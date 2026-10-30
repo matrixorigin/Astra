@@ -128,13 +128,13 @@ pub(crate) fn resolved_tool_metrics<I>(
     fallback_count: u32,
     fallback_tools: I,
     tool_call_records: &[ToolCallRecord],
-    aggregate_authoritative: bool,
+    include_fallback_tools: bool,
 ) -> (u32, Vec<String>)
 where
     I: IntoIterator<Item = String>,
 {
     let fallback_tools = fallback_tools.into_iter().collect::<Vec<_>>();
-    if !aggregate_authoritative && tool_call_records.is_empty() {
+    if !include_fallback_tools && tool_call_records.is_empty() {
         let mut tools_used = normalize_name_list(fallback_tools);
         tools_used.sort_unstable();
         return (fallback_count, tools_used);
@@ -144,7 +144,7 @@ where
     // the local ToolCallRecord ledger covers only the edge/request wrapper.
     // Keep both tool-name sources for audit, but never replace the aggregate
     // count with that partial record count.
-    let mut tools_used = if aggregate_authoritative {
+    let mut tools_used = if include_fallback_tools {
         fallback_tools
     } else {
         Vec::new()
@@ -164,11 +164,10 @@ where
 
     let mut tools_used = normalize_name_list(tools_used);
     tools_used.sort_unstable();
-    let tool_calls_count = if aggregate_authoritative || record_tool_calls_count == 0 {
-        fallback_count
-    } else {
-        record_tool_calls_count
-    };
+    // Both observed counts are lower bounds; never add overlapping calls or
+    // let a partial callback list erase Server-owned calls. The caller checks
+    // the resulting count against any canonical aggregate before granting proof.
+    let tool_calls_count = fallback_count.max(record_tool_calls_count);
     (tool_calls_count, tools_used)
 }
 
@@ -251,7 +250,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         run_transcript_messages,
         applied_user_intents,
     } = ctx;
-    let (_, tools_used) = resolved_tool_metrics(
+    let (tool_calls_count, tools_used) = resolved_tool_metrics(
         tool_calls_count,
         tools_used,
         &tool_call_records,

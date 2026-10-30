@@ -5,7 +5,7 @@ use serde_json::Value;
 #[macro_export]
 macro_rules! agent_parent_scope_guidance {
     () => {
-        "Parent work excludes child scope, even at launch; revisit it only for gaps or counter-evidence after results."
+        "Do not duplicate delegated work; continue independent user-requested work."
     };
 }
 

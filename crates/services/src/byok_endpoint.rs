@@ -225,11 +225,11 @@ pub async fn require_endpoint_policy_with_mode(
 }
 
 fn transport_builder() -> reqwest::ClientBuilder {
+    // The caller owns request/body deadlines; streams may remain active.
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(360))
 }
 
 fn validate_addresses(addresses: &[SocketAddr]) -> Result<(), String> {
@@ -265,6 +265,62 @@ pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_has_no_implicit_body_deadline_but_honors_request_timeout() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        for explicit_timeout in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                {
+                    let mut request = BufReader::new(&mut socket);
+                    let mut headers = String::new();
+                    while !headers.ends_with("\r\n\r\n") {
+                        assert_ne!(request.read_line(&mut headers).await.unwrap(), 0);
+                    }
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nbegin",
+                    )
+                    .await
+                    .unwrap();
+                let _ = finished.await;
+                let _ = socket.write_all(b"end").await;
+            });
+            let mut request = transport_builder()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}"));
+            if explicit_timeout {
+                request = request.timeout(Duration::from_secs(360));
+            }
+            let mut response = request.send().await.unwrap();
+            assert_eq!(response.chunk().await.unwrap().unwrap(), "begin");
+            // Real socket I/O must not cause Tokio's paused clock to auto-advance.
+            let clock_guard = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            });
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(400)).await;
+            finish.send(()).unwrap();
+            let chunk = response.chunk().await;
+            clock_guard.abort();
+            tokio::time::resume();
+            if explicit_timeout {
+                assert!(chunk.unwrap_err().is_timeout());
+            } else {
+                assert_eq!(chunk.unwrap().unwrap(), "end");
+            }
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn endpoint_policy_defaults_to_public_https_and_invalid_config_fails_closed() {

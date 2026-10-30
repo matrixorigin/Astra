@@ -770,10 +770,10 @@ fn render_child_agent_result(mut body: Value) -> String {
 
 pub const CHILD_OUTCOME_GUIDANCE: &str = concat!(
     astra_tools::agent_parent_scope_guidance!(),
-    " When no independent work remains, propose an answer; the runtime completion barrier waits for owned children and resumes synthesis with their terminal outcomes. Do not claim completion before observing those outcomes. After sufficient terminal outcomes arrive, finish the request; wait for future input only when requested. Terminal child outcomes are delivered automatically. Do not re-fetch an already observed, sufficient terminal result. get_result/get_results remain available for inspection, missing or truncated output, pagination, and recovery. Do not busy-poll or use shell sleep. A wait timeout does not cancel children or authorize completion."
+    " Continue independent requested work. When blocked on children, use agent(action='wait') for new messages or results. Answer child questions with send_message and the incoming request_id. Report observed results; get_result/get_results can recover missing or truncated output. Waiting does not cancel children."
 );
 
-pub const PENDING_CHILD_RUNTIME_WAIT_GUIDANCE: &str = "This observation is not a terminal result. Continue only work needed for the user's request. For a pending direct child owned by this run with no independent work remaining, propose an answer so the runtime completion barrier waits and resumes when continuation is available. This does not authorize claiming that the child has completed. Otherwise inspect the child's status or waiting reason. Do not busy-poll or use shell sleep solely to wait.";
+pub const PENDING_CHILD_RUNTIME_WAIT_GUIDANCE: &str = "The child has not completed. Continue independent requested work, or use agent(action='wait') for new messages/results. Answer pending child questions before waiting. Do not claim an unobserved result.";
 
 pub fn render_wait_timeout_outcome(
     agent_id: &str,
@@ -1500,9 +1500,6 @@ mod tests {
         assert!(parsed.get("delivery").is_none());
         assert_eq!(parsed["observation_timed_out"], true);
         assert_eq!(parsed["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
-        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("when continuation is available"));
-        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("Do not busy-poll"));
-        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("shell sleep"));
         let idle: Value = serde_json::from_str(&render_wait_for_agent_status(
             "reviewer",
             &AgentStatus::Idle,

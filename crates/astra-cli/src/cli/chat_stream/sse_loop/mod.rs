@@ -855,11 +855,23 @@ async fn stream_chat_sse_inner(
             state.total_tool_calls,
             state.telemetry.all_tools_used.iter().cloned(),
             &state.stall.tool_call_records,
-            !state.remote_summary.is_none(),
+            state
+                .remote_summary
+                .as_ref()
+                .is_some_and(|summary| summary.has_complete_tool_ledger()),
         );
-        let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
-            &state.stall.tool_call_records,
-        );
+        // Callback records are only local observations, never a complete
+        // Server ledger, even when their count happens to match a fallback.
+        let tool_outcomes = state
+            .remote_summary
+            .as_ref()
+            .filter(|summary| summary.has_complete_tool_ledger())
+            .and_then(|summary| {
+                crate::cli::stream::streaming_types::canonical_tool_outcomes(
+                    summary.tool_ledger_receipt.canonical_aggregate(),
+                    tool_calls_count,
+                )
+            });
         let usage_attribution = UsageAttribution::from_explain_analyze_events(
             &state.telemetry.explain_analyze_events,
             state
@@ -887,7 +899,7 @@ async fn stream_chat_sse_inner(
                     .as_ref()
                     .map(|summary| summary.llm_rounds),
                 token_usage_coverage: state.token_usage_coverage(),
-                tool_outcomes: Some(tool_outcomes),
+                tool_outcomes,
                 applied_user_intents: state
                     .applied_user_intents
                     .iter()
@@ -988,8 +1000,16 @@ async fn stream_chat_sse_inner(
     let tool_ledger_aggregate = state
         .remote_summary
         .as_ref()
+        .filter(|summary| summary.has_complete_tool_ledger())
         .map(|summary| summary.tool_ledger_receipt.canonical_aggregate())
-        .unwrap_or_default();
+        .unwrap_or(
+            astra_turn_types::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
+                // An absent receipt is not a measured empty ledger. Reuse the
+                // aggregate's existing evidence-validity bit through JSON/journal.
+                consistent: false,
+                ..Default::default()
+            },
+        );
     let result = build_stream_result(StreamResultBuild {
         turn_evaluation: host.turn_evaluation.take(),
         tool_health_entries: p.tool_health_entries,
@@ -1032,7 +1052,9 @@ async fn stream_chat_sse_inner(
         tool_record_coverage_partial: state
             .remote_summary
             .as_ref()
-            .is_some_and(|summary| !summary.has_complete_tool_ledger()),
+            .map_or(state.server_terminal_authoritative, |summary| {
+                !summary.has_complete_tool_ledger()
+            }),
         final_messages,
         deferred_tool_activations: state.deferred_tool_activations.clone(),
         run_transcript_messages,

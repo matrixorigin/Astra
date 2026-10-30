@@ -2757,11 +2757,20 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_writing_hidden_home_app_state_requires_approval_in_auto_mode() {
+    fn evaluate_known_agent_state_requires_approval_but_hidden_projects_do_not() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
-        let config_path = "~/.yyy/config.toml".to_string();
+        let ordinary = evaluate_permission(
+            "write_file",
+            &serde_json::json!({"path":"~/.codex/workspace/service.conf", "content":"workers=4"}),
+            &ctx,
+        );
+        assert!(
+            matches!(ordinary.decision, HardDecision::Allow),
+            "{ordinary:?}"
+        );
+        let config_path = "~/.astra/config.toml".to_string();
 
         let write_file = evaluate_permission(
             "write_file",
@@ -2770,7 +2779,7 @@ mod tests {
         );
         assert!(
             matches!(write_file.decision, HardDecision::NeedExternal { .. }),
-            "hidden home app state writes must remain gated: {write_file:?}"
+            "known agent state writes must remain gated: {write_file:?}"
         );
 
         let bash_rm = evaluate_permission(
@@ -2780,7 +2789,7 @@ mod tests {
         );
         assert!(
             matches!(bash_rm.decision, HardDecision::NeedExternal { .. }),
-            "destructive shell operations on hidden home app state must remain gated: {bash_rm:?}"
+            "destructive shell operations on known agent state must remain gated: {bash_rm:?}"
         );
     }
 

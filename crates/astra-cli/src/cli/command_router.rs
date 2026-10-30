@@ -3793,7 +3793,9 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
     let classes = partial
         .tool_outcomes
         .as_ref()
-        .filter(|outcomes| outcomes.is_consistent())
+        .filter(|outcomes| {
+            outcomes.is_consistent() && outcomes.requested == partial.tool_calls_count
+        })
         .map(|outcomes| {
             serde_json::json!({
                 "succeeded": outcomes.succeeded,
@@ -3861,8 +3863,16 @@ fn final_json_output_with_context(
         sr.cache_creation_tokens,
     )
     .total_input_tokens();
-    let tool_result_class_counts = serde_json::to_value(sr.tool_ledger_aggregate.result_classes)
-        .expect("fixed tool result-class aggregate must serialize");
+    let tool_result_class_counts = if !sr
+        .tool_ledger_aggregate
+        .is_complete_for(sr.tool_calls_count)
+        || (sr.server_terminal_unverified && sr.tool_record_coverage_partial)
+    {
+        serde_json::json!({})
+    } else {
+        serde_json::to_value(sr.tool_ledger_aggregate.result_classes)
+            .expect("fixed tool result-class aggregate must serialize")
+    };
     let disposition = completion_disposition(sr, exit_code);
     serde_json::json!({
         "trace_id": trace_id,
@@ -5068,6 +5078,7 @@ mod exit_code_tests {
                     status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
                     error: Some("provider stream stopped".into()),
                     error_kind: Some(astra_core::ErrorKind::StreamTransport),
+                    interruption: None,
                 }),
                 partial_text: "  real partial bytes\n".into(),
                 partial_text_model_item_id: Some("partial-model-item".into()),
@@ -5097,6 +5108,23 @@ mod exit_code_tests {
         );
         assert!(json["llm_rounds"].is_null());
         assert!(json["local_continuation"].is_null());
+    }
+
+    #[test]
+    fn failed_remote_run_does_not_invent_tool_result_classes() {
+        for (count, outcomes) in [
+            (0, None),
+            (1, None),
+            (4, None),
+            (4, Some(Default::default())),
+        ] {
+            let mut failure = accepted_failed_run();
+            failure.partial.tool_calls_count = count;
+            failure.partial.tool_outcomes = outcomes;
+            let json = super::hard_failure_json_output(failure);
+            assert_eq!(json["tool_calls_count"], count);
+            assert_eq!(json["tool_result_class_counts"], serde_json::json!({}));
+        }
     }
 
     #[test]
@@ -5809,6 +5837,31 @@ mod final_json_output_tests {
         assert_eq!(output["tool_result_class_counts"]["succeeded"], 1);
         assert_eq!(output["tool_result_class_counts"]["failed"], 1);
         assert_eq!(output["tool_calls_count"], 2);
+    }
+
+    #[test]
+    fn final_json_does_not_invent_zero_classes_for_missing_remote_accounting() {
+        let mut sr = stream_result_for_json();
+        sr.tool_calls_count = 4;
+        sr.tool_ledger_aggregate = Default::default();
+        sr.server_terminal_authoritative = true;
+        sr.server_terminal_unverified = true;
+        sr.tool_record_coverage_partial = true;
+        let output = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(output["tool_calls_count"], 4);
+        assert_eq!(output["tool_result_class_counts"], serde_json::json!({}));
+        sr.tool_calls_count = 0;
+        sr.server_terminal_unverified = false;
+        sr.tool_ledger_aggregate.consistent = false;
+        let unknown = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(unknown["tool_result_class_counts"], serde_json::json!({}));
+        assert!(sr.canonical_tool_outcomes().is_none());
+        sr.tool_ledger_aggregate =
+            astra_turn_types::tool_ledger_receipt::ToolLedgerReceipt::empty("run", 1)
+                .canonical_aggregate();
+        let measured = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+        assert_eq!(measured["tool_result_class_counts"]["failed"], 0);
+        assert_eq!(sr.canonical_tool_outcomes().unwrap().requested, 0);
     }
 
     #[test]

@@ -5503,7 +5503,9 @@ impl ToolExecutor {
         let requested = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let path = match self.resolve_checked(requested) {
             Ok(path) => path,
-            Err(error) => return astra_tools::ToolResult::error(error),
+            Err(error) => {
+                return astra_tools::ToolResult::error(error).with_execution_not_started();
+            }
         };
         let mut context = self.default_executor.context().clone();
         context.cancel_token = cancel_token.map(|token| std::sync::Arc::new(token.clone()));
@@ -5897,9 +5899,15 @@ mod tests {
         }
         let executor = ToolExecutor::new(temp.path().to_path_buf());
         let late_marker = temp.path().join("late-marker");
+        let started = temp.path().join("started");
+        let release = temp.path().join("release");
+        // Confirm the child entered the owned group, but let it attempt the
+        // observed effect only after the executor reports cleanup complete.
         let command = format!(
-            "(sleep 0.5; printf late > {}) & exit 0",
-            super::shell_escape(late_marker.to_str().unwrap())
+            "(printf started > {started}; while [ ! -e {release} ]; do sleep 0.02; done; printf late > {late}) & while [ ! -e {started} ]; do sleep 0.02; done; exit 0",
+            started = super::shell_escape(started.to_str().unwrap()),
+            release = super::shell_escape(release.to_str().unwrap()),
+            late = super::shell_escape(late_marker.to_str().unwrap()),
         );
         let outcome = executor
             .bash_outcome_with_cancel_async(
@@ -5946,6 +5954,12 @@ mod tests {
             "contract failures must carry the shared non-retryable evidence"
         );
 
+        assert!(started.exists(), "the descendant must have started");
+        assert!(
+            !late_marker.exists(),
+            "the release gate must hold the effect"
+        );
+        std::fs::write(&release, "release").unwrap();
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert!(
             !late_marker.exists(),
@@ -7409,10 +7423,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         let result = executor.list_dir(&serde_json::json!({"path": "/etc"}));
+        assert!(result.is_error);
         assert!(
-            result.contains("SANDBOX_DENIED") || result.contains("Sandbox"),
-            "list_dir outside project should be blocked: {result}"
+            result.output.contains("SANDBOX_DENIED") || result.output.contains("Sandbox"),
+            "list_dir outside project should be blocked: {result:?}"
         );
+        assert_eq!(result.metadata.unwrap()["disposition"], "rejected");
     }
 
     // ── str_replace diff preview ─────────────────────────────────────────────
@@ -7656,12 +7672,10 @@ mod tests {
             "{secret_read}"
         );
 
-        let hidden_write = check_bash_path_boundary(&policy, "rm -f ~/.yyy/config.toml")
-            .expect("mutating hidden app state must still block");
-        assert!(
-            hidden_write.contains("write-sensitive app/runtime state"),
-            "{hidden_write}"
-        );
+        assert!(check_bash_path_boundary(&policy, "rm -f ~/.yyy/config.toml").is_none());
+        let state_write = check_bash_path_boundary(&policy, "rm -f ~/.astra/permissions.json")
+            .expect("known agent policy state must still block");
+        assert!(state_write.contains("write-sensitive app/runtime state"));
     }
 
     #[test]

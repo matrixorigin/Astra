@@ -31,12 +31,17 @@ MACOS_RUNNER_AUTHORS = {
     49832303: "aptend",
     169294: "fengttt",
     28526327: "plane-hjh",
+    523063: "aunjgr",
+    134036682: "Lundomn",
 }
 MACOS_SELF_HOSTED_LABELS = ["self-hosted", "macOS", "ARM64", "mac-arm64-mini"]
+MACOS_MAIN_LABELS = ["self-hosted", "macOS", "ARM64", "mac-arm64-main"]
 
 
-def select_macos_runner(event_name: str, event: dict) -> list[str]:
-    # Trusted pushes must not consume persistent state left by unmerged PRs.
+def select_macos_runner(event_name: str, event: dict, *, main_enabled: bool = False) -> list[str]:
+    # Main has a dedicated host that never executes PR code.
+    if main_enabled and event_name == "push" and isinstance(event, dict) and event.get("ref") == "refs/heads/main":
+        return MACOS_MAIN_LABELS.copy()
     if event_name == "pull_request" and isinstance(event, dict):
         pull_request = event.get("pull_request")
         author = pull_request.get("user") if isinstance(pull_request, dict) else None
@@ -288,7 +293,8 @@ def emit(scopes: dict[str, bool], paths: list[str], *, fallback: str | None = No
     try:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
         labels = select_macos_runner(
-            os.environ.get("GITHUB_EVENT_NAME", ""), event
+            os.environ.get("GITHUB_EVENT_NAME", ""), event,
+            main_enabled=os.environ.get("ASTRA_MACOS_MAIN_ENABLED") == "1"
         )
     except (KeyError, OSError, ValueError, TypeError):
         labels = ["macos-15"]

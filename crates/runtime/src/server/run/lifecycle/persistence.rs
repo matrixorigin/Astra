@@ -14,8 +14,8 @@ use tracing;
 use uuid::Uuid;
 
 use astra_core::{
-    ErrorResponse, STATUS_CANCELLED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool,
-    connect_matrixone,
+    ErrorResponse, STATUS_CANCELLED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
+    SharedPool, connect_matrixone,
 };
 use astra_services::coordination::AgentProfile;
 use astra_services::runs::{
@@ -437,6 +437,7 @@ pub(crate) struct CanonicalTerminalSettlementCommit {
 fn atomic_terminal_request<'a>(
     append: &'a CanonicalLoopAppend<'a>,
     settlement: CanonicalTerminalSettlement<'a>,
+    interruption: Option<&'a astra_turn_core::interruption::InterruptionRecord>,
 ) -> CanonicalRunTerminalRequest<'a> {
     CanonicalRunTerminalRequest {
         user_id: append.user_id,
@@ -450,6 +451,7 @@ fn atomic_terminal_request<'a>(
         error_code: settlement.error_code,
         error_kind: settlement.error_kind,
         error_metadata: settlement.error_metadata,
+        interruption,
         cancellation_origin: settlement.cancellation_origin.map(|origin| match origin {
             astra_turn_core::orchestration_types::CancellationOrigin::User => {
                 DurableCancellationOrigin::User
@@ -612,7 +614,7 @@ async fn prepare_canonical_terminal(
             authority,
         )
     };
-    let request = atomic_terminal_request(append, settlement);
+    let request = atomic_terminal_request(append, settlement, None);
     let outcome = CanonicalRunTerminalReceipt::outcome_for_request(request)?;
     let context = if authority.is_none() {
         CanonicalTerminalContext::Unowned
@@ -669,6 +671,17 @@ async fn prepare_canonical_terminal(
         error_code: request.error_code.map(str::to_owned),
         error_kind: request.error_kind,
         error_metadata: settlement.error_metadata.cloned(),
+        interruption: state
+            .interruption
+            .as_ref()
+            .filter(|interruption| {
+                settlement.status == STATUS_FAILED
+                    && settlement.error_kind.is_none()
+                    && settlement.error_metadata.is_none()
+                    && interruption.kind
+                        == astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
+            })
+            .map(astra_turn_core::interruption::InterruptionRecord::public_projection),
         context,
         transcript: CanonicalTerminalTranscript {
             item_count: u32::try_from(items.len()).map_err(|_| "raw transcript count overflow")?,
@@ -752,7 +765,11 @@ async fn persist_server_loop_canonical_append_inner(
             match store
                 .claim_canonical_terminal_with_controls_in_transaction(
                     &mut tx,
-                    atomic_terminal_request(&append, *current),
+                    atomic_terminal_request(
+                        &append,
+                        *current,
+                        prepared.receipt.interruption.as_ref(),
+                    ),
                     &prepared.receipt,
                 )
                 .await?
@@ -789,6 +806,7 @@ async fn persist_server_loop_canonical_append_inner(
                     prepared.receipt.error_code = None;
                     prepared.receipt.error_kind = None;
                     prepared.receipt.error_metadata = None;
+                    prepared.receipt.interruption = None;
                 }
                 CanonicalTerminalClaim::Paused => {
                     return Err(
@@ -804,7 +822,11 @@ async fn persist_server_loop_canonical_append_inner(
             drop(connection);
             if store
                 .resolve_canonical_terminal_receipt(
-                    atomic_terminal_request(&append, *current),
+                    atomic_terminal_request(
+                        &append,
+                        *current,
+                        prepared.receipt.interruption.as_ref(),
+                    ),
                     &prepared.receipt,
                 )
                 .await?
@@ -907,7 +929,11 @@ async fn persist_server_loop_canonical_append_inner(
             };
             if store
                 .resolve_canonical_terminal_receipt(
-                    atomic_terminal_request(&append, current),
+                    atomic_terminal_request(
+                        &append,
+                        current,
+                        prepared.receipt.interruption.as_ref(),
+                    ),
                     &prepared.receipt,
                 )
                 .await?
@@ -4834,6 +4860,12 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn canonical_incomplete_terminal_preserves_public_partial_on_commit_and_replay() {
+        assert_canonical_terminal(TerminalCase::Incomplete).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_user_cancellation_converges_with_raw_in_same_transaction() {
         assert_canonical_terminal(TerminalCase::UserCancellation).await;
     }
@@ -4854,6 +4886,7 @@ mod tests {
     enum TerminalCase {
         Completed,
         Failed,
+        Incomplete,
         LateGuidance,
         RawCollision,
         UserCancellation,
@@ -4922,6 +4955,27 @@ mod tests {
             astra_turn_types::CanonicalTokenUsage::new(Some(101), Some(202), Some(303), Some(404))
                 .unwrap(),
         );
+        let incomplete = matches!(
+            case,
+            TerminalCase::Incomplete | TerminalCase::UserCancellation
+        );
+        if incomplete {
+            use astra_turn_core::interruption::{
+                InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+            };
+            state.interruption = Some(InterruptionRecord::new(
+                InterruptionKind::ExecutionIncomplete,
+                ResumeAction::ContinueImmediately,
+                InterruptionStateSummary {
+                    tool_calls_completed: 3,
+                    turns_completed: 2,
+                    remaining_turns: 5,
+                    error_detail: Some("private-terminal-diagnostic".into()),
+                    stall_signal: Some("private-stall-signal".into()),
+                    ..Default::default()
+                },
+            ));
+        }
         let context = AgenticRunLifecycleService::prepare_canonical_turn_commit(
             Some(&admitted),
             &state.messages,
@@ -4966,8 +5020,14 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let proposed_failure =
-            matches!(case, TerminalCase::Failed | TerminalCase::UserCancellation);
+        let proposed_failure = matches!(
+            case,
+            TerminalCase::Failed | TerminalCase::Incomplete | TerminalCase::UserCancellation
+        );
+        let public_error = state
+            .interruption
+            .as_ref()
+            .map(|record| record.user_message.clone());
         let settlement = CanonicalTerminalSettlement {
             expected_owner_pod_id: owner,
             expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
@@ -4978,9 +5038,17 @@ mod tests {
                 astra_core::STATUS_COMPLETED
             },
             waiting_for: None,
-            error_message: proposed_failure.then_some("provider disconnected"),
-            error_code: proposed_failure.then_some("provider_connection_lost"),
-            error_kind: proposed_failure.then_some(astra_core::ErrorKind::Network),
+            error_message: if incomplete {
+                public_error.as_deref()
+            } else {
+                proposed_failure.then_some("provider disconnected")
+            },
+            error_code: if incomplete {
+                Some("execution_incomplete")
+            } else {
+                proposed_failure.then_some("provider_connection_lost")
+            },
+            error_kind: (proposed_failure && !incomplete).then_some(astra_core::ErrorKind::Network),
             error_metadata: None,
             cancellation_origin: None,
             prompt_tokens: 606,
@@ -5041,7 +5109,7 @@ mod tests {
             let commit = result.unwrap();
             let expected_status = if case == TerminalCase::UserCancellation {
                 STATUS_CANCELLED
-            } else if case == TerminalCase::Failed {
+            } else if matches!(case, TerminalCase::Failed | TerminalCase::Incomplete) {
                 astra_core::STATUS_FAILED
             } else {
                 astra_core::STATUS_COMPLETED
@@ -5100,6 +5168,7 @@ mod tests {
             if case == TerminalCase::UserCancellation {
                 assert!(stored.receipt.error_code.is_none());
                 assert!(stored.receipt.error_metadata.is_none());
+                assert!(stored.receipt.interruption.is_none());
             }
 
             let text = current
@@ -5127,6 +5196,47 @@ mod tests {
                     .iter()
                     .any(|event| durable_event_type(event) == Some("run_finished"))
             );
+            if case == TerminalCase::Incomplete {
+                let expected = state.interruption.as_ref().unwrap().public_projection();
+                assert_eq!(stored.receipt.interruption.as_ref(), Some(&expected));
+                // Exercise committed live events and a cold reconnect through
+                // the same public formatter and SSE terminal consumer.
+                for events in [commit.terminal_events.clone(), current.events.clone()] {
+                    let projected =
+                        crate::server::run::handlers::transform_stream_run_events_for_client(
+                            &run_id, events,
+                        );
+                    let wire = serde_json::to_string(&projected).unwrap();
+                    assert!(!wire.contains("private-terminal-diagnostic"));
+                    assert!(!wire.contains("private-stall-signal"));
+                    let terminal = projected
+                        .iter()
+                        .find(|event| event["type"] == "run_finished")
+                        .unwrap();
+                    let terminal =
+                        astra_turn_core::chat_turn_sse_dispatch::durable_run_terminal_from_event(
+                            terminal,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(terminal.interruption, Some(expected.clone()));
+                    assert!(terminal.error_kind.is_none());
+                    let text = projected
+                        .iter()
+                        .find(|event| event["type"] == "text_done")
+                        .unwrap();
+                    assert_eq!(text["full_text"], state.final_text);
+                    assert_eq!(text["partial"], true);
+                }
+                assert_eq!(
+                    delta
+                        .events
+                        .iter()
+                        .find(|event| durable_event_type(event) == Some("run_finished"))
+                        .unwrap()["data"]["interruption"],
+                    expected.to_json()
+                );
+            }
             let replay = persist_server_loop_canonical_terminal_settlement(
                 &pool,
                 append(),
@@ -5150,6 +5260,26 @@ mod tests {
                     .collect::<Vec<_>>(),
                 "idempotent confirmation repeats completion without new control notifications"
             );
+            if case == TerminalCase::Incomplete {
+                state.interruption.as_mut().unwrap().remaining_turns += 1;
+                // Use the same public error; changing resume facts must still
+                // fail exact-commit resolution.
+                let retry = CanonicalTerminalSettlement {
+                    error_message: current.error_message.as_deref(),
+                    ..settlement
+                };
+                assert!(
+                    persist_server_loop_canonical_terminal_settlement(
+                        &pool,
+                        append(),
+                        &state,
+                        retry,
+                        None
+                    )
+                    .await
+                    .is_err()
+                );
+            }
             if case == TerminalCase::Failed {
                 for kind in [None, Some(astra_core::ErrorKind::Unknown)] {
                     assert!(

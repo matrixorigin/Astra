@@ -20894,7 +20894,13 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
     );
 
     assert_eq!(status, RunStatus::Failed);
-    assert!(error.as_deref().unwrap().contains("Round budget"));
+    assert_eq!(
+        error.as_deref(),
+        state
+            .interruption
+            .as_ref()
+            .map(|record| record.user_message.as_str())
+    );
     assert_eq!(events[0]["event_type"], "text_done");
     assert_eq!(events[0]["data"]["full_text"], state.final_text);
     assert_eq!(events[0]["data"]["partial"], true);
@@ -20902,6 +20908,68 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
     assert_eq!(events[1]["data"]["error_code"], "budget_exhausted");
     assert_eq!(events[2]["event_type"], "run_finished");
     assert!(events.iter().all(|e| e["event_type"] != "run_interrupted"));
+}
+
+#[test]
+fn incomplete_run_projection_preserves_partial_without_exposing_internal_diagnostics() {
+    for detail in [
+        "typed completion action was not satisfied",
+        "a side-effect-capable invocation has an interrupted or unknown outcome",
+    ] {
+        let svc = test_service();
+        let request = test_request("partial");
+        let mut state = svc.build_initial_state(
+            "test-user",
+            &request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+            None,
+        );
+        state.final_text = "Authored partial result.".into();
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            InterruptionKind::ExecutionIncomplete,
+            ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                error_detail: Some(detail.into()),
+                ..Default::default()
+            },
+        ));
+        let (mut events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+            Ok(AgenticLoopOutcome::Completed),
+            vec![],
+            &state,
+        );
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(
+            error.as_deref(),
+            state
+                .interruption
+                .as_ref()
+                .map(|record| record.user_message.as_str())
+        );
+        assert!(!error.as_ref().unwrap().contains(detail));
+        assert_eq!(events[0]["data"]["full_text"], state.final_text);
+        assert_eq!(events[0]["data"]["partial"], true);
+        events.last_mut().unwrap()["data"]["owner_generation"] = json!(1);
+        let projected = run_handlers::transform_stream_run_events_for_client("run-1", events);
+        assert!(!serde_json::to_string(&projected).unwrap().contains(detail));
+        let terminal = projected
+            .iter()
+            .find(|event| event["type"] == "run_finished")
+            .unwrap();
+        let terminal =
+            astra_turn_core::chat_turn_sse_dispatch::durable_run_terminal_from_event(terminal)
+                .unwrap()
+                .unwrap();
+        assert!(terminal.interruption.is_some());
+        assert!(terminal.error_kind.is_none());
+        assert_eq!(
+            state.interruption.as_ref().unwrap().error_detail.as_deref(),
+            Some(detail)
+        );
+    }
 }
 
 #[test]

@@ -13,27 +13,9 @@ use std::path::Path;
 /// Paths/directories that always require manual approval even in permissive modes.
 /// Modifying these can compromise the system, the shell, or the agent itself.
 pub const DANGEROUS_FILE_PATHS: &[&str] = &[
-    // Git internals
-    ".git/",
-    ".gitconfig",
-    ".gitmodules",
-    // Shell configs (modifying = persistent code execution)
-    ".bashrc",
-    ".bash_profile",
-    ".zshrc",
-    ".zprofile",
-    ".profile",
-    ".zshenv",
-    // IDE/editor configs
-    ".vscode/",
-    ".idea/",
-    // Agent configs
-    ".claude/",
-    ".astra/",
-    // SSH keys
-    ".ssh/",
-    // Ripgrep config (can alter search behavior)
-    ".ripgreprc",
+    // Git/agent authority metadata and credentials. Ordinary project settings,
+    // including IDE and shell configuration, follow workspace write authority.
+    ".git/", ".claude/", ".astra/", ".ssh/",
 ];
 
 /// Environment variables that contain secrets and must be scrubbed from subprocesses.
@@ -857,14 +839,23 @@ mod tests {
         assert!(is_dangerous_file_path("/home/user/.git"));
         assert!(is_dangerous_file_path(".git/config"));
         assert!(is_dangerous_file_path("/home/user/.git/hooks/pre-commit"));
-        assert!(is_dangerous_file_path(".gitconfig"));
+        assert!(!is_dangerous_file_path(".gitconfig"));
     }
 
     #[test]
-    fn detects_shell_config_paths() {
-        assert!(is_dangerous_file_path(".bashrc"));
-        assert!(is_dangerous_file_path("/home/user/.zshrc"));
-        assert!(is_dangerous_file_path(".profile"));
+    fn ordinary_project_configuration_is_not_protected_metadata() {
+        for path in [
+            ".bashrc",
+            ".zshrc",
+            ".profile",
+            ".gitmodules",
+            ".gitconfig",
+            ".vscode/settings.json",
+            ".idea/workspace.xml",
+            ".ripgreprc",
+        ] {
+            assert!(!is_dangerous_file_path(path), "{path}");
+        }
     }
 
     #[test]
@@ -889,9 +880,8 @@ mod tests {
         assert!(!is_dangerous_file_path("my.profile.rs"));
         assert!(!is_dangerous_file_path("user.profile_settings"));
         assert!(!is_dangerous_file_path("src/bashrc_utils.rs"));
-        // But actual .bashrc should still match
-        assert!(is_dangerous_file_path("/home/user/.bashrc"));
-        assert!(is_dangerous_file_path(".bashrc"));
+        assert!(!is_dangerous_file_path("/home/user/.bashrc"));
+        assert!(!is_dangerous_file_path(".bashrc"));
     }
 
     #[test]

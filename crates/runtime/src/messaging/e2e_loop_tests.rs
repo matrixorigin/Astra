@@ -1003,8 +1003,8 @@ mod tests {
         assert_eq!(accepted["success"], true);
         assert!(accepted["instruction"].as_str().is_some_and(|text| {
             text.contains("queued, not applied")
-                && text.contains("runtime completion barrier")
-                && text.contains("terminal outcomes")
+                && text.contains("agent(action='wait')")
+                && text.contains("observed results")
         }));
         let reply = child_mb
             .try_recv()

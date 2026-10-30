@@ -303,7 +303,7 @@ mod tests {
         assert!(
             v["hint"]
                 .as_str()
-                .is_some_and(|hint| hint.contains("Do not busy-poll")),
+                .is_some_and(|hint| hint.contains("agent(action='wait')")),
             "{v}"
         );
     }

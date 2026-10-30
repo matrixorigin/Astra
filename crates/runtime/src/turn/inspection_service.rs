@@ -400,7 +400,7 @@ mod tests {
         assert!(summary.contains("read_over_stable_prefix=1.00"));
         assert!(!summary.contains("cache=88%"));
         assert!(summary.contains("snapshot_age_turns=2"));
-        assert!(summary.contains("turns: session_turn=3 llm_rounds_completed=3 slice_boundary=10 slice_remaining=7 absolute_round_ceiling=none"));
+        assert!(summary.contains("turns: current_turn=3 llm_rounds_completed=3 slice_boundary=10 slice_remaining=7 absolute_round_ceiling=none"));
         assert!(summary.contains("compaction: TrimSchemas"));
         assert!(summary.contains("execution_topology: server_only"));
         assert!(summary.contains("test_alert"));

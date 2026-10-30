@@ -70,7 +70,8 @@ class GitHubApi:
         self._api_origin = (parsed_api_url.scheme.lower(), parsed_api_url.netloc.lower())
         self._opener = build_opener(RejectRedirects())
 
-    def _request(self, method: str, url: str, *, data: dict[str, Any] | None = None) -> tuple[bytes, Any]:
+    def _request(self, method: str, url: str, *, data: dict[str, Any] | None = None,
+                 etag: str | None = None) -> tuple[bytes, Any]:
         target = url if urlsplit(url).scheme else urljoin(self._api_url, url.lstrip("/"))
         parsed_target = urlsplit(target)
         target_origin = (parsed_target.scheme.lower(), parsed_target.netloc.lower())
@@ -88,6 +89,8 @@ class GitHubApi:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
+        if etag is not None:
+            request.add_header("If-None-Match", etag)
         with self._opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             return response.read(), response.headers
 

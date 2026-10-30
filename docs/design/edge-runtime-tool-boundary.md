@@ -540,3 +540,16 @@ workspace boundary. Both paths share search arguments, ignore rules, pagination,
 bounded output, timeout and caller-owned cancellation. The CLI supplies its
 pressure-scaled output budget through the existing execution context. It preserves source
 error and exit metadata instead of reinterpreting result text.
+
+## Path sensitivity and ordinary project content
+
+A hidden directory name under the user's home is not itself a sensitive-state
+boundary. Ordinary project content remains editable there. Permission admission
+continues to classify known credential files, authority metadata and
+owned internal artifacts through the shared path-sensitivity owner; sandbox and
+explicit workspace authority still apply independently.
+
+IDE settings, shell configuration, `.gitmodules` and other ordinary project
+configuration follow the same workspace write authority as source files. Merely
+being configuration or potentially executable does not create a second approval
+boundary. Git/agent authority metadata and credential rules remain separate.

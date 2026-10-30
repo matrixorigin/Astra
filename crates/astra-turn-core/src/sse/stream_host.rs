@@ -411,6 +411,26 @@ pub struct ToolBatchRequest {
     pub args: Value,
 }
 
+impl ToolBatchRequest {
+    /// Rejection before execution, retaining the effective invocation arguments.
+    pub fn rejected_result(&self, args: &Value, error: String) -> EdgeToolExecResult {
+        let mut fields = serde_json::Map::new();
+        astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+        EdgeToolExecResult {
+            work_attribution: self.work_attribution.clone(),
+            execution_completion: None,
+            request_id: self.request_id.clone(),
+            tool: self.tool.clone(),
+            args: args.clone(),
+            output: astra_text_utils::credential_redaction::redact_credentials_for_display(&error)
+                .0,
+            tool_result_fields: Some(fields),
+            status: "failed".into(),
+            duration_ms: 0,
+        }
+    }
+}
+
 fn pending_is_coalescible_tool_batch(pending: &[ChatTurnEdgePending]) -> bool {
     !pending.is_empty()
         && pending.iter().all(|item| match item {
@@ -529,7 +549,8 @@ pub trait SseStreamHost: Send {
 
     /// Reconcile the Server's exact wire-schema admission before an Edge
     /// executor applies its local binding, argument, permission and sandbox
-    /// gates. Hosts without a second local tool surface need no action.
+    /// gates. This reconciliation must not wait on callback delivery or I/O.
+    /// Hosts without a second local tool surface need no action.
     fn on_server_tool_surface_admission(
         &mut self,
         _request: &ToolBatchRequest,
@@ -1288,18 +1309,24 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     // A validated root failure retains observed output. Local transport and
     // protocol failures still tombstone it; all aborts discard executable work.
     if abort.is_some() {
-        let preserve_failed_output = abort_message.is_none()
-            && accum.has_authoritative_failed_terminal()
-            && accum
-                .run_terminal
-                .as_ref()
-                .and_then(|terminal| terminal.error_kind)
-                == abort;
+        let interrupted_terminal = abort_message.is_none()
+            && abort == Some(astra_core::ErrorKind::ContractViolation)
+            && accum.has_authoritative_interrupted_terminal();
+        let preserve_failed_output = interrupted_terminal
+            || (abort_message.is_none()
+                && accum.has_authoritative_failed_terminal()
+                && accum
+                    .run_terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.error_kind)
+                    == abort);
         accum.stream_complete = false;
         if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
             abort = accum.error_kind;
         }
-        accum.error_kind = abort;
+        if !interrupted_terminal {
+            accum.error_kind = abort;
+        }
         // A canonical save failure invalidates completion, not text already
         // received. Keep its partial display while discarding executable work.
         if !preserve_failed_output
@@ -1718,18 +1745,10 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     args,
                 };
                 if let Err(error) = host.on_server_tool_surface_admission(&request) {
-                    let result = EdgeToolExecResult {
-                        work_attribution: request.work_attribution.clone(),
-
-                        execution_completion: None,
-                        request_id: request.request_id,
-                        tool: request.tool,
-                        args: request.args,
-                        output: error,
-                        tool_result_fields: None,
-                        status: "failed".to_string(),
-                        duration_ms: 0,
-                    };
+                    if host.should_abort_edge_work() {
+                        return;
+                    }
+                    let result = request.rejected_result(&request.args, error);
                     host.on_tool_result(&result);
                     tool_results.push(result);
                     continue;
@@ -1822,7 +1841,6 @@ async fn flush_pending_via_host<H: SseStreamHost>(
         return;
     }
 
-    // Execute tools — the host decides whether to parallelize.
     if !tool_batch.is_empty() {
         let results = host.execute_tools_batch(tool_batch).await;
         for result in results {
@@ -3704,7 +3722,11 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(format!("admission:{tool}"));
-                Ok(())
+                if tool == "blocked" {
+                    Err("tool not admitted".into())
+                } else {
+                    Ok(())
+                }
             }
 
             fn on_session_id(&mut self, session_id: &str) {
@@ -3771,6 +3793,24 @@ mod tests {
                 "tool:tr-1".to_string(),
             ]
         );
+        let denied = sse_event(
+            "tool_request",
+            ",\"request_id\":\"tr-2\",\"tool\":\"blocked\",\"args\":{}",
+        );
+        let mut denied_stream = stream::iter(chunks_from_sse(&denied));
+        let (result, abort) = consume_sse_stream(
+            &mut denied_stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+        assert!(abort.is_none());
+        assert_eq!(result.tool_results.len(), 1);
+        assert!(
+            !crate::headless_tool_journal::journal_record_edge_tool_result(&result.tool_results[0])
+                .was_executed()
+        );
+        assert_eq!(order.lock().unwrap().last().unwrap(), "admission:blocked");
     }
 
     #[tokio::test]

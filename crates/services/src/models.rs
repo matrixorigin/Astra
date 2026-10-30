@@ -5325,6 +5325,9 @@ pub async fn validate_connectivity(
             "messages": [{"role": "user", "content": "hi"}]
         });
         astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
+        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+            req = req.timeout(Duration::from_secs(360));
+        }
         let send_result = req.json(&body).send().await;
         (send_result, probe)
     };

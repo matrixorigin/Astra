@@ -2898,6 +2898,65 @@ mod tests {
     }
 
     #[test]
+    fn partial_failure_attempts_do_not_become_executed_successes() {
+        use crate::cli::stream::streaming_types::{
+            PartialTurnData, apply_partial_turn_data_to_error_event,
+        };
+        use astra_services::session_journal::{JournalEvent, ToolOutcomeSummary};
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        for (index, outcomes) in [
+            None,
+            Some(ToolOutcomeSummary {
+                requested: 4,
+                executed: 2,
+                succeeded: 1,
+                failed: 1,
+                rejected: 2,
+                ..Default::default()
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sid = format!("test-partial-failure-digest-{index}");
+            let partial = PartialTurnData {
+                tool_calls_count: 4,
+                tool_outcomes: outcomes.clone(),
+                ..Default::default()
+            };
+            let mut event =
+                JournalEvent::turn_error(Some(&sid), 1, None, "request", "provider failed", 1);
+            event.metadata = Some(serde_json::json!({"partial_tool_calls":4}));
+            apply_partial_turn_data_to_error_event(&mut event, &partial);
+            assert_eq!(
+                event.tool_count,
+                outcomes.as_ref().map(|value| value.executed)
+            );
+            assert_eq!(event.tool_outcomes, outcomes);
+            assert_eq!(event.metadata.as_ref().unwrap()["partial_tool_calls"], 4);
+            write_test_journal(
+                journal_path_for_test(&sid),
+                format!("{}\n", serde_json::to_string(&event).unwrap()),
+            )
+            .unwrap();
+            let digest = build_digest(&sid, DigestFocus::All).unwrap();
+            assert_eq!(
+                digest.aggregates.total_tool_calls,
+                if index == 0 { 0 } else { 4 }
+            );
+            assert_eq!(
+                digest.aggregates.total_fresh_tool_calls,
+                if index == 0 { 0 } else { 1 }
+            );
+            assert_eq!(
+                digest.aggregates.tool_calls_failed,
+                if index == 0 { 0 } else { 3 }
+            );
+        }
+    }
+
+    #[test]
     fn digest_compaction_without_summary_has_no_preview() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());

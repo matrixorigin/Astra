@@ -1,5 +1,5 @@
 self-hosted-runner:
-  labels: [mac-arm64-mini]
+  labels: [mac-arm64-mini, mac-arm64-main]
 # GitHub supports cache-mode; actionlint 1.7.12 predates the syntax.
 paths:
   .github/workflows/macos-mini.yml:

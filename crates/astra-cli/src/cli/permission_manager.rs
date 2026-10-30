@@ -5922,7 +5922,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_allows_hidden_home_logs_but_blocks_writes_and_secrets() {
+    fn auto_mode_allows_hidden_project_content_but_blocks_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = "~/.xxx/logs/session.log";
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
@@ -5940,11 +5940,8 @@ mod tests {
         });
         let write_decision = pm.check_nonblocking("write_file", &write_args);
         assert!(
-            matches!(
-                &write_decision,
-                GateOutcome::Deny(reason) if reason.contains("write-sensitive app/runtime state")
-            ),
-            "hidden home app state remains write-sensitive in Auto mode: {write_decision:?}"
+            matches!(write_decision, GateOutcome::Allow),
+            "ordinary hidden-directory content remains editable: {write_decision:?}"
         );
 
         let secret_args = serde_json::json!({"path": "~/.xxx/.env"});

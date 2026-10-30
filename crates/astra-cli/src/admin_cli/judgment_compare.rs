@@ -330,8 +330,8 @@ pub(super) async fn run(
                 )
                 .with_offering_id(id)
                 .with_timeout(Duration::from_millis(DEADLINE_MS));
-                request.max_tokens =
-                    u32::try_from(case.request.output_token_budget()).map_err(|_| {
+                request.max_tokens = u32::try_from(case.request.generation_token_budget())
+                    .map_err(|_| {
                         "Judgment output budget exceeds the completion protocol".to_string()
                     })?;
                 request.temperature = 0.0;

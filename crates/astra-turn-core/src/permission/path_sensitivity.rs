@@ -77,8 +77,6 @@ fn is_write_sensitive_path(path: &str) -> bool {
     is_read_sensitive_path(path)
         || is_dangerous_file_path(path)
         || is_dangerous_file_path(&expanded.to_string_lossy())
-        || is_tilde_hidden_home_app_state_path(path)
-        || is_hidden_home_app_state_path(&expanded)
 }
 
 fn is_agent_skill_content_path(path: &str) -> bool {
@@ -104,33 +102,6 @@ fn normal_component_strings(path: &Path) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-fn is_tilde_hidden_home_app_state_path(path: &str) -> bool {
-    let Some(relative) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) else {
-        return false;
-    };
-    let first = relative.split(['/', '\\']).next().unwrap_or(relative);
-    // Strip glob metacharacters for classification — a glob like `~/.xxx/*` targets
-    // the same sensitive directory as `~/.xxx/foo`.
-    let first = first.trim_end_matches(['*', '?', '[', ']', '{', '}']);
-    first.starts_with('.') && first.len() > 1
-}
-
-fn is_hidden_home_app_state_path(path: &Path) -> bool {
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-    let candidate = normalize_lexical_path(path);
-    let home = normalize_lexical_path(&home);
-    let Ok(relative) = candidate.strip_prefix(&home) else {
-        return false;
-    };
-    let Some(Component::Normal(first)) = relative.components().next() else {
-        return false;
-    };
-    let first = first.to_string_lossy();
-    first.starts_with('.') && first.len() > 1
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -1046,21 +1017,40 @@ mod tests {
     }
 
     #[test]
-    fn hidden_home_app_state_is_readable_but_not_writable_by_default() {
-        let log_path = "~/.xxx/logs/session.log";
-
-        assert_eq!(
-            classify_path_sensitivity(log_path),
-            PathSensitivity::WriteSensitive
+    fn hidden_project_paths_are_not_application_state() {
+        let home = dirs::home_dir().unwrap();
+        for path in [
+            "~/.cache/projects/app/src/main.rs".to_string(),
+            "~/.codex/reviews/workspace/service.conf".to_string(),
+            home.join(".codex/reviews/workspace/service.conf")
+                .display()
+                .to_string(),
+            "~/.xxx/logs/session.log".to_string(),
+        ] {
+            assert_eq!(
+                classify_path_sensitivity(&path),
+                PathSensitivity::Normal,
+                "{path}"
+            );
+            assert!(path_requires_sensitive_gate(&path, PathAccess::Write).is_none());
+        }
+        assert!(
+            sensitive_path_match_for_shell_command(
+                "printf value > ~/.cache/projects/app/service.conf"
+            )
+            .is_none()
         );
-        assert!(path_requires_sensitive_gate(log_path, PathAccess::Read).is_none());
-        assert!(path_requires_sensitive_gate(log_path, PathAccess::List).is_none());
-        assert!(path_requires_sensitive_gate(log_path, PathAccess::Write).is_some());
-
-        let shell_write = sensitive_path_match_for_shell_command("rm -f ~/.yyy/config.toml")
-            .expect("mutating hidden home app state should gate");
-        assert_eq!(shell_write.sensitivity, PathSensitivity::WriteSensitive);
-        assert_eq!(shell_write.access, PathAccess::Write);
+        for path in [
+            "~/.ssh/id_rsa",
+            "~/.aws/credentials",
+            "~/.xxx/.env",
+            "~/.astra/permissions.json",
+        ] {
+            assert!(
+                path_requires_sensitive_gate(path, PathAccess::Write).is_some(),
+                "{path}"
+            );
+        }
     }
 
     #[test]

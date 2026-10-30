@@ -26161,6 +26161,17 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 ] {
                     insert_if_present(obj, &data, key);
                 }
+                if let Some(mut interruption) = data
+                    .get("interruption")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                {
+                    if let Some(fields) = interruption.as_object_mut() {
+                        fields.remove("error_detail");
+                        fields.remove("stall_signal");
+                    }
+                    obj.insert("interruption".into(), interruption);
+                }
             }
             out
         }
@@ -34835,6 +34846,7 @@ mod tests {
             error_code: Some("business_failure".into()),
             error_kind: Some(astra_core::ErrorKind::Unknown),
             error_metadata: None,
+            interruption: None,
             context: CanonicalTerminalContext::Unchanged,
             transcript: CanonicalTerminalTranscript {
                 item_count: 0,
@@ -34856,6 +34868,7 @@ mod tests {
             error_code: Some("business_failure"),
             error_kind: Some(astra_core::ErrorKind::Unknown),
             error_metadata: None,
+            interruption: None,
             cancellation_origin: None,
             prompt_tokens: 0,
             completion_tokens: 0,

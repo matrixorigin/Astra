@@ -12,6 +12,10 @@ on:
       source_sha:
         required: true
         type: string
+      source_pool:
+        required: true
+        type: choice
+        options: [pr, main]
 permissions:
   contents: read
   actions: read
@@ -28,7 +32,7 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   execute:
-    runs-on: [self-hosted, macOS, ARM64, mac-arm64-mini]
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.source_pool == 'main' && 'mac-arm64-main' || 'mac-arm64-mini' }}"]
     timeout-minutes: 65
     steps:
       - name: Checkout control policy
@@ -43,6 +47,7 @@ jobs:
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_POOL: ${{ inputs.source_pool }}
         run: python3 .ci-control/scripts/ci/macos_dispatch.py admit --run-id "$SOURCE_RUN_ID" --attempt "$SOURCE_ATTEMPT" --sha "$SOURCE_SHA"
       - name: Checkout candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

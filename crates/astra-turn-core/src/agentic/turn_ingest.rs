@@ -162,6 +162,8 @@ pub fn ingest_remote_server_turn<'a>(
     mut st: AgenticTurnIngestMut<'a>,
 ) -> AgenticTurnIngestOutcome {
     st.model_item_id = accum.model_item_id.as_deref();
+    let interrupted_terminal =
+        accum.has_authoritative_interrupted_terminal() && error_kind.is_none();
     let failure = accum.remote_admission_error(error_kind);
     let failure_message = failure.as_ref().map(|error| error.message.clone());
     let mut observed = agentic_turn_stream_snapshot_with_kind(accum, ttft_ms, error_kind);
@@ -170,12 +172,27 @@ pub fn ingest_remote_server_turn<'a>(
         observed.error_kind = Some(error.kind);
     }
     observed.tool_calls = &[];
+    if accum.has_authoritative_failed_terminal()
+        && accum.server_execution_summary.is_none()
+        && let Some(count) = accum.run_total_tool_calls
+    {
+        *st.total_tool_calls = st.total_tool_calls.saturating_add(count);
+    }
     // Error responses still own their partial bytes and model identity.
     // Ordinary ingest intentionally avoids committing them as an assistant
     // message, but they must survive in the returned failure projection.
     if observed.error_message.is_some() && !observed.full_text.trim().is_empty() {
         *st.final_text = observed.full_text.to_owned();
         *st.final_text_model_item_id = st.model_item_id.map(str::to_owned);
+    }
+    if interrupted_terminal {
+        // Preserve authored partial content and usage without presenting the
+        // expected interruption as an LLM error or persisting a successful
+        // answer through ordinary ingest. The outer transcript owner retains
+        // the partial alongside its structured interruption.
+        observed.full_text = "";
+        observed.error_message = &None;
+        observed.error_kind = None;
     }
     match ingest_agentic_turn_stream(&observed, message, st) {
         outcome @ (AgenticTurnIngestOutcome::Break | AgenticTurnIngestOutcome::Fatal(_)) => outcome,
@@ -513,6 +530,75 @@ mod tests {
                 messages: &mut self.messages,
                 last_measured_prompt_tokens: &mut self.last_measured_prompt_tokens,
                 consecutive_context_window_errors: &mut self.consecutive_context_window_errors,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_server_stream_preserves_partial_without_contract_error() {
+        use crate::interruption::{
+            InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+        };
+        use crate::sse::stream_host::{NoopSseStreamHost, consume_sse_stream, stream_idle_timeout};
+        let record = InterruptionRecord::new(
+            InterruptionKind::ExecutionIncomplete,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary::default(),
+        );
+        for split in [false, true] {
+            for with_provisional_error in [false, true] {
+                let mut events = vec![
+                    json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+                    json!({"type":"text_done", "full_text":"Preserved partial answer.", "model_item_id":"answer-1", "partial":true}),
+                    json!({"type":"usage", "usage_scope":"run_total", "input_tokens":12, "output_tokens":3, "tool_call_count":4}),
+                ];
+                if with_provisional_error {
+                    events.push(json!({"type":"run_error", "run_id":"root", "error_code":"execution_incomplete", "error_kind":null, "error":record.user_message}));
+                    events.push(json!({"type":"tool_request", "run_id":"root", "session_id":"session", "request_id":"late", "tool":"read_file", "args":{"path":"secret"}, "schema_admitted_by_server":true}));
+                }
+                events.push(
+                    json!({"type":"run_finished", "run_id":"root", "owner_generation":1,
+                    "status":"failed", "error_code":"execution_incomplete", "error_kind":null,
+                    "error":record.user_message, "interruption":record.to_json()}),
+                );
+                let frames = events
+                    .into_iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<Vec<_>>();
+                let chunks: Vec<Result<Vec<u8>, String>> = if split {
+                    frames
+                        .into_iter()
+                        .map(|frame| Ok(frame.into_bytes()))
+                        .collect()
+                } else {
+                    vec![Ok(frames.concat().into_bytes())]
+                };
+                let mut source = futures_util::stream::iter(chunks);
+                let (result, _) =
+                    consume_sse_stream(&mut source, &mut NoopSseStreamHost, stream_idle_timeout())
+                        .await;
+                let accum = result.accum;
+                assert!(accum.has_authoritative_interrupted_terminal(), "{accum:?}");
+                assert!(accum.error_kind.is_none());
+                assert_eq!(accum.full_text, "Preserved partial answer.");
+                assert!(result.tool_results.is_empty(), "late work must not execute");
+                let mut pack = Pack::new();
+                assert_eq!(
+                    ingest_remote_server_turn(&accum, Some(3), None, "request", pack.ingest_mut()),
+                    AgenticTurnIngestOutcome::Break
+                );
+                assert_eq!(pack.final_text, "Preserved partial answer.");
+                assert_eq!(pack.final_text_model_item_id.as_deref(), Some("answer-1"));
+                assert_eq!((pack.total_prompt, pack.total_completion), (12, 3));
+                assert_eq!(pack.total_tool_calls, 4);
+                assert!(
+                    pack.messages.is_empty(),
+                    "ordinary ingest must not commit a completed answer"
+                );
+                assert_eq!(
+                    accum.server_interruption.as_ref().unwrap()["user_message"],
+                    record.user_message
+                );
             }
         }
     }

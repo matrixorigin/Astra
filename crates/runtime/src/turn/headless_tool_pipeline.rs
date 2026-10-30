@@ -7092,10 +7092,7 @@ mod tests {
             visible.contains("current child status is unknown"),
             "{visible}"
         );
-        assert!(
-            visible.contains("when continuation is available"),
-            "{visible}"
-        );
+        assert!(visible.contains("agent(action='wait')"), "{visible}");
         assert!(!visible.contains("Wait about"), "{visible}");
         drop(pipeline);
         assert_eq!(harness.tool_call_records.len(), 1);

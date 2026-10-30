@@ -268,6 +268,7 @@ fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
     assert!(params.get("catalog").is_none());
     for arguments in [
         json!({"facet":"overview"}),
+        json!({"facet":"overview", "depth":"diagnostic", "horizon":"recent"}),
         json!({"explain":{"target":"previous"}}),
         json!({"artifact":"artifact://session/tool-result/example","offset":0,"max_bytes":1024}),
     ] {
@@ -696,7 +697,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     }
     assert_eq!(
         agent_params["properties"]["action"]["enum"],
-        serde_json::json!(["spawn", "list", "get_result", "send_message"])
+        serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"])
     );
     assert_eq!(agent_params["required"], serde_json::json!(["action"]));
     assert_eq!(agent_params["additionalProperties"], false);
@@ -911,29 +912,23 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
     assert!(
         agent["function"]["parameters"]["x-astra-per-action-allowed"]
             .get("wait")
-            .is_none()
+            .is_some()
     );
     assert!(
         agent["function"]["parameters"]["properties"]
             .get("timeout_ms")
-            .is_none()
+            .is_some()
     );
     for arguments in [
-        json!({"action": "wait"}),
-        json!({"action": "wait", "timeout_ms": 1}),
+        json!({"action":"wait"}),
+        json!({"action":"wait", "timeout_ms":1}),
     ] {
-        assert!(
+        for schema in [agent, canonical_agent] {
             astra_tools::schemas::validate_tool_arguments_against_schema(
-                "agent", &arguments, agent
+                "agent", &arguments, schema,
             )
-            .is_err()
-        );
-        astra_tools::schemas::validate_tool_arguments_against_schema(
-            "agent",
-            &arguments,
-            canonical_agent,
-        )
-        .expect("explicit observation remains available in the selected canonical contract");
+            .expect("ordinary wait is directly callable without schema discovery");
+        }
     }
     let selected = astra_tools::tool_search::tool_selection_contract(canonical_agent).unwrap();
     assert!(

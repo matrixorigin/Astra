@@ -1180,6 +1180,128 @@ async fn split_prepare_reuses_one_initial_probe_and_keeps_transactional_winner()
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn completion_waits_for_dispatch_commit_before_evaluating_state_cas() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let id = identity(&Uuid::new_v4().simple().to_string(), "call-completing");
+    insert_active_run(&pool, &id).await;
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    ledger
+        .prepare(&id, &fingerprint("read"), &decision())
+        .await
+        .unwrap();
+
+    // Hold the dispatch write open so the other connection sees Prepared.
+    // A composite-PK UPDATE filtered by state alone can miss both the row and
+    // its lock on MatrixOne (matrixorigin/matrixone#31685). Completion must
+    // serialize on the invocation identity before evaluating state/owner.
+    let mut dispatch = pool.begin().await.unwrap();
+    assert_eq!(
+        sqlx::query(
+            "UPDATE tool_invocation_ledger
+             SET state = 'dispatched', dispatch_certainty = 'dispatched',
+                 attempt_count = 1, dispatch_owner = 'worker-completing',
+                 dispatch_lease_expires_at = TIMESTAMPADD(SECOND, 90, CURRENT_TIMESTAMP(6))
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ? AND state = 'prepared'",
+        )
+        .bind(&id.user_id)
+        .bind(&id.session_id)
+        .bind(&id.run_id)
+        .bind(&id.turn_chain_id)
+        .bind(&id.invocation_id)
+        .execute(&mut *dispatch)
+        .await
+        .unwrap()
+        .rows_affected(),
+        1
+    );
+
+    let outcome = success("acknowledged result");
+    let completion = ledger.compare_and_complete(
+        &id,
+        ToolInvocationState::Dispatched,
+        Some("worker-completing"),
+        &outcome,
+    );
+    tokio::pin!(completion);
+    // Poll the actual service entrypoint while the dispatch lock is held.
+    // Keep the future alive on timeout, then release the writer before any
+    // assertion so neither success nor a regression leaves an open fixture txn.
+    let early = tokio::time::timeout(Duration::from_secs(1), &mut completion).await;
+    dispatch.commit().await.unwrap();
+    assert!(
+        early.is_err(),
+        "completion bypassed dispatch lock: {early:?}"
+    );
+    let completed = tokio::time::timeout(Duration::from_secs(10), &mut completion)
+        .await
+        .expect("completion must finish after dispatch commits")
+        .unwrap();
+    assert_eq!(completed.state, ToolInvocationState::Succeeded);
+    assert_eq!(completed.attempt_count, 1);
+    assert_eq!(completed.outcome, Some(outcome.clone()));
+    let persisted = ledger.get(&id).await.unwrap().unwrap();
+    assert_eq!(persisted.state, ToolInvocationState::Succeeded);
+    assert_eq!(persisted.outcome.as_ref(), Some(&outcome));
+    cleanup(&pool, &id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn concurrent_completions_preserve_one_terminal_outcome() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let id = identity(&Uuid::new_v4().simple().to_string(), "call-racing");
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    let first = success("first result");
+    let second = failure("second result");
+    assert!(matches!(
+        ledger
+            .compare_and_complete(&id, ToolInvocationState::Dispatched, Some("worker"), &first)
+            .await,
+        Err(ToolInvocationLedgerStoreError::NotFound { .. })
+    ));
+    insert_active_run(&pool, &id).await;
+    ledger
+        .prepare(&id, &fingerprint("read"), &decision())
+        .await
+        .unwrap();
+    ledger
+        .claim_dispatch(&id, "worker", 90_000, dispatch_admission())
+        .await
+        .unwrap();
+
+    let (a, b) = tokio::join!(
+        ledger.compare_and_complete(&id, ToolInvocationState::Dispatched, Some("worker"), &first),
+        ledger.compare_and_complete(
+            &id,
+            ToolInvocationState::Dispatched,
+            Some("worker"),
+            &second
+        ),
+    );
+    let (winner, loser) = match (a, b) {
+        (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+        other => panic!("exactly one terminal writer must win: {other:?}"),
+    };
+    assert!(matches!(
+        loser,
+        ToolInvocationLedgerStoreError::StateMismatch {
+            expected: ToolInvocationState::Dispatched,
+            actual,
+            ..
+        } if actual == winner.state
+    ));
+    let persisted = ledger.get(&id).await.unwrap().unwrap();
+    assert_eq!(persisted.state, winner.state);
+    assert_eq!(persisted.outcome, winner.outcome);
+    assert_eq!(persisted.attempt_count, 1);
+    cleanup(&pool, &id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();

@@ -38,6 +38,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml_ng.workspace = true
 sha2 = { workspace = true }
+shell-words = "1.1"
 sqlx = { workspace = true, features = ["chrono"], optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

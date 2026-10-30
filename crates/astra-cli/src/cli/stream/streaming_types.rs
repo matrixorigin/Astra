@@ -640,9 +640,15 @@ pub(crate) fn apply_partial_turn_data_to_error_event(
     if partial.cache_creation_tokens > 0 {
         event.cache_creation_tokens = Some(partial.cache_creation_tokens);
     }
-    if partial.tool_calls_count > 0 {
-        event.tool_count = Some(partial.tool_calls_count);
-    }
+    // The CLI count is attempted calls (possibly a lower bound); the journal
+    // count means executed calls. Only qualified outcomes can bridge them.
+    event.tool_outcomes = partial.tool_outcomes.clone().filter(|outcomes| {
+        outcomes.is_consistent() && outcomes.requested == partial.tool_calls_count
+    });
+    event.tool_count = event
+        .tool_outcomes
+        .as_ref()
+        .map(|outcomes| outcomes.executed);
     if !partial.tools_used.is_empty() {
         event.tools_used = Some(partial.tools_used.clone());
     }
@@ -801,6 +807,27 @@ pub(crate) struct StreamResult {
     pub(crate) applied_user_intents: Vec<AppliedStreamUserIntent>,
 }
 
+pub(crate) fn canonical_tool_outcomes(
+    aggregate: astra_turn_types::tool_ledger_receipt::ToolLedgerCanonicalAggregate,
+    tool_calls_count: u32,
+) -> Option<astra_services::session_journal::ToolOutcomeSummary> {
+    if !aggregate.is_complete_for(tool_calls_count) {
+        return None;
+    }
+    let classes = aggregate.result_classes;
+    let outcomes = astra_services::session_journal::ToolOutcomeSummary {
+        requested: aggregate.attempted,
+        executed: classes.succeeded.saturating_add(classes.failed),
+        succeeded: classes.succeeded,
+        failed: classes.failed,
+        rejected: classes.rejected,
+        reused: classes.reused,
+        suppressed: classes.suppressed,
+        deferred: 0,
+    };
+    outcomes.is_consistent().then_some(outcomes)
+}
+
 impl StreamResult {
     /// Project the complete run-total ledger into the durable journal shape.
     /// Per-call records may be absent or only cover the Edge wrapper for a
@@ -809,33 +836,18 @@ impl StreamResult {
     pub(crate) fn canonical_tool_outcomes(
         &self,
     ) -> Option<astra_services::session_journal::ToolOutcomeSummary> {
-        let aggregate = self.tool_ledger_aggregate;
-        if !aggregate.is_complete_for(self.tool_calls_count) {
-            return None;
-        }
-        let classes = aggregate.result_classes;
-        let outcomes = astra_services::session_journal::ToolOutcomeSummary {
-            requested: aggregate.attempted,
-            executed: classes.succeeded.saturating_add(classes.failed),
-            succeeded: classes.succeeded,
-            failed: classes.failed,
-            rejected: classes.rejected,
-            reused: classes.reused,
-            suppressed: classes.suppressed,
-            deferred: 0,
-        };
-        outcomes.is_consistent().then_some(outcomes)
+        canonical_tool_outcomes(self.tool_ledger_aggregate, self.tool_calls_count)
     }
 
     pub(crate) fn apply_canonical_tool_outcomes(
         &self,
         event: &mut astra_services::session_journal::JournalEvent,
     ) {
-        let Some(outcomes) = self.canonical_tool_outcomes() else {
-            return;
-        };
-        event.tool_count = Some(outcomes.executed);
-        event.tool_outcomes = Some(outcomes);
+        // with_tool_calls may have derived totals from a partial Edge detail
+        // window. Replace that inference even when canonical facts are absent.
+        let outcomes = self.canonical_tool_outcomes();
+        event.tool_count = outcomes.as_ref().map(|outcomes| outcomes.executed);
+        event.tool_outcomes = outcomes;
     }
 
     /// User input that should represent this committed turn in durable history.
@@ -1637,7 +1649,8 @@ mod tests {
 
         apply_partial_turn_data_to_error_event(&mut event, &partial);
 
-        assert_eq!(event.tool_count, Some(1));
+        assert!(event.tool_count.is_none());
+        assert!(event.tool_outcomes.is_none());
         assert_eq!(
             event.tools_used.as_deref(),
             Some(&["read_file".to_string()][..])

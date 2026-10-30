@@ -45,6 +45,8 @@ jobs:
           persist-credentials: false
       - name: Classify changed paths
         id: scope
+        env:
+          ASTRA_MACOS_MAIN_ENABLED: ${{ vars.ASTRA_MACOS_MAIN_ENABLED == '1' && '1' || '0' }}
         run: python3 scripts/ci/ci_scope.py
 
   macos-plan:
@@ -55,7 +57,7 @@ jobs:
       (needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') &&
       contains(fromJSON(needs.scope.outputs.macos_runner || '[]'), 'self-hosted')
     runs-on: ubuntu-latest
-    timeout-minutes: 67
+    timeout-minutes: 82
     permissions:
       contents: read
       actions: read
@@ -364,10 +366,10 @@ jobs:
     name: "Test: vendored terminal (macos-15)"
     needs: [scope, macos-plan]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
+    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure","obsolete"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
     timeout-minutes: 15
     env:
-      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result) }}
+      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure","obsolete"]'), needs.macos-plan.outputs.result) }}
       MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
     steps:
       - name: Require actual mini result
@@ -392,10 +394,10 @@ jobs:
     name: "Terminal: ${{ matrix.segment }} (macos-15)"
     needs: [scope, macos-plan]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
+    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure","obsolete"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
-      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result) }}
+      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure","obsolete"]'), needs.macos-plan.outputs.result) }}
       MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
     strategy:
       fail-fast: false
@@ -432,10 +434,10 @@ jobs:
     name: "macOS workspace coordination contracts"
     needs: [scope, macos-plan]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
-    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
+    runs-on: ${{ (github.run_attempt > 1 || !contains(fromJSON('["success","failure","obsolete"]'), needs.macos-plan.outputs.result)) && 'macos-15' || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
-      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure"]'), needs.macos-plan.outputs.result) }}
+      RUN_LANE: ${{ github.run_attempt > 1 || !contains(fromJSON('["success","failure","obsolete"]'), needs.macos-plan.outputs.result) }}
       MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
     steps:
       - name: Require actual mini result

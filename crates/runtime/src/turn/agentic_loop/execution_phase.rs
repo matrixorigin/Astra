@@ -1901,6 +1901,22 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
                 .map(str::to_owned)
         })
         .flatten();
+    let failed_declared_opaque_record = validation
+        .unresolved_operations
+        .last()
+        .and_then(|(_, index)| state.stall.tool_call_records.get(*index))
+        .filter(|record| {
+            classify_record_validation_attempt(record)
+                .is_some_and(|(_, opaque_declared)| opaque_declared)
+        });
+    let failed_declared_opaque_verification = failed_declared_opaque_record.is_some();
+    // An indeterminate or changed invocation is still an outstanding debt,
+    // but it cannot authorize either an automatic replay or a repair.
+    if failed_declared_opaque_record
+        .is_some_and(|record| !record_can_retry_declared_verification(record))
+    {
+        return;
+    }
     let concurrent_mutation_risk = current_round_records.iter().any(|record| {
         tool_record_may_have_mutated_bound_workspace(
             state.hooks.workspace_root_hint.as_deref(),
@@ -1912,6 +1928,11 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
         // even when a different validator later passes. Re-run that exact
         // operation before asking for another code change.
         (_, WorkValidationState::Failed) if failed_validation_requiring_revalidation.is_some() => {
+            Some(CompletionAction::CanonicalWorkValidation)
+        }
+        // A declared opaque verification can fail without establishing that
+        // the workspace needs a repair. Retry that same operation once.
+        (_, WorkValidationState::Failed) if failed_declared_opaque_verification => {
             Some(CompletionAction::CanonicalWorkValidation)
         }
         // A later canonical failure in the same batch is decisive evidence,
@@ -2008,6 +2029,8 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
             "schema": "canonical_validation_recovery.v1",
             "signal": if matches!(next_action, CompletionAction::CanonicalWorkRepair) {
                 "canonical_validation_failed_repair_once"
+            } else if failed_declared_opaque_verification {
+                "declared_verification_failed_revalidate_exact_operation"
             } else if failed_validation_requiring_revalidation.is_some() {
                 "canonical_validation_failed_before_workspace_change_revalidate_exact_operation"
             } else if needs_proven_validation {
@@ -2025,6 +2048,8 @@ pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
             },
             "instruction": if matches!(next_action, CompletionAction::CanonicalWorkRepair) {
                 "The owned WorkItem could not be delivered because the runtime-recognized project validation failed. Make one smallest workspace change that addresses it; the next boundary requires the same class of direct standard project build/test validation. Then settle the currently owned WorkItem truthfully. Do not resume broad exploration."
+            } else if failed_declared_opaque_verification {
+                "The declared verification did not complete successfully. Retry that exact verification with the same arguments, then settle the owned WorkItem truthfully. Do not resume broad exploration."
             } else if needs_proven_validation {
                 "The last validation attempt completed, but its command arguments cannot prove that project validation ran. Run one direct standard project build/test validator with unambiguous arguments, then settle the owned WorkItem truthfully."
             } else if matches!(rejected_validation_state, Some(RejectedWorkValidationState::Stale)) {
@@ -2128,30 +2153,26 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
     }
 
     let round_records = state.stall.tool_call_records.get(new_records_start..);
-    let failed_post_mutation_validation_operation =
+    let failed_post_mutation_attempt =
         if matches!(window.action, CompletionAction::PostMutationObservation)
             && window.matched
             && !workspace_observation_is_quarantined(state)
         {
             round_records.and_then(|records| {
                 records.iter().find_map(|record| {
-                    // A negative exit is not enough: `test`, `diff`, and
-                    // `git diff --quiet` can all be successful observations
-                    // of the workspace. Only the executor's source-authored
-                    // test/lint result classification plus a normalized
-                    // validator operation proves a repairable failure.
-                    if record.was_executed()
-                        && record.error_kind.is_none()
-                        && record.result_class.as_deref() == Some("test_failure")
-                    {
-                        record.authoritative_args_full().and_then(|args| {
-                            astra_turn_core::evaluation::normalize_validation_attempt_prefix(
-                                &record.name,
-                                args,
-                            )
-                        })
+                    if !record.was_executed() {
+                        return None;
+                    }
+                    let (attempt, opaque_declared) = classify_record_validation_attempt(record)?;
+                    if opaque_declared {
+                        record_can_retry_declared_verification(record)
+                            .then_some((attempt.into_identity(), true))
                     } else {
-                        None
+                        // Named (or conservatively inferred) validators need
+                        // the source-authored test-failure class for repair.
+                        (record.error_kind.is_none()
+                            && record.result_class.as_deref() == Some("test_failure"))
+                        .then(|| (attempt.into_identity(), false))
                     }
                 })
             })
@@ -2224,7 +2245,53 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
         );
         return;
     }
-    if let Some(failed_validation_operation) = failed_post_mutation_validation_operation
+    if let Some((operation, true)) = &failed_post_mutation_attempt
+        && state
+            .hooks
+            .completion_settlement
+            .post_mutation_observation_failed_action_retries
+            == 0
+    {
+        state
+            .hooks
+            .completion_settlement
+            .post_mutation_observation_failed_action_retries = 1;
+        let next_action = if active_work_attempt {
+            state
+                .hooks
+                .completion_settlement
+                .canonical_validation_recovery_operation = Some(operation.clone());
+            state
+                .hooks
+                .completion_settlement
+                .canonical_validation_recovery_retries = 1;
+            CompletionAction::CanonicalWorkValidation
+        } else {
+            CompletionAction::PostMutationObservation
+        };
+        restart_completion_action_window(state, &next_action);
+        reserve_completion_round(state);
+        state.hooks.completion_settlement.text_only = false;
+        state.hooks.completion_settlement.work_settlement_only = false;
+        state.budget_wrapup_injected = false;
+        state.push_volatile_payload(
+            super::host::VolatileKind::FinalAnswerSettlement,
+            serde_json::json!({
+                "schema": "completion_settlement.v2",
+                "signal": "declared_verification_failed_retry_once",
+                "allowed_action": next_action,
+                "attempts_remaining": 1,
+                "instruction": if active_work_attempt {
+                    "The declared verification did not complete successfully. Retry that exact verification with the same arguments, then settle the owned WorkItem truthfully."
+                } else {
+                    "The declared verification did not complete successfully. Retry it or use another typed workspace observation before producing the final answer."
+                },
+                "authority": "executed_observation_failure",
+            }),
+        );
+        return;
+    }
+    if let Some((failed_validation_operation, false)) = failed_post_mutation_attempt
         && state
             .hooks
             .completion_settlement
@@ -2437,7 +2504,8 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
         && round_records.is_some_and(|records| {
             records.iter().any(|record| {
                 record.was_executed()
-                    && astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
+                    && (astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
+                        || super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record))
                     && record.authoritative_args_full().is_some_and(|args| {
                         astra_turn_core::evaluation::normalize_validation_attempt_prefix(
                             &record.name,
@@ -6880,6 +6948,82 @@ fn record_starts_fresh_work_attempt(
             .is_some_and(|attempt_id| !attempt_id.trim().is_empty())
 }
 
+/// Classify a record once for the Work and bounded-recovery consumers. Opaque
+/// inferred attempts remain conservative; only an explicit declaration can
+/// own a generic verification rather than named project validation.
+fn classify_record_validation_attempt(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> Option<(astra_turn_core::evaluation::ValidationAttempt, bool)> {
+    let args = record.authoritative_args_full()?;
+    let attempt = astra_turn_core::evaluation::classify_validation_attempt(&record.name, args)?;
+    let opaque_declared =
+        matches!(
+            &attempt,
+            astra_turn_core::evaluation::ValidationAttempt::Opaque(_)
+        ) && super::lifecycle::extract_tool_args(Some(args)).is_some_and(|args| {
+            astra_tools::workspace_observation::is_explicit_workspace_verification_request(
+                &record.name,
+                &args,
+            )
+        });
+    Some((attempt, opaque_declared))
+}
+
+/// Only a completed, known-negative custom verification may reserve a retry.
+/// Its transport `ok` flag may describe successful delivery of a negative
+/// command result, so use the existing source-authored outcome taxonomies.
+fn record_can_retry_declared_verification(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    use astra_tools::exit_semantics::{CommandResultClass, ExitSemantics};
+
+    let semantics = record.exit_semantics.as_ref().and_then(|semantics| {
+        serde_json::from_value::<ExitSemantics>(serde_json::Value::String(semantics.clone())).ok()
+    });
+    let result_class = record
+        .result_class
+        .as_ref()
+        .map(|class| {
+            serde_json::from_value::<CommandResultClass>(serde_json::Value::String(class.clone()))
+        })
+        .transpose();
+    let Ok(result_class) = result_class else {
+        return false;
+    };
+    record.was_executed()
+        && matches!(
+            (semantics, result_class),
+            (
+                Some(ExitSemantics::EmptyResult),
+                None | Some(CommandResultClass::EmptyResult)
+            ) | (
+                Some(ExitSemantics::DomainNegative),
+                None | Some(
+                    CommandResultClass::DomainNegative
+                        | CommandResultClass::TestFailure
+                        | CommandResultClass::EnvFailure
+                        | CommandResultClass::Inconclusive
+                )
+            ) | (
+                Some(ExitSemantics::ExecutionError),
+                None | Some(
+                    CommandResultClass::ExecutionError
+                        | CommandResultClass::TestFailure
+                        | CommandResultClass::EnvFailure
+                )
+            )
+        )
+        && record
+            .error_kind
+            .is_none_or(|kind| kind == astra_core::ErrorKind::Unknown)
+        && record.workspace_mutation_observed != Some(true)
+        && record.workspace_mutation_partial != Some(true)
+        && record
+            .workspace_mutation_partial_paths
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+}
+
 /// Ephemeral evidence for one completion/admission boundary. Operation debts
 /// retain their last failure index; no new persisted validation state is needed.
 struct WorkValidationEvidence {
@@ -6913,10 +7057,21 @@ impl WorkValidationEvidence {
             if !record.was_executed() {
                 continue;
             }
+            let args = record.authoritative_args_full();
+            let attempt = classify_record_validation_attempt(record);
+            let opaque_declared = attempt.as_ref().is_some_and(|(_, declared)| *declared);
             if tool_record_may_have_mutated_bound_workspace(
                 state.hooks.workspace_root_hint.as_deref(),
                 record,
-            ) {
+            ) && !(opaque_declared
+                && record.workspace_mutation_partial != Some(true)
+                && (super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
+                    record,
+                )
+                    || super::lifecycle::is_authoritative_unchanged_bash_observation_record(
+                        record,
+                    )))
+            {
                 evidence.last_workspace_mutation_index = Some(index);
                 if saw_validation {
                     validation_is_stale = true;
@@ -6924,35 +7079,88 @@ impl WorkValidationEvidence {
                     saw_unverified_validation_success = false;
                 }
             }
-            let Some(args) = record.authoritative_args_full() else {
+            let Some(args) = args else {
                 continue;
             };
-            let Some(operation) = astra_turn_core::evaluation::normalize_validation_attempt_prefix(
-                &record.name,
-                args,
-            ) else {
+            let Some((attempt, _)) = attempt else {
                 continue;
             };
+            let operation = attempt.into_identity();
+            if opaque_declared {
+                // A declared custom verifier can clear only its own failure;
+                // it is not named project validation. An unsuccessful or
+                // unverified invocation may have changed prior validated
+                // state, unless the executor separately proved no change.
+                if super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
+                    record,
+                ) {
+                    evidence
+                        .unresolved_operations
+                        .retain(|(candidate, _)| candidate != &operation);
+                } else {
+                    if saw_validation
+                        && (record.workspace_mutation_partial == Some(true)
+                            || !super::lifecycle::is_authoritative_unchanged_bash_observation_record(
+                                record,
+                            ))
+                    {
+                        validation_is_stale = true;
+                        saw_current_positive_validation = false;
+                        saw_unverified_validation_success = false;
+                    }
+                    evidence
+                        .unresolved_operations
+                        .retain(|(candidate, _)| candidate != &operation);
+                    evidence.unresolved_operations.push((operation, index));
+                }
+                continue;
+            }
             saw_validation = true;
-            let positive = astra_turn_core::evaluation::tool_outcome_is_positive_success(record);
+            let positive = astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
+                || (record.ok
+                    && super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
+                        record,
+                    ));
             let proof_operation =
                 astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args);
+            let arguments_prove_validation = proof_operation.is_some();
+            let proof_operation = proof_operation.filter(|_| {
+                record.workspace_mutation_observed != Some(true)
+                    && record.workspace_mutation_partial != Some(true)
+                    && super::lifecycle::extract_tool_args(Some(args)).is_some_and(|args| {
+                        super::lifecycle::bash_invocation_has_scoped_workspace_observation(
+                            state.hooks.workspace_root_hint.as_deref(),
+                            &args,
+                        )
+                    })
+            });
             if let Some(proof_operation) = proof_operation.as_ref() {
                 evidence.latest_validation_operation = Some(proof_operation.clone());
             }
             // Only the same canonical operation discharges a failure. A
             // narrowed or differently flagged command supplies independent evidence.
-            evidence
-                .unresolved_operations
-                .retain(|(candidate, _)| candidate != &operation);
             if !positive {
+                evidence
+                    .unresolved_operations
+                    .retain(|(candidate, _)| candidate != &operation);
                 evidence.unresolved_operations.push((operation, index));
                 // A fresh failed validator exposes debt even after a mutation.
                 validation_is_stale = false;
             } else if proof_operation.is_some() {
+                evidence
+                    .unresolved_operations
+                    .retain(|(candidate, _)| candidate != &operation);
                 validation_is_stale = false;
                 saw_current_positive_validation = true;
             } else {
+                if !arguments_prove_validation {
+                    // An attempt-only invocation can resolve its own execution
+                    // failure, but it cannot preserve earlier validation proof.
+                    evidence
+                        .unresolved_operations
+                        .retain(|(candidate, _)| candidate != &operation);
+                }
+                saw_current_positive_validation = false;
                 // Invocation success without proof-eligible arguments cannot
                 // authorize delivery, even when its exact failure is cleared.
                 saw_unverified_validation_success = true;
@@ -7324,11 +7532,37 @@ fn completion_action_requires_complete_state_writer(
         && state.hooks.completion_settlement.workspace_mutation_retries > 0
 }
 
+fn expected_completion_validation_operation(state: &AgenticLoopState) -> Option<String> {
+    state
+        .hooks
+        .completion_settlement
+        .canonical_validation_recovery_operation
+        .clone()
+        .or_else(|| {
+            state
+                .runtime_tool_executor
+                .as_deref()
+                .is_some_and(crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt)
+                .then(|| failed_work_validation_operation(state))
+                .flatten()
+        })
+}
+
 pub(crate) fn completion_action_hint_for_state(
     state: &AgenticLoopState,
     action: &CompletionAction,
 ) -> serde_json::Value {
     let mut hint = completion_action_hint(action);
+    if matches!(action, CompletionAction::CanonicalWorkValidation)
+        && expected_completion_validation_operation(state).is_some()
+    {
+        hint["accepted_action_shapes"] = serde_json::json!([{
+            "tool": "bash",
+            "evidence_source": "prior_runtime_recognized_validation_or_declared_verification",
+            "constraint": "repeat the exact previously selected validation or declared verification with the same arguments; the runtime checks the operation identity and outcome",
+            "raw_arguments_projected": false,
+        }]);
+    }
     if completion_action_requires_complete_state_writer(state, action) {
         hint["accepted_action_shapes"] = serde_json::json!([{
             "tool": "write_file",
@@ -7383,6 +7617,15 @@ fn completion_action_mismatch_instruction(
     action: &CompletionAction,
     correction_available: bool,
 ) -> &'static str {
+    if matches!(action, CompletionAction::CanonicalWorkValidation)
+        && expected_completion_validation_operation(state).is_some()
+    {
+        return if correction_available {
+            "This request did not match the selected validation or declared verification and was not executed. Retry that exact operation with the same arguments. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
+        } else {
+            "Only the exact previously selected validation or declared verification with the same arguments may execute at this boundary."
+        };
+    }
     if completion_action_requires_complete_state_writer(state, action) {
         return if correction_available {
             "This request was not one complete-state typed write_file call and was not executed. Correct it now with exactly one write_file call containing the target path and full desired bytes. A real change must produce an executor mutation receipt; bytes already exactly present may produce a no-op convergence receipt and then require a later separate full read_file of that same target. Bash output, Bash exit status, assistant prose, and server-side stat of a remote workspace cannot satisfy this obligation."
@@ -7551,19 +7794,7 @@ pub(crate) fn completion_action_match_label(
             // primary Work attempt is active. A successful typed settlement
             // closes that attempt, so a duplicate sibling result cannot
             // resurrect its validation debt after the reset boundary.
-            let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
-                crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
-            );
-            let expected_operation = state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .clone()
-                .or_else(|| {
-                    active_work_attempt
-                        .then(|| failed_work_validation_operation(state))
-                        .flatten()
-                });
+            let expected_operation = expected_completion_validation_operation(state);
             let raw_args = call
                 .get("function")
                 .and_then(|function| function.get("arguments"))
@@ -12142,6 +12373,8 @@ mod tests {
             ok,
             args_full: args_full.map(ToString::to_string),
             disposition: Some(ToolCallDisposition::Executed),
+            result_class: ok.then(|| "success".into()),
+            exit_semantics: ok.then(|| "success".into()),
             ..Default::default()
         };
         // Provider-neutral fixtures model the same owner fact production
@@ -12190,6 +12423,211 @@ mod tests {
             disposition: Some(ToolCallDisposition::Executed),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn configuration_changed_validation_cannot_reuse_prior_work_proof() {
+        for command in [
+            "GOFLAGS=-n; GOWORK=off go test ./...",
+            "GOFLAGS=-n && GOWORK=off go test ./... || true",
+            "printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
+            "GOFLAGS=$(cat /tmp/flags) && GOWORK=off go test ./...",
+            "mkdir -p /tmp/astra-cache && printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            for (records, expected) in [
+                (
+                    vec![
+                        validation_record("GOWORK=off go test ./...", "success"),
+                        validation_record(command, "success"),
+                    ],
+                    WorkValidationState::Stale,
+                ),
+                (
+                    vec![
+                        validation_record(command, "test_failure"),
+                        validation_record("GOWORK=off go test ./...", "success"),
+                    ],
+                    WorkValidationState::Failed,
+                ),
+                (
+                    vec![
+                        validation_record(command, "test_failure"),
+                        validation_record(command, "success"),
+                    ],
+                    WorkValidationState::Stale,
+                ),
+            ] {
+                state.stall.tool_call_records = records.into_iter().map(|mut record| {
+                    record.runtime_args_full = record.args_full.clone();
+                    record.workspace_mutation_scope = Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+                    record.workspace_mutation_receipt = astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                        astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+                    ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+                    record
+                }).collect();
+                assert_eq!(
+                    WorkValidationEvidence::collect(&state, true).state,
+                    expected,
+                    "{command}"
+                );
+            }
+            state
+                .stall
+                .tool_call_records
+                .push(validation_record("GOWORK=off go test ./...", "success"));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_output_keeps_completed_work_validation_current() {
+        for command in [
+            r#"echo '<<' "$PWD""#,
+            r#"echo '`literal`' "$PWD""#,
+            r#"echo '# literal' "$PWD""#,
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            let mut observation = validation_record(command, "success");
+            observation.workspace_mutation_scope =
+                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+            observation.workspace_mutation_receipt = astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+            state.stall.tool_call_records = vec![
+                validation_record("GOWORK=off go test ./...", "success"),
+                observation,
+            ];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_work_validation_requires_scoped_success_of_the_same_operation() {
+        let chain = "GOWORK=off go build ./... && GOWORK=off go vet ./...";
+        for (failed, passed) in [
+            (
+                "cat /tmp/missing && GOWORK=off go vet ./...",
+                "GOWORK=off go vet ./...",
+            ),
+            ("GOWORK=off go test ./...", "go test ./..."),
+            ("GOWORK=off go test ./...", "GOWORK=off go build ./..."),
+            (chain, "GOWORK=off go vet ./..."),
+            (
+                "mkdir -p /tmp/astra-cache && go test ./...",
+                "go test ./...",
+            ),
+            (
+                "mkdir -p /tmp/astra-cache && go test ./... && echo OK",
+                "mkdir -p /tmp/astra-cache && go test ./...",
+            ),
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            state.stall.tool_call_records = vec![
+                validation_record(failed, "test_failure"),
+                validation_record(passed, "success"),
+            ];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Failed,
+                "{passed} must not discharge {failed}"
+            );
+            state
+                .stall
+                .tool_call_records
+                .push(validation_record(failed, "success"));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed
+            );
+        }
+        for root in ["/", "/tmp", "/tmp/astra-cache", "/tmp/astra-cache/repo"] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some(root.into());
+            state.stall.tool_call_records = vec![validation_record(
+                "mkdir -p /tmp/astra-cache && go test ./...",
+                "success",
+            )];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Stale,
+                "{root}"
+            );
+        }
+        let mut state = make_state();
+        state.hooks.workspace_root_hint = Some("/workspace".into());
+        state.stall.tool_call_records = vec![validation_record(
+            "GOWORK=off go vet /tmp/other/...",
+            "success",
+        )];
+        assert_eq!(
+            WorkValidationEvidence::collect(&state, true).state,
+            WorkValidationState::Stale
+        );
+        for (failed_args, passed_args) in [
+            (
+                serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/a"}),
+                serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/b"}),
+            ),
+            (
+                serde_json::json!({"command": "GOWORK=off go test -run 'Test  Name' ./..."}),
+                serde_json::json!({"command": "GOWORK=off go test -run 'Test Name' ./..."}),
+            ),
+        ] {
+            let mut failed = validation_record("", "test_failure");
+            failed.runtime_args_full = Some(failed_args.to_string());
+            let mut passed = validation_record("", "success");
+            passed.runtime_args_full = Some(passed_args.to_string());
+            state.stall.tool_call_records = vec![failed, passed];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Failed
+            );
+            state
+                .stall
+                .tool_call_records
+                .last_mut()
+                .unwrap()
+                .runtime_args_full = Some(failed_args.to_string());
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed
+            );
+        }
+        state.stall.tool_call_records = vec![
+            validation_record("GOWORK=off go test -n ./...", "test_failure"),
+            validation_record("GOWORK=off go build ./...", "success"),
+            validation_record("GOWORK=off go test -n ./...", "success"),
+        ];
+        assert_eq!(
+            WorkValidationEvidence::collect(&state, true).state,
+            WorkValidationState::Stale
+        );
+        let mut external = validation_record("cd /tmp && GOWORK=off go vet ./...", "success");
+        external.runtime_args_full = Some(
+            serde_json::json!({"command": "cd /tmp && GOWORK=off go vet ./...", "mode": "verify"})
+                .to_string(),
+        );
+        external.workspace_mutation_scope =
+            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+        external.workspace_mutation_receipt =
+            astra_tools::workspace_observation::explicit_workspace_verification_receipt()
+                .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+        state.stall.tool_call_records = vec![external];
+        assert_eq!(
+            WorkValidationEvidence::collect(&state, true).state,
+            WorkValidationState::Stale
+        );
     }
 
     #[test]
@@ -14217,6 +14655,81 @@ mod tests {
             entry.payload["signal"] == "failed_post_mutation_observation_repair_once"
                 && entry.payload["allowed_action"] == "post_mutation_repair"
         }));
+    }
+
+    #[test]
+    fn sensitive_validation_invalidates_proof_without_entering_recovery_state() {
+        for command in [
+            "GOWORK=off go test -run password=synthetic-secret-value-123456 ./...",
+            "GOWORK=off go test -run '<<password=synthetic-secret-value-123456' ./...",
+            &format!(
+                "GOFLAGS=-n go test -run '{}' \"$PKGS\"",
+                "x".repeat(16 * 1024)
+            ),
+            "export GOFLAGS=-n && GOWORK=off go test ./... && echo password=synthetic-secret-value-123456",
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            let mut sensitive = validation_record(command, "success");
+            sensitive.runtime_args_full = sensitive.args_full.take();
+            sensitive.workspace_mutation_scope =
+                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+            sensitive.workspace_mutation_receipt = astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+            ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+            state.stall.tool_call_records = vec![
+                validation_record("GOWORK=off go test ./...", "success"),
+                sensitive,
+            ];
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Stale
+            );
+
+            state.stall.tool_call_records[1].result_class = Some("test_failure".into());
+            state.stall.tool_call_records[1].exit_semantics = Some("domain_negative".into());
+            state.hooks.completion_settlement.completion_action_window =
+                Some(super::super::host::CompletionActionWindow {
+                    action: CompletionAction::PostMutationObservation,
+                    attempts_remaining: 0,
+                    mismatch_corrections_remaining: 0,
+                    consumed: true,
+                    matched: true,
+                });
+            advance_completion_action_window_after_tool_round(&mut state);
+            let checkpoint = serde_json::to_string(&state.hooks.completion_settlement).unwrap();
+            assert!(!checkpoint.contains("synthetic-secret-value"));
+            assert!(
+                state
+                    .volatile_pending
+                    .iter()
+                    .all(|entry| !entry.payload.to_string().contains("synthetic-secret-value"))
+            );
+            state.stall.tool_call_records.push(validation_record(
+                "GOWORK=off go test -run TestOther ./...",
+                "success",
+            ));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Failed
+            );
+            state
+                .stall
+                .tool_call_records
+                .push(validation_record(command, "success"));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Stale
+            );
+            state
+                .stall
+                .tool_call_records
+                .push(validation_record("GOWORK=off go test ./...", "success"));
+            assert_eq!(
+                WorkValidationEvidence::collect(&state, true).state,
+                WorkValidationState::Passed
+            );
+        }
     }
 
     #[test]
@@ -20396,6 +20909,8 @@ mod tests {
             name: "bash".into(),
             ok: true,
             disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            result_class: Some("success".into()),
+            exit_semantics: Some("success".into()),
             args_full: Some(
                 serde_json::json!({
                     "command": "python3 -m pytest tests/test_knot.py"

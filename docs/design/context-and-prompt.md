@@ -90,6 +90,11 @@ Platform integrations must put invariant rules in `stable_runtime_system_prompt`
 and per-turn data in `runtime_system_prompt`. Switching a runtime policy can
 change the system prefix; changing round facts must not.
 
+Current semantic mailbox input and terminal child outcomes are placed after older
+conversation/tool observations, including stale running-status receipts. Ordinary
+runtime context keeps its declared cache placement; semantic input follows event
+chronology. This uses the existing typed ownership, delivery and history lanes.
+
 Semantic mailbox input and terminal child results survive temporary delivery
 retirement for the current human turn. They use the existing typed canonical
 runtime history, deduplication, checkpoint and compaction path independently of
@@ -255,3 +260,9 @@ same safety projection when accepted. Client-pipeline invocation facts are
 recorded from the complete final governed result after PostToolUse hooks and
 successful result persistence; ordinary delivery consumes that same governed
 callback body.
+
+Ordinary agent waiting is directly exposed through the canonical `agent.wait`
+action. Models need not propose a final answer to invoke an internal completion
+barrier. The existing completion owner still prevents finalization before owned
+children settle. Mailbox questions and answers use their existing correlation IDs;
+provider-owned collaborators retain their distinct advertised resume capability.

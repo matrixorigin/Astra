@@ -840,6 +840,64 @@ mod connection_quota_tests {
             "the last SharedPool wrapper releases the reserved quota"
         );
     }
+
+    #[test]
+    fn concurrent_shared_pool_close_releases_only_its_own_quota_once() {
+        let _guard = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
+        reset_quota();
+        const SENTINEL: u64 = 7;
+        const POOL_MAX: u32 = 10;
+        try_allocate_with_cap(SENTINEL, 100).unwrap();
+        try_allocate_with_cap(u64::from(POOL_MAX), 100).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let settings = MatrixOneSettings {
+                db_pool_max_connections: POOL_MAX,
+                ..MatrixOneSettings::default()
+            };
+            let pool = MySqlPoolOptions::new()
+                .min_connections(0)
+                .connect_lazy(&settings.database_url_with_password())
+                .unwrap();
+            let shared = SharedPool {
+                pool: Arc::new(pool),
+                settings,
+                quota_released: Arc::new(AtomicBool::new(false)),
+            };
+            let start = Arc::new(tokio::sync::Barrier::new(4));
+            let mut tasks = Vec::new();
+            for _ in 0..3 {
+                let clone = shared.clone();
+                let start = start.clone();
+                tasks.push(tokio::spawn(async move {
+                    start.wait().await;
+                    clone.close().await;
+                    clone
+                }));
+            }
+            start.wait().await;
+            let mut clones = Vec::new();
+            for task in tasks {
+                clones.push(task.await.unwrap());
+            }
+            assert_eq!(
+                GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire),
+                SENTINEL
+            );
+            shared.close().await;
+            drop((clones, shared));
+            assert_eq!(
+                GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire),
+                SENTINEL
+            );
+        });
+        release_global_connections(SENTINEL);
+        assert_eq!(GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire), 0);
+    }
 }
 
 pub mod composite_snapshot;

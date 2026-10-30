@@ -1187,7 +1187,10 @@ impl CliServerAdmissionHost<'_> {
         // final conversation commit and restart history match durable state.
         state.applied_user_intents = turn_result.core.applied_user_intents.clone();
 
-        if let Some(interruption) = turn_result.core.server_interruption.clone() {
+        if let Some(interruption) = turn_result.core.server_interruption.clone().filter(|_| {
+            turn_result.core.server_loop_terminal
+                || turn_result.core.has_authoritative_interrupted_terminal()
+        }) {
             let interruption = serde_json::from_value(interruption).map_err(|error| {
                 format!("server terminal carried an invalid interruption record: {error}")
             })?;
@@ -1940,6 +1943,7 @@ mod tests {
                 status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
                 error: Some("already settled".to_string()),
                 error_kind: Some(astra_core::ErrorKind::ContractViolation),
+                interruption: None,
             },
         );
         assert!(

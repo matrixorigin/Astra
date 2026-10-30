@@ -1133,7 +1133,7 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
     out.push_str(&format!(
         "## Current Runtime Snapshot\n\
          Scope: current live runtime snapshot; prompt-cache values are not durable session-wide aggregates.\n\
-         Pressure: {} | Prompt cache read share: {} | Turns: {} | Tier: {}\n\
+         Pressure: {} | Prompt cache read share: {} | Current progress: {} | Tier: {}\n\
          Prompt tokens: input_total={} fresh={} cached_read={} cache_create={} | Output tokens: {}\n",
         pressure,
         cache_share,
@@ -1315,7 +1315,7 @@ pub fn turn_budget_label(s: &IntrospectSnapshot) -> String {
         .absolute_round_ceiling
         .map_or_else(|| "none".to_string(), |value| value.to_string());
     format!(
-        "session_turn={} llm_rounds_completed={} slice_boundary={} slice_remaining={} absolute_round_ceiling={}",
+        "current_turn={} llm_rounds_completed={} slice_boundary={} slice_remaining={} absolute_round_ceiling={}",
         progress.session_turn,
         progress.llm_rounds_completed,
         progress.slice_round_limit,
@@ -1701,7 +1701,8 @@ pub fn render_errors(s: &IntrospectSnapshot) -> String {
 /// distinguish fresh runtime context from signals that have aged out.
 pub fn render_injection_freshness(s: &IntrospectSnapshot) -> String {
     if s.injection_freshness.is_empty() {
-        return "## Injection Freshness\n(No injections tracked yet — runtime has not observed any round.)".to_string();
+        return "## Injection Freshness\n(No injection freshness observations recorded.)"
+            .to_string();
     }
     let mut out = String::from(&format!(
         "## Injection Freshness (round {})\n\
@@ -2325,7 +2326,7 @@ mod tests {
         snapshot.runtime_feedback = Some(test_runtime_feedback(1, 6, 18));
         assert_eq!(
             turn_budget_label(&snapshot),
-            "session_turn=1 llm_rounds_completed=6 slice_boundary=24 slice_remaining=18 absolute_round_ceiling=none"
+            "current_turn=1 llm_rounds_completed=6 slice_boundary=24 slice_remaining=18 absolute_round_ceiling=none"
         );
         snapshot
             .runtime_feedback
@@ -2335,7 +2336,7 @@ mod tests {
             .absolute_round_ceiling = Some(50);
         assert_eq!(
             turn_budget_label(&snapshot),
-            "session_turn=1 llm_rounds_completed=6 slice_boundary=24 slice_remaining=18 absolute_round_ceiling=50"
+            "current_turn=1 llm_rounds_completed=6 slice_boundary=24 slice_remaining=18 absolute_round_ceiling=50"
         );
     }
 
@@ -2416,7 +2417,7 @@ mod tests {
         assert!(output.contains("prompt_cache_read_over_stable_prefix=1.00"));
         assert!(output.contains("cache_create=8000"));
         assert!(!output.contains("cache=66%"));
-        assert!(output.contains("turns=session_turn=8 llm_rounds_completed=8 slice_boundary=20 slice_remaining=12 absolute_round_ceiling=none"));
+        assert!(output.contains("turns=current_turn=8 llm_rounds_completed=8 slice_boundary=20 slice_remaining=12 absolute_round_ceiling=none"));
         assert!(output.contains("alerts=2"));
         assert!(output.contains("model=deepseek-v4-flash"));
         assert!(output.contains("topology=server_only"));
@@ -3222,9 +3223,10 @@ mod tests {
         let snap = IntrospectSnapshot::default();
         let out = render_injection_freshness(&snap);
         assert!(
-            out.contains("No injections tracked yet"),
+            out.contains("No injection freshness observations recorded"),
             "empty state message missing: {out}"
         );
+        assert!(!out.contains("has not observed any round"));
     }
 
     #[test]

@@ -2717,17 +2717,16 @@ fn evaluate_one_with_primary_cache(
             }
         }
         Criterion::ToolResultClassCount { class, min, max } => {
-            let count = outcome
-                .tool_result_class_counts
-                .get(class)
-                .copied()
-                .unwrap_or(0);
-            let pass = count >= *min && count <= *max;
+            let count = outcome.tool_result_class_counts.get(class).copied();
+            let pass = count.is_some_and(|count| count >= *min && count <= *max);
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
-                detail: format!("tool_result_class_count[{class}]={count}, expected {min}..={max}"),
+                detail: format!(
+                    "tool_result_class_count[{class}]={}, expected {min}..={max}",
+                    count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+                ),
                 full_detail: None,
                 score: None,
             }
@@ -6254,8 +6253,14 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::ToolResultClassCount { class, min, max } => {
-            if class.trim().is_empty() {
-                return Err("ToolResultClassCount.class must not be empty".into());
+            if serde_json::to_value(
+                astra_turn_types::tool_ledger_receipt::ToolLedgerResultClassCounts::default(),
+            )
+            .map_err(|error| error.to_string())?
+            .get(class)
+            .is_none()
+            {
+                return Err(format!("unknown canonical tool result class: {class}"));
             }
             if min > max {
                 return Err(format!("ToolResultClassCount: min ({min}) > max ({max})"));
@@ -8093,16 +8098,40 @@ mod tests {
     #[test]
     fn tool_result_class_count_criterion() {
         let mut out = RunOutcome::new("m");
-        out.tool_result_class_counts.insert("env_failure".into(), 2);
+        out.tool_result_class_counts.insert("failed".into(), 2);
         let results = evaluate_deterministic(
             &[Criterion::ToolResultClassCount {
-                class: "env_failure".into(),
+                class: "failed".into(),
                 min: 1,
                 max: 2,
             }],
             &out,
         );
         assert!(results[0].passed);
+        let missing = crate::runner::parse_json_outcome(
+            r#"{"text":"Partial result.","tool_calls_count":4,"tool_result_class_counts":{},"final_state":"interrupted"}"#,
+            "m",
+        );
+        let zero_failures = [Criterion::ToolResultClassCount {
+            class: "failed".into(),
+            min: 0,
+            max: 0,
+        }];
+        assert!(!evaluate_deterministic(&zero_failures, &missing)[0].passed);
+        assert!(
+            validate_criterion(&Criterion::ToolResultClassCount {
+                class: "execution_error".into(),
+                min: 0,
+                max: 0,
+            })
+            .is_err()
+        );
+        assert!(validate_criterion(&zero_failures[0]).is_ok());
+        let mut observed_zero = missing;
+        observed_zero
+            .tool_result_class_counts
+            .insert("failed".into(), 0);
+        assert!(evaluate_deterministic(&zero_failures, &observed_zero)[0].passed);
     }
 
     #[test]
@@ -8158,6 +8187,38 @@ mod tests {
                     raw: raw.clone(),
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn skill_case_requires_successful_argument_bound_invocation() {
+        let case: crate::case::Case = serde_yaml_ng::from_str(include_str!(
+            "../cases/skill_discovery_uses_skill_tool.yaml"
+        ))
+        .unwrap();
+        let criterion = case
+            .criteria
+            .iter()
+            .find(|criterion| matches!(criterion, Criterion::JournalToolCallCount { .. }))
+            .unwrap();
+        for ok in [false, true] {
+            let session = mk_session(&[(
+                "turn",
+                serde_json::json!({"tool_calls":[{
+                    "tool_call_id":"skill", "name":"skill", "ok":ok,
+                    "disposition": if ok { "executed" } else { "rejected" },
+                    "args_full":r#"{"skill_name":"analyze-session"}"#
+                }]}),
+            )]);
+            assert_eq!(
+                evaluate_deterministic_with_session(
+                    std::slice::from_ref(criterion),
+                    &outcome_with_tools(&["skill"]),
+                    Some(&session)
+                )[0]
+                .passed,
+                ok
+            );
         }
     }
 

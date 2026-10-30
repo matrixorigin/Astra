@@ -93,7 +93,7 @@ fn server_agent_run_chain_unavailable_result() -> astra_tools::ToolResult {
             ("action".to_string(), Value::String("run_chain".to_string())),
             (
                 "available_actions".to_string(),
-                serde_json::json!(["spawn", "list", "get_result", "send_message"]),
+                serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"]),
             ),
         ]);
     result
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(metadata["action"], "run_chain");
         assert_eq!(
             metadata["available_actions"],
-            serde_json::json!(["spawn", "list", "get_result", "send_message"])
+            serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"])
         );
     }
 }

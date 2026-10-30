@@ -2191,7 +2191,7 @@ pub(crate) fn generate_insights(
         insights.push(Insight {
             severity: "info".into(),
             kind: InsightKind::EmptySession,
-            message: "Empty session — no events recorded".into(),
+            message: "No observation events recorded in this view".into(),
             evidence: "0 events".into(),
         });
     }
@@ -4454,7 +4454,11 @@ mod tests {
     fn insight_empty_session() {
         let overview = make_overview(0, 0, vec![], 0, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(insights.iter().any(|i| i.message.contains("Empty session")));
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.message == "No observation events recorded in this view")
+        );
     }
 
     #[test]

@@ -155,6 +155,71 @@ fn target() -> SocketAddr {
 }
 
 #[tokio::test]
+async fn proxy_stream_has_no_hidden_total_deadline() {
+    let tls = test_tls();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (frames, mut incoming_frames) = mpsc::channel::<String>(1);
+    let server_tls = tls.server.clone();
+    let origin_task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream = tokio_rustls::TlsAcceptor::from(server_tls)
+            .accept(socket)
+            .await
+            .unwrap();
+        read_head(&mut stream).await.unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        while let Some(frame) = incoming_frames.recv().await {
+            stream
+                .write_all(format!("{:x}\r\n{frame}\r\n", frame.len()).as_bytes())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let (proxy, _forwarded, proxy_task) = mock_proxy("http", &tls, address, false).await;
+    let client = client(
+        &endpoint(),
+        &[target()],
+        proxy,
+        super::super::transport_builder().add_root_certificate(tls.certificate.clone()),
+    )
+    .await
+    .unwrap();
+    frames.send("data: start\n\n".into()).await.unwrap();
+    let mut response = client.get("https://byok.test/v1").send().await.unwrap();
+    assert_eq!(response.chunk().await.unwrap().unwrap(), "data: start\n\n");
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::pause();
+    for index in 1..=40 {
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let frame = format!("data: part-{index}\n\n");
+        frames.send(frame.clone()).await.unwrap();
+        assert_eq!(
+            response
+                .chunk()
+                .await
+                .expect("active proxy stream")
+                .unwrap(),
+            frame
+        );
+    }
+    drop(frames);
+    assert!(response.chunk().await.unwrap().is_none());
+    clock_guard.abort();
+    tokio::time::resume();
+    drop(client);
+    origin_task.await.unwrap();
+    proxy_task.abort();
+}
+
+#[tokio::test]
 async fn http_https_and_socks_proxies_preserve_tls_host_auth_and_streaming() {
     for scheme in ["http", "https", "socks5", "socks5h"] {
         let tls = test_tls();

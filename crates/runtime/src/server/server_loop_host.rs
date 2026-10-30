@@ -30177,8 +30177,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn edge_profile_full_deferred_contract_reaches_search_admission_and_offer() {
+    async fn selected_weather_deferred_contract_fixture() -> (
+        tempfile::TempDir,
+        ServerAgenticLoopHost,
+        Arc<crate::server::runtime_tool_executor::RuntimeToolExecutor>,
+        AgenticLoopState,
+        Vec<u8>,
+        Value,
+    ) {
         let tool_name = "mcp__weather__forecast";
         let (schema, mut edge_profile) = weather_deferred_contract_fixture();
         edge_profile.insert(
@@ -30265,6 +30271,14 @@ mod tests {
                 )
             }
         });
+        (dir, host, executor, state, wire_bytes, carrier)
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_reaches_search_admission_and_offer() {
+        let (_dir, mut host, executor, mut state, wire_bytes, carrier) =
+            selected_weather_deferred_contract_fixture().await;
+        let tool_name = "mcp__weather__forecast";
         let admitted = host.resolve_deferred_tool_admission(
             &state,
             crate::turn::agentic::tool_interception::admit_tool_calls(
@@ -30394,7 +30408,13 @@ mod tests {
         assert_eq!(selected_offer.provider_id, "edge-2");
         assert_eq!(selected_offer.route, ToolExecutionRouteKind::EdgeBound);
         assert!(selected_offer.schema_digest.is_some());
+    }
 
+    async fn check_weather_descriptor_invalidations(identity_variants: bool) {
+        let (_dir, mut host, _executor, mut state, _wire_bytes, carrier) =
+            selected_weather_deferred_contract_fixture().await;
+        host.executor_binding.executor_id = "edge-2".to_string();
+        host.visible_turn_tools(&mut state);
         let current_selection = state.deferred_tool_activations[0].clone();
         let mut missing_descriptor = current_selection.clone();
         missing_descriptor.descriptor = None;
@@ -30414,12 +30434,12 @@ mod tests {
             .unwrap()
             .descriptor_version =
             astra_turn_types::DescriptorVersion::new("changed-contract-version").unwrap();
-        for invalid in [
-            missing_descriptor,
-            changed_selection,
-            changed_native,
-            changed_version,
-        ] {
+        let variants = if identity_variants {
+            vec![changed_native, changed_version]
+        } else {
+            vec![missing_descriptor, changed_selection]
+        };
+        for invalid in variants {
             state.deferred_tool_activations = vec![invalid.clone()];
             host.visible_turn_tools(&mut state);
             assert_eq!(state.deferred_tool_activations, vec![invalid]);
@@ -30433,6 +30453,26 @@ mod tests {
             assert!(denied.admitted.is_empty());
             assert_eq!(denied.rejected.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_rejects_missing_or_changed_digest() {
+        check_weather_descriptor_invalidations(false).await;
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_rejects_changed_native_or_version() {
+        check_weather_descriptor_invalidations(true).await;
+    }
+
+    #[tokio::test]
+    async fn edge_profile_full_deferred_contract_cannot_rebind_when_restricted_or_offline() {
+        let (_dir, mut host, _executor, mut state, _wire_bytes, carrier) =
+            selected_weather_deferred_contract_fixture().await;
+        let tool_name = "mcp__weather__forecast";
+        host.executor_binding.executor_id = "edge-2".to_string();
+        host.visible_turn_tools(&mut state);
+        let current_selection = state.deferred_tool_activations[0].clone();
         for restricted in [true, false] {
             state.deferred_tool_activations = vec![current_selection.clone()];
             host.executor_binding.executor_id = "edge-3".to_string();
@@ -32404,12 +32444,18 @@ mod tests {
             .expect("final server agent schema");
         assert_eq!(
             agent.pointer("/function/parameters/properties/action/enum"),
-            Some(&json!(["spawn", "list", "get_result", "send_message"]))
+            Some(&json!([
+                "spawn",
+                "list",
+                "get_result",
+                "wait",
+                "send_message"
+            ]))
         );
         assert!(
             agent
                 .pointer("/function/parameters/properties/timeout_ms")
-                .is_none()
+                .is_some()
         );
         assert!(
             agent
@@ -32668,12 +32714,12 @@ mod tests {
             .expect("ordinary spawn is resident when delegation is authorized");
         assert_eq!(
             resident["function"]["parameters"]["properties"]["action"]["enum"],
-            json!(["spawn", "list", "get_result", "send_message"])
+            json!(["spawn", "list", "get_result", "wait", "send_message"])
         );
         assert!(
             resident
                 .pointer("/function/parameters/properties/timeout_ms")
-                .is_none()
+                .is_some()
         );
         assert!(!host.current_deferred_tool_names.contains("agent"));
         let result = executor
@@ -32719,11 +32765,14 @@ mod tests {
                 ),
             );
             ServerAgenticLoopHost::reject_calls_outside_wire_schema(&mut admission, &visible);
-            assert_eq!(admission.admitted.len(), usize::from(deferred));
-            assert_eq!(admission.rejected.len(), usize::from(!deferred));
+            assert_eq!(admission.admitted.len(), 1);
+            assert!(admission.rejected.is_empty());
+            if !deferred {
+                assert!(admission.admitted[0].activation().is_none());
+            }
             if deferred {
                 let invocation = &admission.admitted[0];
-                assert!(invocation.activation().is_some());
+                assert_eq!(invocation.activation().is_some(), targeted);
                 assert_eq!(
                     astra_turn_core::tool::args::shape::tool_call_arguments_value(
                         invocation.logical_target_call()
@@ -46732,6 +46781,90 @@ mod tests {
                 .result
                 .contains("unresolved_work_validation")
         );
+    }
+
+    #[test]
+    fn declared_verifier_recovery_gates_work_delivery_at_the_server_boundary() {
+        let mut host = test_host_builder("u-declared-check", "s-declared-check")
+            .with_edge_tools(sample_edge_tools())
+            .with_execution_binding_snapshot(edge_runtime_snapshot())
+            .with_work_item_attempt_bound(true)
+            .build();
+        let delivered = json!({"id":"settle", "type":"function", "function":{
+            "name":"settle_work_item", "arguments":r#"{"outcome":"delivered","summary":"checked"}"#
+        }});
+        for command in [
+            "python3 -c 'assert 1 == 1'",
+            "python3 - <<'PY'\nassert 1 == 1\nPY",
+        ] {
+            let args = json!({"command":command, "mode":"verify"});
+            let record = |ok| {
+                let mut record = validation_record(command, ok);
+                record.args_full = Some(args.to_string());
+                record.runtime_args_full = record.args_full.clone();
+                record.workspace_mutation_scope =
+                    Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+                if ok {
+                    record.workspace_mutation_receipt = astra_tools::workspace_observation::explicit_workspace_verification_receipt()
+                        .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+                }
+                record
+            };
+            let mut state = create_test_state();
+            state.stall.tool_call_records.push(record(false));
+            assert!(
+                host.admit_terminal_tool_calls_with_completion(
+                    &mut state,
+                    std::slice::from_ref(&delivered),
+                    Some("tool_calls")
+                )
+                .is_empty(),
+                "{command}: failed check must block delivery"
+            );
+            assert!(
+                host.pending_tool_call_admission
+                    .take()
+                    .unwrap()
+                    .rejected
+                    .iter()
+                    .any(|call| call.result.contains("unresolved_work_validation"))
+            );
+            state.stall.tool_call_records.push(record(true));
+            assert_eq!(
+                host.admit_terminal_tool_calls_with_completion(
+                    &mut state,
+                    std::slice::from_ref(&delivered),
+                    Some("tool_calls")
+                ),
+                vec![delivered.clone()],
+                "{command}: exact successful retry must allow delivery"
+            );
+            host.pending_tool_call_admission.take();
+
+            let mut state = create_test_state();
+            let pending = json!({"id":"check", "type":"function", "function":{
+                "name":"bash", "arguments":args.to_string()
+            }});
+            let admitted = host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                &[pending, delivered.clone()],
+                Some("tool_calls"),
+            );
+            assert!(
+                !admitted
+                    .iter()
+                    .any(|call| call["function"]["name"] == "settle_work_item"),
+                "{command}: same-batch check has no outcome yet"
+            );
+            assert!(
+                host.pending_tool_call_admission
+                    .take()
+                    .unwrap()
+                    .rejected
+                    .iter()
+                    .any(|call| call.result.contains("work_validation_pending"))
+            );
+        }
     }
 
     #[test]

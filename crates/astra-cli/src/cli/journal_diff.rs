@@ -259,11 +259,11 @@ impl<'a> TerminalIndex<'a> {
     }
 }
 
-/// Non-empty per-call observations from rounds and standalone failures.
-fn round_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
+/// Per-call observations, including callback results with uncertain delivery.
+fn observed_calls(e: &JournalEvent) -> Option<&Vec<ToolCallRecord>> {
     matches!(
         e.event_type,
-        JournalEventType::LlmRound | JournalEventType::ToolCallError
+        JournalEventType::LlmRound | JournalEventType::ToolCallError | JournalEventType::SyncMarker
     )
     .then_some(e.tool_calls.as_ref())
     .flatten()
@@ -346,7 +346,7 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
         }
     }
     for (idx, event) in events.iter().enumerate() {
-        let Some(calls) = round_calls(event) else {
+        let Some(calls) = observed_calls(event) else {
             continue;
         };
         let normalized = normalized_error(events, &index, &round_positions, idx);

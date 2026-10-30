@@ -56,6 +56,499 @@ fn basic_chat_context<'a>(
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
 #[tokio::test]
+#[serial_test::serial]
+async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
+    use astra_turn_core::interruption::{
+        InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+    };
+    let interruption = InterruptionRecord::new(
+        InterruptionKind::ExecutionIncomplete,
+        ResumeAction::ContinueImmediately,
+        InterruptionStateSummary::default(),
+    );
+    #[derive(Clone, Copy)]
+    enum Terminal {
+        Failed,
+        Interrupted,
+        Mismatched,
+        Completed,
+        CallbackFailed,
+        CallbackFailedWithExpired,
+        AdmissionRejected,
+        AdmissionAndCallbackFailed,
+        CancelledDuringCallback,
+        ConflictingIdentities,
+    }
+    use Terminal::*;
+    for (terminal_kind, reported_count, root_callbacks, child_callbacks) in [
+        (Interrupted, Some(4), 0, 0),
+        (Failed, Some(4), 0, 0),
+        (Interrupted, None, 0, 0),
+        (Failed, None, 0, 0),
+        (Failed, Some(4), 1, 0),
+        (Failed, None, 1, 0),
+        (Interrupted, Some(4), 1, 0),
+        (Interrupted, None, 1, 0),
+        // A lower-bound count must not repair the original receipt mismatch.
+        (Mismatched, Some(1), 2, 0),
+        // Child callbacks use the same transport, but belong to a different run.
+        (Completed, Some(2), 1, 3),
+        (Failed, None, 1, 3),
+        (Interrupted, None, 1, 3),
+        (CallbackFailed, None, 0, 2),
+        (CallbackFailedWithExpired, None, 0, 2),
+        (AdmissionRejected, Some(1), 1, 1),
+        (AdmissionAndCallbackFailed, None, 0, 2),
+        (CancelledDuringCallback, None, 1, 1),
+        (ConflictingIdentities, None, 1, 3),
+    ] {
+        let callback_failed = matches!(
+            terminal_kind,
+            CallbackFailed
+                | CallbackFailedWithExpired
+                | AdmissionAndCallbackFailed
+                | ConflictingIdentities
+        );
+        let admission_rejected = matches!(
+            terminal_kind,
+            AdmissionRejected | AdmissionAndCallbackFailed
+        );
+        let cancel_during_callback = matches!(terminal_kind, CancelledDuringCallback);
+        let conflicting_identities = matches!(terminal_kind, ConflictingIdentities);
+        let cancellation = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        let callback_cancel = cancellation.clone();
+        let expired_child = matches!(terminal_kind, CallbackFailedWithExpired);
+        let classified = matches!(terminal_kind, Failed);
+        let mismatched_summary = matches!(terminal_kind, Mismatched);
+        let completed = matches!(terminal_kind, Completed | AdmissionRejected);
+        let request_count = root_callbacks + child_callbacks;
+        let callback_count =
+            request_count - u32::from(admission_rejected || cancel_during_callback);
+        let temp = tempfile::tempdir().unwrap();
+        let _journal_guard = ProcessJournalDirGuard::new(temp.path());
+        let path = temp.path().join("evidence.txt");
+        std::fs::write(
+            &path,
+            "first evidence\nsecond evidence\nthird evidence\nfourth evidence\n",
+        )
+        .unwrap();
+        let child_marker = temp.path().join("cancelled-child-must-not-write");
+        let callback_done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let terminal = if classified {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_kind":"network", "error_code":"network", "error":"connection lost"})
+        } else if mismatched_summary {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"paused"})
+        } else {
+            serde_json::json!({"type":"run_finished","run_id":"partial-run","owner_generation":1,"status":"failed", "error_code":"execution_incomplete","error_kind":null,"error":interruption.user_message,"interruption":interruption.to_json()})
+        };
+        let mut usage = serde_json::json!({"type":"usage","usage_scope":"run_total","input_tokens":12,"output_tokens":3});
+        if let Some(count) = reported_count {
+            usage["tool_call_count"] = serde_json::json!(count);
+        }
+        let prefix = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"session_info","session_id":"partial-session","run_id":"partial-run"})
+        );
+        let request = serde_json::json!({
+            "type":"tool_request", "session_id":"partial-session", "run_id":"partial-run",
+            "turn_chain_id":"partial-chain", "request_id":"read-1", "schema_admitted_by_server":true,
+            "execution_timeout_ms":300_000, "command_timeout_cap_ms":30_000,
+            "execution_deadline_unix_ms":4_102_444_800_000_u64,
+            "tool":"read_file", "args":{"path":path.to_str().unwrap()}
+        });
+        let mut prefix = prefix;
+        for index in 0..request_count {
+            let mut request = request.clone();
+            request["request_id"] = serde_json::json!(format!("read-{index}"));
+            if index >= root_callbacks {
+                request["run_id"] = serde_json::json!("child-run");
+                request["session_id"] = serde_json::json!(if callback_failed
+                    || admission_rejected
+                    || cancel_during_callback
+                {
+                    "partial-session"
+                } else {
+                    "child-session"
+                });
+            }
+            request["args"]["start_line"] = serde_json::json!(index + 1);
+            request["args"]["end_line"] = serde_json::json!(index + 1);
+            if expired_child && index == 1 {
+                request["execution_deadline_unix_ms"] = serde_json::json!(1);
+            }
+            if admission_rejected && index + 1 == request_count {
+                request["tool"] = serde_json::json!("unavailable_tool");
+                request["args"] = serde_json::json!({});
+            }
+            if cancel_during_callback {
+                if index == 0 {
+                    request["tool"] = serde_json::json!("bash");
+                    request["args"] = serde_json::json!({"command":"printf first"});
+                } else {
+                    request["tool"] = serde_json::json!("write_file");
+                    request["args"] =
+                        serde_json::json!({"path":child_marker, "content":"must not execute"});
+                }
+            }
+            if conflicting_identities {
+                request["request_id"] =
+                    serde_json::json!(["root-x", "child-y", "child-y", "root-x"][index as usize]);
+                request["run_id"] = serde_json::json!(
+                    ["partial-run", "child-a", "child-b", "child-c"][index as usize]
+                );
+            }
+            prefix.push_str(&format!("data: {request}\n\n"));
+        }
+        let mut suffix = [
+            serde_json::json!({"type":"text_done","full_text":"Partial result.","partial":true}),
+            usage,
+            terminal,
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        if mismatched_summary {
+            let wire = sse_text_response_with_execution_summary(
+                "Partial result.",
+                "partial-session",
+                2,
+                2,
+                &["read_file"],
+                1,
+                ("partial-run", 1),
+            );
+            let mut summary = wire
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|event| event["type"] == "turn_complete")
+                .unwrap();
+            summary["tool_calls_count"] = serde_json::json!(1);
+            summary["observation_tool_calls_count"] = serde_json::json!(1);
+            summary["execution_state"] = serde_json::json!({"status":"interrupted","interruption_kind":"execution_incomplete"});
+            summary["interruption"] = interruption.to_json();
+            suffix.push_str(&format!("data: {summary}\n\n"));
+        }
+        if completed {
+            let count = reported_count.unwrap();
+            suffix = sse_text_response_with_execution_summary(
+                "Partial result.",
+                "partial-session",
+                count,
+                count,
+                if count == 0 { &[] } else { &["read_file"] },
+                1,
+                ("partial-run", 1),
+            );
+        }
+        let callback_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies_for_route = callback_bodies.clone();
+        let callbacks_received = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let notify = callback_done.clone();
+        let received_for_route = callbacks_received.clone();
+        let app =
+            Router::new()
+                .route(
+                    "/chat/stream",
+                    post(move || {
+                        let prefix = prefix.clone();
+                        let suffix = suffix.clone();
+                        let notify = notify.clone();
+                        async move {
+                            use futures_util::StreamExt;
+                            let chunks = futures_util::stream::once(async move {
+                                Ok::<_, std::io::Error>(prefix)
+                            })
+                            .chain(futures_util::stream::once(async move {
+                                if callback_count > 0 && !callback_failed {
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        notify.notified(),
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                                if callback_failed {
+                                    std::future::pending::<()>().await;
+                                }
+                                Ok::<_, std::io::Error>(suffix)
+                            }));
+                            (TEST_SSE_HEADERS, axum::body::Body::from_stream(chunks))
+                        }
+                    }),
+                )
+                .route(
+                    "/tools/result",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let callback_cancel = callback_cancel.clone();
+                        let bodies = bodies_for_route.clone();
+                        let notify = callback_done.clone();
+                        let callbacks_received = received_for_route.clone();
+                        async move {
+                            bodies.lock().unwrap().push(body);
+                            // Cancel while the first callback is in flight, before its HTTP acknowledgement.
+                            if cancel_during_callback {
+                                callback_cancel.cancel();
+                            }
+                            if callbacks_received.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                + 1
+                                == callback_count
+                            {
+                                notify.notify_one();
+                            }
+                            (
+                                if callback_failed {
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                                } else {
+                                    axum::http::StatusCode::OK
+                                },
+                                Json(serde_json::json!({"ok":!callback_failed})),
+                            )
+                        }
+                    }),
+                );
+        let app = app.route(
+            "/chat/runs/{run_id}",
+            axum::routing::delete(|| async {
+                Json(serde_json::json!({"run_id":"partial-run", "status":"cancelled"}))
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "review results");
+        let mut pm = PermissionManager::new(true);
+        let mut params = ChatTurnParams::basic_cli(&context, "fake-token", None, &mut pm);
+        if cancel_during_callback {
+            params.cancel_token = Some(cancellation.clone());
+        }
+        let result = stream_chat_sse(params).await;
+        if conflicting_identities {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 0);
+            assert!(failure.partial.tool_call_records.is_empty());
+            assert!(callback_bodies.lock().unwrap().is_empty());
+            let events = session_journal::read_journal("partial-session").unwrap();
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.tool_calls.as_ref().is_none_or(Vec::is_empty))
+            );
+            continue;
+        }
+        if cancel_during_callback {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 1);
+            assert_eq!(failure.partial.tool_call_records.len(), 1);
+            assert_eq!(failure.partial.tool_call_records[0].name, "bash");
+            assert!(!child_marker.exists());
+            assert_eq!(callback_bodies.lock().unwrap().len(), 1);
+            let events = session_journal::read_journal("partial-session").unwrap();
+            let observations = events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SyncMarker)
+                .collect::<Vec<_>>();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(
+                observations[0].producer_scope.as_ref().unwrap().run_id,
+                "child-run"
+            );
+            let records = observations[0].tool_calls.as_ref().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].name, "write_file");
+            assert!(!records[0].was_executed());
+            assert!(observations[0].tool_count.is_none());
+            assert!(observations[0].tool_outcomes.is_none());
+            continue;
+        }
+        if admission_rejected {
+            let bodies = callback_bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1, "surface refusal sends no callback");
+            assert_eq!(bodies[0]["request_id"], "read-0");
+            if !callback_failed {
+                assert_eq!(bodies[0]["run_id"], "partial-run");
+                let events = session_journal::read_journal("partial-session").unwrap();
+                let observations = events
+                    .iter()
+                    .filter(|event| event.event_type == JournalEventType::SyncMarker)
+                    .collect::<Vec<_>>();
+                assert_eq!(observations.len(), 1);
+                let observation = observations[0];
+                let records = observation.tool_calls.as_ref().unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].tool_call_id.as_deref(), Some("read-1"));
+                assert!(!records[0].was_executed());
+                assert!(records[0].execution_completion.is_none());
+                assert_eq!(
+                    observation.producer_scope.as_ref().unwrap().run_id,
+                    "child-run"
+                );
+                assert!(observation.tool_count.is_none());
+                assert!(observation.tool_outcomes.is_none());
+            }
+        }
+        if callback_failed {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.tool_calls_count, 0);
+            assert!(failure.partial.tool_call_records.is_empty());
+            let events = session_journal::read_journal("partial-session").unwrap();
+            let observation = events
+                .iter()
+                .find(|event| event.event_type == JournalEventType::SyncMarker)
+                .unwrap();
+            assert_eq!(
+                observation.producer_scope.as_ref().unwrap().run_id,
+                "child-run"
+            );
+            assert!(observation.tool_count.is_none());
+            assert!(observation.tool_outcomes.is_none());
+            let records = observation.tool_calls.as_ref().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(records[0].ok);
+            let unexecuted_child = expired_child || admission_rejected;
+            assert_eq!(records[1].ok, !unexecuted_child);
+            assert_eq!(records[1].was_executed(), !unexecuted_child);
+            assert!(
+                records[1]
+                    .result_full
+                    .as_ref()
+                    .unwrap()
+                    .contains(if expired_child {
+                        "deadline expired"
+                    } else if admission_rejected {
+                        "unavailable_tool"
+                    } else {
+                        "second evidence"
+                    })
+            );
+            // The first executed result was posted; the sibling observation is retained once.
+            assert_eq!(
+                callbacks_received.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            let mut root_error = session_journal::JournalEvent::turn_error(
+                Some("partial-session"),
+                1,
+                None,
+                "request",
+                "callback failed",
+                1,
+            )
+            .with_producer_scope(Some("partial-run"));
+            crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
+                &mut root_error,
+                &failure.partial,
+            );
+            session_journal::JournalWriter::new("partial-session")
+                .unwrap()
+                .append(&root_error)
+                .unwrap();
+            let diff = crate::cli::journal_diff::compute_diff("partial-session", "partial-session")
+                .unwrap();
+            let executed = if unexecuted_child { 1 } else { 2 };
+            assert_eq!(diff.a_tool_calls_executed, executed);
+            assert_eq!(diff.a_tool_sequence, vec!["read_file"; executed as usize]);
+            assert!(!diff.a_tool_sequence_complete);
+            let digest = crate::cli::journal_digest::build_digest(
+                "partial-session",
+                crate::cli::journal_digest::DigestFocus::All,
+            )
+            .unwrap();
+            assert_eq!(digest.aggregates.total_tool_calls, 0);
+            continue;
+        }
+        if classified {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.partial.partial_text, "Partial result.");
+            assert_eq!(
+                failure.partial.tool_calls_count,
+                reported_count.unwrap_or(0).max(root_callbacks)
+            );
+            assert_eq!(
+                failure.partial.tool_call_records.len(),
+                root_callbacks as usize
+            );
+            if root_callbacks > 0 {
+                assert!(failure.partial.tool_call_records[0].ok);
+            }
+            assert!(failure.partial.tool_outcomes.is_none());
+            assert!(failure.partial.failed_run_terminal.is_some());
+            let sid = "failed-root-projection";
+            let mut event = session_journal::JournalEvent::turn_error(
+                Some(sid),
+                1,
+                None,
+                "request",
+                "connection lost",
+                1,
+            );
+            crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
+                &mut event,
+                &failure.partial,
+            );
+            session_journal::JournalWriter::new(sid)
+                .unwrap()
+                .append(&event)
+                .unwrap();
+            let digest = crate::cli::journal_digest::build_digest(
+                sid,
+                crate::cli::journal_digest::DigestFocus::All,
+            )
+            .unwrap();
+            assert_eq!(
+                digest.aggregates.total_tool_calls,
+                u64::from(root_callbacks)
+            );
+            assert_eq!(
+                digest.aggregates.total_fresh_tool_calls,
+                u64::from(root_callbacks)
+            );
+            continue;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.full_text, "Partial result.");
+        assert_eq!(
+            result.tool_calls_count,
+            reported_count.unwrap_or(0).max(root_callbacks)
+        );
+        if completed {
+            assert!(result.interruption.is_none());
+            assert_eq!(
+                result.canonical_tool_outcomes().unwrap().requested,
+                reported_count.unwrap()
+            );
+            assert_eq!(result.tool_call_records.len(), root_callbacks as usize);
+            continue;
+        }
+        assert!(result.canonical_tool_outcomes().is_none());
+        if mismatched_summary {
+            assert_eq!(result.llm_rounds, Some(1));
+        }
+        assert_eq!(result.tool_call_records.len(), root_callbacks as usize);
+        if root_callbacks > 0 {
+            assert!(result.tool_call_records[0].ok);
+        }
+        assert!(result.tool_record_coverage_partial);
+        assert!(result.interruption.is_some());
+        let mut event = session_journal::JournalEvent::turn(
+            None,
+            1,
+            None,
+            "request",
+            &result.full_text,
+            result.tool_calls_count,
+            0,
+            0,
+            0,
+        )
+        .with_tool_calls(result.tool_call_records.clone());
+        result.apply_canonical_tool_outcomes(&mut event);
+        assert!(event.tool_outcomes.is_none());
+        assert!(event.tool_count.is_none());
+    }
+}
+
+#[tokio::test]
 async fn server_admission_cancelled_during_bearer_resolution_never_dispatches_a_new_attempt() {
     use std::sync::{
         Arc,
@@ -2139,9 +2632,12 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
                     result.expect_err("completed callback cannot authorize an unfinished run");
                 assert_eq!(failure.partial.partial_text, "MCP done!");
                 assert_eq!(failure.partial.tool_call_records.len(), 1);
-                let outcomes = failure.partial.tool_outcomes.unwrap();
-                assert_eq!(outcomes.executed, 1);
-                assert_eq!(outcomes.succeeded, 1);
+                assert_eq!(failure.partial.tool_calls_count, 1);
+                assert!(failure.partial.tool_call_records[0].ok);
+                assert!(
+                    failure.partial.tool_outcomes.is_none(),
+                    "a callback is not a complete Server ledger"
+                );
                 assert!(
                     !failure
                         .partial

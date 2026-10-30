@@ -4011,7 +4011,7 @@ mod tests {
         assert!(
             result
                 .output
-                .contains("turns=session_turn=3 llm_rounds_completed=3 slice_boundary=13 slice_remaining=10 absolute_round_ceiling=none"),
+                .contains("turns=current_turn=3 llm_rounds_completed=3 slice_boundary=13 slice_remaining=10 absolute_round_ceiling=none"),
             "{}",
             result.output
         );

@@ -390,9 +390,11 @@ configuration cannot repair it. Physical attempts remain separately accounted.
   the complete canonical group. An early slot query does not require another
   query after all group results have been observed at the completion barrier.
   Failed or unobserved terminal results still block completion. When the
-  parent has no independent work, it proposes a final answer; the existing
-  completion barrier waits for direct children and resumes synthesis with
-  their results, without shell sleeps, polling, or an extra database read.
+  parent has no independent work, it can call the resident `agent.wait` action
+  for new messages or results, without schema discovery, shell sleeps or polling.
+  Pending questions are answered with their correlation ID before waiting. The
+  existing completion barrier remains the finalization guard; the model does
+  not need to propose an artificial final answer to request a wait.
   Terminal notifications inline complete child output when the existing aggregate
   delivery budget permits, including JSON escaping and envelope overhead. The
   small diagnostic/status preview is not the delivery payload. Output exceeding

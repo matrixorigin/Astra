@@ -42,9 +42,11 @@ use std::sync::LazyLock;
 /// enums, and required fields, while verbose per-parameter prose remains in
 /// the canonical catalog selected through `tool_search`. The extra headroom
 /// covers direct provider-stage and exact collaborator-resume fields; those
-/// are part of the normal spawn contract, not a second discovery path.
+/// are part of the normal spawn contract, not a second discovery path. Direct
+/// waiting and basic diagnostic depth/window fields also belong to this surface;
+/// a sub-kilobyte increase avoids separate discovery/model round trips.
 #[cfg(test)]
-pub(crate) const DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET: usize = 9 * 1024;
+pub(crate) const DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET: usize = 10 * 1024;
 
 /// Default T1 always_load candidate tool names, derived from the single
 /// authority [`astra_runtime_env::ToolSpec`] classification.
@@ -427,8 +429,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "collaborator_id",
                 "max_output_tokens",
                 "agent_id",
-                // Ordinary completion uses the runtime barrier. Explicit
-                // current-run observation stays in the selected full contract.
+                "timeout_ms",
                 "to",
                 "message",
                 "message_type",
@@ -436,12 +437,14 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
             ][..],
             concat!(
                 astra_tools::agent_parent_scope_guidance!(),
-                " Auto results;resume:exact collaborator_id."
+                " Auto results. wait receives messages; answers need request_id. collaborator_id: provider-owned only."
             ),
         ),
         "introspect" => (
             &[
                 "facet",
+                "depth",
+                "horizon",
                 "question",
                 "artifact",
                 "explain",
@@ -534,7 +537,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 actions.retain(|action, _| {
                     matches!(
                         action.as_str(),
-                        "spawn" | "list" | "get_result" | "send_message"
+                        "spawn" | "list" | "get_result" | "wait" | "send_message"
                     )
                 });
                 if key == "x-astra-per-action-allowed" {
@@ -593,7 +596,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
     {
         action.insert(
             "enum".to_string(),
-            serde_json::json!(["spawn", "list", "get_result", "send_message"]),
+            serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"]),
         );
     }
     if name == "ask_user"

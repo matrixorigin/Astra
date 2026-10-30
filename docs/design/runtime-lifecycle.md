@@ -118,6 +118,77 @@ workspace did not change. Parallel verification calls carrying that receipt do
 not invalidate each other's evidence. Opaque commands, failed or malformed
 receipts, and a concurrent writer retain the freshness barrier.
 
+Canonical Go observations include `go test`, `go build`, and `go vet`, with
+literal scope-preserving environment assignments such as `GOWORK=off`. They
+require a positively successful executed result within the bound workspace;
+dry-run, redirected-scope and opaque wrapper forms are not positive proof.
+Environment configuration and ordered validation stages remain part of operation
+identity: a successful vet does not clear a failed test or a failed build/vet
+chain. A literal external scratch setup followed by `&&` may precede a Go check,
+using the existing scratch-scope contract and a concrete bound root. Its entire
+command remains the operation identity, so a bare check cannot clear a failure
+that may have occurred during setup. Shell configuration changes, opaque
+preparation and concurrent setup do not grant this proof. Scratch paths must not
+overlap the workspace in either direction; ancestor setup is rejected even for a
+benign mkdir. Shell configuration writes invalidate later validation proof with
+or without scratch preparation. Plain output and static printf formats using
+literal text, `%s` and `%%` remain neutral; variable-writing or dynamic formats
+do not. Go checks use the complete invocation as identity, including any
+fallible prefix reader or output stage. A recognizable unsafe check retains only
+attempt identity. Sensitive or unscannable invocations reuse the existing opaque
+exact-argument identity, so failures remain debts without copying credentials
+into recovery state. Only an exact retry can resolve a named validation debt;
+an unproven success still needs a separate eligible validation. An explicit
+verify receipt proves workspace freshness under the executor-owned lease,
+successful exit and unchanged fingerprint contract. This declared custom verifier path is
+independent of shell syntax and language. An unsuccessful or unverified custom
+invocation retains exact-argument failure debt until the same invocation produces
+a valid full-scope verify receipt; a changed command or a raw unchanged
+fingerprint cannot clear it. That receipt does not certify which tests ran or
+clear named Work validation debts. A failed custom invocation without an
+authoritative unchanged fingerprint also makes earlier named proof stale. Go
+semantic inference owns inferred observations and named Work validation
+independently; a freshness receipt never overrides an existing named debt. A
+completed custom-verifier failure at a bounded observation may receive one
+retry: active Work binds the exact verifier, while ordinary completion may use
+a different typed observation. Unsettled, partial or changed execution cannot
+authorize this retry. These are invocation receipts under the
+existing trusted executor environment, not a guarantee about inherited tool
+configuration or test counts. Executors enable pipefail for pipelines; commands
+that may disable that setting cannot use the final pipeline stage's success as
+validation evidence. An unchanged Bash fingerprint prevents a false mutation
+barrier but is not, by itself, evidence that any workspace observation or
+requested validation occurred.
+
+An incomplete execution remains a terminal failed Run with preserved partial
+output. Its owner-stamped terminal carries the existing sanitized interruption
+record so thin clients can present the actionable continuation notice without
+inventing a protocol error or treating the partial as success. The existing C0
+terminal receipt owns that sanitized record for both committed live output and
+cold replay; a winning cancellation clears it. Claim and exact-commit recovery
+bind the record to the same public error identity and terminal outcome. Public run errors
+and stored error summaries use that record's user message; detailed runtime
+reasons remain in the owning checkpoint and trace. Clients accept this partial
+closure only when the failed terminal, root identity, generation and interruption
+agree. Missing or conflicting evidence and actual classified errors retain the
+normal failure path.
+Failed-run usage retains its reported tool count. Missing aggregate result
+classes remain absent from the existing class-count map, rather than measured
+zeros; harness criteria cannot satisfy a zero-failure assertion without an
+observed class count.
+A shared callback transport does not merge parent and child accounting. Rejected
+or expired invocations report non-execution at their owning boundary, including
+local binding admission. Delivery failures and unposted binding refusals retain
+child-scoped local observations when stream consumption returns; these records
+certify neither Server settlement nor a complete root result. Local binding
+reconciliation is synchronous, so refusal callbacks cannot delay unrelated
+invocations. The existing unposted-refusal protocol limitation remains: Server
+may wait for its timeout or another terminal boundary. The local marker is not
+crash durability while the stream remains open. Journal diff retains observations
+with incomplete coverage when invocation identity cannot reconcile them.
+Cancellation is checked at dispatch boundaries, including after local approvals
+and earlier callbacks; already-started settlement retains its existing owner.
+
 ## State hierarchy
 
 ```text
@@ -529,8 +600,10 @@ must not clear a failure, and changing a command does not prove equivalence.
 An executed validation-shaped command can retain exact-operation failure debt
 without proving a successful validation when its arguments have ambiguous
 execution semantics. An ambiguous success clears only its own failure debt;
-Work delivery still requires a proof-eligible validation, with one bounded
-direct revalidation opportunity or a truthful failed/blocked settlement.
+named Work validation still requires a proof-eligible validation, with one
+bounded direct revalidation opportunity or a truthful failed/blocked settlement.
+A declared custom verifier is separate: its exact successful verify receipt
+resolves its own failure without inventing a named validation obligation.
 At each completion boundary, the current Work attempt's validation projection
 collects operation debts, freshness and recovery targets together. It is
 short-lived evidence rather than another persisted state or global cache.

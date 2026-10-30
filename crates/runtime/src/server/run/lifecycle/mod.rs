@@ -8083,10 +8083,10 @@ impl AgenticRunLifecycleService {
                         .as_ref()
                         .expect("checked interruption");
                     let code = interruption.kind.label();
-                    let message = interruption
-                        .error_detail
-                        .clone()
-                        .unwrap_or_else(|| format!("execution stopped: {code}"));
+                    // Runtime diagnostics remain in the owning checkpoint and
+                    // trace. Both the live event and durable run projection
+                    // expose the existing actionable interruption message.
+                    let message = interruption.user_message.clone();
                     if !loop_state.final_text.is_empty() {
                         events.push(json!({"event_type":"text_done", "data": {
                             "full_text":loop_state.final_text,
@@ -8101,6 +8101,9 @@ impl AgenticRunLifecycleService {
                     finished["error"] = json!(message);
                     finished["error_code"] = json!(code);
                     finished["error_kind"] = json!(error_kind);
+                    if interruption.kind == InterruptionKind::ExecutionIncomplete {
+                        finished["interruption"] = interruption.public_projection().to_json();
+                    }
                     events.push(json!({"event_type":"run_finished", "data":finished}));
                     (RunStatus::Failed, Some(message))
                 }
@@ -24552,8 +24555,12 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let projected_status = server_subrun_outcome_status(&outcome, &loop_state);
         let durable_status = server_subrun_durable_status(&outcome, &loop_state);
         let interruption_reason = server_subrun_interruption_reason(&loop_state);
-        let durable_error =
-            server_subrun_durable_error(&outcome, projected_status, interruption_reason.as_deref());
+        let durable_error = loop_state.interruption.as_ref()
+            .filter(|interruption| durable_status == STATUS_FAILED
+                && interruption.kind == astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
+                && loop_terminal_error_kind(&outcome, &loop_state).is_none())
+            .map(|interruption| interruption.user_message.clone())
+            .or_else(|| server_subrun_durable_error(&outcome, projected_status, interruption_reason.as_deref()));
         let classified_error_code = outcome.as_ref().err()
             .filter(|_| projected_status == STATUS_FAILED).map(classified_terminal_error_code);
         let durable_error_code = classified_error_code.as_deref()

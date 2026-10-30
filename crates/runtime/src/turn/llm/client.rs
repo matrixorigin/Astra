@@ -170,8 +170,8 @@ const TPM_EXHAUST_DELAY_MS: u64 = 60_000;
 const LLM_CONNECT_TIMEOUT_S: u64 = 30;
 /// Non-stream request hard timeout (seconds). Override: `ASTRA_LLM_NONSTREAM_TIMEOUT_S`.
 const LLM_NONSTREAM_TIMEOUT_S: u64 = 120;
-/// Total budget across all safe retries for a single LLM call (seconds).
-/// Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
+/// Default bound for request startup/retries and ledger I/O (seconds).
+/// `ASTRA_LLM_TOTAL_BUDGET_S` explicitly opts into a whole-call cap.
 const LLM_TOTAL_BUDGET_S: u64 = 300;
 /// Maximum time a streaming inference may go without meaningful text,
 /// reasoning, or authorized tool-call progress. Heartbeats do not refresh it.
@@ -749,19 +749,14 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         let connect = llm_connect_timeout();
-        // This client-level ceiling is only a transport backstop. Derive it
-        // from the same effective provider-attempt configuration so an
-        // operator override cannot be silently capped by the compiled 300s
-        // default. Per-request deadlines remain authoritative below.
-        let total = llm_total_budget().saturating_add(std::time::Duration::from_secs(60));
+        // Body lifetime belongs to the streaming watchdogs or an explicit
+        // invocation budget. A client-wide timeout would cap healthy streams.
         let pool_idle = std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4usize);
         let mut builder = reqwest::Client::builder()
             .connect_timeout(connect)
-            // Use a generous timeout; per-request timeout handled via tokio::time::timeout
-            .timeout(total)
             .pool_max_idle_per_host(pool_idle);
         // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
         // does not auto-read system proxy, so we wire it up explicitly).
@@ -773,7 +768,6 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
                     target: "astra_runtime::llm_client",
                     pool_max_idle_per_host = pool_idle,
                     connect_timeout_s = connect.as_secs(),
-                    total_timeout_s = total.as_secs(),
                     "global LLM HTTP client built"
                 );
                 client
@@ -787,9 +781,7 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
                     error = %e,
                     "failed to build global LLM HTTP client; retrying without pool_max_idle_per_host"
                 );
-                let mut fallback_builder = reqwest::Client::builder()
-                    .connect_timeout(connect)
-                    .timeout(total);
+                let mut fallback_builder = reqwest::Client::builder().connect_timeout(connect);
                 fallback_builder = apply_env_proxy(fallback_builder);
                 match fallback_builder.build() {
                     Ok(client) => client,
@@ -1270,7 +1262,7 @@ struct ControlledProviderAttemptObserver<'a> {
     inner: &'a dyn ProviderAttemptObserver,
     started: Instant,
     work_budget: std::time::Duration,
-    logical_budget: std::time::Duration,
+    logical_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'a>,
 }
 
@@ -1282,7 +1274,11 @@ impl ControlledProviderAttemptObserver<'_> {
     fn remaining_settlement(&self) -> std::time::Duration {
         // The reserve stops provider work early enough to leave time for
         // settlement; it is not a second, shorter deadline for a fast reply.
-        self.logical_budget.saturating_sub(self.started.elapsed())
+        // Without an explicit total limit, settlement gets an independent I/O
+        // budget, regardless of how long the provider streamed.
+        self.logical_budget
+            .map(|budget| budget.saturating_sub(self.started.elapsed()))
+            .unwrap_or_else(llm_total_budget)
     }
 
     fn cancellation_error(&self, stage: &str) -> astra_core::ClassifiedError {
@@ -1966,12 +1962,57 @@ pub(crate) fn llm_nonstream_timeout() -> std::time::Duration {
     ))
 }
 
-/// Total budget across all retries + fallback for a single LLM call. Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
+/// Bound for setup/retries, auxiliary calls and individual ledger operations.
+/// A configured total budget also bounds these phases.
 pub(crate) fn llm_total_budget() -> std::time::Duration {
     std::time::Duration::from_secs(llm_secs_from_env(
         "ASTRA_LLM_TOTAL_BUDGET_S",
         LLM_TOTAL_BUDGET_S,
     ))
+}
+
+/// Only an explicit positive duration enables the stream total deadline.
+pub(crate) fn llm_stream_total_budget() -> Result<Option<Duration>, astra_core::ClassifiedError> {
+    parse_llm_stream_total_budget(std::env::var("ASTRA_LLM_TOTAL_BUDGET_S"))
+}
+
+fn parse_llm_stream_total_budget(
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<Duration>, astra_core::ClassifiedError> {
+    let invalid = || {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "ASTRA_LLM_TOTAL_BUDGET_S must be unset/empty or a positive integer number of seconds within the supported deadline range",
+        )
+    };
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let duration = value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|duration| Instant::now().checked_add(*duration).is_some())
+        .ok_or_else(invalid)?;
+    Ok(Some(duration))
+}
+
+/// A missing deadline disables only this timer, never cancellation or idle checks.
+pub(crate) async fn wait_optional_deadline(deadline: Option<TokioInstant>) -> TokioInstant {
+    match deadline {
+        Some(deadline) => {
+            tokio::time::sleep_until(deadline).await;
+            deadline
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Deadline for producing meaningful semantic progress inside a live provider
@@ -2009,7 +2050,9 @@ pub(crate) enum StreamYieldState {
         last_semantic_activity_at: TokioInstant,
         actionable_delivery_observed: bool,
     },
-    Terminal,
+    Terminal {
+        observed_at: TokioInstant,
+    },
 }
 
 impl StreamYieldState {
@@ -2021,7 +2064,7 @@ impl StreamYieldState {
     }
 
     pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Terminal)
+        matches!(self, Self::Terminal { .. })
     }
 
     pub(crate) fn has_actionable_yield(self) -> bool {
@@ -2044,7 +2087,17 @@ impl StreamYieldState {
                 last_semantic_activity_at,
                 ..
             } => Some(last_semantic_activity_at + timeout),
-            Self::Terminal => None,
+            Self::Terminal { .. } => None,
+        }
+    }
+
+    /// Tail traffic cannot move the deadline established by the first terminal.
+    pub(crate) fn terminal_deadline(self, idle_timeout: Duration) -> Option<TokioInstant> {
+        match self {
+            Self::Terminal { observed_at } => {
+                Some(observed_at + stream_terminal_drain_timeout(idle_timeout))
+            }
+            _ => None,
         }
     }
 
@@ -2080,7 +2133,7 @@ impl StreamYieldState {
                 last_semantic_activity_at: now,
                 actionable_delivery_observed,
             },
-            Self::Terminal => Self::Terminal,
+            terminal @ Self::Terminal { .. } => terminal,
         };
     }
 
@@ -2112,12 +2165,16 @@ impl StreamYieldState {
                     actionable_delivery_observed: true,
                 };
             }
-            Self::Delivering { .. } | Self::Terminal => {}
+            Self::Delivering { .. } | Self::Terminal { .. } => {}
         }
     }
 
     pub(crate) fn mark_terminal(&mut self) {
-        *self = Self::Terminal;
+        if !self.is_terminal() {
+            *self = Self::Terminal {
+                observed_at: TokioInstant::now(),
+            };
+        }
     }
 }
 
@@ -4862,16 +4919,12 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     tool_choice: RuntimeToolChoice,
     total_budget: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    let total_budget = total_budget.unwrap_or_else(|| match tool_choice {
-        RuntimeToolChoice::Auto => llm_total_budget(),
-        RuntimeToolChoice::None => auxiliary_execution_budget(call.purpose, llm_total_budget()),
-    });
-    call_llm_and_collect_with_total_budget(
-        call,
+    let prepared = prepare_streaming_call(call, tool_choice)?;
+    call_prepared_llm_and_collect_with_stream_callback(
+        prepared,
         cancel,
         stream_callback,
         attempt_observer,
-        tool_choice,
         total_budget,
     )
     .await
@@ -4937,7 +4990,6 @@ pub(crate) struct PreparedStreamingCall<'a> {
     authorized_tool_names: HashSet<String>,
     url: String,
     judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
-    tool_choice: RuntimeToolChoice,
     preparation_elapsed: std::time::Duration,
 }
 
@@ -5063,7 +5115,6 @@ pub(crate) fn prepare_streaming_call(
         authorized_tool_names,
         url,
         judgment_provenance,
-        tool_choice,
         preparation_elapsed: preparation_started.elapsed(),
     })
 }
@@ -5083,7 +5134,7 @@ async fn call_llm_and_collect_with_total_budget(
         cancel,
         stream_callback,
         attempt_observer,
-        total_budget,
+        Some(total_budget),
     )
     .await
 }
@@ -5095,9 +5146,11 @@ pub(crate) async fn call_prepared_llm_and_collect_with_stream_callback(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     total_budget: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    let total_budget = total_budget.unwrap_or_else(|| match prepared.tool_choice {
-        RuntimeToolChoice::Auto => llm_total_budget(),
-        RuntimeToolChoice::None => auxiliary_execution_budget(prepared.purpose, llm_total_budget()),
+    let configured_budget = llm_stream_total_budget()?;
+    let total_budget = total_budget.or_else(|| match prepared.purpose {
+        astra_turn_types::InferencePurpose::PrimaryAgent
+        | astra_turn_types::InferencePurpose::SubAgent => configured_budget,
+        purpose => Some(auxiliary_execution_budget(purpose, llm_total_budget())),
     });
     call_prepared_llm_with_total_budget(
         prepared,
@@ -5114,7 +5167,7 @@ async fn call_prepared_llm_with_total_budget(
     cancel: LlmCancel<'_>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
-    total_budget: std::time::Duration,
+    total_budget: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let PreparedStreamingCall {
         purpose,
@@ -5142,8 +5195,11 @@ async fn call_prepared_llm_with_total_budget(
     let model_key = model_name;
     let cooldown = rate_limit_cooldown();
     let logical_total_budget = total_budget;
-    let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
-    let total_budget = logical_total_budget.saturating_sub(settlement_reserve);
+    let stream_budget = logical_total_budget
+        .map(|budget| budget.saturating_sub(llm_mandatory_settlement_reserve(budget)));
+    // Request startup, safe retries and error bodies stay bounded even when
+    // a successful streaming response has no total lifetime cap.
+    let total_budget = stream_budget.unwrap_or_else(llm_total_budget);
     // Count request projection against provider work, while a retained pause
     // or database admission wait keeps its existing separate deadline owner.
     let started = Instant::now() - preparation_elapsed;
@@ -5266,13 +5322,7 @@ async fn call_prepared_llm_with_total_budget(
         let mut req = client.post(&url).header("content-type", "application/json");
         req = apply_provider_auth(req, provider, api_key, header_overrides);
         req = apply_llm_header_overrides(req, header_overrides);
-        // `total_budget` is the provider-work wall-clock bound, not merely a retry-loop
-        // check.  Previously a streaming request without an offering-specific
-        // timeout could remain inside one `send`/response body beyond the
-        // advertised 300s budget, holding an entire foreground fanout group
-        // hostage.  Reqwest carries this timeout into response-body streaming,
-        // while the SSE idle watchdog still provides the more precise
-        // pre/post-progress classification.
+        // Bound response startup separately from a successful streaming body.
         let remaining_total_budget = total_budget.saturating_sub(started.elapsed());
         if remaining_total_budget.is_zero() {
             let error = astra_core::ClassifiedError::new(
@@ -5291,12 +5341,11 @@ async fn call_prepared_llm_with_total_budget(
         let request_deadline = request_timeout
             .map(|timeout| timeout.min(remaining_total_budget))
             .unwrap_or(remaining_total_budget);
-        // Reqwest's request timeout covers the response body as well as
-        // headers. Keep that transport deadline at the hard remaining total;
-        // the offering-specific response-start limit is enforced only by the
-        // `send()` select below. A healthy progressing stream may therefore
-        // outlive its header deadline without outliving total/idle budgets.
-        req = req.timeout(remaining_total_budget);
+        // A request timeout also covers the body. Apply it only when the
+        // caller or deployment explicitly supplied a total budget.
+        if stream_budget.is_some() {
+            req = req.timeout(remaining_total_budget);
+        }
 
         tracing::debug!(
             target: "astra_runtime::llm_client",
@@ -5431,7 +5480,7 @@ async fn call_prepared_llm_with_total_budget(
                     response,
                     model_name,
                     started,
-                    total_budget,
+                    stream_budget,
                     cancel,
                     idle_pre,
                     &authorized_tool_names,
@@ -5624,7 +5673,7 @@ async fn call_prepared_llm_with_total_budget(
                         error: transport_error,
                         partial,
                     }) => {
-                        let kind = if started.elapsed() >= total_budget {
+                        let kind = if stream_budget.is_some_and(|budget| started.elapsed() >= budget) {
                             astra_core::ErrorKind::ProviderDeadline
                         } else {
                             astra_core::ErrorKind::StreamTransport
@@ -5662,7 +5711,7 @@ async fn call_prepared_llm_with_total_budget(
                     byte_stream,
                     model_name,
                     started,
-                    total_budget,
+                    stream_budget,
                     cancel,
                     idle_pre,
                     idle_post,
@@ -5675,7 +5724,7 @@ async fn call_prepared_llm_with_total_budget(
                     byte_stream,
                     model_name,
                     started,
-                    total_budget,
+                    stream_budget,
                     cancel,
                     idle_pre,
                     idle_post,
@@ -5741,7 +5790,7 @@ async fn call_prepared_llm_with_total_budget(
                     return Err(error);
                 }
                 Err(StreamCollectError::Transport { error, partial }) => {
-                    let kind = if started.elapsed() >= total_budget {
+                    let kind = if stream_budget.is_some_and(|budget| started.elapsed() >= budget) {
                         astra_core::ErrorKind::ProviderDeadline
                     } else {
                         astra_core::ErrorKind::StreamTransport
@@ -6122,7 +6171,7 @@ async fn collect_llm_stream_for_wire(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
@@ -6159,7 +6208,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline(
         stream,
         model_name,
         started,
-        llm_total_budget(),
+        llm_stream_total_budget().expect("valid test streaming budget"),
         cancel,
         idle_pre,
         idle_post,
@@ -6174,7 +6223,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
@@ -6235,7 +6284,8 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
-    let provider_work_deadline = started + provider_work_budget;
+    let provider_work_deadline =
+        provider_work_budget.map(|budget| TokioInstant::from_std(started + budget));
     loop {
         if cancel.is_triggered() {
             if yield_state.is_terminal() {
@@ -6252,9 +6302,12 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 ),
             });
         }
-        if !yield_state.is_terminal() && started.elapsed() >= provider_work_budget {
+        if let Some(budget) = provider_work_budget
+            && !yield_state.is_terminal()
+            && started.elapsed() >= budget
+        {
             return Err(StreamCollectError::ProviderWorkDeadline {
-                elapsed_ms: provider_work_budget.as_millis() as u64,
+                elapsed_ms: budget.as_millis() as u64,
                 partial: partial_result(
                     &response_id,
                     &full_text,
@@ -6279,15 +6332,9 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 ),
             });
         }
-        let ordinary_idle = if made_progress { idle_post } else { idle_pre };
-        let idle = if yield_state.is_terminal() {
-            stream_terminal_drain_timeout(ordinary_idle)
-        } else {
-            ordinary_idle
-        };
-        let yield_deadline = yield_state
-            .deadline(semantic_progress_timeout)
-            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
+        let idle = if made_progress { idle_post } else { idle_pre };
+        let terminal_deadline = yield_state.terminal_deadline(idle);
+        let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let item = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -6305,11 +6352,9 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                provider_work_deadline
-            )), if !yield_state.is_terminal() => {
+            deadline = wait_optional_deadline(provider_work_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::ProviderWorkDeadline {
-                    elapsed_ms: provider_work_budget.as_millis() as u64,
+                    elapsed_ms: deadline.duration_since(TokioInstant::from_std(started)).as_millis() as u64,
                     partial: partial_result(
                         &response_id,
                         &full_text,
@@ -6320,7 +6365,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
+            _ = wait_optional_deadline(yield_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::SemanticProgressTimeout {
                     elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                     made_semantic_progress: yield_state.has_actionable_yield(),
@@ -6334,6 +6379,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     ),
                 });
             },
+            _ = wait_optional_deadline(terminal_deadline) => break,
             r = tokio::time::timeout(idle, sse.next()) => match r {
                 Ok(v) => v,
                 Err(_elapsed) => {
@@ -6769,7 +6815,7 @@ async fn collect_anthropic_llm_stream_for_wire(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
@@ -6806,7 +6852,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline(
         stream,
         model_name,
         started,
-        llm_total_budget(),
+        llm_stream_total_budget().expect("valid test streaming budget"),
         cancel,
         idle_pre,
         idle_post,
@@ -6821,7 +6867,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_pre: std::time::Duration,
     idle_post: std::time::Duration,
@@ -6882,7 +6928,8 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
-    let provider_work_deadline = started + provider_work_budget;
+    let provider_work_deadline =
+        provider_work_budget.map(|budget| TokioInstant::from_std(started + budget));
     loop {
         if cancel.is_triggered() {
             if yield_state.is_terminal() {
@@ -6900,9 +6947,12 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                 ),
             });
         }
-        if !yield_state.is_terminal() && started.elapsed() >= provider_work_budget {
+        if let Some(budget) = provider_work_budget
+            && !yield_state.is_terminal()
+            && started.elapsed() >= budget
+        {
             return Err(StreamCollectError::ProviderWorkDeadline {
-                elapsed_ms: provider_work_budget.as_millis() as u64,
+                elapsed_ms: budget.as_millis() as u64,
                 partial: partial_result(
                     &response_id,
                     &full_text,
@@ -6929,15 +6979,8 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                 ),
             });
         }
-        let ordinary_idle = if made_progress { idle_post } else { idle_pre };
-        let idle = if yield_state.is_terminal() {
-            stream_terminal_drain_timeout(ordinary_idle)
-        } else {
-            ordinary_idle
-        };
-        let yield_deadline = yield_state
-            .deadline(semantic_progress_timeout)
-            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
+        let idle = if made_progress { idle_post } else { idle_pre };
+        let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let item = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -6956,11 +6999,9 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                provider_work_deadline
-            )), if !yield_state.is_terminal() => {
+            deadline = wait_optional_deadline(provider_work_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::ProviderWorkDeadline {
-                    elapsed_ms: provider_work_budget.as_millis() as u64,
+                    elapsed_ms: deadline.duration_since(TokioInstant::from_std(started)).as_millis() as u64,
                     partial: partial_result(
                         &response_id,
                         &full_text,
@@ -6972,7 +7013,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
+            _ = wait_optional_deadline(yield_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::SemanticProgressTimeout {
                     elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                     made_semantic_progress: yield_state.has_actionable_yield(),
@@ -7463,7 +7504,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             inner,
             started,
             work_budget: timeout,
-            logical_budget: logical_timeout,
+            logical_budget: Some(logical_timeout),
             cancel: LlmCancel::None,
         });
     let attempt_observer = controlled_attempt_observer
@@ -8790,9 +8831,49 @@ mod tests {
     }
 
     #[test]
-    fn total_budget_default_is_300s() {
+    fn startup_budget_default_is_300s() {
         let dur = llm_total_budget();
         assert_eq!(dur, std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S));
+    }
+
+    #[test]
+    fn streaming_total_budget_configuration_requires_an_explicit_positive_duration() {
+        assert_eq!(
+            parse_llm_stream_total_budget(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        for value in ["", " \t\n"] {
+            assert_eq!(
+                parse_llm_stream_total_budget(Ok(value.to_string())).unwrap(),
+                None
+            );
+        }
+        for (value, seconds) in [("1", 1), (" 60 ", 60)] {
+            assert_eq!(
+                parse_llm_stream_total_budget(Ok(value.to_string())).unwrap(),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        for value in [
+            "0",
+            "-1",
+            "not-a-duration",
+            "18446744073709551616",
+            "18446744073709551615",
+        ] {
+            let error = parse_llm_stream_total_budget(Ok(value.to_string())).unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+            assert!(error.message.contains("ASTRA_LLM_TOTAL_BUDGET_S"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let error = parse_llm_stream_total_budget(Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )))
+            .unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        }
     }
 
     #[test]
@@ -8872,7 +8953,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn default_semantic_progress_timeout_preserves_provider_work_budget() {
+    async fn explicit_provider_work_budget_preserves_terminalization_reserve() {
         for anthropic in [false, true] {
             let source = Box::pin(async_stream::stream! {
                 loop {
@@ -8888,7 +8969,7 @@ mod tests {
                     source,
                     "test-model",
                     started.into_std(),
-                    work,
+                    Some(work),
                     LlmCancel::None,
                     stream_idle_timeout(),
                     stream_idle_timeout_after_progress(),
@@ -8902,7 +8983,7 @@ mod tests {
                     source,
                     "test-model",
                     started.into_std(),
-                    work,
+                    Some(work),
                     LlmCancel::None,
                     stream_idle_timeout(),
                     stream_idle_timeout_after_progress(),
@@ -9092,6 +9173,238 @@ mod tests {
         .expect("response-start timeout must stop applying after headers arrive");
 
         assert_eq!(result.full_text, "first second");
+    }
+
+    #[tokio::test]
+    async fn default_streaming_call_accepts_progress_beyond_six_minutes() {
+        for purpose in [
+            astra_turn_types::InferencePurpose::PrimaryAgent,
+            astra_turn_types::InferencePurpose::SubAgent,
+        ] {
+            for tool_choice in [RuntimeToolChoice::Auto, RuntimeToolChoice::None] {
+                assert_default_streaming_call_accepts_long_output(purpose, tool_choice).await;
+            }
+        }
+    }
+
+    #[test]
+    fn empty_total_budget_environment_keeps_progressing_streams_alive() {
+        for value in ["", " \t\n"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("turn::llm::client::tests::default_streaming_call_accepts_progress_beyond_six_minutes")
+                .arg("--nocapture")
+                .env("ASTRA_LLM_TOTAL_BUDGET_S", value)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "empty total budget must behave as unset:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    async fn assert_default_streaming_call_accepts_long_output(
+        purpose: astra_turn_types::InferencePurpose,
+        tool_choice: RuntimeToolChoice,
+    ) {
+        let (frames, receiver) = tokio::sync::mpsc::channel::<String>(1);
+        let receiver = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let receiver = receiver.clone();
+                async move {
+                    let receiver = receiver.lock().await.take().expect("one request");
+                    let body = stream::unfold(receiver, |mut receiver| async move {
+                        receiver.recv().await.map(|frame| {
+                            (
+                                Ok::<_, std::convert::Infallible>(Bytes::from(frame)),
+                                receiver,
+                            )
+                        })
+                    });
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut call = tokio::spawn(async move {
+            let messages = vec![json!({"role":"user","content":"write a long answer"})];
+            let observer = RecordingAttemptObserver::default();
+            let prepared = prepare_streaming_call(
+                LlmCall {
+                    purpose,
+                    messages: &messages,
+                    tools: &[],
+                    cache_capability: None,
+                    route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        supported_reasoning_efforts: None,
+                        thinking_protocol: None,
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "k",
+                        base_url: &base,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: None,
+                    temperature: None,
+                    thinking: &ThinkingConfig::Off,
+                },
+                tool_choice,
+            )
+            .unwrap();
+            let result = call_prepared_llm_and_collect_with_stream_callback(
+                prepared,
+                LlmCancel::None,
+                Some(&mut |update| {
+                    let _ = updates.send(update);
+                }),
+                Some(&observer),
+                None,
+            )
+            .await;
+            let finished = observer.finished.lock().unwrap().clone();
+            (result, finished)
+        });
+        let frame = |text: &str| {
+            format!(
+                "data: {}\n\n",
+                json!({"choices":[{"delta":{"content":text}}]})
+            )
+        };
+        frames.send(frame("start ")).await.unwrap();
+        received.recv().await.expect("first streamed update");
+        // Keep Tokio from auto-advancing while real loopback I/O is pending.
+        // Advance only after the consumer has observed each text fragment.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::pause();
+        let mut expected = String::from("start ");
+        for index in 1..=40 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            let text = format!("part-{index} ");
+            frames.send(frame(&text)).await.unwrap();
+            tokio::select! {
+                update = received.recv() => {
+                    if update.is_none() {
+                        panic!("healthy stream ended at step {index}: {:?}", call.await);
+                    }
+                }
+                result = &mut call => panic!("healthy stream ended before completion: {result:?}"),
+            }
+            expected.push_str(&text);
+        }
+        frames.send("data: [DONE]\n\n".into()).await.unwrap();
+        drop(frames);
+        let (result, finished) = call.await.unwrap();
+        clock_guard.abort();
+        tokio::time::resume();
+        let result = result.expect("progressing default stream must not have a wall-clock cap");
+        assert_eq!(result.full_text, expected);
+        assert_eq!(
+            finished,
+            vec![(0, astra_services::InferenceTerminalStatus::Succeeded)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_collectors_allow_long_reasoning_but_reject_heartbeat_only_streams() {
+        for anthropic in [false, true] {
+            for meaningful in [true, false] {
+                let activity = if !meaningful {
+                    ": PING\n\n".to_string()
+                } else if anthropic {
+                    format!(
+                        "data: {}\n\n",
+                        json!({"type":"content_block_delta","index":0,
+                        "delta":{"type":"thinking_delta","thinking":"thinking"}})
+                    )
+                } else {
+                    format!(
+                        "data: {}\n\n",
+                        json!({"choices":[{"delta":{"reasoning_content":"thinking"}}]})
+                    )
+                };
+                let terminal = if anthropic {
+                    format!(
+                        "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+                        json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+                        json!({"type":"message_stop"})
+                    )
+                } else {
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]})
+                    )
+                };
+                let source = Box::pin(async_stream::stream! {
+                    for _ in 0..40 {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        yield Ok::<Bytes, reqwest::Error>(Bytes::from(activity.clone()));
+                    }
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(terminal));
+                });
+                let started = TokioInstant::now();
+                let result = if anthropic {
+                    collect_anthropic_llm_stream(
+                        source,
+                        "m",
+                        started.into_std(),
+                        LlmCancel::None,
+                        stream_idle_timeout(),
+                        stream_idle_timeout_after_progress(),
+                        None,
+                    )
+                    .await
+                } else {
+                    collect_llm_stream(
+                        source,
+                        "m",
+                        started.into_std(),
+                        LlmCancel::None,
+                        stream_idle_timeout(),
+                        stream_idle_timeout_after_progress(),
+                        None,
+                    )
+                    .await
+                };
+                if meaningful {
+                    let result =
+                        result.expect("active reasoning must survive the former total deadline");
+                    assert_eq!(result.full_text, "answer");
+                    assert_eq!(result.reasoning, "thinking".repeat(40));
+                    assert_eq!(started.elapsed(), Duration::from_secs(400));
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(StreamCollectError::SemanticProgressTimeout {
+                                elapsed_ms: 300000,
+                                ..
+                            })
+                        ),
+                        "{result:?}"
+                    );
+                    assert_eq!(started.elapsed(), Duration::from_secs(300));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -9996,7 +10309,7 @@ mod tests {
                     source,
                     "test-model",
                     TokioInstant::now().into_std(),
-                    std::time::Duration::from_secs(300),
+                    Some(std::time::Duration::from_secs(300)),
                     LlmCancel::None,
                     std::time::Duration::from_secs(60),
                     std::time::Duration::from_secs(60),
@@ -10032,7 +10345,7 @@ mod tests {
                 source,
                 "test-model",
                 TokioInstant::now().into_std(),
-                std::time::Duration::from_secs(300),
+                Some(std::time::Duration::from_secs(300)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(60),
                 std::time::Duration::from_secs(60),
@@ -10071,7 +10384,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_millis(50),
+                Some(std::time::Duration::from_millis(50)),
                 LlmCancel::None,
                 std::time::Duration::from_millis(20),
                 std::time::Duration::from_millis(20),
@@ -10312,7 +10625,7 @@ mod tests {
             source,
             "test-model",
             started,
-            std::time::Duration::from_millis(30),
+            Some(std::time::Duration::from_millis(30)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10348,7 +10661,7 @@ mod tests {
             source,
             "test-model",
             started,
-            std::time::Duration::from_millis(30),
+            Some(std::time::Duration::from_millis(30)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10391,7 +10704,7 @@ mod tests {
             source,
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10423,7 +10736,7 @@ mod tests {
             source,
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10457,7 +10770,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_secs(1),
+                Some(std::time::Duration::from_secs(1)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
@@ -10478,7 +10791,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_secs(1),
+                Some(std::time::Duration::from_secs(1)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
@@ -10520,7 +10833,7 @@ mod tests {
             Box::pin(source),
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -10690,7 +11003,7 @@ mod tests {
         assert!(state.timed_out(start + std::time::Duration::from_millis(36), timeout));
 
         state.mark_terminal();
-        assert_eq!(state, StreamYieldState::Terminal);
+        assert!(state.is_terminal());
         assert_eq!(state.deadline(timeout), None);
     }
 
@@ -10832,7 +11145,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_secs(30),
+                Some(std::time::Duration::from_secs(30)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
@@ -10883,7 +11196,7 @@ mod tests {
                 source,
                 "test-model",
                 Instant::now(),
-                std::time::Duration::from_secs(30),
+                Some(std::time::Duration::from_secs(30)),
                 LlmCancel::None,
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(1),
@@ -11007,7 +11320,7 @@ mod tests {
             Box::pin(repeated),
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -11043,7 +11356,7 @@ mod tests {
             Box::pin(repeated),
             "test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -11377,6 +11690,7 @@ mod tests {
         let byte_stream =
             stream::iter(vec![Ok(bytes)]).chain(stream::pending::<Result<Bytes, reqwest::Error>>());
 
+        let started = TokioInstant::now();
         let result = collect_llm_stream(
             byte_stream,
             "test-model",
@@ -11391,6 +11705,83 @@ mod tests {
 
         assert_eq!(result.full_text, "done");
         assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_tail_noise_does_not_restart_grace() {
+        for terminal in [
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function",
+                "function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        ] {
+            let repeated_terminal = json!({"choices":[{"delta":{},
+                "finish_reason":terminal["choices"][0]["finish_reason"]}]});
+            for noise in [json!({"choices":[]}), repeated_terminal] {
+                let expected_finish = terminal["choices"][0]["finish_reason"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let terminal_frame = format!("data: {terminal}\n\n");
+                let source = Box::pin(async_stream::stream! {
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(terminal_frame));
+                    for _ in 0..10 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        yield Ok(Bytes::from(format!("data: {noise}\n\n")));
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let started = TokioInstant::now();
+                let result = collect_llm_stream(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    LlmCancel::None,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    None,
+                )
+                .await
+                .expect("completed output must not wait for a noisy open socket");
+                assert_eq!(
+                    result.finish_reason.as_deref(),
+                    Some(expected_finish.as_str())
+                );
+                assert_eq!(started.elapsed(), Duration::from_millis(500));
+                if expected_finish == "tool_calls" {
+                    assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+                    assert_eq!(result.tool_calls[0]["function"]["arguments"], "{}");
+                } else {
+                    assert_eq!(result.full_text, "done");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_tail_preserves_usage_inside_grace() {
+        let source = Box::pin(async_stream::stream! {
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            yield Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n"));
+            std::future::pending::<()>().await;
+        });
+        let started = TokioInstant::now();
+        let result = collect_llm_stream(
+            source,
+            "test-model",
+            started.into_std(),
+            LlmCancel::None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.usage["input_tokens"], 10);
+        assert_eq!(result.usage["output_tokens"], 3);
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
     }
 
     #[tokio::test]
@@ -11797,7 +12188,7 @@ mod tests {
             stream::iter(vec![Ok(Bytes::from(body.clone()))]),
             "deepseek-test",
             Instant::now(),
-            llm_total_budget(),
+            Some(llm_total_budget()),
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
@@ -11814,7 +12205,7 @@ mod tests {
             stream::iter(vec![Ok(Bytes::from(body))]),
             "deepseek-test",
             Instant::now(),
-            llm_total_budget(),
+            Some(llm_total_budget()),
             LlmCancel::None,
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
@@ -12147,13 +12538,33 @@ mod tests {
             inner: &inner,
             started: Instant::now(),
             work_budget: logical_budget - reserve,
-            logical_budget,
+            logical_budget: Some(logical_budget),
             cancel: LlmCancel::None,
         };
         assert!(
             observer.remaining_settlement() > reserve,
             "reserving the final slice must not discard unused provider time"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncapped_stream_terminalization_has_its_own_bounded_io_budget() {
+        let inner = PendingAttemptObserver::default();
+        let observer = ControlledProviderAttemptObserver {
+            inner: &inner,
+            started: Instant::now() - Duration::from_secs(600),
+            work_budget: llm_total_budget(),
+            logical_budget: None,
+            cancel: LlmCancel::None,
+        };
+        let terminal = provider_attempt_terminal_from_result(&LlmCallResult::default());
+        let started = TokioInstant::now();
+        let error = observer
+            .finish_attempt(0, &terminal)
+            .await
+            .expect_err("a stalled ledger must not wait forever after a long stream");
+        assert!(crate::turn::llm::durable::is_ledger_error(&error));
+        assert_eq!(started.elapsed(), llm_total_budget());
     }
 
     #[test]
@@ -12196,7 +12607,7 @@ mod tests {
             inner: &inner,
             started: Instant::now() - std::time::Duration::from_millis(980),
             work_budget: std::time::Duration::from_secs(1),
-            logical_budget: std::time::Duration::from_secs(1),
+            logical_budget: Some(std::time::Duration::from_secs(1)),
             cancel: LlmCancel::None,
         };
         let terminal = provider_attempt_terminal_from_error(&astra_core::ClassifiedError::new(
@@ -12238,7 +12649,7 @@ mod tests {
             inner: &inner,
             started: Instant::now(),
             work_budget: std::time::Duration::from_secs(7),
-            logical_budget: std::time::Duration::from_secs(8),
+            logical_budget: Some(std::time::Duration::from_secs(8)),
             cancel: LlmCancel::Token(&cancel),
         };
         let terminal = provider_attempt_terminal_from_result(&LlmCallResult::default());
@@ -12253,7 +12664,7 @@ mod tests {
             inner: &inner,
             started: Instant::now(),
             work_budget: std::time::Duration::from_millis(20),
-            logical_budget: std::time::Duration::from_millis(25),
+            logical_budget: Some(std::time::Duration::from_millis(25)),
             cancel: LlmCancel::None,
         };
         let prepared = PreparedProviderRequest::from_json(
@@ -12408,7 +12819,7 @@ mod tests {
             inner: &inner,
             started: Instant::now(),
             work_budget: std::time::Duration::from_millis(20),
-            logical_budget: std::time::Duration::from_millis(25),
+            logical_budget: Some(std::time::Duration::from_millis(25)),
             cancel: LlmCancel::None,
         };
         let provider_error = astra_core::ClassifiedError::new(
@@ -19714,7 +20125,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_agent_wire_defers_observation_and_keeps_spawn_required_fields() {
+    fn resident_agent_wire_exposes_wait_and_keeps_spawn_required_fields() {
         let surface = crate::tool_registry::surface::ToolSurface::build(
             astra_tools::schemas::all_tool_schemas(),
             &astra_config::ToolSurfaceConfig::default(),
@@ -19779,9 +20190,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|branch| branch["properties"]["action"]["enum"] != json!(["wait"]))
+                .any(|branch| branch["properties"]["action"]["enum"] == json!(["wait"]))
         );
-        assert!(schema["properties"].get("timeout_ms").is_none());
+        assert!(schema["properties"].get("timeout_ms").is_some());
         let canonical_tools = astra_tools::schemas::all_tool_schemas()
             .into_iter()
             .filter(|tool| tool["function"]["name"] == "agent")
@@ -19813,7 +20224,7 @@ mod tests {
                 &observation,
                 &body["tools"][0],
             )
-            .is_err()
+            .is_ok()
         );
         astra_tools::schemas::validate_tool_arguments_against_schema(
             "agent",

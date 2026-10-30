@@ -243,13 +243,10 @@ async fn bridge(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
     // Only opaque, end-to-end TLS travels through the adapter. Neither proxy
-    // authentication header is forwarded to the model endpoint.
-    tokio::time::timeout(
-        Duration::from_secs(360),
-        tokio::io::copy_bidirectional(&mut incoming, &mut upstream),
-    )
-    .await
-    .map_err(|_| failed("model proxy tunnel deadline"))??;
+    // authentication header is forwarded to the model endpoint. The request
+    // owner enforces idle/cancellation/explicit deadlines; dropping its
+    // EndpointClient also aborts this bridge through the owning JoinSet.
+    tokio::io::copy_bidirectional(&mut incoming, &mut upstream).await?;
     Ok(())
 }
 

@@ -182,6 +182,7 @@ async fn complete_run_fixture(
         error_code: None,
         error_kind: None,
         error_metadata: None,
+        interruption: None,
         context: CanonicalTerminalContext::Unowned,
         transcript: CanonicalTerminalTranscript {
             item_count: 0,
@@ -211,6 +212,7 @@ async fn complete_run_fixture(
                 error_code: None,
                 error_kind: None,
                 error_metadata: None,
+                interruption: None,
                 cancellation_origin: None,
                 prompt_tokens: prompt.unwrap_or(0),
                 completion_tokens: 0,

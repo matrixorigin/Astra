@@ -832,6 +832,15 @@ pub(crate) fn insert_runtime_system_context(
     if runtime_messages.is_empty() {
         return None;
     }
+    // New semantic input belongs after the observations it supersedes. Cache
+    // placement still controls ordinary runtime context, not message chronology.
+    let (semantic_input, runtime_messages): (Vec<_>, Vec<_>) =
+        runtime_messages.into_iter().partition(|message| {
+            message
+                .get(RUNTIME_VOLATILE_KIND_MARKER)
+                .and_then(Value::as_str)
+                .is_some_and(is_semantic_input_authority_kind)
+        });
     let boundary = if matches!(
         placement,
         astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
@@ -840,8 +849,15 @@ pub(crate) fn insert_runtime_system_context(
     } else {
         current_turn_boundary(messages)
     };
+    let has_context = !runtime_messages.is_empty();
     messages.splice(boundary..boundary, runtime_messages);
-    Some(boundary)
+    let semantic_start = messages.len();
+    messages.extend(semantic_input);
+    Some(if has_context {
+        boundary
+    } else {
+        semantic_start
+    })
 }
 
 pub(crate) fn is_runtime_system_context(message: &Value) -> bool {
@@ -4631,6 +4647,42 @@ mod tests {
 
     /// Regression lock: runtime context must keep system authority while the
     /// complete conversation history remains byte-for-byte unchanged.
+    #[test]
+    fn current_agent_input_follows_older_tool_status_in_provider_request() {
+        use astra_turn_core::cache_placement::VolatilePlacement;
+        for placement in [
+            VolatilePlacement::CurrentUserOnly,
+            VolatilePlacement::TailSuffix,
+        ] {
+            for kind in [
+                "mailbox:sha256:question",
+                "background_task_notification:sha256:result",
+            ] {
+                let history = vec![
+                    json!({"role":"system", "content":"agent rules"}),
+                    json!({"role":"user", "content":"Answer the child and report its result"}),
+                    json!({"role":"assistant", "content":null, "tool_calls":[{"id":"call-1", "type":"function", "function":{"name":"agent", "arguments":"{}"}}]}),
+                    json!({"role":"tool", "tool_call_id":"call-1", "content":"still_running"}),
+                ];
+                let mut messages = history.clone();
+                let mut input =
+                    runtime_system_context_message("Child asks which format; reply JSON", true)
+                        .unwrap();
+                mark_runtime_authority(&mut input, kind, RUNTIME_AUTHORITY_CURRENT_USER_TURN);
+                insert_runtime_system_context(&mut messages, vec![input], placement);
+                assert_eq!(&messages[..history.len()], history.as_slice());
+                let wire = crate::turn::llm::client::consolidate_system_messages_for_provider(
+                    &messages, "openai", None,
+                );
+                assert_eq!(wire.last().unwrap()["role"], "user");
+                assert!(message_text(wire.last().unwrap()).contains("Child asks which format"));
+                let tool_index = wire.iter().position(|m| m["role"] == "tool").unwrap();
+                assert_eq!(wire[tool_index - 1]["tool_calls"][0]["id"], "call-1");
+                assert_eq!(wire[tool_index]["content"], "still_running");
+            }
+        }
+    }
+
     #[test]
     fn prefix_provider_places_runtime_context_at_current_turn_boundary() {
         let stable_sys = vec![json!({"role": "system", "content": "stable core rules only"})];

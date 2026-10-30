@@ -129,6 +129,8 @@ class MacRunnerTests(unittest.TestCase):
             self.assertIn("needs: [scope, macos-plan]", section)
             self.assertIn("github.run_attempt > 1", section, "Failed-only reruns must ignore reused mini outputs")
             self.assertIn("'macos-15' || 'ubuntu-latest'", section)
+            self.assertIn('["success","failure","obsolete"]', section,
+                          "Obsolete runs must not allocate hosted Macs")
         self.assertNotIn("pull_request_target:", workflow)
         self.assertNotIn("self-hosted", workflow.split("  vendored-terminal:\n", 1)[1])
 
@@ -138,7 +140,7 @@ class MacRunnerTests(unittest.TestCase):
             section = workflow.split(f"\n  {job}:\n", 1)[1]
             block = section.split("        run: |\n", 1)[1].split("      - ", 1)[0]
             script = "\n".join(line[10:] for line in block.splitlines())
-            for outcome in ("success", "failure", "hosted", "", "skipped"):
+            for outcome in ("success", "failure", "obsolete", "hosted", "", "skipped"):
                 with self.subTest(job=job, outcome=outcome), tempfile.TemporaryDirectory() as directory:
                     result = subprocess.run(["bash", "-c", script], env={
                         **os.environ, "MINI_RESULT": outcome,

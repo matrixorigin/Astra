@@ -1404,6 +1404,7 @@ mod tests {
                     error_code: failed.then(|| "stream_transport".into()),
                     error_kind: failed.then_some(astra_core::ErrorKind::StreamTransport),
                     error_metadata: None,
+                    interruption: None,
                     context: CanonicalTerminalContext::Unowned,
                     transcript: CanonicalTerminalTranscript {
                         item_count: 0,
@@ -1511,6 +1512,7 @@ mod tests {
                 error_code: error_code.map(str::to_owned),
                 error_kind,
                 error_metadata: None,
+                interruption: None,
                 context: CanonicalTerminalContext::Unowned,
                 transcript: CanonicalTerminalTranscript {
                     item_count: 1,

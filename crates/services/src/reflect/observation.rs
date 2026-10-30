@@ -470,7 +470,7 @@ fn build_reflect_summary(
     }
 
     if overview.total_events == 0 {
-        "Empty session - no events recorded yet".to_string()
+        "No observation events recorded in this view".to_string()
     } else if overview.error_count == 0 {
         format!(
             "No classified error events observed across {} events; task completion is not established",

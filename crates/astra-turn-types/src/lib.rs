@@ -50,6 +50,7 @@ mod explain_analyze_projection;
 mod explain_wire;
 pub use explain_wire::decode_explain_analyze_wire;
 mod inference;
+pub mod interruption;
 mod memory_ranking;
 mod memory_structure;
 mod permission_mode;

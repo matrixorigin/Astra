@@ -3,6 +3,7 @@
 //! an execution grant or evidence that an external effect has settled.
 
 use super::*;
+use astra_turn_types::interruption::{InterruptionKind, InterruptionRecord};
 use astra_turn_types::{
     CanonicalTokenUsage, SessionCursorV1, tool_ledger_receipt::ToolLedgerReceipt,
 };
@@ -22,6 +23,7 @@ pub struct CanonicalRunTerminalRequest<'a> {
     pub error_code: Option<&'a str>,
     pub error_kind: Option<astra_core::ErrorKind>,
     pub error_metadata: Option<&'a crate::models::ModelGatewayErrorMetadata>,
+    pub interruption: Option<&'a InterruptionRecord>,
     pub cancellation_origin: Option<DurableCancellationOrigin>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -94,6 +96,7 @@ pub struct CanonicalRunTerminalReceipt {
     /// Source-authored classification, independent of a domain error code.
     pub error_kind: Option<astra_core::ErrorKind>,
     pub error_metadata: Option<crate::models::ModelGatewayErrorMetadata>,
+    pub interruption: Option<InterruptionRecord>,
     pub context: CanonicalTerminalContext,
     pub transcript: CanonicalTerminalTranscript,
     /// None means unavailable evidence. Never manufacture measured zeros.
@@ -197,6 +200,9 @@ impl CanonicalRunTerminalReceipt {
                 data["cancelled"] = true.into();
                 data["cancellation_origin"] = origin.as_str().into();
             }
+            if let Some(interruption) = &self.interruption {
+                data["interruption"] = interruption.to_json();
+            }
             if let Some(usage) = self.usage {
                 for (key, value) in [
                     ("prompt_tokens", usage.input_tokens()),
@@ -262,6 +268,19 @@ impl CanonicalRunTerminalReceipt {
             if !matches!(self.outcome, CanonicalTerminalOutcome::Failed) {
                 return Err("only failed outcomes carry model gateway recovery facts".into());
             }
+        }
+        if let Some(interruption) = &self.interruption
+            && (!matches!(self.outcome, CanonicalTerminalOutcome::Failed)
+                || interruption.kind != InterruptionKind::ExecutionIncomplete
+                || self.error_kind.is_some()
+                || self.error_metadata.is_some()
+                || self.error_code.as_deref() != Some(interruption.kind.label())
+                || interruption.user_message.trim().is_empty()
+                || interruption.error_detail.is_some()
+                || interruption.stall_signal.is_some()
+                || self.error_hash != Self::error_hash(Some(&interruption.user_message)))
+        {
+            return Err("invalid canonical terminal interruption".into());
         }
         if let Some(source) = &self.transcript.assistant_source_event_id
             && (self.transcript.item_count == 0 || source.is_empty() || source.len() > 255)
@@ -561,6 +580,7 @@ impl DatabaseRunStateStore {
             || receipt.error_kind != request.error_kind
             || receipt.error_code.as_deref() != request.error_code
             || receipt.error_metadata.as_ref() != request.error_metadata
+            || receipt.interruption.as_ref() != request.interruption
             || receipt.outcome != CanonicalRunTerminalReceipt::outcome_for_request(request)?
         {
             return Err("canonical terminal request disagrees with its exact receipt".into());
@@ -850,6 +870,9 @@ impl DatabaseRunStateStore {
             || decoded.receipt.run_id != request.run_id
             || decoded.receipt.generation != request.expected_owner_generation
             || decoded.receipt.error_kind != request.error_kind
+            || decoded.receipt.error_code.as_deref() != request.error_code
+            || decoded.receipt.error_metadata.as_ref() != request.error_metadata
+            || decoded.receipt.interruption.as_ref() != request.interruption
             || error_message.as_deref() != request.error_message
             || error_code != expected.error_code
             || opening_hash.as_deref() != Some(expected.opening_hash.as_str())
@@ -957,6 +980,7 @@ mod tests {
                 error_metadata: ModelGatewayErrorMetadata::from_details(
                     details.as_object().unwrap(),
                 ),
+                interruption: None,
                 context: CanonicalTerminalContext::Unowned,
                 transcript: CanonicalTerminalTranscript {
                     item_count: 0,
@@ -970,6 +994,52 @@ mod tests {
             completion_count: 2,
             control_count: 0,
             control_digest: None,
+        }
+    }
+
+    #[test]
+    fn cold_terminal_interruption_requires_coherent_sanitized_outcome() {
+        use astra_turn_types::interruption::{InterruptionStateSummary, ResumeAction};
+        let mut stored = failed_receipt();
+        let record = InterruptionRecord::new(
+            InterruptionKind::ExecutionIncomplete,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary::default(),
+        );
+        stored.receipt.error_kind = None;
+        stored.receipt.error_metadata = None;
+        stored.receipt.error_code = Some(record.kind.label().into());
+        stored.receipt.error_hash =
+            CanonicalRunTerminalReceipt::error_hash(Some(&record.user_message));
+        stored.receipt.interruption = Some(record);
+        let encoded = serde_json::to_string(&stored).unwrap();
+        assert_eq!(
+            CommittedRunTerminalReceipt::decode(&encoded, 2).unwrap(),
+            stored
+        );
+        for (path, value) in [
+            (
+                "/receipt/interruption/error_detail",
+                serde_json::json!("private"),
+            ),
+            (
+                "/receipt/interruption/user_message",
+                serde_json::json!("changed error"),
+            ),
+            (
+                "/receipt/interruption/kind",
+                serde_json::json!("budget_exhausted"),
+            ),
+            ("/receipt/error_kind", serde_json::json!("network")),
+            ("/receipt/error_code", serde_json::json!("other_error")),
+            ("/receipt/outcome/status", serde_json::json!("completed")),
+        ] {
+            let mut corrupt: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            *corrupt.pointer_mut(path).unwrap() = value;
+            assert!(
+                CommittedRunTerminalReceipt::decode(&corrupt.to_string(), 2).is_err(),
+                "{path}"
+            );
         }
     }
 

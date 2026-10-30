@@ -1675,6 +1675,23 @@ impl DatabaseToolInvocationLedger {
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
         let mut tx = connection.begin().await?;
         let (owner_predicate, owner_id) = completion_owner(expected, owner_id, identity)?;
+        // Lock by the full identity before evaluating mutable CAS predicates.
+        // MatrixOne can miss the row lock when a stale composite-PK scan filters
+        // out the current state/owner (matrixorigin/matrixone#31685). Keep these
+        // predicates on the UPDATE, not the locking read. An absent read is not
+        // authoritative either: the UPDATE may observe a newly committed row.
+        sqlx::query(
+            "SELECT state, dispatch_owner FROM tool_invocation_ledger
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
+               AND turn_chain_id = ? AND invocation_id = ? FOR UPDATE",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.invocation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let query = format!(
             "UPDATE tool_invocation_ledger
              SET state = ?, dispatch_certainty = 'dispatched', outcome_json = ?,

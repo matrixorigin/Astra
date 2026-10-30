@@ -310,27 +310,6 @@ mod tests {
     use astra_services::session_journal;
     use std::time::Instant;
 
-    fn tool_call_record(
-        name: &str,
-        ok: bool,
-        result_preview: Option<&str>,
-    ) -> session_journal::ToolCallRecord {
-        session_journal::ToolCallRecord {
-            name: name.into(),
-            ok,
-            ms: 0,
-            error: None,
-            input_bytes: None,
-            output_bytes: None,
-            args_preview: None,
-            result_preview: result_preview.map(str::to_string),
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn line_surface_does_not_claim_a_composer_restore() {
         let mut line_ui = crate::cli::ui_adapter::LineUiAdapter;
@@ -456,87 +435,122 @@ mod tests {
 
     #[test]
     fn report_turn_failure_persists_filtered_partial_metrics() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("test-turn-failure-{}", uuid::Uuid::new_v4());
-        let mut state = SessionState {
-            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
-            session_id: Some(sid.clone()),
-            model: Some("gpt-5".into()),
+        let qualified = session_journal::ToolOutcomeSummary {
+            requested: 2,
+            executed: 1,
+            succeeded: 1,
+            suppressed: 1,
             ..Default::default()
         };
-        let failure = crate::TurnFailure {
-            error: "model overloaded".into(),
-            partial: crate::PartialTurnData {
-                tool_call_records: vec![
-                    tool_call_record(
-                        "bash",
-                        false,
-                        Some("Skipped: the skill already completed this work."),
-                    ),
-                    tool_call_record("read_file", true, Some("contents")),
-                ],
-                tools_used: vec!["read_file".into()],
-                run_id: Some("run-failure-1".into()),
-                prompt_tokens: 13,
-                completion_tokens: 7,
-                tool_calls_count: 1,
-                partial_text: "Partial analysis".into(),
-                ..Default::default()
-            },
+        let mismatched = session_journal::ToolOutcomeSummary {
+            requested: 3,
+            executed: 1,
+            succeeded: 1,
+            suppressed: 2,
+            ..Default::default()
         };
+        // Two retained records do not prove complete run accounting. Only
+        // the qualified aggregate may supply the journal's executed count.
+        for (tool_outcomes, expected_count, expected_outcomes) in [
+            (Some(qualified.clone()), Some(1), Some(qualified)),
+            (None, None, None),
+            (Some(mismatched), None, None),
+        ] {
+            let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+            let sid = format!("test-turn-failure-{}", uuid::Uuid::new_v4());
+            let mut state = SessionState {
+                journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+                session_id: Some(sid.clone()),
+                model: Some("gpt-5".into()),
+                ..Default::default()
+            };
+            let failure = crate::TurnFailure {
+                error: "model overloaded".into(),
+                partial: crate::PartialTurnData {
+                    tool_call_records: vec![
+                        session_journal::ToolCallRecord {
+                            name: "bash".into(),
+                            disposition: Some(session_journal::ToolCallDisposition::Suppressed),
+                            skill_reentry_count: Some(1),
+                            result_preview: Some(
+                                "Skipped: the skill already completed this work.".into(),
+                            ),
+                            ..Default::default()
+                        },
+                        session_journal::ToolCallRecord {
+                            name: "read_file".into(),
+                            ok: true,
+                            disposition: Some(session_journal::ToolCallDisposition::Executed),
+                            result_preview: Some("contents".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    tools_used: vec!["read_file".into()],
+                    run_id: Some("run-failure-1".into()),
+                    prompt_tokens: 13,
+                    completion_tokens: 7,
+                    tool_calls_count: 2,
+                    tool_outcomes,
+                    partial_text: "Partial analysis".into(),
+                    ..Default::default()
+                },
+            };
 
-        report_turn_failure(
-            &mut state,
-            None,
-            "show session metrics",
-            &failure,
-            Instant::now(),
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+            report_turn_failure(
+                &mut state,
+                None,
+                "show session metrics",
+                &failure,
+                Instant::now(),
+                &mut crate::cli::ui_adapter::LineUiAdapter,
+            );
 
-        let event = state.last_turn_event.as_ref().expect("turn_error event");
-        assert_eq!(event.tool_count, Some(1));
-        assert_eq!(event.turn, Some(1));
-        assert_eq!(event.tools_used, Some(vec!["read_file".into()]));
-        assert_eq!(event.tokens_in, Some(13));
-        assert_eq!(event.tokens_out, Some(7));
-        assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
-        assert_eq!(
-            state.turn, 1,
-            "failed turn settlement must advance the local turn cursor"
-        );
-        assert_eq!(state.history.len(), 1);
-        assert_eq!(
-            state.history[0],
-            (
-                "show session metrics".to_string(),
-                "[Previous turn failed: model overloaded]".to_string()
-            ),
-            "live continuation must use the same canonical TurnError projection as restart"
-        );
-        assert_eq!(
-            state.history,
-            crate::cli::session::session_runtime::turn_error_history_pairs(event),
-            "online and restart projections must remain byte-for-byte identical"
-        );
-        assert_eq!(state.last_response.as_deref(), Some("Partial analysis"));
+            let event = state.last_turn_event.as_ref().expect("turn_error event");
+            assert_eq!(event.tool_count, expected_count);
+            assert_eq!(event.tool_outcomes, expected_outcomes);
+            assert_eq!(event.turn, Some(1));
+            assert_eq!(event.tools_used, Some(vec!["read_file".into()]));
+            assert_eq!(event.tokens_in, Some(13));
+            assert_eq!(event.tokens_out, Some(7));
+            assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
+            assert_eq!(
+                state.turn, 1,
+                "failed turn settlement must advance the local turn cursor"
+            );
+            assert_eq!(state.history.len(), 1);
+            assert_eq!(
+                state.history[0],
+                (
+                    "show session metrics".to_string(),
+                    "[Previous turn failed: model overloaded]".to_string()
+                ),
+                "live continuation must use the same canonical TurnError projection as restart"
+            );
+            assert_eq!(
+                state.history,
+                crate::cli::session::session_runtime::turn_error_history_pairs(event),
+                "online and restart projections must remain byte-for-byte identical"
+            );
+            assert_eq!(state.last_response.as_deref(), Some("Partial analysis"));
 
-        let events = session_journal::read_journal(&sid).unwrap();
-        let persisted = events.last().expect("persisted turn_error");
-        assert_eq!(persisted.tool_count, Some(1));
-        assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
-        assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
-        assert_eq!(
-            persisted.metadata.as_ref().unwrap()["run_id"],
-            "run-failure-1"
-        );
-        let scope = persisted
-            .producer_scope
-            .as_ref()
-            .expect("exact root producer");
-        assert_eq!(scope.run_id, "run-failure-1");
-        assert_eq!(scope.agent_id.as_deref(), Some("root"));
-        assert!(scope.parent_run_id.is_none());
+            let events = session_journal::read_journal(&sid).unwrap();
+            let persisted = events.last().expect("persisted turn_error");
+            assert_eq!(persisted.tool_count, expected_count);
+            assert_eq!(persisted.tool_outcomes, expected_outcomes);
+            assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
+            assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
+            assert_eq!(
+                persisted.metadata.as_ref().unwrap()["run_id"],
+                "run-failure-1"
+            );
+            let scope = persisted
+                .producer_scope
+                .as_ref()
+                .expect("exact root producer");
+            assert_eq!(scope.run_id, "run-failure-1");
+            assert_eq!(scope.agent_id.as_deref(), Some("root"));
+            assert!(scope.parent_run_id.is_none());
+        }
     }
 
     #[test]

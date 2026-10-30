@@ -1243,7 +1243,7 @@ mod tests {
         let fanout = &parsed["matches"][0];
         let desc = fanout["description"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("Parent work excludes child scope")
+            desc.contains(crate::agent_parent_scope_guidance!())
                 && desc.contains("Exact provider/Offering")
                 && desc.contains("slots=target_count")
                 && desc.contains("description+prompt")

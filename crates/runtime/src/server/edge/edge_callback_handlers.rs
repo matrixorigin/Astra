@@ -3709,74 +3709,88 @@ mod edge_callback_insert_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tool_result_handler_uses_dispatch_when_local_ledger_is_full() {
-        let identity = EdgeDispatchIdentity::new(
-            "u-approval",
-            "sess-tool-dispatch",
-            "run-tool-dispatch",
-            "chain-tool-dispatch",
-            "req-tool-dispatch",
-        );
-        let dispatch = Arc::new(RecordingEdgeDispatch {
-            deliver_result: true,
-            server_cancelled_dispatch: false,
-            delivered: Mutex::new(Vec::new()),
-        });
-        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
-            .with_auth_service(Arc::new(StaticAuthService))
-            .with_run_lifecycle_service(Arc::new(
-                ApprovalTargetRunLifecycle::new("run-tool-dispatch", "sess-tool-dispatch")
-                    .with_running_edge_wait(),
-            ))
-            .with_edge_dispatch_service(dispatch.clone());
-        {
-            let mut ledger = state.edge_callback_ledger.lock().await;
-            for i in 0..LEDGER_MAX_ENTRIES {
-                ledger.insert(format!("u-approval:tool:filled-{i}"), json!({"i": i}));
+        for rejected in [false, true] {
+            let identity = EdgeDispatchIdentity::new(
+                "u-approval",
+                "sess-tool-dispatch",
+                "run-tool-dispatch",
+                "chain-tool-dispatch",
+                "req-tool-dispatch",
+            );
+            let dispatch = Arc::new(RecordingEdgeDispatch {
+                deliver_result: true,
+                server_cancelled_dispatch: false,
+                delivered: Mutex::new(Vec::new()),
+            });
+            let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+                .with_auth_service(Arc::new(StaticAuthService))
+                .with_run_lifecycle_service(Arc::new(
+                    ApprovalTargetRunLifecycle::new("run-tool-dispatch", "sess-tool-dispatch")
+                        .with_running_edge_wait(),
+                ))
+                .with_edge_dispatch_service(dispatch.clone());
+            {
+                let mut ledger = state.edge_callback_ledger.lock().await;
+                for i in 0..LEDGER_MAX_ENTRIES {
+                    ledger.insert(format!("u-approval:tool:filled-{i}"), json!({"i": i}));
+                }
+            }
+
+            let response = post_tool_result_handler(
+                Extension(RequestTrace {
+                    request_id: "trace-tool-dispatch".into(),
+                }),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(astra_thin_client::ToolResultRequest::new_with_hash(
+                    astra_thin_client::ToolResultRequestParts {
+                        session_id: identity.session_id.clone(),
+                        run_id: identity.run_id.clone(),
+                        turn_chain_id: identity.turn_chain_id.clone(),
+                        request_id: "req-tool-dispatch".into(),
+                        edge_agent_id: "edge-a".into(),
+                        status: if rejected { "failed" } else { "completed" }.into(),
+                        output: "tool output".into(),
+                        duration_ms: 12,
+                        tool_result_fields: rejected.then(|| {
+                            let mut fields = serde_json::Map::new();
+                            astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+                            fields
+                        }),
+                    },
+                )),
+            )
+            .await
+            .expect("dispatch delivery should recover from local ledger capacity");
+
+            assert_eq!(response.0["ok"], true);
+            assert_eq!(response.0["ledger_enqueued"], false);
+            assert_eq!(response.0["dispatch_delivered"], true);
+            assert_eq!(response.0["delivery_route"], "durable_dispatch");
+
+            let ledger = state.edge_callback_ledger.lock().await;
+            assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
+            assert!(
+                !ledger.contains_key(&astra_turn_core::edge_ledger::tool_callback_key(&identity)),
+                "full local ledger should not be required when dispatch delivery succeeds"
+            );
+            drop(ledger);
+
+            let delivered = dispatch.delivered.lock().unwrap();
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].0, "u-approval");
+            assert_eq!(delivered[0].1, "req-tool-dispatch");
+            assert_eq!(delivered[0].2, "edge-a");
+            assert!(delivered[0].3.contains("tool output"));
+            let body: serde_json::Value = serde_json::from_str(&delivered[0].3).unwrap();
+            assert_eq!(
+                body["status"],
+                if rejected { "failed" } else { "completed" }
+            );
+            if rejected {
+                assert_eq!(body["tool_result_fields"]["disposition"], "rejected");
             }
         }
-
-        let response = post_tool_result_handler(
-            Extension(RequestTrace {
-                request_id: "trace-tool-dispatch".into(),
-            }),
-            State(state.clone()),
-            HeaderMap::new(),
-            Json(astra_thin_client::ToolResultRequest::new_with_hash(
-                astra_thin_client::ToolResultRequestParts {
-                    session_id: identity.session_id.clone(),
-                    run_id: identity.run_id.clone(),
-                    turn_chain_id: identity.turn_chain_id.clone(),
-                    request_id: "req-tool-dispatch".into(),
-                    edge_agent_id: "edge-a".into(),
-                    status: "completed".into(),
-                    output: "tool output".into(),
-                    duration_ms: 12,
-                    tool_result_fields: None,
-                },
-            )),
-        )
-        .await
-        .expect("dispatch delivery should recover from local ledger capacity");
-
-        assert_eq!(response.0["ok"], true);
-        assert_eq!(response.0["ledger_enqueued"], false);
-        assert_eq!(response.0["dispatch_delivered"], true);
-        assert_eq!(response.0["delivery_route"], "durable_dispatch");
-
-        let ledger = state.edge_callback_ledger.lock().await;
-        assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
-        assert!(
-            !ledger.contains_key(&astra_turn_core::edge_ledger::tool_callback_key(&identity)),
-            "full local ledger should not be required when dispatch delivery succeeds"
-        );
-        drop(ledger);
-
-        let delivered = dispatch.delivered.lock().unwrap();
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].0, "u-approval");
-        assert_eq!(delivered[0].1, "req-tool-dispatch");
-        assert_eq!(delivered[0].2, "edge-a");
-        assert!(delivered[0].3.contains("tool output"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -7,11 +7,6 @@ use astra_thin_client::{
 use astra_turn_types::{JudgmentRequest, judgment_messages, normalize_judgment_response};
 use serde_json::{Value, json};
 
-// Answer-envelope sizing is a wire minimum, not the provider's total generation
-// budget. A bounded reserve permits adapters that consume internal reasoning
-// before emitting the typed answer; the Server still enforces its resource cap.
-const MIN_JUDGE_COMPLETION_TOKENS: usize = 2_048;
-
 /// A dash streams the same canonical JSON without the OS per-argument limit.
 /// Request validation and provider/resource admission remain Server-owned.
 pub(crate) fn read_message(message: String, input: impl std::io::Read) -> Result<String, String> {
@@ -85,11 +80,7 @@ pub(crate) async fn execute(
     if let Err(error) = judgment.validate() {
         return json!({"ok":false,"stage":"validate_request","error_kind":ErrorKind::InvalidRequest,"error":error});
     }
-    let max_tokens = match u32::try_from(
-        judgment
-            .output_token_budget()
-            .max(MIN_JUDGE_COMPLETION_TOKENS),
-    ) {
+    let max_tokens = match u32::try_from(judgment.generation_token_budget()) {
         Ok(budget) => budget,
         Err(_) => {
             return json!({"ok":false,"stage":"validate_request","error_kind":ErrorKind::ResourceLimit,"error":"judgment output budget exceeds transport limits"});
@@ -382,16 +373,15 @@ mod tests {
             "no chat/run/tool HTTP requests permitted"
         );
         let body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let wire_request: CompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        wire_request
+            .validate()
+            .expect("judge request must satisfy the real Server completion contract");
         assert_eq!(body["operation"], "verification_judge");
         assert_eq!(body["session_id"], SESSION);
         assert_eq!(body["model_selection"]["offering_id"], "offering-1");
         let judgment: JudgmentRequest = serde_json::from_str(&judgment_input()).unwrap();
-        assert_eq!(
-            body["max_tokens"],
-            judgment
-                .output_token_budget()
-                .max(super::MIN_JUDGE_COMPLETION_TOKENS)
-        );
+        assert_eq!(body["max_tokens"], judgment.generation_token_budget());
         assert_eq!(body["messages"], json!(judgment_messages(&judgment)));
         assert_eq!(result["provenance"], "discrete_decision");
         assert_eq!(result["judgment"]["answers"]["0"]["decision"], "no");

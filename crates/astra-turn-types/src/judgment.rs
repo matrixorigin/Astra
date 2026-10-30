@@ -149,6 +149,14 @@ impl JudgmentRequest {
         .saturating_add(32)
     }
 
+    /// Total generation allowance, including provider reasoning before the answer.
+    /// The answer-envelope minimum remains separate for model admission. This
+    /// allowance is an upper bound; providers and execution deadlines still cap it.
+    #[must_use]
+    pub fn generation_token_budget(&self) -> usize {
+        self.output_token_budget().max(8_192)
+    }
+
     /// Return whether an admitted model can emit the complete typed answer.
     #[must_use]
     pub fn output_budget_fits_completion_cap(&self, max_completion_tokens: Option<u32>) -> bool {
@@ -1112,6 +1120,8 @@ mod tests {
             },
         );
         assert!(with_choice.output_token_budget() > base.output_token_budget());
+        assert!(base.generation_token_budget() >= 8_192);
+        assert!(with_choice.generation_token_budget() >= with_choice.output_token_budget());
         let required = with_choice.output_token_budget();
         assert!(!with_choice.output_budget_fits_completion_cap(Some((required - 1) as u32)));
         assert!(with_choice.output_budget_fits_completion_cap(Some(required as u32)));

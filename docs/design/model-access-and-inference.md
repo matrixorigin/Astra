@@ -833,6 +833,32 @@ handoff checkpoints carry their complete checked continuation without loading a
 provider-attempt WAL. Run/Context commits and tool side-effect admission and
 deduplication keep their independent contracts.
 
+### Provider timeout ownership
+
+Ordinary agent streaming calls use rolling transport-idle and semantic-progress
+watchdogs, not a default whole-response wall-clock limit. Text, reasoning, and
+authorized tool argument progress refresh semantic liveness; heartbeats alone
+do not. The shared OpenAI-compatible, Anthropic and Bedrock collectors retain
+cancellation, response-size limits, and bounded terminal draining.
+Terminal draining has a fixed deadline, at most 500ms after the first terminal
+signal. Empty events and duplicate terminal signals cannot extend that window.
+Bedrock returns as soon as both `messageStop` and usage metadata are present;
+missing metadata at the deadline remains a partial transport failure.
+Anthropic completes immediately on `message_stop` and does not enter a tail wait.
+
+The HTTP transport must not add a hidden total body timeout, including for
+user-owned compatible endpoints. An explicit caller budget or positive
+`ASTRA_LLM_TOTAL_BUDGET_S` override still limits the logical call across retries
+and leaves its existing terminalization reserve. Without such a limit, setup
+and retries are bounded until a response starts, and ledger operations have
+independent bounded waits; they do not consume a progressing stream's lifetime.
+Non-stream, auxiliary inference, model checks, and run/resource deadlines retain
+their own limits. Unknown provider delivery is still not blindly retried.
+An unset, empty, or whitespace-only total-budget variable leaves ordinary
+streaming uncapped. Invalid nonempty values produce an actionable
+`InvalidRequest` before streaming attempt admission, rather than selecting a
+default cap.
+
 ## Control plane and data plane
 
 ```text
@@ -1850,3 +1876,14 @@ system, tool, and cache-marker hashes remain diagnostic metadata; they never
 substitute for provider-final identities in structural break classification.
 Protocol changes are attributed separately; protocol-native marker changes are
 represented by the exact component identity that contains those markers.
+
+### Typed judgment generation allowance
+
+Typed completion callers distinguish the minimum serialized answer budget from
+total generation allowance. The shared judgment request provides a bounded
+8,192-token total allowance for ordinary judgments, covering reasoning and the
+answer together. Larger answer envelopes retain their explicit minimum and remain
+subject to the transport and model limits. Model admission
+still checks the complete answer minimum, and Server dispatch caps total generation
+at the admitted model limit. Non-normal finishes remain unscorable; increasing the
+allowance never turns a truncated response into a judgment.

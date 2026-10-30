@@ -286,6 +286,9 @@ pub struct ChatTurnSseAccum {
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     /// `true` only for run totals, never a logical-request retry increment.
     pub usage_is_run_total: bool,
+    /// Attempt count reported by the run-total usage event. Failed terminals
+    /// may have this accounting without a completed-loop execution summary.
+    pub run_total_tool_calls: Option<u32>,
     /// Usage for the most recent physical model request. This is distinct
     /// from aggregate logical-response usage: the latter is useful for
     /// accounting but cannot describe the active context window after a tool
@@ -370,11 +373,25 @@ impl ChatTurnSseAccum {
             terminal.status == DurableRunTerminalStatus::Failed
                 && terminal.owner_generation.is_some()
                 && self.root_identity.run_id() == Some(terminal.run_id.as_str())
-                && terminal.error_kind.is_some_and(|kind| {
-                    kind != astra_core::ErrorKind::ContractViolation
-                        && self.error_kind.is_none_or(|observed| observed == kind)
-                })
+                && (self.has_authoritative_interrupted_terminal()
+                    || terminal.error_kind.is_some_and(|kind| {
+                        kind != astra_core::ErrorKind::ContractViolation
+                            && self.error_kind.is_none_or(|observed| observed == kind)
+                    }))
         })
+    }
+
+    /// A failed run can carry an honest partial result rather than a protocol
+    /// failure. Only the owner-stamped, validated terminal grants this closure.
+    pub fn has_authoritative_interrupted_terminal(&self) -> bool {
+        self.error_kind.is_none()
+            && self.run_terminal.as_ref().is_some_and(|terminal| {
+                terminal.status == DurableRunTerminalStatus::Failed
+                    && terminal.owner_generation.is_some()
+                    && self.root_identity.run_id() == Some(terminal.run_id.as_str())
+                    && terminal.error_kind.is_none()
+                    && terminal.interruption.is_some()
+            })
     }
 
     fn has_final_error(&self) -> bool {
@@ -403,13 +420,14 @@ impl ChatTurnSseAccum {
                 "Server admission stream reported an error without an error message",
             ));
         }
-        let message = if !self.server_loop_terminal {
-            "Server admission stream ended without terminal execution evidence"
-        } else if self.has_tool_calls || !self.tool_calls.is_empty() {
-            "remote Server returned pending client continuation work"
-        } else {
-            return None;
-        };
+        let message =
+            if !self.server_loop_terminal && !self.has_authoritative_interrupted_terminal() {
+                "Server admission stream ended without terminal execution evidence"
+            } else if self.has_tool_calls || !self.tool_calls.is_empty() {
+                "remote Server returned pending client continuation work"
+            } else {
+                return None;
+            };
         Some(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
             message,
@@ -499,6 +517,8 @@ pub struct DurableRunTerminal {
     /// Missing kinds remain `None` so consumers can fail closed instead of
     /// guessing that every failed run was a provider overload.
     pub error_kind: Option<astra_core::ErrorKind>,
+    /// Validated user-facing partial outcome, never successful execution proof.
+    pub interruption: Option<crate::interruption::InterruptionRecord>,
 }
 
 /// Parse a durable run terminal without mutating stream state.  The SSE
@@ -534,6 +554,30 @@ pub fn durable_run_terminal_from_event(
         ),
         Some(_) => return Err("run_finished carried non-string error_kind".to_string()),
     };
+    let interruption = event
+        .get("interruption")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<crate::interruption::InterruptionRecord>(value.clone())
+                .map_err(|error| format!("invalid terminal interruption: {error}"))
+        })
+        .transpose()?;
+    if let Some(record) = interruption.as_ref()
+        && (status != DurableRunTerminalStatus::Failed
+            || event
+                .get("owner_generation")
+                .and_then(Value::as_u64)
+                .is_none()
+            || error_kind.is_some()
+            || record.kind != crate::interruption::InterruptionKind::ExecutionIncomplete
+            || event.get("error_code").and_then(Value::as_str) != Some(record.kind.label())
+            || record.user_message.trim().is_empty()
+            || event.get("error").and_then(Value::as_str) != Some(record.user_message.as_str())
+            || record.error_detail.is_some()
+            || record.stall_signal.is_some())
+    {
+        return Err("terminal interruption is inconsistent with the failed run".into());
+    }
     Ok(Some(DurableRunTerminal {
         run_id: run_id.to_string(),
         owner_generation: event.get("owner_generation").and_then(Value::as_u64),
@@ -543,6 +587,7 @@ pub fn durable_run_terminal_from_event(
             .and_then(Value::as_str)
             .map(ToString::to_string),
         error_kind,
+        interruption,
     }))
 }
 
@@ -1613,6 +1658,13 @@ fn apply_one_event(
                     Some(validated)
                 };
             accum.usage_is_run_total = usage_scope == Some("run_total");
+            if accum.usage_is_run_total {
+                accum.run_total_tool_calls = event
+                    .get("tool_call_count")
+                    .or_else(|| nested.and_then(|usage| usage.get("tool_call_count")))
+                    .and_then(Value::as_u64)
+                    .and_then(|count| u32::try_from(count).ok());
+            }
             if matches!(usage_scope, Some("run_total" | "logical_request_total")) {
                 // `/chat/stream` carries the final physical exchange inside
                 // its terminal accounting event.  The run endpoint expands
@@ -1700,6 +1752,14 @@ fn apply_one_event(
             if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
                 return;
             }
+            let provisional_interruption = event.get("error_code").and_then(Value::as_str)
+                == Some("execution_incomplete")
+                && matches!(event.get("error_kind"), None | Some(Value::Null));
+            if provisional_interruption
+                && (accum.error_kind.is_some() || accum.pending_attempt_error)
+            {
+                return;
+            }
             accum.error_message = Some(
                 event
                     .get("error")
@@ -1717,7 +1777,9 @@ fn apply_one_event(
                 .or_else(|| event.get("error_code"))
                 .and_then(Value::as_str)
                 .and_then(astra_core::ErrorKind::parse_tag)
-                .or(Some(astra_core::ErrorKind::ContractViolation));
+                .or_else(|| {
+                    (!provisional_interruption).then_some(astra_core::ErrorKind::ContractViolation)
+                });
             // Root failure is final, unlike a recoverable provider-attempt error.
             accum.pending_attempt_error = false;
             accum.attempt_error_supersession_eligible = false;
@@ -1869,6 +1931,27 @@ fn apply_one_event(
                 }
                 match durable_run_terminal_from_event(event) {
                     Ok(Some(terminal)) => {
+                        if let Some(interruption) = terminal.interruption.as_ref() {
+                            let coherent = accum.error_kind.is_none()
+                                && !accum.pending_attempt_error
+                                && accum.error_message.as_ref().is_none_or(|message| {
+                                    message == &interruption.user_message
+                                        && accum.error_code.as_deref()
+                                            == Some(interruption.kind.label())
+                                })
+                                && accum.server_interruption.as_ref().is_none_or(|previous| {
+                                    serde_json::from_value::<
+                                            crate::interruption::InterruptionRecord,
+                                        >(previous.clone())
+                                        .is_ok_and(|previous| previous == *interruption)
+                                });
+                            if !coherent {
+                                accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                                accum.error_message =
+                                    Some("Conflicting failed interruption terminal".into());
+                                return;
+                            }
+                        }
                         let evaluation = event
                             .get("turn_evaluation")
                             .filter(|value| !value.is_null())
@@ -1920,6 +2003,11 @@ fn apply_one_event(
                             accum.error_message =
                                 Some("Root failure contradicted by terminal outcome".into());
                             return;
+                        }
+                        if let Some(interruption) = terminal.interruption.as_ref() {
+                            accum.server_interruption = Some(interruption.to_json());
+                            accum.error_message = Some(interruption.user_message.clone());
+                            accum.error_code = Some(interruption.kind.label().into());
                         }
                         accum.turn_evaluation = evaluation;
                         accum.attempt_error_supersession_eligible = accum.pending_attempt_error
@@ -3878,6 +3966,94 @@ mod tests {
         let terminal = a.run_terminal.expect("root terminal must be retained");
         assert_eq!(terminal.run_id, "root-run");
         assert_eq!(terminal.status, DurableRunTerminalStatus::Cancelled);
+    }
+
+    #[test]
+    fn typed_incomplete_terminal_rejects_conflicting_or_diagnostic_payloads() {
+        let record = crate::interruption::InterruptionRecord::new(
+            crate::interruption::InterruptionKind::ExecutionIncomplete,
+            crate::interruption::ResumeAction::ContinueImmediately,
+            crate::interruption::InterruptionStateSummary::default(),
+        );
+        let terminal = serde_json::json!({"type":"run_finished", "run_id":"root", "owner_generation":1,
+            "status":"failed", "error_code":"execution_incomplete", "error_kind":null,
+            "error":record.user_message, "interruption":record.to_json()});
+        assert!(
+            durable_run_terminal_from_event(&terminal)
+                .unwrap()
+                .unwrap()
+                .interruption
+                .is_some()
+        );
+        for (pointer, value) in [
+            ("/status", serde_json::json!("completed")),
+            ("/owner_generation", Value::Null),
+            ("/error_kind", serde_json::json!("server_error")),
+            ("/error_kind", serde_json::json!("unknown_kind")),
+            ("/error_code", serde_json::json!("budget_exhausted")),
+            ("/interruption/kind", serde_json::json!("budget_exhausted")),
+            (
+                "/interruption/error_detail",
+                serde_json::json!("internal diagnostic"),
+            ),
+            ("/error", serde_json::json!("internal diagnostic")),
+        ] {
+            let mut invalid = terminal.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                durable_run_terminal_from_event(&invalid).is_err(),
+                "{pointer}: {invalid}"
+            );
+        }
+        let mut invalid_evaluation = terminal.clone();
+        invalid_evaluation["turn_evaluation"] = serde_json::json!({});
+        let mut invalid_accum = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse("session_info", ",\"run_id\":\"root\""),
+            &mut invalid_accum,
+            &mut vec![],
+        );
+        dispatch_chat_turn_sse_event_block(
+            &format!("data: {invalid_evaluation}\n\n"),
+            &mut invalid_accum,
+            &mut vec![],
+        );
+        assert_eq!(
+            invalid_accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(invalid_accum.server_interruption.is_none());
+        assert!(invalid_accum.run_terminal.is_none());
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("session_info", ",\"run_id\":\"root\""),
+            &mut accum,
+            &mut pending,
+        );
+        let mut child = terminal.clone();
+        child["run_id"] = serde_json::json!("child");
+        dispatch_chat_turn_sse_event_block(&format!("data: {child}\n\n"), &mut accum, &mut pending);
+        assert!(accum.run_terminal.is_none());
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "run_error",
+                ",\"run_id\":\"root\",\"error_kind\":\"contract_violation\",\"error\":\"actual protocol failure\"",
+            ),
+            &mut accum,
+            &mut pending,
+        );
+        dispatch_chat_turn_sse_event_block(
+            &format!("data: {terminal}\n\n"),
+            &mut accum,
+            &mut pending,
+        );
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(!accum.has_authoritative_interrupted_terminal());
+        assert!(accum.server_interruption.is_none());
     }
 
     #[test]
