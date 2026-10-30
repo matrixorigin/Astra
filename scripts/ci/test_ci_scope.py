@@ -145,6 +145,7 @@ class CiScopeTests(unittest.TestCase):
                 "test_runtime",
                 "test_cli",
                 "test_core",
+                "test_macos",
                 "online_core",
                 "online_integration",
             },
@@ -386,6 +387,21 @@ class CiScopeTests(unittest.TestCase):
                 self.assertTrue(scopes["test_core"])
                 self.assertFalse(scopes["sdk"])
                 self.assertFalse(scopes["web"])
+
+    def test_linux_only_terminal_inputs_do_not_allocate_mac_even_in_mixed_diffs(self) -> None:
+        portable = [".nvmrc", "scripts/tui-reflow/resize.cjs", "scripts/tui-reflow/pty_bridge.py"]
+        for path in portable:
+            scopes = classify([path])
+            self.assertTrue(scopes["test_cli"])
+            self.assertFalse(scopes["test_macos"])
+        self.assertFalse(classify(portable)["test_macos"])
+        for native in ("crates/astra-cli/src/lib.rs", "crates/runtime/src/lib.rs",
+                       "crates/services/src/lib.rs", "crates/core/tests.rs", "Cargo.lock",
+                       "vendor/crossterm/src/event.rs", "config/default.yaml", "Dockerfile",
+                       ".github/workflows/test.yml", "unknown/input"):
+            with self.subTest(native=native):
+                self.assertTrue(classify([*portable, native])["test_macos"])
+        self.assertFalse(classify([*portable, "crates/runtime/tests/http.rs"])["test_macos"])
 
     def test_ci_classifier_change_falls_back_to_every_scope(self) -> None:
         self.assertTrue(all(classify(["scripts/ci/ci_scope.py"]).values()))

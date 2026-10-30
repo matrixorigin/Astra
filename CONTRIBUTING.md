@@ -121,6 +121,8 @@ never serve as the main runner.
 An IDC route gets a 60-minute queue/discovery budget and never switches to
 paid hosted Macs automatically. Queue, setup and control failures fail the
 required checks; fix the cause and **Re-run all jobs** to create a fresh attempt.
+If only Linux work failed, **Re-run failed jobs** reuses the successful Mac
+producer for the same run and tested SHA.
 Other known authors and default-hosted pushes use one Mac bundle that shares
 checkout, toolchain setup and Cargo artifacts across the native checks. Full
 production reflow, dev-tty and portable vendored units stay on Linux. Linux

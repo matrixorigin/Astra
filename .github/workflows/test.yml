@@ -33,6 +33,7 @@ jobs:
       test_cli: ${{ steps.scope.outputs.test_cli }}
       test_runtime: ${{ steps.scope.outputs.test_runtime }}
       test_services: ${{ steps.scope.outputs.test_services }}
+      test_macos: ${{ steps.scope.outputs.test_macos }}
       test_core: ${{ steps.scope.outputs.test_core }}
       online_core: ${{ steps.scope.outputs.online_core }}
       online_integration: ${{ steps.scope.outputs.online_integration }}
@@ -54,7 +55,7 @@ jobs:
     needs: scope
     if: >-
       !cancelled() && needs.scope.result == 'success' &&
-      (needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') &&
+      needs.scope.outputs.test_macos == 'true' &&
       (needs.scope.outputs.macos_runner == '["self-hosted","macOS","ARM64","mac-arm64-mini"]' ||
        needs.scope.outputs.macos_runner == '["self-hosted","macOS","ARM64","mac-arm64-main"]')
     runs-on: ubuntu-latest
@@ -301,11 +302,13 @@ jobs:
         env:
           SHARDS_RESULT: ${{ needs.terminal-pty-shards.result }}
           MACOS_RESULT: ${{ needs.terminal-pty-shards-macos.result }}
+          MACOS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_macos != 'false' }}
           SHARDS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true' }}
         run: |
           set -euo pipefail
-          for result in "$SHARDS_RESULT" "$MACOS_RESULT"; do
-            if [ "$SHARDS_REQUIRED" = true ]; then
+          for check in "$SHARDS_REQUIRED:$SHARDS_RESULT" "$MACOS_REQUIRED:$MACOS_RESULT"; do
+            result=${check#*:}
+            if [ "${check%%:*}" = true ]; then
               test "$result" = success
             else
               case "$result" in success|skipped) ;; *) exit 1 ;; esac
@@ -344,7 +347,7 @@ jobs:
 
   macos-workspace-coordination:
     name: "Test: macOS workspace coordination"
-    needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards, terminal-pty-shards-macos]
+    needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards, terminal-pty-shards-macos, vendored-terminal]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -355,11 +358,14 @@ jobs:
           COORDINATION_RESULT: ${{ needs.macos-workspace-coordination-tests.result }}
           TERMINAL_RESULT: ${{ needs.terminal-pty-shards.result }}
           MACOS_TERMINAL_RESULT: ${{ needs.terminal-pty-shards-macos.result }}
+          VENDOR_RESULT: ${{ needs.vendored-terminal.result }}
+          MACOS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_macos != 'false' }}
           SHARDS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true' }}
         run: |
           set -euo pipefail
-          for result in "$COORDINATION_RESULT" "$TERMINAL_RESULT" "$MACOS_TERMINAL_RESULT"; do
-            if [ "$SHARDS_REQUIRED" = true ]; then
+          for check in "$MACOS_REQUIRED:$COORDINATION_RESULT" "$MACOS_REQUIRED:$MACOS_TERMINAL_RESULT" "$SHARDS_REQUIRED:$TERMINAL_RESULT" "$SHARDS_REQUIRED:$VENDOR_RESULT"; do
+            result=${check#*:}
+            if [ "${check%%:*}" = true ]; then
               test "$result" = success
             else
               case "$result" in success|skipped) ;; *) exit 1 ;; esac
@@ -371,7 +377,7 @@ jobs:
     needs: scope
     if: >-
       !cancelled() && needs.scope.result == 'success' &&
-      (needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') &&
+      needs.scope.outputs.test_macos == 'true' &&
       needs.scope.outputs.macos_runner == '["macos-15"]'
     runs-on: macos-15
     timeout-minutes: 65
@@ -395,108 +401,39 @@ jobs:
         run: |
           printf 'run_id=%s\nattempt=%s\nsha=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
+  # Keep legacy status names as relays of the single platform result owner.
   vendored-terminal-macos:
     name: "Test: vendored terminal (macos-15)"
-    needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    needs: [scope, macos-workspace-coordination-tests]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_macos != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      SCOPE_RESULT: ${{ needs.scope.result }}
-      LINUX_TERMINAL_RESULT: ${{ needs.terminal-pty-shards.result }}
-      LINUX_VENDOR_RESULT: ${{ needs.vendored-terminal.result }}
-      MACOS_ROUTE: ${{ needs.scope.outputs.macos_runner }}
-      MINI_JOB_RESULT: ${{ needs.macos-plan.result }}
-      MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
-      MINI_RUN_ID: ${{ needs.macos-plan.outputs.run_id }}
-      MINI_ATTEMPT: ${{ needs.macos-plan.outputs.attempt }}
-      MINI_SHA: ${{ needs.macos-plan.outputs.sha }}
-      HOSTED_JOB_RESULT: ${{ needs.macos-hosted.result }}
-      HOSTED_RUN_ID: ${{ needs.macos-hosted.outputs.run_id }}
-      HOSTED_ATTEMPT: ${{ needs.macos-hosted.outputs.attempt }}
-      HOSTED_SHA: ${{ needs.macos-hosted.outputs.sha }}
     steps:
-      - name: Require current macOS bundle
-        run: |
-          set -euo pipefail
-          test "$SCOPE_RESULT" = success
-          test "$LINUX_TERMINAL_RESULT" = success
-          test "$LINUX_VENDOR_RESULT" = success
-          case "$MACOS_ROUTE" in
-            '["macos-15"]')
-              test "$MINI_JOB_RESULT" = skipped
-              test "$HOSTED_JOB_RESULT" = success
-              test "$HOSTED_RUN_ID/$HOSTED_ATTEMPT/$HOSTED_SHA" = "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_SHA"
-              ;;
-            '["self-hosted","macOS","ARM64","mac-arm64-mini"]'|'["self-hosted","macOS","ARM64","mac-arm64-main"]')
-              if [[ "$MINI_JOB_RESULT/$MINI_RESULT" != success/success ||
-                    "$MINI_RUN_ID/$MINI_ATTEMPT/$MINI_SHA" != "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_SHA" ]]; then
-                echo '::error::IDC macOS bundle did not pass for this attempt. Resolve runner/control failures and Re-run all jobs; paid fallback is disabled.'
-                exit 1
-              fi
-              test "$HOSTED_JOB_RESULT" = skipped
-              ;;
-            *) echo '::error::Unknown macOS route; refusing paid execution or unverified success.'; exit 1 ;;
-          esac
-          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-            echo 'Mac: default PTY/Bash, native workspace coordination and Mio readiness. Linux: full renderer/reflow, dev-tty and vendored units; those full combinations were not run on Mac.' >> "$GITHUB_STEP_SUMMARY"
-          fi
+      - name: Require verified macOS result
+        env:
+          RESULT: ${{ needs.macos-workspace-coordination-tests.result }}
+        run: test "$RESULT" = success
 
   terminal-pty-shards-macos:
     name: "Terminal: ${{ matrix.segment }} (macos-15)"
-    needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    needs: [scope, macos-workspace-coordination-tests]
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_macos != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      SCOPE_RESULT: ${{ needs.scope.result }}
-      LINUX_TERMINAL_RESULT: ${{ needs.terminal-pty-shards.result }}
-      LINUX_VENDOR_RESULT: ${{ needs.vendored-terminal.result }}
-      MACOS_ROUTE: ${{ needs.scope.outputs.macos_runner }}
-      MINI_JOB_RESULT: ${{ needs.macos-plan.result }}
-      MINI_RESULT: ${{ needs.macos-plan.outputs.result }}
-      MINI_RUN_ID: ${{ needs.macos-plan.outputs.run_id }}
-      MINI_ATTEMPT: ${{ needs.macos-plan.outputs.attempt }}
-      MINI_SHA: ${{ needs.macos-plan.outputs.sha }}
-      HOSTED_JOB_RESULT: ${{ needs.macos-hosted.result }}
-      HOSTED_RUN_ID: ${{ needs.macos-hosted.outputs.run_id }}
-      HOSTED_ATTEMPT: ${{ needs.macos-hosted.outputs.attempt }}
-      HOSTED_SHA: ${{ needs.macos-hosted.outputs.sha }}
     strategy:
       fail-fast: false
       matrix:
         segment: [default-reader, dev-tty-reader, reflow]
     steps:
-      - name: Require current macOS bundle
-        run: |
-          set -euo pipefail
-          test "$SCOPE_RESULT" = success
-          test "$LINUX_TERMINAL_RESULT" = success
-          test "$LINUX_VENDOR_RESULT" = success
-          case "$MACOS_ROUTE" in
-            '["macos-15"]')
-              test "$MINI_JOB_RESULT" = skipped
-              test "$HOSTED_JOB_RESULT" = success
-              test "$HOSTED_RUN_ID/$HOSTED_ATTEMPT/$HOSTED_SHA" = "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_SHA"
-              ;;
-            '["self-hosted","macOS","ARM64","mac-arm64-mini"]'|'["self-hosted","macOS","ARM64","mac-arm64-main"]')
-              if [[ "$MINI_JOB_RESULT/$MINI_RESULT" != success/success ||
-                    "$MINI_RUN_ID/$MINI_ATTEMPT/$MINI_SHA" != "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_SHA" ]]; then
-                echo '::error::IDC macOS bundle did not pass for this attempt. Resolve runner/control failures and Re-run all jobs; paid fallback is disabled.'
-                exit 1
-              fi
-              test "$HOSTED_JOB_RESULT" = skipped
-              ;;
-            *) echo '::error::Unknown macOS route; refusing paid execution or unverified success.'; exit 1 ;;
-          esac
-          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-            echo 'Mac: default PTY/Bash, native workspace coordination and Mio readiness. Linux: full renderer/reflow, dev-tty and vendored units; those full combinations were not run on Mac.' >> "$GITHUB_STEP_SUMMARY"
-          fi
+      - name: Require verified macOS result
+        env:
+          RESULT: ${{ needs.macos-workspace-coordination-tests.result }}
+        run: test "$RESULT" = success
 
   macos-workspace-coordination-tests:
     name: "macOS workspace coordination contracts"
     needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_macos != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -524,18 +461,25 @@ jobs:
             '["macos-15"]')
               test "$MINI_JOB_RESULT" = skipped
               test "$HOSTED_JOB_RESULT" = success
-              test "$HOSTED_RUN_ID/$HOSTED_ATTEMPT/$HOSTED_SHA" = "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_SHA"
+              producer_run=$HOSTED_RUN_ID
+              producer_attempt=$HOSTED_ATTEMPT
+              producer_sha=$HOSTED_SHA
               ;;
             '["self-hosted","macOS","ARM64","mac-arm64-mini"]'|'["self-hosted","macOS","ARM64","mac-arm64-main"]')
-              if [[ "$MINI_JOB_RESULT/$MINI_RESULT" != success/success ||
-                    "$MINI_RUN_ID/$MINI_ATTEMPT/$MINI_SHA" != "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_SHA" ]]; then
-                echo '::error::IDC macOS bundle did not pass for this attempt. Resolve runner/control failures and Re-run all jobs; paid fallback is disabled.'
-                exit 1
-              fi
+              test "$MINI_JOB_RESULT/$MINI_RESULT" = success/success
               test "$HOSTED_JOB_RESULT" = skipped
+              producer_run=$MINI_RUN_ID
+              producer_attempt=$MINI_ATTEMPT
+              producer_sha=$MINI_SHA
               ;;
             *) echo '::error::Unknown macOS route; refusing paid execution or unverified success.'; exit 1 ;;
           esac
+          # GitHub retains successful producers on failed-only reruns. Their
+          # immutable run/SHA proof remains valid; newly dispatched workers
+          # still undergo strict admission for their own source attempt.
+          test "$producer_run/$producer_sha" = "$GITHUB_RUN_ID/$GITHUB_SHA"
+          [[ "$producer_attempt" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          test "$producer_attempt" -le "$GITHUB_RUN_ATTEMPT"
           if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
             echo 'Mac: default PTY/Bash, native workspace coordination and Mio readiness. Linux: full renderer/reflow, dev-tty and vendored units; those full combinations were not run on Mac.' >> "$GITHUB_STEP_SUMMARY"
           fi

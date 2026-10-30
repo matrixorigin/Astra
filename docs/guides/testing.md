@@ -495,7 +495,11 @@ removes macOS production-binary reflow and dev-tty cross-product coverage; Linux
 cannot prove those exact Darwin combinations. Default Mac PTY tests retain real
 SIGINT/terminal restoration, input and resize/cursor behavior. Unaffected changes
 skip heavy jobs. IDC failure never allocates paid fallback; producer stamps must
-match the current run/attempt/SHA. Pushes populate the terminal cache once per OS.
+match the current run and SHA, with a valid producer attempt no later than the
+current attempt. Failed-only reruns can reuse a same-version Mac success after
+Linux recovery. Node/reflow-only changes run Linux coverage and skip Mac; mixed
+native or unknown changes retain Mac coverage. Pushes populate the terminal
+cache once per OS.
 The Rust terminal-reader PTY tests also
 verify that a resize cursor query preserves keyboard/paste input and times out
 when the terminal does not answer.

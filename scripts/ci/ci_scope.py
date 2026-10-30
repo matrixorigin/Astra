@@ -69,6 +69,7 @@ SCOPES = (
     "test_runtime",
     "test_services",
     "test_core",
+    "test_macos",
     "online_core",
     "online_integration",
 )
@@ -78,6 +79,7 @@ RUST_SCOPES = (
     "test_runtime",
     "test_services",
     "test_core",
+    "test_macos",
     "online_core",
     "online_integration",
 )
@@ -144,7 +146,7 @@ def _rust_scope_for(path: str, result: dict[str, bool]) -> None:
     is_test_only = "/tests/" in path or path.endswith(("/tests.rs", "/test.rs"))
 
     if crate == "astra-cli":
-        _enable(result, "test_cli")
+        _enable(result, "test_cli", "test_macos")
         return
     if crate == "runtime":
         _enable(result, "test_runtime")
@@ -153,7 +155,7 @@ def _rust_scope_for(path: str, result: dict[str, bool]) -> None:
             _enable(result, online_lane)
         else:
             # Runtime is consumed by the CLI and the bridge-hook tests in shard D.
-            _enable(result, "test_cli", "test_core", "online_core", "online_integration")
+            _enable(result, "test_cli", "test_core", "test_macos", "online_core", "online_integration")
         return
     if crate in SERVICE_CRATES:
         _enable(result, "test_services")
@@ -165,10 +167,10 @@ def _rust_scope_for(path: str, result: dict[str, bool]) -> None:
             _enable(result, "online_core")
         if not is_test_only:
             # These crates feed both runtime orchestration and CLI execution.
-            _enable(result, "test_runtime", "test_cli")
+            _enable(result, "test_runtime", "test_cli", "test_macos")
         return
 
-    _enable(result, "test_core")
+    _enable(result, "test_core", "test_macos")
     if not is_test_only:
         # Core crates are shared broadly. Keep their downstream behavioral gates
         # conservative; workspace clippy also compiles every downstream target.
@@ -199,6 +201,8 @@ def classify(paths: list[str]) -> dict[str, bool]:
         ):
             _enable(result, *RUST_SCOPES)
             continue
+        # Node/reflow consumers run on Linux; native Mac selection is separate
+        # and monotone so a mixed diff still retains its native coverage.
         if path == ".nvmrc":
             _enable(result, "sdk", "web", "test_cli", "online_integration")
             continue
@@ -228,6 +232,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
                 result,
                 "rust",
                 "test_core",
+                "test_macos",
                 "test_runtime",
                 "online_core",
                 "online_integration",
@@ -236,7 +241,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
         if path in {"Dockerfile", ".dockerignore"}:
             # Lint checks the pinned toolchain; core's repo_layout_contract
             # checks Docker stages and workspace inputs as well.
-            _enable(result, "rust", "test_core")
+            _enable(result, "rust", "test_core", "test_macos")
             continue
         if path.startswith("crates/"):
             _rust_scope_for(path, result)

@@ -131,7 +131,10 @@ authors and default-hosted pushes use one hosted bundle, sharing checkout,
 toolchain setup and Cargo artifacts across the native checks. When Mac coverage is
 selected, missing or malformed routing metadata selects no Mac and fails the
 checks on Linux. A successful scope that selects no Mac coverage skips these
-jobs without needing a Mac route.
+jobs without needing a Mac route. The classifier exposes native Mac scope
+separately from Linux CLI scope: `.nvmrc` and `scripts/tui-reflow/**` changes alone
+do not start a Mac. Mixed native changes and unknown inputs retain conservative
+Mac coverage. Missing native scope fails the gates without allocating a Mac.
 
 Main defaults to hosted. Operators may enable `ASTRA_MACOS_MAIN_ENABLED=1` only
 after provisioning a separate isolated `mac-arm64-main` runner. Develop pushes
@@ -145,9 +148,10 @@ The ordinary Test Suite owns the existing required check names. Linux tests
 start independently from scope. One successful scope with an explicit hosted
 route may allocate a `macos-15` runner; an absent planner/result never authorizes
 it. The five existing Mac-facing checks run as lightweight Ubuntu adapters.
-They pass only for a fully successful native producer matching their current
-source run ID, run attempt and tested merge/push SHA, plus successful full Linux
-terminal/vendor matrices. Their summaries distinguish native Mac execution from
+One existing coordination job validates the native producer and full Linux
+terminal/vendor matrices; the other Mac labels forward that result. Producer
+proof must match the current source run ID and tested merge/push SHA, with a
+positive producer attempt no later than the current attempt. The canonical owner's summary distinguishes native Mac execution from
 portable/alternate-backend Linux coverage. A bundle failure fails all adapters,
 including native checks not reached after the first failure. No test is inferred
 from a successful checkout or skipped step.
@@ -189,10 +193,11 @@ runners while waiting; this policy trades waiting/control time for paid Mac cost
 After a failed IDC attempt, resolve the runner/control cause and select **Re-run
 all jobs** on Test Suite. That schedules a fresh worker for source attempt 2+
 while its own worker attempt remains 1. Direct worker reruns stay rejected.
-Failed-only/individual reruns can reuse prior successful producer jobs; any
-re-executed adapter rejects stale attempt stamps instead of reporting a new pass.
-Already successful jobs GitHub retains without executing still represent their
-original attempt. The default-branch controller must contain this policy before
+When only Linux work failed, **Re-run failed jobs** can reuse a successful Mac
+producer for the same run and SHA. Re-executed gates accept that earlier attempt
+only while its selected producer remains successful; different runs, changed
+SHAs, invalid/future attempt stamps and failed producers are rejected. New
+workers still undergo exact source-attempt admission. The default-branch controller must contain this policy before
 rerun-all IDC can be verified; pre-merge tests use the old controller and may fail
 closed for source attempts greater than one.
 

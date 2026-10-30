@@ -2,7 +2,6 @@
 """Exercise CI gates and the real Makefile's online shard dispatch offline."""
 
 import json
-from itertools import product
 import os
 import re
 import shlex
@@ -133,8 +132,11 @@ class MacRunnerTests(unittest.TestCase):
         self.assertEqual(hosted.count("run-macos-lanes.sh all"), 1)
         self.assertEqual(workflow.count("runs-on: macos-15"), 1)
         for job in ("vendored-terminal-macos", "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
-            section = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], 1)[0]
-            self.assertIn("needs: [scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal]", section)
+            section = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
+            dependencies = ("scope, macos-plan, macos-hosted, terminal-pty-shards, vendored-terminal"
+                            if job == "macos-workspace-coordination-tests"
+                            else "scope, macos-workspace-coordination-tests")
+            self.assertIn(f"needs: [{dependencies}]", section)
             self.assertIn("runs-on: ubuntu-latest", section)
             self.assertNotIn("uses:", section)
         self.assertNotIn("pull_request_target:", workflow)
@@ -152,66 +154,86 @@ class MacRunnerTests(unittest.TestCase):
 
     def test_unaffected_scope_needs_no_mac_route_or_execution(self):
         scopes = classify(["docs/README.md"])
-        self.assertFalse(scopes["test_cli"] or scopes["test_core"])
+        self.assertFalse(scopes["test_macos"])
         self.assertEqual(select_macos_runner("pull_request", {}), [])
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         for job in ("macos-plan", "macos-hosted", "vendored-terminal-macos",
                     "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
             header = workflow.split(f"\n  {job}:\n", 1)[1].split("    runs-on:", 1)[0]
-            self.assertIn("needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true'", header)
+            comparison = "== 'true'" if job in ("macos-plan", "macos-hosted") else "!= 'false'"
+            self.assertIn(f"needs.scope.outputs.test_macos {comparison}", header)
         script = workflow_run_script(".github/workflows/test.yml", "Require macOS coordination and CLI execution")
         result = subprocess.run(["bash", "-c", script], env={**os.environ,
-            "SHARDS_REQUIRED": "false", "COORDINATION_RESULT": "skipped",
-            "TERMINAL_RESULT": "skipped", "MACOS_TERMINAL_RESULT": "skipped"}, capture_output=True)
+            "SHARDS_REQUIRED": "false", "MACOS_REQUIRED": "false", "COORDINATION_RESULT": "skipped",
+            "TERMINAL_RESULT": "skipped", "MACOS_TERMINAL_RESULT": "skipped", "VENDOR_RESULT": "skipped"}, capture_output=True)
         self.assertEqual(result.returncode, 0)
 
-    def test_required_mac_labels_bind_success_to_current_producer_and_attempt(self):
+    def test_mac_result_reuses_same_frozen_success_and_rejects_invalid_proofs(self):
+        script = workflow_run_script(".github/workflows/test.yml", "Require current macOS bundle")
+        base = {"SCOPE_RESULT": "success", "LINUX_TERMINAL_RESULT": "success", "LINUX_VENDOR_RESULT": "success",
+            "MINI_JOB_RESULT": "success", "MINI_RESULT": "success",
+            "MINI_RUN_ID": "1", "MINI_ATTEMPT": "2", "MINI_SHA": "abc", "HOSTED_JOB_RESULT": "skipped",
+            "HOSTED_RUN_ID": "1", "HOSTED_ATTEMPT": "2", "HOSTED_SHA": "abc",
+            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "abc"}
+        for route in ('["self-hosted","macOS","ARM64","mac-arm64-mini"]',
+                      '["self-hosted","macOS","ARM64","mac-arm64-main"]', '["macos-15"]', '', '[]', '["other"]'):
+            env = {**base, "MACOS_ROUTE": route}
+            valid = route not in ('', '[]', '["other"]')
+            hosted = route == '["macos-15"]'
+            if hosted:
+                env.update(MINI_JOB_RESULT="skipped", HOSTED_JOB_RESULT="success")
+            variants = [({}, valid)]
+            for key in ("SCOPE_RESULT", "LINUX_TERMINAL_RESULT", "LINUX_VENDOR_RESULT", "HOSTED_JOB_RESULT" if hosted else "MINI_JOB_RESULT"):
+                variants.extend(({key: value}, False) for value in ("failure", "cancelled", "skipped", ""))
+            prefix = "HOSTED" if hosted else "MINI"
+            for key in (f"{prefix}_RUN_ID", f"{prefix}_SHA"):
+                variants.extend(({key: value}, False) for value in ("", "wrong"))
+            variants.extend(({f"{prefix}_ATTEMPT": value}, False) for value in ("", "wrong", "0", "-1", "01", "3", "9" * 40))
+            variants.extend([
+                ({f"{prefix}_ATTEMPT": "1", "LINUX_TERMINAL_RESULT": "failure"}, False),
+                ({f"{prefix}_ATTEMPT": "1"}, valid),
+                ({f"{prefix}_ATTEMPT": "1", "GITHUB_SHA": "changed"}, False),
+            ])
+            if not hosted:
+                variants.extend(({"MINI_RESULT": value}, False) for value in ("failure", "unavailable", "obsolete", ""))
+            variants.append(({"MINI_JOB_RESULT" if hosted else "HOSTED_JOB_RESULT": "success"}, False))
+            for changes, expected in variants:
+                with self.subTest(route=route, changes=changes):
+                    result = subprocess.run(["bash", "-c", script], env={**os.environ, **env, **changes}, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, expected, result.stderr)
+
+    def test_mac_aliases_forward_only_the_canonical_result(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
-        for job in ("vendored-terminal-macos", "terminal-pty-shards-macos", "macos-workspace-coordination-tests"):
-            block = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1].split("        run: |\n", 1)[1], 1)[0]
-            script = "\n".join(line[10:] for line in block.splitlines())
-            base = {"SCOPE_RESULT": "success", "LINUX_TERMINAL_RESULT": "success", "LINUX_VENDOR_RESULT": "success", "MINI_JOB_RESULT": "success", "MINI_RESULT": "success",
-                "MINI_RUN_ID": "1", "MINI_ATTEMPT": "2", "MINI_SHA": "abc", "HOSTED_JOB_RESULT": "skipped",
-                "HOSTED_RUN_ID": "1", "HOSTED_ATTEMPT": "2", "HOSTED_SHA": "abc",
-                "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "abc"}
-            for route in ('["self-hosted","macOS","ARM64","mac-arm64-mini"]',
-                          '["self-hosted","macOS","ARM64","mac-arm64-main"]', '["macos-15"]', '', '[]', '["other"]'):
-                env = {**base, "MACOS_ROUTE": route}
-                valid = route in ('["self-hosted","macOS","ARM64","mac-arm64-mini"]',
-                                  '["self-hosted","macOS","ARM64","mac-arm64-main"]', '["macos-15"]')
-                hosted = route == '["macos-15"]'
-                if hosted:env.update(MINI_JOB_RESULT="skipped", HOSTED_JOB_RESULT="success")
-                variants = [({}, valid)]
-                for key in ("SCOPE_RESULT", "LINUX_TERMINAL_RESULT", "LINUX_VENDOR_RESULT", "HOSTED_JOB_RESULT" if hosted else "MINI_JOB_RESULT"):
-                    variants.extend(({key: value}, False) for value in ("failure", "cancelled", "skipped", ""))
-                prefix = "HOSTED" if hosted else "MINI"
-                for key in (f"{prefix}_RUN_ID", f"{prefix}_ATTEMPT", f"{prefix}_SHA"):
-                    variants.extend(({key: value}, False) for value in ("", "wrong"))
-                if not hosted:
-                    variants.extend(({"MINI_RESULT": value}, False) for value in ("failure", "unavailable", "obsolete", ""))
-                variants.append(({"MINI_JOB_RESULT" if hosted else "HOSTED_JOB_RESULT": "success"}, False))
-                for changes, expected in variants:
-                    with self.subTest(job=job, route=route, changes=changes):
-                        result = subprocess.run(["bash", "-c", script], env={**os.environ, **env, **changes}, capture_output=True, text=True)
-                        self.assertEqual(result.returncode == 0, expected, result.stderr)
+        self.assertEqual(workflow.count('case "$MACOS_ROUTE" in'), 1)
+        for job in ("vendored-terminal-macos", "terminal-pty-shards-macos"):
+            section = re.split(r"\n  (?=\S)", workflow.split(f"\n  {job}:\n", 1)[1], maxsplit=1)[0]
+            script = section.split('        run: ', 1)[1].strip()
+            for status in ("success", "failure", "cancelled", "skipped", ""):
+                with self.subTest(job=job, status=status):
+                    result = subprocess.run(["bash", "-c", script], env={**os.environ, "RESULT": status}, capture_output=True)
+                    self.assertEqual(result.returncode == 0, status == "success")
 
 
 class ParallelGateTests(unittest.TestCase):
     def test_shard_gates_reject_failure_cancellation_and_unexpected_skip(self):
-        for step, variables in (
-            ("Require terminal PTY shards", ("SHARDS_RESULT", "MACOS_RESULT")),
-            ("Require macOS coordination and CLI execution", ("COORDINATION_RESULT", "TERMINAL_RESULT", "MACOS_TERMINAL_RESULT")),
+        for step, variables, mac_variables in (
+            ("Require terminal PTY shards", ("SHARDS_RESULT", "MACOS_RESULT"), {"MACOS_RESULT"}),
+            ("Require macOS coordination and CLI execution", ("COORDINATION_RESULT", "TERMINAL_RESULT", "MACOS_TERMINAL_RESULT", "VENDOR_RESULT"),
+             {"COORDINATION_RESULT", "MACOS_TERMINAL_RESULT"}),
         ):
             script = workflow_run_script(".github/workflows/test.yml", step)
-            for required in (True, False):
-                for statuses in product(("success", "failure", "cancelled", "skipped", ""), repeat=len(variables)):
-                    with self.subTest(step=step, required=required, statuses=statuses):
-                        result = subprocess.run(["bash", "-c", script], env={
-                            **os.environ, "SHARDS_REQUIRED": str(required).lower(),
-                            **dict(zip(variables, statuses)),
-                        }, capture_output=True, text=True)
-                        expected = all(status == "success" or (not required and status == "skipped") for status in statuses)
-                        self.assertEqual(result.returncode == 0, expected)
+            for linux_required, mac_required in ((True, True), (True, False), (False, False)):
+                baseline = {key: "success" if (mac_required if key in mac_variables else linux_required) else "skipped" for key in variables}
+                for key in variables:
+                    for status in ("success", "failure", "cancelled", "skipped", ""):
+                        statuses = {**baseline, key: status}
+                        with self.subTest(step=step, linux=linux_required, mac=mac_required, statuses=statuses):
+                            result = subprocess.run(["bash", "-c", script], env={
+                                **os.environ, "SHARDS_REQUIRED": str(linux_required).lower(),
+                                "MACOS_REQUIRED": str(mac_required).lower(), **statuses,
+                            }, capture_output=True, text=True)
+                            required = mac_required if key in mac_variables else linux_required
+                            self.assertEqual(result.returncode == 0, status == "success" or (not required and status == "skipped"))
 
     def test_online_gate_requires_all_matrix_jobs_to_succeed(self):
         script = workflow_run_script(".github/workflows/test.yml", "Require online shards")
@@ -239,7 +261,7 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("if: ${{ !cancelled() }}", terminal)
         coordination = workflow.split("\n  macos-workspace-coordination:\n", 1)[1].split("\n  macos-workspace-coordination-tests:", 1)[0]
         self.assertIn('name: "Test: macOS workspace coordination"', coordination)
-        self.assertIn("needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards, terminal-pty-shards-macos]", coordination)
+        self.assertIn("needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards, terminal-pty-shards-macos, vendored-terminal]", coordination)
         self.assertIn("needs.scope.result != 'success'", coordination)
         self.assertIn("if: ${{ !cancelled() }}", coordination)
         contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
