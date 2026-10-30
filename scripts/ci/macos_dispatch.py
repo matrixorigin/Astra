@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Bounded mini attempt; ordinary Test Suite owns hosted fallback and checks."""
+"""Bounded mini attempt; ordinary Test Suite owns required checks without paid fallback."""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 from http.client import IncompleteRead
 import json
@@ -25,7 +26,8 @@ WAIT_STEP = "Wait for a bounded mini attempt"
 TEST_STEP = "Run all macOS lanes"
 PREFLIGHT_STEPS = {"Set up job", "Checkout control policy", "Validate mini dispatch",
                    "Checkout candidate", "Prepare Rust", "Prepare Node"}
-QUEUE_SECONDS = 900
+QUEUE_SECONDS = 3600
+QUEUE_POLL_SECONDS = 360
 EXECUTION_SECONDS = 3600
 POLL_SECONDS = 90
 RUNNING_POLL_SECONDS = 120
@@ -134,7 +136,7 @@ class Api(GitHubApi):
 
     def _read(self, path):
         # Retry only idempotent reads. Retrying dispatch could create duplicate
-        # workers; authorization failures must still fall back immediately.
+        # workers; authorization failures fail the IDC path.
         for attempt in range(3):
             try:
                 cached = self._conditional.get(path)
@@ -191,7 +193,7 @@ class Source:
     run_id: int
     attempt: int
     sha: str
-    created_at: str | None = None
+    started_at: str | None = None
     pr_number: int = 0
     head_sha: str = ""
     head_repo_id: int | None = None
@@ -219,13 +221,28 @@ def check_current(api, repo, src, run=None):
     return None
 
 
+def attempt_start(run):
+    # Reruns retain attempt 1's created_at; bound lookup to this attempt.
+    started_at = run.get("run_started_at")
+    if not isinstance(started_at, str):
+        raise Unavailable("source attempt start timestamp unavailable")
+    try:
+        # The mini may have Python 3.10, whose ISO parser does not accept Z.
+        parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if parsed.utcoffset() is None:
+            raise ValueError("missing timezone")
+    except (TypeError, ValueError):
+        raise Unavailable("source attempt start timestamp unavailable") from None
+    return started_at
+
+
 def source(api, repo, run_id, attempt):
     run = api.get(f"repos/{repo}/actions/runs/{run_id}")
     match = TITLE.fullmatch(run.get("display_title", ""))
     # GitHub may populate name with the dynamic run-name as well. The workflow
     # path is the identity; the title carries the immutable event tuple.
     if (run.get("id") != run_id or run.get("path") != ".github/workflows/test.yml"
-            or run.get("run_attempt") != attempt or attempt != 1 or not match):
+            or run.get("run_attempt") != attempt or attempt < 1 or not match):
         raise Unavailable("source run is not a current mini candidate")
     pr_number, event_base, head, merge = match.groups()
     if run.get("head_sha") != head:
@@ -233,7 +250,7 @@ def source(api, repo, run_id, attempt):
     if run.get("event") == "pull_request" and int(pr_number) > 0:
         # Fork run.pull_requests can be empty. The event title records the PR
         # and immutable merge tuple, rather than relying on that association.
-        src = Source(run_id, attempt, merge, run.get("created_at"),
+        src = Source(run_id, attempt, merge, attempt_start(run),
                      int(pr_number), head, run["head_repository"]["id"])
         pr = check_current(api, repo, src, run)
         parents = api.get(f"repos/{repo}/commits/{merge}")["parents"]
@@ -256,7 +273,7 @@ def source(api, repo, run_id, attempt):
           and run.get("head_branch") == "main" and merge == head
           and run.get("head_repository", {}).get("id") == run.get("repository", {}).get("id")
           and run.get("repository", {}).get("id") is not None):
-        src = Source(run_id, attempt, head, run.get("created_at"))
+        src = Source(run_id, attempt, head, attempt_start(run))
         check_current(api, repo, src, run)
         labels = MACOS_MAIN_LABELS
     else:
@@ -291,8 +308,8 @@ def gate_active(api, repo, src):
 
 def workers(api, repo, src):
     filters = {"event": "workflow_dispatch", "branch": "main", "per_page": 100}
-    if src.created_at:
-        filters["created"] = ">=" + src.created_at
+    if src.started_at:
+        filters["created"] = ">=" + src.started_at
     query = urlencode(filters)
     runs = api.collection(f"repos/{repo}/actions/workflows/{WORKFLOW}/runs?{query}", "workflow_runs")
     return [run for run in runs if run.get("display_title") == src.title
@@ -322,13 +339,13 @@ def worker_state(api, repo, run):
     if (run.get("conclusion") == "failure" and not preflight_failed
             and not (len(tests) == 1 and tests[0].get("conclusion") == "success")):
         # Incomplete/eventually consistent job metadata must not turn a failed
-        # test run into a successful hosted retry. Only proven setup failures
-        # or an explicit infrastructure terminal state get that fallback.
+        # test run into an infrastructure result. Only proven setup failures
+        # or an explicit infrastructure terminal state are unavailable.
         return "failure", assigned
     # Checkout, admission, low disk, toolchain, agent loss or an execution
     # deadline are infrastructure outcomes. Never infer success from a skip.
-    print("::notice::Mini ended without a completed passing test step; using hosted macOS")
-    return "hosted", assigned
+    print("::notice::Mini ended without a completed passing test step; no paid macOS fallback")
+    return "unavailable", assigned
 
 
 def wait_for_mini(api, repo, src, *, clock=time.monotonic, sleep=time.sleep, queued_at=None):
@@ -363,13 +380,13 @@ def wait_for_mini(api, repo, src, *, clock=time.monotonic, sleep=time.sleep, que
             if assigned and assigned_at is None:
                 assigned_at = min(clock(), queued_at + QUEUE_SECONDS)
         if assigned_at is None and clock() - queued_at >= QUEUE_SECONDS:
-            print("::notice::Mini queue/discovery budget expired; using hosted macOS")
-            return "hosted"
+            print("::notice::Mini queue/discovery budget expired; no paid macOS fallback")
+            return "unavailable"
         if assigned_at is not None and clock() - assigned_at >= EXECUTION_SECONDS:
-            print("::notice::Mini execution budget expired; using hosted macOS")
-            return "hosted"
+            print("::notice::Mini execution budget expired; no paid macOS fallback")
+            return "unavailable"
         deadline = (assigned_at + EXECUTION_SECONDS if assigned_at is not None else queued_at + QUEUE_SECONDS)
-        sleep(min(RUNNING_POLL_SECONDS if assigned_at is not None else POLL_SECONDS,
+        sleep(min(RUNNING_POLL_SECONDS if assigned_at is not None else QUEUE_POLL_SECONDS,
                   max(0, deadline - clock())))
 
 
@@ -427,7 +444,7 @@ def schedule(api, repo, src, *, clock=time.monotonic, sleep=time.sleep, queued_a
         if assigned_at is not None and clock() - assigned_at >= EXECUTION_SECONDS:
             return
         deadline = (assigned_at + EXECUTION_SECONDS if assigned_at is not None else queued_at + QUEUE_SECONDS)
-        sleep(min(RUNNING_POLL_SECONDS if assigned_at is not None else POLL_SECONDS,
+        sleep(min(RUNNING_POLL_SECONDS if assigned_at is not None else QUEUE_POLL_SECONDS,
                   max(0, deadline - clock())))
 
 
@@ -442,7 +459,7 @@ def main():
     api = Api(os.environ.get("GH_TOKEN", ""), os.environ.get("GITHUB_API_URL", "https://api.github.com"))
     queued_at = time.monotonic()
     api.set_deadline(queued_at + (QUEUE_SECONDS if args.mode in {"wait", "schedule"} else 120))
-    outcome, status, src = "hosted", 0, None
+    outcome, status, src = "unavailable", 0, None
     try:
         if args.mode == "cleanup":
             run = api.get(f"repos/{repo}/actions/runs/{args.run_id}")
@@ -450,14 +467,18 @@ def main():
             if run.get("path") == ".github/workflows/test.yml" and match:
                 # Completion also repairs an orphan left by a scheduler/API
                 # failure; the PR may already be closed or on a newer attempt.
-                cancel_workers(api, repo, Source(args.run_id, args.attempt, match[4], run.get("created_at")))
+                historical = api.get(f"repos/{repo}/actions/runs/{args.run_id}/attempts/{args.attempt}")
+                if (historical.get("id") != args.run_id or historical.get("run_attempt") != args.attempt
+                        or historical.get("path") != ".github/workflows/test.yml"):
+                    raise Unavailable("cleanup source attempt mismatch")
+                cancel_workers(api, repo, Source(args.run_id, args.attempt, match[4], attempt_start(historical)))
             return 0
         src = source(api, repo, args.run_id, args.attempt)
         if args.mode == "schedule":
             schedule(api, repo, src, queued_at=queued_at)
         elif args.mode == "admit":
             if os.environ.get("GITHUB_RUN_ATTEMPT") != "1":
-                raise Unavailable("worker reruns must use ordinary hosted recovery")
+                raise Unavailable("worker reruns must use a fresh source workflow attempt")
             if (src.sha != args.sha or os.environ.get("SOURCE_POOL") != ("pr" if src.pr_number else "main")
                     or not gate_active(api, repo, src)):
                 raise Unavailable("dispatch expired before execution")
@@ -501,6 +522,10 @@ def main():
     if args.mode == "wait":
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
             output.write(f"result={outcome}\n")
+            if src is not None:
+                output.write(f"run_id={src.run_id}\nattempt={src.attempt}\nsha={src.sha}\n")
+        if outcome != "success":
+            status = 1
         print(f"macOS execution result: {outcome}")
     return status
 

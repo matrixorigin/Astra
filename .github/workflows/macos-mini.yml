@@ -60,9 +60,5 @@ jobs:
           shared-key: ci-terminal-pty
           save-cache: "false"
           install-nextest: "false"
-      - name: Prepare Node
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version-file: .nvmrc
       - name: Run all macOS lanes
         run: bash scripts/ci/run-macos-lanes.sh all
