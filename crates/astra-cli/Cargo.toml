@@ -24,6 +24,7 @@ release-vendored-openssl = ["astra-services/openssl-vendored"]
 e2e-hooks = ["astra-services/e2e-hooks", "astra-runtime/e2e-hooks"]
 
 [dependencies]
+astra-build-info.workspace = true
 astra-core.workspace = true
 astra-sync-protocol.workspace = true
 astra-credentials.workspace = true

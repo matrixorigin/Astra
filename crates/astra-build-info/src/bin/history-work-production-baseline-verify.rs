@@ -1,11 +1,10 @@
 //! Fail-closed verifier for a Phase-0 production history-work artifact.
 
+use astra_build_info::verify_current_build_attestation;
 use std::fs;
 use std::path::PathBuf;
 
-use astra_core::history_work_baseline::{
-    ProductionBaselineArtifact, verify_current_build_attestation,
-};
+use astra_core::history_work_baseline::ProductionBaselineArtifact;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {

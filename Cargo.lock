@@ -129,9 +129,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-build-info"
+version = "0.2.13"
+dependencies = [
+ "astra-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "astra-cli"
 version = "0.2.13"
 dependencies = [
+ "astra-build-info",
  "astra-config",
  "astra-core",
  "astra-credentials",
@@ -300,6 +311,7 @@ dependencies = [
 name = "astra-edge"
 version = "0.2.13"
 dependencies = [
+ "astra-build-info",
  "astra-core",
  "astra-credentials",
  "astra-logging",
@@ -460,6 +472,7 @@ dependencies = [
 name = "astra-runtime"
 version = "0.2.13"
 dependencies = [
+ "astra-build-info",
  "astra-config",
  "astra-core",
  "astra-harness",
@@ -674,6 +687,7 @@ name = "astra-test-harness"
 version = "0.2.13"
 dependencies = [
  "anyhow",
+ "astra-build-info",
  "astra-config",
  "astra-core",
  "astra-credentials",

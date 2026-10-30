@@ -241,7 +241,7 @@ jobs:
       - name: Test core crates
         run: >-
           cargo nextest run --manifest-path Cargo.toml
-          -p astra-core -p astra-thin-client -p astra-runtime-env
+          -p astra-core -p astra-build-info -p astra-thin-client -p astra-runtime-env
           -p astra-tools -p astra-pipeline -p astra-turn-types
           -p astra-skills -p astra-sandbox -p astra-server-types
           -p astra-messaging -p astra-text-utils

@@ -85,9 +85,9 @@ fn main() {
         watch_git_path(&workspace, namespace);
     }
     // Attestation requires a valid embedded nonce. Only those builds need to
-    // invalidate core on every tracked edit, even when the nonce is reused.
+    // invalidate artifact identity on every tracked edit, even when the nonce is reused.
     // Ordinary builds conservatively declare dirty/unknown, never an unchecked
-    // clean snapshot: docs/web edits must not rebuild core and its dependents,
+    // clean snapshot: docs/web edits must not rebuild identity and its dependents,
     // but an edited downstream binary must not pass clean-artifact verification.
     // Trusted launchers can supply explicit source identity through the watched
     // env vars. Deleted tracked paths conservatively rerun attestation builds

@@ -112,7 +112,7 @@ cargo build \
     -p astra-runtime \
     -p astra-cli \
     -p astra-edge \
-    -p astra-core \
+    -p astra-build-info \
     --bin astra-server \
     --bin astra \
     --bin astra-edge \

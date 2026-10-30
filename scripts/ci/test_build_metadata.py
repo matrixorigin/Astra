@@ -44,7 +44,7 @@ class BuildMetadataTests(unittest.TestCase):
             "RUSTC_WORKSPACE_WRAPPER": "",
         })
         (self.repo / "Cargo.toml").write_text(
-            '[workspace]\nmembers = ["crates/core", "crates/app"]\nresolver = "2"\n'
+            '[workspace]\nmembers = ["crates/core", "crates/service", "crates/identity", "crates/app"]\nresolver = "2"\n'
         )
         shutil.copyfile(ROOT / "rust-toolchain.toml", self.repo / "rust-toolchain.toml")
         (self.repo / ".gitignore").write_text("/target/\n")
@@ -52,22 +52,36 @@ class BuildMetadataTests(unittest.TestCase):
             tracked = self.repo / path
             tracked.parent.mkdir(parents=True, exist_ok=True)
             tracked.write_text("fixture\n")
-        for name in ("core", "app"):
+        for name in ("identity", "app"):
             package = self.repo / "crates" / name
             (package / "src").mkdir(parents=True)
             manifest = f'[package]\nname = "fixture_{name}"\nversion = "0.1.0"\nedition = "2024"\n'
             if name == "app":
-                manifest += '[dependencies]\nfixture_core = { path = "../core" }\n'
+                manifest += '[dependencies]\nfixture_identity = { path = "../identity" }\n'
             (package / "Cargo.toml").write_text(manifest)
-        shutil.copyfile(ROOT / "crates/core/build.rs", self.repo / "crates/core/build.rs")
-        (self.repo / "crates/core/src/lib.rs").write_text('''
+        for name, manifest, source in (
+            ("core", '[package]\nname="astra-core"\nversion="0.1.0"\nedition="2024"\n',
+             'pub fn value() -> u8 { 1 }\n'),
+            ("service", '[package]\nname="fixture_service"\nversion="0.1.0"\nedition="2024"\n[dependencies]\nastra-core={path="../core"}\n',
+             'pub fn value() -> u8 { astra_core::value() }\n'),
+        ):
+            package = self.repo / "crates" / name
+            (package / "src").mkdir(parents=True)
+            (package / "Cargo.toml").write_text(manifest)
+            (package / "src/lib.rs").write_text(source)
+        with (self.repo / "crates/identity/Cargo.toml").open("a") as output:
+            output.write('[dependencies]\nastra-core={path="../core"}\n')
+        with (self.repo / "crates/app/Cargo.toml").open("a") as output:
+            output.write('fixture_service={path="../service"}\n')
+        shutil.copyfile(ROOT / "crates/astra-build-info/build.rs", self.repo / "crates/identity/build.rs")
+        (self.repo / "crates/identity/src/lib.rs").write_text('''
 pub fn identity() -> [&'static str; 3] {
     [env!("ASTRA_BUILD_GIT_SHA"), env!("ASTRA_BUILD_GIT_DIRTY"),
      env!("ASTRA_BUILD_ATTESTATION_NONCE")]
 }
 ''')
         (self.repo / "crates/app/src/main.rs").write_text('''
-fn main() { println!("{:?}", fixture_core::identity()); }
+fn main() { assert_eq!(fixture_service::value(), 1); println!("{:?}", fixture_identity::identity()); }
 ''')
         self.run_command("cargo", "generate-lockfile", "--offline")
         self.git("init", "-b", "main")
@@ -88,8 +102,8 @@ fn main() { println!("{:?}", fixture_core::identity()); }
         result = self.run_command("cargo", "run", "--locked", "--offline", "--verbose",
                                   "-p", "fixture_app")
         if fresh or fresh_core:
-            self.assertIn("Fresh fixture_core", result.stderr)
-            self.assertNotIn("Compiling fixture_core", result.stderr)
+            self.assertIn("Fresh fixture_identity", result.stderr)
+            self.assertNotIn("Compiling fixture_identity", result.stderr)
         if fresh:
             self.assertIn("Fresh fixture_app", result.stderr)
             self.assertNotIn("Compiling fixture_", result.stderr)
@@ -97,6 +111,24 @@ fn main() { println!("{:?}", fixture_core::identity()); }
         if expected is not None:
             self.assertEqual(identity, expected)
         return identity
+
+    def test_metadata_commit_preserves_core_and_service_artifacts(self):
+        self.build()
+        self.git("commit", "--allow-empty", "-m", "metadata-only change")
+        result = self.run_command("cargo", "run", "--locked", "--offline", "--verbose", "-p", "fixture_app")
+        self.assertEqual(json.loads(result.stdout)[0], self.git("rev-parse", "HEAD"))
+        for package in ("astra-core", "fixture_service"):
+            self.assertIn(f"Fresh {package}", result.stderr)
+            self.assertNotIn(f"Compiling {package}", result.stderr)
+        for package in ("fixture_identity", "fixture_app"):
+            self.assertIn(f"Compiling {package}", result.stderr)
+        self.build(fresh=True)
+        core = self.repo / "crates/core/src/lib.rs"
+        core.write_text(core.read_text() + "\n// real source edit\n")
+        result = self.run_command("cargo", "run", "--locked", "--offline", "--verbose", "-p", "fixture_app")
+        for package in ("astra-core", "fixture_service", "fixture_identity", "fixture_app"):
+            self.assertIn(f"Compiling {package}", result.stderr)
+        self.assertEqual(json.loads(result.stdout)[0], self.git("rev-parse", "HEAD"))
 
     def test_cold_detached_checkout_reuses_second_and_third_build(self):
         # packed-refs absent reproduces A; present isolates the index refresh B.
@@ -117,7 +149,7 @@ fn main() { println!("{:?}", fixture_core::identity()); }
                     # Force stale stat data without changing content. Do not run
                     # git status/refresh before Cargo: the build must be read-only
                     # even on the very first checkout build.
-                    tracked = clone / "crates/core/src/lib.rs"
+                    tracked = clone / "crates/identity/src/lib.rs"
                     stat = tracked.stat()
                     os.utime(tracked, ns=(stat.st_atime_ns, stat.st_mtime_ns - 10_000_000_000))
                     index = clone / ".git/index"
@@ -244,24 +276,29 @@ fn main() { println!("{:?}", fixture_core::identity()); }
         # closure. Fetch it before switching back to fully offline builds.
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
         versions = {p["name"]: p["version"] for p in lock["package"]}
-        manifest = self.repo / "crates/core/Cargo.toml"
+        manifest = self.repo / "crates/identity/Cargo.toml"
         with manifest.open("a") as output:
-            output.write('[dependencies]\n')
             output.write(f'serde = {{ version = "={versions["serde"]}", features = ["derive"] }}\n')
             output.write(f'serde_json = "={versions["serde_json"]}"\n')
         shutil.copyfile(ROOT / "Cargo.lock", self.repo / "Cargo.lock")
-        shutil.copyfile(ROOT / "crates/core/src/build_info.rs",
-                        self.repo / "crates/core/src/build_info.rs")
         (self.repo / "crates/core/src/lib.rs").write_text('''
-pub mod build_info;
+pub fn value() -> u8 { 1 }
 pub mod history_work_baseline {
-    pub const BUILD_GIT_SHA: &str = env!("ASTRA_BUILD_GIT_SHA");
-    pub const BUILD_GIT_DIRTY: &str = env!("ASTRA_BUILD_GIT_DIRTY");
+    pub struct BuildAttestation { pub git_sha: &'static str, pub git_dirty: &'static str, pub nonce: &'static str }
+    pub fn verify_current_build_attestation(_: &str, _: &str, _: BuildAttestation) -> std::io::Result<String> {
+        unreachable!("probe must not initialize baseline verification")
+    }
 }
+''')
+        shutil.copyfile(ROOT / "crates/astra-build-info/src/lib.rs",
+                        self.repo / "crates/identity/src/build_info.rs")
+        (self.repo / "crates/identity/src/lib.rs").write_text('''
+pub mod build_info;
+
 ''')
         downstream = self.repo / "crates/app/src/main.rs"
         original = '''fn main() {
-    if fixture_core::build_info::write_json_if_requested().unwrap() { return; }
+    if fixture_identity::build_info::write_json_if_requested().unwrap() { return; }
     println!("original behavior");
 }
 '''
@@ -309,8 +346,8 @@ pub mod history_work_baseline {
                 result = self.run_command("cargo", "build", "--locked", "--offline",
                                           "--verbose", "-p", "fixture_app")
                 if mode in ("ordinary", "invalid-nonce"):
-                    self.assertIn("Fresh fixture_core", result.stderr)
-                    self.assertNotIn("Compiling fixture_core", result.stderr)
+                    self.assertIn("Fresh fixture_identity", result.stderr)
+                    self.assertNotIn("Compiling fixture_identity", result.stderr)
                 self.assertEqual(self.run_command(str(binary)).stdout.strip(), "edited behavior")
                 downstream.write_text(original)
                 self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=no"), "")

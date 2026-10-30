@@ -441,7 +441,7 @@ fn project(event: &DashboardEvent) -> io::Result<Value> {
             run_id,
             sequence,
             json!({"type":"suite_started", "total":total_cases,
-                "commit":astra_core::build_info::current().git_sha}),
+                "commit":astra_build_info::current().git_sha}),
         ),
         DashboardEvent::CaseQueued {
             run_id,

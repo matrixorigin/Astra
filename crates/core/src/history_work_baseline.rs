@@ -24,9 +24,14 @@ const PROCESS_CAPTURE_PATH_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_FRAGMENT";
 pub const BASELINE_RUN_ID_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_RUN_ID";
 pub const BASELINE_GIT_SHA_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_GIT_SHA";
 pub const BASELINE_CAPTURE_SCOPE_ENV: &str = "ASTRA_HISTORY_WORK_BASELINE_CAPTURE_SCOPE";
-pub const BUILD_GIT_SHA: &str = env!("ASTRA_BUILD_GIT_SHA");
-pub const BUILD_GIT_DIRTY: &str = env!("ASTRA_BUILD_GIT_DIRTY");
-pub const BUILD_ATTESTATION_NONCE: &str = env!("ASTRA_BUILD_ATTESTATION_NONCE");
+/// Identity embedded by the executable's build, supplied without runtime overrides.
+#[derive(Debug, Clone, Copy)]
+pub struct BuildAttestation {
+    pub git_sha: &'static str,
+    pub git_dirty: &'static str,
+    pub nonce: &'static str,
+}
+
 const MAX_BASELINE_RUN_SECONDS: u64 = 24 * 60 * 60;
 const ATOMIC_WRITE_CREATE_ATTEMPTS: usize = 64;
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -182,7 +187,10 @@ pub struct ProductionProcessCaptureGuard {
 }
 
 impl ProductionProcessCaptureGuard {
-    pub fn from_env(role: ProductionProcessRole) -> io::Result<Option<Self>> {
+    pub fn from_env(
+        role: ProductionProcessRole,
+        build: BuildAttestation,
+    ) -> io::Result<Option<Self>> {
         let Some(path) = std::env::var_os(PROCESS_CAPTURE_PATH_ENV) else {
             return Ok(None);
         };
@@ -207,7 +215,8 @@ impl ProductionProcessCaptureGuard {
                 format!("{PROCESS_CAPTURE_PATH_ENV} requires {BASELINE_GIT_SHA_ENV}"),
             )
         })?;
-        let git_sha = verify_current_build_attestation(&configured_git_sha, &baseline_run_id)?;
+        let git_sha =
+            verify_current_build_attestation(&configured_git_sha, &baseline_run_id, build)?;
         let scope = std::env::var(BASELINE_CAPTURE_SCOPE_ENV)
             .map_err(|_| {
                 io::Error::new(
@@ -470,13 +479,14 @@ fn verify_clean_build_attestation(built_dirty: &str) -> io::Result<()> {
 pub fn verify_current_build_attestation(
     expected_sha: &str,
     expected_run_id: &str,
+    build: BuildAttestation,
 ) -> io::Result<String> {
     verify_build_attestation(
         expected_sha,
         expected_run_id,
-        BUILD_GIT_SHA,
-        BUILD_GIT_DIRTY,
-        BUILD_ATTESTATION_NONCE,
+        build.git_sha,
+        build.git_dirty,
+        build.nonce,
     )
 }
 

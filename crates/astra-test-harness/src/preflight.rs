@@ -193,7 +193,7 @@ async fn check_client_build(astra_bin: &Path, expected: &str) -> Result<(), Pref
     let identity: serde_json::Value = serde_json::from_slice(&stdout)
         .map_err(|error| invalid(format!("CLI build identity is invalid JSON: {error}")))?;
     if identity.get("schema").and_then(serde_json::Value::as_str)
-        != Some(astra_core::build_info::BUILD_INFO_SCHEMA)
+        != Some(astra_build_info::BUILD_INFO_SCHEMA)
     {
         return Err(invalid("CLI build identity schema is unsupported".into()));
     }
@@ -491,7 +491,7 @@ pub async fn run_preflight(
         requested_profile.unwrap_or("harness-auto"),
         require_memoria,
         expected_build.as_deref(),
-        astra_core::build_info::current(),
+        astra_build_info::current(),
     )
     .await
 }
@@ -503,7 +503,7 @@ async fn run_preflight_with_build(
     auto_profile: &str,
     require_memoria: bool,
     expected_build: Option<&str>,
-    harness: astra_core::build_info::BuildInfo,
+    harness: astra_build_info::BuildInfo,
 ) -> Result<Option<String>, PreflightError> {
     // Probe workspaces change CWD; resolve the executable once beforehand.
     let astra_bin = canonical_binary_path(astra_bin)?;
@@ -1272,7 +1272,7 @@ esac
         let bin = dir.path().join("astra");
         let calls = dir.path().join("calls");
         let identity = serde_json::json!({
-            "schema": astra_core::build_info::BUILD_INFO_SCHEMA,
+            "schema": astra_build_info::BUILD_INFO_SCHEMA,
             "git_sha": SHA, "git_dirty": false, "target": "test", "profile": "test"
         });
         for execution_sha in ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", SHA] {
@@ -1306,10 +1306,10 @@ esac
                 "local",
                 false,
                 Some(SHA),
-                astra_core::build_info::BuildInfo {
+                astra_build_info::BuildInfo {
                     git_sha: SHA,
                     git_dirty: false,
-                    ..astra_core::build_info::current()
+                    ..astra_build_info::current()
                 },
             )
             .await
@@ -1555,7 +1555,7 @@ esac
         let bin = dir.path().join("astra");
         let calls = dir.path().join("calls");
         let identity = serde_json::json!({
-            "schema": astra_core::build_info::BUILD_INFO_SCHEMA,
+            "schema": astra_build_info::BUILD_INFO_SCHEMA,
             "git_sha": SHA, "git_dirty": false, "target": "test", "profile": "test"
         })
         .to_string();
@@ -1572,10 +1572,10 @@ esac
                 "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n--build-info-json) printf '%s' '{}' ;;\nhealth) printf '%s' '{}' ;;\n*) exit 99 ;;\nesac\n",
                 calls.display(), metadata, health,
             )).unwrap();
-            let harness = astra_core::build_info::BuildInfo {
+            let harness = astra_build_info::BuildInfo {
                 git_sha: SHA,
                 git_dirty: false,
-                ..astra_core::build_info::current()
+                ..astra_build_info::current()
             };
             let error = super::run_preflight_with_build(
                 &bin,

@@ -15,6 +15,7 @@ name = "astra-edge"
 path = "src/main.rs"
 
 [dependencies]
+astra-build-info.workspace = true
 astra-core.workspace = true
 astra-logging.workspace = true
 clap = { workspace = true }

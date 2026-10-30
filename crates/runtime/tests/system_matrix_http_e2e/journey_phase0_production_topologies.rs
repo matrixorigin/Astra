@@ -6,6 +6,7 @@
 //! `astra-edge` binaries. Process counters are emitted only by each binary's
 //! `ProductionProcessCaptureGuard`.
 
+use astra_build_info::verify_current_build_attestation;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -17,8 +18,7 @@ use astra_core::config::{ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_E
 use astra_core::history_work_baseline::{
     BASELINE_CAPTURE_SCOPE_ENV, BASELINE_GIT_SHA_ENV, BASELINE_RUN_ID_ENV, PROCESS_CAPTURE_SCHEMA,
     ProductionCaptureScope, ProductionProcessCapture, ProductionProcessRole, ProductionTopology,
-    WindowClass, production_process_capture_id, verify_current_build_attestation,
-    write_json_atomic,
+    WindowClass, production_process_capture_id, write_json_atomic,
 };
 use astra_core::{AppSettings, SharedPool};
 use astra_runtime_env::ASTRA_LOCAL_STATE_ROOT_ENV;

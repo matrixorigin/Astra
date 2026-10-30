@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(code);
     }
     let _installation_lease = astra_core::client_installation::acquire(&executable)?;
-    if astra_core::build_info::write_json_if_requested()? {
+    if astra_build_info::write_json_if_requested()? {
         return Ok(());
     }
 
@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let process_capture =
         astra_core::history_work_baseline::ProductionProcessCaptureGuard::from_env(
             astra_core::history_work_baseline::ProductionProcessRole::Cli,
+            astra_build_info::current_attestation(),
         )?;
     let exit_code = astra_cli::entrypoint::run();
     if let Some(process_capture) = process_capture {

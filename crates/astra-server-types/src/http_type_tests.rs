@@ -581,7 +581,7 @@ fn health_response_serializes() {
         memoria: "connected".into(),
         interaction_api_major: AGENT_INTERACTION_API_MAJOR.to_string(),
         build_git_sha: "a".repeat(40),
-        build_git_dirty: astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true",
+        build_git_dirty: true,
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["status"], "ok");
@@ -590,10 +590,7 @@ fn health_response_serializes() {
     assert!(v.get("persist_ok").is_none());
     assert!(v.get("persist_fail").is_none());
     assert_eq!(v["interaction_api_major"], AGENT_INTERACTION_API_MAJOR);
-    assert_eq!(
-        v["build_git_dirty"],
-        astra_core::history_work_baseline::BUILD_GIT_DIRTY == "true"
-    );
+    assert_eq!(v["build_git_dirty"], true);
 }
 
 #[test]
