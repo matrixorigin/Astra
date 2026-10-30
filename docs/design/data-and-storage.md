@@ -57,6 +57,15 @@ negotiation. Consecutive small protocol messages, including prepared-statement
 close and execute packets, must not incur Nagle/delayed-ACK stalls. This is a
 transport setting; persistence and transaction boundaries remain unchanged.
 
+Pool shutdown cancels an unfinished health check on a connection already being
+returned to the pool. The connection is discarded and its permit released;
+shutdown does not depend on a reply from that health check. A close listener is
+registered before checking the closed flag so concurrent close cannot lose its
+notification. Healthy returns still check and reuse their connections. This is
+not a deadline for application-held connections or other graceful-close I/O;
+callers must still stop admissions and drain the owning runtime first. Shared
+pool limits and process-wide connection quota remain unchanged.
+
 Settled execution continuation belongs to the Run checkpoint. Provider attempts
 retain their exact wire hash, byte count and admission identity; uncertain
 admission reconciles those facts before transport. The unused database canonical

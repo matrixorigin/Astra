@@ -147,6 +147,6 @@ strip = "symbols"
 # Local startup-query prototype; see vendor/crossterm/ASTRA-PATCH.md.
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm" }
-# Restore TCP_NODELAY omitted by SQLx 0.9.0. Remove this pin when a release
-# contains https://github.com/launchbadge/sqlx/pull/4336.
-sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "6e57d05490859f31aa364ca69fcb379f3a2995e6" }
+# Preserve TCP_NODELAY and cancel pending return health checks on pool close.
+# Based directly on upstream 6e57d05; see docs/design/data-and-storage.md.
+sqlx-core = { git = "https://github.com/XuPeng-SH/sqlx", rev = "718ace3156fa67cf639a872e016cabd95796e6fc" }

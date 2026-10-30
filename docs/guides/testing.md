@@ -508,6 +508,19 @@ service stacks; distinct database names alone do not remove shared-host load.
 All existing test selections, features, exclusions, and per-test deadlines are
 retained.
 
+The integration lane includes `pool_shutdown_db_it`. It forwards a real MySQL
+handshake and query, withholds only the returned connection's health-check ping,
+and verifies that public `SharedPool::close()` completes and the client socket
+closes without a ping response. A second case withholds a queued transaction
+rollback, then verifies rollback and key-lock release using an independent
+connection. Run these cases against the explicitly configured
+disposable MatrixOne instance with:
+
+```bash
+ASTRA_TEST_DB_IT=1 cargo nextest run -p astra-runtime --test pool_shutdown_db_it \
+  --profile strict-online-ci --run-ignored only
+```
+
 Memoria identity/credential fixtures require `ASTRA_TEST_DB_IT=1` and an
 explicit `ASTRA_TEST_DATABASE` matching the effective database name. The normal
 online runner supplies its isolated lane database; local callers must designate
