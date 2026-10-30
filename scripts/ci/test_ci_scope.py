@@ -25,18 +25,18 @@ class CiScopeTests(unittest.TestCase):
 
     def test_macos_unknown_author_stays_hosted_even_when_actor_or_login_matches(self):
         for user in ({}, {"login": "XuPeng-SH"}, {"id": 999999999, "login": "XuPeng-SH"},
-                     {"id": "39627130"}, {"id": True}, None):
+                     {"id": "39627130"}, {"id": True}, {"id": 0}, {"id": -1}, None):
             with self.subTest(user=user):
                 event = {"pull_request": {"user": user}, "sender": {"id": 39627130}}
-                self.assertEqual(select_macos_runner("pull_request", event),
-                                 ["macos-15"])
+                expected = ["macos-15"] if isinstance(user, dict) and user.get("id") == 999999999 else []
+                self.assertEqual(select_macos_runner("pull_request", event), expected)
         for event in ({}, {"pull_request": None}, []):
-            self.assertEqual(select_macos_runner("pull_request", event), ["macos-15"])
+            self.assertEqual(select_macos_runner("pull_request", event), [])
 
     def test_other_pushes_and_manual_events_remain_hosted(self):
         for event_name in ("workflow_dispatch", "pull_request_target"):
             self.assertEqual(select_macos_runner(event_name,
-                {"ref": "refs/heads/main", "sender": {"id": 39627130}}), ["macos-15"])
+                {"ref": "refs/heads/main", "sender": {"id": 39627130}}), [])
         self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/main"}), ["macos-15"])
         self.assertEqual(select_macos_runner("push", {"ref": "refs/heads/main"}, main_enabled=True),
                          ["self-hosted", "macOS", "ARM64", "mac-arm64-main"])
@@ -44,9 +44,9 @@ class CiScopeTests(unittest.TestCase):
             for ref in ("refs/heads/develop", "refs/heads/feature", "refs/tags/v1.0", "main", None):
                 with self.subTest(enabled=enabled, ref=ref):
                     self.assertEqual(select_macos_runner("push", {"ref": ref}, main_enabled=enabled),
-                                     ["macos-15"])
+                                     ["macos-15"] if isinstance(ref, str) and ref.startswith("refs/") else [])
 
-    def test_macos_missing_event_routes_to_hosted_without_omitting_scope_checks(self):
+    def test_macos_missing_event_refuses_paid_route_without_omitting_scope_checks(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
             with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(Path(directory) / "missing"),
@@ -55,7 +55,7 @@ class CiScopeTests(unittest.TestCase):
                  redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                 self.assertEqual(main(), 0)
             values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-            self.assertEqual(json.loads(values["macos_runner"]), ["macos-15"])
+            self.assertEqual(json.loads(values["macos_runner"]), [])
             self.assertEqual(values["test_core"], "true")
 
     def assert_rename_selects_expected_scopes(

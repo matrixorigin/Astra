@@ -479,13 +479,18 @@ ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 ```
 
 CI runs the default terminal reader, `use-dev-tty` reader, and reflow binary in
-three parallel jobs on each of Linux and macOS. Separate builds keep dev-tty
-feature unification out of the default-reader checks. The existing
+three parallel Linux jobs. On macOS, they share one sequential bundle with
+workspace coordination and vendored units, on IDC when eligible or on one
+explicitly selected hosted runner. Separate Cargo invocations retain the default
+and dev-tty feature graphs; dev-tty runs last. Hosted bundle preparation and Cargo
+artifacts are shared instead of repeated across five paid Macs. The existing
 `Test: terminal PTY (ubuntu-latest)` and `Test: terminal PTY (macos-15)` required
-checks aggregate the full terminal matrix; a failed, cancelled, or unexpectedly
-skipped shard cannot pass either gate. Unaffected changes skip the heavy jobs.
-Push runs populate the terminal dependency cache once per OS and the separate
-macOS workspace-coordination cache. The Rust terminal-reader PTY tests also
+checks still reject failed, cancelled or unexpectedly skipped work. Unaffected
+changes skip heavy jobs. IDC failures never allocate a paid fallback; rerun all
+jobs after resolving capacity/control failures. Producer results must match the
+current run, attempt and tested SHA. Push runs populate the terminal dependency
+cache once per OS.
+The Rust terminal-reader PTY tests also
 verify that a resize cursor query preserves keyboard/paste input and times out
 when the terminal does not answer.
 

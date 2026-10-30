@@ -117,9 +117,11 @@ Main pushes default to hosted; operators may enable a separate isolated main
 runner with `ASTRA_MACOS_MAIN_ENABLED=1`. Develop pushes and release builds
 remain hosted. The PR mini shares a persistent account and toolchain and must
 never serve as the main runner.
-A 15-minute queue/discovery or setup failure falls back to hosted jobs in parallel;
-real test failures remain failures. Updated/closed PRs
-request cancellation instead of starting hosted Mac tests. Other authors and reruns use hosted macOS. Linux
+An IDC route gets a 60-minute queue/discovery budget and never switches to
+paid hosted Macs automatically. Queue, setup and control failures fail the
+required checks; fix the cause and **Re-run all jobs** to create a fresh attempt.
+Other known authors and default-hosted pushes use one Mac bundle that shares
+checkout, toolchain setup and Cargo artifacts across all five lanes. Linux
 execution starts independently. The ordinary workflow retains required checks
 and fork approval; no App or custom check source is needed.
 See [runner operations](docs/guides/repository-automation.md#self-hosted-macos-tests)

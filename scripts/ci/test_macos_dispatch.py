@@ -50,6 +50,7 @@ class ApiFixture:
             "path": ".github/workflows/test.yml", "event": "pull_request",
             "display_title": f"Test Suite pr=1126 base={BASE} head={HEAD} merge={MERGE}",
             "head_sha": HEAD, "status": "in_progress", "pull_requests": [],
+            "created_at": "2026-10-24T00:00:00Z", "run_started_at": "2026-10-30T00:00:00Z",
             "head_repository": {"id": 42}, "repository": {"id": 7}}
         self.run["name"] = self.run["display_title"]
         self.pr = {"state": "open", "user": {"id": 52204121},
@@ -58,7 +59,7 @@ class ApiFixture:
         self.parents = [BASE, HEAD]
         self.tip = BASE
         self.compare_status = "ahead"
-        self.src = dispatch.Source(1, 1, MERGE, pr_number=1126, head_sha=HEAD, head_repo_id=42)
+        self.src = dispatch.Source(1, 1, MERGE, self.run["run_started_at"], pr_number=1126, head_sha=HEAD, head_repo_id=42)
         self.enabled = True
         self.assign_at, self.finish_at = 0, 30
         self.run_conclusion, self.test_conclusion = "success", "success"
@@ -85,6 +86,11 @@ class ApiFixture:
             if self.source_end_at is not None and self.clock() >= self.source_end_at:
                 run["status"] = "completed"
             return run
+        if "/actions/runs/1/attempts/" in path and "/jobs" not in path:
+            run = deepcopy(self.run)
+            run["run_attempt"] = int(path.rsplit("/", 1)[1])
+            run["run_started_at"] = "2026-10-30T00:00:00Z"
+            return run
         if path.endswith("/pulls/1126"):
             pr = deepcopy(self.pr)
             if self.pr_change_at is not None and self.clock() >= self.pr_change_at:
@@ -109,7 +115,7 @@ class ApiFixture:
         self.timed_calls.append(self.clock())
         if "/workflows/macos-mini.yml/runs?" in path:
             return ([self.worker()] if self.enabled else []) + deepcopy(self.other_runs)
-        if "/runs/1/attempts/1/jobs?" in path:
+        if f"/runs/1/attempts/{self.run['run_attempt']}/jobs?" in path:
             completed = self.gate_end_at is not None and self.clock() >= self.gate_end_at
             status = "in_progress" if self.clock() >= self.gate_start_at else "queued"
             wait_status = "completed" if completed or (self.wait_end_at is not None and self.clock() >= self.wait_end_at) else status
@@ -152,7 +158,7 @@ def real_api(fixture):
             return b"", {}
         if "/workflows/" in path:
             value = {"workflow_runs": fixture.collection(path, "workflow_runs")}
-        elif "/attempts/" in path:
+        elif "/attempts/" in path and "/jobs" in path:
             value = {"jobs": fixture.collection(path, "jobs")}
         else:
             value = fixture.get(path)
@@ -381,7 +387,7 @@ class SourceTests(unittest.TestCase):
         api = ApiFixture()
         api.run.update(event="push", head_branch="main", head_repository={"id": 7},
             display_title=f"Test Suite pr=0 base={BASE} head={HEAD} merge={HEAD}")
-        self.assertEqual(dispatch.source(api, REPO, 1, 1), dispatch.Source(1, 1, HEAD))
+        self.assertEqual(dispatch.source(api, REPO, 1, 1), dispatch.Source(1, 1, HEAD, api.run["run_started_at"]))
 
     def test_main_push_requires_exact_sha_and_repository(self):
         for mutation in (
@@ -418,16 +424,16 @@ class WaitTests(unittest.TestCase):
             api.pr_change_at = 120
             with self.assertRaises(dispatch.Superseded):
                 self.wait(api)
-            self.assertLessEqual(api.clock(), 120 + dispatch.RUNNING_POLL_SECONDS)
+            self.assertLessEqual(api.clock(), 120 + max(dispatch.QUEUE_POLL_SECONDS, dispatch.RUNNING_POLL_SECONDS))
 
     def test_full_queue_plus_one_hour_attempt_stays_below_default_rest_budget(self):
         api = ApiFixture()
-        api.assign_at = 890
+        api.assign_at = dispatch.QUEUE_SECONDS - 10
         api.finish_at = 100000
-        self.assertEqual(self.wait(api), "hosted")
+        self.assertEqual(self.wait(api), "unavailable")
         read_calls = len(api.calls)
         api = ApiFixture()
-        api.assign_at = 890
+        api.assign_at = dispatch.QUEUE_SECONDS - 10
         api.finish_at = 100000
         dispatch.schedule(api, REPO, api.src, clock=api.clock, sleep=api.clock.sleep)
         self.assertLess(read_calls + len(api.calls), 400)
@@ -467,7 +473,7 @@ class WaitTests(unittest.TestCase):
         run.update(status="in_progress", conclusion=None)
         self.assertEqual(dispatch.worker_state(api, REPO, run)[0], "failure")
 
-    def test_worker_lookup_filters_history_to_the_source_creation_window(self):
+    def test_worker_lookup_filters_history_to_the_source_attempt_window(self):
         api = ApiFixture()
         src = dispatch.Source(1, 1, MERGE, "2026-10-24T08:00:00Z")
         dispatch.workers(api, REPO, src)
@@ -480,7 +486,7 @@ class WaitTests(unittest.TestCase):
             with self.subTest(conclusion=conclusion, test=test):
                 api = ApiFixture()
                 api.run_conclusion, api.test_conclusion = conclusion, test
-                self.assertEqual(self.wait(api), "hosted")
+                self.assertEqual(self.wait(api), "unavailable")
 
     def test_same_sha_different_source_run_and_attempt_cannot_supply_results(self):
         for title in (dispatch.Source(2, 1, MERGE).title, dispatch.Source(1, 2, MERGE).title):
@@ -489,7 +495,7 @@ class WaitTests(unittest.TestCase):
             other = api.worker()
             other.update(id=20, status="completed", conclusion="success", display_title=title)
             api.other_runs = [other]
-            self.assertEqual(self.wait(api), "hosted")
+            self.assertEqual(self.wait(api), "unavailable")
             self.assertEqual(api.clock(), dispatch.QUEUE_SECONDS)
 
     def test_parent_cancellation_does_not_reuse_old_mini_result(self):
@@ -511,12 +517,12 @@ class LifecycleTests(unittest.TestCase):
         for role in (dispatch.wait_for_mini, dispatch.schedule):
             # Late assignment, missing/unassigned worker, and exact terminal boundary.
             for enabled, assigned, finished, conclusion, expected_time in (
-                (True, 890, 950, "success", 1020),
-                (False, 100000, 100000, "success", 900),
-                (True, 100000, 100000, "success", 900),
+                (True, dispatch.QUEUE_SECONDS - 10, dispatch.QUEUE_SECONDS + 50, "success", dispatch.QUEUE_SECONDS + 120),
+                (False, 100000, 100000, "success", dispatch.QUEUE_SECONDS),
+                (True, 100000, 100000, "success", dispatch.QUEUE_SECONDS),
                 (True, 0, 3600, "success", 3600),
                 (True, 0, 3600, "failure", 3600),
-                (True, 890, 100000, "success", 4500),
+                (True, dispatch.QUEUE_SECONDS - 10, 100000, "success", dispatch.QUEUE_SECONDS + dispatch.EXECUTION_SECONDS),
             ):
                 with self.subTest(role=role.__name__, enabled=enabled, assigned=assigned,
                                   finished=finished, conclusion=conclusion):
@@ -527,7 +533,7 @@ class LifecycleTests(unittest.TestCase):
                     with real_api(fixture) as api:
                         result = role(api, REPO, fixture.src, clock=fixture.clock,
                                       sleep=fixture.clock.sleep)
-                    expected = conclusion if finished <= expected_time else "hosted"
+                    expected = conclusion if finished <= expected_time else "unavailable"
                     self.assertEqual(result, expected if role == dispatch.wait_for_mini else None)
                     self.assertEqual(fixture.clock(), expected_time)
 
@@ -553,23 +559,23 @@ class LifecycleTests(unittest.TestCase):
     def test_poll_crossing_queue_deadline_does_not_extend_execution(self):
         for role in (dispatch.wait_for_mini, dispatch.schedule):
             fixture = ApiFixture()
-            fixture.assign_at, fixture.finish_at = 890, 100000
+            fixture.assign_at, fixture.finish_at = dispatch.QUEUE_SECONDS - 10, 100000
             original = fixture.collection
 
             def collection(path, key):
-                if "/runs/10/" in path and fixture.clock() == 810:
-                    fixture.clock.sleep(100)
+                if "/runs/10/" in path and fixture.clock() == dispatch.QUEUE_SECONDS - dispatch.QUEUE_POLL_SECONDS:
+                    fixture.clock.sleep(dispatch.QUEUE_POLL_SECONDS + 10)
                 return original(path, key)
 
             fixture.collection = collection
             with real_api(fixture) as api:
                 role(api, REPO, fixture.src, clock=fixture.clock, sleep=fixture.clock.sleep)
-            self.assertEqual(fixture.clock(), 4500)
+            self.assertEqual(fixture.clock(), dispatch.QUEUE_SECONDS + dispatch.EXECUTION_SECONDS)
 
     def test_expired_gate_never_dispatches(self):
         fixture = ApiFixture()
         fixture.enabled = False
-        fixture.gate_start_at = 900
+        fixture.gate_start_at = dispatch.QUEUE_SECONDS
         with real_api(fixture) as api:
             dispatch.schedule(api, REPO, fixture.src, clock=fixture.clock, sleep=fixture.clock.sleep)
         self.assertEqual(fixture.posts, [])
@@ -723,7 +729,7 @@ class SchedulerTests(unittest.TestCase):
         self.run_scheduler(api)
         self.assertEqual(api.cancelled, [])
         self.assertGreaterEqual(api.clock(), 300)
-        self.assertLessEqual(api.clock(), 300 + dispatch.RUNNING_POLL_SECONDS)
+        self.assertLessEqual(api.clock(), 300 + max(dispatch.QUEUE_POLL_SECONDS, dispatch.RUNNING_POLL_SECONDS))
         self.assertEqual(api.dispatch_deadline, api.dispatch_time + dispatch.QUEUE_SECONDS)
 
     def test_cancel_failure_does_not_prevent_other_owned_workers_from_cancelling(self):
@@ -761,19 +767,29 @@ class SchedulerTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
-    def invoke(self, api, mode, *, worker_attempt="1", pool="pr", sha=MERGE):
+    def invoke(self, api, mode, *, worker_attempt="1", pool="pr", sha=MERGE, source_attempt=1):
         schedule = dispatch.schedule
+        wait = dispatch.wait_for_mini
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(dispatch.time, "monotonic", side_effect=api.clock), \
              patch.object(dispatch, "schedule", side_effect=lambda a, r, s, **kw:
                  schedule(a, r, s, clock=api.clock, sleep=api.clock.sleep, **kw)):
             output = Path(directory) / "output"
-            args = ["macos_dispatch.py", mode, "--run-id", "1", "--attempt", "1", "--sha", sha]
-            with patch.object(dispatch, "Api", return_value=api), patch.object(sys, "argv", args), \
+            args = ["macos_dispatch.py", mode, "--run-id", "1", "--attempt", str(source_attempt), "--sha", sha]
+            with patch.object(dispatch, "Api", return_value=api), \
+                 patch.object(dispatch, "wait_for_mini", side_effect=lambda a, r, s, **kw: wait(a, r, s, clock=api.clock, sleep=api.clock.sleep, **kw)), \
+                 patch.object(sys, "argv", args), \
                  patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "fixture",
                      "GITHUB_OUTPUT": str(output), "GITHUB_RUN_ATTEMPT": worker_attempt, "SOURCE_POOL": pool}, clear=True):
                 status = dispatch.main()
-            return status, output.read_text() if output.exists() else ""
+            if not output.exists():
+                return status, ""
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            if "run_id" in values:
+                self.assertEqual(values["run_id"], "1")
+                self.assertEqual(values["attempt"], str(source_attempt))
+                self.assertEqual(values["sha"], sha)
+            return status, f"result={values['result']}\n"
 
     def test_pool_admission_binds_the_verified_source(self):
         pr = ApiFixture()
@@ -786,33 +802,82 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(self.invoke(main, "admit", pool="pr", sha=HEAD)[0], 1)
         self.assertEqual(self.invoke(main, "admit", pool="main", sha=MERGE)[0], 1)
 
-    def test_unavailable_api_and_missing_controller_fail_open_to_actual_hosted_tests(self):
+    def test_unavailable_api_and_missing_controller_fail_without_paid_execution(self):
         api = ApiFixture()
         with patch.object(api, "get", side_effect=RuntimeError("unavailable")):
-            self.assertEqual(self.invoke(api, "wait"), (0, "result=hosted\n"))
+            self.assertEqual(self.invoke(api, "wait"), (1, "result=unavailable\n"))
+
+    def test_rerun_discovers_and_cleans_only_its_attempt_history(self):
+        from urllib.parse import parse_qs, urlsplit
+        api = ApiFixture()
+        api.run["run_attempt"] = 2
+        original = api.collection
+        def collection(path, key):
+            if "/workflows/macos-mini.yml/runs?" in path:
+                since = parse_qs(urlsplit(path).query).get("created")
+                if since != [">=2026-10-30T00:00:00Z"]:
+                    raise dispatch.Unavailable("stale history exceeds 500-run pagination bound")
+            return original(path, key)
+        api.collection = collection
+        api.src = dispatch.Source(1, 2, MERGE, api.run["run_started_at"], 1126, HEAD, 42)
+        self.assertEqual(self.invoke(api, "wait", source_attempt=2), (0, "result=success\n"))
+        api.run.update(status="completed", run_attempt=3, run_started_at="2026-11-01T00:00:00Z")
+        api.finish_at = 100000
+        self.assertEqual(self.invoke(api, "cleanup", source_attempt=2)[0], 0)
+        self.assertIn(10, api.cancelled)
+        self.assertIn(f"repos/{REPO}/actions/runs/1/attempts/2", api.calls)
+
+    def test_attempt_window_accepts_github_dates_with_legacy_iso_parser(self):
+        parse = dispatch.datetime.fromisoformat
+        def legacy_parse(value):
+            if value.endswith("Z"):
+                raise ValueError("Python 3.10 rejects trailing Z")
+            return parse(value)
+        with patch.object(dispatch, "datetime") as date:
+            date.fromisoformat.side_effect = legacy_parse
+            for timestamp in ("2026-10-30T00:00:00Z", "2026-10-30T00:00:00+00:00"):
+                self.assertEqual(dispatch.attempt_start({"run_started_at": timestamp}), timestamp)
+
+    def test_missing_attempt_timestamp_refuses_unbounded_discovery(self):
+        for timestamp in (None, "invalid", "2026-10-30T00:00:00"):
+            api = ApiFixture()
+            api.run["run_started_at"] = timestamp
+            self.assertEqual(self.invoke(api, "wait"), (1, "result=unavailable\n"))
+            self.assertFalse(any("/workflows/macos-mini.yml/runs?" in call for call in api.calls))
+
+    def test_rerun_all_uses_a_fresh_worker_for_current_source_attempt(self):
+        api = ApiFixture()
+        api.run["run_attempt"] = 2
+        api.src = dispatch.Source(1, 2, MERGE, pr_number=1126, head_sha=HEAD, head_repo_id=42)
+        self.assertEqual(self.invoke(api, "admit", source_attempt=2)[0], 0)
+        self.assertEqual(self.invoke(api, "wait", source_attempt=2), (0, "result=success\n"))
+        api.enabled = False
+        self.assertEqual(self.invoke(api, "schedule", source_attempt=2)[0], 0)
+        self.assertEqual(api.posts[0][1]["inputs"]["source_attempt"], "2")
+        self.assertEqual(self.invoke(api, "admit", source_attempt=2, worker_attempt="2")[0], 1)
 
     def test_failure_is_published_as_failure_not_fallback(self):
         api = ApiFixture()
         api.finish_at = 0
         api.run_conclusion = api.test_conclusion = "failure"
-        self.assertEqual(self.invoke(api, "wait"), (0, "result=failure\n"))
+        self.assertEqual(self.invoke(api, "wait"), (1, "result=failure\n"))
 
     def test_updated_or_closed_pr_does_not_start_hosted_tests(self):
         for change in ({"state": "closed"}, {"state": "closed", "head": {"sha": HEAD, "repo": None}},
                        {"head": {"sha": "d" * 40, "repo": {"id": 42}}}):
             api = ApiFixture()
             api.pr.update(change)
-            self.assertEqual(self.invoke(api, "wait"), (0, "result=obsolete\n"))
+            self.assertEqual(self.invoke(api, "wait"), (1, "result=obsolete\n"))
             self.assertEqual(self.invoke(api, "schedule")[0], 0)
             self.assertIn(1, api.cancelled)
             self.assertIn(10, api.cancelled)
             self.assertEqual(self.invoke(api, "admit")[0], 1)
             self.assertEqual(api.posts, [])
 
-    def test_unknown_pr_state_keeps_hosted_recovery_instead_of_cancelling(self):
+    def test_unknown_pr_state_fails_without_paid_recovery(self):
         api = ApiFixture()
         api.pr.pop("state")
-        self.assertEqual(self.invoke(api, "wait"), (0, "result=hosted\n"))
+        self.assertEqual(self.invoke(api, "wait"), (1, "result=unavailable\n"))
         self.assertEqual(api.cancelled, [])
 
     def test_obsolete_controller_never_cancels_a_new_attempt(self):
@@ -847,7 +912,7 @@ class EntrypointTests(unittest.TestCase):
         api.cancel_run = cancel
         self.assertEqual(self.invoke(api, "schedule")[0], 1)
         self.assertIn(10, api.cancelled)
-        self.assertEqual(self.invoke(api, "wait"), (0, "result=obsolete\n"))
+        self.assertEqual(self.invoke(api, "wait"), (1, "result=obsolete\n"))
 
     def test_scheduler_and_parent_timeouts_cover_queue_plus_execution(self):
         import re
@@ -861,7 +926,6 @@ class EntrypointTests(unittest.TestCase):
         # Assert the actual workflow contract without emulating Actions' evaluator.
         condition = re.search(r"    if: >-\n(.*?)\n    runs-on:", scheduler, re.S)[1]
         self.assertEqual(" ".join(condition.split()),
-            "github.event.workflow_run.run_attempt == 1 && "
             "(github.event.workflow_run.event == 'pull_request' || "
             "(github.event.workflow_run.event == 'push' && "
             "github.event.workflow_run.head_branch == 'main'))")

@@ -4,8 +4,8 @@
 The classifier is deliberately conservative: an unknown diff or a change to CI
 itself enables every scope. Documentation and repository-governance changes are
 handled by the always-on lightweight repository checks. The same event also
-selects macOS runners by a static PR-author ID allowlist, with hosted fallback
-for unknown authors or unavailable metadata.
+selects macOS runners by a static PR-author ID allowlist, with hosted execution
+for known noneligible sources and no paid route for unavailable metadata.
 """
 
 from __future__ import annotations
@@ -42,13 +42,21 @@ def select_macos_runner(event_name: str, event: dict, *, main_enabled: bool = Fa
     # Main has a dedicated host that never executes PR code.
     if main_enabled and event_name == "push" and isinstance(event, dict) and event.get("ref") == "refs/heads/main":
         return MACOS_MAIN_LABELS.copy()
-    if event_name == "pull_request" and isinstance(event, dict):
+    if event_name == "pull_request":
+        if not isinstance(event, dict):
+            return []
         pull_request = event.get("pull_request")
         author = pull_request.get("user") if isinstance(pull_request, dict) else None
         author_id = author.get("id") if isinstance(author, dict) else None
-        if type(author_id) is int and author_id in MACOS_RUNNER_AUTHORS:
+        if type(author_id) is not int or author_id <= 0:
+            return []
+        if author_id in MACOS_RUNNER_AUTHORS:
             return MACOS_SELF_HOSTED_LABELS.copy()
-    return ["macos-15"]
+        return ["macos-15"]
+    if (event_name == "push" and isinstance(event, dict)
+            and isinstance(event.get("ref"), str) and event["ref"].startswith("refs/")):
+        return ["macos-15"]
+    return []
 
 
 SCOPES = (
@@ -297,7 +305,7 @@ def emit(scopes: dict[str, bool], paths: list[str], *, fallback: str | None = No
             main_enabled=os.environ.get("ASTRA_MACOS_MAIN_ENABLED") == "1"
         )
     except (KeyError, OSError, ValueError, TypeError):
-        labels = ["macos-15"]
+        labels = []
     runner_json = json.dumps(labels, separators=(",", ":"))
     print("macos_runner=" + runner_json)
 
