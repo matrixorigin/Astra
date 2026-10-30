@@ -78,8 +78,8 @@ credentials. OAuth identity is never Astra identity or login-session authority.
 
 Model creation, activation and default selection lock and revalidate the probed
 connection generation within their database transaction, before changing model
-rows. Disconnect and reauthorization use the same connection-before-model lock
-order. A stale successful probe cannot re-enable models after disconnect.
+rows. Disconnect and reauthorization lock the connection before its authorization
+attempts and dependent models. A stale successful probe cannot re-enable models after disconnect.
 Retry backoff uses the shared provider deadline/cancellation owner and consumes
 the original inference budget.
 Catalog reads and connectivity probes share version-aware 401 recovery. Failed

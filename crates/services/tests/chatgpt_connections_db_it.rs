@@ -614,6 +614,111 @@ async fn disconnect_fences_inflight_model_creation_check_activation_and_default(
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn reauthorization_completion_uses_disconnect_lock_order() {
+    use std::time::Duration;
+    let (shared, mut settings) = common::setup_pool_and_settings().await;
+    isolated_database::require_isolated_database(&settings.database);
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let worker = astra_core::SharedPool::new(&settings).await.unwrap();
+    let worker_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(worker.get())
+        .await
+        .unwrap();
+    let provider = fixture::ProviderFixture::start().await;
+    let service = Arc::new(ChatgptConnections::new(
+        Some(worker),
+        Arc::new(FernetTokenEncryptor::new("subscription-reauthorization-race").unwrap()),
+        Ok(ChatgptConfig::for_test(&provider.base)),
+    ));
+    let owner = format!("reauthorization-{}", uuid::Uuid::new_v4());
+    let initial = start(&service, &owner, None).await;
+    let code = provider.issue_code(&initial, "same-account", true);
+    let linked = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Complete(
+            initial["authorization_id"].as_str().unwrap().into(),
+            callback(&initial, &code),
+        ),
+    )
+    .await;
+    let connection = linked["connection"]["connection_id"].as_str().unwrap();
+    let attempt = start(&service, &owner, Some(connection)).await;
+    let authorization = attempt["authorization_id"].as_str().unwrap();
+    let code = provider.issue_code(&attempt, "same-account", true);
+    let exchanges = provider.state.token_calls.load(Ordering::SeqCst);
+
+    // Hold the first row owned by disconnect, then let real completion exchange
+    // its code and reach the blocked connection write/read. Observing its SQL
+    // makes this interleaving independent of HTTP and scheduler timing.
+    let mut disconnect = shared.get().begin().await.unwrap();
+    sqlx::query("SELECT connection_id FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
+        .bind(&owner).bind(connection).fetch_one(&mut *disconnect).await.unwrap();
+    let completion = tokio::spawn({
+        let service = service.clone();
+        let owner = owner.clone();
+        let operation =
+            ConnectionOperation::Complete(authorization.into(), callback(&attempt, &code));
+        async move { service.operate(&owner, operation).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sql: Option<String> = sqlx::query_scalar(
+                "SELECT info FROM information_schema.processlist WHERE db=? AND conn_id=? AND info IS NOT NULL",
+            ).bind(&settings.database).bind(worker_id).fetch_optional(shared.get()).await.unwrap().flatten();
+            if sql.is_some_and(|sql| sql.contains("user_llm_connections")
+                && (sql.contains("FOR UPDATE") || sql.contains("INSERT INTO"))) { break; }
+            assert!(!completion.is_finished(), "completion settled before reaching the connection lock");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("completion must wait on disconnect's connection row");
+    assert_eq!(
+        provider.state.token_calls.load(Ordering::SeqCst),
+        exchanges + 1
+    );
+
+    // These are disconnect's fenced writes. Completion must not already own
+    // the authorization row while waiting for this connection row.
+    sqlx::query("UPDATE user_llm_connections SET status='disconnected',credentials_encrypted=NULL,token_expires_at=NULL,generation=generation+1 WHERE user_id=? AND connection_id=?")
+        .bind(&owner).bind(connection).execute(&mut *disconnect).await.unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_secs(5),
+        sqlx::query("UPDATE user_llm_authorizations SET status='cancelled',verifier_encrypted=NULL WHERE user_id=? AND connection_id=? AND status IN ('pending','exchanging')")
+            .bind(&owner).bind(connection).execute(&mut *disconnect),
+    ).await.expect("authorization cancellation must not deadlock with completion").unwrap();
+    assert_eq!(cancelled.rows_affected(), 1);
+    disconnect.commit().await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), completion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.0, axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("oauth_attempt_cancelled")
+    );
+    assert_eq!(
+        provider.state.token_calls.load(Ordering::SeqCst),
+        exchanges + 1
+    );
+    let persisted: (String, Option<String>) = sqlx::query_as(
+        "SELECT status,credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?",
+    ).bind(&owner).bind(connection).fetch_one(shared.get()).await.unwrap();
+    assert_eq!(persisted, ("disconnected".into(), None));
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?",
+    )
+    .bind(&owner)
+    .bind(authorization)
+    .fetch_one(shared.get())
+    .await
+    .unwrap();
+    assert_eq!(status, "cancelled");
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn legacy_byok_rows_survive_idempotent_connection_migration() {
     let settings = common::require_db_it_env();
     isolated_database::require_isolated_database(&settings.database);

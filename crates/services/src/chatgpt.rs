@@ -944,6 +944,9 @@ impl ChatgptConnections {
                 .bind(owner).bind(client_id).bind(&identity.sub).fetch_optional(&pool).await.map_err(internal_error)?;
             let connection_id = row.connection_id.clone().or(existing).unwrap_or_else(|| Uuid::new_v4().to_string());
             let mut tx = pool.begin().await.map_err(internal_error)?;
+            // Match disconnect's connection -> authorization -> model lock order.
+            let _ = sqlx::query_scalar::<_,String>("SELECT connection_id FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
+                .bind(owner).bind(&connection_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
             let pending: String = sqlx::query_scalar("SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=? FOR UPDATE")
                 .bind(owner).bind(id).fetch_one(&mut *tx).await.map_err(internal_error)?;
             if pending!="exchanging" { return Err(fail(StatusCode::CONFLICT,"oauth_attempt_cancelled","Authorization was cancelled before linking completed")); }

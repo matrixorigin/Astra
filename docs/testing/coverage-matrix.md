@@ -57,6 +57,8 @@ Offline coverage lives in `astra-core::model_wire::responses` (wire codec),
 `services/tests/chatgpt_connections_db_it.rs` uses an explicitly isolated
 MatrixOne database and a local fake OAuth/Responses provider for encryption,
 ownership, rotation races, model sharing, disconnect and reauthorization.
+The reauthorization/disconnect race observes the blocked completion SQL before
+cancelling its attempt, and verifies cancellation without a second code exchange.
 The identity journey reuses one SQL connection from initial registration through
 reauthorization and verifies its persisted connection/subject fences.
 Refresh regressions cover a refused TCP connection followed by recovery,
