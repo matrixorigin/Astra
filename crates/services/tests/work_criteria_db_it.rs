@@ -229,6 +229,14 @@ async fn accepted_criteria_are_immutable_canonical_and_leave_branch_basis_explic
         }
     }
 
+    let replay = repository
+        .propose_criteria(recorded.proposal.clone())
+        .await
+        .expect("exact proposal replay after its new identities were accepted");
+    assert_eq!(
+        replay.status,
+        astra_services::work::WorkProposalStatus::Accepted
+    );
     let mut empty = proposal(&owner_id, &work_id, Vec::new());
     empty.expected_work_revision = WorkRevision::new(2).expect("Work r2");
     empty.expected_criteria_set_revision = CriterionSetRevision::new(2).expect("set r2");
@@ -315,7 +323,7 @@ async fn invalid_or_missing_criterion_proposals_leave_work_unchanged() {
         1
     );
     assert_eq!(
-        count_work_rows(&pool, "work_criteria", &owner_id, &work_id).await,
+        count_work_rows(&pool, "work_criterion_revisions", &owner_id, &work_id).await,
         0
     );
 
@@ -420,11 +428,6 @@ async fn concurrent_criterion_set_cas_has_one_complete_winner() {
         "genesis plus one accepted set"
     );
     assert_eq!(
-        count_work_rows(&pool, "work_criteria", &owner_id, &work_id).await,
-        1,
-        "losing criteria identities must roll back"
-    );
-    assert_eq!(
         count_work_rows(&pool, "work_criterion_revisions", &owner_id, &work_id).await,
         1,
         "losing criterion revisions must roll back"
@@ -450,4 +453,135 @@ async fn concurrent_criterion_set_cas_has_one_complete_winner() {
     assert_eq!(accepted_events, 1);
 
     common::cleanup_work_owner(&pool, &owner_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn criterion_identity_is_scoped_and_survives_set_replacement() {
+    use astra_services::work::{
+        InternalSessionId, NewWorkCriterion, OriginalIntentRef, WorkBranchId, WorkGenesisParts,
+        WorkGoal, WorkProposalBasisResource,
+    };
+
+    let pool = common::setup_pool().await;
+    let repository = DatabaseWorkRepository::new(pool.clone());
+    let owner = common::id("owner");
+    let other_owner = common::id("owner");
+    let work = common::id("work");
+    let other_work = common::id("work");
+    let other_owner_work = common::id("work");
+    let criterion_id = CriterionId::parse(common::id("criterion")).expect("criterion");
+    for (owner_id, work_id) in [
+        (&owner, &work),
+        (&other_owner, &other_owner_work),
+        (&owner, &other_work),
+    ] {
+        let definition = CriterionDefinition::HumanReview {
+            statement: CriterionStatement::parse("The reviewer accepts the result.")
+                .expect("statement"),
+        };
+        repository
+            .create_genesis(
+                WorkGenesis::new(WorkGenesisParts {
+                    owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
+                    work_id: WorkId::parse(work_id).expect("work"),
+                    branch_id: WorkBranchId::parse(format!("{work_id}-branch")).expect("branch"),
+                    session_id: InternalSessionId::parse(common::id("session")).expect("session"),
+                    project_id: None,
+                    original_intent_ref: OriginalIntentRef::parse(common::id("intent"))
+                        .expect("intent"),
+                    goal: WorkGoal::parse("Deliver a reviewed result.").expect("goal"),
+                    criteria: vec![NewWorkCriterion {
+                        criterion_id: criterion_id.clone(),
+                        definition,
+                    }],
+                })
+                .expect("genesis input"),
+            )
+            .await
+            .expect("the same criterion identity is independent across owners and Works");
+        assert!(matches!(
+            repository
+                .propose_criteria(proposal(
+                    owner_id,
+                    work_id,
+                    vec![new_criterion(
+                        criterion_id.as_str(),
+                        CriterionKind::HumanReview,
+                        "New definition."
+                    )],
+                ))
+                .await,
+            Err(WorkRepositoryError::InvalidWorkProposalBasis {
+                resource: WorkProposalBasisResource::NewCriterionIdentity,
+            })
+        ));
+        assert_eq!(
+            count_work_rows(&pool, "work_criterion_revisions", owner_id, work_id).await,
+            1
+        );
+    }
+    let replacement = repository
+        .propose_criteria(proposal(
+            &owner,
+            &work,
+            vec![new_criterion(
+                &common::id("replacement"),
+                CriterionKind::HumanReview,
+                "The replacement criterion is accepted.",
+            )],
+        ))
+        .await
+        .expect("propose a set without the initial criterion");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &replacement,
+            &common::id("accept"),
+        ))
+        .await
+        .expect("replace the initial criterion set");
+    repository
+        .adopt_branch_basis(astra_services::work::WorkBranchBasisChange {
+            owner_id: replacement.proposal.owner_id.clone(),
+            work_id: replacement.proposal.work_id.clone(),
+            branch_id: replacement.proposal.branch_id.clone(),
+            expected_work_revision: WorkRevision::new(2).expect("Work r2"),
+            expected_branch_revision: astra_services::work::WorkBranchRevision::INITIAL,
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_criteria_set_revision: CriterionSetRevision::INITIAL,
+            target_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            target_criteria_set_revision: CriterionSetRevision::new(2).expect("set r2"),
+            source_ref: astra_services::work::WorkChangeRef::parse(common::id("adopt"))
+                .expect("source"),
+        })
+        .await
+        .expect("adopt the replacement basis");
+    let mut reused = proposal(
+        &owner,
+        &work,
+        vec![new_criterion(
+            criterion_id.as_str(),
+            CriterionKind::HumanReview,
+            "Reused identity.",
+        )],
+    );
+    reused.expected_work_revision = WorkRevision::new(2).expect("Work r2");
+    reused.expected_criteria_set_revision = CriterionSetRevision::new(2).expect("set r2");
+    reused.expected_branch_revision =
+        astra_services::work::WorkBranchRevision::new(2).expect("branch r2");
+    assert!(
+        matches!(
+            repository.propose_criteria(reused).await,
+            Err(WorkRepositoryError::InvalidWorkProposalBasis {
+                resource: WorkProposalBasisResource::NewCriterionIdentity,
+            })
+        ),
+        "removing a criterion from the current set must not free its identity"
+    );
+    assert_eq!(
+        count_work_rows(&pool, "work_criterion_revisions", &owner, &work).await,
+        2
+    );
+    common::cleanup_work_owner(&pool, &owner).await;
+    common::cleanup_work_owner(&pool, &other_owner).await;
 }

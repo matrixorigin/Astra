@@ -76,6 +76,8 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         );
     }
     for retired in [
+        "work_criteria",
+        "work_item_edges",
         "infra_sandbox_metadata",
         "skill_metrics",
         "session_checkpoints",
@@ -873,10 +875,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
             &["owner_id", "work_id", "revision"][..],
         ),
         (
-            "work_criteria",
-            &["owner_id", "work_id", "criterion_id"][..],
-        ),
-        (
             "work_criterion_revisions",
             &["owner_id", "work_id", "criterion_id", "revision"][..],
         ),
@@ -893,17 +891,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
         (
             "work_item_revisions",
             &["owner_id", "work_id", "item_id", "revision"][..],
-        ),
-        (
-            "work_item_edges",
-            &[
-                "owner_id",
-                "work_id",
-                "graph_revision",
-                "predecessor_item_id",
-                "successor_item_id",
-                "edge_kind",
-            ][..],
         ),
         (
             "work_item_attempts",
@@ -1078,14 +1065,12 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
     for table in [
         "works",
         "work_goal_revisions",
-        "work_criteria",
         "work_criterion_revisions",
         "work_criterion_sets",
         "work_graph_revisions",
         "work_graph_sequences",
         "work_items",
         "work_item_revisions",
-        "work_item_edges",
         "work_branches",
         "work_branch_deletion_operations",
         "work_proposal_trigger_attempts",

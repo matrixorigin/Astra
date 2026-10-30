@@ -367,8 +367,9 @@ async fn validate_basis(
         })
         .collect::<Vec<_>>();
     if !new_ids.is_empty() {
-        let mut builder =
-            QueryBuilder::<MySql>::new("SELECT criterion_id FROM work_criteria WHERE owner_id = ");
+        let mut builder = QueryBuilder::<MySql>::new(
+            "SELECT criterion_id FROM work_criterion_revisions WHERE revision = 1 AND owner_id = ",
+        );
         builder
             .push_bind(proposal.owner_id.as_str())
             .push(" AND work_id = ")

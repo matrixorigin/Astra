@@ -33,10 +33,8 @@ pub enum WorkConflictResource {
     CriterionSetRevision,
     GraphRevision,
     CriterionIdentity,
-    CriterionRevision,
     WorkItemIdentity,
     WorkItemRevision,
-    WorkItemEdge,
     CheckRunIdentity,
     AcceptanceDecisionIdentity,
     WorkEventSequence,
@@ -851,25 +849,8 @@ async fn insert_new_criteria(
         return Ok(());
     }
 
-    let mut identities =
-        QueryBuilder::<MySql>::new("INSERT INTO work_criteria (owner_id, work_id, criterion_id) ");
-    identities.push_values(criteria, |mut row, encoded| {
-        row.push_bind(owner_id.as_str())
-            .push_bind(work_id.as_str())
-            .push_bind(encoded.criterion.criterion_id.as_str());
-    });
-    identities
-        .build()
-        .execute(&mut **transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::insert(
-                "insert criterion identities",
-                WorkConflictResource::CriterionIdentity,
-                source,
-            )
-        })?;
-
+    // Every identity starts at revision 1 and is retained for the Work lifetime.
+    // Its primary key is also the final identity fence if proposal admission races.
     let mut revisions = QueryBuilder::<MySql>::new(
         "INSERT INTO work_criterion_revisions
          (owner_id, work_id, criterion_id, revision, criterion_kind,
@@ -893,7 +874,7 @@ async fn insert_new_criteria(
         .map_err(|source| {
             WorkRepositoryError::insert(
                 "insert criterion revisions",
-                WorkConflictResource::CriterionRevision,
+                WorkConflictResource::CriterionIdentity,
                 source,
             )
         })?;

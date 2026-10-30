@@ -566,42 +566,6 @@ async fn insert_revised_items(
     Ok(())
 }
 
-async fn insert_edges(
-    transaction: &mut Transaction<'_, MySql>,
-    change: &WorkGraphChange,
-    graph: &CanonicalGraph,
-    graph_revision: GraphRevision,
-) -> Result<(), WorkRepositoryError> {
-    if graph.edges.is_empty() {
-        return Ok(());
-    }
-    let mut edges = QueryBuilder::<MySql>::new(
-        "INSERT INTO work_item_edges
-         (owner_id, work_id, graph_revision, predecessor_item_id,
-          successor_item_id, edge_kind) ",
-    );
-    edges.push_values(&graph.edges, |mut row, edge| {
-        row.push_bind(change.owner_id.as_str())
-            .push_bind(change.work_id.as_str())
-            .push_bind(graph_revision.get())
-            .push_bind(edge.predecessor_item_id.as_str())
-            .push_bind(edge.successor_item_id.as_str())
-            .push_bind(edge.kind.as_str());
-    });
-    edges
-        .build()
-        .execute(&mut **transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::insert(
-                "insert WorkItem edges",
-                WorkConflictResource::WorkItemEdge,
-                source,
-            )
-        })?;
-    Ok(())
-}
-
 fn decode_timestamp(value: String) -> Result<DateTime<Utc>, WorkRepositoryError> {
     DateTime::parse_from_rfc3339(&value)
         .map(|value| value.with_timezone(&Utc))
@@ -876,7 +840,6 @@ pub(super) async fn apply_prepared_graph_change(
     verify_existing_item_revisions(transaction, change).await?;
     insert_new_items(transaction, change).await?;
     insert_revised_items(transaction, change).await?;
-    insert_edges(transaction, change, graph, graph_revision).await?;
     query(
         "INSERT INTO work_graph_revisions
          (owner_id, work_id, revision, parent_revision, item_revision_manifest_json,

@@ -184,11 +184,7 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
     assert_eq!(graph.try_get::<String, _>("actor_id").unwrap(), proposal_id);
     assert_eq!(graph.try_get::<i64, _>("item_count").unwrap(), 4);
     assert_eq!(graph.try_get::<i64, _>("edge_count").unwrap(), 2);
-    for (table, expected) in [
-        ("work_items", 4_i64),
-        ("work_item_revisions", 4_i64),
-        ("work_item_edges", 2_i64),
-    ] {
+    for (table, expected) in [("work_items", 4_i64), ("work_item_revisions", 4_i64)] {
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE owner_id = ? AND work_id = ?"
         )))

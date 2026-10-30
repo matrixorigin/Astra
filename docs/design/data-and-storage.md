@@ -41,6 +41,13 @@ Generation fencing, quiescence checks, and owner-scoped binding reads remain
 part of the canonical coordinator. Edge handoff requires verifiable source
 and target materializations; it does not convert a Server binding into Edge.
 
+Work graph dependencies are stored only in the immutable graph revision's edge
+manifest. Graph validation and revision-pinned readers share that authority;
+there is no relational edge projection. Criterion identity is owned by its
+initial immutable revision. Revision 1 remains retained for the Work lifetime,
+including after removal from an accepted set, so the existing owner/Work-scoped
+primary key prevents identity reuse without a separate identity table.
+
 ## MatrixOne role
 
 MatrixOne is the platform state store and analytic substrate. It should support:

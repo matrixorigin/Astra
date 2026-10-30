@@ -270,14 +270,6 @@ pub(crate) const WORK_GOAL_REVISIONS_CREATE_SQL: &str =
     CONSTRAINT chk_work_goal_revision CHECK (revision > 0)
 )";
 
-pub(crate) const WORK_CRITERIA_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work_criteria (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    criterion_id VARCHAR(64) NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (owner_id, work_id, criterion_id)
-)";
-
 pub(crate) const WORK_CRITERION_REVISIONS_CREATE_SQL: &str =
     "CREATE TABLE IF NOT EXISTS work_criterion_revisions (
     owner_id VARCHAR(128) NOT NULL,
@@ -385,23 +377,6 @@ pub(crate) const WORK_ITEM_REVISIONS_CREATE_SQL: &str =
     CONSTRAINT chk_work_item_declaration_state CHECK (
         declaration_state IN ('active', 'superseded', 'cancelled')
     )
-)";
-
-pub(crate) const WORK_ITEM_EDGES_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work_item_edges (
-    owner_id VARCHAR(128) NOT NULL,
-    work_id VARCHAR(64) NOT NULL,
-    graph_revision BIGINT NOT NULL,
-    predecessor_item_id VARCHAR(64) NOT NULL,
-    successor_item_id VARCHAR(64) NOT NULL,
-    edge_kind VARCHAR(32) NOT NULL,
-    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-    PRIMARY KEY (
-        owner_id, work_id, graph_revision,
-        predecessor_item_id, successor_item_id, edge_kind
-    ),
-    CONSTRAINT chk_work_item_edge_graph_revision CHECK (graph_revision > 0),
-    CONSTRAINT chk_work_item_edge_kind CHECK (edge_kind IN ('dependency')),
-    CONSTRAINT chk_work_item_edge_not_self CHECK (predecessor_item_id <> successor_item_id)
 )";
 
 pub(crate) const WORK_BRANCHES_CREATE_SQL: &str =
@@ -1390,7 +1365,6 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
     ),
     ("works", WORKS_CREATE_SQL),
     ("work_goal_revisions", WORK_GOAL_REVISIONS_CREATE_SQL),
-    ("work_criteria", WORK_CRITERIA_CREATE_SQL),
     (
         "work_criterion_revisions",
         WORK_CRITERION_REVISIONS_CREATE_SQL,
@@ -1400,7 +1374,6 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
     ("work_graph_sequences", WORK_GRAPH_SEQUENCES_CREATE_SQL),
     ("work_items", WORK_ITEMS_CREATE_SQL),
     ("work_item_revisions", WORK_ITEM_REVISIONS_CREATE_SQL),
-    ("work_item_edges", WORK_ITEM_EDGES_CREATE_SQL),
     ("work_branches", WORK_BRANCHES_CREATE_SQL),
     (
         "work_branch_creation_operations",
@@ -2130,7 +2103,6 @@ mod tests {
             "work_criterion_sets",
             "work_branches",
             "work_item_revisions",
-            "work_item_edges",
             "work_graph_revisions",
             "work_proposal_trigger_attempts",
             "work_check_runs",

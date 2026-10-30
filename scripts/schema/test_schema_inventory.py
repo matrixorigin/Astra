@@ -96,14 +96,12 @@ class SchemaInventoryTest(unittest.TestCase):
             "works",
             "work_establishment_operations",
             "work_goal_revisions",
-            "work_criteria",
             "work_criterion_revisions",
             "work_criterion_sets",
             "work_graph_revisions",
             "work_graph_sequences",
             "work_items",
             "work_item_revisions",
-            "work_item_edges",
             "work_branches",
             "work_branch_creation_operations",
             "work_branch_control_operations",
@@ -131,7 +129,7 @@ class SchemaInventoryTest(unittest.TestCase):
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(33, len(actual))
+        self.assertEqual(31, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}
