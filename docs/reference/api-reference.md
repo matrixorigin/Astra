@@ -77,6 +77,44 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 ---
 
+## Personal subscription connections
+
+All endpoints below require an Astra bearer token. Ownership comes from that
+principal, independently of the ChatGPT identity; other owners receive 404.
+Renewable provider credentials are never returned.
+
+| Method | Path | Request / result |
+| --- | --- | --- |
+| POST | `/me/model-connections/chatgpt/authorizations` | `{redirect_uri,label?,connection_id?,retry_authorization_id?}` → `{authorization_id,authorization_url,state,expires_at}` |
+| POST | `/me/model-connections/chatgpt/authorizations/{id}/complete` | `{state,code?,client_id?,error?}` → `{connection}` |
+| DELETE | `/me/model-connections/chatgpt/authorizations/{id}` | Cancels a pending/exchanging attempt |
+| GET | `/me/model-connections` | `{items:[connection]}` metadata only |
+| GET | `/me/model-connections/{id}/models` | `{items:[{slug,display_name}]}` visible models only |
+| POST | `/me/model-connections/{id}/disconnect` | Clears local credentials, disables linked models; reports `remote_revocation_confirmed` |
+
+Connection metadata includes `connection_id`, `provider`, `label`, optional
+`email`, `status`, access-token `expires_at`, and nullable revocation confirmation.
+States are `connected`, `plan_disabled`, `reauth_required`, or `disconnected`.
+An authorization expires after 15 minutes. Its redirect must be exactly
+`http://127.0.0.1:<port>/auth/callback`; Server validates state, PKCE, nonce,
+issuer, signature, audience and subject. Start and complete must use the same
+Astra owner. Repeating a completed callback is idempotent only for the same
+callback values. `connection_id` and `retry_authorization_id` are alternatives.
+
+`POST /me/models` accepts `provider:"chatgpt"` and `connection_id` instead of
+`api_key`; omit `base_url`. Use a currently visible provider slug in `model`
+and an Astra-local alias in `name`. Creation and `POST /me/models/{id}/check`
+run the common Responses probe. API-key and subscription sources are mutually
+exclusive. Subscription model credentials cannot be rotated through model
+update; reconnect the connection instead.
+
+`GET /models` and `GET /model-access` retain catalog version 2. Each connection
+has an opaque access ID `chatgpt:<uuid>`, kind `cloud_byok`, Server placement,
+and label `ChatGPT subscription · <label>`. No new public enum or catalog field
+is required by released clients. Pricing and reasoning controls are absent.
+Missing grants, reauthentication, disconnection and quota failures fail closed;
+clients must not refresh their Astra login in response to a provider denial.
+
 ## Auto model routing for chat
 
 On `POST /chat` and `POST /chat/stream`, an authenticated Server-catalog user

@@ -252,6 +252,10 @@ impl std::fmt::Debug for ThinClient {
 }
 
 impl ThinClient {
+    /// Origin selected by the caller, for credential-transfer policy checks.
+    pub fn base_url(&self) -> &Url {
+        &self.base
+    }
     /// `base` is the server origin, e.g. `https://api.example.com` (trailing slash optional).
     pub fn new(base: &str, bearer_token: Option<String>) -> Result<Self, ThinClientError> {
         let base =

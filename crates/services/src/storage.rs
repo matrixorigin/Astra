@@ -4293,6 +4293,22 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
+    core_schema_create!(
+        pool,
+        "user_llm_connections",
+        crate::chatgpt::CONNECTIONS_TABLE_SQL
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
+        "user_llm_authorizations",
+        crate::chatgpt::AUTHORIZATIONS_TABLE_SQL
+    )
+    .execute(&pool)
+    .await?;
+    crate::chatgpt::bootstrap(&pool).await?;
+
     // Canonical inference execution ledger. Admission writes the immutable route
     // and logical invocation together; each physical attempt is then committed
     // before its provider I/O. Route rows contain no credential or endpoint
@@ -5373,7 +5389,10 @@ async fn verify_core_schema_shape(
             ][..],
         ),
         ("infra_llm_models", &["thinking_probe_json"][..]),
-        ("user_llm_models", &["thinking_probe_json"][..]),
+        (
+            "user_llm_models",
+            &["thinking_probe_json", "connection_id"][..],
+        ),
     ] {
         for column in required {
             if !columns.contains(&(table.to_owned(), (*column).to_owned())) {

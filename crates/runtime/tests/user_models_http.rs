@@ -337,6 +337,7 @@ type HttpError = (StatusCode, Json<ErrorResponse>);
 
 #[derive(Clone, Default)]
 struct TestModelService {
+    connection_operations: Arc<Mutex<Vec<(String, &'static str)>>>,
     rows: Arc<Mutex<HashMap<(String, String), UserModelRecord>>>,
     preflights: Arc<Mutex<Vec<(String, String)>>>,
     preflight_network_failure: bool,
@@ -353,6 +354,26 @@ fn unsupported<T>() -> Result<T, HttpError> {
 
 #[async_trait]
 impl ModelService for TestModelService {
+    async fn model_connection_operation(
+        &self,
+        owner: String,
+        operation: astra_services::chatgpt::ConnectionOperation,
+    ) -> Result<serde_json::Value, HttpError> {
+        use astra_services::chatgpt::ConnectionOperation::*;
+        let name = match operation {
+            List => "list",
+            Start(_) => "start",
+            Complete(_, _) => "complete",
+            Cancel(_) => "cancel",
+            Models(_) => "models",
+            Disconnect(_) => "disconnect",
+        };
+        self.connection_operations
+            .lock()
+            .unwrap()
+            .push((owner, name));
+        Ok(serde_json::json!({"ok":true}))
+    }
     async fn allows_deployment_models(&self, _: String) -> Result<bool, HttpError> {
         Ok(self.allows_deployment)
     }
@@ -1027,4 +1048,122 @@ async fn cloud_byok_completion_without_personal_default_does_not_fall_back() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let response: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(response["error_code"], "missing_model_selection");
+}
+
+#[tokio::test]
+async fn subscription_connection_http_uses_authenticated_owner_for_every_operation() {
+    let service = TestModelService::default();
+    for (method, path, body, operation) in [
+        ("GET", "/me/model-connections", None, "list"),
+        (
+            "POST",
+            "/me/model-connections/chatgpt/authorizations",
+            Some(serde_json::json!({"redirect_uri":"http://127.0.0.1:12345/auth/callback"})),
+            "start",
+        ),
+        (
+            "POST",
+            "/me/model-connections/chatgpt/authorizations/attempt/complete",
+            Some(
+                serde_json::json!({"state":"callback-state","code":"one-time-code","client_id":"oaiapp_fixture"}),
+            ),
+            "complete",
+        ),
+        (
+            "DELETE",
+            "/me/model-connections/chatgpt/authorizations/attempt",
+            None,
+            "cancel",
+        ),
+        (
+            "GET",
+            "/me/model-connections/connection/models",
+            None,
+            "models",
+        ),
+        (
+            "POST",
+            "/me/model-connections/connection/disconnect",
+            None,
+            "disconnect",
+        ),
+    ] {
+        let (status, _) = request(app(service.clone()), method, path, None, body.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        let before = service.connection_operations.lock().unwrap().len();
+        let (status, result) = request(
+            app(service.clone()),
+            method,
+            path,
+            Some("connection-owner"),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {result}");
+        let calls = service.connection_operations.lock().unwrap();
+        assert_eq!(calls.len(), before + 1);
+        assert_eq!(calls.last(), Some(&("connection-owner".into(), operation)));
+    }
+    let (status,_)=request(app(service.clone()),"POST","/me/model-connections/chatgpt/authorizations",Some("connection-owner"),Some(serde_json::json!({"redirect_uri":"http://127.0.0.1:12345/auth/callback","user_id":"another-owner"}))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(service.connection_operations.lock().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn subscription_sources_are_readable_by_published_catalog_v2_clients() {
+    use astra_services::{ModelAccessKind, ModelExecutionPlacement};
+    let source = "chatgpt:00000000-0000-4000-8000-000000000001";
+    let label = "ChatGPT subscription · personal";
+    let service = TestModelService {
+        catalog: vec![ModelListItem {
+            thinking_protocol: None,
+            offering_id: "subscription-offering".into(),
+            access_id: source.into(),
+            access_kind: ModelAccessKind::CloudByok,
+            access_label: label.into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: "coding".into(),
+            provider: "chatgpt".into(),
+            description: None,
+            is_active: true,
+            context_window: 128000,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+            pricing: None,
+        }],
+        ..Default::default()
+    };
+    for route in ["/models", "/model-access"] {
+        let (status, body) = request(
+            app(service.clone()),
+            "GET",
+            route,
+            Some("connection-owner"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            published_0_2_12_response(route, value.clone()).is_ok(),
+            "{body}"
+        );
+        let items = if route == "/models" {
+            &value["items"]
+        } else {
+            &value["offerings"]
+        };
+        assert_eq!(items[0]["access_id"], source);
+        assert_eq!(items[0]["access_label"], label);
+        if route == "/model-access" {
+            assert!(
+                value["accesses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|access| access["id"] == source && access["label"] == label)
+            );
+        }
+    }
 }

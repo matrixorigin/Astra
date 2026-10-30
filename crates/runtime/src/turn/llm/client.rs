@@ -30,6 +30,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
+#[path = "responses.rs"]
+mod responses;
 
 #[cfg(test)]
 use crate::prompts;
@@ -68,7 +70,7 @@ fn uses_moi_model_gateway_error_contract(
     })
 }
 
-struct MoiModelGatewayError {
+struct ProviderHttpRejection {
     classified: astra_core::ClassifiedError,
     retryable: bool,
 }
@@ -82,7 +84,7 @@ fn moi_model_gateway_error(
     response_body: &str,
     header_overrides: Option<&HashMap<String, String>>,
     response_contract_version: Option<&str>,
-) -> Option<MoiModelGatewayError> {
+) -> Option<ProviderHttpRejection> {
     if !uses_moi_model_gateway_error_contract(header_overrides)
         || response_contract_version
             != Some(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1)
@@ -112,7 +114,7 @@ fn moi_model_gateway_error(
     if let Some(action) = action {
         details["action"] = Value::String(action.to_string());
     }
-    Some(MoiModelGatewayError {
+    Some(ProviderHttpRejection {
         classified: astra_core::ClassifiedError::new(
             astra_core::ErrorKind::Unknown,
             format!("MOI model gateway rejected inference: {code}"),
@@ -196,6 +198,7 @@ use super::super::model_cooldown::rate_limit_cooldown;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LlmProviderProtocol {
+    OpenAiResponses,
     OpenAiCompatible,
     AnthropicMessages,
     BedrockConverse,
@@ -206,6 +209,7 @@ impl LlmProviderProtocol {
     #[must_use]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::OpenAiResponses => "openai_responses",
             Self::OpenAiCompatible => "openai_compatible",
             Self::AnthropicMessages => "anthropic_messages",
             Self::BedrockConverse => "bedrock_converse",
@@ -224,6 +228,7 @@ impl LlmProviderProtocol {
 
 pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
     match provider {
+        "chatgpt" => LlmProviderProtocol::OpenAiResponses,
         "anthropic" => LlmProviderProtocol::AnthropicMessages,
         "bedrock" => LlmProviderProtocol::BedrockConverse,
         "typesafe" => LlmProviderProtocol::TypeSafeSystemOne,
@@ -269,6 +274,23 @@ impl ProviderWireFingerprints {
         cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
         let (messages, system, conversation, tools) = match protocol {
+            LlmProviderProtocol::OpenAiResponses => {
+                let items = provider_wire_items(body.get("input"));
+                (
+                    items.clone(),
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|item| item["role"] == "developer")
+                        .collect(),
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|item| item["role"] != "developer")
+                        .collect(),
+                    provider_wire_items(body.get("tools")),
+                )
+            }
             LlmProviderProtocol::TypeSafeSystemOne => (
                 provider_wire_items(body.get("state")),
                 provider_wire_items(body.get("questions")),
@@ -366,6 +388,10 @@ fn provider_cache_key_system_items(
     use astra_turn_core::cache_placement::{CacheProtocol, VolatilePlacement};
 
     let mut system = match protocol {
+        LlmProviderProtocol::OpenAiResponses => provider_wire_items(body.get("input"))
+            .into_iter()
+            .filter(|item| item["role"] == "developer")
+            .collect(),
         LlmProviderProtocol::TypeSafeSystemOne => provider_wire_items(body.get("questions")),
         LlmProviderProtocol::OpenAiCompatible => {
             let messages = body
@@ -420,6 +446,7 @@ fn provider_cache_key_tool_items(
     use astra_turn_core::cache_placement::CacheProtocol;
 
     let mut tools = match protocol {
+        LlmProviderProtocol::OpenAiResponses => provider_wire_items(body.get("tools")),
         LlmProviderProtocol::OpenAiCompatible
         | LlmProviderProtocol::AnthropicMessages
         | LlmProviderProtocol::TypeSafeSystemOne => provider_wire_items(body.get("tools")),
@@ -452,6 +479,7 @@ fn provider_cache_key_tool_items(
 
 fn provider_wire_tool_name(protocol: LlmProviderProtocol, tool: &Value) -> Option<&str> {
     let pointer = match protocol {
+        LlmProviderProtocol::OpenAiResponses => "/name",
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             "/function/name"
         }
@@ -516,6 +544,22 @@ impl ProviderWireComposition {
     ) -> Result<Self, astra_core::ClassifiedError> {
         let mut composition = Self::default();
         match protocol {
+            LlmProviderProtocol::OpenAiResponses => {
+                for item in provider_wire_items(body.get("input")) {
+                    if item["role"] == "developer" {
+                        composition.system_bytes += serialized_value_bytes(item)?;
+                        composition.system_items += 1;
+                    } else {
+                        composition.conversation_bytes += serialized_value_bytes(item)?;
+                        composition.conversation_items += 1;
+                    }
+                }
+                accumulate_wire_items(
+                    body.get("tools"),
+                    &mut composition.tool_schema_bytes,
+                    &mut composition.tool_schema_items,
+                )?;
+            }
             LlmProviderProtocol::TypeSafeSystemOne => {
                 accumulate_wire_items(
                     body.get("questions"),
@@ -850,6 +894,8 @@ fn is_tpm_exhaustion(error_text: &str) -> bool {
 /// Collected result from a single LLM streaming call.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LlmCallResult {
+    /// Replayable provider output, scoped to its connection and model.
+    pub provider_continuation: Option<Value>,
     /// Set by the executing adapter, never decoded from generated text.
     pub judgment_provenance: Option<astra_turn_types::JudgmentResponseProvenance>,
     /// Provider response identity when available on non-stream responses.
@@ -1042,6 +1088,7 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub subscription: Option<&'a astra_services::chatgpt::ExecutionCredential>,
     pub fixed_temperature: Option<f64>,
     pub supported_reasoning_efforts: Option<&'a [String]>,
     pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
@@ -1063,6 +1110,7 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            subscription: execution.subscription.as_ref(),
             fixed_temperature: execution.fixed_temperature,
             supported_reasoning_efforts: execution.supported_reasoning_efforts.as_deref(),
             thinking_protocol: execution.thinking_protocol,
@@ -1087,6 +1135,7 @@ impl<'a> LlmExecutionRoute<'a> {
 /// credentials, endpoint URLs, and header values from `Debug`.
 #[derive(Clone)]
 pub(crate) struct OwnedLlmExecutionRoute {
+    pub subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     pub model_name: String,
     pub wire_model_name: Option<String>,
     pub api_key: String,
@@ -1109,6 +1158,7 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            subscription: self.subscription.as_ref(),
             fixed_temperature: self.fixed_temperature,
             supported_reasoning_efforts: self.supported_reasoning_efforts.as_deref(),
             thinking_protocol: self.thinking_protocol,
@@ -2275,6 +2325,7 @@ pub(crate) fn llm_request_url_for_provider(
 ) -> String {
     let base = base_url.trim_end_matches('/');
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => format!("{base}/responses"),
         LlmProviderProtocol::AnthropicMessages => {
             if base.ends_with("/v1") {
                 format!("{base}/messages")
@@ -3459,7 +3510,10 @@ fn build_provider_request_body_with_cache_capability(
     };
     let marker_stripped_messages;
     let messages = if messages.iter().any(|message| {
-        crate::turn::wire_assembly::is_required_runtime_preamble(message)
+        message
+            .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+            .is_some()
+            || crate::turn::wire_assembly::is_required_runtime_preamble(message)
             || crate::turn::wire_assembly::is_runtime_system_context(message)
             || astra_turn_types::is_runtime_owned_message(message)
             || astra_turn_types::has_append_only_runtime_authority_policy(message)
@@ -3541,6 +3595,9 @@ fn build_provider_request_body_with_cache_capability(
         std::borrow::Cow::Owned(owned)
     };
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            unreachable!("Responses requests use the connection-bound streaming adapter")
+        }
         LlmProviderProtocol::BedrockConverse => {
             let repaired = repair_openai_tool_pairing(&reasoning_repaired);
             let (system, bedrock_messages) =
@@ -3699,7 +3756,9 @@ fn apply_no_tool_choice(
     tools: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
+        LlmProviderProtocol::OpenAiResponses
+        | LlmProviderProtocol::OpenAiCompatible
+        | LlmProviderProtocol::TypeSafeSystemOne => {
             // Keep the explicit terminal instruction even when the repair
             // request physically removed every schema. OpenAI-compatible
             // models can otherwise infer the tool protocol from conversation
@@ -3743,6 +3802,10 @@ fn apply_required_tool_choice(
     }
 
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            body["tool_choice"] =
+                json!({"type":"function","namespace":"astra","name":required_tool_name});
+        }
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             body["tool_choice"] = json!({
                 "type": "function",
@@ -4012,7 +4075,7 @@ pub(crate) fn strip_empty_assistant_tool_calls(messages: &mut [Value]) {
 
 #[cfg(test)]
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
-    consolidate_system_messages_inner(messages, false, true)
+    consolidate_system_messages_inner(messages, false, true, false)
 }
 
 pub(crate) fn consolidate_system_messages_for_provider(
@@ -4027,18 +4090,23 @@ pub(crate) fn consolidate_system_messages_for_provider(
         cache_cap.volatile_placement,
         VolatilePlacement::AppendOnlyUserTail
     );
-    if matches!(protocol, LlmProviderProtocol::OpenAiCompatible) {
+    if matches!(
+        protocol,
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::OpenAiResponses
+    ) {
         let projected = crate::turn::wire_assembly::project_runtime_roles(messages);
         return consolidate_system_messages_inner(
             &projected,
             false,
             allow_suffix_dependent_history_repair,
+            matches!(protocol, LlmProviderProtocol::OpenAiResponses),
         );
     }
     consolidate_system_messages_inner(
         messages,
         preserve_runtime_system_tail,
         allow_suffix_dependent_history_repair,
+        false,
     )
 }
 
@@ -4065,12 +4133,13 @@ fn provider_history_ids(messages: &[Value]) -> HashMap<String, String> {
 
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
     let provider_ids = provider_history_ids(messages);
-    strip_internal_runtime_markers_with_ids(messages, &provider_ids);
+    strip_internal_runtime_markers_with_ids(messages, &provider_ids, false);
 }
 
 fn strip_internal_runtime_markers_with_ids(
     messages: &mut [Value],
     provider_ids: &HashMap<String, String>,
+    preserve_responses: bool,
 ) {
     use astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD;
     for message in messages {
@@ -4129,6 +4198,7 @@ fn strip_internal_runtime_markers_with_ids(
             // message contract and only add round-specific bytes to the
             // prompt cache suffix.
             for key in [
+                astra_core::model_wire::responses::CONTINUATION_KEY,
                 "_round_index",
                 astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
                 "_timestamp",
@@ -4141,6 +4211,10 @@ fn strip_internal_runtime_markers_with_ids(
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
                 RETIRED_TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
             ] {
+                if preserve_responses && key == astra_core::model_wire::responses::CONTINUATION_KEY
+                {
+                    continue;
+                }
                 object.remove(key);
             }
         }
@@ -4151,6 +4225,7 @@ fn consolidate_system_messages_inner(
     messages: &[Value],
     preserve_runtime_system_tail: bool,
     allow_suffix_dependent_history_repair: bool,
+    preserve_responses: bool,
 ) -> Vec<Value> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut system_blocks: Vec<Value> = Vec::new();
@@ -4226,7 +4301,8 @@ fn consolidate_system_messages_inner(
     }
     out.extend(rest);
     if !allow_suffix_dependent_history_repair {
-        strip_internal_runtime_markers(&mut out);
+        let provider_ids = provider_history_ids(&out);
+        strip_internal_runtime_markers_with_ids(&mut out, &provider_ids, preserve_responses);
         return out;
     }
 
@@ -4293,7 +4369,8 @@ fn consolidate_system_messages_inner(
         }
     }
 
-    strip_internal_runtime_markers(&mut out);
+    let provider_ids = provider_history_ids(&out);
+    strip_internal_runtime_markers_with_ids(&mut out, &provider_ids, preserve_responses);
     out
 }
 
@@ -4933,7 +5010,9 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
 pub(crate) fn provider_supports_no_tool_choice(provider: &str) -> bool {
     matches!(
         llm_provider_protocol(provider),
-        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages
+        LlmProviderProtocol::OpenAiResponses
+            | LlmProviderProtocol::OpenAiCompatible
+            | LlmProviderProtocol::AnthropicMessages
     )
 }
 
@@ -5005,6 +5084,9 @@ pub(crate) fn prepare_streaming_call(
     tool_choice: RuntimeToolChoice,
 ) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
     let preparation_started = Instant::now();
+    if call.route.provider == astra_services::chatgpt::PROVIDER {
+        return responses::prepare(call, tool_choice, preparation_started);
+    }
     if call.route.provider == "typesafe" {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::InvalidRequest,
@@ -5162,6 +5244,39 @@ pub(crate) async fn call_prepared_llm_and_collect_with_stream_callback(
     .await
 }
 
+async fn wait_connection_cancel(lease: Option<&astra_services::chatgpt::CredentialLease>) {
+    match lease {
+        Some(lease) => lease.cancel.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+enum ProviderErrorBody {
+    Transport(reqwest::Error),
+    TooLarge,
+}
+
+async fn read_provider_error_body(
+    mut response: reqwest::Response,
+    limit: Option<usize>,
+) -> Result<String, ProviderErrorBody> {
+    let Some(limit) = limit else {
+        return response.text().await.map_err(ProviderErrorBody::Transport);
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(ProviderErrorBody::Transport)?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(ProviderErrorBody::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 async fn call_prepared_llm_with_total_budget(
     prepared: PreparedStreamingCall<'_>,
     cancel: LlmCancel<'_>,
@@ -5190,6 +5305,12 @@ async fn call_prepared_llm_with_total_budget(
         completions_url_override,
         ..
     } = route;
+    if (provider == astra_services::chatgpt::PROVIDER) != route.subscription.is_some() {
+        return Err(responses::error(
+            astra_core::ErrorKind::ContractViolation,
+            "subscription_route_mismatch",
+        ));
+    }
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let model_key = model_name;
@@ -5214,10 +5335,19 @@ async fn call_prepared_llm_with_total_budget(
     let attempt_observer = controlled_attempt_observer
         .as_ref()
         .map(|observer| observer as &dyn ProviderAttemptObserver);
-    let client = global_llm_client();
+    let subscription = route.subscription;
+    let subscription_client = subscription
+        .map(|binding| binding.http_client())
+        .transpose()
+        .map_err(responses::credential_error)?;
+    let client = subscription_client
+        .as_ref()
+        .unwrap_or_else(|| global_llm_client());
+    let mut rejected_version = None;
+    let mut auth_retried = false;
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
-    let mut last_model_gateway_error = None;
+    let mut last_structured_error = None;
     let max_retries = LLM_MAX_RETRIES;
     let mut retry_delay_override_ms = None;
     // Read idle timeouts once before the retry loop to avoid env-var races between
@@ -5317,11 +5447,29 @@ async fn call_prepared_llm_with_total_budget(
             None
         };
         let client = compatible_client.as_deref().unwrap_or(client);
+        let lease = if let Some(binding) = subscription {
+            let remaining = total_budget.saturating_sub(started.elapsed());
+            Some(tokio::select! {
+                biased;
+                _ = wait_llm_cancel(cancel) => return Err(responses::error(astra_core::ErrorKind::Cancelled, "cancelled")),
+                value = tokio::time::timeout(remaining, binding.acquire(rejected_version.take())) => value
+                    .map_err(|_| responses::error(astra_core::ErrorKind::ProviderDeadline, "credential_deadline"))?
+                    .map_err(responses::credential_error)?,
+            })
+        } else {
+            None
+        };
         let observed_attempt =
             begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
         let mut req = client.post(&url).header("content-type", "application/json");
-        req = apply_provider_auth(req, provider, api_key, header_overrides);
-        req = apply_llm_header_overrides(req, header_overrides);
+        req = if let Some(lease) = &lease {
+            req.bearer_auth(lease.bearer())
+        } else {
+            apply_llm_header_overrides(
+                apply_provider_auth(req, provider, api_key, header_overrides),
+                header_overrides,
+            )
+        };
         // Bound response startup separately from a successful streaming body.
         let remaining_total_budget = total_budget.saturating_sub(started.elapsed());
         if remaining_total_budget.is_zero() {
@@ -5380,6 +5528,11 @@ async fn call_prepared_llm_with_total_budget(
                     &error,
                 )
                 .await?;
+                return Err(error);
+            }
+            _ = wait_connection_cancel(lease.as_ref()) => {
+                let error = responses::error(astra_core::ErrorKind::Cancelled, "model_connection_unavailable");
+                finish_observed_provider_delivery_unknown(attempt_observer, observed_attempt, &error).await?;
                 return Err(error);
             }
             result = tokio::time::timeout(request_deadline, send_request) => result,
@@ -5461,7 +5614,7 @@ async fn call_prepared_llm_with_total_budget(
                 // This transport failure is the newest provider attempt outcome.
                 // Do not let structured metadata from an earlier gateway response
                 // replace the final connection failure after retries are exhausted.
-                last_model_gateway_error = None;
+                last_structured_error = None;
                 last_err = error.message.clone();
                 last_kind = error.kind;
                 if retry_safe {
@@ -5473,8 +5626,9 @@ async fn call_prepared_llm_with_total_budget(
 
         let status = response.status().as_u16();
         if response.status().is_success() {
-            // Success — record to cooldown tracker
-            cooldown.with(model_key, |c| c.record_success());
+            if subscription.is_none() {
+                cooldown.with(model_key, |c| c.record_success());
+            }
             if provider_uses_bedrock_converse(provider) {
                 match crate::turn::bedrock::transport::collect_bedrock_stream_for_wire(
                     response,
@@ -5705,35 +5859,74 @@ async fn call_prepared_llm_with_total_budget(
                     }
                 }
             }
-            let byte_stream = response.bytes_stream();
-            let stream_result = if provider_uses_anthropic_messages(provider) {
-                collect_anthropic_llm_stream_for_wire(
-                    byte_stream,
-                    model_name,
+            let stream_result = if let Some(lease) = &lease {
+                responses::collect(
+                    response,
+                    route,
+                    &authorized_tool_names,
+                    cancel,
+                    stream_callback.as_deref_mut(),
                     started,
                     stream_budget,
-                    cancel,
-                    idle_pre,
-                    idle_post,
-                    &authorized_tool_names,
-                    stream_callback.as_deref_mut(),
+                    lease,
                 )
                 .await
             } else {
-                collect_llm_stream_for_wire(
-                    byte_stream,
-                    model_name,
-                    started,
-                    stream_budget,
-                    cancel,
-                    idle_pre,
-                    idle_post,
-                    &authorized_tool_names,
-                    stream_callback.as_deref_mut(),
-                )
-                .await
+                let byte_stream = response.bytes_stream();
+                if provider_uses_anthropic_messages(provider) {
+                    collect_anthropic_llm_stream_for_wire(
+                        byte_stream,
+                        model_name,
+                        started,
+                        stream_budget,
+                        cancel,
+                        idle_pre,
+                        idle_post,
+                        &authorized_tool_names,
+                        stream_callback.as_deref_mut(),
+                    )
+                    .await
+                } else {
+                    collect_llm_stream_for_wire(
+                        byte_stream,
+                        model_name,
+                        started,
+                        stream_budget,
+                        cancel,
+                        idle_pre,
+                        idle_post,
+                        &authorized_tool_names,
+                        stream_callback.as_deref_mut(),
+                    )
+                    .await
+                }
             };
             match stream_result {
+                Err(StreamCollectError::Provider {
+                    error,
+                    partial,
+                    rejected,
+                }) => {
+                    let error = attach_llm_result_details(error, &partial);
+                    if rejected {
+                        finish_observed_provider_error_with_partial(
+                            attempt_observer,
+                            observed_attempt,
+                            &error,
+                            &partial,
+                        )
+                        .await?;
+                    } else {
+                        finish_observed_provider_delivery_unknown_with_partial(
+                            attempt_observer,
+                            observed_attempt,
+                            &error,
+                            &partial,
+                        )
+                        .await?;
+                    }
+                    return Err(error);
+                }
                 Ok(mut result) => {
                     result.judgment_provenance = judgment_provenance;
                     reconcile_missing_output_cap_finish_reason(&mut result, wire_output_limit);
@@ -5902,7 +6095,7 @@ async fn call_prepared_llm_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let body = response.text();
+        let body = read_provider_error_body(response, subscription.map(|_| 1024 * 1024));
         tokio::pin!(body);
         let body_result = tokio::select! {
             biased;
@@ -5911,6 +6104,11 @@ async fn call_prepared_llm_with_total_budget(
                     astra_core::ErrorKind::Cancelled,
                     "LLM call cancelled while reading provider error response",
                 );
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+            _ = wait_connection_cancel(lease.as_ref()) => {
+                let error = responses::error(astra_core::ErrorKind::Cancelled, "model_connection_unavailable");
                 finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
                 return Err(error);
             }
@@ -5926,7 +6124,15 @@ async fn call_prepared_llm_with_total_budget(
         };
         let text = match body_result {
             Ok(text) => text,
-            Err(error) => {
+            Err(ProviderErrorBody::TooLarge) => {
+                let error = astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ResourceLimit,
+                    "provider error response exceeded its size limit",
+                );
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+            Err(ProviderErrorBody::Transport(error)) => {
                 let kind = if started.elapsed() >= total_budget {
                     astra_core::ErrorKind::ProviderDeadline
                 } else if error.is_timeout() {
@@ -5952,23 +6158,42 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
-        if let Some(model_gateway_error) = moi_model_gateway_error(
-            status,
-            &text,
-            header_overrides,
-            model_gateway_error_contract.as_deref(),
-        ) {
-            let error = model_gateway_error.classified;
+        let structured_error = if let Some(lease) = &lease {
+            let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let code = astra_services::chatgpt::provider_error_code(status, &body);
+            let refresh = status == 401 && !auth_retried;
+            if refresh {
+                rejected_version = Some(lease.version());
+                auth_retried = true;
+                retry_delay_override_ms = Some(0);
+            }
+            Some(ProviderHttpRejection {
+                classified: responses::error(provider_http_error_kind(status, code), code)
+                    .with_details_json(
+                        json!({"source":"chatgpt","code":code,"http_status":status}).to_string(),
+                    ),
+                retryable: refresh || status >= 500,
+            })
+        } else {
+            moi_model_gateway_error(
+                status,
+                &text,
+                header_overrides,
+                model_gateway_error_contract.as_deref(),
+            )
+        };
+        if let Some(rejection) = structured_error {
+            let error = rejection.classified;
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
-            if model_gateway_error.retryable && status >= 500 {
+            if rejection.retryable && (status >= 500 || subscription.is_some() && status == 401) {
                 last_err = error.message.clone();
                 last_kind = error.kind;
-                last_model_gateway_error = Some(error);
+                last_structured_error = Some(error);
                 continue;
             }
             return Err(error);
         }
-        last_model_gateway_error = None;
+        last_structured_error = None;
         // A negotiated gateway route must retain its versioned error boundary;
         // do not reinterpret a missing/mismatched contract as a provider error.
         // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
@@ -6099,7 +6324,7 @@ async fn call_prepared_llm_with_total_budget(
         return Err(error);
     }
 
-    if let Some(error) = last_model_gateway_error {
+    if let Some(error) = last_structured_error {
         return Err(error);
     }
     Err(astra_core::ClassifiedError::new(
@@ -6261,6 +6486,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: response_id.clone(),
             full_text:
@@ -6773,6 +6999,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     }
 
     Ok(LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id,
         full_text,
@@ -6911,6 +7138,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: response_id.clone(),
             full_text: full_text.clone(),
@@ -7376,6 +7604,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
     let (usage_tokens, reported_presence) =
         usage_tokens.qualified_snapshot(retained_usage_presence);
     Ok(LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id,
         full_text,
@@ -7393,6 +7622,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
 
 #[derive(Debug)]
 enum StreamCollectError {
+    Provider {
+        error: astra_core::ClassifiedError,
+        partial: LlmCallResult,
+        rejected: bool,
+    },
     IdleTimeout {
         elapsed_ms: u64,
         partial: LlmCallResult,
@@ -7458,6 +7692,17 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    if call.route.provider == astra_services::chatgpt::PROVIDER {
+        let prepared = prepare_streaming_call(call, tool_choice)?;
+        return call_prepared_llm_and_collect_with_stream_callback(
+            prepared,
+            LlmCancel::None,
+            None,
+            attempt_observer,
+            Some(timeout),
+        )
+        .await;
+    }
     call.validate_declared_reasoning()?;
     let judgment_provenance = discrete_judgment_provenance(&call);
     let logical_timeout = timeout;
@@ -7485,6 +7730,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         temperature
     };
     let LlmExecutionRoute {
+        subscription: _,
         fixed_temperature: _,
         supported_reasoning_efforts: _,
         thinking_protocol,
@@ -7740,19 +7986,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let kind = if status == 401 || status == 403 {
-            astra_core::ErrorKind::Auth
-        } else if is_rate_limit_status(status) {
-            astra_core::ErrorKind::RateLimit
-        } else if status >= 500 {
-            astra_core::ErrorKind::ServerError
-        } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
-            astra_core::ErrorKind::ContextWindow
-        } else if status == 400 {
-            astra_core::ErrorKind::InvalidRequest
-        } else {
-            astra_core::ErrorKind::Unknown
-        };
+        let kind = provider_http_error_kind(status, &text);
         let message = if kind == astra_core::ErrorKind::Auth {
             "LLM provider authentication failed".to_owned()
         } else {
@@ -7977,6 +8211,7 @@ fn parse_bedrock_nonstream_response(v: &Value, model_name: &str) -> LlmCallResul
     }
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -8062,6 +8297,7 @@ fn parse_openai_compatible_nonstream_response(v: &Value, model_name: &str) -> Ll
     }
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -8138,6 +8374,7 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
         .unwrap_or_default();
 
     LlmCallResult {
+        provider_continuation: None,
         judgment_provenance: None,
         response_id: v.get("id").and_then(Value::as_str).map(String::from),
         full_text,
@@ -8156,12 +8393,33 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
     }
 }
 
+/// Canonical HTTP recovery classification shared by inference protocols.
+fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
+    use astra_core::ErrorKind;
+    if status == 401 || status == 403 {
+        ErrorKind::Auth
+    } else if is_rate_limit_status(status) {
+        ErrorKind::RateLimit
+    } else if status >= 500 {
+        ErrorKind::ServerError
+    } else if status == 400 && astra_core::is_llm_context_window_error(body) {
+        ErrorKind::ContextWindow
+    } else if status == 400 {
+        ErrorKind::InvalidRequest
+    } else {
+        ErrorKind::Unknown
+    }
+}
+
 pub(crate) fn parse_nonstream_response_for_provider(
     v: &Value,
     provider: &str,
     model_name: &str,
 ) -> LlmCallResult {
     match llm_provider_protocol(provider) {
+        LlmProviderProtocol::OpenAiResponses => {
+            unreachable!("Responses calls collect the streaming adapter's result")
+        }
         LlmProviderProtocol::BedrockConverse => parse_bedrock_nonstream_response(v, model_name),
         LlmProviderProtocol::AnthropicMessages => parse_anthropic_nonstream_response(v, model_name),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
@@ -8353,6 +8611,7 @@ mod tests {
                     overrides["reasoning_effort"] = json!("medium");
                 }
                 let route = OwnedLlmExecutionRoute {
+                    subscription: None,
                     model_name: "local-alias".into(),
                     wire_model_name: Some("upstream-fixture".into()),
                     api_key: "fixture".into(),
@@ -8433,6 +8692,7 @@ mod tests {
         for streaming in [false, true] {
             for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
                 let route = OwnedLlmExecutionRoute {
+                    subscription: None,
                     model_name: "fixture".into(),
                     wire_model_name: None,
                     api_key: "fixture".into(),
@@ -8530,6 +8790,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
                 thinking_protocol: Some(
@@ -8610,6 +8871,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -8785,6 +9047,7 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            subscription: None,
             fixed_temperature: None,
             supported_reasoning_efforts: None,
             thinking_protocol: None,
@@ -9033,6 +9296,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9079,6 +9343,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9146,6 +9411,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9245,6 +9511,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,
@@ -9438,6 +9705,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9497,6 +9765,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9575,6 +9844,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9644,6 +9914,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9710,6 +9981,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9783,6 +10055,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9848,6 +10121,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9892,6 +10166,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -9942,6 +10217,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -10009,6 +10285,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -10101,6 +10378,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -10174,6 +10452,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -12713,6 +12992,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -12772,6 +13052,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -13122,6 +13403,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
                 thinking_protocol: None,
@@ -13719,6 +14001,7 @@ mod tests {
                     tools,
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,
@@ -15471,6 +15754,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15535,6 +15819,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15585,6 +15870,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,
@@ -15630,6 +15916,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15672,6 +15959,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15717,6 +16005,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,
@@ -15792,6 +16081,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15824,6 +16114,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15877,6 +16168,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15944,6 +16236,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -15993,6 +16286,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16046,6 +16340,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16093,6 +16388,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16140,6 +16436,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16261,6 +16558,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16306,6 +16604,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -16450,6 +16749,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
                         thinking_protocol: None,

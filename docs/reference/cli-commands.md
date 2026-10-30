@@ -75,6 +75,57 @@ These are Server settings, not options ordinary CLI users need to fill in.
 The default policy is `public-https`; invalid values fail closed. Upgrade the
 Server together with the CLI to provide `/me/models/validate-endpoint`.
 
+## ChatGPT subscription models
+
+On a self-hosted Server with subscription sharing enabled, sign in to Astra,
+then link a ChatGPT account from a terminal with a local browser:
+
+```bash
+astra model connect chatgpt --label personal
+astra model connections
+astra model add coding --provider chatgpt --connection <connection-uuid> --model <visible-slug> --default
+astra chat --model coding
+```
+
+`astra model add` also offers a guided ChatGPT setup and lists the models
+currently visible to the chosen account. Multiple aliases/model slugs can share
+one connection; link another account to create a separate credential source.
+Adding/checking a model sends a short inference probe against that subscription.
+Linking alone does not change the default model. Existing CLI/Web model pickers
+can select a configured Offering; browser linking is available in the CLI only.
+
+The browser asks OpenAI for sign-in and plan-use consent. Astra Server encrypts
+renewable credentials with its existing token encryption key and can continue
+inference after this terminal closes. Use a Server you trust and HTTPS for a
+remote Server. This flow does not import the Codex CLI credential cache or
+change Astra's login identity. Native Codex collaborators remain separately
+configured.
+
+Recovery and removal:
+
+```bash
+astra model connect chatgpt --connection <connection-uuid>
+astra model check coding
+astra model disconnect <connection-uuid>
+```
+
+A failed code exchange prints an authorization UUID; `astra model connect
+chatgpt --retry <authorization-uuid>` retains the issued client registration.
+Declined, expired or cancelled attempts require a new authorization. Reconnect
+must use the same ChatGPT identity. Disconnect disables every model using that
+connection and cancels its requests; recheck individual models to reactivate
+them after reconnecting. The result reports whether upstream revocation was
+confirmed. Inspect OpenAI's connected-app settings if it was not confirmed.
+A disconnected default produces an actionable error until you recheck it or
+explicitly choose another default. Quota errors never select a paid fallback.
+
+V1 supports text and Astra function tools through the Responses HTTP API.
+Images/audio, hosted tools, realtime/WebSocket sessions, custom endpoints and
+reasoning controls are not exposed. Availability and eligibility come from
+OpenAI; a ChatGPT subscription does not imply every model is available.
+See [Server configuration](configuration.md#chatgpt-subscription-connections)
+for deployment and rollback requirements.
+
 ## Installation
 
 For day-to-day development builds:

@@ -41287,6 +41287,7 @@ mod tests {
             requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                subscription: None,
                 admitted_at: std::time::Instant::now(),
                 price_snapshot: None,
                 offering_id: "offer-gpt-4".to_string(),

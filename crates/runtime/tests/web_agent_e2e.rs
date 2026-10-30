@@ -6072,3 +6072,248 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
     .await
     .expect("context_meta_surfaces_unknown_active_skills_for_debugging exceeded 30s timeout — likely a hang regression");
 }
+
+#[allow(dead_code)]
+mod subscription_provider {
+    use astra_services as services;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../services/tests/common/chatgpt_fixture.rs"
+    ));
+}
+
+#[path = "../../services/tests/common/isolated_database.rs"]
+mod subscription_isolated_database;
+
+/// Product path: explicit provider consent, personal model creation, real
+/// model-catalog execution, durable history, and fresh Server services.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session() {
+    use astra_services::chatgpt::ChatgptConfig;
+    use astra_services::{DatabaseAgentService, DatabaseModelService, DatabaseSessionService};
+    init_env();
+    let settings = test_support::require_db_it_env();
+    subscription_isolated_database::require_isolated_database(&settings.database);
+    let journals = tempfile::tempdir().unwrap();
+    let _journal_scope =
+        astra_services::session_journal::ProcessJournalDirGuard::new(journals.path());
+    astra_services::ensure_core_schema(&settings, "mysql")
+        .await
+        .unwrap();
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let provider = subscription_provider::ProviderFixture::start().await;
+    let config = ChatgptConfig::for_test(&provider.base);
+    let key = test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!");
+    let make_app = || {
+        let models = Arc::new(
+            DatabaseModelService::new(settings.clone(), key.clone())
+                .with_pool(pool.clone())
+                .with_chatgpt_config(config.clone()),
+        );
+        let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+            .with_shared_pool(pool.clone())
+            .with_auth_service(Arc::new(StubAuth))
+            .with_agent_service(Arc::new(
+                DatabaseAgentService::new(settings.clone()).with_pool(pool.clone()),
+            ))
+            .with_session_service(Arc::new(
+                DatabaseSessionService::new(settings.clone()).with_pool(pool.clone()),
+            ))
+            .with_model_service(models.clone());
+        let store = Arc::new(
+            astra_services::DatabaseRunStateStore::new(pool.clone())
+                .with_owner_pod_id("subscription-public-server"),
+        );
+        let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+            settings.clone(),
+            key.clone(),
+            base.edge_callback_ledger(),
+            astra_runtime::RunEngine::new(store),
+        )
+        .with_pool(pool.clone())
+        .with_auth_service(Arc::new(StubAuth))
+        .with_model_service(models)
+        .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
+        (base, lifecycle)
+    };
+    async fn post(app: &Router, path: &str, value: Value) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            status.is_success(),
+            "{path}: {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let (base, lifecycle) = make_app();
+    let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
+    let authorization = post(
+        &app,
+        "/me/model-connections/chatgpt/authorizations",
+        json!({"redirect_uri":"http://127.0.0.1:14555/auth/callback","label":"public-agent-test"}),
+    )
+    .await;
+    let code = provider.issue_code(
+        &authorization,
+        &format!("public-{}", uuid::Uuid::new_v4()),
+        true,
+    );
+    let linked = post(
+        &app,
+        &format!(
+            "/me/model-connections/chatgpt/authorizations/{}/complete",
+            authorization["authorization_id"].as_str().unwrap()
+        ),
+        json!({"state":authorization["state"],"code":code,"client_id":"oaiapp_fixture"}),
+    )
+    .await;
+    let model=post(&app,"/me/models",json!({"name":format!("public-{}",uuid::Uuid::new_v4()),"provider":"chatgpt","model":"fixture-model","connection_id":linked["connection"]["connection_id"],"context_window":128000,"is_default":false})).await;
+    let agent = post(
+        &app,
+        "/agents",
+        json!({"name":format!("subscription-{}",uuid::Uuid::new_v4())}),
+    )
+    .await;
+    let session = post(
+        &app,
+        "/sessions",
+        json!({"agent_id":agent["agent_id"],"title":"Subscription durable history"}),
+    )
+    .await;
+    let session_id = session["session_id"].as_str().unwrap();
+    drop(app);
+    let (base, lifecycle) = make_app();
+    *provider.state.script.lock().unwrap() = vec![
+        (
+            "tool_search".into(),
+            json!({"query":"select:model_catalog"}),
+        ),
+        (
+            "invoke_tool".into(),
+            json!({"name":"model_catalog","arguments":{"limit":16}}),
+        ),
+    ];
+    provider
+        .state
+        .scripted
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let lifecycle = Arc::new(lifecycle);
+    let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
+    let payload = |message: &str| json!({"message":message,"session_id":session_id,"model_selection":{"offering_id":model["model_id"]},"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
+    let first = chat_stream_collect(
+        &app,
+        payload("subscription-public-first: List the models I can use."),
+    )
+    .await;
+    assert!(
+        first.iter().all(|event| event["type"] != "error"),
+        "{first:?}"
+    );
+    assert!(
+        provider.state.script.lock().unwrap().is_empty(),
+        "the agent did not execute its scripted tool rounds"
+    );
+    let requests = provider.state.requests.lock().unwrap().clone();
+    assert!(
+        requests.iter().any(
+            |request| request["input"].as_array().unwrap().iter().any(|item| {
+                item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains(model["model_id"].as_str().unwrap()))
+            })
+        ),
+        "authorized model catalog never reached the provider: {:?}",
+        requests
+            .iter()
+            .map(|request| request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| item["output"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(1200)
+                    .collect::<String>())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while lifecycle.background_task_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let persisted:i64=sqlx::query_scalar("SELECT COUNT(*) FROM conversation_manifest_nodes WHERE owner_user_id=? AND session_id=? AND content_json LIKE '%_astra_responses%'")
+        .bind(USER_ID).bind(session_id).fetch_one(pool.get()).await.unwrap();
+    assert!(
+        persisted > 0,
+        "provider continuation was not written to canonical database history"
+    );
+    drop(app);
+    drop(lifecycle);
+    // A new local journal root also rules out recovering the first turn from
+    // its local journal. The fresh services must read the durable store.
+    let fresh_journals = tempfile::tempdir().unwrap();
+    let _fresh_journal_scope =
+        astra_services::session_journal::ProcessJournalDirGuard::new(fresh_journals.path());
+    // Build new services and a new run engine against the same durable store.
+    let (base, lifecycle) = make_app();
+    let lifecycle = Arc::new(lifecycle);
+    let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
+    let before = provider.state.requests.lock().unwrap().len();
+    let second = chat_stream_collect(
+        &app,
+        payload("subscription-public-second: Continue using the former session."),
+    )
+    .await;
+    assert!(
+        second.iter().all(|event| event["type"] != "error"),
+        "{second:?}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while lifecycle.background_task_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let requests = provider.state.requests.lock().unwrap();
+    let continued = &requests[before..];
+    assert!(
+        continued.iter().any(|request| request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["encrypted_content"] == "sk-fixtureciphertextciphertextciphertext")),
+        "provider reasoning was lost after rebuilding Server services"
+    );
+    assert!(
+        continued.iter().any(|request| request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["phase"] == "final_answer")),
+        "assistant phase was lost from persisted history"
+    );
+}

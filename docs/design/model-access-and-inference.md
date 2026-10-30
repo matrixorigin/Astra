@@ -38,6 +38,70 @@ without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
+## Implemented ChatGPT subscription connection boundary
+
+The opt-in self-hosted ChatGPT adapter uses the same Offering admission, agent
+backbone, invocation/provider-attempt ledger, tool execution, cancellation,
+canonical history and checkpoint paths as API-key models. `chatgpt` selects
+the shared Responses codec; it does not create another session state machine.
+The supported deployment and CLI/API contracts are documented in
+[configuration](../reference/configuration.md#chatgpt-subscription-connections),
+[CLI commands](../reference/cli-commands.md#chatgpt-subscription-models), and
+[API reference](../reference/api-reference.md#personal-subscription-connections).
+
+`user_llm_connections` owns one encrypted renewable credential per Astra owner,
+issued client registration and provider subject. Multiple personal model rows
+reference it. A row has exactly one source: API-key ciphertext or connection ID;
+admission rejects malformed combinations. `user_llm_authorizations` owns
+short-lived, owner-bound OAuth attempts, encrypted PKCE verifiers and keyed
+state/nonce digests. ID tokens are verified and discarded; only renewable
+credentials are stored encrypted. Credentials never enter serializable routes, catalogs,
+checkpoints or public errors. The CLI relays only the browser callback and uses
+a loopback listener; Server never reads local CLI/Codex credentials.
+
+Valid-token reads run concurrently. Refresh rotation shares one connection-owned
+task per generation and a database compare-and-set lease plus the rejected
+credential version. Cancelling an inference or its last waiter does not cancel
+the bounded rotation or its credential commit. Discovery/JWKS metadata is cached
+and prepared before taking the lease; the full rotation operation has a
+25-second budget within its 30-second lease. Pre-dispatch failures and rejected
+rate-limited refreshes release the lease and preserve credentials. A lost/expired refresh
+outcome requires reauthentication instead of reusing a potentially consumed
+refresh token. A delayed 401 for an older version reuses a committed winner. Connection generations fence reauthorization
+and disconnect against old execution bindings. Disconnect clears ciphertext,
+disables dependent models and cancels local requests; each replica shares one
+database generation watcher per active connection, and each request performs a
+fresh fence before accepting completion. Watchers stop with their last request.
+Interrupted delivered requests settle as delivery-unknown through the existing
+attempt owner. A disabled selected default cannot silently choose deployment
+credentials. OAuth identity is never Astra identity or login-session authority.
+
+Model creation, activation and default selection lock and revalidate the probed
+connection generation within their database transaction, before changing model
+rows. Disconnect and reauthorization lock the connection before its authorization
+attempts and dependent models. A stale successful probe cannot re-enable models after disconnect.
+Retry backoff uses the shared provider deadline/cancellation owner and consumes
+the original inference budget.
+Catalog reads and connectivity probes share version-aware 401 recovery. Failed
+and incomplete Responses retain provider identity and usage for settlement.
+Streaming protocols share the physical-attempt runner for sending, retries,
+deadlines, error-body reads and settlement. The Responses adapter owns wire
+decoding and its connection fences, including cancellation during a stream.
+
+Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
+before wire encoding, including direct auxiliary calls. Requests send full
+history with `store:false` and `stream:true`.
+Astra functions occupy the `astra` namespace. Completed provider output items,
+including encrypted reasoning and message phase, live in private canonical
+assistant-message metadata before tool execution/final checkpoint. Opaque
+provider-encrypted reasoning is base64 encoded for storage so generic text
+redaction cannot corrupt ciphertext. Function arguments come from the canonical
+assistant tool calls; private metadata retains no second raw argument copy. Resume
+replays them only for the same connection and model; other protocols remove
+that metadata at the existing internal-marker projection boundary. No
+`previous_response_id` thread store or parallel history projection exists.
+Only completed streams authorize tool dispatch; partial/truncated streams fail.
+
 ## Ownership
 
 Opt-in Auto chat routing uses the existing authenticated Offering admission

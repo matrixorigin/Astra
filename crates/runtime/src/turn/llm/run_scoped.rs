@@ -252,6 +252,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: super::super::client::LlmExecutionRoute {
+                    subscription: None,
                     model_name: "fixture-model",
                     api_key: "fixture-key",
                     base_url: "http://127.0.0.1:1",

@@ -18176,6 +18176,9 @@ pub(crate) fn safe_model_offering_error(
         astra_services::ModelOfferingResolutionError::Backend(_) => {
             "The authorized model catalog is temporarily unavailable."
         }
+        astra_services::ModelOfferingResolutionError::CredentialUnavailable { .. } => {
+            "Reconnect or inspect the selected model connection."
+        }
     }
 }
 
@@ -18194,6 +18197,9 @@ pub(crate) fn safe_model_offering_error_with_code(
             "model_offering_unavailable"
         }
         astra_services::ModelOfferingResolutionError::Backend(_) => "model_catalog_unavailable",
+        astra_services::ModelOfferingResolutionError::CredentialUnavailable { .. } => {
+            "model_connection_reauthentication_required"
+        }
     };
     format!("[{code}] {}", safe_model_offering_error(error))
 }

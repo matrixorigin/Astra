@@ -5487,6 +5487,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
     };
     let ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
+    // Ingest already materializes successful text-only replies. Attach protocol
+    // state before the canonical transcript owner records those new messages.
+    if state.final_text_model_item_id.is_some()
+        && state.final_text_model_item_id == state.current_model_item_id
+        && let Some(continuation) = state.pending_provider_continuation.as_ref()
+    {
+        for message in &mut state.messages[transcript_append_start..] {
+            if astra_turn_types::model_item_id(message) == state.final_text_model_item_id.as_deref()
+            {
+                message[astra_core::model_wire::responses::CONTINUATION_KEY] = continuation.clone();
+            }
+        }
+    }
     // Apply weak/partial quarantine on the same boundary as newly ingested
     // records, and checkpoint the first transition immediately.
     if let Some(records) = state.stall.tool_call_records.get(tool_record_floor..) {

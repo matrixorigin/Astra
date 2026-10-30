@@ -64,6 +64,29 @@ impl FernetTokenEncryptor {
         mac.update(value.as_bytes());
         format!("{:x}", mac.finalize().into_bytes())
     }
+
+    /// Verify a stored digest without exposing a secret-dependent prefix match.
+    pub fn verify_keyed_digest(&self, domain: &str, value: &str, expected: &str) -> bool {
+        if expected.len() != 64 {
+            return false;
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in expected.as_bytes().chunks_exact(2).enumerate() {
+            let Ok(pair) = std::str::from_utf8(pair) else {
+                return false;
+            };
+            let Ok(value) = u8::from_str_radix(pair, 16) else {
+                return false;
+            };
+            bytes[index] = value;
+        }
+        let mut mac =
+            HmacSha256::new_from_slice(&self.digest_key).expect("HMAC accepts a 32-byte key");
+        mac.update(domain.as_bytes());
+        mac.update(&[0]);
+        mac.update(value.as_bytes());
+        mac.verify_slice(&bytes).is_ok()
+    }
 }
 
 fn derive_fernet_key(secret_key: &str) -> String {
@@ -137,6 +160,16 @@ mod tests {
             first.keyed_digest("provider-header", "workspace-1"),
             other.keyed_digest("provider-header", "workspace-1")
         );
+    }
+
+    #[test]
+    fn keyed_digest_verification_requires_matching_domain_value_and_digest() {
+        let key = make_encryptor("digest-verification-key");
+        let digest = key.keyed_digest("domain-one", "value");
+        assert!(key.verify_keyed_digest("domain-one", "value", &digest));
+        assert!(!key.verify_keyed_digest("domain-two", "value", &digest));
+        assert!(!key.verify_keyed_digest("domain-one", "different", &digest));
+        assert!(!key.verify_keyed_digest("domain-one", "value", "not-a-digest"));
     }
 
     #[test]

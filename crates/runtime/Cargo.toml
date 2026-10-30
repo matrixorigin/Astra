@@ -97,6 +97,7 @@ fs2 = "0.4"
 tempfile = "3"
 
 [dev-dependencies]
+rsa = "0.9"
 jsonwebtoken.workspace = true
 astra-services = { workspace = true, features = ["e2e-hooks"] }
 astra-test-harness = { path = "../astra-test-harness" }

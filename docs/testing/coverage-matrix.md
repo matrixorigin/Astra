@@ -48,6 +48,64 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | `SharedPool` on `AppState` / auth+session service constructors | Compile-time API + real pool in services tests / Matrix E2E | `shared_pool_contract`, `shared_pool_migration_contract` |
 | Thinking models: `reasoning_content` on every assistant+`tool_calls` after mid-session switch / DB recovery | `runtime/src/turn/edge_ledger.rs` `#[cfg(test)]` (`mid_session_switch_*`, `append_recovered_events` + `strip_stale_reasoning` pipeline) | — (avoid extra integration binary) |
 
+## ChatGPT subscription connections
+
+Offline coverage lives in `astra-core::model_wire::responses` (wire codec),
+`astra-services::chatgpt::tests` (OIDC, redirect and feature gates),
+`astra-services::auth::encryption::tests` (keyed-digest verification),
+`astra-cli::cli::model_connections::tests` (callback/browser binding), and
+`runtime/tests/user_models_http.rs` (authenticated routes and frozen catalog).
+`services/tests/chatgpt_connections_db_it.rs` uses an explicitly isolated
+MatrixOne database and a local fake OAuth/Responses provider for encryption,
+ownership, rotation races, model sharing, disconnect and reauthorization.
+The reauthorization/disconnect race observes the blocked completion SQL before
+cancelling its attempt, and verifies cancellation without a second code exchange.
+The identity journey reuses one SQL connection from initial registration through
+reauthorization and verifies its persisted connection/subject fences.
+Refresh regressions cover a refused TCP connection followed by recovery,
+cross-instance expiry with 11-second discovery/JWKS/token legs, and metadata
+cache reuse, rejected refresh rate limits and probe 401 recovery. Cancellation of the last refresh waiter must still commit the new
+credential; 64 concurrent waiters share one rotation. Row-lock races exercise
+model creation, checking, activation and default selection against disconnect.
+The ignored `responses_transport_recovery_and_credential_fencing`
+transport test covers physical-attempt settlement, manually constructed tool
+frames, a delayed old-token 401, context-window and in-stream quota classifications,
+failed-response usage preservation, and disconnect during
+headers. Sixteen concurrent requests verify that SQL fencing is shared per
+connection. A refused-connection retry with a 100 ms invocation budget must
+expire during its one-second backoff before admitting a second attempt.
+Transient HTTP admission failures exercise the shared retry runner and preserve
+the structured subscription error after physical retries are exhausted.
+Paired OpenAI/Responses projection coverage checks runtime fact/instruction roles,
+tool/result order, prefix stability, and private continuation. The transport
+journey supplies raw canonical messages to exercise direct request preparation.
+The ignored `chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session`
+test in `runtime/tests/web_agent_e2e.rs` exercises authenticated connection and
+model routes, real model-catalog tool execution through `/chat/stream`, and
+canonical database history. It continues the same session with fresh Server
+services and a new run engine, using an empty local journal directory, and
+asserts provider tool results, encrypted reasoning and assistant phase survive.
+This tests durable restoration within one test process; an operating-system
+restart and live OpenAI consent/inference remain operator acceptance steps.
+These database lanes do not contact OpenAI or spend subscription quota.
+
+Run these DB lanes with the testing guide's isolated database variables:
+
+```bash
+cargo test -p astra-services --features e2e-hooks --test chatgpt_connections_db_it -- --ignored --test-threads=1
+cargo test -p astra-runtime --lib responses_transport_recovery_and_credential_fencing -- --ignored --test-threads=1
+cargo test -p astra-runtime --features e2e-hooks --test web_agent_e2e chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session -- --ignored --test-threads=1
+```
+
+Live acceptance remains an explicit operator step on an isolated self-hosted
+installation: enable the feature/host ID, run the documented CLI linking flow,
+authorize plan use, configure two visible models sharing one connection, run a
+text/tool turn, close the CLI and resume the former session, then disconnect
+and verify dependent models fail closed. Reconnect and check a model to recover.
+This requires real browser consent and consumes plan usage; do not make it a
+required fork CI lane or reuse a deployment credential cache. Record the exact
+OpenAI model catalog and source SHA without logging tokens or callback URLs.
+
 ## Large integration binaries (audit — not removed in this pass)
 
 | Binary | Role | E2E overlap | Recommendation |

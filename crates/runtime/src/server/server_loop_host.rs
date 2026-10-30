@@ -1991,6 +1991,7 @@ fn record_full_llm_response_event(
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
     /// `None` → send `model_name`. See `ResolvedActiveLlmModel::upstream_model_name`.
@@ -2021,6 +2022,7 @@ struct ResolvedTurnLlmConfig {
 impl ResolvedTurnLlmConfig {
     fn execution_route(&self) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            subscription: self.subscription.clone(),
             model_name: self.model_name.clone(),
             wire_model_name: self.wire_model_name.clone(),
             api_key: self.api_key.clone(),
@@ -3126,6 +3128,7 @@ fn resolve_llm_model_for_turn(
         return Err("model override does not match the Offering admitted for this run".to_string());
     }
     Ok(ResolvedTurnLlmConfig {
+        subscription: execution.subscription.clone(),
         model_name: execution.model_name.clone(),
         wire_model_name: execution.wire_model_name.clone(),
         api_key: execution.api_key.clone(),
@@ -20717,6 +20720,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             let mut attempt_first_stream_update_ms: Option<u64> = None;
             let mut attempt_first_visible_text_ms: Option<u64> = None;
+            state.pending_provider_continuation=None;
             let r = {
                 let mut attempt_text = String::new();
                 let mut attempt_reasoning = String::new();
@@ -21913,6 +21917,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             first_visible_text_turn_ms,
             turn_started.elapsed().as_millis() as u64,
         ));
+        state.pending_provider_continuation=result.provider_continuation.clone();
         let mut accum = Self::result_to_accum_with_usage(&result, Some(physical_attempt_usage));
         accum.model_item_id = state.current_model_item_id.clone();
         accum.qualified_usage = qualified_attempt_usage;
@@ -28703,6 +28708,7 @@ mod tests {
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
+            subscription: None,
             model_name: "gpt-4o-mini".to_string(),
             wire_model_name: None,
             api_key: String::new(),
@@ -34731,6 +34737,7 @@ mod tests {
     #[test]
     fn result_to_accum_converts_correctly() {
         let result = LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: None,
             full_text: "Hello world".to_string(),
@@ -51441,6 +51448,7 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new(
             OwnedLlmExecutionRoute {
+                subscription: None,
                 model_name: "gpt-4o-mini".to_string(),
                 wire_model_name: None,
                 api_key: String::new(),

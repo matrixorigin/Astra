@@ -3,6 +3,30 @@ use super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
+            "/me/model-connections",
+            get(data_layer::model_connections::list),
+        )
+        .route(
+            "/me/model-connections/chatgpt/authorizations",
+            post(data_layer::model_connections::start),
+        )
+        .route(
+            "/me/model-connections/chatgpt/authorizations/{authorization_id}/complete",
+            post(data_layer::model_connections::complete),
+        )
+        .route(
+            "/me/model-connections/chatgpt/authorizations/{authorization_id}",
+            axum::routing::delete(data_layer::model_connections::cancel),
+        )
+        .route(
+            "/me/model-connections/{connection_id}/models",
+            get(data_layer::model_connections::models),
+        )
+        .route(
+            "/me/model-connections/{connection_id}/disconnect",
+            post(data_layer::model_connections::disconnect),
+        )
+        .route(
             "/me/models",
             get(data_layer::models::list_user_models_handler)
                 .post(data_layer::models::create_user_model_handler),

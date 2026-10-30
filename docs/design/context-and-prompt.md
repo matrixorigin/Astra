@@ -71,9 +71,9 @@ guidance changes neither tool admission nor sandbox permission enforcement.
 
 ## Dynamic blocks
 
-For OpenAI-compatible requests, the provider projection has at most one system
-message, at the beginning. Stable agent/platform rules and typed runtime
-instructions are consolidated there. Runtime facts and advisory evidence are
+OpenAI-compatible and Responses requests share at most one leading system
+message. Stable agent/platform rules and typed runtime instructions are
+consolidated there. Runtime facts and advisory evidence are
 separate user-role messages marked `astra-runtime-context`; this wire role does
 not turn them into canonical human requests. Genuine user content and real
 assistant/tool groups retain their identity and order.

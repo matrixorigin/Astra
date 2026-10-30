@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 
 pub mod purpose;
+pub mod responses;
 pub mod thinking;
 
 /// Apply a caller-bounded output budget to Anthropic Messages or OpenAI-style

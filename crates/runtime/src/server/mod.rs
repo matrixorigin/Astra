@@ -253,6 +253,7 @@ async fn finish_server_shutdown(
 }
 
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    astra_services::chatgpt::ChatgptConfig::from_env()?;
     static TRACING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     TRACING.get_or_init(|| {
         let _ = astra_logging::init_from_env(

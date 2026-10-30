@@ -969,6 +969,12 @@ pub(crate) struct SessionIdArgs {
     after_help = "Examples:\n  astra model add\n  astra model list\n  astra model add deepseek --provider deepseek --model deepseek-v4-flash --context-window 1000000 --api-key-stdin --default\n  astra model add gateway --provider openai-compatible --base-url https://gateway.example/v1 --model MODEL_ID --api-key-stdin\n  astra model show deepseek\n  astra model probe deepseek"
 )]
 pub(crate) enum ModelCmd {
+    /// Link a subscription account using browser authorization
+    Connect(ModelConnectArgs),
+    /// List your provider connections without credential material
+    Connections,
+    /// Revoke a linked account and disable its models
+    Disconnect { connection_id: String },
     /// List available models
     List,
     /// Add a personal Cloud BYOK model
@@ -983,11 +989,14 @@ pub(crate) enum ModelCmd {
 
 #[derive(Args, Debug)]
 pub(crate) struct ModelAddArgs {
+    /// Subscription connection UUID (for provider chatgpt)
+    #[arg(long = "connection")]
+    pub connection_id: Option<String>,
     /// Configuration alias used with chat --model (wizard default: provider model ID)
     #[arg(value_name = "ALIAS")]
     pub name: Option<String>,
     /// Model provider (omit to choose interactively)
-    #[arg(long, value_parser = ["openai", "anthropic", "deepseek", "openai-compatible"])]
+    #[arg(long, value_parser = ["openai", "anthropic", "deepseek", "openai-compatible", "chatgpt"])]
     pub provider: Option<String>,
     /// Exact model ID from your provider's API documentation (not the Astra alias)
     #[arg(long)]
@@ -1004,6 +1013,20 @@ pub(crate) struct ModelAddArgs {
     /// Model context-window size in tokens
     #[arg(long, default_value_t = 128_000)]
     pub context_window: i32,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelConnectArgs {
+    #[arg(value_parser=["chatgpt"])]
+    pub provider: String,
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Reauthorize the same account registration
+    #[arg(long)]
+    pub connection: Option<String>,
+    /// Retry a failed code exchange using its issued registration
+    #[arg(long = "retry", conflicts_with = "connection")]
+    pub retry_authorization_id: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1552,5 +1575,59 @@ mod tests {
         assert_eq!(args.base_url.as_deref(), Some("https://gateway.example/v1"));
         assert_eq!(args.provider.as_deref(), Some("openai-compatible"));
         assert!(Cli::try_parse_from(["astra", "model", "add", "--provider", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn subscription_commands_keep_connection_and_registration_retry_explicit() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "add",
+            "coding",
+            "--provider",
+            "chatgpt",
+            "--connection",
+            "connection-id",
+            "--model",
+            "visible-model",
+            "--default",
+        ])
+        .unwrap();
+        let Some(Command::Model(ModelCmd::Add(args))) = cli.command else {
+            panic!("model add")
+        };
+        assert_eq!(args.connection_id.as_deref(), Some("connection-id"));
+        assert!(!args.api_key_stdin);
+        assert!(args.default);
+        for command in [
+            vec![
+                "astra", "model", "connect", "chatgpt", "--label", "personal",
+            ],
+            vec![
+                "astra",
+                "model",
+                "connect",
+                "chatgpt",
+                "--retry",
+                "attempt-id",
+            ],
+            vec!["astra", "model", "connections"],
+            vec!["astra", "model", "disconnect", "connection-id"],
+        ] {
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "astra",
+                "model",
+                "connect",
+                "chatgpt",
+                "--connection",
+                "connection-id",
+                "--retry",
+                "attempt-id"
+            ])
+            .is_err()
+        );
     }
 }

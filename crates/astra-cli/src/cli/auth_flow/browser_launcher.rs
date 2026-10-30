@@ -57,7 +57,7 @@ use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
-pub(super) async fn launch_login_url(url: String) -> Result<(), String> {
+pub(crate) async fn launch_login_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if running_in_wsl() {
         return run_wsl_launcher(

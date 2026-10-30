@@ -7,6 +7,7 @@ pub mod artifact_policy;
 pub mod auth;
 pub mod byok_endpoint;
 mod cancellation_safe_db;
+pub mod chatgpt;
 pub(crate) use cancellation_safe_db::CancellationSafeTransaction;
 pub use cancellation_safe_db::{CancellationSafePoolConnection, TransactionConnection};
 pub mod context;
