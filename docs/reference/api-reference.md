@@ -163,7 +163,8 @@ responses from changing the current view.
 
 ### POST /chat/runs/{run_id}/resume
 
-Resume preflight returns `503` when saved Run state cannot be read, with a
+Run lists (`GET /runs`), Session Run trees (`GET /sessions/{id}/runs`), and
+resume preflight return `503` when their saved Run state cannot be read, with a
 neutral retry message and no storage details or error code. Missing and
 foreign-owned Runs return `404`. A rejected preflight does not change the Run.
 

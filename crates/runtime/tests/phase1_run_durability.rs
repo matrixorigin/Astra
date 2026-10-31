@@ -812,7 +812,7 @@ async fn l3_s10_retry_scope_is_persisted_for_retry_runs() {
 
 shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn resume_preflight_hides_corrupt_durable_storage() {
+async fn durable_reads_hide_corrupt_storage() {
     let pool = setup_pool().await;
     for damage in ["healthy", "checkpoint", "opening"] {
         let (run, session, user) = test_ids();
@@ -840,8 +840,33 @@ async fn resume_preflight_hides_corrupt_durable_storage() {
             ).bind(&user).bind(&run).fetch_one(pool.get()).await.unwrap()
         };
         let before = snapshot().await;
+        // The Session stub permits the foreign tree request so this also
+        // exercises store-level Run filtering; production rejects that Session
+        // at its ownership lookup before reaching the Run reader.
         for foreign in [false, true] {
             let app = build_phase1_http_app(pool.clone(), if foreign { format!("foreign-{user}") } else { user.clone() }, store.clone());
+            // Both metadata routes share the presentation boundary; concurrent
+            // reads must retain ownership filtering without mutating state.
+            let request = |path: String| Request::builder().uri(path)
+                .header("authorization", HTTP_TOKEN).body(Body::empty()).unwrap();
+            let (list, tree) = tokio::join!(
+                app.clone().oneshot(request("/runs".into())),
+                app.clone().oneshot(request(format!("/sessions/{session}/runs"))),
+            );
+            for response in [list.unwrap(), tree.unwrap()] {
+                let failed = !foreign && damage == "checkpoint";
+                assert_eq!(response.status(), if failed { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK });
+                let bytes = body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                if failed {
+                    assert_eq!(body["detail"], "Unable to load this run right now. Please try again later.");
+                    assert!(body["error_code"].is_null());
+                } else {
+                    let runs = body["runs"].as_array().unwrap();
+                    assert_eq!(runs.len(), if foreign { 0 } else { 1 });
+                    if !foreign { assert_eq!(runs[0]["run_id"], run); }
+                }
+            }
             let response = app.oneshot(Request::builder().method("POST")
                 .uri(format!("/chat/runs/{run}/resume"))
                 .header("authorization", HTTP_TOKEN).body(Body::empty()).unwrap()).await.unwrap();

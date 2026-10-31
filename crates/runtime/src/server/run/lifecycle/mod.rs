@@ -12981,14 +12981,16 @@ impl AgenticRunLifecycleService {
             .run_engine
             .load_run(user_id, run_id)
             .await
-            .map_err(|error| {
-                tracing::warn!(run_id, user_id, error = %error, "Failed to load durable run state");
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Unable to load this run right now. Please try again later.",
-                )
-            })?;
+            .map_err(Self::durable_read_error)?;
         Ok(run)
+    }
+
+    fn durable_read_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
+        tracing::warn!(%error, "Failed to read durable run state");
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Unable to load this run right now. Please try again later.",
+        )
     }
 
     async fn require_durable_run_for_user(
@@ -17404,12 +17406,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .run_engine
             .list_user_runs_cursor(&user_id, limit, cursor)
             .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to list durable run state: {error}"),
-                )
-            })?;
+            .map_err(Self::durable_read_error)?;
         let page = durable_page
             .runs
             .iter()
@@ -17433,12 +17430,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         self.run_engine
             .list_session_runs(&user_id, &session_id, limit)
             .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to list durable session runs: {error}"),
-                )
-            })
+            .map_err(Self::durable_read_error)
     }
 
     async fn pause_run(
