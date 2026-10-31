@@ -27,7 +27,7 @@ async fn seed_orphan_cancel_race_run(
         .with_owner_pod_id(fixture_owner.clone());
     store
         .insert_run(DurableRunRecord {
-            opening: None,
+            opening: Default::default(),
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
@@ -50,8 +50,7 @@ async fn seed_orphan_cancel_race_run(
             ),
             run_generation: 0,
             last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
+            current_checkpoint: None,
             error_code: None,
             error_message: None,
 
@@ -670,7 +669,7 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let recovered = store.load_run(&ctx.user_id, &run_id).await.unwrap().unwrap();
         assert_eq!(recovered.status, "paused");
         assert!(recovered.run_generation > original.run_generation);
-        assert_eq!(recovered.checkpoint_json.as_deref(), Some(checkpoint.checkpoint_json.as_str()));
+        assert_eq!(recovered.current_checkpoint.as_ref(), Some(&astra_services::runs::CurrentCheckpointRef::from(&checkpoint)));
         assert_eq!(ctx.native_provider_requests().await.len(), 1, "recovery cannot dispatch");
 
         let resume_path = format!("/chat/runs/{run_id}/resume");
@@ -723,7 +722,7 @@ pub async fn run_execution_handoff_resume_reaches_provider_http() {
         let requests = ctx.native_provider_requests().await;
         assert_eq!(requests.len(), 2, "one physical request before and after restart");
         let messages = requests[1].body["messages"].as_array().unwrap();
-        assert_eq!(original.opening.as_ref().unwrap().input().unwrap().original_input, message);
+        assert_eq!(original.opening.loaded().unwrap().unwrap().input().unwrap().original_input, message);
         assert_eq!(requests[0].body["messages"].as_array().unwrap().iter()
             .filter(|m| m["role"] == "user" && m["content"] == message.trim()).count(), 1);
         assert_eq!(messages.iter().filter(|m| m["role"] == "user" && m["content"] == message.trim()).count(), 1);

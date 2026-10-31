@@ -488,13 +488,50 @@ pub trait EventService: Send + Sync {
 pub struct DatabaseEventService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    #[cfg(feature = "e2e-hooks")]
+    retained_write_hook: Option<std::sync::Arc<RetainedWriteTestHook>>,
+}
+
+/// Instance-local, exact-owner/session pause after a real retained INSERT.
+/// Available only to opt-in database tests; it does not replace persistence.
+#[cfg(feature = "e2e-hooks")]
+#[derive(Debug)]
+pub struct RetainedWriteTestHook {
+    pub user_id: String,
+    pub session_id: String,
+    pub inserted: tokio::sync::Notify,
+    pub resume: tokio::sync::Notify,
+    pub fail: bool,
+}
+
+#[cfg(feature = "e2e-hooks")]
+impl RetainedWriteTestHook {
+    pub async fn after_insert(&self, user_id: &str, session_id: &str) -> bool {
+        if self.user_id != user_id || self.session_id != session_id {
+            return false;
+        }
+        self.inserted.notify_one();
+        self.resume.notified().await;
+        self.fail
+    }
 }
 
 impl DatabaseEventService {
+    #[cfg(feature = "e2e-hooks")]
+    pub fn with_retained_write_test_hook(
+        mut self,
+        hook: std::sync::Arc<RetainedWriteTestHook>,
+    ) -> Self {
+        self.retained_write_hook = Some(hook);
+        self
+    }
+
     pub fn new(matrixone: MatrixOneSettings) -> Self {
         Self {
             matrixone,
             pool: None,
+            #[cfg(feature = "e2e-hooks")]
+            retained_write_hook: None,
         }
     }
 
@@ -823,6 +860,13 @@ impl EventService for DatabaseEventService {
             }
             Err(error) => return Err(internal_error(error)),
         };
+
+        #[cfg(feature = "e2e-hooks")]
+        if let Some(hook) = &self.retained_write_hook
+            && hook.after_insert(&user_id, &session_id).await
+        {
+            return Err(internal_error("injected retained event receipt failure"));
+        }
 
         crate::storage::insert_agent_event_edges(
             &mut tx,

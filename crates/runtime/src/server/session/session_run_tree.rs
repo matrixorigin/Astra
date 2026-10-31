@@ -243,7 +243,7 @@ mod tests {
 
     fn run(run_id: &str, status: &str, depth: u32) -> DurableRunRecord {
         DurableRunRecord {
-            opening: None,
+            opening: Default::default(),
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
@@ -264,8 +264,7 @@ mod tests {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: 4,
-            checkpoint_version: None,
-            checkpoint_json: None,
+            current_checkpoint: None,
             error_code: None,
             error_message: None,
 

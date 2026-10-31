@@ -577,7 +577,7 @@ async fn prepare_canonical_terminal(
         let run = stored.run();
         let mut authority = run
             .opening
-            .as_ref()
+            .loaded()?
             .and_then(|opening| opening.context_authority())
             .cloned();
         if let Some(authority) = &mut authority {
@@ -2666,17 +2666,16 @@ mod tests {
     async fn write_retained_fixture(
         pool: astra_core::SharedPool,
         user: String,
-        request: astra_services::DecisionCreateRequestData,
-        hook: Option<Arc<astra_services::decisions::RetainedWriteTestHook>>,
+        request: astra_services::EventCreateRequestData,
+        hook: Option<Arc<astra_services::events::RetainedWriteTestHook>>,
     ) -> Result<(), String> {
-        use astra_services::DecisionService;
         let mut writer =
-            astra_services::DatabaseDecisionService::new(pool.settings().clone()).with_pool(pool);
+            astra_services::DatabaseEventService::new(pool.settings().clone()).with_pool(pool);
         if let Some(hook) = hook {
             writer = writer.with_retained_write_test_hook(hook);
         }
         writer
-            .record_decision(user, request)
+            .create_event(user, request)
             .await
             .map(|_| ())
             .map_err(|error| {
@@ -2692,8 +2691,8 @@ mod tests {
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1 and e2e-hooks"]
-    async fn retained_decision_writer_orders_delete_rollback_and_cancellation_on_live_matrixone() {
-        use astra_services::{ContextService, DecisionCreateRequestData, SessionService};
+    async fn retained_event_writer_orders_delete_rollback_and_cancellation_on_live_matrixone() {
+        use astra_services::SessionService;
         use tokio_util::task::AbortOnDropHandle;
         // The strict-online profile owns the total live-DB test budget.
         // Individual contended operations keep their bounded waits below.
@@ -2733,25 +2732,18 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let snapshot = astra_services::DatabaseContextService::new(settings.clone())
-                .with_pool(observer.clone())
-                .create_snapshot(
-                    user.clone(),
-                    astra_services::SnapshotCreateRequestData {
-                        session_id: session.clone(),
-                        event_id: event.record.event_id,
-                        context_data: json!({"race": outcome}),
-                    },
-                )
-                .await
-                .unwrap();
-            let request = DecisionCreateRequestData {
+            let request = EventCreateRequestData {
+                event_id: None,
                 session_id: session.clone(),
-                event_id: snapshot.event_id.clone(),
-                context_capture_id: snapshot.context_capture_id,
-                decision_type: "retained_race".into(),
-                decision_output: json!({"ok": true}),
-                model_params: None,
+                event_type: "retained_race".into(),
+                content: "{}".into(),
+                ingestion_source: astra_services::EventIngestionSource::Client,
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: Some(event.record.event_id),
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
             };
             if matches!(outcome, "delete_first" | "cancel_admission") {
                 let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
@@ -2800,10 +2792,9 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                    let independent_request = DecisionCreateRequestData {
+                    let independent_request = EventCreateRequestData {
                         session_id: independent_session.clone(),
-                        event_id: event.record.event_id,
-                        context_capture_id: String::new(),
+                        parent_event_id: Some(event.record.event_id),
                         ..request.clone()
                     };
                     tokio::time::timeout(
@@ -2825,7 +2816,7 @@ mod tests {
                             &independent_session
                         )
                         .await,
-                        1
+                        2
                     );
                     // Deleting an unrelated identity must also make progress.
                     tokio::time::timeout(
@@ -2861,7 +2852,7 @@ mod tests {
                     );
                 }
             } else {
-                let hook = Arc::new(astra_services::decisions::RetainedWriteTestHook {
+                let hook = Arc::new(astra_services::events::RetainedWriteTestHook {
                     user_id: user.clone(),
                     session_id: session.clone(),
                     inserted: Notify::new(),
@@ -2912,7 +2903,10 @@ mod tests {
                             .unwrap()
                             .unwrap()
                             .unwrap_err();
-                        assert!(error.contains("model_params"), "{error}");
+                        assert!(
+                            error.contains("injected retained event receipt failure"),
+                            "{error}"
+                        );
                     }
                 }
             }
@@ -2926,15 +2920,6 @@ mod tests {
                         .unwrap();
                     tx.rollback().await.unwrap();
                 }
-                let count: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM ctx_decision_audits WHERE user_id = ? AND session_id = ?",
-                )
-                .bind(&user)
-                .bind(&session)
-                .fetch_one(worker.get())
-                .await
-                .unwrap();
-                assert_eq!(count, 0, "{outcome}/ctx_decision_audits");
                 assert_eq!(
                     assert_session_event_count(worker.get(), &user, &session).await,
                     1
@@ -2948,7 +2933,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     assert_session_event_count(worker.get(), &user, &session).await,
-                    1
+                    2
                 );
             }
             if outcome != "writer_first" {
@@ -2963,7 +2948,7 @@ mod tests {
                     .await
                     .is_err()
             );
-            for table in ["agent_sessions", "ctx_decision_audits"] {
+            for table in ["agent_sessions", "agent_events"] {
                 let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
                 )))

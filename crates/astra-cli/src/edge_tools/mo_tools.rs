@@ -980,8 +980,8 @@ mod tests {
     #[test]
     fn extract_table_from_common_sql() {
         assert_eq!(
-            extract_table_from_sql("SELECT * FROM astra_runtime.ctx_snapshots WHERE id = 1"),
-            Some("astra_runtime.ctx_snapshots".into())
+            extract_table_from_sql("SELECT * FROM astra_runtime.agent_events WHERE id = 1"),
+            Some("astra_runtime.agent_events".into())
         );
         assert_eq!(
             extract_table_from_sql("SELECT col FROM `my_table` LIMIT 5"),

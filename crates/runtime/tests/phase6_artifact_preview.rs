@@ -816,12 +816,9 @@ async fn l2_49d_personal_skill_activation_and_session_delete_are_fenced() {
         "SELECT
             (SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?) AS sessions,
             (SELECT COUNT(*) FROM session_state_items WHERE user_id = ? AND session_id = ?) AS state_items,
-            (SELECT COUNT(*) FROM session_state_item_events WHERE user_id = ? AND session_id = ?) AS state_events,
             (SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?) AS artifacts,
             (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?) AS activation_events",
     )
-    .bind(&user_id)
-    .bind(&session_id)
     .bind(&user_id)
     .bind(&session_id)
     .bind(&user_id)
@@ -835,7 +832,6 @@ async fn l2_49d_personal_skill_activation_and_session_delete_are_fenced() {
     .unwrap();
     assert_eq!(row.try_get::<i64, _>("sessions").unwrap(), 0);
     assert_eq!(row.try_get::<i64, _>("state_items").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 0);
     assert_eq!(row.try_get::<i64, _>("artifacts").unwrap(), 0);
     assert_eq!(row.try_get::<i64, _>("activation_events").unwrap(), 0);
     sqlx::query("DELETE FROM user_skill_versions WHERE owner_user_id = ? AND skill_name = ?")

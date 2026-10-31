@@ -1273,6 +1273,13 @@ async fn concurrent_run_projections_preserve_one_hundred_session_identities() {
         .execute(&b.ctx.pool)
         .await
         .unwrap();
+        sqlx::query("INSERT INTO agent_run_openings (user_id,run_id,session_id) VALUES (?,?,?)")
+            .bind(&b.ctx.user_id)
+            .bind(&run_id)
+            .bind(&session_id)
+            .execute(&b.ctx.pool)
+            .await
+            .unwrap();
     }
     *capture.0.lock().unwrap() = Some(Vec::new());
     for index in 0..100_u32 {
@@ -1319,6 +1326,7 @@ async fn concurrent_run_projections_preserve_one_hundred_session_identities() {
     ).bind(&b.ctx.user_id).bind(format!("{prefix}%")).fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!((rows, tokens), (100, 5050));
     for sql in [
+        "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id LIKE ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id LIKE ?",
         "DELETE FROM agent_sessions WHERE user_id = ? AND session_id LIKE ?",
     ] {

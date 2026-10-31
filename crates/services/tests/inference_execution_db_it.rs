@@ -2593,6 +2593,10 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
             session_id,
         ),
         (
+            "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+            run_id,
+        ),
+        (
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
             run_id,
         ),

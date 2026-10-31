@@ -670,7 +670,10 @@ pub(crate) async fn get_session_transcript_handler(
                 query.reuse_terminal,
             )
             .await
-            .map_err(internal_error)?;
+            .map_err(|error| {
+                tracing::error!(user_id, session_id, %error, "conversation history read failed");
+                internal_error("Conversation history could not be loaded.")
+            })?;
         return Ok(Json(TranscriptReadResponse::Conversation(Box::new(
             super::conversation::ConversationResponse {
                 kind: "conversation",

@@ -395,27 +395,6 @@ impl DatabaseStateProjectionStore {
             entity: skill_name.to_string(),
             source,
         })?;
-        sqlx::query(
-            "INSERT INTO session_state_item_events
-             (event_id, item_id, user_id, session_id, category, item_key, mutation, next_hash,
-              payload_json, provenance_event_id, created_at)
-             VALUES (?, ?, ?, ?, 'active_skill', ?, 'activate', ?, ?, ?, NOW(6))",
-        )
-        .bind(new_state_item_event_id())
-        .bind(&item_id)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(skill_name)
-        .bind(&payload_hash)
-        .bind(&payload_json)
-        .bind(&event_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "insert_skill_activation_state_event",
-            entity: skill_name.to_string(),
-            source,
-        })?;
         tx.commit()
             .await
             .map_err(|source| StateProjectionError::Database {
@@ -431,10 +410,6 @@ impl DatabaseStateProjectionStore {
 fn content_hash(content: &str) -> String {
     let digest = Sha256::digest(content.as_bytes());
     format!("sha256:{digest:x}")
-}
-
-fn new_state_item_event_id() -> String {
-    Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]

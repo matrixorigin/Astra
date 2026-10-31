@@ -250,7 +250,7 @@ async fn insert_state_item(
 
 fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRecord {
     DurableRunRecord {
-        opening: None,
+        opening: Default::default(),
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
@@ -271,8 +271,7 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         owner_lease_expires_at: None,
         run_generation: 0,
         last_event_idx: -1,
-        checkpoint_version: None,
-        checkpoint_json: None,
+        current_checkpoint: None,
         error_code: None,
         error_message: None,
 
@@ -818,6 +817,7 @@ async fn cleanup_joint_run(pool: &SharedPool, user_id: &str, run_id: &str) {
     for sql in [
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
     ] {
         sqlx::query(sql)
@@ -1547,25 +1547,6 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     .execute(pool.get())
     .await
     .expect("S07 approval condition update must persist");
-    for condition in [
-        "target_branch == main",
-        "target_branch == main AND tests_green == true",
-    ] {
-        sqlx::query(
-            "INSERT INTO session_state_item_events
-             (event_id, item_id, user_id, session_id, category, item_key, mutation, payload_json, created_at)
-             VALUES (?, ?, ?, ?, 'approval_state', 'release-approval', 'apply_suggestion', ?, NOW(6))",
-        )
-        .bind(id("state-event"))
-        .bind(&approval_item)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(json!({"condition": condition, "approval_id": approval_id}).to_string())
-        .execute(pool.get())
-        .await
-        .expect("S07 approval condition event chain must persist");
-    }
-
     post_user_intent(
         &client,
         addr,

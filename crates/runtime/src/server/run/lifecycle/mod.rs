@@ -5745,9 +5745,9 @@ pub struct AgenticRunLifecycleService {
     /// during test/deployment composition.
     /// Shared metrics registry for capacity/admission signals exposed via /metrics.
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    /// Harness sink registry for server-side harness observation (Phase 2A).
+    /// Enable the existing verifier kernel with a bounded per-Run observation sink.
     #[cfg(feature = "harness")]
-    harness_registry: Option<crate::server::harness::handlers::HarnessSinkRegistry>,
+    harness_observation_enabled: bool,
     /// Shared background session-memory extraction coordinator. Cloned
     /// into every `AgenticLoopState` the service builds, so all turns
     /// share selector cooldown, in-flight dedup, event sink, and
@@ -5857,7 +5857,7 @@ impl AgenticRunLifecycleService {
                 .expect("per-owner weighted admission limits fit global limits"),
             metrics_registry: None,
             #[cfg(feature = "harness")]
-            harness_registry: None,
+            harness_observation_enabled: false,
             memory_extraction_service: None,
             tool_execution_service: None,
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
@@ -6048,11 +6048,8 @@ impl AgenticRunLifecycleService {
     }
 
     #[cfg(feature = "harness")]
-    pub fn with_harness_registry(
-        mut self,
-        registry: crate::server::harness::handlers::HarnessSinkRegistry,
-    ) -> Self {
-        self.harness_registry = Some(registry);
+    pub fn with_harness_observation(mut self) -> Self {
+        self.harness_observation_enabled = true;
         self
     }
 
@@ -11750,23 +11747,10 @@ impl AgenticRunLifecycleService {
 
         // Create harness sink early so sub-run executors can share it.
         #[cfg(feature = "harness")]
-        let (harness_server_sink, harness_sink_arc): (
-            Option<std::sync::Arc<crate::server::harness::server_sink::ServerSnapshotSink>>,
-            Option<std::sync::Arc<dyn astra_harness::SnapshotSink>>,
-        ) = if self.harness_registry.is_some() {
-            let mut raw_sink = crate::server::harness::server_sink::ServerSnapshotSink::new(
-                session_id.to_string(),
-                String::new(),
-            );
-            if let Some(ref pool) = self.shared_pool {
-                raw_sink = raw_sink.with_pool(pool.get().clone());
-            }
-            let concrete = std::sync::Arc::new(raw_sink);
-            let dyn_sink = concrete.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>;
-            (Some(concrete), Some(dyn_sink))
-        } else {
-            (None, None)
-        };
+        let harness_sink_arc = self.harness_observation_enabled.then(|| {
+            astra_harness::InMemorySnapshotSink::arc()
+                as std::sync::Arc<dyn astra_harness::SnapshotSink>
+        });
 
         // Build the server-side skill fork executor so skills with
         // execution_context: Fork can run in isolated sub-agent loops.
@@ -11871,12 +11855,7 @@ impl AgenticRunLifecycleService {
             harness: {
                 #[cfg(feature = "harness")]
                 {
-                    if let (Some(registry), Some(server_sink), Some(sink_arc)) = (
-                        &self.harness_registry,
-                        harness_server_sink,
-                        harness_sink_arc,
-                    ) {
-                        let broadcaster_tx = server_sink.broadcaster_sender();
+                    if let Some(sink_arc) = harness_sink_arc {
                         // The agentic loop is the sole owner of execution
                         // budget.  Its current `max_turns` can move within a
                         // bounded, runtime-owned recovery/settlement contract
@@ -11893,19 +11872,10 @@ impl AgenticRunLifecycleService {
                         let kernel = std::sync::Arc::new(
                             astra_harness::StandardKernel::configured(sink_arc.clone(), limits),
                         );
-                        registry.register_with_broadcast(
-                            session_id.to_string(),
-                            sink_arc.clone(),
-                            broadcaster_tx,
-                        );
-                        let mut slot = crate::turn::harness_adapter::HarnessSlot::new(
+                        crate::turn::harness_adapter::HarnessSlot::new(
                             kernel as std::sync::Arc<dyn astra_harness::HarnessKernel>,
                             sink_arc,
-                        );
-                        slot.registry = Some(registry.clone());
-                        slot.session_id_for_cleanup = Some(session_id.to_string());
-                        slot.server_sink = Some(server_sink);
-                        slot
+                        )
                     } else {
                         crate::turn::harness_adapter::HarnessSlot::empty()
                     }
@@ -15688,10 +15658,6 @@ impl AgenticRunLifecycleService {
             if let Some(admission) = canonical_turn.as_ref() {
                 state.initialize_provider_canonical_wal_base(&admission.prior_messages);
             }
-            // Inject user_id into the harness sink used by DB-persistence tests.
-            #[cfg(feature = "harness")]
-            state.harness.set_user_id(&user_id);
-
             if let Some(admission) = canonical_turn.as_ref()
                 && admission.had_canonical_head
             {

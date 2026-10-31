@@ -25,7 +25,6 @@
 
 mod harness;
 mod journey_admin_smoke_matrix;
-mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
 mod journey_extended;
 mod journey_full;
@@ -293,11 +292,6 @@ matrix_test! {
     e2e_matrix_session_artifact_latest_tiebreaker, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_session_artifacts_matrix::run_session_artifact_latest_route_uses_stable_tiebreaker
-}
-matrix_test! {
-    e2e_matrix_context_decision_chain, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_context_decision_chain_matrix::run_context_decision_chain_db
 }
 matrix_test! {
     e2e_matrix_models, 2,

@@ -6735,7 +6735,6 @@ pub(crate) mod tests {
                 overall: "fresh".to_string(),
                 source: "test".to_string(),
                 events: 0,
-                decisions: 0,
                 providers: Default::default(),
                 warnings: Vec::new(),
             };

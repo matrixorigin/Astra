@@ -1844,7 +1844,8 @@ where
     )
     .await
     .map_err(|error| match error {
-        crate::runs::ExecutionHandoffReferenceError::Rejected(reason) => {
+        crate::runs::ExecutionHandoffReferenceError::Rejected(reason)
+        | crate::runs::ExecutionHandoffReferenceError::Corrupt(reason) => {
             SessionHandoffError::Invalid(reason.into())
         }
         crate::runs::ExecutionHandoffReferenceError::Unavailable(error) => {
@@ -2642,6 +2643,7 @@ mod tests {
 
     async fn cleanup(pool: &SharedPool, key: &SessionKeyV1) {
         for table in [
+            "agent_run_openings",
             "run_checkpoints",
             "tool_invocation_ledger",
             "agent_run_events",
@@ -3376,6 +3378,15 @@ mod tests {
         .execute(pool.get())
         .await
         .expect("insert competing execution");
+        sqlx::query(
+            "INSERT INTO agent_run_openings (user_id, run_id, session_id) VALUES (?, ?, ?)",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&competing_run)
+        .bind(&key.session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
         assert!(matches!(
             service.transition_handoff(&checkpoint_request).await,
             Err(SessionHandoffError::Invalid(_))
@@ -3533,6 +3544,9 @@ mod tests {
                     sqlx::query("INSERT INTO agent_runs (run_id, user_id, session_id, root_run_id, ancestor_path, depth, status) VALUES (?, ?, ?, ?, ?, 0, 'paused')")
                         .bind(&parent).bind(&key.owner_user_id).bind(&key.session_id).bind(&parent).bind(&parent)
                         .execute(pool.get()).await.unwrap();
+                    sqlx::query("INSERT INTO agent_run_openings (user_id, run_id, session_id) VALUES (?, ?, ?)")
+                        .bind(&key.owner_user_id).bind(&parent).bind(&key.session_id)
+                        .execute(pool.get()).await.unwrap();
                     sqlx::query("UPDATE agent_runs SET parent_run_id = ?, root_run_id = ?, ancestor_path = ?, depth = 1 WHERE user_id = ? AND run_id = ?")
                         .bind(&parent).bind(&parent).bind(format!("{parent}/{competing_run}"))
                         .bind(&key.owner_user_id).bind(&competing_run).execute(pool.get()).await.unwrap();
@@ -3569,8 +3583,8 @@ mod tests {
                 assert_eq!(recovered.run.status, "paused");
                 assert_eq!(recovered.run.run_generation, 4);
                 assert_eq!(
-                    recovered.run.checkpoint_json.as_deref(),
-                    Some(next_payload.as_str())
+                    recovered.run.current_checkpoint.as_ref().unwrap().hash,
+                    format!("{:x}", Sha256::digest(next_payload.as_bytes()))
                 );
                 assert!(
                     store

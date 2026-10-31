@@ -475,11 +475,10 @@ mod tests {
     fn project_events(events: &[super::super::EvidenceEvent]) -> ReflectReport {
         use super::super::{ReflectRequest, SessionOverview};
         let (graph, budget) = super::super::budget_reflect_evidence_graph(
-            super::super::build_evidence_graph(&[], events, &Default::default()),
+            super::super::build_evidence_graph(events, &Default::default()),
         );
         let overview = SessionOverview {
             total_events: events.len() as i64,
-            total_decisions: 0,
             duration_minutes: None,
             unique_skills_used: 0,
             error_count: 0,
@@ -533,7 +532,7 @@ mod tests {
             "topic":"overview","facet":"overview","depth":depth,"horizon":"session",
             "source_policy":"auto","include_context":false,"summary":text,
             "model_requests":{"coverage":"not_captured","records_observed":0,"accepted_records_observed":0},
-            "data_coverage":{"overall":"fresh","source":"test","events":60,"decisions":0},
+            "data_coverage":{"overall":"fresh","source":"test","events":60},
             "observations":observations,"evidence":evidence,
             "action_hints":[{"target_type":"tool","summary":text,"confidence":{},"observation_refs":["obs-59"]}],
             "graph_slice":{"nodes":nodes,"edges":[]}

@@ -1779,7 +1779,7 @@ async fn exercise_primary_continuation_entry(
         assert_eq!(count, 1, "continuation must not duplicate delivered work");
         // Both the compacted turn and its restored successor keep real Work
         // authority without manufacturing answer-derived decisions or summaries.
-        for table in ["session_state_items", "session_state_item_events"] {
+        for table in ["session_state_items"] {
             let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ? \
                  AND category IN ('decision', 'summary')"
@@ -1791,15 +1791,6 @@ async fn exercise_primary_continuation_entry(
             .expect("count answer-derived projections");
             assert_eq!(count, 0, "continuation must not invent {table}");
         }
-        let audits: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM ctx_decision_audits WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(owner)
-        .bind(session)
-        .fetch_one(pool.get())
-        .await
-        .expect("count synthetic decision audits");
-        assert_eq!(audits, 0);
         created.push(run.run_id);
     }
     for run in created {
@@ -8836,6 +8827,157 @@ fn server_subrun_budget_exhaustion_preserves_reason_without_leaving_child_paused
 }
 
 #[test]
+fn server_lifecycle_harness_wiring_keeps_bounded_history_and_enforcement() {
+    let service = test_service();
+    let request = test_request("inspect Server harness wiring");
+    let disabled =
+        service.build_initial_state("user", &request, "session", "run", None, None, None);
+    #[cfg(feature = "harness")]
+    {
+        use crate::turn::harness_adapter::harness_fire;
+        use astra_harness::{HookPoint, HookVerdict};
+        assert!(disabled.harness.kernel.is_none());
+        assert!(disabled.harness.sink.is_none());
+        let service = service.with_harness_observation();
+        let mut enabled =
+            service.build_initial_state("user", &request, "session", "run", None, None, None);
+        let sink = enabled
+            .harness
+            .sink
+            .as_ref()
+            .expect("Server observation sink");
+        for _ in 0..70 {
+            assert!(matches!(
+                harness_fire(&enabled.harness, HookPoint::PostTurn, &enabled),
+                HookVerdict::Continue
+            ));
+        }
+        assert_eq!(sink.history(100).len(), 64);
+        // The actual configured Completion verifier rejects empty success.
+        assert!(matches!(
+            harness_fire(&enabled.harness, HookPoint::SessionEnd, &enabled),
+            HookVerdict::Block { .. }
+        ));
+        assert!(!sink.latest().unwrap().has_final_text);
+        enabled.final_text = "late output after terminal".into();
+        assert!(matches!(
+            harness_fire(&enabled.harness, HookPoint::SessionEnd, &enabled),
+            HookVerdict::Continue
+        ));
+        assert!(
+            !sink.latest().unwrap().has_final_text,
+            "duplicate terminal must not publish later state"
+        );
+        assert_eq!(sink.history(100).len(), 64);
+    }
+    #[cfg(not(feature = "harness"))]
+    assert_eq!(std::mem::size_of_val(&disabled.harness), 0);
+}
+
+#[cfg(all(feature = "harness", feature = "e2e-hooks"))]
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost fixture"]
+async fn server_lifecycle_skill_fork_publishes_to_the_parent_harness_sink() {
+    use astra_services::SessionService;
+    use astra_skills::{
+        manifest::{ExecutionContext, LoadedSkill, SkillManifest},
+        traits::SkillExecutionContext,
+    };
+    let llm = spawn_terminal_test_llm().await;
+    let pool = setup_lifecycle_run_db_it().await;
+    let user = format!("harness-parent-{}", Uuid::new_v4());
+    let session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let bindings = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    );
+    let service = db_backed_test_service(&pool, "harness-parent")
+        .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())))
+        .with_harness_observation();
+    let execution = astra_services::AdmittedModelExecution::from_offering(
+        test_resolved_model_offering_at(&llm.base_url),
+    )
+    .unwrap();
+    start_model_bound_test_parent(&service.run_engine, &run, &user, &session, &execution).await;
+    let parent = service
+        .run_engine
+        .load_run(&user, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut request = test_request("Explain the supplied facts without making changes.");
+    request.admitted_model_execution = Some(execution);
+    let state = service
+        .build_initial_state_inner(
+            &user,
+            &request,
+            &session,
+            &run,
+            Some(workspace.path()),
+            Some(&bindings),
+            None,
+            None,
+            None,
+            RequestConstraints::default(),
+            &EdgeContext::default(),
+            None,
+            &PreparedRuntimeCapabilities::default(),
+            Some(parent.run_generation),
+        )
+        .unwrap();
+    let sink = state.harness.sink.as_ref().unwrap();
+    assert!(sink.history(64).is_empty());
+    let skill = LoadedSkill {
+        manifest: SkillManifest {
+            name: "explanation".into(),
+            execution_context: ExecutionContext::Fork,
+            ..Default::default()
+        },
+        instructions: "Explain only; do not modify files.".into(),
+        instruction_tokens: 8,
+        resources: None,
+        skill_dir: None,
+    };
+    let context = SkillExecutionContext {
+        task: request.message,
+        arguments: HashMap::from([
+            ("__astra_invocation_id".into(), "fork-call".into()),
+            (
+                "__astra_expected_control_epoch".into(),
+                parent.last_event_idx.to_string(),
+            ),
+            ("__astra_parent_turn_chain_id".into(), "parent-chain".into()),
+        ]),
+        recursion_depth: 0,
+    };
+    let result = state
+        .skills
+        .executor
+        .as_ref()
+        .unwrap()
+        .execute(&skill, &context)
+        .await
+        .unwrap();
+    assert!(result.success, "{:?}", result.error_category);
+    assert!(result.output.lines().any(|line| line == "done"));
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 1);
+    assert!(
+        sink.history(64)
+            .iter()
+            .any(|snapshot| { snapshot.session_id == session && snapshot.has_final_text }),
+        "a real child must publish into the sink created by parent lifecycle assembly"
+    );
+    astra_services::DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .delete_session(session, user)
+        .await
+        .unwrap();
+}
+
+#[test]
 fn server_subrun_nonresumable_interruption_is_failed_not_completed() {
     let svc = test_service();
     let request = test_request("subrun blocked by fatal harness verdict");
@@ -11892,7 +12034,7 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
                 .await
                 .unwrap()
                 .unwrap();
-            let opening = stored.opening.as_ref().unwrap().input().unwrap();
+            let opening = stored.opening.loaded().unwrap().unwrap().input().unwrap();
             assert_eq!(
                 opening.original_input, request.message,
                 "original input must survive before workspace/provider work"
@@ -11948,6 +12090,7 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
             ("session_transcript_items", "user_id"),
             ("agent_events", "user_id"),
             ("agent_run_events", "user_id"),
+            ("agent_run_openings", "user_id"),
             ("agent_runs", "user_id"),
             ("agent_sessions", "user_id"),
         ] {
@@ -12523,6 +12666,7 @@ async fn cleanup_lifecycle_run_fixture(pool: &SharedPool, user_id: &str, run_id:
     for sql in [
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
     ] {
         let _ = sqlx::query(sql)
@@ -28225,7 +28369,7 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
         .map(|i| json!({"event_type": "tool_call_end", "data": {"seq": i}}))
         .collect();
     let mut run = DurableRunRecord {
-        opening: None,
+        opening: Default::default(),
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
@@ -28246,8 +28390,7 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
         owner_lease_expires_at: None,
         run_generation: 0,
         last_event_idx: 449,
-        checkpoint_version: None,
-        checkpoint_json: None,
+        current_checkpoint: None,
         error_code: None,
         error_message: None,
 
@@ -37015,8 +37158,10 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
     // Use valid admitted bytes; this is fixture population, not a second opening encoder.
     for index in 0..205 {
         let id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status, opening_events_json, opening_context_json, opening_hash, created_at) SELECT user_id, ?, ?, ?, ?, 'failed', opening_events_json, opening_context_json, opening_hash, DATE_ADD('2026-02-01', INTERVAL ? SECOND) FROM agent_runs WHERE user_id = ? AND run_id = ?")
+        sqlx::query("INSERT INTO agent_runs (user_id, session_id, run_id, root_run_id, ancestor_path, status, opening_hash, created_at) SELECT user_id, ?, ?, ?, ?, 'failed', opening_hash, DATE_ADD('2026-02-01', INTERVAL ? SECOND) FROM agent_runs WHERE user_id = ? AND run_id = ?")
             .bind(&session).bind(&id).bind(&id).bind(&id).bind(index).bind(&user).bind(&template).execute(pool.get()).await.unwrap();
+        sqlx::query("INSERT INTO agent_run_openings (user_id,session_id,run_id,opening_events_json,opening_context_json) SELECT user_id,?,?,opening_events_json,opening_context_json FROM agent_run_openings WHERE user_id = ? AND run_id = ?")
+            .bind(&session).bind(&id).bind(&user).bind(&template).execute(pool.get()).await.unwrap();
     }
     // Exercise the actual authenticated handler and Axum's HTTP serializer,
     // including the selected input larger than the historical byte budget.
@@ -37292,8 +37437,10 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
     let error = "错误\n".repeat(2000);
     let receipt =
         json!({"receipt":{"transcript":{"assistant_source_event_id":"old-terminal"}}}).to_string();
-    sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status,opening_events_json,opening_context_json,opening_hash,error_message,error_code,terminal_receipt_json,created_at) SELECT user_id,?,?,?,?, 'failed',opening_events_json,opening_context_json,opening_hash,?,'stream_transport',?,'2025-01-01' FROM agent_runs WHERE user_id = ? AND run_id = ?")
+    sqlx::query("INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,ancestor_path,status,opening_hash,error_message,error_code,terminal_receipt_json,created_at) SELECT user_id,?,?,?,?, 'failed',opening_hash,?,'stream_transport',?,'2025-01-01' FROM agent_runs WHERE user_id = ? AND run_id = ?")
         .bind(&session).bind(&old).bind(&old).bind(&old).bind(&error).bind(&receipt).bind(&user).bind(&template).execute(pool.get()).await.unwrap();
+    sqlx::query("INSERT INTO agent_run_openings (user_id,session_id,run_id,opening_events_json,opening_context_json) SELECT user_id,?,?,opening_events_json,opening_context_json FROM agent_run_openings WHERE user_id = ? AND run_id = ?")
+        .bind(&session).bind(&old).bind(&user).bind(&template).execute(pool.get()).await.unwrap();
     sqlx::query("INSERT INTO session_transcript_items (user_id,session_id,item_seq,run_id,role,content,content_hash,source_event_id) VALUES (?,?,210,?,'assistant','old partial answer','fixture','old-terminal')")
         .bind(&user).bind(&session).bind(&old).execute(pool.get()).await.unwrap();
     let (_, items, _, truncated, _) = read_conversation(&pool, &user, &session, 200, None, false)

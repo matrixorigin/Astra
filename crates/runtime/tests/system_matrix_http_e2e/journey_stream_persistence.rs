@@ -3489,11 +3489,7 @@ async fn stream_context_trace_and_restore(continuation_race: bool) {
     )
     .await;
     assert_eq!(full_status, StatusCode::OK);
-    for table in [
-        "session_state_items",
-        "session_state_item_events",
-        "ctx_decision_audits",
-    ] {
+    for table in ["session_state_items"] {
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
         )))

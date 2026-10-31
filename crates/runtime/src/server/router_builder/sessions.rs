@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<AppState> {
+pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/sessions",
@@ -154,10 +154,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             "/sessions/{session_id}/artifacts/{artifact_id}/download",
             get(session::session_handlers::download_session_artifact_handler),
         )
-        .nest(
-            "/sessions/{session_id}/harness",
-            harness_routes(state.clone()),
-        )
         .route(
             "/sessions/{session_id}/audit/summary",
             get(audit_handlers::audit_summary_handler),
@@ -202,32 +198,4 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             "/audit/promotions",
             get(audit_handlers::cross_session_runtime_promotions_handler),
         )
-}
-
-#[cfg(feature = "harness")]
-fn harness_routes(state: AppState) -> Router<AppState> {
-    use axum::routing::get;
-    Router::new()
-        .route(
-            "/snapshot",
-            get(crate::server::harness::handlers::get_harness_snapshot),
-        )
-        .route(
-            "/history",
-            get(crate::server::harness::handlers::get_harness_history),
-        )
-        .route(
-            "/diff",
-            get(crate::server::harness::handlers::get_harness_diff),
-        )
-        .route(
-            "/stream",
-            get(crate::server::harness::handlers::stream_harness_snapshots),
-        )
-        .with_state(state)
-}
-
-#[cfg(not(feature = "harness"))]
-fn harness_routes(_state: AppState) -> Router<AppState> {
-    Router::new()
 }

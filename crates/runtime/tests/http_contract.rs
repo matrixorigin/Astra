@@ -222,6 +222,26 @@ async fn retired_database_mutation_routes_cannot_execute_through_http() {
     let app = build_test_app(true);
     let payload = serde_json::json!({"name":"fixture_branch","source":"fixture_source","target":"fixture_target","operation":"merge","model":"fixture_model","session_count":2,"checkpoint_name":"fixture_checkpoint"});
     for (method, path) in [
+        ("GET", "/context"),
+        ("POST", "/context"),
+        ("GET", "/context/snapshot"),
+        ("GET", "/decisions"),
+        ("POST", "/decisions"),
+        ("GET", "/decisions/decision"),
+        ("GET", "/decisions/decision/audit"),
+        ("GET", "/introspection/context/trend?session_id=fixture"),
+        ("GET", "/introspection/context/snapshot?session_id=fixture"),
+        (
+            "GET",
+            "/introspection/context/retrieval_quality?session_id=fixture",
+        ),
+        ("GET", "/introspection/decision-trace?session_id=fixture"),
+        ("GET", "/sessions/fixture/harness/snapshot"),
+        ("GET", "/sessions/fixture/harness/history"),
+        ("GET", "/sessions/fixture/harness/diff"),
+        ("GET", "/sessions/fixture/harness/stream"),
+        ("GET", "/admin/harness/sessions"),
+        ("POST", "/skills/user/review_changes/evaluations"),
         ("POST", "/branches"),
         ("DELETE", "/branches"),
         ("POST", "/branches/diff"),

@@ -59,20 +59,8 @@ pub struct RetrievalQualityQuery {
     pub turns: i32,
 }
 
-// ── P2.1: LLM-facing introspection (decision trace / tool history / drift) ──
-
-fn default_decision_trace_last_n() -> i32 {
-    20
-}
 fn default_tool_history_window_hours() -> i32 {
     24
-}
-
-#[derive(Deserialize)]
-pub struct DecisionTraceQuery {
-    pub session_id: String,
-    #[serde(default = "default_decision_trace_last_n")]
-    pub last_n: i32,
 }
 
 #[derive(Deserialize)]
@@ -97,70 +85,6 @@ pub async fn get_skills_introspection_handler(
     let resp = state
         .introspection_service
         .get_skills_introspection(&user.user_id)
-        .await?;
-    Ok(Json(resp))
-}
-
-pub async fn get_context_trend_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<ContextTrendQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let resp = state
-        .introspection_service
-        .get_context_trend(
-            &user.user_id,
-            &params.session_id,
-            params.turns,
-            params.context_window,
-        )
-        .await?;
-    Ok(Json(resp))
-}
-
-pub async fn get_context_snapshot_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<ContextSnapshotQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let resp = state
-        .introspection_service
-        .get_context_snapshot(
-            &user.user_id,
-            &params.session_id,
-            params.turn_index,
-            params.detail,
-            params.raw,
-            params.raw_token_budget,
-        )
-        .await?;
-    Ok(Json(resp))
-}
-
-pub async fn get_retrieval_quality_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<RetrievalQualityQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let resp = state
-        .introspection_service
-        .get_retrieval_quality(&user.user_id, &params.session_id, params.turns)
-        .await?;
-    Ok(Json(resp))
-}
-
-pub async fn get_decision_trace_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<DecisionTraceQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let resp = state
-        .introspection_service
-        .get_decision_trace(&user.user_id, &params.session_id, params.last_n)
         .await?;
     Ok(Json(resp))
 }
@@ -201,39 +125,6 @@ mod tests {
         assert_eq!(default_context_window(), 200000);
         assert_eq!(default_retrieval_turns(), 5);
         assert_eq!(default_raw_token_budget(), 2000);
-    }
-
-    #[test]
-    fn context_trend_query_defaults() {
-        let json = r#"{"session_id": "s1"}"#;
-        let q: ContextTrendQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.session_id, "s1");
-        assert_eq!(q.turns, 10);
-        assert_eq!(q.context_window, 200000);
-    }
-
-    #[test]
-    fn context_snapshot_query_defaults() {
-        let json = r#"{"session_id": "s1"}"#;
-        let q: ContextSnapshotQuery = serde_json::from_str(json).unwrap();
-        assert!(!q.detail);
-        assert!(!q.raw);
-        assert_eq!(q.raw_token_budget, 2000);
-        assert!(q.turn_index.is_none());
-    }
-
-    #[test]
-    fn retrieval_quality_query_defaults() {
-        let json = r#"{"session_id": "s1"}"#;
-        let q: RetrievalQualityQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.turns, 5);
-    }
-
-    #[test]
-    fn decision_trace_query_defaults() {
-        let q: DecisionTraceQuery = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
-        assert_eq!(q.session_id, "s1");
-        assert_eq!(q.last_n, 20);
     }
 
     #[test]

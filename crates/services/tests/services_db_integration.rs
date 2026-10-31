@@ -31,18 +31,16 @@ use astra_services::session_workspace::{
     to_remote_artifact_record,
 };
 use astra_services::{
-    AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, ContextService,
-    DatabaseAdminAuditReader, DatabaseContextService, DatabaseDecisionService,
+    AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, DatabaseAdminAuditReader,
     DatabaseEventService, DatabaseIntrospectionService, DatabaseMarketplaceService,
     DatabasePersonalSkillStore, DatabaseReflectService, DatabaseSessionArtifactStore,
     DatabaseSessionContextCoordinator, DatabaseSessionService, DatabaseSkillService,
-    DatabaseStateProjectionStore, DecisionCreateRequestData, DecisionListFilter, DecisionService,
-    EventCreateRequestData, EventListFilter, EventService, IntrospectionService,
-    MAX_API_LIST_LIMIT, MarketplaceService, ReflectService, ReserveTurnOutcome,
-    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
-    SessionArtifactStore, SessionArtifactStoreError, SessionContextCoordinator,
-    SessionContextCoordinatorError, SessionListFilter, SessionService, SkillService,
-    SnapshotCreateRequestData, SnapshotListFilter, SubmitUserSkillVersion,
+    DatabaseStateProjectionStore, EventCreateRequestData, EventListFilter, EventService,
+    IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, ReflectService,
+    ReserveTurnOutcome, SessionArtifactJsonStore, SessionArtifactReference,
+    SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
+    SessionContextCoordinator, SessionContextCoordinatorError, SessionListFilter, SessionService,
+    SkillService, SubmitUserSkillVersion,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
@@ -817,7 +815,6 @@ async fn cleanup_session_bundle(
     session_id_2: &str,
     user_id: &str,
     event_ids: &[String],
-    decision_ids: &[String],
     audit_ids: &[String],
 ) {
     for eid in event_ids {
@@ -836,20 +833,6 @@ async fn cleanup_session_bundle(
             .execute(pool)
             .await;
     }
-    for did in decision_ids {
-        let _ =
-            sqlx::query("DELETE FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?")
-                .bind(did)
-                .bind(user_id)
-                .execute(pool)
-                .await;
-    }
-    let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE user_id = ? AND session_id IN (?, ?)")
-        .bind(user_id)
-        .bind(session_id)
-        .bind(session_id_2)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM skill_installations WHERE user_id = ?")
         .bind(user_id)
         .execute(pool)
@@ -1133,7 +1116,7 @@ async fn unpublish_skill_is_owner_bound_for_same_name_versions() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn events_sessions_decisions_admin_and_marketplace_installed_pagination() {
+async fn events_sessions_admin_and_marketplace_installed_pagination() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -1143,18 +1126,12 @@ async fn events_sessions_decisions_admin_and_marketplace_installed_pagination() 
     let e1 = Uuid::new_v4().to_string();
     let e2 = Uuid::new_v4().to_string();
     let e3 = Uuid::new_v4().to_string();
-    let snapshot_id = Uuid::new_v4().to_string();
-    let snapshot_id_2 = Uuid::new_v4().to_string();
-    let snapshot_id_3 = Uuid::new_v4().to_string();
     let installation_id = Uuid::new_v4().to_string();
     let installation_id_2 = Uuid::new_v4().to_string();
     let installation_id_3 = Uuid::new_v4().to_string();
     let skill_name = format!("skill-{}", Uuid::new_v4());
     let skill_name_2 = format!("skill-{}", Uuid::new_v4());
     let skill_name_3 = format!("skill-{}", Uuid::new_v4());
-    let decision_id = Uuid::new_v4().to_string();
-    let decision_id_2 = Uuid::new_v4().to_string();
-    let decision_id_3 = Uuid::new_v4().to_string();
     let a0 = Uuid::new_v4().to_string();
     let a1 = Uuid::new_v4().to_string();
     let a2 = Uuid::new_v4().to_string();
@@ -1170,11 +1147,6 @@ async fn events_sessions_decisions_admin_and_marketplace_installed_pagination() 
         activity_id_3.clone(),
     ];
     let event_ids = vec![e1.clone(), e2.clone(), e3.clone()];
-    let decision_ids = vec![
-        decision_id.clone(),
-        decision_id_2.clone(),
-        decision_id_3.clone(),
-    ];
 
     cleanup_session_bundle(
         &pool,
@@ -1182,7 +1154,6 @@ async fn events_sessions_decisions_admin_and_marketplace_installed_pagination() 
         &session_id_2,
         &user_id,
         &event_ids,
-        &decision_ids,
         &audit_ids,
     )
     .await;
@@ -1317,135 +1288,6 @@ async fn events_sessions_decisions_admin_and_marketplace_installed_pagination() 
         vec![e2.as_str()]
     );
     assert!(second_session_page.next_cursor.is_none());
-
-    for (capture_id, event_id, ts) in [
-        (&snapshot_id, &e1, "2026-05-01 10:00:00.000000"),
-        (&snapshot_id_2, &e2, "2026-05-01 12:00:00.000000"),
-        (&snapshot_id_3, &e3, "2026-05-01 11:00:00.000000"),
-    ] {
-        sqlx::query(
-            "INSERT INTO ctx_snapshots \
-             (context_capture_id, user_id, session_id, event_id, context_data, created_at) \
-             VALUES (?, ?, ?, ?, CAST('{\"kind\":\"it\"}' AS JSON), ?)",
-        )
-        .bind(capture_id)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(ts)
-        .execute(&pool)
-        .await
-        .expect("insert snapshot");
-    }
-
-    let ctx_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
-    let first_snapshot_page = ctx_service
-        .list_snapshots(SnapshotListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            limit: 2,
-            cursor: None,
-        })
-        .await
-        .expect("list first snapshot page");
-    assert_eq!(
-        first_snapshot_page
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.context_capture_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![snapshot_id_2.as_str(), snapshot_id_3.as_str()]
-    );
-    let second_snapshot_page = ctx_service
-        .list_snapshots(SnapshotListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            limit: 2,
-            cursor: first_snapshot_page.next_cursor.clone(),
-        })
-        .await
-        .expect("list second snapshot page");
-    assert_eq!(
-        second_snapshot_page
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.context_capture_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![snapshot_id.as_str()]
-    );
-    assert!(second_snapshot_page.next_cursor.is_none());
-
-    for (did, event_id, ts) in [
-        (&decision_id, &e1, "2026-05-01 10:00:00.000000"),
-        (&decision_id_2, &e2, "2026-05-01 12:00:00.000000"),
-        (&decision_id_3, &e3, "2026-05-01 11:00:00.000000"),
-    ] {
-        sqlx::query(
-            "INSERT INTO ctx_decision_audits \
-             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, created_at) \
-             VALUES (?, ?, ?, ?, 'cc', 'it_dec', CAST('{}' AS JSON), CAST('{}' AS JSON), ?)",
-        )
-        .bind(did)
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(ts)
-        .execute(&pool)
-        .await
-        .expect("insert decision");
-    }
-
-    let dec = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
-    let dlist = dec
-        .list_decisions(DecisionListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            decision_type: None,
-            limit: 99_999,
-            cursor: None,
-        })
-        .await
-        .expect("list_decisions");
-    assert_eq!(dlist.limit, MAX_API_LIST_LIMIT);
-    assert_eq!(dlist.decisions.len(), 3);
-
-    let first_decision_page = dec
-        .list_decisions(DecisionListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            decision_type: None,
-            limit: 2,
-            cursor: None,
-        })
-        .await
-        .expect("list first decision page");
-    assert_eq!(
-        first_decision_page
-            .decisions
-            .iter()
-            .map(|decision| decision.decision_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![decision_id_2.as_str(), decision_id_3.as_str()]
-    );
-    let second_decision_page = dec
-        .list_decisions(DecisionListFilter {
-            user_id: user_id.clone(),
-            session_id: None,
-            decision_type: None,
-            limit: 2,
-            cursor: first_decision_page.next_cursor.clone(),
-        })
-        .await
-        .expect("list second decision page");
-    assert_eq!(
-        second_decision_page
-            .decisions
-            .iter()
-            .map(|decision| decision.decision_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![decision_id.as_str()]
-    );
-    assert!(second_decision_page.next_cursor.is_none());
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -1693,7 +1535,6 @@ async fn events_sessions_decisions_admin_and_marketplace_installed_pagination() 
         &session_id_2,
         &user_id,
         &event_ids,
-        &decision_ids,
         &audit_ids,
     )
     .await;
@@ -1713,7 +1554,6 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
         &user_id,
         std::slice::from_ref(&session_id),
         std::slice::from_ref(&event_id),
-        &[],
     )
     .await;
 
@@ -1781,8 +1621,7 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
         "unfiltered list_events session total should use agent_sessions.event_count summary"
     );
 
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &[event_id], &[])
-        .await;
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &[event_id]).await;
 }
 
 /// Matches [`astra_services::session_audit::MAX_AUDIT_SESSIONS_PER_PAGE`] (not exported).
@@ -1805,19 +1644,8 @@ async fn cleanup_agent_sessions_and_events_for_owner(
     user_id: &str,
     session_ids: &[String],
     event_ids: &[String],
-    decision_ids: &[String],
 ) {
     for sid in session_ids {
-        let _ = sqlx::query("DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?")
-            .bind(sid)
-            .bind(user_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM ctx_snapshots WHERE session_id = ? AND user_id = ?")
-            .bind(sid)
-            .bind(user_id)
-            .execute(pool)
-            .await;
         let _ = sqlx::query("DELETE FROM agent_event_edges WHERE session_id = ? AND user_id = ?")
             .bind(sid)
             .bind(user_id)
@@ -1830,28 +1658,6 @@ async fn cleanup_agent_sessions_and_events_for_owner(
             .bind(user_id)
             .execute(pool)
             .await;
-    }
-    for did in decision_ids {
-        let _ =
-            sqlx::query("DELETE FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?")
-                .bind(did)
-                .bind(user_id)
-                .execute(pool)
-                .await;
-    }
-    for sid in session_ids {
-        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(sid)
-            .bind(user_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query(
-            "DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(sid)
-        .bind(user_id)
-        .execute(pool)
-        .await;
     }
 }
 
@@ -1929,21 +1735,7 @@ async fn cleanup_session_delete_fixture_for_owner(
     .execute(pool)
     .await;
 
-    let _ = sqlx::query(
-        "DELETE FROM user_skill_evaluations \
-         WHERE (owner_user_id, run_id) IN (
-             SELECT user_id, run_id FROM agent_runs
-             WHERE session_id = ? AND user_id = ?
-         )",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .execute(pool)
-    .await;
-
     for table in [
-        "ctx_decision_audits",
-        "ctx_snapshots",
         "session_artifacts",
         "agent_event_edges",
         "agent_events",
@@ -2002,8 +1794,6 @@ async fn cleanup_restore_fixture_for_owner(
 ) {
     for sid in session_ids {
         for table in [
-            "ctx_decision_audits",
-            "ctx_snapshots",
             "agent_event_edges",
             "session_artifact_references",
             "session_artifacts",
@@ -3013,7 +2803,6 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         &user_id,
         &[s1.clone(), s2.clone()],
         &event_ids,
-        &[],
     )
     .await;
 
@@ -3281,7 +3070,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(list.total, 2);
     assert_eq!(list.sessions.len(), 2);
 
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[s1, s2], &event_ids, &[]).await;
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[s1, s2], &event_ids).await;
 }
 
 #[tokio::test]
@@ -3301,7 +3090,6 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
         &user_id,
         std::slice::from_ref(&session_id),
         &event_ids,
-        &[],
     )
     .await;
 
@@ -3427,8 +3215,7 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
     assert_eq!(filtered.total, 0);
     assert!(filtered.sessions.is_empty());
 
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &event_ids, &[])
-        .await;
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &event_ids).await;
 }
 
 #[tokio::test]
@@ -3453,7 +3240,6 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
         &user_id,
         std::slice::from_ref(&s1),
         &event_ids,
-        &[],
     )
     .await;
 
@@ -3659,7 +3445,7 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
     assert_eq!(p4.outcome, RuntimePromotionOutcome::Promoted);
     assert_eq!(p4.recommendation, RuntimePromotionRecommendation::Promote);
 
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[s1], &event_ids, &[]).await;
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[s1], &event_ids).await;
 }
 
 #[tokio::test]
@@ -3679,7 +3465,6 @@ async fn session_runtime_promotions_db_read_is_bounded() {
         &user_id,
         std::slice::from_ref(&session_id),
         &event_ids,
-        &[],
     )
     .await;
 
@@ -3758,8 +3543,7 @@ async fn session_runtime_promotions_db_read_is_bounded() {
         "bounded read should drop oldest overflow rows"
     );
 
-    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &event_ids, &[])
-        .await;
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[session_id], &event_ids).await;
 }
 
 #[tokio::test]
@@ -3955,7 +3739,6 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
         &user_id,
         std::slice::from_ref(&session_id),
         &[turn_event_id, child_event_id, error_event_id],
-        &[],
     )
     .await;
 }
@@ -4292,7 +4075,6 @@ async fn session_audit_prices_historical_physical_attempts_without_catalog_repri
         &user_id,
         std::slice::from_ref(&session_id),
         std::slice::from_ref(&event_id),
-        &[],
     )
     .await;
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
@@ -5205,7 +4987,6 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         &owner_user_id,
         std::slice::from_ref(&session_id),
         &[],
-        &[],
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -5216,7 +4997,6 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
             stray_event_id.clone(),
             non_owner_session_end_event_id.clone(),
         ],
-        &[],
     )
     .await;
 
@@ -5456,7 +5236,6 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         &owner_user_id,
         std::slice::from_ref(&session_id),
         &[owner_event.record.event_id],
-        &[],
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -5464,7 +5243,6 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         &other_user_id,
         &[session_id],
         &[stray_event_id, non_owner_session_end_event_id],
-        &[],
     )
     .await;
 }
@@ -5479,7 +5257,6 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
     let other_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
     let event_id = Uuid::new_v4().to_string();
-    let context_capture_id = Uuid::new_v4().to_string();
 
     cleanup_restore_fixture_for_owner(&pool, &owner_user_id, std::slice::from_ref(&session_id))
         .await;
@@ -5498,42 +5275,27 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
     .await
     .expect("insert owner session");
 
-    let context_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
-    let snapshot_result = context_service
-        .create_snapshot(
+    let event_service = DatabaseEventService::new(settings.clone()).with_pool(shared.clone());
+    let rejected = event_service
+        .create_event(
             other_user_id.clone(),
-            SnapshotCreateRequestData {
+            EventCreateRequestData {
+                ingestion_source: astra_services::EventIngestionSource::Client,
+                event_id: Some(event_id),
                 session_id: session_id.clone(),
-                event_id: event_id.clone(),
-                context_data: serde_json::json!({"attempt": "non-owner"}),
+                event_type: "owner_isolation".into(),
+                content: "{}".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
             },
         )
-        .await;
-    assert_eq!(
-        snapshot_result
-            .expect_err("non-owner cannot create context snapshot")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-
-    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
-    let decision_result = decision_service
-        .record_decision(
-            other_user_id.clone(),
-            DecisionCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: event_id.clone(),
-                context_capture_id,
-                decision_type: "it_decision".into(),
-                decision_output: serde_json::json!({"allowed": false}),
-                model_params: None,
-            },
-        )
-        .await;
-    let error = decision_result.expect_err("non-owner cannot record decision");
-    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
-
+        .await
+        .expect_err("foreign owner cannot write retained Session events");
+    assert_eq!(rejected.0, axum::http::StatusCode::NOT_FOUND);
     seed_restore_session_fixture(
         &pool,
         &other_user_id,
@@ -5551,29 +5313,6 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
             .is_some(),
         "the other owner restores only its independently created session"
     );
-    let snapshot_count =
-        sqlx::query("SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id = ?")
-            .bind(&session_id)
-            .bind(&owner_user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count context snapshots")
-            .try_get::<i64, _>("c")
-            .expect("decode snapshot count");
-    assert_eq!(snapshot_count, 0, "rejected snapshot must not write rows");
-
-    let decision_count = sqlx::query(
-        "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count decisions")
-    .try_get::<i64, _>("c")
-    .expect("decode decision count");
-    assert_eq!(decision_count, 0, "rejected decision must not write rows");
-
     let metadata_after: Option<String> = sqlx::query(
         "SELECT CAST(metadata AS CHAR) AS metadata_json FROM agent_sessions WHERE session_id = ? AND user_id = ?",
     )
@@ -5602,346 +5341,6 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn context_and_decision_writes_require_owner_bound_references_on_live_matrixone() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let owner_user_id = Uuid::new_v4().to_string();
-    let other_user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let owner_event_id = Uuid::new_v4().to_string();
-    let other_event_id = Uuid::new_v4().to_string();
-    let other_context_id = Uuid::new_v4().to_string();
-
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &owner_user_id,
-        std::slice::from_ref(&session_id),
-        std::slice::from_ref(&owner_event_id),
-        &[],
-    )
-    .await;
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &other_user_id,
-        std::slice::from_ref(&session_id),
-        std::slice::from_ref(&other_event_id),
-        &[],
-    )
-    .await;
-
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'ctx-ref-integrity-it', 'active', 2)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner session");
-
-    for (event_id, user_id, event_type) in [
-        (&owner_event_id, &owner_user_id, "owner_event"),
-        (&other_event_id, &other_user_id, "other_event"),
-    ] {
-        sqlx::query(
-            "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-             causal_chain_id, payload_hash, ingestion_write_id) \
-             VALUES (?, ?, ?, ?, '{}', '', ?, ?)",
-        )
-        .bind(event_id)
-        .bind(&session_id)
-        .bind(user_id)
-        .bind(event_type)
-        .bind(agent_event_fixture_payload_hash(serde_json::json!({
-            "event_id": event_id,
-            "session_id": &session_id,
-            "user_id": user_id,
-            "event_type": event_type,
-            "content": "{}",
-            "causal_chain_id": "",
-        })))
-        .bind(Uuid::new_v4().to_string())
-        .execute(&pool)
-        .await
-        .expect("insert event");
-    }
-
-    let context_service = DatabaseContextService::new(settings.clone()).with_pool(shared.clone());
-    let wrong_event_result = context_service
-        .create_snapshot(
-            owner_user_id.clone(),
-            SnapshotCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: other_event_id.clone(),
-                context_data: serde_json::json!({"wrong": "event-owner"}),
-            },
-        )
-        .await;
-    assert_eq!(
-        wrong_event_result
-            .expect_err("owner snapshot cannot reference another owner's event")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-
-    let snapshot = context_service
-        .create_snapshot(
-            owner_user_id.clone(),
-            SnapshotCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: owner_event_id.clone(),
-                context_data: serde_json::json!({"owner": true}),
-            },
-        )
-        .await
-        .expect("owner snapshot can reference owner event");
-
-    sqlx::query(
-        "INSERT INTO ctx_snapshots \
-         (context_capture_id, user_id, session_id, event_id, context_data) \
-         VALUES (?, ?, ?, ?, CAST('{\"secret\":\"other\"}' AS JSON))",
-    )
-    .bind(&other_context_id)
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .bind(&other_event_id)
-    .execute(&pool)
-    .await
-    .expect("insert other-owner snapshot");
-
-    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
-    let wrong_context_result = decision_service
-        .record_decision(
-            owner_user_id.clone(),
-            DecisionCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: owner_event_id.clone(),
-                context_capture_id: other_context_id.clone(),
-                decision_type: "wrong_context_owner".into(),
-                decision_output: serde_json::json!({"allowed": false}),
-                model_params: None,
-            },
-        )
-        .await;
-    assert_eq!(
-        wrong_context_result
-            .expect_err("owner decision cannot reference another owner's context")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-
-    let wrong_event_result = decision_service
-        .record_decision(
-            owner_user_id.clone(),
-            DecisionCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: other_event_id.clone(),
-                context_capture_id: snapshot.context_capture_id.clone(),
-                decision_type: "wrong_event_owner".into(),
-                decision_output: serde_json::json!({"allowed": false}),
-                model_params: None,
-            },
-        )
-        .await;
-    assert_eq!(
-        wrong_event_result
-            .expect_err("owner decision cannot reference another owner's event")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-
-    let decision = decision_service
-        .record_decision(
-            owner_user_id.clone(),
-            DecisionCreateRequestData {
-                session_id: session_id.clone(),
-                event_id: owner_event_id.clone(),
-                context_capture_id: snapshot.context_capture_id.clone(),
-                decision_type: "owner_reference_integrity".into(),
-                decision_output: serde_json::json!({"allowed": true}),
-                model_params: None,
-            },
-        )
-        .await
-        .expect("owner decision can reference owner event and context");
-
-    let owner_decisions = sqlx::query(
-        "SELECT COUNT(*) AS c FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count owner decisions")
-    .try_get::<i64, _>("c")
-    .expect("decode owner decision count");
-    assert_eq!(
-        owner_decisions, 1,
-        "rejected decision references must not write stray owner rows"
-    );
-    assert_eq!(decision.context_capture_id, snapshot.context_capture_id);
-
-    let request = DecisionCreateRequestData {
-        session_id: session_id.clone(),
-        event_id: owner_event_id.clone(),
-        context_capture_id: snapshot.context_capture_id.clone(),
-        decision_type: "retained_reference_contract".into(),
-        decision_output: serde_json::json!({"allowed": true}),
-        model_params: None,
-    };
-    for (candidate, expected) in [
-        (
-            DecisionCreateRequestData {
-                event_id: other_event_id.clone(),
-                context_capture_id: other_context_id.clone(),
-                ..request.clone()
-            },
-            format!("Event {other_event_id} not found"),
-        ),
-        (
-            DecisionCreateRequestData {
-                session_id: Uuid::new_v4().to_string(),
-                ..request.clone()
-            },
-            String::from("Session "),
-        ),
-    ] {
-        let error = decision_service
-            .record_decision(owner_user_id.clone(), candidate)
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-        assert!(error.1.0.detail.starts_with(&expected));
-    }
-    for blank in ["", " \t "] {
-        let receipt = decision_service
-            .record_decision(
-                owner_user_id.clone(),
-                DecisionCreateRequestData {
-                    context_capture_id: blank.into(),
-                    ..request.clone()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(receipt.context_capture_id, blank);
-        assert_eq!(receipt.model_params, serde_json::json!({}));
-        assert_eq!(receipt.decision_output, request.decision_output);
-        let stored_timestamp: String = sqlx::query_scalar(
-            "SELECT DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') FROM ctx_decision_audits WHERE decision_id = ? AND user_id = ?",
-        ).bind(&receipt.decision_id).bind(&owner_user_id).fetch_one(&pool).await.unwrap();
-        assert_eq!(receipt.created_at, stored_timestamp);
-    }
-    let other_session_id = Uuid::new_v4().to_string();
-    let other_session_snapshot = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status) VALUES (?, ?, 'active')")
-        .bind(&other_session_id)
-        .bind(&owner_user_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO ctx_snapshots (context_capture_id, user_id, session_id, event_id, context_data) VALUES (?, ?, ?, ?, '{}')")
-        .bind(&other_session_snapshot).bind(&owner_user_id).bind(&other_session_id).bind(&owner_event_id).execute(&pool).await.unwrap();
-    for (candidate, expected) in [
-        (
-            DecisionCreateRequestData {
-                session_id: other_session_id.clone(),
-                ..request.clone()
-            },
-            format!("Event {owner_event_id} not found"),
-        ),
-        (
-            DecisionCreateRequestData {
-                context_capture_id: other_session_snapshot.clone(),
-                ..request.clone()
-            },
-            format!("Snapshot {other_session_snapshot} not found"),
-        ),
-        (
-            DecisionCreateRequestData {
-                context_capture_id: format!(" {} ", request.context_capture_id),
-                ..request.clone()
-            },
-            format!("Snapshot  {}  not found", request.context_capture_id),
-        ),
-    ] {
-        let error = decision_service
-            .record_decision(owner_user_id.clone(), candidate)
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-        assert_eq!(error.1.0.detail, expected);
-    }
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &owner_user_id,
-        &[other_session_id],
-        &[],
-        &[],
-    )
-    .await;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        count, 2,
-        "retained decisions never change the session counter"
-    );
-    // Valid event and snapshot remain intact: this rejects the old unfenced path.
-    sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
-        .bind(&owner_user_id).bind(&session_id).execute(&pool).await.unwrap();
-    let error = decision_service
-        .record_decision(owner_user_id.clone(), request.clone())
-        .await
-        .unwrap_err();
-    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
-    DatabaseSessionService::new(settings.clone())
-        .with_pool(shared.clone())
-        .delete_session(session_id.clone(), owner_user_id.clone())
-        .await
-        .unwrap();
-    let error = decision_service
-        .record_decision(owner_user_id.clone(), request)
-        .await
-        .unwrap_err();
-    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM ctx_decision_audits WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(remaining, 0);
-
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &owner_user_id,
-        std::slice::from_ref(&session_id),
-        std::slice::from_ref(&owner_event_id),
-        &[],
-    )
-    .await;
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &other_user_id,
-        &[session_id],
-        &[other_event_id],
-        &[],
-    )
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -5959,10 +5358,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     let other_query_event_id = Uuid::new_v4().to_string();
     let other_llm_event_id = Uuid::new_v4().to_string();
     let other_drift_assessment_event_id = Uuid::new_v4().to_string();
-    let owner_context_id = Uuid::new_v4().to_string();
-    let other_context_id = Uuid::new_v4().to_string();
-    let owner_decision_id = Uuid::new_v4().to_string();
-    let other_decision_id = Uuid::new_v4().to_string();
     let owner_tool_event_id = Uuid::new_v4().to_string();
     let owner_boundary_event_id = Uuid::new_v4().to_string();
 
@@ -5978,7 +5373,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_tool_event_id.clone(),
             owner_boundary_event_id.clone(),
         ],
-        std::slice::from_ref(&owner_decision_id),
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -5990,7 +5384,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             other_llm_event_id.clone(),
             other_drift_assessment_event_id.clone(),
         ],
-        std::slice::from_ref(&other_decision_id),
     )
     .await;
     cleanup_model_request_fixtures(
@@ -6329,97 +5722,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     .await
     .expect("insert canonical dependency boundary fixture");
 
-    for (
-        context_id,
-        user_id,
-        event_id,
-        llm_response_id,
-        token_budget,
-        total_tokens,
-        relevance,
-        created_at,
-    ) in [
-        (
-            &owner_context_id,
-            &owner_user_id,
-            &owner_query_event_id,
-            &owner_llm_event_id,
-            1000_i32,
-            100_i64,
-            serde_json::json!({"selected_events": 0.95}),
-            "2026-06-01 10:01:30.000000",
-        ),
-        (
-            &other_context_id,
-            &other_user_id,
-            &other_query_event_id,
-            &other_llm_event_id,
-            9000_i32,
-            900_i64,
-            serde_json::json!({"selected_events": 0.05}),
-            "2026-06-01 10:03:30.000000",
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO ctx_snapshots \
-             (context_capture_id, user_id, session_id, event_id, llm_response_id, token_budget, total_tokens, relevance_scores, task_type, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), 'it', ?)",
-        )
-        .bind(context_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(llm_response_id)
-        .bind(token_budget)
-        .bind(total_tokens)
-        .bind(relevance.to_string())
-        .bind(created_at)
-        .execute(&pool)
-        .await
-        .expect("insert mixed owner snapshot");
-    }
-
-    for (decision_id, user_id, event_id, context_id, decision_type, output, model, created_at) in [
-        (
-            &owner_decision_id,
-            &owner_user_id,
-            &owner_query_event_id,
-            &owner_context_id,
-            "owner_decision",
-            serde_json::json!({"visible": "owner"}),
-            "owner-model",
-            "2026-06-01 10:01:40.000000",
-        ),
-        (
-            &other_decision_id,
-            &other_user_id,
-            &other_query_event_id,
-            &other_context_id,
-            "other_decision",
-            serde_json::json!({"secret": "other"}),
-            "other-model",
-            "2026-06-01 10:03:40.000000",
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO ctx_decision_audits \
-             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output, model_params, model_used, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), CAST('{}' AS JSON), ?, ?)",
-        )
-        .bind(decision_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(context_id)
-        .bind(decision_type)
-        .bind(output.to_string())
-        .bind(model)
-        .bind(created_at)
-        .execute(&pool)
-        .await
-        .expect("insert mixed owner decision");
-    }
-
     let reflect = DatabaseReflectService::new(settings.clone()).with_pool(shared.clone());
     let report = reflect
         .build_evidence(
@@ -6437,7 +5739,12 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .await
         .expect("owner reflect report");
     assert_eq!(report.data_coverage.events, 6);
-    assert_eq!(report.data_coverage.decisions, 1);
+    assert!(
+        !report
+            .data_coverage
+            .providers
+            .contains_key("decision_audits")
+    );
     assert_eq!(report.model_requests.records_observed, 4);
     assert_eq!(report.model_requests.accepted_records_observed, 2);
     assert_eq!(
@@ -6468,7 +5775,7 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     assert_eq!(view.topic, "overview");
     assert_eq!(view.facet, "overview");
     assert_eq!(view.data_coverage.events, 6);
-    assert_eq!(view.data_coverage.decisions, 1);
+
     assert!(!report.summary.is_empty());
     assert!(
         report.observations.iter().any(|observation| {
@@ -6485,27 +5792,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             })
         }),
         "reflect report should include standardized evidence refs"
-    );
-    let owner_decision_ref = format!("urn:astra:decision:cloud:{owner_decision_id}");
-    let other_decision_ref = format!("urn:astra:decision:cloud:{other_decision_id}");
-    assert!(
-        report
-            .evidence
-            .iter()
-            .any(|evidence| evidence.ref_id == owner_decision_ref),
-        "lightweight reflection should preserve a bounded owner decision evidence identity"
-    );
-    assert!(
-        report
-            .observations
-            .iter()
-            .any(|observation| { observation.evidence_refs.contains(&owner_decision_ref) })
-    );
-    assert!(
-        !report
-            .evidence
-            .iter()
-            .any(|evidence| evidence.ref_id == other_decision_ref)
     );
     assert!(
         !report
@@ -6546,38 +5832,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
 
     let introspection =
         DatabaseIntrospectionService::new(settings.clone()).with_pool(shared.clone());
-    let snapshot = introspection
-        .get_context_snapshot(&owner_user_id, &session_id, None, false, false, 2000)
-        .await
-        .expect("owner context snapshot");
-    assert_eq!(snapshot["snapshot_id"], owner_context_id);
-    assert_eq!(snapshot["total_turns"], 1);
-    assert_eq!(snapshot["context_managed_tokens"], 100);
-    assert_eq!(snapshot["llm_prompt_tokens"], 100);
-    assert_eq!(snapshot["llm_total_tokens"], 110);
-
-    let trend = introspection
-        .get_context_trend(&owner_user_id, &session_id, 10, 128000)
-        .await
-        .expect("owner context trend");
-    assert_eq!(trend["turns_sampled"], 1);
-    assert_eq!(trend["current_tokens"]["input_tokens"], 100);
-
-    let retrieval = introspection
-        .get_retrieval_quality(&owner_user_id, &session_id, 10)
-        .await
-        .expect("owner retrieval quality");
-    assert_eq!(retrieval["turns_sampled"], 1);
-
-    let trace = introspection
-        .get_decision_trace(&owner_user_id, &session_id, 10)
-        .await
-        .expect("owner decision trace");
-    let decisions = trace["decisions"].as_array().expect("decisions array");
-    assert_eq!(decisions.len(), 1);
-    assert_eq!(decisions[0]["decision_id"], owner_decision_id);
-    assert_ne!(decisions[0]["decision_id"], other_decision_id);
-
     let drift = introspection
         .get_drift_check(&owner_user_id, &session_id)
         .await
@@ -6623,7 +5877,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_tool_event_id,
             owner_boundary_event_id,
         ],
-        &[owner_decision_id],
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -6635,7 +5888,6 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             other_llm_event_id,
             other_drift_assessment_event_id,
         ],
-        &[other_decision_id],
     )
     .await;
     cleanup_model_request_fixtures(
@@ -6658,14 +5910,8 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let session_id = Uuid::new_v4().to_string();
     let owner_event_id = Uuid::new_v4().to_string();
     let foreign_event_id = Uuid::new_v4().to_string();
-    let owner_context_capture_id = Uuid::new_v4().to_string();
-    let foreign_context_capture_id = Uuid::new_v4().to_string();
-    let owner_decision_id = Uuid::new_v4().to_string();
-    let foreign_decision_id = Uuid::new_v4().to_string();
     let owner_run_id = Uuid::new_v4().to_string();
     let foreign_run_id = Uuid::new_v4().to_string();
-    let owner_skill_eval_id = Uuid::new_v4().to_string();
-    let foreign_skill_eval_id = Uuid::new_v4().to_string();
     let owner_artifact_id = Uuid::new_v4().to_string();
     let foreign_artifact_id = Uuid::new_v4().to_string();
     let owner_workspace_id = format!("workspace-{}", Uuid::new_v4());
@@ -6730,42 +5976,12 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("insert event edge");
     }
 
-    for (user_id, run_id, evaluation_id, marker) in [
-        (&owner_user_id, &owner_run_id, &owner_skill_eval_id, "owner"),
-        (
-            &other_user_id,
-            &foreign_run_id,
-            &foreign_skill_eval_id,
-            "foreign",
-        ),
+    for (user_id, run_id) in [
+        (&owner_user_id, &owner_run_id),
+        (&other_user_id, &foreign_run_id),
     ] {
-        sqlx::query(
-            "INSERT INTO agent_runs \
-             (run_id, user_id, session_id, root_run_id, ancestor_path, status) \
-             VALUES (?, ?, ?, ?, '', 'running')",
-        )
-        .bind(run_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(run_id)
-        .execute(&pool)
-        .await
-        .expect("insert session run");
-
-        sqlx::query(
-            "INSERT INTO user_skill_evaluations \
-             (evaluation_id, owner_user_id, source_id, version_id, run_id, hits, suspects, false_positives, payload_json) \
-             VALUES (?, ?, ?, ?, ?, 1, 1, 0, ?)",
-        )
-        .bind(evaluation_id)
-        .bind(user_id)
-        .bind(format!("skill-source-{marker}"))
-        .bind(format!("skill-version-{marker}"))
-        .bind(run_id)
-        .bind(format!("{{\"marker\":\"{marker}\"}}"))
-        .execute(&pool)
-        .await
-            .expect("insert skill evaluation");
+        sqlx::query("INSERT INTO agent_runs (run_id, user_id, session_id, root_run_id, ancestor_path, status) VALUES (?, ?, ?, ?, '', 'running')")
+            .bind(run_id).bind(user_id).bind(&session_id).bind(run_id).execute(&pool).await.unwrap();
     }
 
     for (user_id, run_id, artifact_id, marker) in [
@@ -6792,54 +6008,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .execute(&pool)
         .await
         .expect("insert session artifact");
-    }
-
-    for (user_id, event_id, context_capture_id, decision_id, marker) in [
-        (
-            &owner_user_id,
-            &owner_event_id,
-            &owner_context_capture_id,
-            &owner_decision_id,
-            "owner",
-        ),
-        (
-            &other_user_id,
-            &foreign_event_id,
-            &foreign_context_capture_id,
-            &foreign_decision_id,
-            "foreign",
-        ),
-    ] {
-        let context_data = format!("{{\"marker\":\"{marker}\"}}");
-        sqlx::query(
-            "INSERT INTO ctx_snapshots \
-             (context_capture_id, user_id, session_id, event_id, context_data) \
-             VALUES (?, ?, ?, ?, CAST(? AS JSON))",
-        )
-        .bind(context_capture_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(&context_data)
-        .execute(&pool)
-        .await
-        .expect("insert context snapshot");
-
-        let decision_output = format!("{{\"marker\":\"{marker}\"}}");
-        sqlx::query(
-            "INSERT INTO ctx_decision_audits \
-             (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output) \
-             VALUES (?, ?, ?, ?, ?, 'owner_scoped_delete_it', CAST(? AS JSON))",
-        )
-        .bind(decision_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(event_id)
-        .bind(context_capture_id)
-        .bind(&decision_output)
-        .execute(&pool)
-        .await
-        .expect("insert decision audit");
     }
 
     for (user_id, workspace_id, run_id, marker) in [
@@ -6917,30 +6085,34 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     .await
     .expect("insert unresolved cleanup debt");
 
-    let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
-    let retained_request = DecisionCreateRequestData {
+    let event_service = DatabaseEventService::new(settings.clone()).with_pool(shared.clone());
+    let retained_request = EventCreateRequestData {
+        ingestion_source: astra_services::EventIngestionSource::Client,
+        event_id: None,
         session_id: session_id.clone(),
-        event_id: owner_event_id.clone(),
-        context_capture_id: owner_context_capture_id.clone(),
-        decision_type: "retained_delete_fixture".into(),
-        decision_output: serde_json::json!({"owner": true}),
-        model_params: None,
+        event_type: "retained_delete_fixture".into(),
+        content: "{}".into(),
+        agent_id: None,
+        agent_version: None,
+        parent_event_id: None,
+        parent_event_ids: None,
+        causal_chain_id: None,
+        metadata: None,
     };
-    decision_service
-        .record_decision(owner_user_id.clone(), retained_request.clone())
+    event_service
+        .create_event(owner_user_id.clone(), retained_request.clone())
         .await
         .unwrap();
     let session_service = DatabaseSessionService::new(settings).with_pool(shared);
     session_service
         .delete_session(session_id.clone(), owner_user_id.clone())
         .await
-        .expect("owner-scoped delete must ignore unrelated foreign rows");
-    let error = decision_service
-        .record_decision(owner_user_id.clone(), retained_request)
+        .unwrap();
+    let error = event_service
+        .create_event(owner_user_id.clone(), retained_request)
         .await
         .unwrap_err();
     assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
-    assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
 
     let delete_audit = load_session_delete_audit_details(&pool, &owner_user_id, &session_id).await;
     assert_eq!(
@@ -6961,14 +6133,10 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         deleted_rows_for_table(&delete_audit, "agent_event_edges"),
         1
     );
-    assert_eq!(deleted_rows_for_table(&delete_audit, "agent_events"), 1);
+    assert_eq!(deleted_rows_for_table(&delete_audit, "agent_events"), 2);
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
     assert_eq!(
         deleted_rows_for_table(&delete_audit, "session_artifacts"),
-        1
-    );
-    assert_eq!(
-        deleted_rows_for_table(&delete_audit, "user_skill_evaluations"),
         1
     );
     assert_eq!(
@@ -6980,8 +6148,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         ("agent_sessions", "agent_sessions"),
         ("agent_events", "agent_events"),
         ("session_artifacts", "session_artifacts"),
-        ("ctx_snapshots", "ctx_snapshots"),
-        ("ctx_decision_audits", "ctx_decision_audits"),
     ] {
         let owner_remaining = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) AS c FROM {table} WHERE session_id = ? AND user_id = ?"
@@ -7011,36 +6177,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
             "{label} foreign rows must not be touched by owner delete"
         );
     }
-
-    let owner_skill_eval_remaining = sqlx::query(
-        "SELECT COUNT(*) AS c FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&owner_skill_eval_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count owner skill evaluation")
-    .try_get::<i64, _>("c")
-    .expect("decode owner skill evaluation count");
-    assert_eq!(
-        owner_skill_eval_remaining, 0,
-        "owner skill evaluation must be deleted through owner/run match"
-    );
-
-    let foreign_skill_eval_remaining = sqlx::query(
-        "SELECT COUNT(*) AS c FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
-    )
-    .bind(&other_user_id)
-    .bind(&foreign_skill_eval_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count foreign skill evaluation")
-    .try_get::<i64, _>("c")
-    .expect("decode foreign skill evaluation count");
-    assert_eq!(
-        foreign_skill_eval_remaining, 1,
-        "foreign skill evaluation must not be touched by owner delete"
-    );
 
     let owner_edge_remaining = sqlx::query(
         "SELECT COUNT(*) AS c FROM agent_event_edges WHERE user_id = ? AND child_event_id = ?",
@@ -7144,9 +6280,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
 
     let owner_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
-    let context_capture_id = Uuid::new_v4().to_string();
-    let decision_id = Uuid::new_v4().to_string();
-    let event_id = Uuid::new_v4().to_string();
 
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
 
@@ -7159,32 +6292,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
     .execute(&pool)
     .await
     .expect("insert owner session");
-    sqlx::query(
-        "INSERT INTO ctx_snapshots \
-         (context_capture_id, user_id, session_id, event_id, context_data) \
-         VALUES (?, ?, ?, ?, CAST('{\"owner\":true}' AS JSON))",
-    )
-    .bind(&context_capture_id)
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&event_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner context snapshot");
-    sqlx::query(
-        "INSERT INTO ctx_decision_audits \
-         (decision_id, user_id, session_id, event_id, context_capture_id, decision_type, decision_output) \
-         VALUES (?, ?, ?, ?, ?, 'owner_delete_it', CAST('{\"owner\":true}' AS JSON))",
-    )
-    .bind(&decision_id)
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .bind(&event_id)
-    .bind(&context_capture_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner decision audit");
-
     let temp_sessions = tempfile::tempdir().expect("temp sessions dir");
     let _journal_guard =
         astra_services::session_journal::JournalDirGuard::new(temp_sessions.path());
@@ -7206,7 +6313,7 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
         "session service delete must remove owner checkpoint/artifact directory"
     );
 
-    for label in ["agent_sessions", "ctx_snapshots", "ctx_decision_audits"] {
+    for label in ["agent_sessions", "agent_events"] {
         let remaining = count_user_session_rows(&pool, label, &owner_user_id, &session_id).await;
         assert_eq!(remaining, 0, "{label} must be removed by hard delete");
     }
@@ -7359,7 +6466,6 @@ async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone(
         &user_id,
         std::slice::from_ref(&session_id),
         &[created.record.event_id],
-        &[],
     )
     .await;
 }
@@ -7539,7 +6645,6 @@ async fn sync_outbox_create_event_isolates_same_session_id_across_owners_live_ma
         &owner_user_id,
         std::slice::from_ref(&session_id),
         &[],
-        &[],
     )
     .await;
     cleanup_agent_sessions_and_events_for_owner(
@@ -7547,7 +6652,6 @@ async fn sync_outbox_create_event_isolates_same_session_id_across_owners_live_ma
         &other_user_id,
         std::slice::from_ref(&session_id),
         &[event_id],
-        &[],
     )
     .await;
 }
@@ -7732,7 +6836,6 @@ async fn event_count_delta_service_and_state_paths_live_matrixone() {
         &user_id,
         &[service_session, state_session],
         &event_ids,
-        &[],
     )
     .await;
 }

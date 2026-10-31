@@ -810,7 +810,7 @@ fn item_run(
         WorkItemAttemptId::parse(run_id).expect("attempt id"),
     ));
     DurableRunRecord {
-        opening: None,
+        opening: Default::default(),
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
@@ -831,8 +831,7 @@ fn item_run(
         owner_lease_expires_at: None,
         run_generation: 0,
         last_event_idx: -1,
-        checkpoint_version: None,
-        checkpoint_json: None,
+        current_checkpoint: None,
         error_code: None,
         error_message: None,
 

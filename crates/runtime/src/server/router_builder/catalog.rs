@@ -62,10 +62,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
                 .post(user_skill_handlers::submit_user_skill_version_handler),
         )
         .route(
-            "/skills/user/{skill_name}/evaluations",
-            post(user_skill_handlers::record_user_skill_evaluation_handler),
-        )
-        .route(
             "/skills/user/{skill_name}/activate",
             post(user_skill_handlers::activate_user_skill_handler),
         )

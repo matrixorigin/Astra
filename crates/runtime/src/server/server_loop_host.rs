@@ -24726,13 +24726,19 @@ mod tests {
         let mut conflicting_checkpoint: Value =
             serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
         conflicting_checkpoint["heavy"]["original_facts"]["total_prompt"] = json!(124);
-        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
-            .bind(conflicting_checkpoint.to_string())
-            .bind(&user)
-            .bind(run_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
+        use sha2::Digest as _;
+        sqlx::query(
+            "UPDATE agent_runs SET current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(format!(
+            "{:x}",
+            sha2::Sha256::digest(conflicting_checkpoint.to_string().as_bytes())
+        ))
+        .bind(&user)
+        .bind(run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
         let before = custody_snapshot().await;
         assert!(
             coordinator
@@ -24745,13 +24751,15 @@ mod tests {
             before,
             "checkpoint mismatch cannot retain the provisional claim"
         );
-        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
-            .bind(&checkpoint.checkpoint_json)
-            .bind(&user)
-            .bind(run_id)
-            .execute(pool.get())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE agent_runs SET current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(astra_services::runs::CurrentCheckpointRef::from(&checkpoint).hash)
+        .bind(&user)
+        .bind(run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
 
         let tail_index = custody_snapshot().await.0.4;
         let tail: String = sqlx::query_scalar("SELECT payload_json FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx = ?")
@@ -24809,7 +24817,12 @@ mod tests {
                 "preserve original admission facts independently of display indexes"
             );
             assert_eq!(adopted.run().run_generation, generation);
-            assert!(adopted.run().checkpoint_json.is_none());
+            assert_eq!(
+                adopted.run().current_checkpoint.as_ref(),
+                Some(&astra_services::runs::CurrentCheckpointRef::from(
+                    &checkpoint
+                ))
+            );
             assert_eq!(
                 adopted.run().execution_authentication().unwrap(),
                 Some(execution_authentication.clone())
@@ -24828,28 +24841,23 @@ mod tests {
                     } else {
                         facts[field] = Value::Null;
                     }
-                    for table in ["agent_runs", "run_checkpoints"] {
-                        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")))
-                            .bind(malformed.to_string()).bind(&user).bind(run_id)
-                            .execute(pool.get()).await.unwrap();
-                    }
+                    sqlx::query("UPDATE run_checkpoints SET checkpoint_json = ? WHERE user_id = ? AND run_id = ? AND checkpoint_id = ?")
+                        .bind(malformed.to_string()).bind(&user).bind(run_id).bind(&checkpoint.checkpoint_id)
+                        .execute(pool.get()).await.unwrap();
+                    sqlx::query("UPDATE agent_runs SET current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?")
+                        .bind(format!("{:x}", sha2::Sha256::digest(malformed.to_string().as_bytes())))
+                        .bind(&user).bind(run_id).execute(pool.get()).await.unwrap();
                     let invalid = coordinator
                         .resume_execution_turn(resume_request(generation - 1, winner))
                         .await
                         .unwrap();
                     assert!(RuntimeExecutionHandoff::from_adopted(&invalid).is_err());
                 }
-                for table in ["agent_runs", "run_checkpoints"] {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "UPDATE {table} SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?"
-                    )))
-                    .bind(&checkpoint.checkpoint_json)
-                    .bind(&user)
-                    .bind(run_id)
-                    .execute(pool.get())
-                    .await
-                    .unwrap();
-                }
+                sqlx::query("UPDATE run_checkpoints SET checkpoint_json = ? WHERE user_id = ? AND run_id = ? AND checkpoint_id = ?")
+                    .bind(&checkpoint.checkpoint_json).bind(&user).bind(run_id).bind(&checkpoint.checkpoint_id).execute(pool.get()).await.unwrap();
+                sqlx::query("UPDATE agent_runs SET current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?")
+                    .bind(astra_services::runs::CurrentCheckpointRef::from(&checkpoint).hash)
+                    .bind(&user).bind(run_id).execute(pool.get()).await.unwrap();
             }
             let recovered = RuntimeExecutionHandoff::from_adopted(&adopted)
                 .expect("decode the exact checkpoint returned by atomic adoption");
@@ -24869,7 +24877,8 @@ mod tests {
                 adopted
                     .run()
                     .opening
-                    .as_ref()
+                    .loaded()
+                    .unwrap()
                     .unwrap()
                     .input()
                     .unwrap()
@@ -25008,8 +25017,10 @@ mod tests {
                 assert_eq!(parked.status, astra_core::STATUS_PAUSED);
                 assert_eq!(parked.run_generation, generation);
                 assert_eq!(
-                    parked.checkpoint_json.as_deref(),
-                    Some(checkpoint.checkpoint_json.as_str())
+                    parked.current_checkpoint.as_ref(),
+                    Some(&astra_services::runs::CurrentCheckpointRef::from(
+                        &checkpoint
+                    ))
                 );
                 // Production heartbeat releases this lease after confirmed
                 // parking. This fixture owns the pod without a heartbeat.
@@ -25380,8 +25391,8 @@ mod tests {
             );
             assert!(recovered_run.run_generation > run.run_generation);
             assert_eq!(
-                recovered_run.checkpoint_json.as_deref(),
-                Some(saved.checkpoint_json.as_str())
+                recovered_run.current_checkpoint.as_ref(),
+                Some(&astra_services::runs::CurrentCheckpointRef::from(&saved))
             );
             let persisted_run = engine
                 .load_run("handoff-user", "handoff-run")

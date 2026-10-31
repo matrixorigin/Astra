@@ -44,7 +44,7 @@ pub(crate) fn mutate_run_opening_fixture(
     run: &mut astra_services::runs::DurableRunRecord,
     mutate: impl FnOnce(&mut serde_json::Value),
 ) {
-    let mut opening = serde_json::to_value(run.opening.as_ref().unwrap()).unwrap();
+    let mut opening = serde_json::to_value(run.opening.loaded().unwrap().unwrap()).unwrap();
     mutate(&mut opening);
-    run.opening = Some(serde_json::from_value(opening).unwrap());
+    run.opening = Some(serde_json::from_value(opening).unwrap()).into();
 }

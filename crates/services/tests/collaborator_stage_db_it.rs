@@ -1985,7 +1985,7 @@ async fn concurrent_next_stages_have_one_winner_and_preserve_terminal_anchor() {
         .unwrap()
         .unwrap();
     assert_eq!(after.status, "completed");
-    assert_eq!(after.checkpoint_json, before.checkpoint_json);
+    assert_eq!(after.current_checkpoint, before.current_checkpoint);
     assert_eq!(after.run_generation, before.run_generation);
     assert_eq!(after.last_event_idx, before.last_event_idx + 1);
     fixture.cleanup().await;

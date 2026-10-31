@@ -828,7 +828,6 @@ fn local_reflect_data_coverage(
         }
         .to_string(),
         events: total_events,
-        decisions: 0,
         providers,
         warnings,
     }

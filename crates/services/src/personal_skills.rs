@@ -52,11 +52,6 @@ pub enum PersonalSkillError {
         owner_user_id: String,
         session_id: String,
     },
-    #[error("run not found: owner={owner_user_id}, run={run_id}")]
-    RunNotFound {
-        owner_user_id: String,
-        run_id: String,
-    },
     #[error(
         "invalid active personal skill projection: owner={owner_user_id}, session={session_id}, skill={skill_name}"
     )]
@@ -95,20 +90,6 @@ pub struct UserSkillVersionRecord {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct UserSkillEvaluationRecord {
-    pub evaluation_id: String,
-    pub owner_user_id: String,
-    pub source_id: String,
-    pub version_id: String,
-    pub run_id: Option<String>,
-    pub hits: u64,
-    pub suspects: u64,
-    pub false_positives: u64,
-    pub payload_json: Value,
-    pub created_at: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivePersonalSkillRecord {
     pub skill_name: String,
@@ -138,18 +119,6 @@ pub struct SubmitUserSkillVersion {
 pub struct ActivateUserSkillVersion {
     pub session_id: String,
     pub version_id: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordUserSkillEvaluation {
-    pub source_id: String,
-    pub version_id: String,
-    pub run_id: Option<String>,
-    pub hits: u64,
-    pub suspects: u64,
-    pub false_positives: u64,
-    pub payload_json: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -501,124 +470,6 @@ impl DatabasePersonalSkillStore {
             .collect()
     }
 
-    pub async fn record_evaluation(
-        &self,
-        owner_user_id: &str,
-        skill_name: &str,
-        request: RecordUserSkillEvaluation,
-    ) -> Result<UserSkillEvaluationRecord, PersonalSkillError> {
-        if let Some(run_id) = request.run_id.as_deref() {
-            let exists = sqlx::query(
-                "SELECT 1 AS owned FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1",
-            )
-            .bind(owner_user_id)
-            .bind(run_id)
-            .fetch_optional(self.pool.get())
-            .await
-            .map_err(|source| PersonalSkillError::Database {
-                operation: "validate_user_skill_evaluation_run",
-                entity: run_id.to_string(),
-                source,
-            })?
-            .is_some();
-            if !exists {
-                return Err(PersonalSkillError::RunNotFound {
-                    owner_user_id: owner_user_id.to_string(),
-                    run_id: run_id.to_string(),
-                });
-            }
-        }
-        let evaluation_id = format!("skill-eval-{}", Uuid::new_v4());
-        let payload = request.payload_json.unwrap_or(Value::Null);
-        let payload_json =
-            serde_json::to_string(&payload).map_err(|source| PersonalSkillError::Json {
-                operation: "serialize_skill_evaluation",
-                entity: request.version_id.clone(),
-                source,
-            })?;
-        let result = sqlx::query(
-            "INSERT INTO user_skill_evaluations
-             (evaluation_id, owner_user_id, source_id, version_id, run_id, hits, suspects,
-              false_positives, payload_json, created_at)
-             SELECT ?, sources.owner_user_id, versions.source_id, versions.version_id,
-                    ?, ?, ?, ?, ?, NOW(6)
-             FROM user_skill_sources sources
-             JOIN user_skill_versions versions
-               ON versions.source_id = sources.source_id
-             WHERE sources.owner_user_id = ?
-               AND sources.skill_name = ?
-               AND sources.source_id = ?
-               AND versions.version_id = ?
-               AND (? IS NULL OR EXISTS (
-                    SELECT 1 FROM agent_runs runs
-                    WHERE runs.user_id = sources.owner_user_id AND runs.run_id = ?
-               ))
-             LIMIT 1",
-        )
-        .bind(&evaluation_id)
-        .bind(&request.run_id)
-        .bind(request.hits as i64)
-        .bind(request.suspects as i64)
-        .bind(request.false_positives as i64)
-        .bind(&payload_json)
-        .bind(owner_user_id)
-        .bind(skill_name)
-        .bind(&request.source_id)
-        .bind(&request.version_id)
-        .bind(&request.run_id)
-        .bind(&request.run_id)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| PersonalSkillError::Database {
-            operation: "record_user_skill_evaluation",
-            entity: request.version_id.clone(),
-            source,
-        })?;
-        if result.rows_affected() == 0 {
-            if let Some(run_id) = request.run_id.as_deref() {
-                let run_still_exists = sqlx::query(
-                    "SELECT 1 AS owned FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1",
-                )
-                .bind(owner_user_id)
-                .bind(run_id)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| PersonalSkillError::Database {
-                    operation: "revalidate_user_skill_evaluation_run",
-                    entity: run_id.to_string(),
-                    source,
-                })?
-                .is_some();
-                if !run_still_exists {
-                    return Err(PersonalSkillError::RunNotFound {
-                        owner_user_id: owner_user_id.to_string(),
-                        run_id: run_id.to_string(),
-                    });
-                }
-            }
-            return Err(PersonalSkillError::VersionNotFound {
-                owner_user_id: owner_user_id.to_string(),
-                skill_name: skill_name.to_string(),
-                version_id: request.version_id,
-            });
-        }
-        let row = sqlx::query(
-            "SELECT evaluation_id, owner_user_id, source_id, version_id, run_id, hits, suspects,
-                    false_positives, payload_json, CAST(created_at AS CHAR) AS created_at
-             FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
-        )
-        .bind(owner_user_id)
-        .bind(&evaluation_id)
-        .fetch_one(self.pool.get())
-        .await
-        .map_err(|source| PersonalSkillError::Database {
-            operation: "load_user_skill_evaluation",
-            entity: evaluation_id.clone(),
-            source,
-        })?;
-        evaluation_from_row(row, "load_user_skill_evaluation", &evaluation_id)
-    }
-
     async fn load_source(
         &self,
         owner_user_id: &str,
@@ -800,16 +651,6 @@ fn row_string(
     Ok(value)
 }
 
-fn row_optional_string(
-    row: &sqlx::mysql::MySqlRow,
-    operation: &'static str,
-    entity: &str,
-    column: &'static str,
-) -> Result<Option<String>, PersonalSkillError> {
-    row.try_get::<Option<String>, _>(column)
-        .map_err(|source| db_error(operation, entity, source))
-}
-
 fn row_non_negative_i64(
     row: &sqlx::mysql::MySqlRow,
     operation: &'static str,
@@ -873,33 +714,6 @@ fn version_from_row(
         status: row_string(&row, operation, entity, "status")?,
         created_at: row_string(&row, operation, entity, "created_at")?,
         updated_at: row_string(&row, operation, entity, "updated_at")?,
-    })
-}
-
-fn evaluation_from_row(
-    row: sqlx::mysql::MySqlRow,
-    operation: &'static str,
-    entity: &str,
-) -> Result<UserSkillEvaluationRecord, PersonalSkillError> {
-    let evaluation_id = row_string(&row, operation, entity, "evaluation_id")?;
-    let payload_raw = row_string(&row, operation, entity, "payload_json")?;
-    let payload_json =
-        serde_json::from_str(&payload_raw).map_err(|source| PersonalSkillError::Json {
-            operation: "deserialize_skill_evaluation",
-            entity: evaluation_id.clone(),
-            source,
-        })?;
-    Ok(UserSkillEvaluationRecord {
-        evaluation_id,
-        owner_user_id: row_string(&row, operation, entity, "owner_user_id")?,
-        source_id: row_string(&row, operation, entity, "source_id")?,
-        version_id: row_string(&row, operation, entity, "version_id")?,
-        run_id: row_optional_string(&row, operation, entity, "run_id")?,
-        hits: row_non_negative_i64(&row, operation, entity, "hits")? as u64,
-        suspects: row_non_negative_i64(&row, operation, entity, "suspects")? as u64,
-        false_positives: row_non_negative_i64(&row, operation, entity, "false_positives")? as u64,
-        payload_json,
-        created_at: row_string(&row, operation, entity, "created_at")?,
     })
 }
 

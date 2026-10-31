@@ -18,7 +18,9 @@ use crate::model_request_context::{ModelRequestContextRecord, ModelRequestEventS
 mod observation;
 mod projection;
 mod request;
-use observation::{build_observation_envelope, graph_decision_ref, graph_event_ref};
+#[cfg(test)]
+use observation::graph_decision_ref;
+use observation::{build_observation_envelope, graph_event_ref};
 pub use request::ReflectRequest;
 
 // `agent_events.event_type` is a machine-owned discriminator. Reflection must
@@ -971,7 +973,6 @@ impl AgentDeliveryRollup {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SessionOverview {
     pub total_events: i64,
-    pub total_decisions: i64,
     pub duration_minutes: Option<f64>,
     pub unique_skills_used: i64,
     pub error_count: i64,
@@ -1016,7 +1017,6 @@ pub(crate) enum InsightKind {
     ErrorRate,
     ToolFailure { tool: String },
     ToolConcentration { tool: String },
-    ModelFanout { decision_type: String },
     EmptySession,
 }
 
@@ -1026,7 +1026,6 @@ impl InsightKind {
             Self::ErrorRate => "error_rate",
             Self::ToolFailure { .. } => "tool_failure",
             Self::ToolConcentration { .. } => "tool_concentration",
-            Self::ModelFanout { .. } => "model_fanout",
             Self::EmptySession => "empty_session",
         }
     }
@@ -1063,23 +1062,6 @@ pub struct ErrorPattern {
     pub event_type: String,
     pub fail_count: i64,
     pub sample_error: String,
-}
-
-/// Intermediate type for decision aggregation.
-#[derive(Debug, Clone)]
-pub struct DecisionAgg {
-    pub decision_type: String,
-    pub cnt: i64,
-    pub models_used: i64,
-}
-
-#[derive(Debug, Clone)]
-struct EvidenceDecision {
-    decision_id: String,
-    event_id: String,
-    decision_type: String,
-    decision_output: serde_json::Value,
-    created_at: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1558,47 +1540,25 @@ fn execution_spines(
 }
 
 fn build_evidence_graph(
-    decisions: &[EvidenceDecision],
     events: &[EvidenceEvent],
     parent_id_map: &std::collections::HashMap<String, Vec<String>>,
 ) -> Option<ObservationGraphSlice> {
-    if decisions.is_empty() && events.is_empty() {
+    if events.is_empty() {
         return None;
     }
 
     let (mut nodes, execution_refs) = execution_spines(events);
     let mut edges = Vec::new();
-    let mut event_node_ids = std::collections::HashSet::new();
     let mut event_refs = std::collections::HashMap::new();
-    let mut decision_refs = std::collections::HashMap::new();
     let mut edge_keys = BTreeSet::new();
     let event_ids: std::collections::HashSet<&str> =
         events.iter().map(|event| event.event_id.as_str()).collect();
-
-    for decision in decisions {
-        let ref_id = graph_decision_ref(&decision.decision_id);
-        decision_refs.insert(decision.decision_id.clone(), ref_id.clone());
-        nodes.push(ObservationGraphNode {
-            ref_id,
-            layer: ObservationGraphLayer::Runtime,
-            kind: ObservationGraphNodeKind::Decision,
-            label: decision.decision_type.clone(),
-            summary: truncate_graph_summary(&decision.decision_output.to_string(), 140),
-            metadata: Some(serde_json::json!({
-                "decision_id": decision.decision_id,
-                "event_id": decision.event_id,
-                "decision_output": decision.decision_output,
-                "created_at": decision.created_at,
-            })),
-        });
-    }
 
     for event in events {
         let ref_id = execution_refs
             .get(&event.event_id)
             .cloned()
             .unwrap_or_else(|| graph_event_ref(&event.event_id));
-        event_node_ids.insert(event.event_id.clone());
         event_refs.insert(event.event_id.clone(), ref_id.clone());
         if execution_refs.contains_key(&event.event_id) {
             continue;
@@ -1616,23 +1576,6 @@ fn build_evidence_graph(
                 "created_at": event.created_at,
             })),
         });
-    }
-
-    for decision in decisions {
-        if event_node_ids.contains(&decision.event_id)
-            && let (Some(from), Some(to)) = (
-                event_refs.get(decision.event_id.as_str()),
-                decision_refs.get(decision.decision_id.as_str()),
-            )
-        {
-            push_graph_edge(
-                &mut edges,
-                &mut edge_keys,
-                from.clone(),
-                to.clone(),
-                ObservationGraphEdgeKind::Supports,
-            );
-        }
     }
 
     for event in events {
@@ -1656,23 +1599,6 @@ fn build_evidence_graph(
                     to.clone(),
                     ObservationGraphEdgeKind::Causes,
                 );
-            }
-
-            for decision in decisions {
-                if decision.event_id == parent_event_id
-                    && let (Some(from), Some(to)) = (
-                        decision_refs.get(decision.decision_id.as_str()),
-                        event_refs.get(event.event_id.as_str()),
-                    )
-                {
-                    push_graph_edge(
-                        &mut edges,
-                        &mut edge_keys,
-                        from.clone(),
-                        to.clone(),
-                        ObservationGraphEdgeKind::Causes,
-                    );
-                }
             }
         }
     }
@@ -1841,25 +1767,6 @@ fn reflect_count_pair_from_row(
     ))
 }
 
-fn decision_agg_from_row(row: &impl ReflectRow) -> ServiceResult<DecisionAgg> {
-    let context = "decision_agg_row";
-    let cnt = reflect_row_non_negative_i64(row, context, "cnt")?;
-    let models_used = reflect_row_non_negative_i64(row, context, "models_used")?;
-    if models_used > cnt {
-        return Err(reflect_decode_error(
-            context,
-            "models_used",
-            format!("expected <= cnt {cnt}, got {models_used}"),
-        ));
-    }
-
-    Ok(DecisionAgg {
-        decision_type: reflect_row_required_non_empty_string(row, context, "decision_type")?,
-        cnt,
-        models_used,
-    })
-}
-
 fn error_pattern_from_row(row: &impl ReflectRow) -> ServiceResult<ErrorPattern> {
     let context = "error_pattern_row";
     Ok(ErrorPattern {
@@ -1876,27 +1783,6 @@ fn raw_error_from_row(row: &impl ReflectRow) -> ServiceResult<RawError> {
         skill_name: reflect_row_required_non_empty_string(row, context, "skill_name")?,
         event_type: reflect_row_required_non_empty_string(row, context, "event_type")?,
         content: reflect_row_string(row, context, "content")?,
-    })
-}
-
-fn evidence_decision_from_row(row: &impl ReflectRow) -> ServiceResult<EvidenceDecision> {
-    let context = "evidence_decision_row";
-    let Some(decision_output_json) =
-        reflect_row_optional_string(row, context, "decision_output_json")?
-    else {
-        return Err(reflect_decode_error(
-            context,
-            "decision_output_json",
-            "expected decision output JSON, got NULL",
-        ));
-    };
-    Ok(EvidenceDecision {
-        decision_id: reflect_row_required_non_empty_string(row, context, "decision_id")?,
-        event_id: reflect_row_required_non_empty_string(row, context, "event_id")?,
-        decision_type: reflect_row_required_non_empty_string(row, context, "decision_type")?,
-        decision_output: serde_json::from_str(&decision_output_json)
-            .map_err(|error| reflect_decode_error(context, "decision_output_json", error))?,
-        created_at: reflect_row_required_non_empty_string(row, context, "created_at")?,
     })
 }
 
@@ -2125,7 +2011,6 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
 pub(crate) fn generate_insights(
     overview: &SessionOverview,
     error_patterns: &[ErrorPattern],
-    decision_aggs: &[DecisionAgg],
 ) -> Vec<Insight> {
     let mut insights = Vec::new();
 
@@ -2174,19 +2059,6 @@ pub(crate) fn generate_insights(
         }
     }
 
-    for da in decision_aggs {
-        if da.models_used > 2 && da.cnt >= 5 {
-            insights.push(Insight {
-                severity: "info".into(),
-                kind: InsightKind::ModelFanout {
-                    decision_type: da.decision_type.clone(),
-                },
-                message: format!("{} used {} models", da.decision_type, da.models_used),
-                evidence: format!("{} decisions", da.cnt),
-            });
-        }
-    }
-
     if overview.total_events == 0 {
         insights.push(Insight {
             severity: "info".into(),
@@ -2228,7 +2100,6 @@ pub(crate) fn generate_recommendations(
             }
             InsightKind::ErrorRate
             | InsightKind::ToolFailure { .. }
-            | InsightKind::ModelFanout { .. }
             | InsightKind::EmptySession => None,
         };
         if let Some(summary) = summary {
@@ -2330,28 +2201,7 @@ impl DatabaseReflectService {
             return Ok(None);
         }
 
-        let decision_limit = i64::from(last_n.clamp(1, 50));
-        let decision_rows = query(
-            "SELECT d.decision_id, d.event_id, d.decision_type, \
-               CAST(d.decision_output AS CHAR) AS decision_output_json, \
-               DATE_FORMAT(d.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM ctx_decision_audits d \
-             WHERE d.user_id = ? AND d.session_id = ? \
-             ORDER BY d.created_at DESC LIMIT ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(decision_limit)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| internal_error(format!("evidence graph decisions query: {e}")))?;
-
-        let decisions: Vec<EvidenceDecision> = decision_rows
-            .iter()
-            .map(evidence_decision_from_row)
-            .collect::<ServiceResult<Vec<_>>>()?;
-
-        let event_limit = std::cmp::max(decision_limit * 10, 50);
+        let event_limit = std::cmp::max(i64::from(last_n.clamp(1, 50)) * 10, 50);
         let event_rows = query(
             "SELECT event_id, event_type, \
                SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 180) AS content, \
@@ -2399,63 +2249,8 @@ impl DatabaseReflectService {
         .await
         .map_err(|e| internal_error(format!("evidence graph parent query: {e}")))?;
 
-        let filtered_events =
-            filter_evidence_events_for_graph(&decisions, recent_events, &parent_id_map);
-
-        Ok(build_evidence_graph(
-            &decisions,
-            &filtered_events,
-            &parent_id_map,
-        ))
+        Ok(build_evidence_graph(&recent_events, &parent_id_map))
     }
-}
-
-fn filter_evidence_events_for_graph(
-    decisions: &[EvidenceDecision],
-    recent_events: Vec<EvidenceEvent>,
-    parent_id_map: &std::collections::HashMap<String, Vec<String>>,
-) -> Vec<EvidenceEvent> {
-    if decisions.is_empty() {
-        return recent_events;
-    }
-
-    let decision_event_ids: std::collections::HashSet<String> = decisions
-        .iter()
-        .map(|decision| decision.event_id.clone())
-        .collect();
-    let relevant_chain_ids: std::collections::HashSet<String> = recent_events
-        .iter()
-        .filter(|event| decision_event_ids.contains(&event.event_id))
-        .filter_map(|event| event.causal_chain_id.clone())
-        .collect();
-
-    recent_events
-        .into_iter()
-        .filter(|event| {
-            event.is_execution_fact()
-                || event.event_type == "tool_invocation_run_reconciled"
-                || event.event_type == "tool_invocation_compaction_deferred"
-                || decision_event_ids.contains(&event.event_id)
-                || event
-                    .parent_event_id
-                    .as_ref()
-                    .map(|parent_event_id| decision_event_ids.contains(parent_event_id))
-                    .unwrap_or(false)
-                || event
-                    .causal_chain_id
-                    .as_ref()
-                    .map(|causal_chain_id| relevant_chain_ids.contains(causal_chain_id))
-                    .unwrap_or(false)
-                || parent_id_map
-                    .get(&event.event_id)
-                    .map(|parent_ids| {
-                        parent_ids
-                            .iter()
-                            .any(|parent_event_id| decision_event_ids.contains(parent_event_id))
-                    })
-                    .unwrap_or(false)
-        })
-        .collect()
 }
 
 #[async_trait]
@@ -2730,27 +2525,6 @@ impl ReflectService for DatabaseReflectService {
             .map(|row| reflect_count_pair_from_row(row, "skill_agg_row", "skill_name"))
             .collect::<ServiceResult<_>>()?;
 
-        // Decision aggregation
-        let decision_rows = query(
-            "SELECT d.decision_type, COUNT(*) AS cnt, \
-               COUNT(DISTINCT d.model_used) AS models_used \
-             FROM ctx_decision_audits d \
-             WHERE d.user_id = ? AND d.session_id = ? \
-             GROUP BY d.decision_type ORDER BY cnt DESC LIMIT 5",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| internal_error(format!("decisions query: {e}")))?;
-
-        let decision_aggs: Vec<DecisionAgg> = decision_rows
-            .iter()
-            .map(decision_agg_from_row)
-            .collect::<ServiceResult<_>>()?;
-
-        let total_decisions: i64 = decision_aggs.iter().map(|agg| agg.cnt).sum();
-
         // Error patterns (aggregated, for insights)
         let error_patterns = if analysis_view_queries_error_patterns(&request.analysis_view) {
             let ep_rows = query(REFLECT_ERROR_PATTERNS_SQL)
@@ -2790,7 +2564,6 @@ impl ReflectService for DatabaseReflectService {
 
         let overview = SessionOverview {
             total_events: overview_agg.total_events,
-            total_decisions,
             duration_minutes,
             unique_skills_used: overview_agg.unique_skills,
             error_count: overview_agg.error_count,
@@ -2799,7 +2572,7 @@ impl ReflectService for DatabaseReflectService {
             top_skills,
         };
 
-        let insights = generate_insights(&overview, &error_patterns, &decision_aggs);
+        let insights = generate_insights(&overview, &error_patterns);
         let recommendations = generate_recommendations(&overview, &diagnoses, &insights);
         let raw_evidence_graph = self
             .build_recent_evidence_graph(
@@ -2844,7 +2617,7 @@ impl ReflectService for DatabaseReflectService {
             &failure_clusters,
             &budget_result,
         );
-        let mut view = request.view(overview.total_events, overview.total_decisions);
+        let mut view = request.view(overview.total_events);
         if model_requests.coverage == ModelRequestCaptureCoverage::SourceUnavailable {
             mark_model_request_usage_unavailable(&mut summary, &mut view.data_coverage);
         } else {
@@ -3848,7 +3621,6 @@ mod tests {
         total_events: i64,
         error_count: i64,
         top_skills: Vec<(String, i64)>,
-        total_decisions: i64,
         duration_minutes: Option<f64>,
     ) -> SessionOverview {
         let error_rate_pct = if total_events > 0 {
@@ -3858,7 +3630,6 @@ mod tests {
         };
         SessionOverview {
             total_events,
-            total_decisions,
             duration_minutes,
             unique_skills_used: top_skills.len() as i64,
             error_count,
@@ -3872,7 +3643,6 @@ mod tests {
     struct FakeReflectRow {
         failed_column: Option<&'static str>,
         empty_column: Option<&'static str>,
-        decision_output_json: Option<&'static str>,
         skill_name: Option<&'static str>,
         parent_event_id: Option<&'static str>,
         causal_chain_id: Option<&'static str>,
@@ -3883,7 +3653,6 @@ mod tests {
             Self {
                 failed_column: None,
                 empty_column: None,
-                decision_output_json: Some(r#"{"visible_tools":["bash"],"reason":"inspect"}"#),
                 skill_name: Some("bash"),
                 parent_event_id: Some("evt-user"),
                 causal_chain_id: Some("chain-1"),
@@ -3900,13 +3669,6 @@ mod tests {
         fn empty_on(column: &'static str) -> Self {
             Self {
                 empty_column: Some(column),
-                ..Self::complete()
-            }
-        }
-
-        fn with_decision_output_json(decision_output_json: Option<&'static str>) -> Self {
-            Self {
-                decision_output_json,
                 ..Self::complete()
             }
         }
@@ -3941,9 +3703,7 @@ mod tests {
         fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
             self.fail_if_needed(column)?;
             Ok(match column {
-                "decision_id" => self.text(column, "decision-1"),
                 "event_id" => self.text(column, "evt-user"),
-                "decision_type" => self.text(column, "tool_surface"),
                 "event_type" => self.text(column, "user_query"),
                 "content" => self.text(column, "list files"),
                 "created_at" => self.text(column, "2026-06-26T12:00:00"),
@@ -3954,7 +3714,6 @@ mod tests {
         fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
             self.fail_if_needed(column)?;
             Ok(match column {
-                "decision_output_json" => self.decision_output_json.map(str::to_string),
                 "skill_name" => self.skill_name.map(str::to_string),
                 "parent_event_id" => self.parent_event_id.map(str::to_string),
                 "causal_chain_id" => self.causal_chain_id.map(str::to_string),
@@ -3983,7 +3742,6 @@ mod tests {
         unique_skills: i64,
         error_count: i64,
         cnt: i64,
-        models_used: i64,
         fail_count: i64,
         first_event: Option<&'static str>,
         last_event: Option<&'static str>,
@@ -4000,7 +3758,6 @@ mod tests {
                 unique_skills: 3,
                 error_count: 2,
                 cnt: 4,
-                models_used: 2,
                 fail_count: 3,
                 first_event: Some("2026-06-26 09:00:00"),
                 last_event: Some("2026-06-26 09:15:00"),
@@ -4043,14 +3800,6 @@ mod tests {
             }
         }
 
-        fn with_decision_counts(cnt: i64, models_used: i64) -> Self {
-            Self {
-                cnt,
-                models_used,
-                ..Self::complete()
-            }
-        }
-
         fn with_fail_count(fail_count: i64) -> Self {
             Self {
                 fail_count,
@@ -4081,7 +3830,6 @@ mod tests {
             Ok(match column {
                 "event_type" => self.text(column, "tool_call_failed"),
                 "skill_name" => self.text(column, "bash"),
-                "decision_type" => self.text(column, "tool_surface"),
                 "sample_error" => self.text(column, self.sample_error),
                 "content" => self.text(column, self.content),
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -4105,7 +3853,6 @@ mod tests {
                 "unique_skills" => Ok(self.unique_skills),
                 "error_count" => Ok(self.error_count),
                 "cnt" => Ok(self.cnt),
-                "models_used" => Ok(self.models_used),
                 "fail_count" => Ok(self.fail_count),
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
@@ -4213,29 +3960,6 @@ mod tests {
     }
 
     #[test]
-    fn reflect_decision_agg_row_decode_preserves_values_and_fails_loudly() {
-        let agg = decision_agg_from_row(&FakeReflectAggRow::complete()).expect("decision decodes");
-        assert_eq!(agg.decision_type, "tool_surface");
-        assert_eq!(agg.cnt, 4);
-        assert_eq!(agg.models_used, 2);
-
-        for column in ["decision_type", "cnt", "models_used"] {
-            assert_reflect_internal_error_mentions(
-                decision_agg_from_row(&FakeReflectAggRow::fail_on(column)),
-                column,
-            );
-        }
-        assert_reflect_internal_error_mentions(
-            decision_agg_from_row(&FakeReflectAggRow::empty_on("decision_type")),
-            "expected non-empty string",
-        );
-        assert_reflect_internal_error_mentions(
-            decision_agg_from_row(&FakeReflectAggRow::with_decision_counts(1, 2)),
-            "models_used",
-        );
-    }
-
-    #[test]
     fn reflect_error_rows_decode_preserve_values_and_fail_loudly() {
         let pattern =
             error_pattern_from_row(&FakeReflectAggRow::complete()).expect("pattern decodes");
@@ -4266,43 +3990,6 @@ mod tests {
         assert_reflect_internal_error_mentions(
             raw_error_from_row(&FakeReflectAggRow::fail_on("content")),
             "content",
-        );
-    }
-
-    #[test]
-    fn evidence_decision_row_decode_preserves_values_and_fails_loudly() {
-        let decision =
-            evidence_decision_from_row(&FakeReflectRow::complete()).expect("decision row decodes");
-        assert_eq!(decision.decision_id, "decision-1");
-        assert_eq!(decision.event_id, "evt-user");
-        assert_eq!(decision.decision_type, "tool_surface");
-        assert_eq!(
-            decision.decision_output,
-            serde_json::json!({"visible_tools":["bash"],"reason":"inspect"})
-        );
-        assert_eq!(decision.created_at, "2026-06-26T12:00:00");
-
-        assert_reflect_internal_error_mentions(
-            evidence_decision_from_row(&FakeReflectRow::fail_on("decision_id")),
-            "decision_id",
-        );
-        assert_reflect_internal_error_mentions(
-            evidence_decision_from_row(&FakeReflectRow::empty_on("event_id")),
-            "expected non-empty string",
-        );
-        assert_reflect_internal_error_mentions(
-            evidence_decision_from_row(&FakeReflectRow::fail_on("decision_output_json")),
-            "decision_output_json",
-        );
-        assert_reflect_internal_error_mentions(
-            evidence_decision_from_row(&FakeReflectRow::with_decision_output_json(None)),
-            "expected decision output JSON",
-        );
-        assert_reflect_internal_error_mentions(
-            evidence_decision_from_row(&FakeReflectRow::with_decision_output_json(Some(
-                "{not-json",
-            ))),
-            "decision_output_json",
         );
     }
 
@@ -4341,29 +4028,29 @@ mod tests {
     #[test]
     fn insight_error_rate_thresholds() {
         // high (critical, >=40%)
-        let ov = make_overview(100, 40, vec![], 5, None);
-        let ins = generate_insights(&ov, &[], &[]);
+        let ov = make_overview(100, 40, vec![], None);
+        let ins = generate_insights(&ov, &[]);
         assert!(
             ins.iter()
                 .any(|i| i.severity == "critical" && i.kind == InsightKind::ErrorRate)
         );
 
         // elevated (warning, 20%)
-        let ov = make_overview(100, 20, vec![], 5, None);
-        let ins = generate_insights(&ov, &[], &[]);
+        let ov = make_overview(100, 20, vec![], None);
+        let ins = generate_insights(&ov, &[]);
         assert!(
             ins.iter()
                 .any(|i| i.severity == "warning" && i.kind == InsightKind::ErrorRate)
         );
 
         // low (no warning)
-        let ov = make_overview(100, 5, vec![], 5, None);
-        let ins = generate_insights(&ov, &[], &[]);
+        let ov = make_overview(100, 5, vec![], None);
+        let ins = generate_insights(&ov, &[]);
         assert!(!ins.iter().any(|i| i.kind == InsightKind::ErrorRate));
 
         // 100% (critical)
-        let ov = make_overview(10, 10, vec![], 0, None);
-        let ins = generate_insights(&ov, &[], &[]);
+        let ov = make_overview(10, 10, vec![], None);
+        let ins = generate_insights(&ov, &[]);
         assert!(
             ins.iter()
                 .any(|i| i.severity == "critical" && i.kind == InsightKind::ErrorRate)
@@ -4372,8 +4059,8 @@ mod tests {
 
     #[test]
     fn insight_elevated_error_rate() {
-        let overview = make_overview(100, 20, vec![], 5, None);
-        let insights = generate_insights(&overview, &[], &[]);
+        let overview = make_overview(100, 20, vec![], None);
+        let insights = generate_insights(&overview, &[]);
         assert!(
             insights
                 .iter()
@@ -4383,22 +4070,22 @@ mod tests {
 
     #[test]
     fn insight_no_error_rate_warning_when_low() {
-        let overview = make_overview(100, 5, vec![], 5, None);
-        let insights = generate_insights(&overview, &[], &[]);
+        let overview = make_overview(100, 5, vec![], None);
+        let insights = generate_insights(&overview, &[]);
         assert!(!insights.iter().any(|i| i.kind == InsightKind::ErrorRate));
     }
 
     #[test]
     fn insight_repeated_tool_failure() {
         // high count triggers insight
-        let ov = make_overview(50, 5, vec![], 5, None);
+        let ov = make_overview(50, 5, vec![], None);
         let patterns = vec![ErrorPattern {
             skill_name: "bash".into(),
             event_type: "tool_call_failed".into(),
             fail_count: 5,
             sample_error: "permission denied".into(),
         }];
-        let ins = generate_insights(&ov, &patterns, &[]);
+        let ins = generate_insights(&ov, &patterns);
         assert!(
             ins.iter()
                 .any(|i| matches!(&i.kind, InsightKind::ToolFailure { tool } if tool == "bash"))
@@ -4411,7 +4098,7 @@ mod tests {
             fail_count: 2,
             sample_error: "not found".into(),
         }];
-        let ins = generate_insights(&ov, &patterns, &[]);
+        let ins = generate_insights(&ov, &patterns);
         assert!(
             !ins.iter()
                 .any(|i| matches!(&i.kind, InsightKind::ToolFailure { tool } if tool == "bash"))
@@ -4421,8 +4108,8 @@ mod tests {
     #[test]
     fn insight_over_reliance() {
         // over-reliance detected
-        let ov = make_overview(100, 0, vec![("bash".into(), 75)], 5, None);
-        let ins = generate_insights(&ov, &[], &[]);
+        let ov = make_overview(100, 0, vec![("bash".into(), 75)], None);
+        let ins = generate_insights(&ov, &[]);
         assert!(
             ins.iter().any(
                 |i| matches!(&i.kind, InsightKind::ToolConcentration { tool } if tool == "bash")
@@ -4430,21 +4117,15 @@ mod tests {
         );
 
         // balanced usage — no warning
-        let ov = make_overview(
-            100,
-            0,
-            vec![("bash".into(), 30), ("grep".into(), 25)],
-            5,
-            None,
-        );
-        let ins = generate_insights(&ov, &[], &[]);
+        let ov = make_overview(100, 0, vec![("bash".into(), 30), ("grep".into(), 25)], None);
+        let ins = generate_insights(&ov, &[]);
         assert!(!ins.iter().any(|i| i.message.contains("Over-reliance")));
     }
 
     #[test]
     fn insight_short_session() {
-        let overview = make_overview(3, 0, vec![], 1, None);
-        let insights = generate_insights(&overview, &[], &[]);
+        let overview = make_overview(3, 0, vec![], None);
+        let insights = generate_insights(&overview, &[]);
         // Small sessions with 1-4 events no longer get a "short session" insight
         // (removed trivial short-session noise)
         assert!(!insights.iter().any(|i| i.severity == "critical"));
@@ -4452,8 +4133,8 @@ mod tests {
 
     #[test]
     fn insight_empty_session() {
-        let overview = make_overview(0, 0, vec![], 0, None);
-        let insights = generate_insights(&overview, &[], &[]);
+        let overview = make_overview(0, 0, vec![], None);
+        let insights = generate_insights(&overview, &[]);
         assert!(
             insights
                 .iter()
@@ -4463,16 +4144,16 @@ mod tests {
 
     #[test]
     fn missing_context_decision_audits_do_not_imply_routing_failure() {
-        let overview = make_overview(50, 0, vec![], 0, None);
-        let insights = generate_insights(&overview, &[], &[]);
+        let overview = make_overview(50, 0, vec![], None);
+        let insights = generate_insights(&overview, &[]);
         assert!(insights.is_empty());
         assert!(generate_recommendations(&overview, &[], &insights).is_empty());
     }
 
     #[test]
     fn insight_100_pct_error_rate() {
-        let overview = make_overview(10, 10, vec![], 0, None);
-        let insights = generate_insights(&overview, &[], &[]);
+        let overview = make_overview(10, 10, vec![], None);
+        let insights = generate_insights(&overview, &[]);
         assert!(
             insights
                 .iter()
@@ -4482,14 +4163,8 @@ mod tests {
 
     #[test]
     fn insight_huge_session_numbers() {
-        let overview = make_overview(
-            100_000,
-            500,
-            vec![("bash".into(), 40_000)],
-            5000,
-            Some(120.0),
-        );
-        let insights = generate_insights(&overview, &[], &[]);
+        let overview = make_overview(100_000, 500, vec![("bash".into(), 40_000)], Some(120.0));
+        let insights = generate_insights(&overview, &[]);
         assert!(
             insights.is_empty(),
             "large but healthy sessions should not produce low-signal insights: {insights:?}"
@@ -4508,9 +4183,9 @@ mod tests {
 
     #[test]
     fn recommendations_do_not_infer_actions_from_error_count_without_evidence() {
-        let overview = make_overview(100, 40, vec![], 5, None);
+        let overview = make_overview(100, 40, vec![], None);
         let diagnoses = build_diagnoses(&[]); // no raw errors for this test
-        let insights = generate_insights(&overview, &[], &[]);
+        let insights = generate_insights(&overview, &[]);
         let recs = generate_recommendations(&overview, &diagnoses, &insights);
         assert!(
             recs.is_empty(),
@@ -4520,7 +4195,7 @@ mod tests {
 
     #[test]
     fn recommendations_skip_empty_diagnosis_fix_hints() {
-        let overview = make_overview(50, 0, vec![], 0, None);
+        let overview = make_overview(50, 0, vec![], None);
         let diagnoses = vec![Diagnosis {
             category: astra_core::ErrorKind::Unknown,
             severity: "warning".into(),
@@ -4536,14 +4211,14 @@ mod tests {
 
     #[test]
     fn recommendations_long_session() {
-        let overview = make_overview(200, 0, vec![], 10, Some(45.0));
+        let overview = make_overview(200, 0, vec![], Some(45.0));
         let recs = generate_recommendations(&overview, &[], &[]);
         assert!(recs.iter().any(|r| r.summary.contains("breaking")));
     }
 
     #[test]
     fn recommendations_empty_for_clean_session() {
-        let overview = make_overview(50, 0, vec![("bash".into(), 20)], 10, Some(5.0));
+        let overview = make_overview(50, 0, vec![("bash".into(), 20)], Some(5.0));
         let recs = generate_recommendations(&overview, &[], &[]);
         assert!(recs.is_empty());
     }
@@ -4558,7 +4233,7 @@ mod tests {
             20,
             "why did bash fail?",
         );
-        let overview = make_overview(10, 3, vec![("bash".into(), 5)], 2, Some(3.0));
+        let overview = make_overview(10, 3, vec![("bash".into(), 5)], Some(3.0));
         let diagnoses = vec![Diagnosis {
             category: astra_core::ErrorKind::ToolTimeout,
             severity: "warning".into(),
@@ -4633,7 +4308,7 @@ mod tests {
             20,
             "what next?",
         );
-        let overview = make_overview(10, 3, vec![("bash".into(), 5)], 2, Some(3.0));
+        let overview = make_overview(10, 3, vec![("bash".into(), 5)], Some(3.0));
         let diagnoses = vec![Diagnosis {
             category: astra_core::ErrorKind::ToolTimeout,
             severity: "warning".into(),
@@ -4673,7 +4348,7 @@ mod tests {
             20,
             "what failed?",
         );
-        let overview = make_overview(10, 3, vec![], 2, Some(3.0));
+        let overview = make_overview(10, 3, vec![], Some(3.0));
         let timeout = Diagnosis {
             category: astra_core::ErrorKind::ToolTimeout,
             severity: "warning".into(),
@@ -4718,7 +4393,7 @@ mod tests {
     fn observation_envelope_classifies_diagnoses_independent_of_overview_request() {
         let request =
             ReflectRequest::from_observation_params(None, None, None, None, 20, "what went wrong?");
-        let overview = make_overview(12, 2, vec![("bash".into(), 5)], 2, Some(3.0));
+        let overview = make_overview(12, 2, vec![("bash".into(), 5)], Some(3.0));
         let diagnoses = vec![Diagnosis {
             category: astra_core::ErrorKind::ResourceLimit,
             severity: "critical".into(),
@@ -4755,7 +4430,7 @@ mod tests {
             20,
             "how is the session going?",
         );
-        let overview = make_overview(80, 0, vec![("bash".into(), 64)], 0, Some(8.0));
+        let overview = make_overview(80, 0, vec![("bash".into(), 64)], Some(8.0));
         let insights = vec![Insight {
             severity: "info".into(),
             kind: InsightKind::ToolConcentration {
@@ -4840,7 +4515,7 @@ mod tests {
     #[test]
     fn observation_envelope_emits_health_observation_when_no_findings() {
         let request = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
-        let overview = make_overview(8, 0, vec![("bash".into(), 3)], 2, Some(1.0));
+        let overview = make_overview(8, 0, vec![("bash".into(), 3)], Some(1.0));
 
         let (summary, observations, evidence, action_hints, failure_clusters) =
             build_observation_envelope("sess-healthy", &request, &overview, &[], &[], &[], None);
@@ -4859,7 +4534,7 @@ mod tests {
     #[test]
     fn observation_envelope_adds_standard_refs_for_evidence_graph_nodes() {
         let request = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
-        let overview = make_overview(2, 0, vec![], 1, None);
+        let overview = make_overview(2, 0, vec![], None);
         let graph = ObservationGraphSlice {
             nodes: vec![
                 ObservationGraphNode {
@@ -4925,7 +4600,7 @@ mod tests {
             20,
             "show trace",
         );
-        let overview = make_overview(10, 3, vec![("bash".into(), 5)], 2, Some(3.0));
+        let overview = make_overview(10, 3, vec![("bash".into(), 5)], Some(3.0));
         let diagnoses = vec![Diagnosis {
             category: astra_core::ErrorKind::ToolTimeout,
             severity: "warning".into(),
@@ -5128,7 +4803,6 @@ mod tests {
             overall: "fresh".into(),
             source: "server_db".into(),
             events: 10,
-            decisions: 2,
             providers: Default::default(),
             warnings: vec![],
         };
@@ -5292,7 +4966,6 @@ mod tests {
             overall: "fresh".into(),
             source: "server_db".into(),
             events: 1,
-            decisions: 0,
             providers: Default::default(),
             warnings: vec![],
         };
@@ -5311,56 +4984,6 @@ mod tests {
             ModelRequestCaptureCoverage::NoRecordsObserved
         );
         assert!(empty.terminal.is_none());
-    }
-
-    #[test]
-    fn build_evidence_graph_attaches_decisions_to_related_events() {
-        let decisions = vec![EvidenceDecision {
-            decision_id: "d1".into(),
-            event_id: "evt-user".into(),
-            decision_type: "tool_surface".into(),
-            decision_output: serde_json::json!({"tool_calls":["bash"]}),
-            created_at: "2026-04-12T10:00:01".into(),
-        }];
-        let events = vec![
-            EvidenceEvent {
-                event_id: "evt-user".into(),
-                event_type: "user_query".into(),
-                content: "list files".into(),
-                skill_name: None,
-                parent_event_id: None,
-                causal_chain_id: Some("chain-1".into()),
-                created_at: "2026-04-12T10:00:00".into(),
-                ..Default::default()
-            },
-            EvidenceEvent {
-                event_id: "evt-tool".into(),
-                event_type: "tool_call_completed".into(),
-                content: "listed files".into(),
-                skill_name: Some("bash".into()),
-                parent_event_id: Some("evt-user".into()),
-                causal_chain_id: Some("chain-1".into()),
-                created_at: "2026-04-12T10:00:02".into(),
-                ..Default::default()
-            },
-        ];
-        let parent_id_map = std::collections::HashMap::from([(
-            "evt-tool".to_string(),
-            vec!["evt-user".to_string()],
-        )]);
-
-        let graph = build_evidence_graph(&decisions, &events, &parent_id_map).expect("graph");
-        assert_eq!(graph.nodes.len(), 3);
-        assert!(graph.edges.iter().any(|edge| {
-            edge.from == graph_event_ref("evt-user")
-                && edge.to == graph_decision_ref("d1")
-                && edge.kind == ObservationGraphEdgeKind::Supports
-        }));
-        assert!(graph.edges.iter().any(|edge| {
-            edge.from == graph_decision_ref("d1")
-                && edge.to == graph_event_ref("evt-tool")
-                && edge.kind == ObservationGraphEdgeKind::Causes
-        }));
     }
 
     #[test]
@@ -5391,9 +5014,8 @@ mod tests {
             "evt-error".to_string(),
             vec!["evt-call".to_string()],
         )]);
-        let filtered = filter_evidence_events_for_graph(&[], events, &parent_id_map);
 
-        let graph = build_evidence_graph(&[], &filtered, &parent_id_map)
+        let graph = build_evidence_graph(&events, &parent_id_map)
             .expect("event-only failures still produce graph evidence");
         assert_eq!(graph.nodes.len(), 2);
         assert!(graph.nodes.iter().any(|node| {
@@ -5405,34 +5027,6 @@ mod tests {
                 && edge.to == graph_event_ref("evt-error")
                 && edge.kind == ObservationGraphEdgeKind::Causes
         }));
-    }
-
-    #[test]
-    fn evidence_filter_keeps_durable_invocation_lifecycle_independent_of_decisions() {
-        let decisions = vec![EvidenceDecision {
-            decision_id: "d1".into(),
-            event_id: "evt-unrelated".into(),
-            decision_type: "context".into(),
-            decision_output: serde_json::json!({}),
-            created_at: "2026-07-16T10:00:00".into(),
-        }];
-        let lifecycle = EvidenceEvent {
-            event_id: "evt-lifecycle".into(),
-            event_type: "tool_invocation_run_reconciled".into(),
-            content: "prepared_rejected=1".into(),
-            skill_name: None,
-            parent_event_id: None,
-            causal_chain_id: None,
-            created_at: "2026-07-16T10:00:01".into(),
-            ..Default::default()
-        };
-        let filtered = filter_evidence_events_for_graph(
-            &decisions,
-            vec![lifecycle.clone()],
-            &std::collections::HashMap::new(),
-        );
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].event_id, lifecycle.event_id);
     }
 
     /// Validate that all GROUP BY queries only SELECT grouped columns or aggregate functions.
@@ -5452,12 +5046,6 @@ mod tests {
                AND COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) IS NOT NULL \
              GROUP BY COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) \
              ORDER BY cnt DESC LIMIT 5",
-            // decisions
-            "SELECT d.decision_type, COUNT(*) AS cnt, \
-               COUNT(DISTINCT d.model_used) AS models_used \
-             FROM ctx_decision_audits d \
-             WHERE d.user_id = ? AND d.session_id = ? \
-             GROUP BY d.decision_type ORDER BY cnt DESC LIMIT 5",
             REFLECT_ERROR_PATTERNS_SQL,
         ];
 
@@ -5796,7 +5384,7 @@ mod tests {
 
     #[test]
     fn recommendations_from_diagnoses() {
-        let overview = make_overview(50, 3, vec![], 5, None);
+        let overview = make_overview(50, 3, vec![], None);
         let diags = vec![Diagnosis {
             category: astra_core::ErrorKind::ResourceLimit,
             severity: "critical".into(),

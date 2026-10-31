@@ -325,7 +325,6 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
         overall: "unavailable".to_string(),
         source: "edge_local_artifacts_unavailable".to_string(),
         events: 0,
-        decisions: 0,
         providers,
         warnings: vec![warning],
     };
@@ -753,7 +752,6 @@ fn introspect_data_coverage(
         },
         source,
         events,
-        decisions: snapshot.semantic_cache_decisions.len() as i64,
         providers,
         warnings,
     }
@@ -1806,7 +1804,6 @@ mod tests {
                 counts: Some(
                     astra_services::semantic_judgment_observation::SemanticJudgmentStageCounts {
                         evaluated: 1,
-                        decisions: 1,
                         ..Default::default()
                     },
                 ),

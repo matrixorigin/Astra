@@ -36,7 +36,6 @@ pub mod device_lease_sweeper;
 mod edge;
 pub(crate) use edge::edge_capacity_handler::validate_relay_origin;
 pub(crate) mod explain_analyze_artifact;
-pub mod harness;
 pub(crate) mod header_utils;
 mod http_helpers;
 mod inference_settlement_sweeper;

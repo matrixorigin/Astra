@@ -142,14 +142,6 @@ pub use astra_services::{
         SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
         SessionService, SessionUpdateRequestData,
     },
-    context::{
-        ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
-        SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
-    },
-    decisions::{
-        DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
-        DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
-    },
     events::{
         DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord,
         EventRecord, EventService, UnconfiguredEventService,

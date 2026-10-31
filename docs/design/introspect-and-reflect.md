@@ -1,9 +1,18 @@
 # Introspect and reflect
 
 > Status: target design contract.
-> Last updated: 2026-09-28.
+> Last updated: 2026-10-31.
 
 Introspect and reflect are first-class backbone capabilities. They are not debug-only tools and not prompt decorations.
+
+Generic Context-snapshot/Decision-audit CRUD and the table-backed Context trend,
+snapshot, retrieval-quality and introspection decision-trace endpoints are
+retired. Reflection uses bounded canonical execution events, actual semantic
+judgments and physical inference evidence. It omits the retired decision-audit provider, its old count and model-fanout
+inference. Retirement does not make supported event/semantic/model coverage
+partial or add a routine user warning; absence is not reported as zero decisions. The chat Session decision-trace endpoint and CLI
+local introspection remain available. Server harness snapshot streaming/history
+is retired while kernel verifier enforcement and CLI `/inspect` remain intact.
 
 ## Ownership
 

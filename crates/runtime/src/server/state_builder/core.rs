@@ -122,12 +122,6 @@ pub(super) fn build_core_state(
     .with_event_service(Arc::new(
         DatabaseEventService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
-    .with_context_service(Arc::new(
-        DatabaseContextService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_decision_service(Arc::new(
-        DatabaseDecisionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
     .with_model_service(Arc::new(
         DatabaseModelService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
             .with_uc_native(uc_provider)

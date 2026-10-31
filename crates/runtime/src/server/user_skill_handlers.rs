@@ -3,7 +3,7 @@
 use super::*;
 use astra_services::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore,
-    PersonalSkillError, RecordUserSkillEvaluation, SubmitUserSkillVersion,
+    PersonalSkillError, SubmitUserSkillVersion,
 };
 use serde::Deserialize;
 
@@ -32,8 +32,7 @@ fn map_personal_skill_error(error: PersonalSkillError) -> (StatusCode, Json<Erro
             error_response(StatusCode::CONFLICT, error.to_string())
         }
         PersonalSkillError::VersionNotFound { .. }
-        | PersonalSkillError::SessionNotActive { .. }
-        | PersonalSkillError::RunNotFound { .. } => {
+        | PersonalSkillError::SessionNotActive { .. } => {
             error_response(StatusCode::NOT_FOUND, error.to_string())
         }
         PersonalSkillError::InvalidActiveProjection { .. } => {
@@ -123,23 +122,5 @@ pub(super) async fn activate_user_skill_handler(
         )
         .await
         .map(Json)
-        .map_err(map_personal_skill_error)
-}
-
-pub(super) async fn record_user_skill_evaluation_handler(
-    State(state): State<AppState>,
-    Path(skill_name): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<RecordUserSkillEvaluation>,
-) -> Result<
-    (StatusCode, Json<astra_services::UserSkillEvaluationRecord>),
-    (StatusCode, Json<ErrorResponse>),
-> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let store = require_personal_skill_store(&state)?;
-    store
-        .record_evaluation(&user.user_id, &skill_name, request)
-        .await
-        .map(|record| (StatusCode::CREATED, Json(record)))
         .map_err(map_personal_skill_error)
 }

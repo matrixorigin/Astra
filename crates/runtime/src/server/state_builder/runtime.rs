@@ -139,7 +139,7 @@ pub(super) async fn build_runtime_wiring(
     }
 
     #[cfg(feature = "harness")]
-    let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
+    let run_lifecycle = run_lifecycle.with_harness_observation();
 
     // Reconciliation must follow complete service composition. A checkpoint
     // cannot be dispatched while model, policy, mailbox or tool owners are
@@ -167,13 +167,13 @@ async fn recover_active_runs(
                     .filter(|run| {
                         run.status == astra_core::STATUS_PAUSED
                             && run.waiting_for.is_none()
-                            && run.checkpoint_version.as_deref() != Some("execution_handoff_v1")
+                            && run.current_checkpoint_version() != Some("execution_handoff_v1")
                     })
                     .count();
                 let handoffs_preserved = recovered_runs
                     .iter()
                     .filter(|run| {
-                        run.checkpoint_version.as_deref() == Some("execution_handoff_v1")
+                        run.current_checkpoint_version() == Some("execution_handoff_v1")
                             && !matches!(
                                 run.status.as_str(),
                                 astra_core::STATUS_COMPLETED

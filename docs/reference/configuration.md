@@ -294,7 +294,7 @@ across terminals and browsers; `/explain --format markdown` and
 `/explain --format text` select a different derived companion for the next
 capture.
 
-Durable harness snapshot history is controlled by the `harness_snapshots` trace category; production defaults keep it off and `trace.profile = "dev"` enables it. Persisted prompt hash-diffs and Context manifests are retired, together with the `prompt_assembly`/`context_assembly` categories and overlays. Configurations naming those categories are unsupported. Live Context traces, actual provider request evidence and explicitly enabled full LLM captures retain their independent controls.
+Server harness snapshot persistence, history/stream routes, the `harness_snapshots` trace category and its setting overlay are removed. The harness kernel keeps the same configured verifiers and limits with its existing bounded in-memory sink; CLI `/inspect` remains local. Configurations naming the retired category are unsupported. Persisted prompt hash-diffs and Context manifests are retired, together with the `prompt_assembly`/`context_assembly` categories and overlays. Configurations naming those categories are unsupported. Live Context traces, actual provider request evidence and explicitly enabled full LLM captures retain their independent controls.
 
 Provider admission is intentionally configured by capacity inputs only. Scope is fixed at provider level; window size, retention, cleanup cadence, burst, and fail-closed behavior are internal runtime policy rather than deployment knobs.
 

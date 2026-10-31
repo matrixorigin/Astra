@@ -127,8 +127,8 @@ WITH roots AS (
     FROM roots WHERE selected_rank = 1
 ), candidates AS (
     SELECT r.*, b.opening_hash, b.context_admission_hash,
-           COALESCE(OCTET_LENGTH(b.opening_events_json), 0) +
-               COALESCE(OCTET_LENGTH(b.opening_context_json), 4) AS stored_bytes,
+           COALESCE(OCTET_LENGTH(o.opening_events_json), 0) +
+               COALESCE(OCTET_LENGTH(o.opening_context_json), 4) AS stored_bytes,
            s.history_loaded,
            CASE WHEN r.status = 'failed' THEN LEFT(b.error_message, 256) ELSE NULL END AS failure_message,
            CASE WHEN r.status = 'failed' THEN b.error_code ELSE NULL END AS failure_code,
@@ -137,6 +137,7 @@ WITH roots AS (
                ELSE NULL END AS terminal_assistant_source,
            CASE WHEN r.status = 'failed' AND CHAR_LENGTH(b.error_message) > 256 THEN 1 ELSE 0 END AS failure_detail_truncated
     FROM roots r JOIN agent_runs b ON b.user_id = r.user_id AND b.run_id = r.run_id
+    LEFT JOIN agent_run_openings o ON o.user_id = r.user_id AND o.session_id = r.session_id AND o.run_id = r.run_id
     CROSS JOIN selection s
     WHERE b.user_id = ? AND b.session_id = ? AND (history_rank <= 201 OR selected_rank = 1)
       AND (s.history_loaded = 1 OR selected_rank = 1)
@@ -169,14 +170,14 @@ SELECT 'root' AS record_kind, r.session_id, r.run_id, r.status, r.waiting_for,
        r.opening_hash, r.context_admission_hash,
        CASE WHEN body_loaded = 1 THEN b.opening_events_json ELSE CAST(NULL AS CHAR) END AS opening_events_json,
        CASE WHEN body_loaded = 1 THEN b.opening_context_json ELSE CAST(NULL AS CHAR) END AS opening_context_json,
-       body_loaded AS opening_body_loaded, stored_bytes, history_loaded,
+       CASE WHEN b.run_id IS NULL THEN -1 ELSE body_loaded END AS opening_body_loaded, stored_bytes, history_loaded,
        CASE WHEN body_loaded = 1 THEN failure_message ELSE NULL END AS failure_message,
        failure_code, terminal_assistant_source,
        CASE WHEN failure_detail_truncated = 1 OR (body_loaded = 0 AND failure_message IS NOT NULL)
             THEN 1 ELSE 0 END AS failure_detail_truncated,
        CAST(NULL AS SIGNED) AS item_seq, CAST(NULL AS CHAR) AS role,
        CAST(NULL AS CHAR) AS content, CAST(NULL AS CHAR) AS payload_json, CAST(NULL AS CHAR) AS source_event_id
-FROM admitted r JOIN agent_runs b
+FROM admitted r LEFT JOIN agent_run_openings b
  ON b.user_id = r.user_id AND b.session_id = r.session_id AND b.run_id = r.run_id
 UNION ALL
 SELECT 'raw', t.session_id, t.run_id, r.status, CAST(NULL AS CHAR),
@@ -312,10 +313,19 @@ pub(crate) async fn read_conversation(
             .try_get::<i64, _>("history_loaded")
             .map_err(|e| e.to_string())?
             == 1;
-        let loaded = row
+        let loaded = match row
             .try_get::<i64, _>("opening_body_loaded")
             .map_err(|e| e.to_string())?
-            == 1;
+        {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(format!(
+                    "immutable opening row is missing for Run {}",
+                    root.run_id
+                ));
+            }
+        };
         if selected_rank == 1 {
             selected = Some(ConversationRoot {
                 run_id: root.run_id.clone(),

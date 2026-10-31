@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<AppState> {
+pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/admin/model-router/{owner}",
@@ -22,7 +22,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             "/admin/model-router/{owner}/outcomes/{run_id}",
             post(router_rollout_handlers::outcome),
         )
-        .nest("/admin/harness", admin_harness_routes(state.clone()))
         .route(
             "/admin/register",
             post(admin_handlers::admin_register_handler),
@@ -89,20 +88,4 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             "/admin/tool-offers/disabled/{offer_id}",
             delete(admin_handlers::admin_enable_tool_handler),
         )
-}
-
-#[cfg(feature = "harness")]
-fn admin_harness_routes(state: AppState) -> Router<AppState> {
-    use axum::routing::get;
-    Router::new()
-        .route(
-            "/sessions",
-            get(crate::server::harness::handlers::list_active_harness_sessions),
-        )
-        .with_state(state)
-}
-
-#[cfg(not(feature = "harness"))]
-fn admin_harness_routes(_state: AppState) -> Router<AppState> {
-    Router::new()
 }

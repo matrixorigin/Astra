@@ -4,7 +4,6 @@
 //! Callers (LLM) receive conclusions, not raw data.
 
 pub mod database;
-pub mod scoring;
 
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -375,56 +374,6 @@ pub trait IntrospectionService: Send + Sync {
         user_id: &str,
     ) -> ServiceResult<SkillsIntrospectionResponse>;
 
-    async fn get_context_trend(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        turns: i32,
-        context_window: i64,
-    ) -> ServiceResult<Value>;
-
-    async fn get_context_snapshot(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        turn_index: Option<i32>,
-        detail: bool,
-        raw: bool,
-        raw_token_budget: i32,
-    ) -> ServiceResult<Value>;
-
-    async fn get_retrieval_quality(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        turns: i32,
-    ) -> ServiceResult<Value>;
-
-    /// Recent decisions for a session — who picked what, why, and when.
-    /// Exposed to the LLM so it can read its own decision trace in-turn
-    /// instead of waiting for a human-facing dashboard.
-    ///
-    /// Response shape (schema_version = 1):
-    /// ```json
-    /// {
-    ///   "schema_version": 1,
-    ///   "session_id": "...",
-    ///   "user_id": "...",
-    ///   "last_n": 20,
-    ///   "decisions": [
-    ///     {"decision_id": "...", "decision_type": "tool_surface",
-    ///      "created_at": "...", "output": {...}},
-    ///     ...
-    ///   ]
-    /// }
-    /// ```
-    async fn get_decision_trace(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        last_n: i32,
-    ) -> ServiceResult<Value>;
-
     /// Per-tool history across the caller's sessions within a rolling
     /// `window_hours` (default 24).
     ///
@@ -488,26 +437,6 @@ impl IntrospectionService for UnconfiguredIntrospectionService {
     ) -> ServiceResult<SkillsIntrospectionResponse> {
         Err(internal_error("introspection service not configured"))
     }
-    async fn get_context_trend(&self, _: &str, _: &str, _: i32, _: i64) -> ServiceResult<Value> {
-        Err(internal_error("introspection service not configured"))
-    }
-    async fn get_context_snapshot(
-        &self,
-        _: &str,
-        _: &str,
-        _: Option<i32>,
-        _: bool,
-        _: bool,
-        _: i32,
-    ) -> ServiceResult<Value> {
-        Err(internal_error("introspection service not configured"))
-    }
-    async fn get_retrieval_quality(&self, _: &str, _: &str, _: i32) -> ServiceResult<Value> {
-        Err(internal_error("introspection service not configured"))
-    }
-    async fn get_decision_trace(&self, _: &str, _: &str, _: i32) -> ServiceResult<Value> {
-        Err(internal_error("introspection service not configured"))
-    }
     async fn get_tool_history(&self, _: &str, _: &str, _: i32) -> ServiceResult<Value> {
         Err(internal_error("introspection service not configured"))
     }
@@ -516,77 +445,9 @@ impl IntrospectionService for UnconfiguredIntrospectionService {
     }
 }
 
-// ── Query parameter types ────────────────────────────────────────────────────
-
-fn default_turns() -> i32 {
-    10
-}
-fn default_context_window() -> i64 {
-    200000
-}
-fn default_retrieval_turns() -> i32 {
-    5
-}
-fn default_raw_token_budget() -> i32 {
-    2000
-}
-
-#[derive(Deserialize)]
-pub struct ContextTrendQuery {
-    pub session_id: String,
-    #[serde(default = "default_turns")]
-    pub turns: i32,
-    #[serde(default = "default_context_window")]
-    pub context_window: i64,
-}
-
-#[derive(Deserialize)]
-pub struct ContextSnapshotQuery {
-    pub session_id: String,
-    pub turn_index: Option<i32>,
-    #[serde(default)]
-    pub detail: bool,
-    #[serde(default)]
-    pub raw: bool,
-    #[serde(default = "default_raw_token_budget")]
-    pub raw_token_budget: i32,
-}
-
-#[derive(Deserialize)]
-pub struct RetrievalQualityQuery {
-    pub session_id: String,
-    #[serde(default = "default_retrieval_turns")]
-    pub turns: i32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn context_trend_query_defaults() {
-        let json = r#"{"session_id": "s1"}"#;
-        let q: ContextTrendQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.turns, 10);
-        assert_eq!(q.context_window, 200000);
-    }
-
-    #[test]
-    fn context_snapshot_query_defaults() {
-        let json = r#"{"session_id": "s1"}"#;
-        let q: ContextSnapshotQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.raw_token_budget, 2000);
-        assert!(!q.detail);
-        assert!(!q.raw);
-        assert!(q.turn_index.is_none());
-    }
-
-    #[test]
-    fn retrieval_quality_query_defaults() {
-        let json = r#"{"session_id": "s1"}"#;
-        let q: RetrievalQualityQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.turns, 5);
-    }
 
     #[test]
     fn intent_drift_contract_accepts_only_explicit_llm_provenance() {

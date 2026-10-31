@@ -1,7 +1,7 @@
 # Data and storage
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-10-31.
 
 Data and storage owns platform state layering, MatrixOne usage, retention, archival, versioning, and data correctness boundaries.
 
@@ -50,30 +50,29 @@ primary key prevents identity reuse without a separate identity table.
 
 ## Persistence simplification boundary
 
-The production schema inventory contains 121 table declarations after retiring
-ten of the 131 declarations in this review. Individual bootstrap boundaries may
-initialize a subset; messaging, resource governance and provider admission also
-own declarations. Distinct durable facts do not automatically justify separate tables;
-this is a disposition for this delivery, not proof every retained table is
-permanently necessary. The source inventory remains the complete table catalog.
+The production schema inventory contains 117 table declarations. This wave
+retires five additional declarations (`ctx_snapshots`, `ctx_decision_audits`,
+`harness_snapshots`, `session_state_item_events`, `user_skill_evaluations`) and
+adds the immutable `agent_run_openings` payload owner. Earlier retirement of
+ten declarations is already part of the baseline.
 
-| Journey | Retained table count | Boundary and disposition |
-| --- | ---: | --- |
-| Identity, device trust and policy | 14 | Preserve authorization, replay protection and credential/lease authority. |
-| Session, Run and conversation | 7 | Preserve lifecycle, deletion fencing, canonical transcript and recovery. |
-| Canonical Context, fork and handoff | 14 | Preserve heads, immutable nodes, pins, receipts and execution switching. |
-| Event audit and other diagnostics | 6 | Preserve event DAG, explicit context/decision captures, harness and collision diagnostics. Other diagnostic products remain candidates for separate evaluation. |
-| Inference and model routing | 11 | Preserve physical provider identity, admission, settlement, usage and route policy; metrics remain a derived projection. |
-| Tools and artifacts | 8 | Preserve uncertain-effect recovery, durable reference edges, upload leases, reservations and sealed bytes. |
-| Workspace, agents, Edge and messaging | 9 | Preserve selected provider ownership, dispatch and message coordination. |
-| MCP and skills | 11 | Preserve installed capabilities, credentials and version/evaluation journeys. MCP discovery remains a projection. |
-| Plan, session state and semantic reads | 6 | Preserve actual authoring gates, owner state and read observations; Work is not an automatic replacement for these callers. |
-| Quotas, bootstrap and maintenance | 7 | Preserve admission limits, schema ownership and bounded maintenance progress. |
-| Work roots, revisions, decisions and operations | 25 | Preserve branches, evidence, ordering, recovery and cross-Session operations; do not replace sequence high-water marks with retained-row MAX. |
-| Work runtime-event delivery | 2 | Preserve the bounded outbox, coverage floor and projection cursor. |
-| Work saved-progress capture | 1 | Preserve real capture, package/download and artifact/Context retention. |
+| Journey | Boundary and disposition |
+| --- | --- |
+| Identity, device trust and policy | Preserve authorization, replay protection and credential/lease authority. |
+| Session, Run and conversation | Preserve lifecycle, deletion fencing, canonical transcript and recovery. |
+| Canonical Context, fork and handoff | Preserve heads, immutable nodes, pins, receipts and execution switching. |
+| Event audit and other diagnostics | Preserve the event DAG, semantic/model evidence and identity-collision diagnostics. Generic Context/Decision captures and Server harness snapshot products are retired. |
+| Inference and model routing | Preserve physical provider identity, admission, settlement, usage and route policy; metrics remain a derived projection. |
+| Tools and artifacts | Preserve uncertain-effect recovery, durable reference edges, upload leases, reservations and sealed bytes. |
+| Workspace, agents, Edge and messaging | Preserve selected provider ownership, dispatch and message coordination. |
+| MCP and skills | Preserve installed capabilities, credentials and version/evaluation journeys. MCP discovery remains a projection. |
+| Plan, session state and semantic reads | Preserve actual authoring gates, owner state and read observations; Work is not an automatic replacement for these callers. |
+| Quotas, bootstrap and maintenance | Preserve admission limits, schema ownership and bounded maintenance progress. |
+| Work roots, revisions, decisions and operations | Preserve branches, evidence, ordering, recovery and cross-Session operations; do not replace sequence high-water marks with retained-row MAX. |
+| Work runtime-event delivery | Preserve the bounded outbox, coverage floor and projection cursor. |
+| Work saved-progress capture | Preserve real capture, package/download and artifact/Context retention. |
 
-The removed product chains are prompt hash-diff diagnostics (two tables),
+The earlier wave removed prompt hash-diff diagnostics (two tables),
 legacy database-versioning HTTP checkpoints (one), Work-specific patch
 export/application/commit (three), and persisted Context manifest diagnostics
 (two), plus the two duplicate Work representations described above. No new
@@ -95,6 +94,40 @@ no new schema marker, migration, compatibility API or old-data cleanup. Strict
 request-context JSON decoding is not promised for historical payloads. Existing
 engine snapshots and in-flight old Git operations are not reconciled by the new
 build; stop old workers before handing their workspaces to a new deployment.
+
+### Mutable Run control and cold payloads
+
+`agent_runs` is the sole Run control owner. Its immutable opening bodies live
+in exactly one `agent_run_openings` row per Run, including Runs with no opening.
+The existing creation transaction writes both rows, initial events and admitted
+Context together. Full readers verify the opening hashes and reject a missing
+payload row; control/frames-only readers explicitly carry an unloaded body.
+Conversation selection, watermark and admitted opening bytes share one statement
+snapshot. Session deletion removes opening rows before Run rows.
+
+Checkpoint bodies live only in `run_checkpoints`. The Run stores an all-null or
+all-present `(current_checkpoint_id, checkpoint_version, current_checkpoint_hash)`
+reference; the digest covers the exact stored bytes. Mutable ordinary identities
+retain their original creation time, so saving A, B, then A makes A current while
+B may still be newest by history creation order. Immutable handoff retries keep
+the original stored bytes and hash. Owner/generation/lease/cancellation admission,
+checkpoint persistence and the final Run CAS remain one transaction. Historical
+handoff-reference validation retains its separate custody/tail rules.
+
+The bounded terminal receipt and error remain on the Run row to preserve atomic
+terminal settlement without another write. Recency updates retain their existing
+list/cursor semantics. Guidance reads lease liveness with its locked control
+projection; exact commit reconciliation uses positional windows of at most 64
+identities and 16 KiB of identity bytes. Ordinary append already batches its
+idempotency preflight. These paths add no cache, scheduler or lifecycle owner. The Run binding/Offering indexes and Run-event event-ID index are removed: current queries do not filter by those keys; owner/recency, Work, sequence/idempotency, control, interaction, subject and supersession access paths retain their indexes.
+
+The retired diagnostic products intentionally lose their separately submitted
+Context/Decision payloads, Server live/durable harness snapshots, duplicate
+activation mutation history and self-reported skill evaluation counts. Real
+Context authority, semantic judgments, model receipts, event reflection, harness
+verifier enforcement and skill authoring/publication/activation remain with their
+existing owners. No migration, backfill, compatibility reader or new schema marker
+is provided: this shape requires a fresh database and one matching binary version.
 
 ## MatrixOne role
 
@@ -233,12 +266,12 @@ Run checkpoint custody remains with `run_checkpoints`.
 Fresh schemas also omit `skill_selection_events`, `infra_sandbox_metadata`
 and `skill_metrics`. The separate skill-selection writer copied queries and
 reported success without deriving it from execution. Actual skill resolution,
-activation, tool outcomes, decision audit and observer dispatch retain their
+activation, tool outcomes, semantic decision evidence and observer dispatch retain their
 existing owners. The metadata-only Sandbox CRUD API and its database-snapshot
 alias are removed; execution isolation belongs to the selected capacity provider
 and workspace. Marketplace report aggregation, global quality statistics and
 ranked search are removed; registry visibility, installation and personal-skill
-evaluation remain. No replacement projections or compatibility paths are added.
+authoring, publishing and activation remain. No replacement projections or compatibility paths are added.
 These cuts apply to fresh databases. They do not delete existing physical tables
 or historical rows, and do not define a mixed-version deployment or data-retention
 transition.
@@ -418,7 +451,7 @@ Agent events must have explicit retention class.
 Suggested retention classes:
 
 | Class | Examples | Policy |
-| --- | --- | --- |
+| --- | --- |
 | control_audit | permission, provider decision, run transition | account/audit policy. |
 | trace_default | tool lifecycle, retry/cache/sync facts | diagnosis window, then archive/compact. |
 | quality_signal | tool quality, eval labels | learning/eval policy after redaction. |

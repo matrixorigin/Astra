@@ -22,6 +22,25 @@ use std::{sync::Arc, time::Duration};
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 
+/// Seed cold-body fixtures below the public codec, including corrupt bodies
+/// which metadata-only reads must never materialize or interpret.
+async fn seed_current_checkpoint_fixture(
+    pool: &SharedPool,
+    user: &str,
+    session: &str,
+    run: &str,
+    body: Option<&str>,
+) {
+    let identity = body.map(|_| format!("fixture-{}", uuid::Uuid::new_v4()));
+    if let (Some(id), Some(body)) = (&identity, body) {
+        sqlx::query("INSERT INTO run_checkpoints (checkpoint_id, run_id, user_id, session_id, node_seq, checkpoint_kind, checkpoint_version, idempotency_key, checkpoint_json) VALUES (?, ?, ?, ?, 0, 'phase', 'phase_checkpoint_v1', ?, ?)")
+            .bind(id).bind(run).bind(user).bind(session).bind(id).bind(body).execute(pool.get()).await.unwrap();
+    }
+    let hash = body.map(|body| format!("{:x}", Sha256::digest(body.as_bytes())));
+    sqlx::query("UPDATE agent_runs SET current_checkpoint_id = ?, checkpoint_version = ?, current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?")
+        .bind(&identity).bind(body.map(|_| "phase_checkpoint_v1")).bind(hash).bind(user).bind(run).execute(pool.get()).await.unwrap();
+}
+
 /// Capture actual statements only within the instrumented store call.
 #[derive(Clone, Default)]
 struct Queries(Arc<std::sync::Mutex<Vec<String>>>);
@@ -68,7 +87,7 @@ fn make_idempotent_event(
 
 fn durable_run_record(run_id: String, user_id: String, session_id: String) -> DurableRunRecord {
     DurableRunRecord {
-        opening: None,
+        opening: Default::default(),
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
@@ -89,8 +108,7 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
         owner_lease_expires_at: None,
         run_generation: 1,
         last_event_idx: -1,
-        checkpoint_version: None,
-        checkpoint_json: None,
+        current_checkpoint: None,
         error_code: None,
         error_message: None,
 
@@ -248,13 +266,10 @@ async fn load_run_does_not_mix_metadata_with_later_committed_events() {
             }
             let mut queries = Queries::default();
             event.record(&mut queries);
-            if !queries
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|sql| sql.contains("FROM agent_runs WHERE user_id = ? AND run_id = ?"))
-            {
+            if !queries.0.lock().unwrap().iter().any(|sql| {
+                sql.contains("FROM agent_runs LEFT JOIN agent_run_openings")
+                    && sql.contains("WHERE user_id = ? AND run_id = ?")
+            }) {
                 return;
             }
             if let Some(ready) = self.ready.lock().unwrap().take() {
@@ -401,6 +416,10 @@ async fn cancellation_intent_is_independent_from_a_locked_session_row() {
     for (sql, scoped_id) in [
         (
             "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            &run_id,
+        ),
+        (
+            "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
             &run_id,
         ),
         (
@@ -819,13 +838,7 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
             json!({"version":"checkpoint_v1", "graceful":true, "payload":"x".repeat(bytes)})
                 .to_string()
         });
-        sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
-            .bind(&body)
-            .bind(&user)
-            .bind(&run)
-            .execute(pool.get())
-            .await
-            .unwrap();
+        seed_current_checkpoint_fixture(&pool, &user, &session, &run, body.as_deref()).await;
         let event = make_idempotent_event(
             "agent_progress",
             &format!("body-{bytes}"),
@@ -846,7 +859,7 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
                 .find(|sql| sql.contains("FROM agent_runs") && sql.contains("FOR UPDATE"))
                 .expect("actual run-lock statement");
             assert!(
-                locked_run.contains("CAST(NULL AS CHAR) AS checkpoint_json"),
+                !locked_run.contains("checkpoint_json") && !locked_run.contains("run_checkpoints"),
                 "append must omit recovery body: {locked_run}"
             );
             eprintln!(
@@ -856,7 +869,7 @@ async fn event_append_keeps_checkpoint_durable_without_reading_its_body() {
             );
         }
         let retained: Option<String> = sqlx::query_scalar(
-            "SELECT checkpoint_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            "SELECT c.checkpoint_json FROM agent_runs r LEFT JOIN run_checkpoints c ON c.user_id = r.user_id AND c.run_id = r.run_id AND c.checkpoint_id = r.current_checkpoint_id WHERE r.user_id = ? AND r.run_id = ?",
         )
         .bind(&user)
         .bind(&run)
@@ -1098,6 +1111,7 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
     let user_id = format!("recovery-history-user-{}", uuid::Uuid::new_v4());
     let session_id = format!("recovery-history-session-{}", uuid::Uuid::new_v4());
     let run_id = format!("recovery-history-run-{}", uuid::Uuid::new_v4());
+    let oversized_run_id = format!("oversized-{}", uuid::Uuid::new_v4());
     let malformed_run_id = format!("recovery-history-malformed-{}", uuid::Uuid::new_v4());
     insert_run_fixture(
         &_pool,
@@ -1105,15 +1119,23 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         durable_run_record(run_id.clone(), user_id.clone(), session_id.clone()),
     )
     .await;
-    let mut malformed_record = durable_run_record(
+    let malformed_record = durable_run_record(
         malformed_run_id.clone(),
         user_id.clone(),
         session_id.clone(),
     );
-    malformed_record.checkpoint_version = Some("checkpoint_v1".into());
-    malformed_record.checkpoint_json =
-        Some(r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":7}"#.into());
     insert_run_fixture(&_pool, store.as_ref(), malformed_record).await;
+
+    insert_run_fixture(
+        &_pool,
+        store.as_ref(),
+        durable_run_record(
+            oversized_run_id.clone(),
+            user_id.clone(),
+            session_id.clone(),
+        ),
+    )
+    .await;
 
     let checkpoint_json =
         r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"canonical-only"}"#;
@@ -1148,6 +1170,25 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         .expect("insert recovery checkpoint fixture");
     }
 
+    // The newest oversized row is invalid even though an older valid row
+    // exists. Exercise the actual bounded SQL projection, not just the codec.
+    for (offset, body) in [
+        (0, checkpoint_json.to_owned()),
+        (
+            1,
+            json!({
+                "version":"checkpoint_v1", "graceful":true,
+                "last_batch_id":"oversized", "padding":"x".repeat(8 * 1024 * 1024)
+            })
+            .to_string(),
+        ),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO run_checkpoints (checkpoint_id,run_id,user_id,session_id,node_seq,checkpoint_kind,checkpoint_version,idempotency_key,checkpoint_json,created_at) VALUES (?,?,?,?,4,'resume','checkpoint_v1',?,?,DATE_ADD(NOW(6),INTERVAL ? SECOND))")
+            .bind(&id).bind(&oversized_run_id).bind(&user_id).bind(&session_id)
+            .bind(&id).bind(body).bind(offset).execute(_pool.get()).await.unwrap();
+    }
+
     let claims = store
         .claim_recoverable_active_runs(256)
         .await
@@ -1157,8 +1198,7 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         .find(|claim| claim.run.user_id == user_id && claim.run.run_id == run_id)
         .expect("canonical-only recovery run should be claimed");
     assert!(claim.has_graceful_resume_checkpoint);
-    assert!(claim.run.checkpoint_version.is_none());
-    assert!(claim.run.checkpoint_json.is_none());
+    assert!(claim.run.current_checkpoint.is_none());
 
     let malformed_claim = claims
         .iter()
@@ -1166,9 +1206,22 @@ async fn recovery_claim_reads_canonical_resume_history_without_embedded_snapshot
         .expect("malformed canonical recovery run should be claimed");
     assert!(!malformed_claim.has_graceful_resume_checkpoint);
 
-    for run_id in [run_id.as_str(), malformed_run_id.as_str()] {
+    assert!(
+        !claims
+            .iter()
+            .find(|claim| claim.run.run_id == oversized_run_id)
+            .expect("oversized newest checkpoint still permits its existing owner claim")
+            .has_graceful_resume_checkpoint
+    );
+
+    for run_id in [
+        run_id.as_str(),
+        malformed_run_id.as_str(),
+        oversized_run_id.as_str(),
+    ] {
         for statement in [
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
         ] {
             let _ = sqlx::query(statement)
@@ -1865,13 +1918,7 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         .unwrap()
         .last_event_idx;
     let checkpoint = "x".repeat(256 * 1024);
-    sqlx::query("UPDATE agent_runs SET checkpoint_json = ? WHERE user_id = ? AND run_id = ?")
-        .bind(&checkpoint)
-        .bind(&user)
-        .bind(&run)
-        .execute(pool.get())
-        .await
-        .unwrap();
+    seed_current_checkpoint_fixture(&pool, &user, &session, &run, Some(&checkpoint)).await;
     let (_, replica) = setup().await;
     for phase in 0..2 {
         if phase == 1 {
@@ -1922,7 +1969,7 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
             "status reads cannot write"
         );
         assert!(
-            reads[0].contains("CAST(NULL AS CHAR) AS checkpoint_json"),
+            !reads[0].contains("checkpoint_json") && !reads[0].contains("run_checkpoints"),
             "status must not hydrate recovery bodies"
         );
     }
@@ -1951,7 +1998,7 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         );
     }
     let retained: String = sqlx::query_scalar(
-        "SELECT checkpoint_json FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        "SELECT c.checkpoint_json FROM agent_runs r LEFT JOIN run_checkpoints c ON c.user_id = r.user_id AND c.run_id = r.run_id AND c.checkpoint_id = r.current_checkpoint_id WHERE r.user_id = ? AND r.run_id = ?",
     )
     .bind(&user)
     .bind(&run)
@@ -2833,7 +2880,6 @@ async fn root_discovery_uses_admission_order_and_decodes_narrow_owner_scoped_ide
     for (run_id, owner, session, day) in fixtures {
         let mut run = durable_run_record(run_id.clone(), owner.clone(), session.clone());
         run.status = "completed".into();
-        run.checkpoint_json = Some("x".repeat(512 * 1024));
         if run_id == &child {
             run.depth = 1;
             run.parent_run_id = Some(newer_root.clone());
@@ -2841,6 +2887,14 @@ async fn root_discovery_uses_admission_order_and_decodes_narrow_owner_scoped_ide
             run.ancestor_path = Some(format!("{newer_root}/{child}"));
         }
         insert_run_fixture(&pool, store.as_ref(), run).await;
+        seed_current_checkpoint_fixture(
+            &pool,
+            owner,
+            session,
+            run_id,
+            Some(&"x".repeat(512 * 1024)),
+        )
+        .await;
         store
             .append_event(
                 owner,
@@ -3203,4 +3257,202 @@ async fn auto_model_routing_database_commit_is_atomic_and_fenced() {
     run.resolved_model_name = Some("strong-model".into());
     insert_run_fixture(&pool, store.as_ref(), run.clone()).await;
     assert_auto_model_routing_commit(store.as_ref(), &run).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion() {
+    use astra_services::runs::{
+        AtomicRunActionAdmissionRequest, AtomicRunToolRequestCommitOutcome,
+        AtomicRunToolRequestCommitRequest,
+    };
+    let (pool, store) = setup().await;
+    let user = format!("guarded-user-{}", uuid::Uuid::new_v4());
+    for agent in [None, Some("guarded-agent")] {
+        let session = uuid::Uuid::new_v4().to_string();
+        let run = uuid::Uuid::new_v4().to_string();
+        let mut record = durable_run_record(run.clone(), user.clone(), session.clone());
+        record.agent_id = agent.map(str::to_string);
+        insert_run_fixture(&pool, store.as_ref(), record).await;
+        let initial = store.load_run(&user, &run).await.unwrap().unwrap();
+        let event = json!({"event_type":"tool_request","idempotency_key":"edge-tool-request:guarded-write","data":{"request_id":"guarded-write","tool":"write_file","arguments":{"path":"/workspace/synthetic.txt"}}});
+        let action = AtomicRunActionAdmissionRequest {
+            user_id: &user,
+            expected_session_id: &session,
+            run_id: &run,
+            action_id: "guarded-write",
+            expected_owner_generation: initial.run_generation,
+            expected_control_epoch: initial.last_event_idx,
+        };
+        let request = AtomicRunToolRequestCommitRequest {
+            action,
+            tool_request_event: &event,
+        };
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(&user)
+            .bind(&run)
+            .fetch_one(pool.get())
+            .await
+            .unwrap()
+        };
+        let initial_count = count().await;
+        let mut wrong_session = request;
+        wrong_session.action.expected_session_id = "foreign-session";
+        assert_eq!(
+            store
+                .commit_guarded_tool_request(wrong_session)
+                .await
+                .unwrap(),
+            AtomicRunToolRequestCommitOutcome::Missing
+        );
+        let mut stale = request;
+        stale.action.expected_owner_generation = initial.run_generation + 1;
+        assert!(matches!(
+            store.commit_guarded_tool_request(stale).await.unwrap(),
+            AtomicRunToolRequestCommitOutcome::OwnerGenerationMismatch { .. }
+        ));
+        let mut invalid = event.clone();
+        invalid["data"]["run_id"] = json!("another-run");
+        assert!(
+            store
+                .commit_guarded_tool_request(AtomicRunToolRequestCommitRequest {
+                    tool_request_event: &invalid,
+                    ..request
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            count().await,
+            initial_count,
+            "failure after staging must roll back its grant and request"
+        );
+        assert_eq!(
+            store
+                .load_run_control(&user, &run)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_event_idx,
+            initial.last_event_idx
+        );
+        let queries = Queries::default();
+        let subscriber = tracing_subscriber::registry().with(queries.clone());
+        let committed = store
+            .commit_guarded_tool_request(request)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let AtomicRunToolRequestCommitOutcome::Committed(receipt) = committed else {
+            panic!("expected commit: {committed:?}");
+        };
+        assert_eq!(receipt.action_event_index, initial.last_event_idx + 1);
+        assert_eq!(receipt.tool_request_event_index, initial.last_event_idx + 2);
+        assert_eq!(
+            store.commit_guarded_tool_request(request).await.unwrap(),
+            AtomicRunToolRequestCommitOutcome::AlreadyCommitted(receipt)
+        );
+        assert_eq!(
+            count().await,
+            initial_count + 2,
+            "replay never appends another pair"
+        );
+        let facts: Vec<(String, i64, String, Option<String>)> = sqlx::query_as("SELECT event_type,event_idx,session_id,agent_id FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx > ? ORDER BY event_idx")
+            .bind(&user).bind(&run).bind(initial.last_event_idx).fetch_all(pool.get()).await.unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].0, "action_admission_granted");
+        assert_eq!(facts[1].0, "tool_request");
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.2 == session
+                    && fact.3.as_deref() == Some(agent.unwrap_or_default()))
+        );
+        {
+            let captured = queries.0.lock().unwrap();
+            assert!(!captured.is_empty());
+            assert!(
+                captured
+                    .iter()
+                    .all(|sql| !sql.contains("agent_run_openings")
+                        && !sql.contains("checkpoint_json")),
+                "guarded dispatch must not reload immutable bodies: {captured:?}"
+            );
+        }
+
+        let overflow_event = json!({"event_type":"tool_request","idempotency_key":"edge-tool-request:overflow","data":{"request_id":"overflow","tool":"write_file","arguments":{}}});
+        for frontier in [i64::MAX - 1, i64::MAX] {
+            sqlx::query(
+                "UPDATE agent_runs SET last_event_idx = ? WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(frontier)
+            .bind(&user)
+            .bind(&run)
+            .execute(pool.get())
+            .await
+            .unwrap();
+            let overflow = AtomicRunToolRequestCommitRequest {
+                action: AtomicRunActionAdmissionRequest {
+                    action_id: "overflow",
+                    expected_control_epoch: frontier,
+                    ..action
+                },
+                tool_request_event: &overflow_event,
+            };
+            assert!(store.commit_guarded_tool_request(overflow).await.is_err());
+            assert_eq!(
+                count().await,
+                initial_count + 2,
+                "index exhaustion must roll back a staged grant"
+            );
+            assert_eq!(
+                store
+                    .load_run_control(&user, &run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .last_event_idx,
+                frontier
+            );
+        }
+        sqlx::query("UPDATE agent_runs SET last_event_idx = ? WHERE user_id = ? AND run_id = ?")
+            .bind(i64::MAX - 2)
+            .bind(&user)
+            .bind(&run)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let boundary = AtomicRunToolRequestCommitRequest {
+            action: AtomicRunActionAdmissionRequest {
+                action_id: "overflow",
+                expected_control_epoch: i64::MAX - 2,
+                ..action
+            },
+            tool_request_event: &overflow_event,
+        };
+        assert!(
+            matches!(store.commit_guarded_tool_request(boundary).await.unwrap(), AtomicRunToolRequestCommitOutcome::Committed(ref receipt) if receipt.tool_request_event_index == i64::MAX)
+        );
+        for statement in [
+            "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(&user)
+                .bind(&run)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
 }

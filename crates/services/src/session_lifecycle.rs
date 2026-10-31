@@ -54,16 +54,6 @@ const COMPLETE_SESSION_DELETE_FENCE_SQL: &str = "UPDATE agent_session_lifecycle_
      WHERE session_id = ? AND user_id = ?
        AND delete_requested_at IS NOT NULL";
 
-const SESSION_DELETE_DERIVED_FROM_AGENT_RUNS: &[SessionDeleteStatement] =
-    &[SessionDeleteStatement {
-        label: "user_skill_evaluations",
-        sql: "DELETE FROM user_skill_evaluations
-             WHERE (owner_user_id, run_id) IN (
-                 SELECT user_id, run_id FROM agent_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    }];
-
 const SESSION_DELETE_AGENT_EVENT_EDGES_SQL: &str = "DELETE FROM agent_event_edges
          WHERE session_id = ? AND user_id = ?
          ORDER BY child_event_id ASC, parent_event_id ASC, relation_kind ASC
@@ -141,23 +131,12 @@ const SESSION_DELETE_ORPHAN_MANIFESTS_SQL: &str = "DELETE FROM conversation_mani
 const SESSION_DELETE_WORKSPACE_CLEANUP_DEBT_MESSAGE: &str =
     "session hard delete requested cloud workspace cleanup";
 
-const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[
-    SessionDeleteStatement {
-        label: "session_state_item_events",
-        sql: "DELETE FROM session_state_item_events
-             WHERE (session_id = ? AND user_id = ?)
-                OR item_id IN (
-                    SELECT item_id FROM session_state_items
-                    WHERE origin_session_id = ? AND user_id = ?
-                )",
-    },
-    SessionDeleteStatement {
-        label: "session_state_items",
-        sql: "DELETE FROM session_state_items
+const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[SessionDeleteStatement {
+    label: "session_state_items",
+    sql: "DELETE FROM session_state_items
              WHERE (session_id = ? AND user_id = ?)
                 OR (origin_session_id = ? AND user_id = ?)",
-    },
-];
+}];
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
@@ -271,18 +250,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "ctx_snapshots",
-        sql: "DELETE FROM ctx_snapshots WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "ctx_decision_audits",
-        sql: "DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "harness_snapshots",
-        sql: "DELETE FROM harness_snapshots WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "plans",
         sql: "DELETE FROM plans WHERE session_id = ? AND user_id = ?",
     },
@@ -382,6 +349,10 @@ const SESSION_DELETE_TERMINAL_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
 
 const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
+        label: "agent_run_openings",
+        sql: "DELETE FROM agent_run_openings WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "run_checkpoints",
         sql: "DELETE FROM run_checkpoints WHERE session_id = ? AND user_id = ?",
     },
@@ -414,6 +385,7 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("work_branch_control_operations", "owner_id"),
     ("agent_events", "user_id"),
     ("agent_event_edges", "user_id"),
+    ("agent_run_openings", "user_id"),
     ("agent_runs", "user_id"),
     ("inference_invocation_settlement_debts", "user_id"),
 ];
@@ -764,18 +736,6 @@ pub(crate) async fn hard_delete_session_rows(
         .fetch_all(&mut **tx)
         .await
         .map_err(|source| format!("delete_session.lock_agent_runs: {source}"))?;
-
-    for statement in SESSION_DELETE_DERIVED_FROM_AGENT_RUNS {
-        let rows_deleted = delete_session_rows_session_user(
-            tx,
-            statement.label,
-            statement.sql,
-            session_id,
-            user_id,
-        )
-        .await?;
-        record_table_delete(&mut outcome, statement.label, rows_deleted)?;
-    }
 
     let rows_deleted = delete_session_rows_session_user_batched(
         tx,
@@ -1628,7 +1588,6 @@ mod tests {
     #[test]
     fn session_delete_statements_are_owner_scoped() {
         for group in [
-            SESSION_DELETE_DERIVED_FROM_AGENT_RUNS,
             SESSION_DELETE_SESSION_ORIGIN_TABLES,
             SESSION_DELETE_DIRECT_TABLES,
             SESSION_DELETE_TERMINAL_TABLES,

@@ -156,11 +156,10 @@ impl InfoView {
                 Span::styled("  Coverage · ", dim),
                 Span::styled(
                     format!(
-                        "{} · {} · {} events · {} decisions",
+                        "{} · {} · {} events",
                         report.data_coverage.overall,
                         report.data_coverage.source,
                         report.data_coverage.events,
-                        report.data_coverage.decisions,
                     ),
                     normal,
                 ),
@@ -564,8 +563,7 @@ mod tests {
             "data_coverage": {
                 "overall": "fresh",
                 "source": "session_journal",
-                "events": 1,
-                "decisions": 0
+                "events": 1
             },
             "observations": [{
                 "ref_id": "urn:astra:observation:local:reflect:session:0",

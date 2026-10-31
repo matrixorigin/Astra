@@ -100,47 +100,6 @@ async fn insert_state_item(
     item_id
 }
 
-async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: impl sqlx::SqlSafeStr) -> String {
-    let rows = sqlx::raw_sql(sql).fetch_all(pool.get()).await.unwrap();
-    let mut text = String::new();
-    for row in rows {
-        for idx in 0..row.columns().len() {
-            if let Ok(value) = row.try_get::<String, _>(idx) {
-                text.push_str(&value);
-                text.push('\n');
-            } else if let Ok(value) = row.try_get::<i64, _>(idx) {
-                text.push_str(&value.to_string());
-                text.push('\n');
-            }
-        }
-    }
-    text
-}
-
-async fn index_columns(pool: &astra_core::SharedPool, table: &str, key: &str) -> Vec<String> {
-    let schema = sqlx::query("SELECT DATABASE() AS schema_name")
-        .fetch_one(pool.get())
-        .await
-        .unwrap()
-        .try_get::<String, _>("schema_name")
-        .unwrap();
-    sqlx::query(
-        "SELECT COLUMN_NAME
-         FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?
-         ORDER BY SEQ_IN_INDEX",
-    )
-    .bind(schema)
-    .bind(table)
-    .bind(key)
-    .fetch_all(pool.get())
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
-    .collect()
-}
-
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_39_user_scope_memory_loads_into_anchor_budget() {
@@ -195,43 +154,18 @@ async fn personal_skill_activation_pins_version_and_records_ui_events() {
     let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(payload["version_id"], version_id);
     assert_eq!(payload["activation_source"], "ui_structured_intent");
-    let row = sqlx::query(
-        "SELECT
-          (SELECT COUNT(*) FROM agent_events
-           WHERE session_id = ? AND user_id = ? AND event_type = 'ui.skill.activate' AND llm_model_used IS NULL) AS ui_events,
-          (SELECT COUNT(*) FROM session_state_item_events
-           WHERE session_id = ? AND user_id = ? AND category = 'active_skill' AND mutation = 'activate') AS state_events",
+    let event: (String, i64) = sqlx::query_as(
+        "SELECT CAST(metadata AS CHAR), (SELECT event_count FROM agent_sessions WHERE user_id = ? AND session_id = ?) FROM agent_events WHERE user_id = ? AND session_id = ? AND event_type = 'ui.skill.activate' AND llm_model_used IS NULL",
     )
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<i64, _>("ui_events").unwrap(), 1);
-    assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 1);
-    let plan = explain_analyze_text(
-        &pool,
-        sqlx::AssertSqlSafe(format!(
-            "EXPLAIN ANALYZE SELECT event_id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
-             WHERE user_id = '{}' AND session_id = '{}' ORDER BY created_at DESC LIMIT 5",
-            user_id, session_id
-        )),
-    )
-    .await;
-    assert!(
-        plan.contains("session_state_item_events"),
-        "EXPLAIN ANALYZE should execute the state-event history query, got:\n{plan}"
+    .bind(&user_id).bind(&session_id).bind(&user_id).bind(&session_id)
+    .fetch_one(pool.get()).await.unwrap();
+    let event_payload: serde_json::Value = serde_json::from_str(&event.0).unwrap();
+    assert_eq!(
+        event_payload, payload,
+        "canonical event and current state retain the same activation"
     );
     assert_eq!(
-        index_columns(
-            &pool,
-            "session_state_item_events",
-            "idx_state_events_owner_session_created"
-        )
-        .await,
-        ["user_id", "session_id", "created_at", "event_id"],
-        "state-event history index must stay owner/session ordered with event_id tie-breaker"
+        event.1, 1,
+        "activation commits its canonical event and session count"
     );
 }

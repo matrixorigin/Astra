@@ -1018,6 +1018,7 @@ mod tests {
         for sql in [
             "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
         ] {
             sqlx::query(sql)

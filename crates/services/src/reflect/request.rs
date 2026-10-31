@@ -89,32 +89,27 @@ impl ReflectRequest {
         }
     }
 
-    pub(super) fn view(&self, total_events: i64, total_decisions: i64) -> ObservationView {
+    pub(super) fn view(&self, total_events: i64) -> ObservationView {
         let mut warnings = Vec::new();
         if matches!(
             self.horizon,
             ObservationHorizon::Now | ObservationHorizon::CurrentTurn
         ) {
-            warnings.push(
-                "reflect is backed by persisted session evidence; current-turn data may lag until events are stored"
-                    .to_string(),
-            );
+            warnings.push("Recent activity may take a moment to appear.".to_string());
         }
         if self.depth == ObservationDepth::Forensic && self.last_n > 50 {
-            warnings.push("forensic evidence graph is bounded to recent decisions".to_string());
+            warnings.push("This analysis covers only recent activity.".to_string());
         }
         if self.include_context {
-            warnings.push(
-                "include_context requested, but this server view only includes persisted reflection context"
-                    .to_string(),
-            );
+            warnings
+                .push("This analysis does not include the full conversation context.".to_string());
         }
         if matches!(
             self.source_policy,
             SourcePolicy::LiveOnly | SourcePolicy::LocalOnly
         ) {
             warnings.push(
-                "requested source policy is not fully satisfiable from the server database"
+                "This view shows saved session activity; live or device-local activity is unavailable."
                     .to_string(),
             );
         }
@@ -132,7 +127,6 @@ impl ReflectRequest {
                 },
                 source: reflect_source_label(self.source_policy).to_string(),
                 events: total_events,
-                decisions: total_decisions,
                 providers: reflect_providers(self.source_policy, self.include_context),
                 warnings,
             },
@@ -147,14 +141,6 @@ fn reflect_providers(
     let mut providers = BTreeMap::new();
     providers.insert(
         "cloud_events".to_string(),
-        ObservationProviderCoverage {
-            status: "fresh".to_string(),
-            freshness_ms: None,
-            reason: None,
-        },
-    );
-    providers.insert(
-        "decision_audits".to_string(),
         ObservationProviderCoverage {
             status: "fresh".to_string(),
             freshness_ms: None,
@@ -285,6 +271,15 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_session_view_has_no_retired_product_warning() {
+        let request = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
+        let view = request.view(10);
+        assert_eq!(view.data_coverage.overall, "fresh");
+        assert!(view.data_coverage.warnings.is_empty());
+        assert!(!view.data_coverage.providers.contains_key("decision_audits"));
+    }
+
+    #[test]
     fn source_policy_and_context_are_carried_into_view_coverage() {
         let request = ReflectRequest::from_observation_params_with_source(
             Some("knowledge"),
@@ -303,7 +298,7 @@ mod tests {
         assert_eq!(request.source_policy, SourcePolicy::LocalOnly);
         assert!(request.include_context);
 
-        let view = request.view(10, 2);
+        let view = request.view(10);
         assert_eq!(
             view.data_coverage.source,
             "server_db_local_only_unavailable"
@@ -312,7 +307,7 @@ mod tests {
             view.data_coverage
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("not fully satisfiable")),
+                .any(|warning| warning.contains("live or device-local activity is unavailable")),
             "expected source-policy warning: {:?}",
             view.data_coverage.warnings
         );
@@ -320,7 +315,7 @@ mod tests {
             view.data_coverage
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("include_context requested")),
+                .any(|warning| warning.contains("does not include the full conversation context")),
             "expected context warning: {:?}",
             view.data_coverage.warnings
         );

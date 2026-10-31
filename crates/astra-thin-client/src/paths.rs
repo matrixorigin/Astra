@@ -406,14 +406,6 @@ pub const MEMORY_SEARCH: &str = "/memory/search";
 pub const MEMORY_RETRIEVE: &str = "/memory/retrieve";
 pub const MEMORY_PURGE: &str = "/memory/purge";
 
-/// Context snapshots (`GET/POST /context`, `GET /context/{id}`).
-pub const CONTEXT: &str = "/context";
-
-#[inline]
-pub fn context_capture(context_capture_id: &str) -> String {
-    format!("/context/{context_capture_id}")
-}
-
 /// Lightweight LLM proxy for verification judge / edge components.
 pub const COMPLETIONS: &str = "/v1/chat/completions";
 
@@ -514,7 +506,6 @@ mod tests {
             MEMORY_SEARCH,
             MEMORY_RETRIEVE,
             MEMORY_PURGE,
-            CONTEXT,
             COMPLETIONS,
             ADMIN_INIT,
             ADMIN_REGISTER,
@@ -714,13 +705,6 @@ mod tests {
     #[test]
     fn skill_versions_path() {
         assert_eq!(skill_versions("bash"), "/skills/bash/versions");
-    }
-
-    // --- Context path ---
-
-    #[test]
-    fn context_capture_path() {
-        assert_eq!(context_capture("cap1"), "/context/cap1");
     }
 
     // --- Audit paths ---

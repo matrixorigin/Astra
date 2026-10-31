@@ -52,7 +52,7 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
-| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, reflect/decision-trace, evaluation reads, marketplace probe, server-owned `chat/stream` SSE + `agent_events`, audit ownership, logout |
+| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, reflect/decision-trace, evaluation reads, marketplace probe, server-owned `chat/stream` SSE + `agent_events`, audit ownership, logout |
 | `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
@@ -69,7 +69,6 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_meta_health` | `journey_meta_matrix.rs` | `GET /`, `GET /health` (root metadata, DB connected, persist counters) |
 | `e2e_matrix_session_http_db` | `journey_session_http_db_matrix.rs` | `GET`/`PUT /sessions/{id}` vs `agent_sessions` (`title`, `user_id`) |
 | `e2e_matrix_evaluation_reads` | `journey_evaluation_reads_matrix.rs` | Evaluation GET smoke (`x-user-id`), seed agent for trust/SLO/observability |
-| `e2e_matrix_context_decision_chain` | `journey_context_decision_chain_matrix.rs` | Event → context → decision chain + `ctx_snapshots` / `ctx_decision_audits` SQL |
 | `e2e_matrix_models` | `journey_models_matrix.rs` | paginated `GET /models` + cursor continuation, global-count `GET /model-access`, stable revision/default semantics |
 | `e2e_matrix_delegate_http_boundaries` | `journey_delegate_http_matrix.rs` | `POST /chat` → `run_id`; `GET /chat/runs/{id}/delegations`; `POST .../delegate` validation `400` |
 | `e2e_matrix_saas_admin_tokens_rbac_smoke` | `journey_saas_platform_matrix.rs` | `GET /admin/tokens`: `403` → grant `astra_admin` → `200` JSON array |
@@ -99,8 +98,6 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
 | Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list), `e2e_matrix_models` (list/access); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
-| Context | P0 | `/context` | `ctx_snapshots` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
-| Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
 | Memory proxy | P1 | `/memory/*` | Memoria stub calls | `product_matrix_*` |
 | Edge §5.5 | P0 | `/agents/edge`, `/tools/result`, `/approval/respond` | `edge_agent_registry`, durable run events | `product_matrix_*`, `e2e_matrix_approval_respond_invalid_session_id`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order server-stream callback journeys, `e2e_matrix_duplicate_approval_response_idempotency`; legacy Task Lease claim/renew/release routes are not registered by runtime, so no live E2E is claimed |
 | Skills / introspection | P1 | `/skills`, `/introspection/*` | mixed | `product_matrix_*` |
@@ -137,7 +134,7 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | platform | `/platform/` | Partial | `GET /platform/snapshot` in `product_matrix_*` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
 
-Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
+Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **models** (`/models`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
 
 ## Explicit coverage gaps
 
@@ -155,3 +152,7 @@ Additional route families in `router_builder` not named above: **memory** (`/mem
 - **Branches / admin HTTP** (beyond cost estimate + token list): optional deeper journeys when routes stabilize.
 - **`/chat/ws`**, **successful delegation execute** (long-running): optional fixtures; validation-only delegation is in `e2e_matrix_delegate_http_boundaries`.
 - **Real Memoria**: optional second target with a Memoria test double URL instead of the stub forwarder.
+
+Legacy generic Context/Decision CRUD journeys are retired with those products.
+Retained conversation, Context coordinator, model/semantic evidence and Session
+delete/cancel tests continue to exercise their canonical owners.

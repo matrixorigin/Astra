@@ -35,26 +35,4 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/events/session/{session_id}",
             get(crate::service_handlers::events::get_session_events_handler),
         )
-        .route(
-            "/context",
-            post(crate::service_handlers::context::create_snapshot_handler)
-                .get(crate::service_handlers::context::list_snapshots_handler),
-        )
-        .route(
-            "/context/{context_capture_id}",
-            get(crate::service_handlers::context::get_snapshot_handler),
-        )
-        .route(
-            "/decisions",
-            post(crate::service_handlers::decisions::record_decision_handler)
-                .get(crate::service_handlers::decisions::list_decisions_handler),
-        )
-        .route(
-            "/decisions/{decision_id}",
-            get(crate::service_handlers::decisions::get_decision_handler),
-        )
-        .route(
-            "/decisions/{decision_id}/audit",
-            get(crate::service_handlers::decisions::audit_decision_handler),
-        )
 }

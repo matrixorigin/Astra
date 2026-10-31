@@ -517,7 +517,6 @@ pub struct ObservationDataCoverage {
     pub overall: String,
     pub source: String,
     pub events: i64,
-    pub decisions: i64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, ObservationProviderCoverage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1103,7 +1102,6 @@ mod tests {
             overall: "partial".to_string(),
             source: "live_runtime_snapshot".to_string(),
             events: 2,
-            decisions: 0,
             providers,
             warnings: vec!["memory_backend_unavailable".to_string()],
         };

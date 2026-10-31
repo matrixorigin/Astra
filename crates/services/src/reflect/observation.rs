@@ -375,9 +375,7 @@ fn insight_topic_facet(insight: &Insight) -> (String, String) {
         InsightKind::ToolFailure { .. } | InsightKind::ToolConcentration { .. } => {
             ("execution".to_string(), "tools".to_string())
         }
-        InsightKind::ModelFanout { .. } | InsightKind::EmptySession => {
-            ("runtime".to_string(), "performance".to_string())
-        }
+        InsightKind::EmptySession => ("runtime".to_string(), "performance".to_string()),
     }
 }
 
@@ -395,7 +393,6 @@ fn insight_observation_ref(session_id: &str, kind: &InsightKind) -> String {
         InsightKind::ErrorRate => "error_rate".to_string(),
         InsightKind::ToolFailure { tool } => format!("tool_failure:{tool}"),
         InsightKind::ToolConcentration { tool } => format!("tool_concentration:{tool}"),
-        InsightKind::ModelFanout { decision_type } => format!("model_fanout:{decision_type}"),
         InsightKind::EmptySession => "empty_session".to_string(),
     };
     Urn::new("observation", "graph", "reflect")
@@ -514,6 +511,7 @@ pub(super) fn graph_event_ref(event_id: &str) -> String {
     Urn::new("event", "cloud", event_id).build()
 }
 
+#[cfg(test)]
 pub(super) fn graph_decision_ref(decision_id: &str) -> String {
     Urn::new("decision", "cloud", decision_id).build()
 }
@@ -526,7 +524,6 @@ mod summary_tests {
     fn overview(error_count: i64) -> SessionOverview {
         SessionOverview {
             total_events: 10,
-            total_decisions: 2,
             duration_minutes: Some(1.0),
             unique_skills_used: 1,
             error_count,

@@ -1,7 +1,7 @@
 # Durable agent runs
 
 > Status: target design contract.
-> Last updated: 2026-09-06.
+> Last updated: 2026-10-31.
 
 Durable agent runs define how agent execution survives long tasks, reconnects, cancellation, owner changes, provider failures, and process crashes.
 
@@ -391,6 +391,16 @@ writer lease, turn reservation, operation receipt or authority audit event.
 Exact retry requires the same custody frontier and current live owner.
 A Controller intervention changing the admitted base fences the old execution
 even after that Controller releases its lease.
+
+The opening bodies are stored once in `agent_run_openings`, inserted atomically
+with their `agent_runs` control row. Full recovery validates both bodies against
+the admitted hashes; an unloaded projection or missing opening row cannot stand
+in for a validated empty opening. Checkpoint bodies are stored once in
+`run_checkpoints`; `agent_runs` keeps an exact current ID/version/byte digest.
+Current checkpoint identity differs from newest-by-creation history when an
+ordinary idempotency identity is updated in place. Handoff replay uses immutable
+stored bytes, and historical handoff references keep their original generation
+and custody-tail validation rules.
 
 The immutable Run opening owns the raw submitted user text. The handoff retains
 the loop's current input, which steering may replace, without another audit-input

@@ -2,7 +2,7 @@ mod test_support;
 
 use astra_services::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore,
-    PersonalSkillError, RecordUserSkillEvaluation, SubmitUserSkillVersion, skill_md_content_hash,
+    PersonalSkillError, SubmitUserSkillVersion, skill_md_content_hash,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -186,80 +186,6 @@ async fn l2_45_active_switch_accepts_only_published_version() {
             .unwrap()
             .contains(&v1.version_id)
     );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_46_skill_evaluations_use_independent_table_and_unified_denominator() {
-    let pool = setup_pool().await;
-    let store = DatabasePersonalSkillStore::new(pool.clone());
-    let (user_id, skill_name) = test_ids();
-    let version = store
-        .submit_version(&user_id, &skill_name, submit_request("v1", "published"))
-        .await
-        .unwrap();
-    let evaluation = store
-        .record_evaluation(
-            &user_id,
-            &skill_name,
-            RecordUserSkillEvaluation {
-                source_id: version.source_id.clone(),
-                version_id: version.version_id.clone(),
-                run_id: None,
-                hits: 7,
-                suspects: 10,
-                false_positives: 2,
-                payload_json: Some(json!({"denominator": "suspects", "hit_rate": 0.7})),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(evaluation.owner_user_id, user_id);
-    assert_eq!(evaluation.hits, 7);
-    assert_eq!(evaluation.suspects, 10);
-    let foreign_user_id = Uuid::new_v4().to_string();
-    let rejected = store
-        .record_evaluation(
-            &foreign_user_id,
-            &skill_name,
-            RecordUserSkillEvaluation {
-                source_id: version.source_id.clone(),
-                version_id: version.version_id.clone(),
-                run_id: Some(format!("run-{}", Uuid::new_v4())),
-                hits: 1,
-                suspects: 1,
-                false_positives: 0,
-                payload_json: Some(json!({"should_not_insert": true})),
-            },
-        )
-        .await
-        .expect_err("foreign owner must not record evaluation for another user's skill version");
-    assert!(
-        matches!(
-            rejected,
-            PersonalSkillError::RunNotFound {
-                ref owner_user_id,
-                ref run_id,
-                ..
-            } if owner_user_id == &foreign_user_id && !run_id.is_empty()
-        ),
-        "unexpected foreign-owner error: {rejected:?}"
-    );
-    let row = sqlx::query(
-        "SELECT
-          (SELECT COUNT(*) FROM user_skill_evaluations WHERE owner_user_id = ? AND version_id = ?) AS eval_count,
-          (SELECT COUNT(*) FROM user_skill_evaluations WHERE owner_user_id = ?) AS foreign_eval_count,
-          (SELECT COUNT(*) FROM session_state_items WHERE category = 'skill_evaluation') AS state_count",
-    )
-    .bind(&user_id)
-    .bind(&version.version_id)
-    .bind(&foreign_user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<i64, _>("eval_count").unwrap(), 1);
-    assert_eq!(row.try_get::<i64, _>("foreign_eval_count").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("state_count").unwrap(), 0);
 }
 
 #[tokio::test]

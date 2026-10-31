@@ -2299,7 +2299,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             let source = heavy.context_authority;
             let admitted = run
                 .opening
-                .as_ref()
+                .loaded()
+                .map_err(SessionContextCoordinatorError::NeedsRepair)?
                 .and_then(crate::runs::DurableRunOpening::context_authority)
                 .ok_or(SessionContextCoordinatorError::Fenced)?;
             if source != *request.source
@@ -2373,7 +2374,6 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 producer_generation: producer_owner_generation,
                 checkpoint_id: checkpoint.checkpoint_id.clone(),
             };
-            run.checkpoint_json = None;
             Ok(ResumedExecutionTurn {
                 run,
                 checkpoint,
@@ -6324,6 +6324,9 @@ fn execution_resume_storage_error(
         crate::runs::ExecutionHandoffReferenceError::Rejected(detail) => {
             tracing::warn!(reason = detail, "execution resume custody rejected");
             SessionContextCoordinatorError::Fenced
+        }
+        crate::runs::ExecutionHandoffReferenceError::Corrupt(detail) => {
+            SessionContextCoordinatorError::NeedsRepair(detail.into())
         }
         crate::runs::ExecutionHandoffReferenceError::Unavailable(detail) => {
             database_error("execution_resume_storage", sqlx::Error::Protocol(detail))

@@ -4,33 +4,80 @@ use super::*;
 use astra_services::SessionContextCoordinator;
 
 fn invalid_resume(detail: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
-    error_response_coded(StatusCode::CONFLICT, detail, "execution_resume_unavailable")
+    invalid_resume_with_message(
+        detail,
+        "This task could not be resumed. Check its current status before continuing.",
+    )
+}
+
+fn invalid_resume_with_message(
+    detail: impl Into<String>,
+    message: &'static str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::warn!(detail = %detail.into(), "execution resume is unavailable");
+    error_response_coded(
+        StatusCode::CONFLICT,
+        message,
+        "execution_resume_unavailable",
+    )
+}
+
+/// Decode saved progress at the presentation boundary without exposing its
+/// storage format or suggesting that a status refresh repairs corruption.
+fn decode_resume_progress(
+    body: &str,
+) -> Result<server_loop_host::RuntimeExecutionHandoff, (StatusCode, Json<ErrorResponse>)> {
+    let message = "This task's saved progress could not be read. Continue the conversation to start a new turn.";
+    astra_services::runs::validate_run_checkpoint_size(body)
+        .map_err(|detail| invalid_resume_with_message(detail, message))?;
+    let astra_services::runs::DurableExecutionHandoff::V1 { heavy, .. } = serde_json::from_str::<
+        astra_services::runs::DurableExecutionHandoff<server_loop_host::RuntimeExecutionHandoff>,
+    >(body)
+    .map_err(|error| invalid_resume_with_message(error.to_string(), message))?;
+    Ok(heavy)
 }
 
 fn resume_custody_error(
     error: astra_services::SessionContextCoordinatorError,
 ) -> (StatusCode, Json<ErrorResponse>) {
     use astra_services::SessionContextCoordinatorError as Error;
-    let (status, code) = match &error {
+    let (status, code, message) = match &error {
         Error::Database {
             operation: "commit_execution_resume",
             ..
         } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "execution_resume_outcome_unknown",
+            "The resume result could not be confirmed. Refresh the task status before trying again.",
         ),
-        Error::Database { .. } | Error::DatabaseJson { .. } => (
+        Error::Database { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "execution_resume_storage_unavailable",
+            "Task recovery is temporarily unavailable. Please try again shortly.",
         ),
-        Error::Unauthorized => (StatusCode::FORBIDDEN, "execution_resume_unauthorized"),
-        _ => (StatusCode::CONFLICT, "execution_resume_fenced"),
+        Error::DatabaseJson { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "execution_resume_storage_unavailable",
+            "This task's saved progress could not be read. Continue the conversation to start a new turn.",
+        ),
+        Error::Unauthorized => (
+            StatusCode::FORBIDDEN,
+            "execution_resume_unauthorized",
+            "You no longer have permission to resume this task.",
+        ),
+        Error::NeedsRepair(_) => (
+            StatusCode::CONFLICT,
+            "execution_resume_fenced",
+            "This task's saved progress is unavailable. Continue the conversation to start a new turn.",
+        ),
+        _ => (
+            StatusCode::CONFLICT,
+            "execution_resume_fenced",
+            "The task changed while it was being resumed. Refresh its status before trying again.",
+        ),
     };
-    error_response_coded(
-        status,
-        format!("execution custody was not confirmed: {error}"),
-        code,
-    )
+    tracing::warn!(%error, error_code = code, "execution resume was not confirmed");
+    error_response_coded(status, message, code)
 }
 
 fn admission_field<T: serde::de::DeserializeOwned>(
@@ -72,30 +119,25 @@ impl AgenticRunLifecycleService {
             .admission_source()
             .map_err(|_| invalid_resume("invalid original admission source"))?
         else {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "this handoff requires renewed runtime credentials and bindings",
+                "This task cannot be resumed here. Continue the conversation in the client where it started.",
             ));
         };
         if durable.depth != 0 || durable.work_binding.is_some() {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "this handoff requires its original parent or Work authority",
+                "This task cannot be resumed separately. Open its original conversation to continue.",
             ));
         }
-        astra_services::runs::validate_run_checkpoint_size(&checkpoint.checkpoint_json)
-            .map_err(invalid_resume)?;
-        let astra_services::runs::DurableExecutionHandoff::V1 { heavy: parked, .. } =
-            serde_json::from_str::<
-                astra_services::runs::DurableExecutionHandoff<
-                    server_loop_host::RuntimeExecutionHandoff,
-                >,
-            >(&checkpoint.checkpoint_json)
-            .map_err(|_| invalid_resume("invalid execution handoff"))?;
+        let parked = decode_resume_progress(&checkpoint.checkpoint_json)?;
         if !matches!(
             parked.primary_work,
             runtime_tool_executor::PrimaryWorkHandoff::NoBinding
         ) {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "this checkpoint requires its exact primary Work authority",
+                "This task cannot be resumed separately. Open its original conversation to continue.",
             ));
         }
         let pool = self
@@ -166,9 +208,10 @@ impl AgenticRunLifecycleService {
             .weighted_admission
             .try_admit(&durable.user_id, work)
             .map_err(|error| {
+                tracing::warn!(%error, "execution resume capacity admission rejected");
                 error_response_coded(
                     StatusCode::TOO_MANY_REQUESTS,
-                    format!("execution capacity is unavailable: {error}"),
+                    "The service is busy. Please try resuming this task shortly.",
                     "weighted_session_admission_rejected",
                 )
             })?;
@@ -294,11 +337,10 @@ impl AgenticRunLifecycleService {
                     // User cancellation has its own durable control owner.
                     // A cancelled preparation token is not evidence of it.
                     let unknown = |storage: String| {
+                        tracing::warn!(%storage, "execution resume preparation could not confirm saved progress");
                         error_response_coded(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            format!(
-                                "execution recovery preparation failed; checkpoint custody is unconfirmed: {storage}"
-                            ),
+                            "The resume result could not be confirmed. Refresh the task status before trying again.",
                             "execution_resume_outcome_unknown",
                         )
                     };
@@ -401,15 +443,17 @@ impl AgenticRunLifecycleService {
             // Internal scratch does not acquire user-visible workspace authority.
             self.provision_server_workspace(&run.session_id)?
         } else {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "the original workspace needs its selected execution provider",
+                "The computer used for this task must reconnect. Continue the conversation there once it is connected.",
             ));
         };
         if bindings.executor.kind != ExecutorBindingKind::ServerLocal
             || bindings.executor.transport != ToolTransportKind::ServerLocal
         {
-            return Err(invalid_resume(
+            return Err(invalid_resume_with_message(
                 "the original executor requires a live registered connection",
+                "The computer used for this task must reconnect. Continue the conversation there once it is connected.",
             ));
         }
         let mut inherited =
@@ -731,7 +775,8 @@ impl AgenticRunLifecycleService {
             agent_id: run.agent_id.clone(),
             user_message: run
                 .opening
-                .as_ref()
+                .loaded()
+                .unwrap()
                 .and_then(astra_services::runs::DurableRunOpening::input)
                 .ok_or_else(|| invalid_resume("original user input is missing"))?
                 .original_input
@@ -755,5 +800,74 @@ impl AgenticRunLifecycleService {
             descendant_spawner: entry.spawner.clone(),
             delivery: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_resume_progress_explains_how_to_continue() {
+        let oversized =
+            serde_json::to_string(&"x".repeat(astra_services::runs::MAX_RUN_CHECKPOINT_BYTES + 1))
+                .unwrap();
+        for body in ["{internal_checkpoint_field", oversized.as_str()] {
+            let Err((status, Json(error))) = decode_resume_progress(body) else {
+                panic!("invalid saved progress must not be resumed");
+            };
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                error.error_code.as_deref(),
+                Some("execution_resume_unavailable")
+            );
+            assert!(error.detail.contains("Continue the conversation"));
+            assert!(!error.detail.contains("internal_checkpoint_field"));
+            assert!(!error.detail.contains("check its current status"));
+        }
+    }
+
+    #[test]
+    fn resume_storage_errors_keep_recovery_actions_without_internal_details() {
+        use astra_services::SessionContextCoordinatorError as Error;
+        for (operation, code, action) in [
+            (
+                "commit_execution_resume",
+                "execution_resume_outcome_unknown",
+                "Refresh",
+            ),
+            (
+                "load_current_checkpoint",
+                "execution_resume_storage_unavailable",
+                "try again",
+            ),
+        ] {
+            let (status, Json(body)) = resume_custody_error(Error::Database {
+                operation,
+                source: sqlx::Error::Protocol("internal_checkpoint_field_and_query".into()),
+            });
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body.error_code.as_deref(), Some(code));
+            assert!(body.detail.contains(action));
+            assert!(!body.detail.contains("internal_checkpoint_field_and_query"));
+        }
+        let (status, Json(body)) = invalid_resume("opening_hash and internal admission field");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error_code.as_deref(),
+            Some("execution_resume_unavailable")
+        );
+        assert!(!body.detail.contains("opening_hash"));
+        assert!(!body.detail.contains("admission"));
+        let (status, Json(body)) = resume_custody_error(Error::Unauthorized);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body.error_code.as_deref(),
+            Some("execution_resume_unauthorized")
+        );
+        let (_, Json(body)) =
+            resume_custody_error(Error::NeedsRepair("current_checkpoint_hash".into()));
+        assert!(!body.detail.contains("current_checkpoint_hash"));
+        assert!(body.detail.contains("Continue the conversation"));
     }
 }

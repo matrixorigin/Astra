@@ -222,12 +222,7 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
 
     let introspection = request_status(
         app.clone(),
-        request(
-            "GET",
-            "/introspection/context/trend",
-            auth_headers,
-            Body::empty(),
-        ),
+        request("GET", "/introspection/skills", auth_headers, Body::empty()),
     )
     .await;
     assert_ne!(introspection, StatusCode::NOT_FOUND);

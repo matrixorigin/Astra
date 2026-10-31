@@ -9,10 +9,8 @@ pub mod byok_endpoint;
 mod cancellation_safe_db;
 pub(crate) use cancellation_safe_db::CancellationSafeTransaction;
 pub use cancellation_safe_db::{CancellationSafePoolConnection, TransactionConnection};
-pub mod context;
 pub mod coordination;
 pub mod db_row;
-pub mod decisions;
 pub mod edge_context;
 pub mod event_ingestion;
 pub mod events;
@@ -151,17 +149,9 @@ pub use auth::{
     SessionCreateRequestData, SessionCreationResult, SessionListFilter, SessionListRecord,
     SessionRecord, SessionService, SessionUpdateRequestData,
 };
-pub use context::{
-    ContextService, DatabaseContextService, SnapshotCreateRequestData, SnapshotListFilter,
-    SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
-};
 pub use coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AggregationStrategy,
     CoordinationPattern, DelegationRequest, DelegationResult, aggregate_results,
-};
-pub use decisions::{
-    DatabaseDecisionService, DecisionCreateRequestData, DecisionListFilter, DecisionListRecord,
-    DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use events::{
@@ -246,9 +236,9 @@ pub use pagination::{
 };
 pub use personal_skills::{
     ActivateUserSkillVersion, ActivePersonalSkillRecord, CreateUserSkillSource,
-    DatabasePersonalSkillStore, PersonalSkillError, RecordUserSkillEvaluation,
-    SKILL_MD_NORMALIZE_VERSION, SubmitUserSkillVersion, UserSkillEvaluationRecord,
-    UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md, skill_md_content_hash,
+    DatabasePersonalSkillStore, PersonalSkillError, SKILL_MD_NORMALIZE_VERSION,
+    SubmitUserSkillVersion, UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md,
+    skill_md_content_hash,
 };
 pub use reflect::{
     DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,

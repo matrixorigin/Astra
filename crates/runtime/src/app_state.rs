@@ -161,8 +161,6 @@ pub struct AppState {
     pub(crate) session_service: Arc<dyn SessionService>,
     pub(crate) agent_service: Arc<dyn AgentService>,
     pub(crate) event_service: Arc<dyn EventService>,
-    pub(crate) context_service: Arc<dyn ContextService>,
-    pub(crate) decision_service: Arc<dyn DecisionService>,
     pub(crate) model_service: Arc<dyn ModelService>,
     pub(crate) model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
     pub(crate) marketplace_service: Arc<dyn MarketplaceService>,
@@ -238,8 +236,6 @@ pub struct AppState {
     /// Multi-agent coordination metrics — scraped into metrics_registry on each
     /// /metrics request for a unified exposition endpoint.
     pub(crate) multi_agent_metrics: astra_services::multi_agent::SharedMultiAgentMetrics,
-    #[cfg(feature = "harness")]
-    pub harness_registry: crate::server::harness::handlers::HarnessSinkRegistry,
 }
 
 impl AppState {
@@ -264,8 +260,6 @@ impl AppState {
             session_service: Arc::new(auth::UnconfiguredSessionService),
             agent_service: Arc::new(UnconfiguredAgentService),
             event_service: Arc::new(UnconfiguredEventService),
-            context_service: Arc::new(UnconfiguredContextService),
-            decision_service: Arc::new(UnconfiguredDecisionService),
             model_service: Arc::new(UnconfiguredModelService),
             model_catalog_cache: Default::default(),
             marketplace_service: Arc::new(UnconfiguredMarketplaceService),
@@ -333,8 +327,6 @@ impl AppState {
             cors_origins: None,
             metrics_registry: Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new()),
             multi_agent_metrics: astra_services::multi_agent::shared_metrics(),
-            #[cfg(feature = "harness")]
-            harness_registry: crate::server::harness::handlers::HarnessSinkRegistry::new(),
         }
     }
 
@@ -481,16 +473,6 @@ impl AppState {
 
     pub fn with_event_service(mut self, event_service: Arc<dyn EventService>) -> Self {
         self.event_service = event_service;
-        self
-    }
-
-    pub fn with_context_service(mut self, context_service: Arc<dyn ContextService>) -> Self {
-        self.context_service = context_service;
-        self
-    }
-
-    pub fn with_decision_service(mut self, decision_service: Arc<dyn DecisionService>) -> Self {
-        self.decision_service = decision_service;
         self
     }
 

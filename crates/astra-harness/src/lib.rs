@@ -232,7 +232,7 @@ pub trait Verifier: Send + Sync + 'static {
 
 // ─── Snapshot Sink ──────────────────────────────────────────────────────────
 
-/// Storage backend for snapshots. CLI uses in-memory; server uses DB-backed.
+/// Bounded observation sink shared by the CLI and Server harness kernels.
 pub trait SnapshotSink: Send + Sync + 'static {
     fn update(&self, record: &DecisionRecord);
     fn latest(&self) -> Option<RuntimeSnapshot>;
@@ -242,7 +242,7 @@ pub trait SnapshotSink: Send + Sync + 'static {
 
 const DEFAULT_HISTORY_CAPACITY: usize = 64;
 
-/// In-memory sink with bounded history ring for CLI single-process use.
+/// In-memory sink with a bounded history ring for one process.
 pub struct InMemorySnapshotSink {
     inner: std::sync::RwLock<SnapshotRing>,
 }

@@ -353,6 +353,7 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("work_branch_control_operations", "owner_id"),
         ("work_branch_deletion_operations", "owner_id"),
         ("tool_invocation_ledger", "user_id"),
+        ("agent_run_openings", "user_id"),
         ("agent_runs", "user_id"),
         ("work_item_attempts", "owner_id"),
         ("work_recovery_points", "owner_id"),
@@ -1557,7 +1558,7 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
     let now = chrono::Utc::now().to_rfc3339();
     DatabaseRunStateStore::new(pool.clone())
         .insert_run(DurableRunRecord {
-            opening: None,
+            opening: Default::default(),
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
@@ -1578,8 +1579,7 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
+            current_checkpoint: None,
             error_code: None,
             error_message: None,
 

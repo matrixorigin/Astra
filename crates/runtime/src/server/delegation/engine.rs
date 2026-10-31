@@ -5769,7 +5769,7 @@ mod tests {
             .await
             .unwrap();
         let child = run_engine.load_run("user", "child").await.unwrap().unwrap();
-        let input = child.opening.as_ref().unwrap().input().unwrap();
+        let input = child.opening.loaded().unwrap().unwrap().input().unwrap();
         assert_eq!(input.original_input, "child task");
         assert!(
             input.context_authority.is_none(),
@@ -9766,7 +9766,7 @@ mod tests {
 
         let records = vec![
             DurableRunRecord {
-                opening: None,
+                opening: Default::default(),
                 opening_hash: None,
                 context_admission_hash: None,
                 terminal_receipt_json: None,
@@ -9787,8 +9787,7 @@ mod tests {
                 owner_lease_expires_at: None,
                 run_generation: 0,
                 last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
+                current_checkpoint: None,
                 error_code: None,
                 error_message: None,
                 total_prompt_tokens: 0,
@@ -9807,7 +9806,7 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
-                opening: None,
+                opening: Default::default(),
                 opening_hash: None,
                 context_admission_hash: None,
                 terminal_receipt_json: None,
@@ -9828,8 +9827,7 @@ mod tests {
                 owner_lease_expires_at: None,
                 run_generation: 0,
                 last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
+                current_checkpoint: None,
                 error_code: None,
                 error_message: None,
                 total_prompt_tokens: 0,
@@ -9848,7 +9846,7 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
             DurableRunRecord {
-                opening: None,
+                opening: Default::default(),
                 opening_hash: None,
                 context_admission_hash: None,
                 terminal_receipt_json: None,
@@ -9869,8 +9867,7 @@ mod tests {
                 owner_lease_expires_at: None,
                 run_generation: 0,
                 last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
+                current_checkpoint: None,
                 error_code: None,
                 error_message: None,
                 total_prompt_tokens: 0,
@@ -9890,7 +9887,7 @@ mod tests {
             },
             // Root run — should be skipped
             DurableRunRecord {
-                opening: None,
+                opening: Default::default(),
                 opening_hash: None,
                 context_admission_hash: None,
                 terminal_receipt_json: None,
@@ -9911,8 +9908,7 @@ mod tests {
                 owner_lease_expires_at: None,
                 run_generation: 0,
                 last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
+                current_checkpoint: None,
                 error_code: None,
                 error_message: None,
                 total_prompt_tokens: 0,

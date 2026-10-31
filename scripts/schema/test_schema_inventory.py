@@ -570,7 +570,6 @@ fn char_literal() { let slash = '/'; }
             "skill_user_credentials",
             "user_skill_sources",
             "user_skill_versions",
-            "user_skill_evaluations",
             "agent_agents",
             "agent_bindings",
         }
@@ -621,10 +620,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "authoring/version content",
             self.tables["user_skill_versions"]["merge_guidance"],
-        )
-        self.assertIn(
-            "run-linked review facts",
-            self.tables["user_skill_evaluations"]["merge_guidance"],
         )
         self.assertIn(
             "user-owned agent definitions",
@@ -921,12 +916,11 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("edge poll", row["primary_query"])
 
 
-    def test_session_state_item_events_uses_owner_event_identity(self) -> None:
-        row = self.tables["session_state_item_events"]
-        self.assertEqual(row["primary_key"], ["user_id", "event_id"])
-        self.assertEqual(row["auto_increment_columns"], [])
-        self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
-        self.assertIn("state item audit", row["primary_query"])
+    def test_run_opening_has_payload_identity_and_no_parallel_control(self) -> None:
+        row = self.tables["agent_run_openings"]
+        self.assertEqual(row["primary_key"], ["user_id", "run_id"])
+        self.assertIn("single control owner", row["merge_guidance"])
+        self.assertIn("one row per Run", row["retention_policy"])
 
     def test_auth_grants_use_product_identity(self) -> None:
         role_row = self.tables["auth_user_roles"]

@@ -2180,7 +2180,7 @@ impl RunEngine {
                 .bind_input(input)?;
         }
         let record = DurableRunRecord {
-            opening,
+            opening: opening.into(),
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
@@ -2201,8 +2201,7 @@ impl RunEngine {
             owner_lease_expires_at: None,
             run_generation: 0,
             last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
+            current_checkpoint: None,
             error_code: None,
             error_message: None,
 
@@ -3155,8 +3154,7 @@ impl RunEngine {
         &self,
         resumed: &astra_services::session_context_coordinator::ResumedExecutionTurn,
     ) -> Result<Option<DurableRunRecord>, String> {
-        let mut run = resumed.run().clone();
-        run.checkpoint_json = Some(resumed.checkpoint().checkpoint_json.clone());
+        let run = resumed.run().clone();
         let claimed_from_generation = resumed
             .receipt()
             .run_generation
@@ -3888,7 +3886,7 @@ impl RunEngine {
     ) -> Option<DurableRunRecord> {
         let run = self.load_run(user_id, run_id).await.unwrap().unwrap();
         assert_ne!(
-            run.checkpoint_version.as_deref(),
+            run.current_checkpoint_version(),
             Some("execution_handoff_v1")
         );
         let has_graceful_resume_checkpoint = self
@@ -4024,7 +4022,7 @@ impl RunEngine {
                 }
             };
         }
-        if run.checkpoint_version.as_deref() == Some("execution_handoff_v1") {
+        if run.current_checkpoint_version() == Some("execution_handoff_v1") {
             return match self.store.reconcile_execution_handoff(&claim).await {
                 Ok(Some(recovery)) => {
                     record_recovery_run(
@@ -6808,7 +6806,6 @@ mod tests {
 
     struct FlakyBatchTransitionStore {
         inner: InMemoryRunStateStore,
-        hide_embedded_checkpoint_in_recovery_claims: bool,
         fail_remaining: AtomicUsize,
         cancellation_lookup_failures: AtomicUsize,
         load_run_control_failures: AtomicUsize,
@@ -6856,7 +6853,6 @@ mod tests {
         fn new(failures: usize, mode: BatchTransitionFailureMode) -> Self {
             Self {
                 inner: InMemoryRunStateStore::new(),
-                hide_embedded_checkpoint_in_recovery_claims: false,
                 fail_remaining: AtomicUsize::new(failures),
                 cancellation_lookup_failures: AtomicUsize::new(0),
                 load_run_control_failures: AtomicUsize::new(0),
@@ -7371,13 +7367,7 @@ mod tests {
             if consume_failure(&self.recovery_claim_failures) {
                 return Err("store unavailable".into());
             }
-            let mut claims = self.inner.claim_recoverable_active_runs(limit).await?;
-            if self.hide_embedded_checkpoint_in_recovery_claims {
-                for claim in &mut claims {
-                    claim.run.checkpoint_version = None;
-                    claim.run.checkpoint_json = None;
-                }
-            }
+            let claims = self.inner.claim_recoverable_active_runs(limit).await?;
             Ok(claims)
         }
 
@@ -7757,7 +7747,7 @@ mod tests {
             .unwrap();
         assert_eq!(durable_run_generation_controls(&run).unwrap(), controls);
 
-        let valid_start = run.opening.as_ref().unwrap().events()[0].clone();
+        let valid_start = run.opening.loaded().unwrap().unwrap().events()[0].clone();
         run.events.push(valid_start.clone());
         assert!(durable_run_generation_controls(&run).is_err());
         run.events.pop();
@@ -7840,7 +7830,7 @@ mod tests {
             Some(policy)
         );
 
-        let valid_start = run.opening.as_ref().unwrap().events()[0].clone();
+        let valid_start = run.opening.loaded().unwrap().unwrap().events()[0].clone();
         crate::server::run::mutate_run_opening_fixture(&mut run, |opening| {
             opening["events"][0]["data"]
                 .as_object_mut()
@@ -11749,7 +11739,18 @@ mod tests {
                     STATUS_PAUSED
                 }
             );
-            assert_eq!(run.checkpoint_json.as_deref(), Some(checkpoint.as_str()));
+            let stored_checkpoint = engine
+                .load_latest_checkpoint("user-1", "opaque-handoff", Some("execution_handoff"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored_checkpoint.checkpoint_json, checkpoint);
+            assert_eq!(
+                run.current_checkpoint.as_ref(),
+                Some(&astra_services::runs::CurrentCheckpointRef::from(
+                    &stored_checkpoint
+                ))
+            );
             let durable = engine
                 .load_run("user-1", "opaque-handoff")
                 .await
@@ -11823,12 +11824,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_active_runs_uses_canonical_history_when_embedded_head_is_missing() {
-        // Model a missing embedded projection at the recovery read boundary;
-        // canonical checkpoint history remains owned by the real memory store.
-        let mut store =
+    async fn recover_active_runs_uses_canonical_history_from_control_claims() {
+        let store =
             FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite);
-        store.hide_embedded_checkpoint_in_recovery_claims = true;
         let store = Arc::new(store);
         let engine = RunEngine::new(store.clone());
         engine
@@ -11855,39 +11853,6 @@ mod tests {
             resumed.events.last().unwrap()["data"]["checkpoint_available"],
             true
         );
-    }
-
-    #[tokio::test]
-    async fn recover_active_runs_does_not_resume_an_embedded_only_snapshot() {
-        let store = Arc::new(InMemoryRunStateStore::new());
-        let engine = RunEngine::new(store.clone());
-        engine
-            .start_run("run-embedded-only", "user-1", "sess-embedded-only")
-            .await
-            .unwrap();
-
-        let mut run = store
-            .load_run("user-1", "run-embedded-only")
-            .await
-            .unwrap()
-            .unwrap();
-        run.checkpoint_version = Some("checkpoint_v1".to_string());
-        run.checkpoint_json = Some(
-            r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"legacy-only"}"#
-                .to_string(),
-        );
-        // Seed an embedded-only legacy row once into a fresh store; insert_run
-        // is deliberately not an update API and must reject duplicates.
-        let store = Arc::new(InMemoryRunStateStore::new());
-        store.insert_run(run).await.unwrap();
-        let engine = RunEngine::new(store);
-
-        let recovered = engine.recover_active_runs().await.unwrap();
-        let failed = recovered
-            .into_iter()
-            .find(|run| run.run_id == "run-embedded-only")
-            .expect("embedded-only run should still be classified");
-        assert_eq!(failed.status, STATUS_FAILED);
     }
 
     #[tokio::test]

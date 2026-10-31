@@ -1,8 +1,7 @@
-//! Contract: three new LLM-facing introspection endpoints expose the
-//! runtime's own decision / tool / drift state as stable JSON the agent can
+//! Contract: LLM-facing introspection endpoints expose the
+//! runtime's tool / drift state as stable JSON the agent can
 //! parse in a tool call.
 //!
-//! - `GET /introspection/decision-trace?session_id=...&last_n=20`
 //! - `GET /introspection/tool-history?tool=...&window_hours=24`
 //! - `GET /introspection/drift-check?session_id=...`
 //!
@@ -26,9 +25,7 @@ use tower::util::ServiceExt;
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
-    introspection::{
-        get_decision_trace_handler, get_drift_check_handler, get_tool_history_handler,
-    },
+    introspection::{get_drift_check_handler, get_tool_history_handler},
 };
 use astra_services::introspection::{
     INTENT_DRIFT_ASSESSMENT_SCHEMA_VERSION, IntentDriftAssessmentProvenance,
@@ -109,46 +106,6 @@ impl IntrospectionService for StubIntrospection {
     ) -> ServiceResult<SkillsIntrospectionResponse> {
         unreachable!("not called by this test")
     }
-    async fn get_context_trend(&self, _: &str, _: &str, _: i32, _: i64) -> ServiceResult<Value> {
-        unreachable!("not called by this test")
-    }
-    async fn get_context_snapshot(
-        &self,
-        _: &str,
-        _: &str,
-        _: Option<i32>,
-        _: bool,
-        _: bool,
-        _: i32,
-    ) -> ServiceResult<Value> {
-        unreachable!("not called by this test")
-    }
-    async fn get_retrieval_quality(&self, _: &str, _: &str, _: i32) -> ServiceResult<Value> {
-        unreachable!("not called by this test")
-    }
-
-    async fn get_decision_trace(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        last_n: i32,
-    ) -> ServiceResult<Value> {
-        Ok(json!({
-            "schema_version": 1,
-            "session_id": session_id,
-            "user_id": user_id,
-            "last_n": last_n,
-            "decisions": [
-                {
-                    "decision_id": "d1",
-                    "decision_type": "tool_surface",
-                    "created_at": "2026-05-01T10:00:00",
-                    "output": {"tool": "grep"},
-                },
-            ],
-        }))
-    }
-
     async fn get_tool_history(
         &self,
         user_id: &str,
@@ -207,10 +164,6 @@ fn build_test_app() -> Router {
         .with_introspection_service(Arc::new(StubIntrospection));
 
     Router::new()
-        .route(
-            "/introspection/decision-trace",
-            get(get_decision_trace_handler),
-        )
         .route("/introspection/tool-history", get(get_tool_history_handler))
         .route("/introspection/drift-check", get(get_drift_check_handler))
         .with_state(state)
@@ -229,35 +182,6 @@ async fn get_json(app: Router, path: &str) -> (StatusCode, Value) {
         .unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, value)
-}
-
-// ─── decision-trace ─────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn decision_trace_returns_versioned_schema() {
-    let app = build_test_app();
-    let (status, body) =
-        get_json(app, "/introspection/decision-trace?session_id=s1&last_n=20").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["schema_version"], 1);
-    assert_eq!(body["session_id"], "s1");
-    assert_eq!(body["last_n"], 20);
-    assert!(body["decisions"].is_array());
-}
-
-#[tokio::test]
-async fn decision_trace_default_last_n_is_20() {
-    let app = build_test_app();
-    let (status, body) = get_json(app, "/introspection/decision-trace?session_id=s1").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["last_n"], 20);
-}
-
-#[tokio::test]
-async fn decision_trace_requires_session_id() {
-    let app = build_test_app();
-    let (status, _) = get_json(app, "/introspection/decision-trace").await;
-    assert!(status.is_client_error(), "missing session_id must 4xx");
 }
 
 // ─── tool-history ───────────────────────────────────────────────────────────
@@ -328,7 +252,7 @@ async fn drift_check_requires_session_id() {
 async fn endpoints_reject_missing_auth_header() {
     let app = build_test_app();
     let req = Request::builder()
-        .uri("/introspection/decision-trace?session_id=s1")
+        .uri("/introspection/drift-check?session_id=s1")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();

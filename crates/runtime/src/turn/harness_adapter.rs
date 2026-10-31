@@ -28,13 +28,6 @@ mod enabled {
         pub sink: Option<Arc<dyn SnapshotSink>>,
         pub(crate) session_start_unix_millis: u64,
         session_ended: std::sync::atomic::AtomicBool,
-        /// Registry reference for cleanup on session end (prevents resource leak).
-        pub(crate) registry: Option<crate::server::harness::handlers::HarnessSinkRegistry>,
-        /// Session ID used to unregister from the registry on cleanup.
-        pub(crate) session_id_for_cleanup: Option<String>,
-        /// Concrete server sink reference for deferred user_id injection.
-        pub(crate) server_sink:
-            Option<Arc<crate::server::harness::server_sink::ServerSnapshotSink>>,
     }
 
     impl HarnessSlot {
@@ -44,9 +37,6 @@ mod enabled {
                 sink: None,
                 session_start_unix_millis: now_millis(),
                 session_ended: std::sync::atomic::AtomicBool::new(false),
-                registry: None,
-                session_id_for_cleanup: None,
-                server_sink: None,
             }
         }
 
@@ -56,9 +46,6 @@ mod enabled {
                 sink: Some(sink),
                 session_start_unix_millis: now_millis(),
                 session_ended: std::sync::atomic::AtomicBool::new(false),
-                registry: None,
-                session_id_for_cleanup: None,
-                server_sink: None,
             }
         }
 
@@ -71,28 +58,6 @@ mod enabled {
                 sink: Some(sink),
                 session_start_unix_millis: now_millis(),
                 session_ended: std::sync::atomic::AtomicBool::new(false),
-                registry: None,
-                session_id_for_cleanup: None,
-                server_sink: None,
-            }
-        }
-
-        /// Set the user_id on the server sink (deferred injection).
-        /// Called by the run lifecycle after `build_initial_state` when
-        /// the user_id becomes available.
-        pub fn set_user_id(&self, user_id: &str) {
-            if let Some(ref sink) = self.server_sink {
-                sink.set_user_id(user_id.to_string());
-            }
-        }
-    }
-
-    impl Drop for HarnessSlot {
-        fn drop(&mut self) {
-            if let (Some(registry), Some(sid)) =
-                (self.registry.take(), self.session_id_for_cleanup.take())
-            {
-                registry.unregister(&sid);
             }
         }
     }
@@ -414,6 +379,56 @@ mod enabled {
             assert!(matches!(verdict, HookVerdict::Continue));
 
             assert!(slot.sink.as_ref().unwrap().latest().is_some());
+        }
+
+        #[test]
+        fn bounded_server_sink_keeps_enforcement_and_observe_only_children() {
+            struct CriticalPanic;
+            impl astra_harness::Verifier for CriticalPanic {
+                fn name(&self) -> &'static str {
+                    "critical_fixture"
+                }
+                fn trigger_points(&self) -> &'static [HookPoint] {
+                    &[HookPoint::PostTurn]
+                }
+                fn is_critical(&self) -> bool {
+                    true
+                }
+                fn check(&self, _: &DecisionRecord) -> Vec<astra_harness::Violation> {
+                    panic!("critical fixture");
+                }
+            }
+            for critical in [false, true] {
+                let sink = InMemorySnapshotSink::arc();
+                let kernel = if critical {
+                    StandardKernel::new(sink.clone(), vec![Box::new(CriticalPanic)])
+                } else {
+                    StandardKernel::configured(
+                        sink.clone(),
+                        astra_harness::HarnessLimits {
+                            max_turns: Some(0),
+                            ..Default::default()
+                        },
+                    )
+                };
+                let parent = HarnessSlot::new(Arc::new(kernel), sink.clone());
+                let child = HarnessSlot::observe_only(sink.clone());
+                let mut state = make_state();
+                state.current_session_id = Some("parent".into());
+                assert!(matches!(
+                    harness_fire(&parent, HookPoint::PostTurn, &state),
+                    HookVerdict::Block { .. }
+                ));
+                state.current_session_id = Some("child".into());
+                assert!(matches!(
+                    harness_fire(&child, HookPoint::SessionStart, &state),
+                    HookVerdict::Continue
+                ));
+                let history = sink.history(10);
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[0].session_id, "child");
+                assert_eq!(history[1].session_id, "parent");
+            }
         }
 
         #[test]

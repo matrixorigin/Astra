@@ -927,7 +927,7 @@ pub async fn seed_pending_approval(
     let store = DatabaseRunStateStore::new(ctx.shared_pool.clone()).with_owner_pod_id(owner_pod_id);
     store
         .insert_run(DurableRunRecord {
-            opening: None,
+            opening: Default::default(),
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
@@ -948,8 +948,7 @@ pub async fn seed_pending_approval(
             owner_lease_expires_at: Some(owner_lease_expires_at),
             run_generation: 0,
             last_event_idx: -1,
-            checkpoint_version: None,
-            checkpoint_json: None,
+            current_checkpoint: None,
             error_code: None,
             error_message: None,
 
