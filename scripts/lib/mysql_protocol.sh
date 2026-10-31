@@ -1,0 +1,109 @@
+# Canonical MySQL/MariaDB connection and TLS negotiation, shared by local
+# bootstrap and ops clients. Results: mysql_client and mysql_connection_options.
+# Passwords are passed only through MYSQL_PWD, including harmless TLS probes.
+
+mysql_connection_args() {
+    local tls_mode mysql_host client_help supports_ssl_mode supports_skip_ssl
+    local supports_ssl tls_arg candidate
+    local candidates=() probe_args=()
+    mysql_client="${ASTRA_MYSQL_CLIENT:-mysql}"
+    tls_mode="${ASTRA_MYSQL_TLS_MODE:-auto}"
+    mysql_host="${MATRIXONE_HOST:-127.0.0.1}"
+
+    case "$tls_mode" in
+        auto|disabled|required) ;;
+        *)
+            echo "ASTRA_MYSQL_TLS_MODE must be one of: auto, disabled, required." >&2
+            return 2
+            ;;
+    esac
+
+    client_help="$("$mysql_client" --help 2>&1 || true)"
+    supports_ssl_mode=false
+    supports_skip_ssl=false
+    supports_ssl=false
+    if grep -Eq '(^|[[:space:]])--ssl-mode([=[:space:]]|$)' <<<"$client_help"; then
+        supports_ssl_mode=true
+    fi
+    if grep -Eq '(^|[[:space:]])--skip-ssl([[:space:]]|$)' <<<"$client_help"; then
+        supports_skip_ssl=true
+    fi
+    if grep -Eq '(^|[[:space:]])--ssl([[:space:]]|$)' <<<"$client_help"; then
+        supports_ssl=true
+    fi
+
+    mysql_connection_options=(
+        --protocol=TCP
+        "-h${mysql_host}"
+        "-P${MATRIXONE_PORT:-6001}"
+        "-u${MATRIXONE_USER:-root}"
+    )
+
+    tls_arg=""
+    case "$tls_mode" in
+        disabled)
+            if [[ "$supports_ssl_mode" == true ]]; then
+                tls_arg='--ssl-mode=DISABLED'
+            elif [[ "$supports_skip_ssl" == true ]]; then
+                tls_arg='--skip-ssl'
+            else
+                echo "The configured MySQL client cannot enforce ASTRA_MYSQL_TLS_MODE=disabled." >&2
+                echo "Install a client with --ssl-mode or --skip-ssl support, or choose a compatible client explicitly." >&2
+                return 2
+            fi
+            ;;
+        required)
+            if [[ "$supports_ssl_mode" == true ]]; then
+                tls_arg='--ssl-mode=REQUIRED'
+            elif [[ "$supports_ssl" == true ]]; then
+                tls_arg='--ssl'
+            else
+                echo "The configured MySQL client cannot enforce ASTRA_MYSQL_TLS_MODE=required." >&2
+                echo "Install a client with --ssl-mode or --ssl support, or choose a compatible client explicitly." >&2
+                return 2
+            fi
+            ;;
+        auto)
+            # A client feature only tells us which switch it understands; it says
+            # nothing about the endpoint. Select its connection policy before the
+            # caller's command runs, so an SQL mutation is never retried merely to
+            # work around a TLS handshake. Prefer encrypted transport when it is
+            # available, then make a deliberate plaintext fallback.
+            if [[ "$mysql_host" == "127.0.0.1" || "$mysql_host" == "localhost" || "$mysql_host" == "::1" ]]; then
+                if [[ "$supports_ssl_mode" == true ]]; then
+                    candidates=(--ssl-mode=PREFERRED --ssl-mode=DISABLED)
+                elif [[ "$supports_skip_ssl" == true ]]; then
+                    candidates=("" --skip-ssl)
+                else
+                    candidates=("")
+                fi
+            elif [[ "$supports_ssl_mode" == true ]]; then
+                candidates=(--ssl-mode=REQUIRED)
+            elif [[ "$supports_ssl" == true ]]; then
+                candidates=(--ssl)
+            else
+                echo "Auto TLS mode will not downgrade remote endpoint ${mysql_host} to plaintext." >&2
+                echo "Use ASTRA_MYSQL_TLS_MODE=disabled only when plaintext is explicitly intended." >&2
+                return 2
+            fi
+            for candidate in "${candidates[@]}"; do
+                probe_args=("${mysql_connection_options[@]}")
+                [[ -n "$candidate" ]] && probe_args+=("$candidate")
+                if MYSQL_PWD="${MATRIXONE_PASSWORD:-111}" "$mysql_client" "${probe_args[@]}" -e 'SELECT 1' >/dev/null 2>&1; then
+                    tls_arg="$candidate"
+                    break
+                fi
+            done
+
+            # Preserve the native diagnostic when neither harmless probe can
+            # connect. It contains the endpoint/authentication detail a synthetic
+            # wrapper error would otherwise hide.
+            if [[ -z "$tls_arg" && "${candidates[0]}" != "" ]]; then
+                tls_arg="${candidates[0]}"
+            fi
+            ;;
+    esac
+
+    [[ -n "$tls_arg" ]] && mysql_connection_options+=("$tls_arg")
+    return 0
+}

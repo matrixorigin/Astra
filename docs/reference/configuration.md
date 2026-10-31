@@ -11,6 +11,22 @@ Use these files as the canonical configuration references:
 
 ## Core Variables
 
+### Container runtime
+
+- `ASTRA_CONTAINER_ENGINE` — `docker` (default) or native `podman` with
+  `podman-compose`. An explicit environment/Make value overrides the selected
+  env file; old files without the setting default to Docker. New stack env
+  files retain the selection.
+- `ASTRA_OPS_ENV_FILE` — env file used by health/backup/restore helpers; defaults
+  to the repository's `.env`.
+- `ASTRA_IMAGE` — API/CLI image reference. An explicit value supplied to
+  `make stack-env` or `make stack-start` is saved in the selected stack env file.
+  `make stack-start-head` builds the current checkout and saves
+  `localhost/astra:head-<full-commit-sha>-<build-id>` after a successful build.
+
+See [container runtimes](../guides/container-runtimes.md) for requirements,
+rootless settings, and engine data boundaries.
+
 ### Database: MatrixOne
 
 - `MATRIXONE_HOST`, `MATRIXONE_PORT`, `MATRIXONE_USER`, `MATRIXONE_PASSWORD`

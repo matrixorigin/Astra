@@ -1,5 +1,10 @@
 # Deployment Overview
 
+Docker is the default. Native Podman uses `podman` and `podman-compose` directly:
+select it with `ASTRA_CONTAINER_ENGINE=podman`. See
+[container runtimes](../docs/guides/container-runtimes.md) for prerequisites,
+rootless settings, operations, and monitoring.
+
 ## Main Paths
 
 - `deployment/all-in-one/` - local or single-host Docker compose deployment
@@ -12,6 +17,12 @@
 The release workflow builds multi-architecture images from the root
 [`Dockerfile`](../Dockerfile). Use this path for normal development and
 published releases.
+
+For development validation, run
+`ASTRA_CONTAINER_ENGINE=podman MEMORIA_EMBEDDING_PROVIDER=mock make stack-start-head`
+from the current checkout. It builds HEAD with local changes, saves the local
+image selection in the stack descriptor, and verifies health and memory. Use
+`make stack-build-head` to build and select the image without starting services.
 
 [`Dockerfile.prebuilt`](../Dockerfile.prebuilt) is a specialized amd64 path for
 packaging already cross-compiled `astra-server` and `astra` binaries without

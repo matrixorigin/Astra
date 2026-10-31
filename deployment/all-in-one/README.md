@@ -1,13 +1,37 @@
 # All-in-One Deployment
 
+Docker is the default; native Podman with `podman-compose` 1.6.0+ is also
+supported. Select it with `ASTRA_CONTAINER_ENGINE=podman`.
+New descriptors retain the selection. See
+[container runtimes](../../docs/guides/container-runtimes.md).
+For Linux boot startup, install the
+[user systemd unit](../../docs/guides/container-runtimes.md#start-automatically-after-reboot).
+
 This compose stack starts MatrixOne, Memoria, and `astra-server`.
 
-The guided setup requires a current Docker Compose v2 with `--dry-run` support,
-OpenSSL, and Python 3.9 or newer.
+The guided setup requires OpenSSL and Python 3.9 or newer. The Docker backend
+requires Compose v2 with `--dry-run`; native Podman requires `podman-compose`
+1.6.0 or newer.
 
 The development flow is separate and still uses `docker-compose.deps.yml` through the repo-root `make dev-deps-*` targets, followed by `make dev-api-start` for a locally built API server.
 
 ## Start With Make
+
+For development and deployment validation, build and verify HEAD from the
+repository root:
+
+```bash
+ASTRA_CONTAINER_ENGINE=podman MEMORIA_EMBEDDING_PROVIDER=mock make stack-start-head
+```
+
+This builds the current checkout, including local source changes, and saves
+`localhost/astra:head-<full-commit-sha>` in the stack descriptor after success.
+Subsequent `stack-up` and guided setup retain that selection. Rebuild with the
+same command after updating source. Use `make stack-build-head` to build and
+select the image without starting services. Docker uses the same targets with
+`ASTRA_CONTAINER_ENGINE=docker`.
+
+For a published release deployment, follow the matching-release path below.
 
 Install the released client binaries if they are not already available:
 

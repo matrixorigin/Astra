@@ -24,20 +24,21 @@ esac
 
 "${SCRIPT_DIR}/validate_production_env.sh" "${ENV_FILE}"
 
-if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
-    echo "Error: Docker with the Compose plugin is required." >&2
-    exit 1
-fi
+. "$REPO_ROOT/scripts/lib/container_runtime.sh"
+container_select "$ENV_FILE"
+container_check
 
 compose() {
-    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
+    "$REPO_ROOT/scripts/lib/container_runtime.sh" --env-file "$ENV_FILE" \
+        --file "$COMPOSE_FILE" compose "$@"
 }
 
 echo "Validating production configuration..."
 compose config --quiet
 
 echo "Starting Astra Server behind Nginx (${API_REPLICAS} API replica(s))..."
-compose up -d --scale api="${API_REPLICAS}"
+compose up -d --wait --wait-timeout 180 --scale api="${API_REPLICAS}"
 
 echo "Deployment started. Inspect it with:"
-echo "  docker compose --env-file ${ENV_FILE} -f ${COMPOSE_FILE} ps"
+printf '  ASTRA_CONTAINER_ENGINE=%q %q --env-file %q --file %q compose ps\n' \
+    "$container_engine" "$REPO_ROOT/scripts/lib/container_runtime.sh" "$ENV_FILE" "$COMPOSE_FILE"

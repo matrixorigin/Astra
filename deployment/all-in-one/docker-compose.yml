@@ -15,6 +15,9 @@ services:
   matrixone-init:
     image: ${MATRIXONE_IMAGE:?Set MATRIXONE_IMAGE in deployment/all-in-one/.env}
     user: root
+    userns_mode: ${ASTRA_DEPENDENCY_USERNS:-}
+    labels:
+      io.astra.lifecycle: init
     environment:
       HOST_UID: ${UID:-1000}
       HOST_GID: ${GID:-1000}
@@ -49,6 +52,7 @@ services:
     image: ${MATRIXONE_IMAGE:?Set MATRIXONE_IMAGE in deployment/all-in-one/.env}
     hostname: matrixone
     user: "${UID:-1000}:${GID:-1000}"
+    userns_mode: ${ASTRA_DEPENDENCY_USERNS:-}
     depends_on:
       matrixone-init:
         condition: service_completed_successfully
@@ -66,7 +70,7 @@ services:
     networks:
       - mo-net
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:6060/debug/vars"]
+      test: ["CMD", "curl", "--noproxy", "*", "-sf", "http://127.0.0.1:6060/debug/vars"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -81,6 +85,9 @@ services:
   memoria-init:
     image: ${MEMORIA_IMAGE:?Set MEMORIA_IMAGE in deployment/all-in-one/.env}
     user: root
+    userns_mode: ${ASTRA_DEPENDENCY_USERNS:-}
+    labels:
+      io.astra.lifecycle: init
     environment:
       HOST_UID: ${UID:-1000}
       HOST_GID: ${GID:-1000}
@@ -120,6 +127,7 @@ services:
     image: ${MEMORIA_IMAGE:?Set MEMORIA_IMAGE in deployment/all-in-one/.env}
     hostname: memoria
     user: "${UID:-1000}:${GID:-1000}"
+    userns_mode: ${ASTRA_DEPENDENCY_USERNS:-}
     ports:
       - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${MEMORIA_PORT:-8100}:8100"
     volumes:
@@ -181,6 +189,8 @@ services:
     hostname: api
     command: ["astra-server"]
     env_file: *astra-env-files
+    labels:
+      io.astra.environment-hash: ${ASTRA_STACK_ENV_HASH:-}
     ports:
       # ASTRA_API_PORT is the host-facing port. The container listens on 17001.
       - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${ASTRA_API_PORT:-17001}:17001"
@@ -226,7 +236,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "curl -fsS http://localhost:17001/ready",
+          "curl --noproxy '*' -fsS http://localhost:17001/ready",
         ]
       interval: 30s
       timeout: 5s

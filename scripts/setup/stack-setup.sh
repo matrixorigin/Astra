@@ -48,11 +48,10 @@ on_interrupt() {
 trap on_interrupt INT TERM
 trap cleanup_setup_temporary_files EXIT
 
-command -v docker >/dev/null 2>&1 || die "docker is required"
-docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
-docker compose up --help 2>/dev/null | grep -q -- '--dry-run' ||
-    die "Docker Compose is too old for safe change planning; upgrade to a version whose 'docker compose up --help' includes --dry-run"
-docker info >/dev/null 2>&1 || die "Docker is not running or is not accessible"
+. "$repo_root/scripts/lib/container_runtime.sh"
+container_select "$stack_env"
+export ASTRA_CONTAINER_ENGINE="$container_engine"
+container_check
 
 python_cmd=""
 for candidate in python3 python; do
@@ -85,16 +84,8 @@ if [[ -n "$setup_overrides" ]]; then
 fi
 
 compose() {
-    local project_name
-    project_name="$(env_file_read "$stack_env" ASTRA_STACK_NAME 2>/dev/null || true)"
-    project_name="${project_name:-all-in-one}"
-    (
-        cd "$stack_dir"
-        env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE \
-            UID="$(id -u)" GID="$(id -g)" ASTRA_STACK_ENV_FILE="$stack_env" \
-            docker compose --project-name "$project_name" \
-            --file "$stack_dir/docker-compose.yml" --env-file "$stack_env" "$@"
-    )
+    "$repo_root/scripts/lib/container_runtime.sh" --env-file "$stack_env" \
+        --file "$stack_dir/docker-compose.yml" compose "$@"
 }
 
 read_default() {
@@ -331,8 +322,8 @@ service_state() {
         printf 'missing'
         return
     fi
-    state="$(docker inspect --format '{{if .State.Running}}{{if .State.Health}}{{.State.Health.Status}}{{else}}running{{end}}{{else}}{{.State.Status}}{{end}}' "$container_id" 2>/dev/null || echo unknown)"
-    networks="$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$container_id" 2>/dev/null || echo 0)"
+    state="$(container_metadata state "$container_id" 2>/dev/null || echo unknown)"
+    networks="$(container_metadata networks "$container_id" 2>/dev/null || echo 0)"
     if [[ "$networks" == 0 ]]; then
         printf '%s, network disconnected' "$state"
     else
@@ -351,14 +342,8 @@ stack_exists() {
 }
 
 service_matches_configuration() {
-    local service="$1" plan
-    # Compose's `config --hash` does not match the runtime label for every
-    # env_file configuration. Ask Compose for its own read-only execution plan
-    # so the wizard makes the same recreate decision as `compose up`.
-    if ! plan="$(COMPOSE_ANSI=never compose --dry-run up -d --no-deps --no-build --pull never "$service" 2>&1)"; then
-        return 1
-    fi
-    compose_plan_keeps_service "$plan"
+    "$repo_root/scripts/lib/container_runtime.sh" --env-file "$stack_env" \
+        --file "$stack_dir/docker-compose.yml" plan "$1"
 }
 
 stack_matches_configuration() {
@@ -378,7 +363,7 @@ service_owns_host_port() {
         case "$binding" in
             *:"$host_port") return 0 ;;
         esac
-    done < <(docker port "$container_id" "$container_port/tcp" 2>/dev/null || true)
+    done < <(container_run port "$container_id" "$container_port/tcp" 2>/dev/null || true)
     return 1
 }
 
@@ -741,7 +726,7 @@ if [[ -n "$embedding_endpoints" ]]; then
    Keep the advanced endpoint set and use make stack-start, or clear it before running the wizard."
 fi
 ensure_data_volume_is_not_shared
-ok "Docker, Compose, Python, CLI, and local secrets are ready"
+ok "$container_engine, Compose, Python, CLI, and local secrets are ready"
 choose_existing_stack_action
 
 step "2/5" "Configuring and testing semantic memory"
@@ -793,8 +778,12 @@ api_port="$(env_resolve_value "$stack_env" ASTRA_API_PORT 2>/dev/null || true)"
 bind_address="$(env_resolve_value "$stack_env" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
 api_host="$(env_http_host_from_bind "$bind_address")"
 export ASTRA_API_URL="http://${api_host}:${api_port:-17001}"
-echo "  Model requests originate inside Docker. For a model server on this host,"
-echo "  use http://host.docker.internal:<port> instead of localhost."
+echo "  Model requests originate inside containers. For a model server on this host,"
+if [[ "$container_engine" == podman ]]; then
+    echo "  use http://host.containers.internal:<port> instead of localhost."
+else
+    echo "  use http://host.docker.internal:<port> instead of localhost."
+fi
 save_cli_api_url
 show_setup_state
 choose_admin_model_action

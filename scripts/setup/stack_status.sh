@@ -3,7 +3,7 @@
 
 print_stack_command() {
     local target="$1"
-    printf 'make %s STACK_ENV=%q' "$target" "$stack_env"
+    printf 'make %s STACK_ENV=%q ASTRA_CONTAINER_ENGINE=%q' "$target" "$stack_env" "${container_engine:-docker}"
 }
 
 print_stack_inspect_commands() {

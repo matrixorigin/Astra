@@ -1,0 +1,8 @@
+# Restore the long-running dependency after removing init dependencies in
+# docker-compose.podman-init.yml. Two small overlays avoid podman-compose 1.6's broken
+# nested !override mapping constructor, while retaining health admission.
+services:
+  memoria:
+    depends_on:
+      matrixone:
+        condition: service_healthy

@@ -3,6 +3,7 @@
 # invoke accidentally in CI: this test never starts Docker or prompts.
 
 set -euo pipefail
+unset ASTRA_CONTAINER_ENGINE
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="$repo_root/scripts/setup/stack-setup.sh"
@@ -13,6 +14,7 @@ identity_helpers="$repo_root/scripts/setup/stack_identity.sh"
 status_helpers="$repo_root/scripts/setup/stack_status.sh"
 env_write_helpers="$repo_root/scripts/setup/stack_env_write.sh"
 memory_helpers="$repo_root/scripts/setup/stack_memory.sh"
+runtime_helpers="$repo_root/scripts/lib/container_runtime.sh"
 
 grep -q '^stack-setup:' "$makefile"
 grep -q '^stack-start: stack-env' "$makefile"
@@ -36,13 +38,14 @@ grep -q 'guided setup cannot safely edit .env while exported overrides are activ
 grep -q 'MEMORIA_EMBEDDING_ENDPOINTS is configured' "$script"
 grep -q 'Choose the intended outcome' "$script"
 grep -q 'Create a separate installation' "$script"
-grep -q 'compose --dry-run up' "$script"
-grep -q -- '--project-name "$project_name"' "$script"
+grep -q 'container_runtime.sh' "$script"
+grep -q 'container_plan_matches' "$runtime_helpers"
+grep -q -- '--project-name "$project"' "$runtime_helpers"
 grep -q -- '--file "$stack_dir/docker-compose.yml"' "$script"
-grep -q 'env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE' "$script"
-grep -q -- '--project-name "$$project_name"' "$makefile"
+grep -q 'env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE' "$runtime_helpers"
+grep -q 'CONTAINER_RUNTIME.*container_runtime.sh' "$makefile"
 grep -q -- '--file "$(abspath $(STACK_DIR)/docker-compose.yml)"' "$makefile"
-grep -q 'Docker Compose is too old for safe change planning' "$script"
+grep -q 'Docker Compose is too old for safe change planning' "$runtime_helpers"
 grep -q 'config set api_url' "$script"
 grep -q 'Current installation status' "$script"
 grep -q 'Finish the stack and configure chat later' "$script"
@@ -282,6 +285,8 @@ docker() {
         fi
     fi
 }
+. "$runtime_helpers"
+container_select "$identity_env"
 . "$identity_helpers"
 . "$status_helpers"
 python_cmd=python3
@@ -297,12 +302,12 @@ parse_model_catalog_state '{"items":[{"name":"inactive-only","is_active":false}]
 [[ "$inactive_model_count" == 1 ]]
 [[ "$inactive_model_names" == inactive-only ]]
 
-compose_plan_keeps_service 'DRY-RUN MODE - Container astra-api-1 Running'
-if compose_plan_keeps_service 'DRY-RUN MODE - Container astra-api-1 Recreate'; then
+printf '%s' 'DRY-RUN MODE - Container astra-api-1 Running' | python3 "$repo_root/scripts/lib/container_state.py" plan docker unused
+if printf '%s' 'DRY-RUN MODE - Container astra-api-1 Recreate' | python3 "$repo_root/scripts/lib/container_state.py" plan docker unused; then
     echo "interactive setup contract failed: recreate plan was treated as reusable" >&2
     exit 1
 fi
-if compose_plan_keeps_service ''; then
+if printf '%s' '' | python3 "$repo_root/scripts/lib/container_state.py" plan docker unused; then
     echo "interactive setup contract failed: empty plan was treated as reusable" >&2
     exit 1
 fi
@@ -317,7 +322,7 @@ suggestion="$(suggest_isolated_stack_name)"
 
 # A process-level project override must not redirect the management commands.
 compose_preview="$(COMPOSE_PROJECT_NAME=all-in-one make --no-print-directory -n stack-status STACK_ENV="$identity_env")"
-grep -q -- '--project-name "$project_name"' <<< "$compose_preview"
+grep -q 'container_runtime.sh' <<< "$compose_preview"
 grep -q -- '--file "/.*deployment/all-in-one/docker-compose.yml"' <<< "$compose_preview"
 
 # Port allocation is staged: a failure after the first allocation leaves the
@@ -339,7 +344,7 @@ active_during_staging="$(sed -n '1p' "$identity_interrupt_observation")"
 target_during_staging="$(sed -n '2p' "$identity_interrupt_observation")"
 recovery_during_staging="$(sed -n '3p' "$identity_interrupt_observation")"
 [[ "$active_during_staging" == "$identity_env" ]]
-[[ "$recovery_during_staging" == "make stack-down STACK_ENV=$(printf '%q' "$identity_env")" ]]
+[[ "$recovery_during_staging" == "make stack-down STACK_ENV=$(printf '%q' "$identity_env") ASTRA_CONTAINER_ENGINE=docker" ]]
 case "$target_during_staging" in
     "$identity_env.interrupted.env.staging."*) ;;
     *) echo "interactive setup contract failed: staging descriptor is outside the ignored namespace" >&2; exit 1 ;;
@@ -388,11 +393,11 @@ for managed_env in "$identity_env" "$isolated_env"; do
     managed_preview="$(make --no-print-directory -n stack-status STACK_ENV="$managed_env")"
     managed_env_abs="$(cd "$(dirname "$managed_env")" && pwd)/$(basename "$managed_env")"
     grep -q -- "--env-file \"$managed_env_abs\"" <<< "$managed_preview"
-    grep -q -- '--project-name "$project_name"' <<< "$managed_preview"
+    grep -q 'container_runtime.sh' <<< "$managed_preview"
 done
 stack_env="$isolated_env"
 isolated_env_quoted="$(printf '%q' "$isolated_env")"
-[[ "$(print_stack_command stack-down)" == "make stack-down STACK_ENV=$isolated_env_quoted" ]]
+[[ "$(print_stack_command stack-down)" == "make stack-down STACK_ENV=$isolated_env_quoted ASTRA_CONTAINER_ENGINE=docker" ]]
 failure_preview="$(make --no-print-directory -n stack-up STACK_ENV="$isolated_env")"
 stack_down_recovery="$(grep -F 'make stack-down STACK_ENV=' <<< "$failure_preview")"
 grep -Fq "$isolated_env" <<< "$stack_down_recovery"

@@ -12,7 +12,7 @@ services:
   # ─── Prometheus ───────────────────────────────────────────
 
   prometheus:
-    image: prom/prometheus:v3.14.0
+    image: docker.io/prom/prometheus:v3.14.0
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -33,7 +33,7 @@ services:
   # ─── Grafana ──────────────────────────────────────────────
 
   grafana:
-    image: grafana/grafana:13.2.1
+    image: docker.io/grafana/grafana:13.2.1
     ports:
       - "${GRAFANA_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
     environment:
@@ -54,7 +54,7 @@ services:
   # ─── Node Exporter (Optional) ─────────────────────────────
 
   node-exporter:
-    image: prom/node-exporter:v1.12.1
+    image: docker.io/prom/node-exporter:v1.12.1
     command:
       - '--path.procfs=/host/proc'
       - '--path.sysfs=/host/sys'

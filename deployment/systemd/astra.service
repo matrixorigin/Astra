@@ -1,0 +1,22 @@
+# Install as ~/.config/systemd/user/astra.service and set WorkingDirectory.
+[Unit]
+Description=Astra native Podman stack
+Wants=podman-user-wait-network-online.service
+After=podman-user-wait-network-online.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/absolute/path/to/Astra
+Environment=ASTRA_CONTAINER_ENGINE=podman
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/make --no-print-directory stack-up
+ExecStop=/usr/bin/make --no-print-directory stack-down
+TimeoutStartSec=600
+TimeoutStopSec=180
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

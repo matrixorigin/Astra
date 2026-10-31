@@ -39,7 +39,7 @@ services:
     networks:
       - astra
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:17001/ready"]
+      test: ["CMD-SHELL", "curl --noproxy '*' -fsS http://127.0.0.1:17001/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -60,7 +60,7 @@ services:
         max-file: "3"
 
   nginx:
-    image: ${NGINX_IMAGE:-nginx:1.30.4-alpine}
+    image: ${NGINX_IMAGE:-docker.io/library/nginx:1.30.4-alpine}
     ports:
       - "${ASTRA_PUBLIC_BIND_ADDRESS:-0.0.0.0}:${ASTRA_PUBLIC_HTTP_PORT:-80}:80"
     volumes:

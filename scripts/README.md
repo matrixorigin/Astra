@@ -90,6 +90,14 @@ benchmark summary.
 ### `scripts/dev/init.sh`
 Initializes local development configuration, generating required local secrets in `.env`, and prepares the Rust-first workflow behind `make dev-init`.
 
+### `scripts/lib/container_runtime.sh`
+One native runtime adapter for Docker/Compose (default) and Podman/podman-compose.
+It owns engine selection, project isolation, inspection, readiness, and private
+change planning. `scripts/lib/container_state.py` projects metadata without
+printing container environments. See
+[container runtimes](../docs/guides/container-runtimes.md) and run
+`python3 scripts/dev/test_container_runtime.py` for offline contracts.
+
 ### `scripts/lib/env_file.sh`
 Provides the canonical, non-evaluating reader and placeholder checks for Astra
 environment templates. Source this helper instead of independently parsing

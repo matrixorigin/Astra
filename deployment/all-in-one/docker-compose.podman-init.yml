@@ -1,0 +1,8 @@
+# Native Podman --requires only models running dependencies. Completed init
+# jobs are executed synchronously by the shared runtime before service startup.
+# Keep the actual init commands and all other settings in the canonical files.
+services:
+  matrixone:
+    depends_on: !reset {}
+  memoria:
+    depends_on: !reset {}
