@@ -21,8 +21,8 @@ pub struct BuildInfo {
 pub fn current() -> BuildInfo {
     BuildInfo {
         schema: BUILD_INFO_SCHEMA,
-        git_sha: crate::history_work_baseline::BUILD_GIT_SHA,
-        git_dirty: crate::history_work_baseline::BUILD_GIT_DIRTY == "true",
+        git_sha: BUILD_GIT_SHA,
+        git_dirty: BUILD_GIT_DIRTY == "true",
         target: BUILD_TARGET,
         profile: BUILD_PROFILE,
     }
@@ -45,6 +45,30 @@ pub fn write_json_if_requested() -> Result<bool, Box<dyn std::error::Error>> {
     output.write_all(b"\n")?;
     output.flush()?;
     Ok(true)
+}
+
+/// Source identity compiled into this artifact, independent of runtime environment.
+pub const BUILD_GIT_SHA: &str = env!("ASTRA_BUILD_GIT_SHA");
+pub const BUILD_GIT_DIRTY: &str = env!("ASTRA_BUILD_GIT_DIRTY");
+pub const BUILD_ATTESTATION_NONCE: &str = env!("ASTRA_BUILD_ATTESTATION_NONCE");
+
+pub fn current_attestation() -> astra_core::history_work_baseline::BuildAttestation {
+    astra_core::history_work_baseline::BuildAttestation {
+        git_sha: BUILD_GIT_SHA,
+        git_dirty: BUILD_GIT_DIRTY,
+        nonce: BUILD_ATTESTATION_NONCE,
+    }
+}
+
+pub fn verify_current_build_attestation(
+    expected_sha: &str,
+    run_id: &str,
+) -> std::io::Result<String> {
+    astra_core::history_work_baseline::verify_current_build_attestation(
+        expected_sha,
+        run_id,
+        current_attestation(),
+    )
 }
 
 #[cfg(test)]

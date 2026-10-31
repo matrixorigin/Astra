@@ -930,6 +930,7 @@ async fn main() {
     let process_capture =
         match astra_core::history_work_baseline::ProductionProcessCaptureGuard::from_env(
             astra_core::history_work_baseline::ProductionProcessRole::Edge,
+            astra_build_info::current_attestation(),
         ) {
             Ok(process_capture) => process_capture,
             Err(error) => {

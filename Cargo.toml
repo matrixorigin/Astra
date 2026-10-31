@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/astra-build-info",
     "crates/astra-logging",
     "crates/services",
     "crates/runtime",
@@ -37,6 +38,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
+astra-build-info = { path = "crates/astra-build-info" }
 astra-credentials = { path = "crates/astra-credentials" }
 astra-harness = { path = "crates/astra-harness" }
 astra-logging = { path = "crates/astra-logging" }

@@ -255,7 +255,6 @@ fn matrixone_pool_options(settings: &MatrixOneSettings) -> MySqlPoolOptions {
         ))
 }
 
-pub mod build_info;
 pub mod client_installation;
 pub mod history_work;
 pub mod history_work_baseline;

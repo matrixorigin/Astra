@@ -345,7 +345,7 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
-    if astra_core::build_info::write_json_if_requested()
+    if astra_build_info::write_json_if_requested()
         .map_err(|error| anyhow::anyhow!("build identity: {error}"))?
     {
         return Ok(());

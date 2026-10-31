@@ -5,6 +5,7 @@
 //! counter deltas with correlated scenario facts and refuses to write an
 //! artifact unless the complete typed contract verifies.
 
+use astra_build_info::verify_current_build_attestation;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,8 +16,7 @@ use astra_core::history_work::{HISTORY_WORK_COVERAGE_COMPLETE, HISTORY_WORK_KNOW
 use astra_core::history_work_baseline::{
     BaselineProvenance, CoverageInventory, PRODUCTION_BASELINE_SCHEMA, ProductionBaselineArtifact,
     ProductionExecutableEvidence, ProductionProcessCapture, ProductionProcessRole,
-    ProductionScenario, aggregate_process_site_totals, verify_current_build_attestation,
-    write_json_atomic,
+    ProductionScenario, aggregate_process_site_totals, write_json_atomic,
 };
 use sha2::{Digest, Sha256};
 

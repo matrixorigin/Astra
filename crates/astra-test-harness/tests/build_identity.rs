@@ -203,7 +203,7 @@ fn executable_identity_precedes_configuration_and_argument_parsing() {
     assert!(output.stderr.is_empty(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::to_value(astra_core::build_info::current()).unwrap(),
+        serde_json::to_value(astra_build_info::current()).unwrap(),
     );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }

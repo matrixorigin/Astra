@@ -418,7 +418,10 @@ identity. `build_git_dirty=false` is an explicit clean-build declaration;
 Cargo builds (debug or release) without a valid attestation nonce or a complete
 trusted source declaration conservatively report `true`, even in a clean
 checkout. They do not watch every tracked file, so unrelated edits can reuse
-core without leaving an old clean identity that artifact verification accepts.
+the artifact identity library without leaving an old clean identity that artifact
+verification accepts. Git identity is embedded by `astra-build-info`, near the
+executable boundary, so commit metadata alone does not rebuild `astra-core`
+and its ordinary library consumers.
 
 Identity-sensitive builds must either use a valid 64-hex
 `ASTRA_BUILD_ATTESTATION_NONCE` (which watches all tracked files, even when the
