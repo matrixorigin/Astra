@@ -192,6 +192,7 @@ async fn insert_run_row(
     retry_of: Option<&str>,
     retry_scope: &str,
 ) {
+    let mut tx = pool.get().begin().await.unwrap();
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
@@ -210,9 +211,17 @@ async fn insert_run_row(
         .bind(retry_of)
         .bind(retry_scope)
         .bind(status)
-        .execute(pool.get())
+        .execute(&mut *tx)
         .await
         .expect("insert_run_row must persist run tree node");
+    sqlx::query("INSERT INTO agent_run_openings (user_id, run_id, session_id) VALUES (?, ?, ?)")
+        .bind(user_id)
+        .bind(run_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
 
 async fn insert_state_item(
@@ -1802,6 +1811,15 @@ async fn e2e_joint_4_s10_five_level_delegation_and_retry_node() {
         "S10 original executor run must be superseded, got {superseded}"
     );
     handle.abort();
+    let _ = handle.await;
+    astra_services::auth::session::SessionService::delete_session(
+        &astra_services::auth::session::DatabaseSessionService::new(pool.settings().clone())
+            .with_pool(pool.clone()),
+        session_id,
+        user_id,
+    )
+    .await
+    .expect("clean S10 Run tree and Session");
 }
 
 #[tokio::test]

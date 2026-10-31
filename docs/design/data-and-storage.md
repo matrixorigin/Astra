@@ -101,7 +101,10 @@ build; stop old workers before handing their workspaces to a new deployment.
 in exactly one `agent_run_openings` row per Run, including Runs with no opening.
 The existing creation transaction writes both rows, initial events and admitted
 Context together. Full readers verify the opening hashes and reject a missing
-payload row; control/frames-only readers explicitly carry an unloaded body.
+payload row; control/frames-only readers explicitly carry an unloaded body. Checkpoint
+writes use the same admitted and locked control projection: they validate the
+current checkpoint reference without loading or certifying the cold opening.
+Executable recovery and full reads retain opening integrity validation.
 Conversation selection, watermark and admitted opening bytes share one statement
 snapshot. Session deletion removes opening rows before Run rows.
 
@@ -451,7 +454,7 @@ Agent events must have explicit retention class.
 Suggested retention classes:
 
 | Class | Examples | Policy |
-| --- | --- |
+| --- | --- | --- |
 | control_audit | permission, provider decision, run transition | account/audit policy. |
 | trace_default | tool lifecycle, retry/cache/sync facts | diagnosis window, then archive/compact. |
 | quality_signal | tool quality, eval labels | learning/eval policy after redaction. |

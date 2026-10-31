@@ -1,6 +1,6 @@
 //! Introspection API — cloud-side data for `get_agent_info` tool.
 //!
-//! Types, trait, scoring, and database implementation live in `astra_services::introspection`.
+//! Types, trait, and database implementation live in `astra_services::introspection`.
 //! This module re-exports them and adds HTTP handler functions.
 
 use axum::{
@@ -17,47 +17,6 @@ use crate::{AppState, ErrorResponse};
 pub use astra_services::introspection::*;
 
 // ── Query parameter types (runtime-only) ─────────────────────────────────────
-
-fn default_turns() -> i32 {
-    10
-}
-fn default_context_window() -> i64 {
-    200000
-}
-fn default_retrieval_turns() -> i32 {
-    5
-}
-fn default_raw_token_budget() -> i32 {
-    2000
-}
-
-#[derive(Deserialize)]
-pub struct ContextTrendQuery {
-    pub session_id: String,
-    #[serde(default = "default_turns")]
-    pub turns: i32,
-    #[serde(default = "default_context_window")]
-    pub context_window: i64,
-}
-
-#[derive(Deserialize)]
-pub struct ContextSnapshotQuery {
-    pub session_id: String,
-    pub turn_index: Option<i32>,
-    #[serde(default)]
-    pub detail: bool,
-    #[serde(default)]
-    pub raw: bool,
-    #[serde(default = "default_raw_token_budget")]
-    pub raw_token_budget: i32,
-}
-
-#[derive(Deserialize)]
-pub struct RetrievalQualityQuery {
-    pub session_id: String,
-    #[serde(default = "default_retrieval_turns")]
-    pub turns: i32,
-}
 
 fn default_tool_history_window_hours() -> i32 {
     24
@@ -118,14 +77,6 @@ pub async fn get_drift_check_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_functions() {
-        assert_eq!(default_turns(), 10);
-        assert_eq!(default_context_window(), 200000);
-        assert_eq!(default_retrieval_turns(), 5);
-        assert_eq!(default_raw_token_budget(), 2000);
-    }
 
     #[test]
     fn tool_history_query_defaults() {

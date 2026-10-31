@@ -3456,3 +3456,86 @@ async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion(
             .unwrap();
     }
 }
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn checkpoint_save_keeps_large_opening_out_of_the_locked_read() {
+    use astra_services::runs::{
+        CheckpointWriteAuthority, DurableRunOpening, RunCheckpointWriteRequest,
+    };
+    let (pool, store) = setup().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let run = uuid::Uuid::new_v4().to_string();
+    let mut record = durable_run_record(run.clone(), user.clone(), session.clone());
+    record.events =
+        vec![json!({"event_type":"run_started", "data":{"text":"x".repeat(6 * 1024 * 1024)}})];
+    record.opening = DurableRunOpening::capture(&record.events).unwrap().into();
+    insert_run_fixture(&pool, &store, record).await;
+    let body = r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"small"}"#;
+    let queries = Queries::default();
+    let subscriber = tracing_subscriber::registry().with(queries.clone());
+    let request = || RunCheckpointWriteRequest {
+        user_id: &user,
+        expected_session_id: &session,
+        run_id: &run,
+        checkpoint_json: body,
+        authority: CheckpointWriteAuthority::ControlPlane,
+    };
+    assert!(
+        store
+            .save_checkpoint(request())
+            .with_subscriber(subscriber)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let statements = queries.0.lock().unwrap().clone();
+    assert!(
+        statements
+            .iter()
+            .any(|sql| sql.contains("FROM agent_runs") && sql.contains("FOR UPDATE"))
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|sql| !sql.contains("agent_run_openings")),
+        "checkpoint save must not access the cold opening table"
+    );
+    assert!(
+        store
+            .load_run(&user, &run)
+            .await
+            .unwrap()
+            .unwrap()
+            .opening
+            .loaded()
+            .unwrap()
+            .is_some()
+    );
+
+    // Corrupt cold data is still rejected by a complete read, while a control
+    // write neither transfers nor decodes it. It cannot repair that corruption.
+    sqlx::query("UPDATE agent_run_openings SET opening_events_json = 'invalid' WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    assert!(store.save_checkpoint(request()).await.unwrap().is_some());
+    assert!(store.load_run(&user, &run).await.is_err());
+    sqlx::query(
+        "UPDATE agent_runs SET current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?",
+    )
+    .bind("z".repeat(64))
+    .bind(&user)
+    .bind(&run)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    assert!(
+        store.save_checkpoint(request()).await.is_err(),
+        "the control read must still validate the current checkpoint reference"
+    );
+    DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone())
+        .delete_session(session, user)
+        .await
+        .unwrap();
+}

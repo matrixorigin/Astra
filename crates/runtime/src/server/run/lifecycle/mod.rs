@@ -12982,9 +12982,10 @@ impl AgenticRunLifecycleService {
             .load_run(user_id, run_id)
             .await
             .map_err(|error| {
+                tracing::warn!(run_id, user_id, error = %error, "Failed to load durable run state");
                 error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to load durable run state: {error}"),
+                    "Unable to load this run right now. Please try again later.",
                 )
             })?;
         Ok(run)

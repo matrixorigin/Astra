@@ -56,6 +56,7 @@ async fn insert_run(
     run_id: &str,
     last_event_idx: i64,
 ) {
+    let mut tx = pool.get().begin().await.unwrap();
     sqlx::query(
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, root_run_id, ancestor_path, retry_scope, status, last_event_idx)
@@ -67,9 +68,17 @@ async fn insert_run(
     .bind(run_id)
     .bind(run_id)
     .bind(last_event_idx)
-    .execute(pool.get())
+    .execute(&mut *tx)
     .await
     .unwrap();
+    sqlx::query("INSERT INTO agent_run_openings (user_id, run_id, session_id) VALUES (?, ?, ?)")
+        .bind(user_id)
+        .bind(run_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 }
 
 async fn insert_transcript_item(
@@ -188,6 +197,11 @@ async fn l2_14_cold_start_known_zero_with_active_run_requires_replay() {
     assert_eq!(transcript_hwm, 3);
     assert_eq!(run_hwm, 9);
     assert!(replay_required);
+
+    astra_services::auth::session::SessionService::delete_session(
+        &astra_services::auth::session::DatabaseSessionService::new(pool.settings().clone()).with_pool(pool.clone()),
+        session_id, user_id,
+    ).await.unwrap();
 }
 
 }
@@ -413,6 +427,11 @@ async fn l3_4_s03_four_device_switches_restore_ordered_transcript() {
         .collect::<Vec<_>>();
     seqs.reverse();
     assert_eq!(seqs, [1, 2, 3, 4]);
+
+    astra_services::auth::session::SessionService::delete_session(
+        &astra_services::auth::session::DatabaseSessionService::new(pool.settings().clone()).with_pool(pool.clone()),
+        session_id, user_id,
+    ).await.unwrap();
 }
 
 }

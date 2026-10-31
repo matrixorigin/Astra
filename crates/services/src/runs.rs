@@ -2422,6 +2422,26 @@ async fn load_run_metadata_for_exact_session_tx<T>(
 where
     T: TransactionConnection,
 {
+    load_run_metadata_with_projection_for_exact_session_tx(
+        tx,
+        user_id,
+        expected_session_id,
+        run_id,
+        RunProjection::Opening,
+    )
+    .await
+}
+
+async fn load_run_metadata_with_projection_for_exact_session_tx<T>(
+    tx: &mut T,
+    user_id: &str,
+    expected_session_id: &str,
+    run_id: &str,
+    projection: RunProjection,
+) -> DbStoreResult<Option<DurableRunRecord>>
+where
+    T: TransactionConnection,
+{
     match crate::storage::admit_session_execution_write(tx, expected_session_id, user_id).await {
         Ok(()) => {}
         Err(sqlx::Error::RowNotFound) => return Ok(None),
@@ -2434,7 +2454,7 @@ where
         user_id,
         expected_session_id,
         run_id,
-        RunProjection::Opening,
+        projection,
     )
     .await
 }
@@ -15466,7 +15486,7 @@ impl DatabaseRunStateStore {
         }
         let provider_owner = record
             .opening
-            .as_ref()
+            .loaded()?
             .and_then(|opening| opening.events().first())
             .and_then(|event| event.pointer("/data/provider_run_owner"))
             .map(|value| serde_json::from_value::<ProviderRunOwner>(value.clone()))
@@ -20134,10 +20154,15 @@ impl RunStateStore for DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("begin_save_checkpoint", run_id, source).to_string())?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
-            .await
-            .map_err(|error| error.to_string())?
+        let Some(run) = load_run_metadata_with_projection_for_exact_session_tx(
+            &mut tx,
+            user_id,
+            expected_session_id,
+            run_id,
+            RunProjection::Control,
+        )
+        .await
+        .map_err(|error| error.to_string())?
         else {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_save_checkpoint_missing", run_id, source).to_string()
@@ -36442,6 +36467,137 @@ mod tests {
                 .expect("checkpoint save succeeds")
                 .is_some()
         );
+
+        // A cancelled writer must roll back its guarded checkout. Holding the
+        // canonical locks also makes a concurrent cancellation deterministic.
+        sqlx::query("UPDATE agent_runs SET owner_pod_id = ?, owner_lease_expires_at = TIMESTAMPADD(MINUTE, 5, NOW(6)) WHERE user_id = ? AND run_id = ?")
+            .bind(&store.owner_pod_id).bind(&user_id).bind(&run_id)
+            .execute(pool.get()).await.unwrap();
+        let generation = store
+            .load_run(&user_id, &run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_generation;
+        assert!(
+            store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    checkpoint_json: checkpoint,
+                    authority: CheckpointWriteAuthority::ExecutionOwner {
+                        expected_owner_generation: generation
+                    },
+                })
+                .await
+                .unwrap()
+                .is_some(),
+            "an owner save that wins before cancellation must commit completely"
+        );
+        let mut held = pool.get().begin().await.unwrap();
+        let current = store
+            .load_run_metadata_for_exact_session_tx(&mut held, &user_id, &session_id, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Reserve every other checkout: a full pool after polling proves the
+        // blocked writer acquired its own physical connection before cancellation.
+        let max_connections = pool.stats().max_connections as usize;
+        assert!(max_connections >= 2);
+        let mut reserved = Vec::new();
+        for _ in 0..max_connections - 2 {
+            reserved.push(pool.get().acquire().await.unwrap());
+        }
+        let blocked_body =
+            r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"cancelled-writer"}"#;
+        {
+            let mut blocked = Box::pin(store.save_checkpoint(RunCheckpointWriteRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                checkpoint_json: blocked_body,
+                authority: CheckpointWriteAuthority::ExecutionOwner {
+                    expected_owner_generation: current.run_generation,
+                },
+            }));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut blocked)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(pool.get().size() as usize, max_connections);
+            assert_eq!(pool.get().num_idle(), 0);
+            // Dropping the polled future cancels it while its checkout is held.
+        }
+        let mut competing = Box::pin(store.save_checkpoint(RunCheckpointWriteRequest {
+            user_id: &user_id,
+            expected_session_id: &session_id,
+            run_id: &run_id,
+            checkpoint_json: blocked_body,
+            authority: CheckpointWriteAuthority::ExecutionOwner {
+                expected_owner_generation: current.run_generation,
+            },
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut competing)
+                .await
+                .is_err()
+        );
+        assert_eq!(pool.get().size() as usize, max_connections);
+        assert_eq!(pool.get().num_idle(), 0);
+        sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NOW(6) WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(&mut *held).await.unwrap();
+        held.commit().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), &mut competing)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none(),
+            "a waiting owner save must observe cancellation committed by the lock holder"
+        );
+        drop(competing);
+        drop(reserved);
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(pool.get())
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    checkpoint_json: blocked_body,
+                    authority: CheckpointWriteAuthority::ExecutionOwner {
+                        expected_owner_generation: current.run_generation
+                    },
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "cancelled and rejected saves must not leave a checkpoint child"
+        );
+        let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        assert_eq!(loaded.current_checkpoint, current.current_checkpoint);
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")

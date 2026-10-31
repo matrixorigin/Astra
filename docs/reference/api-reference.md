@@ -161,6 +161,12 @@ responses from changing the current view.
 
 ## Active run permission mode
 
+### POST /chat/runs/{run_id}/resume
+
+Resume preflight returns `503` when saved Run state cannot be read, with a
+neutral retry message and no storage details or error code. Missing and
+foreign-owned Runs return `404`. A rejected preflight does not change the Run.
+
 ### POST /chat/runs/{run_id}/permission-mode
 
 The authenticated owner can select a permission policy for an active root run.
