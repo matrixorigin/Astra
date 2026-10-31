@@ -116,9 +116,6 @@ pub(super) fn build_core_state(
             .with_pool(shared_pool.clone())
             .with_scope_encryptor(Arc::clone(shared_encryptor)),
     ))
-    .with_agent_service(Arc::new(
-        DatabaseAgentService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
     .with_event_service(Arc::new(
         DatabaseEventService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))

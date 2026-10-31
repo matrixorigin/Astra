@@ -203,17 +203,6 @@ pub(crate) fn build_external_sources(
         }
     }
 
-    // Lessons (Memoria-bootstrapped session lessons)
-    if let Some(text) = edge_profile
-        .get("lessons_text")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        providers.push(Box::new(LessonsChannelProvider {
-            text: text.to_string(),
-        }));
-    }
-
     let assembler = ChannelAssembler::new(providers, ContextChannelPolicy::default());
     let (extra_stable_sections, extra_dynamic_sections) =
         assembler.assemble(state.llm_rounds_completed);
@@ -454,37 +443,6 @@ impl astra_turn_core::context_sources::ContextChannelProvider for CacheStrategyP
             "## Execution Strategy\nThis model's prompt cache is only reliable within the current turn. When the task does not require new user input, batch related tool work and complete it within the same turn instead of stopping early or spreading the work across multiple user turns.".to_string(),
             CacheScope::Session,
         ))
-    }
-}
-
-/// Lessons: Memoria-bootstrapped session lessons.
-/// Session scope (loaded once at session start, stable thereafter).
-struct LessonsChannelProvider {
-    text: String,
-}
-
-impl astra_turn_core::context_sources::ContextChannelProvider for LessonsChannelProvider {
-    fn channel_id(&self) -> &'static str {
-        "lessons"
-    }
-    fn cache_scope(&self) -> CacheScope {
-        CacheScope::Session
-    }
-    fn token_bucket(&self) -> PromptTokenBucket {
-        PromptTokenBucket::UserPreferences
-    }
-    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
-        if self.text.is_empty() {
-            None
-        } else {
-            Some(PromptSection::stable(
-                format!(
-                    "\n\n## Session Lessons (Learned from Past Corrections)\n{}",
-                    self.text
-                ),
-                CacheScope::Session,
-            ))
-        }
     }
 }
 
@@ -1828,32 +1786,6 @@ mod tests {
         assert_eq!(p.cache_scope(), CacheScope::Session);
     }
 
-    // ── LessonsChannelProvider ──
-
-    #[test]
-    fn lessons_provider_emits_formatted_lessons() {
-        let p = super::LessonsChannelProvider {
-            text: "fix:compile:check".into(),
-        };
-        let section = p.provide(0).expect("should emit non-empty lessons");
-        assert!(section.text.contains("Session Lessons"));
-        assert!(section.text.contains("fix:compile:check"));
-    }
-
-    #[test]
-    fn lessons_provider_returns_none_when_empty() {
-        let p = super::LessonsChannelProvider {
-            text: String::new(),
-        };
-        assert!(p.provide(0).is_none());
-    }
-
-    #[test]
-    fn lessons_provider_cache_scope_is_session() {
-        let p = super::LessonsChannelProvider { text: "x".into() };
-        assert_eq!(p.cache_scope(), CacheScope::Session);
-    }
-
     // ── ChannelAssembler integration tests ──
 
     #[test]
@@ -1920,7 +1852,7 @@ mod tests {
             Box::new(super::EnvStaticProvider {
                 text: String::new(),
             }), // empty → None
-            Box::new(super::LessonsChannelProvider {
+            Box::new(super::EnvVolatileProvider {
                 text: String::new(),
             }), // empty → None
         ];
@@ -1986,7 +1918,6 @@ mod tests {
             "active_skills".into(),
             Value::Array(vec![Value::String("review".into())]),
         );
-        ep.insert("lessons_text".into(), Value::String("fix:bug:patch".into()));
 
         let mut state = make_state();
         state.max_turns = 20;
@@ -2010,10 +1941,6 @@ mod tests {
         assert!(
             stable_texts.iter().any(|t| t.contains("env: macos")),
             "env_static in stable"
-        );
-        assert!(
-            stable_texts.iter().any(|t| t.contains("Session Lessons")),
-            "lessons in stable"
         );
 
         assert!(

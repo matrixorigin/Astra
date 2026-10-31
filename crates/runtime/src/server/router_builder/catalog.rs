@@ -52,20 +52,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/skills/status", get(skills::get_skill_status_handler))
         .route("/skills/publish", post(skills::publish_skill_handler))
         .route(
-            "/skills/user",
-            get(user_skill_handlers::list_user_skills_handler)
-                .post(user_skill_handlers::create_user_skill_handler),
-        )
-        .route(
-            "/skills/user/{skill_name}/versions",
-            get(user_skill_handlers::list_user_skill_versions_handler)
-                .post(user_skill_handlers::submit_user_skill_version_handler),
-        )
-        .route(
-            "/skills/user/{skill_name}/activate",
-            post(user_skill_handlers::activate_user_skill_handler),
-        )
-        .route(
             "/skills/{skill_name}/info",
             get(skills::get_skill_info_handler),
         )

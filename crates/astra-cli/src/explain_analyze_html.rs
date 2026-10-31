@@ -785,19 +785,6 @@ fn context_markup(context: &astra_turn_types::ExplainAnalyzeContextMetricsV1) ->
         ));
     }
     if let Some(assembly) = &context.assembly {
-        for report in &assembly.edge_memory_selection {
-            markup.push_str(&format!(
-                "<details><summary>{}</summary>",
-                escape_html(&report.summary(), MAX_TEXT_CHARS)
-            ));
-            for line in report.detail_lines() {
-                markup.push_str(&format!(
-                    "<p class=\"detail-line\">{}</p>",
-                    escape_html(&line, MAX_TEXT_CHARS)
-                ));
-            }
-            markup.push_str("</details>");
-        }
         markup.push_str(
             "<p class=\"detail-line\"><strong>Context sources:</strong></p><div class=\"chips\">",
         );

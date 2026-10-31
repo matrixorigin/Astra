@@ -3,17 +3,6 @@ use super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
-            "/agents",
-            post(crate::service_handlers::agents::create_agent_handler)
-                .get(crate::service_handlers::agents::list_agents_handler),
-        )
-        .route(
-            "/agents/{agent_id}",
-            get(crate::service_handlers::agents::get_agent_handler)
-                .put(crate::service_handlers::agents::update_agent_handler)
-                .delete(crate::service_handlers::agents::delete_agent_handler),
-        )
-        .route(
             "/events",
             post(crate::service_handlers::events::create_event_handler)
                 .get(crate::service_handlers::events::list_events_handler),

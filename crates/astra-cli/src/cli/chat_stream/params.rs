@@ -557,14 +557,6 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<&'a mut Vec<astra_turn_types::DeferredToolActivation>>,
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     pub(crate) resume_restricted_tools: &'a [String],
-    /// P6 seam: cross-session lessons loaded once at session bootstrap.
-    /// Passed through to the ToolExecutor via `set_session_lessons` so
-    /// every SelfModel snapshot surfaces prior-session advice.
-    pub(crate) session_lessons: &'a [astra_services::LessonHint],
-    pub(crate) memory_selection_reports: &'a [astra_turn_types::MemorySelectionReport],
-    /// Evaluator-derived feedback from the previous turn. This is injected
-    /// alongside self-awareness on the next turn and cleared by the caller
-    /// once a healthy turn completes.
     pub(crate) latest_turn_quality_feedback:
         Option<&'a astra_runtime::self_model::TurnQualityFeedback>,
     /// Unified skill registry (single source of truth for all skill resolution).
@@ -796,8 +788,6 @@ impl<'a> ChatTurnParams<'a> {
             deferred_tool_activations: None,
             tool_health_entries: &[],
             resume_restricted_tools: &[],
-            session_lessons: &[],
-            memory_selection_reports: &[],
 
             latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,

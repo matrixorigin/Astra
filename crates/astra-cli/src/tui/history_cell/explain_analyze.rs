@@ -459,25 +459,6 @@ fn render_graph(
                         }
                     }
                     if let Some(assembly) = &context.assembly {
-                        for report in &assembly.edge_memory_selection {
-                            let mut details = vec![report.summary()];
-                            if verbose {
-                                details.extend(report.detail_lines());
-                            }
-                            for detail in details {
-                                if !push_wrapped_node_detail(
-                                    &mut lines,
-                                    &detail,
-                                    width,
-                                    Style::default().fg(Color::Cyan),
-                                    detail_limit,
-                                    &detail_ancestors,
-                                ) && !live
-                                {
-                                    truncated = true;
-                                }
-                            }
-                        }
                         if !truncated {
                             if verbose {
                                 if !push_wrapped_node_detail(
@@ -1393,15 +1374,6 @@ mod tests {
             Some(ExplainAnalyzeContextMetricsV1 {
                 budget: None,
                 assembly: Some(Box::new(ExplainAnalyzeContextAssemblyV1 {
-                    edge_memory_selection: vec![
-                        serde_json::from_value(serde_json::json!({
-                            "session_id":"s", "turn":1, "operation":"relevance", "method":"model",
-                            "reason":"completed", "model":"jev-test", "elapsed_ms":398,
-                            "selection_order":[0], "candidates":[{"index":0,"selected":true,"probability_bps":9000},
-                                          {"index":1,"selected":false,"probability_bps":1000}]
-                        }))
-                        .unwrap(),
-                    ],
                     basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
                     sources: vec![ExplainAnalyzeContextSourceV1 {
                         kind: ExplainAnalyzeContextSourceKindV1::Memory,
@@ -1481,8 +1453,6 @@ mod tests {
         assert!(rendered.contains("recording"), "{rendered}");
         assert!(!rendered.contains("incomplete"), "{rendered}");
         assert!(rendered.contains("+1.2s"), "{rendered}");
-        assert!(rendered.contains("2 candidates → 1 selected"), "{rendered}");
-        assert!(rendered.contains("90.00%"), "{rendered}");
         assert!(rendered.contains("420ms"), "{rendered}");
         assert!(rendered.contains("Failed"), "{rendered}");
         assert!(

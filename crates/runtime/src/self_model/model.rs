@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::Scenario;
 use astra_core::feedback::{FeedbackSignal, SignalType};
-use astra_services::LessonHint;
 use astra_text_utils::str_preview::truncate_str;
 use astra_turn_core::context_assembly_trace::TokenBudgetTrace;
 use astra_turn_core::tool_health::ToolHealthTracker;
@@ -95,13 +94,6 @@ pub struct SelfModel {
     /// behavior (batching, repeat calls, stall recovery).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_quality_feedback: Option<TurnQualityFeedback>,
-    /// Cross-session lessons carried over from prior sessions with the same
-    /// `(user_id, persona, workload_tag)` scope (see
-    /// `astra_services::agent_lessons`). Bounded projection of the DAO's
-    /// `Lesson` rows — only the fields the LLM needs for prompt reasoning.
-    /// Empty when no prior lessons apply.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lessons: Vec<LessonHint>,
 }
 
 /// Actionable feedback derived from the previous turn's passive evaluator.
@@ -408,7 +400,6 @@ impl SelfModel {
             stale_runtime_signals: Vec::new(),
             low_confidence_tools: Vec::new(),
             turn_quality_feedback: None,
-            lessons: Vec::new(),
         }
     }
 
@@ -472,16 +463,6 @@ impl SelfModel {
     /// `None` clears stale feedback once a healthy turn completes.
     pub fn with_turn_quality_feedback(mut self, feedback: Option<TurnQualityFeedback>) -> Self {
         self.turn_quality_feedback = feedback;
-        self
-    }
-
-    /// Attach cross-session lessons retrieved via
-    /// `astra_services::AgentLessonsService::load_recent` at session
-    /// bootstrap. The lessons are rendered as a bounded prompt block so the
-    /// LLM carries prior learning forward. Empty input clears any
-    /// previously-attached set.
-    pub fn with_lessons(mut self, lessons: Vec<LessonHint>) -> Self {
-        self.lessons = lessons;
         self
     }
 }
@@ -780,80 +761,13 @@ impl SelfModel {
                 feedback.turn
             );
             for finding in feedback.findings.iter().take(5) {
-                let _ = writeln!(s, "  - {}", astra_services::sanitize_for_prompt(finding));
+                let _ = writeln!(s, "  - {}", sanitize_for_prompt(finding));
             }
             let _ = writeln!(
                 s,
                 "  → {}",
-                astra_services::sanitize_for_prompt(&feedback.recommended_action)
+                sanitize_for_prompt(&feedback.recommended_action)
             );
-        }
-
-        // ── Cross-session lessons (from Memoria L3) ──
-        // Pressure-adaptive: under high pressure, show fewer lessons with
-        // compact text. Under low pressure, show more with full detail.
-        if !self.lessons.is_empty() {
-            let pressure = self
-                .state
-                .token_budget
-                .as_ref()
-                .map(|b| b.pressure)
-                .unwrap_or(0.0);
-            let (max_shown, use_compact) = if pressure > 0.75 {
-                (2, true)
-            } else if pressure > 0.5 {
-                (3, true)
-            } else {
-                (5, false)
-            };
-            let tool_set: std::collections::HashSet<&str> = self
-                .capabilities
-                .tool_names
-                .iter()
-                .map(String::as_str)
-                .collect();
-            // Filter relevant + dedup conflicting tool advice (e.g.,
-            // ToolAvoidance("grep") + ToolBoost("grep")). Lessons are
-            // pre-sorted by confidence DESC, so the first occurrence for
-            // a tool name wins.
-            let mut seen_tools: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let relevant: Vec<&LessonHint> = self
-                .lessons
-                .iter()
-                .filter(|l| is_lesson_relevant(l, &tool_set))
-                .filter(|l| {
-                    if let Some(tool) = extract_tool_from_trigger(&l.trigger_signal) {
-                        seen_tools.insert(tool.to_string())
-                    } else {
-                        true // non-tool lessons always pass
-                    }
-                })
-                .collect();
-            if !relevant.is_empty() {
-                let total = relevant.len();
-                s.push_str("📚 Lessons from prior sessions:\n");
-                for l in relevant.iter().take(max_shown) {
-                    let scope = l
-                        .workload_tag
-                        .as_deref()
-                        .map(|t| format!(" @{t}"))
-                        .unwrap_or_default();
-                    let display_text = if use_compact {
-                        l.compact.as_deref().unwrap_or(&l.action)
-                    } else {
-                        &l.action
-                    };
-                    let _ = writeln!(
-                        s,
-                        "  - [{}{}] {} — {}",
-                        l.kind, scope, l.trigger_signal, display_text
-                    );
-                }
-                if total > max_shown {
-                    let _ = writeln!(s, "  … {} more", total - max_shown);
-                }
-            }
         }
 
         s
@@ -875,7 +789,6 @@ impl SelfModel {
     /// - recent failing tests / rejections / correction excerpts
     /// - per-tool outcome bias entries
     /// - unmet postconditions from the last plan
-    /// - non-empty lessons
     /// - token budget under pressure (> 0.7) or already compressed
     /// - recorded recent feedback signals
     #[must_use]
@@ -914,9 +827,6 @@ impl SelfModel {
         if self.turn_quality_feedback.is_some() {
             return true;
         }
-        if !self.lessons.is_empty() {
-            return true;
-        }
         if let Some(ref b) = self.state.token_budget
             && (b.pressure > 0.7 || b.compression_triggered)
         {
@@ -926,28 +836,6 @@ impl SelfModel {
             return true;
         }
         false
-    }
-}
-
-/// Extract the tool name from a trigger_signal like "tool_failures:grep".
-/// Returns None for non-tool-specific triggers.
-fn extract_tool_from_trigger(trigger: &str) -> Option<&str> {
-    trigger.split_once(':').map(|(_, tool)| tool)
-}
-
-/// Tool-specific lesson kinds whose trigger_signal encodes a tool name
-/// as `"tool_failures:<name>"` or similar. These are only relevant when
-/// the named tool is in the current session's capability set.
-fn is_lesson_relevant(l: &LessonHint, tool_set: &std::collections::HashSet<&str>) -> bool {
-    match l.kind {
-        astra_services::LessonKind::ToolAvoidance | astra_services::LessonKind::ToolBoost => {
-            if let Some((_prefix, tool_name)) = l.trigger_signal.split_once(':') {
-                tool_set.is_empty() || tool_set.contains(tool_name)
-            } else {
-                true
-            }
-        }
-        _ => true,
     }
 }
 
@@ -1892,18 +1780,6 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_when_lessons_attached() {
-        let model = minimal_model().with_lessons(vec![LessonHint {
-            kind: astra_services::LessonKind::PromptShape,
-            trigger_signal: "memoria".into(),
-            action: "Always run cargo test before commit".into(),
-            compact: None,
-            workload_tag: None,
-        }]);
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
     fn system_prompt_section_surfaces_turn_quality_feedback() {
         let model = minimal_model().with_turn_quality_feedback(Some(TurnQualityFeedback {
             turn: 7,
@@ -1984,5 +1860,69 @@ mod tests {
         let mut model = minimal_model();
         model.capabilities.retry_cautioned_tools.push("grep".into());
         assert!(model.has_meaningful_self_awareness());
+    }
+}
+
+fn sanitize_for_prompt(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            if c.is_control() && *c != '\n' {
+                return false;
+            }
+            !is_invisible_unicode(*c)
+        })
+        .collect()
+}
+
+/// Comprehensive invisible/deceptive Unicode character filter.
+fn is_invisible_unicode(c: char) -> bool {
+    matches!(
+        c,
+        // Zero-width spaces and joiners
+        '\u{200B}'..='\u{200F}'
+        // Line/paragraph separators + bidi overrides/isolates
+        | '\u{2028}'..='\u{202F}'
+        // Word joiners and invisible operators
+        | '\u{2060}'..='\u{2064}'
+        // BOM
+        | '\u{FEFF}'
+        // Soft hyphen (renders as nothing unless line break)
+        | '\u{00AD}'
+        // Combining grapheme joiner
+        | '\u{034F}'
+        // Arabic letter mark
+        | '\u{061C}'
+        // Hangul fillers
+        | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
+        // Khmer vowel inherent
+        | '\u{17B4}' | '\u{17B5}'
+        // Mongolian vowel separator
+        | '\u{180E}'
+        // Tag characters (U+E0001–U+E007F)
+        | '\u{E0001}'..='\u{E007F}'
+    )
+}
+
+#[cfg(test)]
+mod feedback_sanitization_tests {
+    #[test]
+    fn preserves_text_and_newlines_without_hidden_controls() {
+        assert_eq!(
+            super::sanitize_for_prompt("run\u{200b} tests\u{202e}\nthen commit\u{0000}\u{feff}\t"),
+            "run tests\nthen commit"
+        );
+        for ch in [
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{061c}',
+            '\u{115f}',
+            '\u{17b4}',
+            '\u{180e}',
+            '\u{2060}',
+            '\u{e0001}',
+        ] {
+            assert_eq!(super::sanitize_for_prompt(&format!("a{ch}b")), "ab");
+        }
+        assert_eq!(super::sanitize_for_prompt("运行测试 🦀"), "运行测试 🦀");
     }
 }

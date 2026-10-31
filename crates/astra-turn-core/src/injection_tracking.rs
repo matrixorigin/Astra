@@ -1,7 +1,7 @@
 //! Per-channel freshness tracking for runtime-injected prompt signals.
 //!
 //! Motivation (session f85a02bb diagnostic): runtime-injected meta like
-//! `Recent test failures: ...`, tool-outcome bias, memoria lessons, and
+//! `Recent test failures: ...`, tool-outcome bias,
 //! volatile-lane entries were observed to persist unchanged for dozens
 //! of rounds while they had long since become stale. Without a
 //! freshness signal, the model keeps reading the same obsolete advice
@@ -47,8 +47,6 @@ pub enum InjectionChannel {
     RecentFailingTests,
     /// `SelfModel.outcome_bias` rendered as "Tool outcome bias: bash ↑0.10 ..."
     OutcomeBias,
-    /// `SelfModel.lessons` rendered as "📚 Lessons from prior sessions: ..."
-    Lessons,
     /// `AgenticLoopState.volatile_pending` content joined into a single fingerprint.
     VolatilePending,
     /// `memoria_prefetch_section` — pre-loaded Memoria memories on session start / compaction.
@@ -75,7 +73,6 @@ impl InjectionChannel {
         match self {
             Self::RecentFailingTests => "recent_failing_tests",
             Self::OutcomeBias => "outcome_bias",
-            Self::Lessons => "lessons",
             Self::VolatilePending => "volatile_pending",
             Self::MemoriaPrefetch => "memoria_prefetch",
             Self::SelfAwareness => "self_awareness",
@@ -94,7 +91,6 @@ impl InjectionChannel {
         match tag {
             "recent_failing_tests" => Some(Self::RecentFailingTests),
             "outcome_bias" => Some(Self::OutcomeBias),
-            "lessons" => Some(Self::Lessons),
             "volatile_pending" => Some(Self::VolatilePending),
             "memoria_prefetch" => Some(Self::MemoriaPrefetch),
             "self_awareness" => Some(Self::SelfAwareness),
@@ -107,16 +103,15 @@ impl InjectionChannel {
 
     /// Canonical ordering used when rendering the full report.
     ///
-    /// Ordering policy: self-* signals first (failing tests, bias,
-    /// lessons), then volatile/content-derived lanes (volatile pending,
+    /// Ordering policy: self-* signals first (failing tests, bias),
+    /// then volatile/content-derived lanes (volatile pending,
     /// typed memoria prefetch), then behavioural/meta-state
     /// lanes (self-awareness), then operational hints (recent-arg, skill listing, tool-round
     /// guidance). Introspect renders in this order for stable output.
-    pub fn all() -> [Self; 9] {
+    pub fn all() -> [Self; 8] {
         [
             Self::RecentFailingTests,
             Self::OutcomeBias,
-            Self::Lessons,
             Self::VolatilePending,
             Self::MemoriaPrefetch,
             Self::SelfAwareness,
@@ -441,9 +436,6 @@ fn stale_channel_guidance(channel: InjectionChannel) -> &'static str {
         InjectionChannel::VolatilePending => {
             "verify pending runtime nudges still apply before following them"
         }
-        InjectionChannel::Lessons => {
-            "apply only if it still matches the current task and repository state"
-        }
         _ => "verify against current state before acting on this signal",
     }
 }
@@ -455,20 +447,19 @@ mod tests {
     #[test]
     fn channel_all_returns_stable_ordering_of_every_variant() {
         let all = InjectionChannel::all();
-        assert_eq!(all.len(), 9);
-        // Self-* ordering: failing tests → bias → lessons.
+        assert_eq!(all.len(), 8);
+        // Self-* ordering: failing tests → bias.
         assert_eq!(all[0], InjectionChannel::RecentFailingTests);
         assert_eq!(all[1], InjectionChannel::OutcomeBias);
-        assert_eq!(all[2], InjectionChannel::Lessons);
         // Volatile + content-derived block.
-        assert_eq!(all[3], InjectionChannel::VolatilePending);
-        assert_eq!(all[4], InjectionChannel::MemoriaPrefetch);
+        assert_eq!(all[2], InjectionChannel::VolatilePending);
+        assert_eq!(all[3], InjectionChannel::MemoriaPrefetch);
         // Behavioural / meta-state block.
-        assert_eq!(all[5], InjectionChannel::SelfAwareness);
+        assert_eq!(all[4], InjectionChannel::SelfAwareness);
         // Operational hints block.
-        assert_eq!(all[6], InjectionChannel::RecentArgHints);
-        assert_eq!(all[7], InjectionChannel::SkillListing);
-        assert_eq!(all[8], InjectionChannel::ToolRoundGuidance);
+        assert_eq!(all[5], InjectionChannel::RecentArgHints);
+        assert_eq!(all[6], InjectionChannel::SkillListing);
+        assert_eq!(all[7], InjectionChannel::ToolRoundGuidance);
     }
 
     #[test]
@@ -541,10 +532,10 @@ mod tests {
         let mut h = InjectionHistory::new();
         let fp_a = InjectionFingerprint::from_content("foo");
         let fp_b = InjectionFingerprint::from_content("bar");
-        h.observe(0, InjectionChannel::Lessons, fp_a.clone());
-        h.observe(1, InjectionChannel::Lessons, fp_a.clone());
-        h.observe(2, InjectionChannel::Lessons, fp_b.clone());
-        let latest = h.latest(InjectionChannel::Lessons).unwrap();
+        h.observe(0, InjectionChannel::SelfAwareness, fp_a.clone());
+        h.observe(1, InjectionChannel::SelfAwareness, fp_a.clone());
+        h.observe(2, InjectionChannel::SelfAwareness, fp_b.clone());
+        let latest = h.latest(InjectionChannel::SelfAwareness).unwrap();
         assert_eq!(latest.fingerprint, fp_b);
         assert_eq!(latest.first_seen_round, 2);
         assert_eq!(latest.last_seen_round, 2);
@@ -554,10 +545,10 @@ mod tests {
     fn observe_different_channels_are_independent() {
         let mut h = InjectionHistory::new();
         let fp = InjectionFingerprint::from_content("x");
-        h.observe(0, InjectionChannel::Lessons, fp.clone());
+        h.observe(0, InjectionChannel::SelfAwareness, fp.clone());
         h.observe(0, InjectionChannel::OutcomeBias, fp.clone());
         assert_eq!(h.len(), 2);
-        assert!(h.latest(InjectionChannel::Lessons).is_some());
+        assert!(h.latest(InjectionChannel::SelfAwareness).is_some());
         assert!(h.latest(InjectionChannel::OutcomeBias).is_some());
     }
 
@@ -568,17 +559,19 @@ mod tests {
         // different fingerprint so each starts a new run.
         for i in 0..(InjectionHistory::MAX_RUNS_PER_CHANNEL as u32 + 3) {
             let fp = InjectionFingerprint::from_content(&format!("v{i}"));
-            h.observe(i, InjectionChannel::Lessons, fp);
+            h.observe(i, InjectionChannel::SelfAwareness, fp);
         }
         let count = (0..h.len())
-            .filter(|&i| h.entries.get(i).map(|e| e.channel) == Some(InjectionChannel::Lessons))
+            .filter(|&i| {
+                h.entries.get(i).map(|e| e.channel) == Some(InjectionChannel::SelfAwareness)
+            })
             .count();
         assert_eq!(
             count,
             InjectionHistory::MAX_RUNS_PER_CHANNEL,
             "run count bounded"
         );
-        let latest = h.latest(InjectionChannel::Lessons).unwrap();
+        let latest = h.latest(InjectionChannel::SelfAwareness).unwrap();
         assert_eq!(
             latest.fingerprint.preview,
             InjectionFingerprint::from_content(&format!(
@@ -601,11 +594,11 @@ mod tests {
         let fp = InjectionFingerprint::from_content("sticky");
         let total = InjectionHistory::MAX_RUNS_PER_CHANNEL as u32 + 10;
         for i in 0..total {
-            h.observe(i, InjectionChannel::Lessons, fp.clone());
+            h.observe(i, InjectionChannel::SelfAwareness, fp.clone());
         }
         // Same fingerprint across rounds = 1 run; first_seen_round
         // must still be 0, last_seen_round = total-1.
-        let latest = h.latest(InjectionChannel::Lessons).unwrap();
+        let latest = h.latest(InjectionChannel::SelfAwareness).unwrap();
         assert_eq!(
             latest.first_seen_round, 0,
             "first_seen_round must survive pruning when fingerprint is unchanged"
@@ -614,11 +607,11 @@ mod tests {
 
         // And freshness_report must report the full rounds_alive.
         let report = freshness_report(&h, total);
-        let lessons = report
+        let awareness = report
             .iter()
-            .find(|e| e.channel == InjectionChannel::Lessons)
+            .find(|e| e.channel == InjectionChannel::SelfAwareness)
             .unwrap();
-        match &lessons.status {
+        match &awareness.status {
             ChannelStatus::Stale { rounds_alive } | ChannelStatus::Fresh { rounds_alive } => {
                 assert_eq!(
                     *rounds_alive, total,
@@ -682,17 +675,17 @@ mod tests {
     fn freshness_report_stale_threshold_boundary() {
         let mut h = InjectionHistory::new();
         let fp = InjectionFingerprint::from_content("y");
-        h.observe(0, InjectionChannel::Lessons, fp);
+        h.observe(0, InjectionChannel::SelfAwareness, fp);
         // threshold = 10; at round 9 → Fresh, at round 10 → Stale.
         let at9 = freshness_report(&h, 9);
         let at10 = freshness_report(&h, 10);
         let entry9 = at9
             .iter()
-            .find(|r| r.channel == InjectionChannel::Lessons)
+            .find(|r| r.channel == InjectionChannel::SelfAwareness)
             .unwrap();
         let entry10 = at10
             .iter()
-            .find(|r| r.channel == InjectionChannel::Lessons)
+            .find(|r| r.channel == InjectionChannel::SelfAwareness)
             .unwrap();
         assert!(matches!(entry9.status, ChannelStatus::Fresh { .. }));
         assert!(matches!(entry10.status, ChannelStatus::Stale { .. }));

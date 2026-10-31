@@ -27,8 +27,6 @@ use astra_test_harness::suite::{
     about = "Declarative CLI test harness for astra: cases × models × agent judger."
 )]
 struct Args {
-    #[command(subcommand)]
-    command: Option<astra_test_harness::router_offline::RouterCommand>,
     /// Directory containing case YAML files.
     /// Optional when --live-dashboard is used (auto-detected).
     #[arg(long, value_name = "DIR")]
@@ -350,10 +348,7 @@ fn main() -> Result<()> {
     {
         return Ok(());
     }
-    let mut args = Args::parse();
-    if let Some(command) = args.command.take() {
-        return command.run();
-    }
+    let args = Args::parse();
     initialize_execution_environment()?;
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

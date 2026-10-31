@@ -454,24 +454,6 @@ pub(crate) struct SessionState {
     /// Original user query at session start (for drift baseline comparison).
     pub drift_original_query: Option<String>,
 
-    /// Cross-session lessons loaded once at first-turn bootstrap. Empty
-    /// until a turn loads lessons for the current session.
-    /// Passed through to every turn's ToolExecutor so the LLM sees prior
-    /// session's advice on every SelfModel snapshot.
-    pub session_lessons: Vec<astra_services::LessonHint>,
-    pub memory_selection_reports: Vec<astra_turn_types::MemorySelectionReport>,
-    /// Set after the first bootstrap attempt regardless of result count.
-    /// Prevents per-turn DB calls for new users with zero lessons.
-    pub session_lessons_loaded: bool,
-    /// Incremental lesson extraction at natural breakpoints (corrections,
-    /// stalls, plan completion). Tracks which lessons have already been
-    /// recorded this session to prevent double-recording.
-    pub lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer,
-
-    /// Governed memory Offering cached at first use. Provider route material
-    /// and credentials remain Server-side and are never retained in session
-    /// state.
-    pub memory_inference_offering: super::session_memory_inference::MemoryJudgmentOffering,
     /// Background session-memory.md extraction coordinator. `None` means
     /// the current CLI path has no API-backed extraction service.
     pub session_memory_port:
@@ -662,12 +644,6 @@ impl Default for SessionState {
             resume_guidance: None,
             resume_restricted_tools: Vec::new(),
             drift_original_query: None,
-            session_lessons: Vec::new(),
-            memory_selection_reports: Vec::new(),
-            session_lessons_loaded: false,
-            lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer::new(),
-            memory_inference_offering:
-                super::session_memory_inference::MemoryJudgmentOffering::Unresolved,
             session_memory_port: None,
 
             latest_turn_quality_feedback: None,
@@ -840,12 +816,6 @@ impl SessionState {
         self.clear_runtime_recovery_state();
         self.clear_resume_recovery_state();
         self.drift_original_query = None;
-        self.session_lessons.clear();
-        self.memory_selection_reports.clear();
-        self.session_lessons_loaded = false;
-        self.lesson_checkpointer = Default::default();
-        self.memory_inference_offering =
-            super::session_memory_inference::MemoryJudgmentOffering::Unresolved;
         self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
         self.observability_session = None;
@@ -1076,7 +1046,6 @@ mod default_tests {
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
             drift_original_query: Some("orig".into()),
-            session_lessons_loaded: true,
             latest_turn_quality_feedback: Some(astra_runtime::self_model::TurnQualityFeedback {
                 turn: 1,
                 findings: vec!["finding".into()],
@@ -1110,8 +1079,6 @@ mod default_tests {
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
         assert!(state.drift_original_query.is_none());
-        assert!(state.session_lessons.is_empty());
-        assert!(!state.session_lessons_loaded);
         assert!(state.latest_turn_quality_feedback.is_none());
         assert!(!state.last_turn_interrupted);
         assert!(state.plan_mode_sync_error.is_none());

@@ -217,20 +217,12 @@ pub struct ExplainAnalyzeContextSourceV1 {
 pub struct ExplainAnalyzeContextAssemblyV1 {
     pub basis: ExplainAnalyzeContextAssemblyBasisV1,
     pub sources: Vec<ExplainAnalyzeContextSourceV1>,
-    /// Selected CLI/Edge reports selection, not proof of final prompt injection.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub edge_memory_selection: Vec<crate::MemorySelectionReport>,
 }
 
 impl ExplainAnalyzeContextAssemblyV1 {
     pub fn is_valid(&self) -> bool {
         let mut kinds = HashSet::with_capacity(self.sources.len());
-        self.edge_memory_selection.len() <= 2
-            && self
-                .edge_memory_selection
-                .iter()
-                .all(crate::MemorySelectionReport::is_valid)
-            && self.sources.len() <= 15
+        self.sources.len() <= 15
             && self.sources.iter().all(|source| {
                 source.estimated_tokens <= EXPLAIN_ANALYZE_MAX_SAFE_INTEGER
                     && kinds.insert(source.kind)
@@ -1029,9 +1021,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retired_cli_selection_payload_is_rejected_even_when_empty() {
+        for retired in [
+            serde_json::json!([]),
+            serde_json::json!([{ "session_id": "historic", "turn": 1 }]),
+        ] {
+            let mut payload = serde_json::to_value(context_assembly()).unwrap();
+            payload["edge_memory_selection"] = retired;
+            assert!(serde_json::from_value::<ExplainAnalyzeContextAssemblyV1>(payload).is_err());
+        }
+    }
+
     fn context_assembly() -> ExplainAnalyzeContextAssemblyV1 {
         ExplainAnalyzeContextAssemblyV1 {
-            edge_memory_selection: Vec::new(),
             basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
             sources: vec![ExplainAnalyzeContextSourceV1 {
                 kind: ExplainAnalyzeContextSourceKindV1::Identity,

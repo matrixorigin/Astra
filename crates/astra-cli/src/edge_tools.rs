@@ -1474,11 +1474,6 @@ pub struct ToolExecutor {
     /// active model. Kept separate from effective input budget so introspection
     /// can answer both questions without guessing.
     current_context_window_tokens: std::sync::RwLock<Option<u64>>,
-    /// P3.1 seam: cross-session lessons loaded at session bootstrap.
-    /// Populated once via `set_session_lessons`, then passed through on
-    /// every `build_self_model_snapshot` for the session's lifetime.
-    session_lessons: std::sync::Mutex<Vec<astra_services::LessonHint>>,
-    memory_selection_reports: std::sync::Mutex<Vec<astra_turn_types::MemorySelectionReport>>,
     /// Evaluator feedback from the previous turn.
     latest_turn_quality_feedback:
         std::sync::Mutex<Option<astra_runtime::self_model::TurnQualityFeedback>>,
@@ -1610,8 +1605,6 @@ impl ToolExecutor {
             current_model: std::sync::RwLock::new(None),
             current_effective_input_budget_tokens: std::sync::RwLock::new(None),
             current_context_window_tokens: std::sync::RwLock::new(None),
-            session_lessons: std::sync::Mutex::new(Vec::new()),
-            memory_selection_reports: std::sync::Mutex::new(Vec::new()),
             latest_turn_quality_feedback: std::sync::Mutex::new(None),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
             default_executor: astra_tools::executor::DefaultToolExecutor::new(
@@ -2441,9 +2434,6 @@ impl ToolExecutor {
             if let Ok(mut pending_boost) = self.pending_round_tool_boost.lock() {
                 *pending_boost = None;
             }
-            if let Ok(mut lessons) = self.session_lessons.lock() {
-                lessons.clear();
-            }
             if let Ok(mut feedback) = self.latest_turn_quality_feedback.lock() {
                 *feedback = None;
             }
@@ -2517,43 +2507,6 @@ impl ToolExecutor {
             turn,
             self.memory_attribution_id.as_deref().unwrap_or("session"),
         )
-    }
-
-    /// P3.1 seam: stash cross-session lessons loaded at session bootstrap.
-    /// Every subsequent `build_self_model_snapshot` will project them via
-    /// [`astra_runtime::self_model::SelfModel::with_lessons`].
-    pub fn set_session_lessons(&self, lessons: Vec<astra_services::LessonHint>) {
-        if let Ok(mut g) = self.session_lessons.lock() {
-            *g = lessons;
-        }
-    }
-
-    /// Snapshot the currently-stashed session lessons. Used by the
-    /// injection-freshness observer (`observe_bridge_injections`) so it can
-    /// fingerprint the same slice the next SelfModel snapshot will
-    /// project into the system prompt.
-    pub fn session_lessons_snapshot(&self) -> Vec<astra_services::LessonHint> {
-        self.session_lessons
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn set_memory_selection_reports(
-        &self,
-        report: Vec<astra_turn_types::MemorySelectionReport>,
-    ) {
-        if let Ok(mut slot) = self.memory_selection_reports.lock() {
-            *slot = report;
-        }
-    }
-
-    pub fn memory_selection_reports(&self) -> Vec<astra_turn_types::MemorySelectionReport> {
-        self.memory_selection_reports
-            .lock()
-            .ok()
-            .map(|slot| slot.clone())
-            .unwrap_or_default()
     }
 
     pub fn set_latest_turn_quality_feedback(
@@ -6215,13 +6168,6 @@ impl ToolExecutor {
                     })
                     .collect(),
             );
-        }
-
-        // P3.1 seam: attach cross-session lessons if bootstrap cached any.
-        if let Ok(lessons) = self.session_lessons.lock()
-            && !lessons.is_empty()
-        {
-            snapshot = snapshot.with_lessons(lessons.clone());
         }
 
         if let Ok(feedback_guard) = self.latest_turn_quality_feedback.lock()

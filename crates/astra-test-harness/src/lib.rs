@@ -55,7 +55,6 @@ pub mod pipeline_analysis;
 pub mod preflight;
 pub mod progress;
 pub mod report;
-pub mod router_offline;
 pub mod runner;
 pub mod session_capture;
 pub(crate) mod session_identity;

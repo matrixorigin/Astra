@@ -11,8 +11,8 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     MATRIX_E2E_EDGE_WORKSPACE_ROOT, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data,
-    delete_no_content, get_json, maybe_tool_result_payload_from_sse, parse_sse_events, post_empty,
-    post_json, post_json_with_headers, put_json, seed_pending_approval, seeded_model_selection,
+    get_json, maybe_tool_result_payload_from_sse, parse_sse_events, post_empty, post_json,
+    post_json_with_headers, put_json, seed_pending_approval, seeded_model_selection,
     tool_result_payload, wait_for_agent_event_types,
 };
 
@@ -217,6 +217,10 @@ pub async fn run_product_matrix_full_journey(
         "snapshot.health.status: {plat}"
     );
     assert!(plat["timestamp"].is_string(), "snapshot.timestamp: {plat}");
+    assert!(
+        plat.get("agents").is_none(),
+        "retired catalog must not appear in the platform snapshot: {plat}"
+    );
 
     let (st_au_sum, au_sum) = get_json(
         app,
@@ -303,69 +307,9 @@ pub async fn run_product_matrix_full_journey(
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let (st_agent, agent_j) = post_json(
-        app,
-        "/agents",
-        Some(auth_header),
-        json!({
-            "name": "matrix-crud-agent",
-            "agent_config": { "suite": "matrix" },
-            "data_source": { "type": "matrixone", "database": ctx.matrixone_database.clone() }
-        }),
-    )
-    .await;
-    assert_eq!(st_agent, StatusCode::CREATED, "create agent: {agent_j}");
-    let agent_id = agent_j["agent_id"].as_str().expect("agent_id").to_string();
-
-    let agent_db =
-        sqlx::query("SELECT agent_name, owner_user_id FROM agent_agents WHERE agent_id = ?")
-            .bind(&agent_id)
-            .fetch_optional(pool)
-            .await
-            .expect("agent_agents select");
-    let agent_db = agent_db.expect("agent row");
-    assert_eq!(
-        agent_db.try_get::<String, _>("agent_name").ok().as_deref(),
-        Some("matrix-crud-agent")
-    );
-    assert_eq!(
-        agent_db
-            .try_get::<String, _>("owner_user_id")
-            .ok()
-            .as_deref(),
-        Some(user_id.as_str())
-    );
-
-    let (st_get_ag, got_ag) =
-        get_json(app, &format!("/agents/{agent_id}"), Some(auth_header), &[]).await;
-    assert_eq!(st_get_ag, StatusCode::OK, "get agent: {got_ag}");
-    assert_eq!(got_ag["name"].as_str(), Some("matrix-crud-agent"));
-
-    let (st_put_ag, put_ag) = put_json(
-        app,
-        &format!("/agents/{agent_id}"),
-        Some(auth_header),
-        json!({ "name": "matrix-crud-agent-renamed" }),
-    )
-    .await;
-    assert_eq!(st_put_ag, StatusCode::OK, "put agent: {put_ag}");
-    assert_eq!(
-        put_ag["name"].as_str(),
-        Some("matrix-crud-agent-renamed"),
-        "agent update response: {put_ag}"
-    );
-    let agent_renamed = sqlx::query("SELECT agent_name FROM agent_agents WHERE agent_id = ?")
-        .bind(&agent_id)
-        .fetch_one(pool)
-        .await
-        .expect("agent_agents after rename");
-    assert_eq!(
-        agent_renamed
-            .try_get::<String, _>("agent_name")
-            .ok()
-            .as_deref(),
-        Some("matrix-crud-agent-renamed")
-    );
+    let (status, _) = post_json(app, "/agents", Some(auth_header), json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let agent_id = edge_agent_id.clone();
 
     let (st_ev, ev_j) = post_json(
         app,
@@ -871,13 +815,6 @@ pub async fn run_product_matrix_full_journey(
 
     cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;
     cleanup_edge_registry(pool, &user_id, &edge_agent_id).await;
-
-    let del_agent = delete_no_content(app, &format!("/agents/{agent_id}"), Some(auth_header)).await;
-    assert_eq!(
-        del_agent,
-        StatusCode::NO_CONTENT,
-        "delete agent should succeed"
-    );
 
     let (st_out, out_j) = post_json(
         app,

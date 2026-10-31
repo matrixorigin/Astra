@@ -29,9 +29,11 @@ use uuid::Uuid;
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and real MatrixOne"]
 async fn committed_terminal_guidance_withholding_survives_late_physical_completion() {
     use astra_services::runs::{
-        AtomicRunGuidanceAdmissionRequest, AtomicRunTerminalSettlementRequest,
-        AtomicRunTerminalSettlementResolution,
+        AtomicRunGuidanceAdmissionRequest, CanonicalRunTerminalReceipt,
+        CanonicalRunTerminalRequest, CanonicalTerminalClaim, CanonicalTerminalContext,
+        CanonicalTerminalOutcome, CanonicalTerminalTranscript,
     };
+    use sha2::{Digest, Sha256};
     let fixture = Fixture::new().await;
     let (ledger, identity) = fixture.interaction_invocation().await;
     let source = json!({"event_type":"user_intent", "idempotency_key":"user_intent:uncertain-before-terminal",
@@ -48,38 +50,85 @@ async fn committed_terminal_guidance_withholding_survives_late_physical_completi
         })
         .await
         .unwrap();
-    let terminal = [
-        json!({"event_type":"run_finished", "idempotency_key":"terminal:uncertain-guidance",
-        "data":{"status":"completed"}}),
-    ];
-    let request = AtomicRunTerminalSettlementRequest {
+    let opened = fixture
+        .store
+        .load_run_admission(&fixture.user_id, &identity.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let opened = opened.run();
+    let mut digest = Sha256::new();
+    digest.update(b"astra.run-terminal-transcript.v1\0");
+    digest.update(0_u64.to_be_bytes());
+    let receipt = CanonicalRunTerminalReceipt {
+        schema_version: 1,
+        user_id: fixture.user_id.clone(),
+        session_id: fixture.session_id.clone(),
+        run_id: identity.run_id.clone(),
+        generation: opened.run_generation,
+        opening_hash: opened.opening_hash.clone().unwrap(),
+        context_admission_hash: opened.context_admission_hash.clone(),
+        outcome: CanonicalTerminalOutcome::Completed,
+        error_hash: None,
+        error_code: None,
+        error_kind: None,
+        error_metadata: None,
+        interruption: None,
+        context: CanonicalTerminalContext::Unowned,
+        transcript: CanonicalTerminalTranscript {
+            item_count: 0,
+            digest: format!("{:x}", digest.finalize()),
+            assistant_source_event_id: None,
+        },
+        usage: None,
+        tool_ledger: None,
+    };
+    let request = CanonicalRunTerminalRequest {
         user_id: &fixture.user_id,
         run_id: &identity.run_id,
         expected_session_id: &fixture.session_id,
         expected_statuses: &["running"],
-        expected_owner_generation: 1,
+        expected_owner_generation: opened.run_generation,
         status: "completed",
         waiting_for: None,
         error_message: None,
-        events: &terminal,
+        error_code: None,
+        error_kind: None,
+        error_metadata: None,
+        interruption: None,
+        cancellation_origin: None,
         prompt_tokens: 0,
         completion_tokens: 0,
         tool_calls: 0,
     };
     let mut tx = fixture.pool.get().begin().await.unwrap();
-    let committed = fixture
+    astra_services::storage::admit_session_execution_write(
+        &mut tx,
+        &fixture.session_id,
+        &fixture.user_id,
+    )
+    .await
+    .unwrap();
+    let CanonicalTerminalClaim::Claimed { control_events, .. } = fixture
         .store
-        .settle_terminal_in_existing_transaction(&mut tx, request)
+        .claim_canonical_terminal_with_controls_in_transaction(&mut tx, request, &receipt)
         .await
         .unwrap()
-        .unwrap();
+    else {
+        panic!("canonical terminal must commit")
+    };
     assert!(
-        committed
-            .committed_events
+        control_events
             .iter()
             .all(|event| event["event_type"] != "user_intent_returned")
     );
     tx.commit().await.unwrap();
+    let committed = fixture
+        .store
+        .resolve_canonical_terminal_receipt(request, &receipt)
+        .await
+        .unwrap()
+        .unwrap();
     let outcome = ToolInvocationTerminalOutcome::Succeeded {
         result: ToolInvocationResultPayload::new("finished later", BTreeMap::new(), None).unwrap(),
     };
@@ -92,17 +141,36 @@ async fn committed_terminal_guidance_withholding_survives_late_physical_completi
         )
         .await
         .unwrap();
-    for receipts in [None, Some(committed.event_receipts.as_slice())] {
-        let resolved = fixture
+    assert_eq!(
+        fixture
             .store
-            .resolve_atomic_terminal_settlement(request, receipts)
+            .resolve_canonical_terminal_receipt(request, &receipt)
             .await
-            .unwrap();
-        assert!(
-            matches!(resolved, AtomicRunTerminalSettlementResolution::Exact(_)),
-            "late completion cannot change the committed terminal prefix: {resolved:?}"
-        );
-    }
+            .unwrap()
+            .unwrap(),
+        committed,
+        "late completion cannot change the committed terminal prefix"
+    );
+    sqlx::query("UPDATE agent_run_openings SET opening_events_json = 'invalid' WHERE user_id = ? AND run_id = ?")
+        .bind(&fixture.user_id).bind(&identity.run_id).execute(fixture.pool.get()).await.unwrap();
+    assert!(
+        fixture
+            .store
+            .load_run(&fixture.user_id, &identity.run_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .resolve_canonical_terminal_receipt(request, &receipt)
+            .await
+            .unwrap()
+            .unwrap(),
+        committed,
+        "exact terminal receipt resolution must not depend on a cold execution body"
+    );
+    fixture.cleanup().await;
 }
 
 #[tokio::test]
@@ -859,6 +927,26 @@ impl Fixture {
         (ledger, identity)
     }
 
+    async fn alter_opening(&self, run_id: &str) -> String {
+        let original: String = sqlx::query_scalar(
+            "SELECT opening_events_json FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&self.user_id)
+        .bind(run_id)
+        .fetch_one(self.pool.get())
+        .await
+        .unwrap();
+        let mut changed: Value = serde_json::from_str(&original).unwrap();
+        changed[0]["data"]["integrity_probe"] = json!(true);
+        self.restore_opening(run_id, &changed.to_string()).await;
+        original
+    }
+
+    async fn restore_opening(&self, run_id: &str, opening: &str) {
+        sqlx::query("UPDATE agent_run_openings SET opening_events_json = ? WHERE user_id = ? AND run_id = ?")
+            .bind(opening).bind(&self.user_id).bind(run_id).execute(self.pool.get()).await.unwrap();
+    }
+
     async fn interaction_invocation(
         &self,
     ) -> (DatabaseToolInvocationLedger, ToolInvocationIdentity) {
@@ -995,6 +1083,44 @@ async fn native_interaction_real_producer_register_begin_resolve_and_early_answe
             AtomicRunInteractionBatchRegistration::Registered
         );
         let response = json!({"request_id":"native-question", "outcome":"submitted", "payload":{"answer":"yes"}});
+        if !early {
+            let before = fixture
+                .store
+                .load_run_control(&fixture.user_id, &identity.run_id)
+                .await
+                .unwrap();
+            let original = fixture.alter_opening(&identity.run_id).await;
+            let wait_error = begin_interaction(&callback, &origin).await.unwrap_err();
+            assert!(
+                wait_error.contains("immutable Run opening does not match its admitted identity"),
+                "{wait_error}"
+            );
+            let resolve_error = callback
+                .resolve_run_interaction(
+                    &fixture.user_id,
+                    &fixture.session_id,
+                    &identity.run_id,
+                    "native-question",
+                    DurableRunInteractionKind::Provider,
+                    response.clone(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                resolve_error
+                    .contains("immutable Run opening does not match its admitted identity"),
+                "{resolve_error}"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .load_run_control(&fixture.user_id, &identity.run_id)
+                    .await
+                    .unwrap(),
+                before
+            );
+            fixture.restore_opening(&identity.run_id, &original).await;
+        }
         if early {
             assert!(matches!(
                 resolve_interaction(&callback, &origin, response.clone()).await,
@@ -1485,6 +1611,40 @@ async fn native_question_remains_answerable_after_current_run_guidance() {
                     .is_err(),
                 "an arbitrary identity is not invocation proof"
             );
+        }
+        if timing == 2 && accepted {
+            let before = fixture
+                .store
+                .load_run_control(&fixture.user_id, &identity.run_id)
+                .await
+                .unwrap();
+            let original = fixture.alter_opening(&identity.run_id).await;
+            let error = fixture
+                .store
+                .apply_run_user_intents(AtomicRunUserIntentApplyRequest {
+                    purpose: astra_services::runs::UserIntentApplyPurpose::ModelBoundary,
+                    invocation_identity: Some(&identity),
+                    user_id: &fixture.user_id,
+                    run_id: &identity.run_id,
+                    expected_session_id: &fixture.session_id,
+                    expected_owner_generation: origin.owner_generation,
+                    source_event_indices: &[event_index],
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("immutable Run opening does not match its admitted identity"),
+                "{error}"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .load_run_control(&fixture.user_id, &identity.run_id)
+                    .await
+                    .unwrap(),
+                before
+            );
+            fixture.restore_opening(&identity.run_id, &original).await;
         }
         let applied = if accepted {
             Some(

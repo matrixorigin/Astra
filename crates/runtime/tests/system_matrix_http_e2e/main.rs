@@ -495,9 +495,9 @@ matrix_test! {
     journey_saas_platform_matrix::run_saas_admin_audit_rbac_smoke
 }
 matrix_test! {
-    e2e_matrix_saas_skills_cross_user_isolation, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 skills isolation",
-    journey_saas_platform_matrix::run_saas_skills_cross_user_isolation
+    e2e_matrix_saas_skills_publisher_ownership, 2,
+    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 skill publisher ownership",
+    journey_saas_platform_matrix::run_saas_skills_publisher_ownership
 }
 matrix_test! {
     e2e_matrix_saas_run_projection_smoke, 2,

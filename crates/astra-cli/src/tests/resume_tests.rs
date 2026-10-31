@@ -449,7 +449,6 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
         assert_eq!(state.turn, local_turn);
         state.perm_manager = PermissionManager::new(true);
         state.cli_context.add_dirs.push(temp.path().to_path_buf());
-        state.session_lessons_loaded = true;
         std::fs::write(&old_file, "historical edit").unwrap();
         let historical_turn = if local_turn > server_turn {
             server_turn + 1

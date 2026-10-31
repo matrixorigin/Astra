@@ -348,6 +348,7 @@ impl DatabaseRunStateStore {
                 user_id,
                 &request.expected_session_id,
                 run_id,
+                RunProjection::Opening,
             )
             .await
             .map_err(|e| e.to_string())?
@@ -420,7 +421,13 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|e| e.to_string())?;
         let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, session_id, run_id)
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                user_id,
+                session_id,
+                run_id,
+                RunProjection::Opening,
+            )
             .await
             .map_err(|e| e.to_string())?
         else {

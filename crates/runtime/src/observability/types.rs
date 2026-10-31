@@ -114,7 +114,7 @@ pub struct ObservabilitySession {
     pub last_feedback_signals: Vec<FeedbackSignal>,
 
     /// Per-channel fingerprint history for runtime-injected prompt signals
-    /// (recent_failing_tests, outcome_bias, lessons, volatile_pending).
+    /// (recent_failing_tests, outcome_bias, volatile_pending).
     /// Observed once per SelfModel snapshot build so the
     /// `introspect facet=noise` renderer can flag channels that have
     /// been re-rendered unchanged for many turns — session f85a02bb's
@@ -162,7 +162,6 @@ pub struct QueryBehavior {
 /// empty for that channel.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InjectionPreviews<'a> {
-    pub lessons: &'a str,
     pub volatile: &'a str,
     pub memoria_prefetch: &'a str,
     pub self_awareness: &'a str,
@@ -173,7 +172,6 @@ pub struct InjectionPreviews<'a> {
 
 impl InjectionPreviews<'_> {
     pub const EMPTY: Self = Self {
-        lessons: "",
         volatile: "",
         memoria_prefetch: "",
         self_awareness: "",

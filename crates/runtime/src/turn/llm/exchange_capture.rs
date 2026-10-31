@@ -504,7 +504,6 @@ mod tests {
                 retention_policy: Some("default".into()),
                 retention_until: None,
                 status: Some("active".into()),
-                referenced_by_state_items_count: 0,
                 referenced_by_citation_count: 0,
                 referenced_by_durable_count: 0,
                 created_at: None,

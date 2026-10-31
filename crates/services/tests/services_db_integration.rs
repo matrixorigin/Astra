@@ -33,14 +33,13 @@ use astra_services::session_workspace::{
 use astra_services::{
     AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, DatabaseAdminAuditReader,
     DatabaseEventService, DatabaseIntrospectionService, DatabaseMarketplaceService,
-    DatabasePersonalSkillStore, DatabaseReflectService, DatabaseSessionArtifactStore,
-    DatabaseSessionContextCoordinator, DatabaseSessionService, DatabaseSkillService,
-    DatabaseStateProjectionStore, EventCreateRequestData, EventListFilter, EventService,
-    IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, ReflectService,
+    DatabaseReflectService, DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator,
+    DatabaseSessionService, DatabaseSkillService, EventCreateRequestData, EventListFilter,
+    EventService, IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, ReflectService,
     ReserveTurnOutcome, SessionArtifactJsonStore, SessionArtifactReference,
     SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
     SessionContextCoordinator, SessionContextCoordinatorError, SessionListFilter, SessionService,
-    SkillService, SubmitUserSkillVersion,
+    SkillService,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
@@ -6689,15 +6688,14 @@ async fn ordinary_create_event_requires_existing_session_header_live_matrixone()
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn event_count_delta_service_and_state_paths_live_matrixone() {
+async fn event_count_delta_service_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
     let user_id = Uuid::new_v4().to_string();
     let service_session = Uuid::new_v4().to_string();
-    let state_session = Uuid::new_v4().to_string();
 
-    for session_id in [&service_session, &state_session] {
+    for session_id in [&service_session] {
         sqlx::query(
             "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
              VALUES (?, ?, 'write-path-it', 'active', 0)",
@@ -6763,81 +6761,9 @@ async fn event_count_delta_service_and_state_paths_live_matrixone() {
         "DatabaseEventService::create_event should add one event_count delta per persisted row"
     );
 
-    let state_projection_store = DatabaseStateProjectionStore::new(shared.clone());
-    let active_skill_name = format!("active-skill-{}", Uuid::new_v4());
-    let personal_skill_store = DatabasePersonalSkillStore::new(shared.clone());
-    let active_skill_version = personal_skill_store
-        .submit_version(
-            &user_id,
-            &active_skill_name,
-            SubmitUserSkillVersion {
-                version: "1.0.0".into(),
-                manifest_json: serde_json::json!({"name": &active_skill_name}),
-                content_markdown: "# Active skill\n\nCanonical published fixture.".into(),
-                status: Some("published".into()),
-            },
-        )
-        .await
-        .expect("publish personal skill version fixture");
-    state_projection_store
-        .activate_personal_skill_from_ui(
-            &user_id,
-            &state_session,
-            &active_skill_name,
-            &active_skill_version.version_id,
-        )
-        .await
-        .expect("activate personal skill");
-    let state_count =
-        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&state_session)
-            .bind(&user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("load state projection session count")
-            .try_get::<i64, _>("event_count")
-            .expect("decode state projection event_count");
-    assert_eq!(
-        state_count, 1,
-        "state projection skill activation should add one event_count delta"
-    );
-    let state_event_ids =
-        sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?")
-            .bind(&state_session)
-            .bind(&user_id)
-            .fetch_all(&pool)
-            .await
-            .expect("load state projection event ids")
-            .into_iter()
-            .map(|row| row.try_get::<String, _>("event_id").expect("event_id"))
-            .collect::<Vec<_>>();
-    assert_eq!(state_event_ids.len(), 1);
-
-    let mut event_ids = vec![created_one.record.event_id, created_two.record.event_id];
-    event_ids.extend(state_event_ids);
-    let _ = sqlx::query(
-        "DELETE FROM session_state_items WHERE session_id = ? AND user_id = ? AND item_key = ?",
-    )
-    .bind(&state_session)
-    .bind(&user_id)
-    .bind(&active_skill_name)
-    .execute(&pool)
-    .await;
-    let _ = sqlx::query("DELETE FROM user_skill_versions WHERE version_id = ?")
-        .bind(&active_skill_version.version_id)
-        .execute(&pool)
+    let event_ids = vec![created_one.record.event_id, created_two.record.event_id];
+    cleanup_agent_sessions_and_events_for_owner(&pool, &user_id, &[service_session], &event_ids)
         .await;
-    let _ = sqlx::query("DELETE FROM user_skill_sources WHERE source_id = ?")
-        .bind(&active_skill_version.source_id)
-        .execute(&pool)
-        .await;
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &user_id,
-        &[service_session, state_session],
-        &event_ids,
-    )
-    .await;
 }
 
 // ── At-most-once idempotency integration tests ───────────────────────────────

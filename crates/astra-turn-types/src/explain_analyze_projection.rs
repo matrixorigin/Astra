@@ -2472,7 +2472,6 @@ mod tests {
         event.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
             assembly: Some(Box::new(ExplainAnalyzeContextAssemblyV1 {
-                edge_memory_selection: Vec::new(),
                 basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
                 sources: vec![ExplainAnalyzeContextSourceV1 {
                     kind: ExplainAnalyzeContextSourceKindV1::Memory,

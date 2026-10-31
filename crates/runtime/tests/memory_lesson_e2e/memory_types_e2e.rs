@@ -227,24 +227,6 @@ fn none_mode_prompt_is_empty() {
 
 // ── 5. Quality gate integration ──────────────────────────────────────────
 
-#[test]
-fn quality_gate_filters_extraction_output() {
-    use astra_runtime::learning::lesson::is_high_quality_lesson;
-
-    // These should PASS the gate (10+ chars, no hedging)
-    assert!(is_high_quality_lesson(
-        "always use RS256 for JWT signing, not HS256"
-    ));
-    assert!(is_high_quality_lesson(
-        "prefers compact JSON output without pretty-printing"
-    ));
-
-    // These should FAIL the gate
-    assert!(!is_high_quality_lesson("maybe X"));
-    assert!(!is_high_quality_lesson("not sure about this approach"));
-    assert!(!is_high_quality_lesson("hi")); // too short
-}
-
 // ── 6. Prompt builder vs memory_types consistency ────────────────────────
 
 #[test]

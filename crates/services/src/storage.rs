@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-29-v116";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-31-v117";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -999,13 +999,6 @@ where
 pub(crate) struct SessionWriteAdmissionFacts {
     pub(crate) user_id: String,
     pub(crate) session_id: String,
-    session_status: String,
-}
-
-impl SessionWriteAdmissionFacts {
-    pub(crate) fn session_status(&self) -> &str {
-        &self.session_status
-    }
 }
 
 /// Transaction-local identity and status protected by lifecycle -> Session
@@ -1084,7 +1077,6 @@ where
         return Ok(SessionWriteAdmissionFacts {
             user_id,
             session_id,
-            session_status: status,
         });
     }
     if !allow_lazy_create {
@@ -1094,8 +1086,8 @@ where
         Ok(()) | Err(sqlx::Error::RowNotFound) => {}
         Err(error) => return Err(error),
     }
-    let created: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT user_id, session_id, status FROM agent_sessions
+    let created: Option<(String, String)> = sqlx::query_as(
+        "SELECT user_id, session_id FROM agent_sessions
          WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
          LIMIT 1 FOR UPDATE",
     )
@@ -1103,11 +1095,10 @@ where
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some((user_id, session_id, session_status)) = created {
+    if let Some((user_id, session_id)) = created {
         Ok(SessionWriteAdmissionFacts {
             user_id,
             session_id,
-            session_status,
         })
     } else {
         Err(sqlx::Error::RowNotFound)
@@ -3868,45 +3859,6 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ── State projection v1 (Phase 4 / G2+G4+G5+G6+G14+G16+G20) ────────
-    core_schema_create!(pool, "session_state_items",
-        "CREATE TABLE IF NOT EXISTS session_state_items (
-            item_id VARCHAR(128) PRIMARY KEY,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            scope VARCHAR(32) NOT NULL DEFAULT 'session',
-            category VARCHAR(64) NOT NULL,
-            item_key VARCHAR(255) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            priority INT NOT NULL DEFAULT 0,
-            source VARCHAR(64) NOT NULL,
-            provenance_event_id VARCHAR(128) NULL,
-            run_id VARCHAR(128) NULL,
-            title VARCHAR(255) NULL,
-            summary_text TEXT NULL,
-            payload_json LONGTEXT NULL,
-            payload_hash VARCHAR(128) NULL,
-            token_estimate INT NOT NULL DEFAULT 0,
-            version BIGINT NOT NULL DEFAULT 1,
-            origin_session_id VARCHAR(128) NULL,
-            origin_chunk_id VARCHAR(128) NULL,
-            origin_state_item_id VARCHAR(128) NULL,
-            expires_at DATETIME(6) NULL,
-            request_id VARCHAR(128) NULL,
-            trace_id VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_session_state_items_scope CHECK (scope IN ('session', 'user', 'project', 'workspace')),
-            UNIQUE KEY uq_state_current (user_id, session_id, scope, category, item_key),
-            INDEX idx_state_owner_session_status_category (user_id, session_id, status, category),
-            INDEX idx_state_user_category (user_id, category, status, updated_at),
-            INDEX idx_state_user_scope_category (user_id, scope, category, status, priority),
-            INDEX idx_state_owner_origin_session (user_id, origin_session_id, category, status),
-            INDEX idx_state_expires (expires_at),
-            INDEX idx_state_provenance (provenance_event_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(
         pool,
@@ -4241,18 +4193,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "model_router_deployments",
-        "CREATE TABLE IF NOT EXISTS model_router_deployments (
-            user_id VARCHAR(128) PRIMARY KEY,
-            revision BIGINT UNSIGNED NOT NULL,
-            state_json LONGTEXT NOT NULL
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra admin config set/get/unset` (first key: `reasoning_offering_id`).
     core_schema_create!(
@@ -4569,7 +4509,6 @@ async fn ensure_core_schema_while_leased(
             normalize_version VARCHAR(16) NULL,
             cold_storage_ref VARCHAR(255) NULL,
             derived_from_artifact_id VARCHAR(128) NULL,
-            referenced_by_state_items_count INT NOT NULL DEFAULT 0,
             referenced_by_citation_count INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -4602,7 +4541,7 @@ async fn ensure_core_schema_while_leased(
             reference_id VARCHAR(128) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_artifact_reference_kind CHECK (
-                reference_kind IN ('invocation_ledger', 'manifest', 'state_item', 'citation', 'recovery_point', 'session_transcript')
+                reference_kind IN ('invocation_ledger', 'manifest', 'citation', 'recovery_point', 'session_transcript')
             ),
             PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id),
             INDEX idx_artifact_references_owner_reference
@@ -4691,51 +4630,6 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ─── Skill management tables ─────────────────────────────────────────────────
-
-    core_schema_create!(pool, "user_skill_sources",
-        "CREATE TABLE IF NOT EXISTS user_skill_sources (
-            source_id VARCHAR(128) PRIMARY KEY,
-            owner_user_id VARCHAR(128) NOT NULL,
-            skill_name VARCHAR(128) NOT NULL,
-            visibility VARCHAR(32) NOT NULL DEFAULT 'private',
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            description TEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_user_skill_sources_visibility CHECK (visibility IN ('private', 'workspace', 'public')),
-            CONSTRAINT chk_user_skill_sources_status CHECK (status IN ('active', 'archived')),
-            UNIQUE KEY uq_user_skill_source_name (owner_user_id, skill_name),
-            INDEX idx_user_skill_owner_name (owner_user_id, skill_name),
-            INDEX idx_user_skill_status_updated (owner_user_id, status, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "user_skill_versions",
-        "CREATE TABLE IF NOT EXISTS user_skill_versions (
-            version_id VARCHAR(128) PRIMARY KEY,
-            source_id VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            skill_name VARCHAR(128) NOT NULL,
-            version VARCHAR(64) NOT NULL,
-            manifest_json LONGTEXT NOT NULL,
-            content_markdown LONGTEXT NOT NULL,
-            content_hash VARCHAR(128) NOT NULL,
-            normalize_version VARCHAR(32) NOT NULL DEFAULT 'skill_md_v1',
-            token_estimate INT NOT NULL DEFAULT 0,
-            status VARCHAR(32) NOT NULL DEFAULT 'draft',
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_user_skill_versions_status CHECK (status IN ('draft', 'published', 'superseded', 'quarantined')),
-            UNIQUE KEY uq_user_skill_source_version (source_id, version),
-            INDEX idx_user_skill_versions_owner_name (owner_user_id, skill_name, status, created_at),
-            INDEX idx_user_skill_versions_source (source_id, created_at),
-            INDEX idx_user_skill_versions_hash (content_hash)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     core_schema_create!(pool, "skill_installations",
         "CREATE TABLE IF NOT EXISTS skill_installations (
@@ -4828,24 +4722,6 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // ─── Agent management tables ─────────────────────────────────────────────────
-
-    core_schema_create!(pool, "agent_agents",
-        "CREATE TABLE IF NOT EXISTS agent_agents (
-            agent_id       VARCHAR(255) PRIMARY KEY,
-            agent_name     VARCHAR(128) NOT NULL,
-            agent_type     VARCHAR(64) NOT NULL DEFAULT 'general',
-            owner_user_id  VARCHAR(128) NOT NULL,
-            is_active      SMALLINT NOT NULL DEFAULT 1,
-            agent_config   LONGTEXT,
-            data_source    TEXT,
-            created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_aa_owner_name (owner_user_id, agent_name),
-            INDEX idx_aa_type (agent_type)
-        )",
-    )
-    .execute(&pool)
-    .await?;
 
     // ─── Data versioning tables ──────────────────────────────────────────────────
 
@@ -5556,22 +5432,6 @@ async fn verify_core_schema_shape(
             index,
             expected_columns,
         )?;
-    }
-    for (index, expected_columns) in [
-        (
-            "idx_state_owner_session_status_category",
-            &["user_id", "session_id", "status", "category"][..],
-        ),
-        (
-            "idx_state_user_scope_category",
-            &["user_id", "scope", "category", "status", "priority"][..],
-        ),
-        (
-            "idx_state_owner_origin_session",
-            &["user_id", "origin_session_id", "category", "status"][..],
-        ),
-    ] {
-        ensure_index_shape(&indexes, "session_state_items", index, expected_columns)?;
     }
     fail_if_obsolete_shape(
         pool,

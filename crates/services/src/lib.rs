@@ -1,8 +1,6 @@
 pub mod admin;
 pub mod admin_config;
 pub mod agent_bindings;
-pub mod agent_lessons;
-pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
 pub mod byok_endpoint;
@@ -29,7 +27,6 @@ pub mod models;
 pub mod multi_agent;
 pub mod observation_capture;
 pub mod pagination;
-pub mod personal_skills;
 pub mod reflect;
 pub(crate) mod registry_payload;
 pub use registry_payload::validate_registered_endpoint_url;
@@ -59,12 +56,10 @@ pub mod skill_auto_route_judge;
 pub mod skill_config;
 pub mod skills;
 pub mod snapshot_sql;
-pub mod state_projection;
 pub mod state_sync;
 pub mod storage;
 pub mod sync_outbox;
 pub mod tool_invocation_ledger;
-pub mod tuning;
 pub mod turn_intent_judge;
 pub mod verification;
 pub mod weighted_admission;
@@ -118,15 +113,6 @@ pub use agent_bindings::{
     AgentBindingService, AgentBindingStatus, DatabaseAgentBindingService,
     InMemoryAgentBindingService, UnconfiguredAgentBindingService, validate_agent_binding_create,
     validate_agent_binding_payload,
-};
-pub use agent_lessons::{
-    Lesson, LessonHint, LessonKind, MAX_LESSON_ACTION_CHARS, MIN_LESSON_ACTION_CHARS,
-    MIN_LESSON_ACTION_WORDS, NewLesson, SCRATCHPAD_LOWERCASE_PHRASES, is_action_prompt_worthy,
-    memory_value_to_lesson_hint, sanitize_for_prompt,
-};
-pub use agents::{
-    AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
-    AgentUpdateRequestData, DatabaseAgentService, UnconfiguredAgentService,
 };
 pub use artifact_policy::{
     PresignedArtifactDownload, artifact_download_signature, build_presigned_artifact_download,
@@ -234,12 +220,6 @@ pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_admin_audit_limit,
     clamp_api_list_pagination,
 };
-pub use personal_skills::{
-    ActivateUserSkillVersion, ActivePersonalSkillRecord, CreateUserSkillSource,
-    DatabasePersonalSkillStore, PersonalSkillError, SKILL_MD_NORMALIZE_VERSION,
-    SubmitUserSkillVersion, UserSkillSourceRecord, UserSkillVersionRecord, normalize_skill_md,
-    skill_md_content_hash,
-};
 pub use reflect::{
     DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
@@ -304,9 +284,6 @@ pub use skill_config::{
 pub use skills::{
     DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillService,
     UnconfiguredSkillService,
-};
-pub use state_projection::{
-    DatabaseStateProjectionStore, StateProjectionError, UserAnchorMemoryItem,
 };
 pub use state_sync::MatrixOneSyncService;
 pub use storage::{

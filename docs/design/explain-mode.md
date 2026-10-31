@@ -59,25 +59,10 @@ identify the bottleneck, critical path, token attribution, or parallel overlap
 with adequate coverage, it must say the result is unavailable and why. Never
 fill sparse data with confident-sounding boilerplate or unexplained zeroes.
 
-CLI/Edge lesson decisions are attached to the context assembly as
-`edge_memory_selection`. They carry the source session and turn, operation
-(relevance, explicit dismissal, or cache reuse), candidate count, batch-local
-indices, selected flags and ranking order, selector model, measured selection duration, and
-provider probabilities when supplied (rounded to basis points). These facts
-are reported by the selected CLI/Edge, not independently verified by Server.
-Repeated assemblies reference the same turn decision; their durations must not
-be added together or placed on the Server clock. Missing or stale observations
-are omitted. Selection does not prove final prompt injection; the report
-explicitly says that injection is not measured.
-
-The concise view shows candidate and selected counts and the decision method.
-Details expose candidate decisions and available scores, never invented
-explanations. Model rejection of all candidates, no retrieved candidates,
-unavailable retrieval, selector failure with local fallback, and cache reuse
-remain distinct. Failed dismissal retains memories. Memory text and raw
-provider payloads do not enter this public Explain contract. There are at most
-two decision operations per bootstrap turn and 256 candidates per exported
-operation; these are observation bounds, not limits on selection behavior.
+Context assembly reports bounded source costs separately from request budgets.
+The former CLI lesson-selection field `edge_memory_selection` is removed. Strict
+Rust and SDK decoders reject old payloads containing it, including empty arrays;
+they do not reinterpret historic selection evidence as current execution.
 
 The graph is a deterministic visual rendering of runtime facts; rendering it
 does not call an LLM or generate narrative claims. Any LLM explanation is a

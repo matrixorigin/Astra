@@ -178,7 +178,6 @@ pub(crate) async fn auto_parent_run(run_id: &str, execution: &AdmittedModelExecu
         .await
         .unwrap();
     let decision = ModelRoutingDecision {
-        rollout: None,
         schema_version: 2,
         features: None,
         work_admission: None,

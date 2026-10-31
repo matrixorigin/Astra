@@ -14,7 +14,6 @@ import type {
   ExplainAnalyzeDecisionDetailV1,
   ExplainAnalyzeRequestJudgmentResultV1,
   ExplainAnalyzeRequestJudgmentFieldV1,
-  MemorySelectionReport,
 } from "./types";
 
 export type ExplainAnalyzeNodeV1 = {
@@ -532,9 +531,8 @@ function isExplainContext(value: unknown, kind: string): value is ExplainAnalyze
     if (kind !== "context_assembly") return false;
     const assembly = value.assembly;
     if (!isRecord(assembly) || assembly.basis !== "runtime_text_estimate" ||
-      Object.keys(assembly).some((key) => !["basis", "sources", "edge_memory_selection"].includes(key)) ||
+      Object.keys(assembly).some((key) => !["basis", "sources"].includes(key)) ||
       !Array.isArray(assembly.sources) || assembly.sources.length > contextSourceKinds.size) return false;
-    if (assembly.edge_memory_selection !== undefined && (!Array.isArray(assembly.edge_memory_selection) || assembly.edge_memory_selection.length > 2 || !assembly.edge_memory_selection.every(isMemorySelectionReport))) return false;
     const seen = new Set<string>();
     for (const source of assembly.sources) {
       if (!isRecord(source) || typeof source.kind !== "string" || !contextSourceKinds.has(source.kind) ||
@@ -546,61 +544,6 @@ function isExplainContext(value: unknown, kind: string): value is ExplainAnalyze
     }
   }
   return true;
-}
-
-function isMemorySelectionReport(value: unknown): value is MemorySelectionReport {
-  if (!isRecord(value) || Object.keys(value).some(k => !["session_id", "turn", "operation", "method", "reason", "model", "candidates", "selection_order", "elapsed_ms", "candidate_coverage", "prompt_projection"].includes(k)) ||
-      typeof value.session_id !== "string" || value.session_id.length === 0 || new TextEncoder().encode(value.session_id).length > 512 || /[\u0000-\u001f\u007f-\u009f]/u.test(value.session_id) ||
-      !isNonNegativeInteger(value.turn) || value.turn === 0 || value.turn > 0xffff_ffff ||
-      !["relevance", "dismissal", "reuse"].includes(String(value.operation)) ||
-      !["model", "lexical", "none", "reuse"].includes(String(value.method)) ||
-      !["completed", "no_candidates", "no_selector", "call_unavailable", "invalid_response", "retrieval_unavailable", "retrieval_timeout", "reused"].includes(String(value.reason)) ||
-      !(value.model === null || (typeof value.model === "string" && value.model.trim().length > 0 && new TextEncoder().encode(value.model).length <= 160 && !/[\u0000-\u001f\u007f-\u009f]/u.test(value.model))) ||
-      !isNonNegativeInteger(value.elapsed_ms) || !Array.isArray(value.candidates) || value.candidates.length > 256) return false;
-  if (!value.candidates.every((c, i) => isRecord(c) && c.index === i && typeof c.selected === "boolean" &&
-    Object.keys(c).every(k => ["index", "selected", "probability_bps"].includes(k)) &&
-    (c.probability_bps === null || (isNonNegativeInteger(c.probability_bps) && c.probability_bps <= 10000)))) return false;
-  const r = value as MemorySelectionReport;
-  if (!Array.isArray(r.selection_order) || r.selection_order.length !== r.candidates.filter(c => c.selected).length ||
-      new Set(r.selection_order).size !== r.selection_order.length || !r.selection_order.every(i => isNonNegativeInteger(i) && r.candidates[i]?.selected)) return false;
-  if (r.candidate_coverage !== undefined &&
-      (!isRecord(r.candidate_coverage) || Object.keys(r.candidate_coverage).some(k => !["source_items", "evaluated_candidates", "truncated"].includes(k)) ||
-       !isNonNegativeInteger(r.candidate_coverage.source_items) || !isNonNegativeInteger(r.candidate_coverage.evaluated_candidates) ||
-       r.candidate_coverage.evaluated_candidates !== r.candidates.length || r.candidate_coverage.source_items < r.candidate_coverage.evaluated_candidates ||
-       typeof r.candidate_coverage.truncated !== "boolean")) return false;
-  if (r.prompt_projection !== undefined &&
-      (!isRecord(r.prompt_projection) || Object.keys(r.prompt_projection).some(k => !["selected_candidates", "included_candidates"].includes(k)) ||
-       r.operation === "dismissal" || !isNonNegativeInteger(r.prompt_projection.selected_candidates) ||
-       r.prompt_projection.selected_candidates !== r.selection_order.length ||
-       !(r.prompt_projection.included_candidates === null ||
-         (isNonNegativeInteger(r.prompt_projection.included_candidates) && r.prompt_projection.included_candidates <= r.prompt_projection.selected_candidates)))) return false;
-  const noScores = r.candidates.every(c => c.probability_bps === null);
-  switch (r.reason) {
-    case "completed": return r.method === "model" && r.operation !== "reuse" && r.model !== null && r.candidates.length > 0;
-    case "no_candidates": return r.method === "none" && r.operation !== "reuse" && r.model === null && r.candidates.length === 0;
-    case "retrieval_unavailable": case "retrieval_timeout": return r.method === "none" && r.operation === "relevance" && r.model === null && r.candidates.length === 0;
-    case "reused": return r.method === "reuse" && r.operation === "reuse" && r.model === null && noScores && r.candidates.every(c => c.selected);
-    default: return noScores && r.candidates.length > 0 && (r.operation === "relevance" ? r.method === "lexical" : r.operation === "dismissal" && r.method === "none" && r.candidates.every(c => !c.selected));
-  }
-}
-
-export function memorySelectionLines(report: MemorySelectionReport): string[] {
-  const reasons = { completed: "completed", no_candidates: "no candidates", no_selector: report.operation === "dismissal" ? "no selector available; memories kept" : "no selector available; ranked locally, candidates kept",
-    call_unavailable: report.operation === "dismissal" ? "selector unavailable; memories kept" : "selector unavailable; ranked locally, candidates kept", invalid_response: report.operation === "dismissal" ? "invalid selector response; memories kept" : "invalid selector response; ranked locally, candidates kept",
-    retrieval_unavailable: "retrieval failed", retrieval_timeout: "retrieval timed out", reused: "no new relevance check" };
-  const selected = report.candidates.filter(c => c.selected).length;
-  const action = report.operation === "dismissal" ? "dismissed" : report.operation === "reuse" ? "reused" : "selected";
-  const method = report.method === "model" ? report.model ?? "model" : report.method === "lexical" ? "local keyword matching" : report.method === "reuse" ? "session cache" : "not run";
-  const coverage = report.candidate_coverage?.truncated ? ` · bounded ${report.candidate_coverage.source_items} source items to ${report.candidate_coverage.evaluated_candidates} candidates` : "";
-  const projection = report.prompt_projection === undefined ? "" : report.prompt_projection.selected_candidates === 0 ? " · no memory entered request" :
-    report.prompt_projection.included_candidates === null ? " · request inclusion unknown" : ` · ${report.prompt_projection.included_candidates}/${report.prompt_projection.selected_candidates} entered request`;
-  const summary = report.reason.startsWith("retrieval_") ? `Memory retrieval unavailable · ${reasons[report.reason]}` :
-    `Memory selection · ${method} · ${report.candidates.length} candidates → ${selected} ${action} · ${report.elapsed_ms}ms · ${reasons[report.reason]}${coverage}${projection}`;
-  const projectionDetail = report.prompt_projection === undefined ? "final request projection unavailable" : "final request projection measured";
-  return [summary, `Reported by CLI/Edge · turn ${report.turn} · same decision across request rounds · ${projectionDetail}`, ...report.candidates.map(c => {
-    const decision = report.operation === "dismissal" ? (c.selected ? "dismissed" : "kept") : (c.selected ? "selected" : "not selected");
-    return `Candidate ${c.index + 1} · ${decision}${c.probability_bps === null ? "" : ` · model score ${(c.probability_bps / 100).toFixed(2)}%`}`;
-  })];
 }
 
 function isExplainAnalyzeUsage(value: unknown): value is ExplainAnalyzeUsageV1 {
@@ -644,12 +587,6 @@ export function explainAnalyzeContextSections(context: ExplainAnalyzeContextMetr
         .concat([{ label: "Visible tools", value: String(budget.visible_tool_count) }]) });
   }
   if (context.assembly) {
-    for (const report of context.assembly.edge_memory_selection ?? []) {
-      const [summary, ...details] = memorySelectionLines(report);
-      sections.push({ title: report.operation === "dismissal" ? "Memory feedback" : report.operation === "reuse" ? "Memory reuse" : "Memory relevance", description: summary,
-        rows: details.map((value, index) => index === 0 ? { label: "Observation", value } :
-          { label: `Candidate ${index}`, value: value.split(" · ").slice(1).join(" · ") }) });
-    }
     sections.push({ title: "Context sources", description: "Text estimates at assembly time. Later request preparation may change the input.",
       rows: context.assembly.sources.map((source) => ({ label: contextSourceLabels[source.kind],
         value: `${source.estimated_tokens.toLocaleString("en-US")} tokens · ${source.section_count} ${source.section_count === 1 ? "section" : "sections"}` })) });
@@ -659,7 +596,6 @@ export function explainAnalyzeContextSections(context: ExplainAnalyzeContextMetr
 
 export function formatExplainAnalyzeContext(context: ExplainAnalyzeContextMetricsV1): string {
   if (context.budget) return `Input ≈${context.budget.estimated_input_tokens.toLocaleString("en-US")} / ${context.budget.effective_input_limit_tokens.toLocaleString("en-US")}`;
-  if (context.assembly?.edge_memory_selection?.length) return context.assembly.edge_memory_selection.map(r => memorySelectionLines(r)[0]).join(" · ");
   return `${context.assembly?.sources.length ?? 0} context sources`;
 }
 

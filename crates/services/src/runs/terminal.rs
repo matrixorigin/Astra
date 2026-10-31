@@ -407,6 +407,13 @@ pub enum CanonicalTerminalClaim {
     Conflict,
 }
 
+/// Physical control facts authenticated by a canonical terminal receipt.
+struct TerminalControlRow {
+    event_idx: i64,
+    event_hash: String,
+    payload: serde_json::Value,
+}
+
 impl DatabaseRunStateStore {
     /// Quiet terminal claim under the caller's canonical Session fence. Real
     /// control history requires the existing locked control owner; unrelated
@@ -805,6 +812,48 @@ impl DatabaseRunStateStore {
         Ok(events)
     }
 
+    async fn load_terminal_control_rows(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        first_event_idx: i64,
+        count: u32,
+    ) -> Result<Vec<TerminalControlRow>, String> {
+        let rows = sqlx::query(
+            "SELECT event_idx, event_hash, payload_json FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND event_idx >= ?
+             ORDER BY event_idx ASC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(first_event_idx)
+        .bind(count)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|error| db_error("load_terminal_control_rows", run_id, error).to_string())?;
+        rows.into_iter()
+            .map(|row| {
+                let event_idx = row.try_get("event_idx").map_err(|error| {
+                    db_error("decode_terminal_control_index", run_id, error).to_string()
+                })?;
+                let event_hash = row.try_get("event_hash").map_err(|error| {
+                    db_error("decode_terminal_control_hash", run_id, error).to_string()
+                })?;
+                let payload: String = row.try_get("payload_json").map_err(|error| {
+                    db_error("decode_terminal_control_payload", run_id, error).to_string()
+                })?;
+                let payload = serde_json::from_str(&payload).map_err(|error| {
+                    format!("decode terminal control payload for run {run_id}: {error}")
+                })?;
+                Ok(TerminalControlRow {
+                    event_idx,
+                    event_hash,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
     /// Return the exact committed outcome, including its server-allocated
     /// range. A terminal status or matching caller JSON alone is insufficient.
     pub async fn resolve_canonical_terminal_receipt(
@@ -896,21 +945,23 @@ impl DatabaseRunStateStore {
         if decoded.control_count != 0 {
             let first = decoded.completion_first - i64::from(decoded.control_count);
             let rows = self
-                .load_atomic_terminal_event_rows(
+                .load_terminal_control_rows(
                     request.user_id,
                     request.run_id,
-                    Some(first),
-                    decoded.control_count as usize,
+                    first,
+                    decoded.control_count,
                 )
                 .await?;
             if rows.len() != decoded.control_count as usize
-                || rows.iter().enumerate().any(|(offset, (receipt, payload))| {
-                    receipt.event_idx != first + offset as i64
-                        || !atomic_terminal_event_hash_is_valid(receipt, payload)
+                || rows.iter().enumerate().any(|(offset, row)| {
+                    row.event_idx != first + offset as i64
+                        || !serde_json::to_string(&row.payload)
+                            .is_ok_and(|json| sha256_hex(json.as_bytes()) == row.event_hash)
                 })
-                || Some(terminal_control_digest(rows.iter().map(|(receipt, _)| {
-                    (receipt.event_idx, receipt.event_hash.as_str())
-                }))) != decoded.control_digest
+                || Some(terminal_control_digest(
+                    rows.iter()
+                        .map(|row| (row.event_idx, row.event_hash.as_str())),
+                )) != decoded.control_digest
             {
                 return Err("committed terminal control facts are missing or changed".into());
             }

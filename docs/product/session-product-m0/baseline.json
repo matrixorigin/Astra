@@ -309,7 +309,7 @@
       "offline_archive": "retain run and invocation audit under existing retention policy",
       "drop": "only task-authority projections inferred from run text or terminal status",
       "replacement": "Run remains authoritative for execution and binds to a Work item attempt",
-      "sources": ["crates/services/src/runs.rs", "crates/services/src/state_projection.rs"]
+      "sources": ["crates/services/src/runs.rs"]
     },
     {
       "store": "checks",

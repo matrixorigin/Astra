@@ -1252,7 +1252,7 @@ impl CliServerAdmissionHost<'_> {
         // ─── Injection-freshness observation (post-turn) ────────────────────
         // wip-7: split observation across two input lanes.
         //   1. CLI-owned raw text for channels the CLI authoritatively
-        //      knows (lessons from session_lessons_snapshot, self_awareness
+        //      knows (self_awareness
         //      from build_self_model_snapshot). These fingerprint with a
         //      full preview so introspect can render the first 80 chars.
         //   2. Bridge-supplied opaque fingerprints for the bridge-internal
@@ -1269,19 +1269,7 @@ impl CliServerAdmissionHost<'_> {
         // the freshness report surfaces the broken pipe rather than
         // hiding it behind uniformly-"empty" entries.
         //
-        // `lessons_text` is recomputed here (cheap — `session_lessons_snapshot`
-        // is an Arc clone) rather than threaded from `prepare_chat_turn_payload`
-        // to avoid widening the prepare/fetch signature. The fingerprint uses
-        // `LessonKind::as_str()` (stable snake_case DB tag), NOT `Debug`, so
-        // enum-variant renames do not flip every channel from Stale→Fresh.
         if let Some(session_lock) = &self.executor.observability_session {
-            let lessons_text = self
-                .executor
-                .session_lessons_snapshot()
-                .iter()
-                .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
-                .collect::<Vec<_>>()
-                .join("|");
             // Rebuild the self-awareness section off the same
             // SelfModel snapshot the CLI injects into edge_profile so
             // the fingerprint matches the bytes the model saw.
@@ -1295,7 +1283,6 @@ impl CliServerAdmissionHost<'_> {
             if let Ok(mut session) = session_lock.write() {
                 session.observe_injections_partial(
                     astra_runtime::observability::InjectionPreviews {
-                        lessons: &lessons_text,
                         self_awareness: &self_awareness_text,
                         ..astra_runtime::observability::InjectionPreviews::EMPTY
                     },

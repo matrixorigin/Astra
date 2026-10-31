@@ -1,18 +1,16 @@
 use super::*;
-use astra_services::agents::AgentListResponse;
 use astra_services::events::EventListResponse;
 
 /// Aggregated platform snapshot returned by `GET /platform/snapshot`.
 #[derive(Serialize)]
 pub(super) struct PlatformSnapshotResponse {
     health: HealthResponse,
-    agents: AgentListResponse,
     sessions: SessionListResponse,
     events: EventListResponse,
     timestamp: String,
 }
 
-/// Returns an aggregated snapshot of the platform: health, agents, sessions,
+/// Returns an aggregated snapshot of the platform: health, sessions,
 /// and recent events in a single round-trip.
 pub(super) async fn platform_snapshot_handler(
     State(state): State<AppState>,
@@ -21,9 +19,8 @@ pub(super) async fn platform_snapshot_handler(
     let user = state.auth_service.current_user(&headers).await?;
 
     // Fan out all reads concurrently.
-    let (health, agents_res, sessions_res, events_res) = tokio::join!(
+    let (health, sessions_res, events_res) = tokio::join!(
         super::meta_handlers::current_health(&state),
-        state.agent_service.list_agents(user.user_id.clone()),
         state.session_service.list_sessions(SessionListFilter {
             user_id: user.user_id.clone(),
             agent_id: None,
@@ -44,7 +41,6 @@ pub(super) async fn platform_snapshot_handler(
 
     Ok(Json(PlatformSnapshotResponse {
         health,
-        agents: AgentListResponse::from(agents_res?),
         sessions: SessionListResponse::from(sessions_res?),
         events: EventListResponse::from(events_res?),
         timestamp: Utc::now().to_rfc3339(),

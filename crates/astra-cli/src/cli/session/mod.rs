@@ -1,11 +1,8 @@
-pub mod session_adaptation;
 pub mod session_cleanup;
 pub mod session_continuation;
 pub(crate) mod session_execution_lease;
 pub mod session_guard;
 pub mod session_input;
-pub mod session_lessons;
-pub mod session_memory_inference;
 pub mod session_projection;
 pub mod session_recovery;
 pub mod session_restore_client;

@@ -1339,3 +1339,134 @@ async fn concurrent_run_projections_preserve_one_hundred_session_identities() {
     }
     b.ctx.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; scripted localhost provider"]
+async fn configured_auto_finishes_without_authoring_or_rollout_queries() {
+    require_system_e2e_env();
+    let capture = SqlCapture::default();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
+        .unwrap();
+    let b = bootstrap().await;
+    struct ClearOverlay;
+    impl Drop for ClearOverlay {
+        fn drop(&mut self) {
+            astra_config::runtime_config::set_cli_overlay(None);
+        }
+    }
+    let _clear = ClearOverlay;
+    astra_config::runtime_config::set_cli_overlay(Some(
+        astra_config::config_overlay::RuntimeConfigLayer::from_json(&json!({
+            "model_routing": {"revision": "sql-budget-pair", "strong_offering_id": b.ctx.model_offering_id,
+                "economy_offering_id": "unavailable-economy"}
+        }).to_string()).unwrap()
+    ));
+    // No judgment Offering is configured in this fixture. Auto must freeze
+    // its strong fallback through the real shared pool before primary dispatch.
+    let model = format!("mock-{}", b.ctx.suffix);
+    b.ctx
+        .install_native_provider(
+            &b.auth_header,
+            vec![ProviderScript::new(
+                "Auto primary",
+                move |r| r.body["model"] == model && r.body["stream"] == true,
+                vec![answer(
+                    json!({"role":"assistant", "content":"Auto completed."}),
+                    "stop",
+                )],
+            )],
+        )
+        .await;
+    prime_chat_pool(&b.ctx).await;
+    *capture.0.lock().unwrap() = Some(Vec::new());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/chat/stream")
+        .header("authorization", &b.auth_header)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({"message":"Reply briefly.", "session_id":b.ctx.session_id,
+            "execution_policy":{"model_routing":"auto"}})
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, body) = collect_full_sse_stream(&b.ctx.app, request, 30).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert!(
+        parse_sse_events(&body)
+            .iter()
+            .any(|e| e["type"] == "run_finished" && e["status"] == "completed"),
+        "{body}"
+    );
+    assert!(body.contains("Auto completed."), "{body}");
+    assert!(
+        b.ctx
+            .app_state
+            .drain_background_runs(std::time::Duration::from_secs(5))
+            .await
+    );
+    wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
+    assert_eq!(
+        b.ctx.native_provider_requests().await.len(),
+        1,
+        "unconfigured optional judgment must not send an auxiliary provider request"
+    );
+    let statements = capture.0.lock().unwrap().take().unwrap();
+    assert!(!statements.is_empty());
+    let sql = statements
+        .iter()
+        .map(|sample| sample.sql.clone())
+        .collect::<Vec<_>>();
+    let control_polls = sql
+        .iter()
+        .filter(|statement| statement.as_str() == CONTROL_OBSERVATION_SQL)
+        .count();
+    let authentication_reads = authentication_snapshot_count(&sql);
+    // The measured cold Auto path is 29 statements including transactions and
+    // completed observer work. Bound the raw total too; only the existing exact
+    // authentication/control reads can explain the two-statement envelope.
+    assert!(
+        sql.len() <= 31,
+        "Auto raw SQL budget: {}\n{}",
+        sql.len(),
+        sql.join("\n")
+    );
+    assert!(
+        sql.len() - control_polls - authentication_reads <= 29,
+        "Auto nonperiodic SQL budget: {}\n{}",
+        sql.len(),
+        sql.join("\n")
+    );
+    for sample in &statements {
+        for retired in [
+            "model_router_deployments",
+            "agent_agents",
+            "session_state_items",
+            "user_skill_sources",
+            "user_skill_versions",
+        ] {
+            assert!(
+                !sample.sql.contains(retired),
+                "retired query: {}",
+                sample.sql
+            );
+        }
+    }
+    let saved: String = sqlx::query_scalar("SELECT payload_json FROM agent_run_events WHERE user_id = ? AND session_id = ? AND event_type = 'model_routing_decision'")
+        .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
+    let saved: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["data"]["policy_version"], "easy-read-only-v1");
+    assert_eq!(
+        saved["data"]["selected_offering_id"],
+        b.ctx.model_offering_id
+    );
+    assert!(saved["data"].get("rollout").is_none());
+    eprintln!(
+        "configured_auto total_sql={} control_polls={} authentication_reads={} reason={} retired_query_count=0 complete_drain=true",
+        statements.len(),
+        control_polls,
+        authentication_reads,
+        saved["data"]["reason"]
+    );
+    b.ctx.close().await;
+}

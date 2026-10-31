@@ -206,24 +206,6 @@ fn append_tree(
                     ),
                 ));
             }
-            for report in node
-                .context
-                .as_ref()
-                .and_then(|c| c.assembly.as_ref())
-                .into_iter()
-                .flat_map(|a| &a.edge_memory_selection)
-            {
-                let prefix = detail_prefix(&ancestor_has_sibling, last);
-                lines.push(format!("{prefix}{}", report.summary()));
-                if verbose {
-                    lines.extend(
-                        report
-                            .detail_lines()
-                            .into_iter()
-                            .map(|line| format!("{prefix}  {line}")),
-                    );
-                }
-            }
             if verbose && let Some(context) = &node.context {
                 if let Some(budget) = &context.budget {
                     let prefix = detail_prefix(&ancestor_has_sibling, last);
@@ -1243,16 +1225,6 @@ mod tests {
         assembly_end.context = Some(ExplainAnalyzeContextMetricsV1 {
             budget: None,
             assembly: Some(Box::new(ExplainAnalyzeContextAssemblyV1 {
-                edge_memory_selection: vec![
-                    serde_json::from_value(serde_json::json!({
-                        "session_id":"s", "turn":1, "operation":"relevance", "method":"model",
-                        "reason":"completed", "model":"jev-test", "elapsed_ms":398,
-                        "selection_order":[0], "candidates":[{"index":0,"selected":true,"probability_bps":9000},
-                                      {"index":1,"selected":false,"probability_bps":1000}],
-                        "prompt_projection":{"selected_candidates":1,"included_candidates":1}
-                    }))
-                    .unwrap(),
-                ],
                 basis: ExplainAnalyzeContextAssemblyBasisV1::RuntimeTextEstimate,
                 sources: vec![ExplainAnalyzeContextSourceV1 {
                     kind: ExplainAnalyzeContextSourceKindV1::Memory,
@@ -1328,16 +1300,6 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("trace"), "{output}");
-        assert!(output.contains("2 candidates → 1 selected"), "{output}");
-        assert!(output.contains("1/1 entered request"), "{output}");
-        assert!(
-            output.contains("Candidate 1 · selected · model score 90.00%"),
-            "{output}"
-        );
-        assert!(
-            output.contains("final request projection measured"),
-            "{output}"
-        );
     }
 
     #[test]

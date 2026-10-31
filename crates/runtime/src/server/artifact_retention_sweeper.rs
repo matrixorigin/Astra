@@ -25,7 +25,6 @@ struct ArtifactRetentionRow {
     user_id: String,
     session_id: String,
     retention_policy: String,
-    referenced_by_state_items_count: i64,
     referenced_by_citation_count: i64,
     referenced_by_durable_count: i64,
 }
@@ -46,7 +45,6 @@ fn decode_artifact_retention_row(row: &impl RowExt) -> Result<ArtifactRetentionR
         user_id: dec.string("user_id")?,
         session_id: dec.string("session_id")?,
         retention_policy: policy,
-        referenced_by_state_items_count: dec.non_negative_i64("referenced_by_state_items_count")?,
         referenced_by_citation_count: dec.non_negative_i64("referenced_by_citation_count")?,
         referenced_by_durable_count: dec.non_negative_i64("referenced_by_durable_count")?,
     })
@@ -63,7 +61,6 @@ pub async fn run_artifact_retention_gc_once(
     // equality until matrixorigin/matrixone#25341 is fixed.
     let rows = sqlx::query(
         "SELECT artifact_id, user_id, session_id, retention_policy,
-                referenced_by_state_items_count,
                 referenced_by_citation_count,
                 (SELECT COUNT(*) FROM session_artifact_references refs
                  WHERE refs.user_id = session_artifacts.user_id
@@ -78,8 +75,7 @@ pub async fn run_artifact_retention_gc_once(
            AND (
                retention_policy = 'project_long_term'
                OR (
-                   referenced_by_state_items_count = 0
-                   AND referenced_by_citation_count = 0
+                   referenced_by_citation_count = 0
                    AND NOT EXISTS (
                        SELECT 1 FROM session_artifact_references refs
                        WHERE refs.user_id = session_artifacts.user_id
@@ -371,8 +367,7 @@ async fn apply_artifact_retention_policy(
     }
 
     let refs = artifact
-        .referenced_by_state_items_count
-        .saturating_add(artifact.referenced_by_citation_count)
+        .referenced_by_citation_count
         .saturating_add(artifact.referenced_by_durable_count);
     if refs > 0 {
         // A durable reference is a reachability edge, not permission to
@@ -409,7 +404,6 @@ async fn apply_artifact_retention_policy(
            AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_until IS NOT NULL
            AND retention_until <= NOW(6)
-           AND referenced_by_state_items_count = 0
            AND referenced_by_citation_count = 0
            AND NOT EXISTS (
                SELECT 1 FROM session_artifact_references refs
@@ -464,7 +458,6 @@ async fn apply_artifact_retention_policy(
            AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_until IS NOT NULL
            AND retention_until > NOW(6)
-           AND referenced_by_state_items_count = 0
            AND referenced_by_citation_count = 0
            AND NOT EXISTS (
                SELECT 1 FROM session_artifact_references refs
@@ -548,7 +541,6 @@ mod tests {
     struct FakeArtifactRetentionRow {
         failed_column: Option<&'static str>,
         retention_policy: &'static str,
-        referenced_by_state_items_count: i64,
         referenced_by_citation_count: i64,
         referenced_by_durable_count: i64,
     }
@@ -558,7 +550,6 @@ mod tests {
             Self {
                 failed_column: None,
                 retention_policy: "default",
-                referenced_by_state_items_count: 2,
                 referenced_by_citation_count: 3,
                 referenced_by_durable_count: 4,
             }
@@ -583,7 +574,6 @@ mod tests {
         fn with_count(column: &'static str, value: i64) -> Self {
             let mut row = Self::default();
             match column {
-                "referenced_by_state_items_count" => row.referenced_by_state_items_count = value,
                 "referenced_by_citation_count" => row.referenced_by_citation_count = value,
                 "referenced_by_durable_count" => row.referenced_by_durable_count = value,
                 _ => unreachable!("unexpected count column: {column}"),
@@ -616,7 +606,6 @@ mod tests {
         fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
             self.maybe_fail(column)?;
             match column {
-                "referenced_by_state_items_count" => Ok(self.referenced_by_state_items_count),
                 "referenced_by_citation_count" => Ok(self.referenced_by_citation_count),
                 "referenced_by_durable_count" => Ok(self.referenced_by_durable_count),
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -632,7 +621,6 @@ mod tests {
         assert_eq!(row.user_id, "user-1");
         assert_eq!(row.session_id, "session-1");
         assert_eq!(row.retention_policy, "default");
-        assert_eq!(row.referenced_by_state_items_count, 2);
         assert_eq!(row.referenced_by_citation_count, 3);
         assert_eq!(row.referenced_by_durable_count, 4);
     }
@@ -644,7 +632,6 @@ mod tests {
             "user_id",
             "session_id",
             "retention_policy",
-            "referenced_by_state_items_count",
             "referenced_by_citation_count",
             "referenced_by_durable_count",
         ] {
@@ -669,7 +656,6 @@ mod tests {
         );
 
         for column in [
-            "referenced_by_state_items_count",
             "referenced_by_citation_count",
             "referenced_by_durable_count",
         ] {

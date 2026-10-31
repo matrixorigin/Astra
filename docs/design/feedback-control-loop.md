@@ -24,7 +24,7 @@ retain their distinct typed outcome signals and existing attribution.
 
 The retired public learning routes retain no request/response projections or
 trigger defaults. Their absence remains an HTTP contract; real evaluation,
-lesson storage, and feedback admission keep their existing owners.
+explicit Memory storage, and feedback admission keep their existing owners.
 
 ## Feedback sources
 

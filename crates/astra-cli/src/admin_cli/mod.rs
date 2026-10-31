@@ -52,9 +52,7 @@ fn judgment_default_name(models: &[serde_yaml_ng::Value]) -> Result<Option<&str>
 async fn bind_judgment_default(api: &ThinClient, token: &str, name: &str) -> Result<(), String> {
     api.put_bearer_path_json_text(token, &paths::admin_config_key("judgment_model"), &serde_json::json!({"value":name}))
         .await.map_err(|e| format!("Could not confirm judgment model '{name}'. Check astra admin config get judgment_model before retrying: {}", map_thin_err(e)))?;
-    stdout_println!(
-        "Judgment model enabled: {name}. New request judgments use it; start a new session to refresh memory selection."
-    );
+    stdout_println!("Judgment model enabled: {name}. New request judgments use it.");
     Ok(())
 }
 

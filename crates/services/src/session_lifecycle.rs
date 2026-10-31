@@ -131,13 +131,6 @@ const SESSION_DELETE_ORPHAN_MANIFESTS_SQL: &str = "DELETE FROM conversation_mani
 const SESSION_DELETE_WORKSPACE_CLEANUP_DEBT_MESSAGE: &str =
     "session hard delete requested cloud workspace cleanup";
 
-const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[SessionDeleteStatement {
-    label: "session_state_items",
-    sql: "DELETE FROM session_state_items
-             WHERE (session_id = ? AND user_id = ?)
-                OR (origin_session_id = ? AND user_id = ?)",
-}];
-
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "agent_session_memory_work",
@@ -431,24 +424,6 @@ async fn delete_session_rows_session_user_batched(
         }
     }
     Ok(total_deleted)
-}
-
-async fn delete_session_rows_session_user_twice(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    label: &'static str,
-    statement: &'static str,
-    session_id: &str,
-    user_id: &str,
-) -> Result<u64, String> {
-    query(statement)
-        .bind(session_id)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| format!("delete_session.{label}: {source}"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -746,18 +721,6 @@ pub(crate) async fn hard_delete_session_rows(
     )
     .await?;
     record_table_delete(&mut outcome, "agent_event_edges", rows_deleted)?;
-
-    for statement in SESSION_DELETE_SESSION_ORIGIN_TABLES {
-        let rows_deleted = delete_session_rows_session_user_twice(
-            tx,
-            statement.label,
-            statement.sql,
-            session_id,
-            user_id,
-        )
-        .await?;
-        record_table_delete(&mut outcome, statement.label, rows_deleted)?;
-    }
 
     outcome.workspace_cleanup_debts_enqueued =
         enqueue_workspace_cleanup_debts_for_session_delete(tx, session_id, user_id).await?;
@@ -1588,7 +1551,6 @@ mod tests {
     #[test]
     fn session_delete_statements_are_owner_scoped() {
         for group in [
-            SESSION_DELETE_SESSION_ORIGIN_TABLES,
             SESSION_DELETE_DIRECT_TABLES,
             SESSION_DELETE_TERMINAL_TABLES,
             SESSION_DELETE_ARTIFACT_TABLES,

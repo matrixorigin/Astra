@@ -7,9 +7,8 @@ use astra_services::session_workspace::{
     WORKSPACE_METADATA_ARTIFACT_KIND, WORKSPACE_METADATA_PROJECTION_ID, WorkspaceMetadata,
 };
 use astra_services::{
-    DatabaseSessionArtifactStore, DatabaseStateProjectionStore, PresignedArtifactDownload,
-    SessionArtifactJsonStore, StoredSessionArtifact, UserAnchorMemoryItem,
-    build_presigned_artifact_download,
+    DatabaseSessionArtifactStore, PresignedArtifactDownload, SessionArtifactJsonStore,
+    StoredSessionArtifact, build_presigned_artifact_download,
 };
 use astra_thin_client::device_proof::{DeviceProofPurpose, canonical_device_proof_message};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -62,9 +61,7 @@ pub(crate) struct SessionStateResponse {
     pub transcript_high_watermark: i64,
     pub active_run: Option<ActiveRunProjection>,
     pub workspace_authority: Option<WorkspaceAuthorityResponse>,
-    pub state_summary: Vec<StateCategorySummaryResponse>,
     pub artifact_previews: Vec<ArtifactPreviewResponse>,
-    pub anchor_memory: Vec<UserAnchorMemoryResponse>,
     pub projection_observability: SessionProjectionObservabilityResponse,
     pub replay_required: bool,
     pub transcript_replay_required: bool,
@@ -85,15 +82,6 @@ pub(crate) struct ActiveRunProjection {
     pub replay_start_event_idx: i64,
 }
 
-#[derive(Serialize)]
-pub(crate) struct UserAnchorMemoryResponse {
-    pub item_id: String,
-    pub category: String,
-    pub item_key: String,
-    pub summary_text: Option<String>,
-    pub token_estimate: u32,
-}
-
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspaceAuthorityResponse {
     pub cwd: String,
@@ -106,12 +94,6 @@ pub(crate) struct WorkspaceAuthorityResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub updated_at: String,
-}
-
-#[derive(Serialize, Debug, PartialEq, Eq)]
-pub(crate) struct StateCategorySummaryResponse {
-    pub category: String,
-    pub count: u32,
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -164,16 +146,6 @@ pub(crate) struct SessionProjectionObservabilityResponse {
     pub latest_fork_parent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_compaction: Option<astra_services::ModelRequestCompaction>,
-}
-
-fn user_anchor_memory_response(item: UserAnchorMemoryItem) -> UserAnchorMemoryResponse {
-    UserAnchorMemoryResponse {
-        item_id: item.item_id,
-        category: item.category,
-        item_key: item.item_key,
-        summary_text: item.summary_text,
-        token_estimate: item.token_estimate,
-    }
 }
 
 #[derive(Deserialize, Default)]
@@ -594,7 +566,6 @@ pub(crate) async fn get_session_state_handler(
     let replay_required = transcript_replay_required || run_event_replay_required;
     let workspace_authority =
         load_workspace_authority(&state, &session.user_id, &session.session_id).await?;
-    let state_summary = load_state_summary(pool, &session.user_id, &session.session_id).await?;
     let artifact_previews =
         load_artifact_previews(&state, &session.user_id, &session.session_id).await?;
     let projection_observability =
@@ -608,18 +579,6 @@ pub(crate) async fn get_session_state_handler(
         };
         run
     });
-    let anchor_memory = DatabaseStateProjectionStore::new(pool.clone())
-        .load_user_anchor_memory(&session.user_id, 400)
-        .await
-        .map_err(|error| {
-            internal_error(format!(
-                "load user anchor memory for session {} failed: {error}",
-                session.session_id
-            ))
-        })?
-        .into_iter()
-        .map(user_anchor_memory_response)
-        .collect();
 
     Ok(Json(SessionStateResponse {
         session_id: session.session_id,
@@ -630,9 +589,7 @@ pub(crate) async fn get_session_state_handler(
         transcript_high_watermark,
         active_run,
         workspace_authority,
-        state_summary,
         artifact_previews,
-        anchor_memory,
         projection_observability,
         replay_required,
         transcript_replay_required,
@@ -964,15 +921,6 @@ pub(super) async fn hydrate_transcript_artifacts(
     Ok(())
 }
 
-fn decode_state_category_summary(
-    row: &impl RowExt,
-) -> Result<StateCategorySummaryResponse, String> {
-    Ok(StateCategorySummaryResponse {
-        category: session_row_string(row, "category")?,
-        count: session_row_u32(row, "total")?,
-    })
-}
-
 fn decode_canonical_head_observability(
     row: &impl RowExt,
 ) -> Result<CanonicalHeadObservabilityResponse, String> {
@@ -1139,29 +1087,6 @@ async fn load_workspace_authority(
         .map(workspace_authority_from_artifact)
         .transpose()
         .map_err(internal_error)
-}
-
-async fn load_state_summary(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-) -> Result<Vec<StateCategorySummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let rows = sqlx::query(
-        "SELECT category, COUNT(*) AS total
-         FROM session_state_items
-         WHERE session_id = ? AND user_id = ? AND status IN ('active', 'backlog')
-         GROUP BY category
-         ORDER BY total DESC, category ASC
-         LIMIT 16",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_all(pool.get())
-    .await
-    .map_err(internal_error)?;
-    rows.into_iter()
-        .map(|row| decode_state_category_summary(&row).map_err(internal_error))
-        .collect()
 }
 
 async fn load_artifact_previews(
@@ -3351,7 +3276,6 @@ fn session_artifact_response(
         retention_policy: artifact.retention_policy,
         retention_until: artifact.retention_until,
         status: artifact.status,
-        referenced_by_state_items_count: artifact.referenced_by_state_items_count,
         referenced_by_citation_count: artifact.referenced_by_citation_count,
         referenced_by_durable_count: artifact.referenced_by_durable_count,
         created_at: artifact.created_at,
@@ -4703,30 +4627,6 @@ mod tests {
     }
 
     #[test]
-    fn state_summary_decode_preserves_values_and_fails_loudly() {
-        let summary = decode_state_category_summary(&FakeSessionRow::complete())
-            .expect("state summary decodes");
-        assert_eq!(summary.category, "decision");
-        assert_eq!(summary.count, 4);
-
-        for column in ["category", "total"] {
-            let err = match decode_state_category_summary(&FakeSessionRow::fail_on(column)) {
-                Ok(_) => panic!("missing state summary column must fail: {column}"),
-                Err(err) => err,
-            };
-            assert!(
-                err.contains(&format!("decode column `{column}`")),
-                "error should identify state summary column {column}: {err}"
-            );
-        }
-        for value in [-1, i64::from(u32::MAX) + 1] {
-            let err = decode_state_category_summary(&FakeSessionRow::with_i64("total", value))
-                .expect_err("invalid state summary count must fail");
-            assert!(err.contains("total"), "error should identify total: {err}");
-        }
-    }
-
-    #[test]
     fn canonical_head_observability_decode_is_exact_and_fails_loudly() {
         let head = decode_canonical_head_observability(&FakeSessionRow::complete())
             .expect("canonical head decodes");
@@ -4952,7 +4852,6 @@ mod tests {
             retention_policy: None,
             retention_until: None,
             status: Some("active".to_string()),
-            referenced_by_state_items_count: 0,
             referenced_by_citation_count: 0,
             referenced_by_durable_count: 0,
             created_at: Some("2026-05-18T00:01:00Z".to_string()),

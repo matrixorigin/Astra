@@ -2418,25 +2418,6 @@ async fn load_run_metadata_for_exact_session_tx<T>(
     user_id: &str,
     expected_session_id: &str,
     run_id: &str,
-) -> DbStoreResult<Option<DurableRunRecord>>
-where
-    T: TransactionConnection,
-{
-    load_run_metadata_with_projection_for_exact_session_tx(
-        tx,
-        user_id,
-        expected_session_id,
-        run_id,
-        RunProjection::Opening,
-    )
-    .await
-}
-
-async fn load_run_metadata_with_projection_for_exact_session_tx<T>(
-    tx: &mut T,
-    user_id: &str,
-    expected_session_id: &str,
-    run_id: &str,
     projection: RunProjection,
 ) -> DbStoreResult<Option<DurableRunRecord>>
 where
@@ -2647,6 +2628,7 @@ pub(crate) async fn lock_execution_resume_tx(
         request.user_id,
         request.session_id,
         request.run_id,
+        RunProjection::Opening,
     )
     .await
     .map_err(|error| Unavailable(error.to_string()))?
@@ -2853,11 +2835,16 @@ pub(crate) async fn activate_execution_resume_tx(
     .await
     .map_err(|error| Unavailable(error.to_string()))?;
     // Read authoritative lease time, not an application-clock approximation.
-    let resumed =
-        load_run_metadata_for_exact_session_tx(tx, &run.user_id, &run.session_id, &run.run_id)
-            .await
-            .map_err(|error| Unavailable(error.to_string()))?
-            .ok_or(Rejected("resumed execution disappeared"))?;
+    let resumed = load_run_metadata_for_exact_session_tx(
+        tx,
+        &run.user_id,
+        &run.session_id,
+        &run.run_id,
+        RunProjection::Opening,
+    )
+    .await
+    .map_err(|error| Unavailable(error.to_string()))?
+    .ok_or(Rejected("resumed execution disappeared"))?;
     let admission = std::mem::take(&mut run.events);
     *run = resumed;
     run.events = admission;
@@ -2875,12 +2862,18 @@ pub(crate) async fn lock_and_validate_execution_handoff_reference_tx<T>(
 where
     T: TransactionConnection,
 {
-    let run = load_run_metadata_for_exact_session_tx(tx, user_id, session_id, run_id)
-        .await
-        .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?
-        .ok_or(ExecutionHandoffReferenceError::Rejected(
-            "handoff run does not belong to this session",
-        ))?;
+    let run = load_run_metadata_for_exact_session_tx(
+        tx,
+        user_id,
+        session_id,
+        run_id,
+        RunProjection::Control,
+    )
+    .await
+    .map_err(|error| ExecutionHandoffReferenceError::Unavailable(error.to_string()))?
+    .ok_or(ExecutionHandoffReferenceError::Rejected(
+        "handoff run does not belong to this session",
+    ))?;
     if lock_durable_lineage_cancellation_markers_tx(tx, &run)
         .await
         .map_err(ExecutionHandoffReferenceError::Unavailable)?
@@ -4035,6 +4028,23 @@ enum RunProjection {
 }
 
 impl RunProjection {
+    fn for_status_transition(status: &str) -> Self {
+        if status == STATUS_PAUSED || durable_run_status_is_terminal(status) {
+            Self::Control
+        } else {
+            Self::Opening
+        }
+    }
+
+    fn for_interaction(kind: DurableRunInteractionKind) -> Self {
+        match kind {
+            DurableRunInteractionKind::Approval | DurableRunInteractionKind::AskUser => {
+                Self::Control
+            }
+            DurableRunInteractionKind::Provider => Self::Opening,
+        }
+    }
+
     fn columns(self) -> &'static str {
         match self {
             Self::Control => AGENT_RUN_RECOVERY_COLUMNS,
@@ -5456,56 +5466,6 @@ pub struct RunUsageOwnerUpdateRequest<'a> {
     pub tool_calls: u32,
 }
 
-/// Exact execution-owner settlement appended by a caller that already owns a
-/// MatrixOne transaction containing the run's canonical evidence.
-///
-/// Keeping this request in `astra-services` lets the canonical journal writer
-/// reuse the same terminal invariants as the ordinary run store: user intents
-/// are returned before termination, the session execution slot and Work
-/// terminal outbox move in the same transaction, and event rows retain their
-/// canonical hashes and idempotency identities.
-#[derive(Clone, Copy, Debug)]
-pub struct AtomicRunTerminalSettlementRequest<'a> {
-    pub user_id: &'a str,
-    pub run_id: &'a str,
-    pub expected_session_id: &'a str,
-    pub expected_statuses: &'a [&'a str],
-    pub expected_owner_generation: u64,
-    pub status: &'a str,
-    pub waiting_for: Option<&'a str>,
-    pub error_message: Option<&'a str>,
-    pub events: &'a [serde_json::Value],
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub tool_calls: u32,
-}
-
-/// Exact identity of one event staged by an atomic terminal settlement.
-///
-/// The receipt is created before `COMMIT`, so a caller whose commit
-/// acknowledgement is lost can prove that the same rows became durable
-/// without retrying or inventing a second terminal transition.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AtomicRunTerminalEventReceipt {
-    pub event_idx: i64,
-    pub event_type: String,
-    pub event_id: String,
-    pub idempotency_key: Option<String>,
-    pub event_hash: String,
-    pub settlement_batch_id: Option<String>,
-}
-
-/// Facts written by an atomic canonical/terminal settlement. The transaction
-/// owner commits these facts before using this value to repair derived display
-/// projections or publish terminal feedback.
-#[derive(Clone, Debug, PartialEq)]
-pub struct AtomicRunTerminalSettlementCommit {
-    pub committed_events: Vec<serde_json::Value>,
-    pub event_receipts: Vec<AtomicRunTerminalEventReceipt>,
-    pub last_event_idx: i64,
-    pub latest_event_type: Option<String>,
-}
-
 /// Additional canonical facts committed by the Run creation transaction.
 /// Existing opening-event row identities and hashes prove this entire batch
 /// during lost-acknowledgement reconciliation. No additional receipt is stored.
@@ -5629,177 +5589,6 @@ impl LockedRunMutation {
     pub fn admission(&self) -> &RunMutationAdmission {
         &self.admission
     }
-}
-
-/// Authoritative read result for an atomic terminal settlement.
-///
-/// `NotCommitted` is reserved for the original active generation, which may
-/// still perform the write. Every terminal, generation, usage, or event
-/// mismatch is a conflict and must fail closed.
-#[derive(Clone, Debug, PartialEq)]
-pub enum AtomicRunTerminalSettlementResolution {
-    NotCommitted,
-    Exact(AtomicRunTerminalSettlementCommit),
-    Conflict(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AtomicRunTerminalFactMatch {
-    ActiveGeneration,
-    Exact,
-    Conflict(&'static str),
-}
-
-type AtomicTerminalEventRow = (AtomicRunTerminalEventReceipt, serde_json::Value);
-
-#[derive(Clone, Debug, PartialEq)]
-enum AtomicTerminalReturnPrefixResolution {
-    Exact(Vec<AtomicTerminalEventRow>),
-    Conflict(String),
-}
-
-fn atomic_terminal_event_hash_is_valid(
-    receipt: &AtomicRunTerminalEventReceipt,
-    payload: &serde_json::Value,
-) -> bool {
-    serde_json::to_string(payload)
-        .is_ok_and(|json| sha256_hex(json.as_bytes()) == receipt.event_hash)
-}
-
-fn atomic_terminal_settlement_batch_id(
-    request: AtomicRunTerminalSettlementRequest<'_>,
-    first_event_idx: i64,
-    committed_events: &[serde_json::Value],
-) -> Result<String, String> {
-    let identity = serde_json::json!({
-        "contract": "astra.atomic_run_terminal_settlement.v1",
-        "user_id": request.user_id,
-        "run_id": request.run_id,
-        "expected_statuses": request.expected_statuses,
-        "owner_generation": request.expected_owner_generation,
-        "status": request.status,
-        "waiting_for": request.waiting_for,
-        "error_message": request.error_message,
-        "prompt_tokens": request.prompt_tokens,
-        "completion_tokens": request.completion_tokens,
-        "tool_calls": request.tool_calls,
-        "first_event_idx": first_event_idx,
-        "request_event_count": request.events.len(),
-        "committed_events": committed_events,
-    });
-    serde_json::to_vec(&identity)
-        .map(|bytes| sha256_hex(&bytes))
-        .map_err(|error| {
-            format!(
-                "serialize atomic terminal settlement identity for run {}: {error}",
-                request.run_id
-            )
-        })
-}
-
-fn validate_atomic_terminal_batch_identity(
-    request: AtomicRunTerminalSettlementRequest<'_>,
-    rows: &[AtomicTerminalEventRow],
-) -> Result<(), String> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let first_event_idx = rows[0].0.event_idx;
-    let committed_events = rows
-        .iter()
-        .map(|(_, payload)| payload.clone())
-        .collect::<Vec<_>>();
-    let expected_batch_id =
-        atomic_terminal_settlement_batch_id(request, first_event_idx, &committed_events)?;
-    if rows.iter().enumerate().all(|(offset, (receipt, payload))| {
-        receipt.event_idx == first_event_idx + offset as i64
-            && receipt.settlement_batch_id.as_deref() == Some(expected_batch_id.as_str())
-            && atomic_terminal_event_hash_is_valid(receipt, payload)
-    }) {
-        Ok(())
-    } else {
-        Err("terminal settlement batch fingerprint mismatch".to_string())
-    }
-}
-
-fn validate_atomic_terminal_return_prefix(
-    durable_intent_history_before_prefix: &[serde_json::Value],
-    actual_prefix: Vec<AtomicTerminalEventRow>,
-    first_event_idx: i64,
-    expected_batch_id: &str,
-    native_guidance_unconfirmed: bool,
-) -> AtomicTerminalReturnPrefixResolution {
-    let expected = terminal_user_intent_return_events(
-        durable_intent_history_before_prefix,
-        true,
-        native_guidance_unconfirmed,
-    );
-    if actual_prefix.len() != expected.len() {
-        return AtomicTerminalReturnPrefixResolution::Conflict(
-            "terminal user-intent return count mismatch".to_string(),
-        );
-    }
-    for (offset, ((receipt, payload), expected_payload)) in
-        actual_prefix.iter().zip(&expected).enumerate()
-    {
-        let expected_json = match serde_json::to_string(expected_payload) {
-            Ok(json) => json,
-            Err(error) => {
-                return AtomicTerminalReturnPrefixResolution::Conflict(format!(
-                    "serialize expected terminal user-intent return: {error}"
-                ));
-            }
-        };
-        if receipt.event_idx != first_event_idx + offset as i64
-            || receipt.event_type != "user_intent_returned"
-            || receipt.idempotency_key
-                != extract_optional_string(expected_payload, "idempotency_key")
-            || receipt.settlement_batch_id.as_deref() != Some(expected_batch_id)
-            || receipt.event_hash != sha256_hex(expected_json.as_bytes())
-            || !atomic_terminal_event_hash_is_valid(receipt, payload)
-            || payload != expected_payload
-        {
-            return AtomicTerminalReturnPrefixResolution::Conflict(
-                "terminal user-intent return identity or payload mismatch".to_string(),
-            );
-        }
-    }
-    AtomicTerminalReturnPrefixResolution::Exact(actual_prefix)
-}
-
-fn combine_atomic_terminal_replay_rows(
-    mut return_prefix: Vec<AtomicTerminalEventRow>,
-    terminal_request_tail: Vec<AtomicTerminalEventRow>,
-) -> Vec<AtomicTerminalEventRow> {
-    return_prefix.extend(terminal_request_tail);
-    return_prefix
-}
-
-fn classify_atomic_run_terminal_facts(
-    run: &DurableRunRecord,
-    request: AtomicRunTerminalSettlementRequest<'_>,
-) -> AtomicRunTerminalFactMatch {
-    if run.run_generation != request.expected_owner_generation {
-        return AtomicRunTerminalFactMatch::Conflict("run generation mismatch");
-    }
-    if request.expected_statuses.contains(&run.status.as_str()) {
-        return AtomicRunTerminalFactMatch::ActiveGeneration;
-    }
-    if run.status != request.status
-        || run.waiting_for.as_deref() != request.waiting_for
-        || run.error_message.as_deref() != request.error_message
-        || run.total_prompt_tokens != request.prompt_tokens
-        || run.total_completion_tokens != request.completion_tokens
-        || run.total_tool_calls != request.tool_calls
-    {
-        return AtomicRunTerminalFactMatch::Conflict("terminal state or usage mismatch");
-    }
-    let expected_error_code =
-        terminal_error_code_from_transition(request.status, request.error_message, request.events);
-    if run.error_code != expected_error_code {
-        return AtomicRunTerminalFactMatch::Conflict("terminal error code mismatch");
-    }
-    AtomicRunTerminalFactMatch::Exact
 }
 
 pub fn run_requested_explain_analyze(run: &DurableRunRecord) -> bool {
@@ -6018,24 +5807,6 @@ where
          ) AS SIGNED)",
     ).bind(user_id).bind(run_id).fetch_one(executor).await?;
     Ok(uncertain != 0)
-}
-
-/// Replay reads immutable admission and the committed return prefix, not a
-/// ledger outcome that late physical completion can legitimately change.
-async fn native_stage_was_admitted<'e, E>(
-    executor: E,
-    user_id: &str,
-    run_id: &str,
-) -> Result<bool, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = MySql>,
-{
-    let admitted: i64 = sqlx::query_scalar(
-        "SELECT CAST(EXISTS (SELECT 1 FROM agent_run_events
-         WHERE user_id = ? AND run_id = ? AND event_type = 'collaborator_stage_admitted'
-           AND JSON_EXTRACT(payload_json, '$.admission.native_execution.descriptor') IS NOT NULL) AS SIGNED)",
-    ).bind(user_id).bind(run_id).fetch_one(executor).await?;
-    Ok(admitted != 0)
 }
 
 fn validate_collaborator_admission(
@@ -11314,9 +11085,9 @@ const RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX: &str = "SELECT id, event_idx, eve
             producer_pod_id, payload_json, user_id, session_id, run_id, invocation_supersession_scope_key \
      FROM agent_run_events WHERE user_id = ";
 
-// Select positions using narrow columns before reading any payload. In
-// particular, an existing finalized row excludes finished even if its JSON is
-// corrupt or has no data. NULL means absent; event index zero remains valid.
+// Select positions using narrow columns before reading any payload, including
+// the latest physical run_finished. Canonical terminal receipt projections are
+// added by the reader. NULL means absent; event index zero remains valid.
 const RUN_STATUS_FACTS_SELECT_SQL: &str = "WITH selected AS (
  SELECT MIN(CASE WHEN event_type='run_started' THEN event_idx END) AS started,
         MIN(CASE WHEN event_type='workspace_bound' THEN event_idx END) AS workspace,
@@ -11464,7 +11235,17 @@ impl DatabaseRunStateStore {
         })?;
 
         let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                user_id,
+                expected_session_id,
+                run_id,
+                if recovery_claim.is_some() {
+                    RunProjection::Opening
+                } else {
+                    RunProjection::for_status_transition(status)
+                },
+            )
             .await
             .map_err(|e| e.to_string())?
         else {
@@ -11772,6 +11553,7 @@ impl DatabaseRunStateStore {
                     user_id,
                     expected_session_id,
                     run_id,
+                    RunProjection::Opening,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -12422,38 +12204,6 @@ impl DatabaseRunStateStore {
         &self.owner_pod_id
     }
 
-    /// Append an exact-generation terminal settlement to an existing
-    /// MatrixOne transaction.
-    ///
-    /// The caller is responsible for committing or rolling back `tx`. `None`
-    /// is a resolved ownership/status conflict and leaves the transaction open
-    /// so the caller can roll back its canonical writes. Committed Run facts
-    /// and immutable event receipts own replay and uncertain-commit resolution.
-    pub async fn settle_terminal_in_existing_transaction(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        request: AtomicRunTerminalSettlementRequest<'_>,
-    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
-        validate_expected_run_session_id(request.expected_session_id)?;
-        if request.expected_statuses.is_empty() {
-            return Ok(None);
-        }
-        let Some(admission) = self
-            .admit_mutation_in_transaction(
-                tx,
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
-        self.settle_terminal_in_admitted_transaction(tx, request, admission)
-            .await
-    }
-
     /// Admit terminal settlement once, returning the exact locked run facts for
     /// a caller that appends canonical evidence before settling the terminal.
     pub async fn admit_mutation_in_transaction(
@@ -12477,9 +12227,9 @@ impl DatabaseRunStateStore {
             Err(source) => return Err(db_error("admit_terminal_settlement", run_id, source)),
         }
         let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS},
+            "SELECT {AGENT_RUN_RECOVERY_COLUMNS},
                     CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested
-             FROM {AGENT_RUN_FULL_SOURCE} WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+             FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
@@ -12505,682 +12255,6 @@ impl DatabaseRunStateStore {
                 })
             })
             .transpose()
-    }
-
-    /// Settle using facts owned by the same transaction's canonical admission.
-    ///
-    /// Renewing this run's lease is allowed between admission and settlement;
-    /// the terminal CAS still validates its live lease using the DB clock.
-    pub async fn settle_terminal_in_admitted_transaction(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        request: AtomicRunTerminalSettlementRequest<'_>,
-        admission: LockedRunMutation,
-    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
-        validate_expected_run_session_id(request.expected_session_id)?;
-        if request.expected_statuses.is_empty() {
-            return Ok(None);
-        }
-        if admission.run.user_id != request.user_id
-            || admission.run.session_id != request.expected_session_id
-            || admission.run.run_id != request.run_id
-        {
-            return Err("terminal settlement admission does not match the requested run".into());
-        }
-        self.settle_terminal_from_locked_run_in_transaction(tx, request, admission)
-            .await
-    }
-
-    async fn settle_terminal_from_locked_run_in_transaction(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        request: AtomicRunTerminalSettlementRequest<'_>,
-        admission: LockedRunMutation,
-    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
-        let run = admission.run;
-        let terminal_origin = cancelled_terminal_origin(request.status, request.events)?;
-        let terminal_error_code = terminal_error_code_from_transition(
-            request.status,
-            request.error_message,
-            request.events,
-        );
-        if !request.expected_statuses.contains(&run.status.as_str())
-            || run.run_generation != request.expected_owner_generation
-        {
-            return Ok(None);
-        }
-        ensure_terminal_status_immutable(&run, request.status)?;
-        let segments = validated_durable_lineage_segments(&run)?;
-        let lineage_markers = if segments.len() == 1 {
-            // The root is the complete lineage and is still write-locked by
-            // admission. A second SELECT cannot observe a different marker.
-            DurableLineageCancellationMarkers {
-                direct: admission.cancellation_requested,
-                ancestor: false,
-            }
-        } else {
-            lock_durable_lineage_cancellation_markers_for_segments_tx(
-                tx,
-                &run.user_id,
-                &run.session_id,
-                &run.run_id,
-                &segments,
-            )
-            .await?
-        };
-        if !cancellation_markers_admit_transition(terminal_origin, lineage_markers) {
-            return Ok(None);
-        }
-
-        let producer_pod_id = run.owner_pod_id.as_deref().ok_or_else(|| {
-            format!(
-                "run {} has execution generation {} but no durable owner pod",
-                request.run_id, request.expected_owner_generation
-            )
-        })?;
-        let interaction_closure_events = self
-            .terminal_interaction_closure_events_tx(tx, &run, request.status)
-            .await
-            .map_err(|error| error.to_string())?;
-        let interaction_closure_rows = interaction_closure_events
-            .iter()
-            .enumerate()
-            .map(|(offset, event)| {
-                build_run_event_insert_row(
-                    request.user_id,
-                    request.run_id,
-                    &run.session_id,
-                    run.agent_id.as_deref(),
-                    run.last_event_idx + 1 + offset as i64,
-                    producer_pod_id,
-                    event,
-                )
-            })
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
-        let mut events_to_commit = Vec::new();
-        events_to_commit.extend(
-            self.terminal_user_intent_return_events_tx(
-                tx,
-                request.user_id,
-                request.run_id,
-                transition_releases_user_intent_ownership(request.status, request.events),
-                "atomic_terminal_settlement_load_intent_dispositions",
-            )
-            .await
-            .map_err(|error| error.to_string())?,
-        );
-        events_to_commit.extend_from_slice(request.events);
-
-        let first_event_idx = run.last_event_idx + 1 + interaction_closure_rows.len() as i64;
-        let settlement_batch_id =
-            atomic_terminal_settlement_batch_id(request, first_event_idx, &events_to_commit)?;
-
-        let event_rows = events_to_commit
-            .iter()
-            .enumerate()
-            .map(|(offset, event)| {
-                build_run_event_insert_row(
-                    request.user_id,
-                    request.run_id,
-                    &run.session_id,
-                    run.agent_id.as_deref(),
-                    first_event_idx + offset as i64,
-                    producer_pod_id,
-                    event,
-                )
-            })
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
-        let event_rows = event_rows
-            .into_iter()
-            .map(|mut event| {
-                event.request_id = Some(settlement_batch_id.clone());
-                event
-            })
-            .collect::<Vec<_>>();
-        let next_last_event_idx = run.last_event_idx
-            + interaction_closure_rows.len() as i64
-            + events_to_commit.len() as i64;
-        let prompt_tokens = i64::try_from(request.prompt_tokens).map_err(|_| {
-            format!(
-                "atomic terminal settlement prompt token total exceeds i64 for run {}",
-                request.run_id
-            )
-        })?;
-        let completion_tokens = i64::try_from(request.completion_tokens).map_err(|_| {
-            format!(
-                "atomic terminal settlement completion token total exceeds i64 for run {}",
-                request.run_id
-            )
-        })?;
-        let tool_calls = i64::from(request.tool_calls);
-
-        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
-        update.push_bind(request.status);
-        update.push(", waiting_for = ");
-        update.push_bind(request.waiting_for);
-        // Terminal facts are an absolute settlement, not a patch. Clearing a
-        // prior resumable error is necessary for exact replay/ACK-loss
-        // resolution to distinguish this commit from an older state.
-        update.push(", error_message = ");
-        update.push_bind(request.error_message);
-        update.push(", error_code = ");
-        update.push_bind(terminal_error_code.as_deref());
-        update.push(", total_prompt_tokens = ");
-        update.push_bind(prompt_tokens);
-        update.push(", total_completion_tokens = ");
-        update.push_bind(completion_tokens);
-        update.push(", total_tool_calls = ");
-        update.push_bind(tool_calls);
-        update.push(", last_event_idx = ");
-        update.push_bind(next_last_event_idx);
-        update.push(", updated_at = NOW(6) WHERE user_id = ");
-        update.push_bind(request.user_id);
-        update.push(" AND session_id = ");
-        update.push_bind(request.expected_session_id);
-        update.push(" AND run_id = ");
-        update.push_bind(request.run_id);
-        update.push(" AND last_event_idx = ");
-        update.push_bind(run.last_event_idx);
-        update.push(" AND owner_pod_id = ");
-        update.push_bind(producer_pod_id);
-        update.push(" AND run_generation = ");
-        update.push_bind(request.expected_owner_generation as i64);
-        update.push(" AND owner_lease_expires_at >= NOW(6) AND status IN (");
-        let mut separated = update.separated(", ");
-        for expected in request.expected_statuses {
-            separated.push_bind(*expected);
-        }
-        separated.push_unseparated(")");
-        if terminal_origin != Some(DurableCancellationOrigin::User) {
-            update.push(" AND cancellation_requested_at IS NULL");
-        }
-
-        let updated = update.build().execute(&mut **tx).await.map_err(|source| {
-            db_error(
-                "atomic_terminal_settlement_update_run",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        if updated.rows_affected() == 0 {
-            return Ok(None);
-        }
-        if !self
-            .validate_new_execution_status_tx(tx, &run, request.status, request.waiting_for)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(None);
-        }
-        enqueue_work_terminal_event_for_run(tx, &run, request.status).await?;
-
-        Self::insert_run_event_rows_tx(
-            tx,
-            request.run_id,
-            &interaction_closure_rows,
-            "atomic_terminal_settlement_insert_interaction_closures",
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        if !event_rows.is_empty() {
-            Self::insert_run_event_rows_tx(
-                tx,
-                request.run_id,
-                &event_rows,
-                "atomic_terminal_settlement_insert_events",
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        }
-        Ok(Some(AtomicRunTerminalSettlementCommit {
-            committed_events: events_to_commit,
-            event_receipts: event_rows
-                .iter()
-                .map(|event| AtomicRunTerminalEventReceipt {
-                    event_idx: event.event_idx,
-                    event_type: event.event_type.clone(),
-                    event_id: event.event_id.clone(),
-                    idempotency_key: event.idempotency_key.clone(),
-                    event_hash: event.event_hash.clone(),
-                    settlement_batch_id: event.request_id.clone(),
-                })
-                .collect(),
-            last_event_idx: next_last_event_idx,
-            latest_event_type: event_rows.last().map(|event| event.event_type.clone()),
-        }))
-    }
-
-    /// Resolve an uncertain atomic terminal settlement from committed facts.
-    ///
-    /// This method never mutates state and never treats a merely-terminal run
-    /// as success. The exact owner generation, terminal state, semantic usage,
-    /// and event identities/hashes must agree. `expected_receipts` is supplied
-    /// after a lost commit acknowledgement; without it, exact replay is
-    /// recognized from the caller's event payload hashes at the durable tail.
-    pub async fn resolve_atomic_terminal_settlement(
-        &self,
-        request: AtomicRunTerminalSettlementRequest<'_>,
-        expected_receipts: Option<&[AtomicRunTerminalEventReceipt]>,
-    ) -> Result<AtomicRunTerminalSettlementResolution, String> {
-        let Some(run) = self
-            .load_run_metadata_for_user(request.user_id, request.run_id)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(AtomicRunTerminalSettlementResolution::NotCommitted);
-        };
-
-        match classify_atomic_run_terminal_facts(&run, request) {
-            AtomicRunTerminalFactMatch::ActiveGeneration => {
-                return Ok(AtomicRunTerminalSettlementResolution::NotCommitted);
-            }
-            AtomicRunTerminalFactMatch::Conflict(reason) => {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "{reason} for run {}",
-                    request.run_id
-                )));
-            }
-            AtomicRunTerminalFactMatch::Exact => {}
-        }
-        let (receipts, committed_events) = if let Some(expected) = expected_receipts {
-            if expected.last().map(|receipt| receipt.event_idx) != Some(run.last_event_idx)
-                && !expected.is_empty()
-            {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "terminal event watermark mismatch for run {}",
-                    request.run_id
-                )));
-            }
-            let rows = self
-                .load_atomic_terminal_event_rows(
-                    request.user_id,
-                    request.run_id,
-                    expected.first().map(|receipt| receipt.event_idx),
-                    expected.len(),
-                )
-                .await?;
-            if rows.len() != expected.len()
-                || !rows.iter().zip(expected).all(|(row, expected)| {
-                    &row.0 == expected && atomic_terminal_event_hash_is_valid(&row.0, &row.1)
-                })
-            {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "terminal event receipt mismatch for run {}",
-                    request.run_id
-                )));
-            }
-            if let Err(reason) = validate_atomic_terminal_batch_identity(request, &rows) {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "{reason} for run {}",
-                    request.run_id
-                )));
-            }
-            (
-                rows.iter().map(|(receipt, _)| receipt.clone()).collect(),
-                rows.into_iter().map(|(_, payload)| payload).collect(),
-            )
-        } else if request.events.is_empty() {
-            let last_row = if run.last_event_idx >= 0 {
-                self.load_atomic_terminal_event_rows(
-                    request.user_id,
-                    request.run_id,
-                    Some(run.last_event_idx),
-                    1,
-                )
-                .await?
-            } else {
-                Vec::new()
-            };
-            if let Some(batch_id) = last_row
-                .first()
-                .and_then(|(receipt, _)| receipt.settlement_batch_id.as_deref())
-            {
-                let rows = match self
-                    .load_and_validate_atomic_terminal_return_prefix(
-                        request.user_id,
-                        request.run_id,
-                        run.last_event_idx + 1,
-                        batch_id,
-                    )
-                    .await?
-                {
-                    AtomicTerminalReturnPrefixResolution::Exact(rows) => rows,
-                    AtomicTerminalReturnPrefixResolution::Conflict(reason) => {
-                        return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                            "{reason} for run {}",
-                            request.run_id
-                        )));
-                    }
-                };
-                if let Err(reason) = validate_atomic_terminal_batch_identity(request, &rows) {
-                    return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                        "{reason} for run {}",
-                        request.run_id
-                    )));
-                }
-                (
-                    rows.iter().map(|(receipt, _)| receipt.clone()).collect(),
-                    rows.into_iter().map(|(_, payload)| payload).collect(),
-                )
-            } else {
-                let durable_intent_history = self
-                    .load_atomic_terminal_intent_history_through(
-                        request.user_id,
-                        request.run_id,
-                        run.last_event_idx,
-                    )
-                    .await?;
-                let unconfirmed = has_unsettled_guidance(&durable_intent_history)
-                    && native_stage_was_admitted(self.pool.get(), request.user_id, request.run_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                if !terminal_user_intent_return_events(&durable_intent_history, true, unconfirmed)
-                    .is_empty()
-                {
-                    return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                        "terminal user-intent return prefix missing for run {}",
-                        request.run_id
-                    )));
-                }
-                (Vec::new(), Vec::new())
-            }
-        } else {
-            let expected_rows = request
-                .events
-                .iter()
-                .map(|event| {
-                    let payload = serde_json::to_string(event).map_err(|error| {
-                        format!(
-                            "serialize terminal replay event for run {}: {error}",
-                            request.run_id
-                        )
-                    })?;
-                    Ok((
-                        extract_event_type(event),
-                        extract_optional_string(event, "event_id")
-                            .or_else(|| extract_optional_string(event, "id")),
-                        extract_optional_string(event, "idempotency_key"),
-                        sha256_hex(payload.as_bytes()),
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            let start_idx = run
-                .last_event_idx
-                .checked_sub(i64::try_from(expected_rows.len()).unwrap_or(i64::MAX) - 1)
-                .ok_or_else(|| {
-                    format!("terminal event index underflow for run {}", request.run_id)
-                })?;
-            let rows = self
-                .load_atomic_terminal_event_rows(
-                    request.user_id,
-                    request.run_id,
-                    Some(start_idx),
-                    expected_rows.len(),
-                )
-                .await?;
-            let observed_batch_id = rows
-                .first()
-                .and_then(|(receipt, _)| receipt.settlement_batch_id.clone());
-            let exact = rows.len() == expected_rows.len()
-                && observed_batch_id.is_some()
-                && rows
-                    .iter()
-                    .zip(&expected_rows)
-                    .zip(request.events)
-                    .enumerate()
-                    .all(
-                        |(
-                            offset,
-                            (
-                                (
-                                    (receipt, payload),
-                                    (event_type, event_id, idempotency_key, event_hash),
-                                ),
-                                expected_payload,
-                            ),
-                        )| {
-                            receipt.event_idx == start_idx + offset as i64
-                                && receipt.event_type == *event_type
-                                && event_id
-                                    .as_ref()
-                                    .is_none_or(|event_id| receipt.event_id == *event_id)
-                                && receipt.idempotency_key == *idempotency_key
-                                && receipt.event_hash == *event_hash
-                                && receipt.settlement_batch_id == observed_batch_id
-                                && payload == expected_payload
-                                && atomic_terminal_event_hash_is_valid(receipt, payload)
-                        },
-                    );
-            if !exact {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "terminal replay event mismatch for run {}",
-                    request.run_id
-                )));
-            }
-            let prefix = match self
-                .load_and_validate_atomic_terminal_return_prefix(
-                    request.user_id,
-                    request.run_id,
-                    start_idx,
-                    observed_batch_id.as_deref().expect("checked above"),
-                )
-                .await?
-            {
-                AtomicTerminalReturnPrefixResolution::Exact(prefix) => prefix,
-                AtomicTerminalReturnPrefixResolution::Conflict(reason) => {
-                    return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                        "{reason} for run {}",
-                        request.run_id
-                    )));
-                }
-            };
-            let full_rows = combine_atomic_terminal_replay_rows(prefix, rows);
-            if let Err(reason) = validate_atomic_terminal_batch_identity(request, &full_rows) {
-                return Ok(AtomicRunTerminalSettlementResolution::Conflict(format!(
-                    "{reason} for run {}",
-                    request.run_id
-                )));
-            }
-            (
-                full_rows
-                    .iter()
-                    .map(|(receipt, _)| receipt.clone())
-                    .collect(),
-                full_rows.into_iter().map(|(_, payload)| payload).collect(),
-            )
-        };
-
-        Ok(AtomicRunTerminalSettlementResolution::Exact(
-            AtomicRunTerminalSettlementCommit {
-                latest_event_type: receipts.last().map(|receipt| receipt.event_type.clone()),
-                committed_events,
-                event_receipts: receipts,
-                last_event_idx: run.last_event_idx,
-            },
-        ))
-    }
-
-    async fn load_and_validate_atomic_terminal_return_prefix(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        terminal_request_start_idx: i64,
-        expected_settlement_batch_id: &str,
-    ) -> Result<AtomicTerminalReturnPrefixResolution, String> {
-        let preceding_non_return_idx = sqlx::query_scalar::<_, i64>(
-            "SELECT event_idx
-             FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx < ?
-               AND (request_id IS NULL OR request_id <> ?)
-             ORDER BY event_idx DESC
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .bind(terminal_request_start_idx)
-        .bind(expected_settlement_batch_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| {
-            db_error(
-                "resolve_atomic_terminal_return_prefix_boundary",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?
-        .unwrap_or(-1);
-        let prefix_start_idx = preceding_non_return_idx.saturating_add(1);
-        let prefix_len = terminal_request_start_idx
-            .checked_sub(prefix_start_idx)
-            .and_then(|length| usize::try_from(length).ok())
-            .ok_or_else(|| {
-                format!("invalid terminal user-intent return prefix for run {run_id}")
-            })?;
-        let actual_prefix = self
-            .load_atomic_terminal_event_rows(
-                user_id,
-                run_id,
-                (prefix_len > 0).then_some(prefix_start_idx),
-                prefix_len,
-            )
-            .await?;
-
-        let durable_intent_history = self
-            .load_atomic_terminal_intent_history_through(user_id, run_id, preceding_non_return_idx)
-            .await?;
-        let unconfirmed = has_unsettled_guidance(&durable_intent_history)
-            && native_stage_was_admitted(self.pool.get(), user_id, run_id)
-                .await
-                .map_err(|error| error.to_string())?;
-        let unconfirmed = unconfirmed
-            && !actual_prefix.iter().any(|(_, event)| {
-                event.pointer("/data/delivery")
-                    == Some(&serde_json::json!(
-                        astra_turn_types::UserIntentDelivery::GuideCurrentRun
-                    ))
-            });
-        Ok(validate_atomic_terminal_return_prefix(
-            &durable_intent_history,
-            actual_prefix,
-            prefix_start_idx,
-            expected_settlement_batch_id,
-            unconfirmed,
-        ))
-    }
-
-    async fn load_atomic_terminal_intent_history_through(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        through_event_idx: i64,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        let history_rows = sqlx::query(
-            "SELECT payload_json, event_idx
-             FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx <= ?
-               AND event_type IN ('user_intent', 'user_intent_applied', 'user_intent_returned')
-             ORDER BY event_idx ASC",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .bind(through_event_idx)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| {
-            db_error(
-                "resolve_atomic_terminal_return_prefix_history",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        history_rows
-            .into_iter()
-            .map(|row| decode_run_event_payload(&row, run_id))
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())
-    }
-
-    async fn load_atomic_terminal_event_rows(
-        &self,
-        user_id: &str,
-        run_id: &str,
-        first_event_idx: Option<i64>,
-        expected_len: usize,
-    ) -> Result<Vec<AtomicTerminalEventRow>, String> {
-        if expected_len == 0 {
-            return Ok(Vec::new());
-        }
-        let first_event_idx = first_event_idx
-            .ok_or_else(|| format!("missing first terminal event index for run {run_id}"))?;
-        let expected_len = u32::try_from(expected_len)
-            .map_err(|_| format!("too many terminal event receipts for run {run_id}"))?;
-        let rows = sqlx::query(
-            "SELECT event_idx, event_type, event_id, idempotency_key, event_hash, request_id,
-                    payload_json
-             FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx >= ?
-             ORDER BY event_idx ASC
-             LIMIT ?",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .bind(first_event_idx)
-        .bind(expected_len)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| {
-            db_error("resolve_atomic_terminal_settlement_events", run_id, source).to_string()
-        })?;
-        rows.into_iter()
-            .map(|row| {
-                let event_idx = row.try_get::<i64, _>("event_idx").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_idx", run_id, source).to_string()
-                })?;
-                let event_type = row.try_get::<String, _>("event_type").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_type", run_id, source).to_string()
-                })?;
-                let event_id = row.try_get::<String, _>("event_id").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_id", run_id, source).to_string()
-                })?;
-                let idempotency_key = row
-                    .try_get::<Option<String>, _>("idempotency_key")
-                    .map_err(|source| {
-                        db_error("decode_atomic_terminal_event_idempotency", run_id, source)
-                            .to_string()
-                    })?;
-                let event_hash = row.try_get::<String, _>("event_hash").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_hash", run_id, source).to_string()
-                })?;
-                let settlement_batch_id =
-                    row.try_get::<Option<String>, _>("request_id")
-                        .map_err(|source| {
-                            db_error("decode_atomic_terminal_settlement_batch", run_id, source)
-                                .to_string()
-                        })?;
-                let payload_json = row.try_get::<String, _>("payload_json").map_err(|source| {
-                    db_error("decode_atomic_terminal_event_payload", run_id, source).to_string()
-                })?;
-                let payload = serde_json::from_str(&payload_json).map_err(|error| {
-                    format!("decode atomic terminal event payload for run {run_id}: {error}")
-                })?;
-                Ok((
-                    AtomicRunTerminalEventReceipt {
-                        event_idx,
-                        event_type,
-                        event_id,
-                        idempotency_key,
-                        event_hash,
-                        settlement_batch_id,
-                    },
-                    payload,
-                ))
-            })
-            .collect()
     }
 
     fn lease_ttl_micros(&self) -> i64 {
@@ -13555,8 +12629,10 @@ impl DatabaseRunStateStore {
         user_id: &str,
         expected_session_id: &str,
         run_id: &str,
+        projection: RunProjection,
     ) -> DbStoreResult<Option<DurableRunRecord>> {
-        load_run_metadata_for_exact_session_tx(tx, user_id, expected_session_id, run_id).await
+        load_run_metadata_for_exact_session_tx(tx, user_id, expected_session_id, run_id, projection)
+            .await
     }
 
     async fn transition_commit_is_durable(
@@ -14124,7 +13200,7 @@ impl DatabaseRunStateStore {
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String> {
         let existing = self
-            .load_run_metadata_for_user(user_id, run_id)
+            .load_run_metadata_with_columns(user_id, run_id, RunProjection::Control)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| {
@@ -14145,7 +13221,13 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|error| error.to_string())?;
         let admitted = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, &existing.session_id, run_id)
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                user_id,
+                &existing.session_id,
+                run_id,
+                RunProjection::Control,
+            )
             .await
             .map_err(|error| error.to_string())?
             .ok_or("existing run or its active Session is no longer available")?;
@@ -15902,6 +14984,7 @@ impl DatabaseRunStateStore {
                     &candidate.user_id,
                     &candidate.session_id,
                     &candidate.run_id,
+                    RunProjection::Control,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -16397,6 +15480,7 @@ impl DatabaseRunStateStore {
                     request.user_id,
                     request.expected_session_id,
                     request.run_id,
+                    RunProjection::Control,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -16990,6 +16074,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 &identity.user_id,
                 &identity.session_id,
                 &identity.run_id,
+                RunProjection::Opening,
             )
             .await?
             .ok_or(ToolInteractionAdmissionError::Unproven)?;
@@ -17304,6 +16389,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 &receipt.user_id,
                 &receipt.session_id,
                 parent_id,
+                RunProjection::Control,
             )
             .await
             .map_err(|error| error.to_string())?
@@ -17628,6 +16714,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     request.user_id,
                     request.expected_session_id,
                     request.run_id,
+                    RunProjection::Control,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -18722,6 +17809,11 @@ impl RunStateStore for DatabaseRunStateStore {
                 request.user_id,
                 request.expected_session_id,
                 request.run_id,
+                if request.invocation_identity.is_some() {
+                    RunProjection::Opening
+                } else {
+                    RunProjection::Control
+                },
             )
             .await
             .map_err(|error| error.to_string())?
@@ -19535,7 +18627,13 @@ impl RunStateStore for DatabaseRunStateStore {
         })?;
 
         let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                user_id,
+                expected_session_id,
+                run_id,
+                RunProjection::for_status_transition(status),
+            )
             .await
             .map_err(|error| error.to_string())?
         else {
@@ -19794,7 +18892,20 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("generation_fenced_append_begin", run_id, source).to_string()
         })?;
         let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
+            .load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                user_id,
+                expected_session_id,
+                run_id,
+                if events
+                    .iter()
+                    .any(|event| extract_event_type(event) == crate::model_routing::EVENT_TYPE)
+                {
+                    RunProjection::Opening
+                } else {
+                    RunProjection::Control
+                },
+            )
             .await
             .map_err(|error| error.to_string())?
         else {
@@ -20154,7 +19265,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .begin()
             .await
             .map_err(|source| db_error("begin_save_checkpoint", run_id, source).to_string())?;
-        let Some(run) = load_run_metadata_with_projection_for_exact_session_tx(
+        let Some(run) = load_run_metadata_for_exact_session_tx(
             &mut tx,
             user_id,
             expected_session_id,
@@ -21366,6 +20477,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     user_id,
                     expected_session_id,
                     run_id,
+                    RunProjection::for_interaction(kind),
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -22195,6 +21307,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     user_id,
                     expected_session_id,
                     run_id,
+                    RunProjection::for_interaction(kind),
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -23979,6 +23092,7 @@ impl DatabaseRunStateStore {
                 request.user_id,
                 request.expected_session_id,
                 request.run_id,
+                RunProjection::Control,
             )
             .await
             .map_err(|error| error.to_string())?
@@ -29126,222 +28240,6 @@ mod tests {
     }
 
     #[test]
-    fn atomic_terminal_authoritative_facts_distinguish_active_exact_and_mismatch() {
-        let events = [json!({
-            "event_type": "run_finished",
-            "data": {"status": "completed"}
-        })];
-        let request = AtomicRunTerminalSettlementRequest {
-            user_id: "u1",
-            run_id: "run-1",
-            expected_session_id: "s1",
-            expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
-            expected_owner_generation: 3,
-            status: STATUS_COMPLETED,
-            waiting_for: None,
-            error_message: None,
-            events: &events,
-            prompt_tokens: 13,
-            completion_tokens: 5,
-            tool_calls: 2,
-        };
-        let mut run = durable_run_record("run-1");
-        run.run_generation = 3;
-        assert_eq!(
-            classify_atomic_run_terminal_facts(&run, request),
-            AtomicRunTerminalFactMatch::ActiveGeneration
-        );
-
-        run.status = STATUS_COMPLETED.to_string();
-        run.total_prompt_tokens = 13;
-        run.total_completion_tokens = 5;
-        run.total_tool_calls = 2;
-        assert_eq!(
-            classify_atomic_run_terminal_facts(&run, request),
-            AtomicRunTerminalFactMatch::Exact,
-            "an exact terminal replay or applied commit with a lost ACK is authoritative"
-        );
-
-        run.total_completion_tokens = 6;
-        assert_eq!(
-            classify_atomic_run_terminal_facts(&run, request),
-            AtomicRunTerminalFactMatch::Conflict("terminal state or usage mismatch")
-        );
-    }
-
-    fn atomic_terminal_test_row(
-        event_idx: i64,
-        payload: serde_json::Value,
-        settlement_batch_id: &str,
-    ) -> AtomicTerminalEventRow {
-        let payload_json = serde_json::to_string(&payload).expect("serialize test event");
-        (
-            AtomicRunTerminalEventReceipt {
-                event_idx,
-                event_type: extract_event_type(&payload),
-                event_id: format!("event-{event_idx}"),
-                idempotency_key: extract_optional_string(&payload, "idempotency_key"),
-                event_hash: sha256_hex(payload_json.as_bytes()),
-                settlement_batch_id: Some(settlement_batch_id.to_string()),
-            },
-            payload,
-        )
-    }
-
-    #[test]
-    fn atomic_terminal_replay_restores_return_prefix_before_terminal_tail() {
-        let terminal_events = [json!({
-            "event_type": "run_finished",
-            "idempotency_key": "run_finished:run-1",
-            "data": {"status": STATUS_COMPLETED}
-        })];
-        let request = AtomicRunTerminalSettlementRequest {
-            user_id: "u1",
-            run_id: "run-1",
-            expected_session_id: "s1",
-            expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
-            expected_owner_generation: 3,
-            status: STATUS_COMPLETED,
-            waiting_for: None,
-            error_message: None,
-            events: &terminal_events,
-            prompt_tokens: 13,
-            completion_tokens: 5,
-            tool_calls: 2,
-        };
-        let intent_history = vec![json!({
-            "event_type": "user_intent",
-            "index": 4,
-            "data": {
-                "intent_id": "intent-late",
-                "delivery": "guide_current_run",
-                "input": {"content": "preserve me"}
-            }
-        })];
-        let returned = terminal_user_intent_return_events(&intent_history, true, false);
-        assert!(
-            terminal_user_intent_return_events(&intent_history, true, true).is_empty(),
-            "unconfirmed native delivery cannot produce a retryable return"
-        );
-        assert_eq!(returned.len(), 1);
-        let mut conflicting = returned[0].clone();
-        conflicting["data"]["content"] = json!("different");
-        assert!(matches!(
-            validate_atomic_terminal_return_prefix(
-                &intent_history,
-                vec![atomic_terminal_test_row(10, conflicting, "batch")],
-                10,
-                "batch",
-                false
-            ),
-            AtomicTerminalReturnPrefixResolution::Conflict(_)
-        ));
-
-        let full_batch = returned
-            .iter()
-            .cloned()
-            .chain(terminal_events.iter().cloned())
-            .collect::<Vec<_>>();
-        let batch_id = atomic_terminal_settlement_batch_id(request, 10, &full_batch)
-            .expect("settlement batch fingerprint");
-        let prefix = match validate_atomic_terminal_return_prefix(
-            &intent_history,
-            vec![atomic_terminal_test_row(10, returned[0].clone(), &batch_id)],
-            10,
-            &batch_id,
-            false,
-        ) {
-            AtomicTerminalReturnPrefixResolution::Exact(prefix) => prefix,
-            AtomicTerminalReturnPrefixResolution::Conflict(reason) => {
-                panic!("expected exact return prefix: {reason}")
-            }
-        };
-        let replay = combine_atomic_terminal_replay_rows(
-            prefix,
-            vec![atomic_terminal_test_row(
-                11,
-                terminal_events[0].clone(),
-                &batch_id,
-            )],
-        );
-
-        validate_atomic_terminal_batch_identity(request, &replay)
-            .expect("the complete transaction batch must verify");
-        assert_eq!(
-            replay
-                .iter()
-                .map(|(receipt, _)| receipt.event_type.as_str())
-                .collect::<Vec<_>>(),
-            ["user_intent_returned", "run_finished"]
-        );
-        assert_eq!(replay[0].1["data"]["content"], "preserve me");
-    }
-
-    #[test]
-    fn atomic_terminal_replay_rejects_missing_or_independent_adjacent_return() {
-        let terminal_events = [json!({
-            "event_type": "run_finished",
-            "data": {"status": STATUS_COMPLETED}
-        })];
-        let request = AtomicRunTerminalSettlementRequest {
-            user_id: "u1",
-            run_id: "run-1",
-            expected_session_id: "s1",
-            expected_statuses: &[STATUS_RUNNING],
-            expected_owner_generation: 3,
-            status: STATUS_COMPLETED,
-            waiting_for: None,
-            error_message: None,
-            events: &terminal_events,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            tool_calls: 0,
-        };
-        let intent_history = vec![json!({
-            "event_type": "user_intent",
-            "index": 4,
-            "data": {
-                "intent_id": "intent-late",
-                "delivery": "guide_current_run",
-                "input": {"content": "preserve me"}
-            }
-        })];
-        let returned = terminal_user_intent_return_events(&intent_history, true, false);
-
-        assert!(matches!(
-            validate_atomic_terminal_return_prefix(&intent_history, Vec::new(), 10, "batch", false),
-            AtomicTerminalReturnPrefixResolution::Conflict(_)
-        ));
-        assert!(matches!(
-            validate_atomic_terminal_return_prefix(
-                &intent_history,
-                vec![atomic_terminal_test_row(
-                    10,
-                    returned[0].clone(),
-                    "independent-batch"
-                )],
-                10,
-                "current-settlement-batch",
-                false
-            ),
-            AtomicTerminalReturnPrefixResolution::Conflict(_)
-        ));
-
-        let full_batch = returned
-            .iter()
-            .cloned()
-            .chain(terminal_events.iter().cloned())
-            .collect::<Vec<_>>();
-        let with_return = atomic_terminal_settlement_batch_id(request, 10, &full_batch).unwrap();
-        let without_return =
-            atomic_terminal_settlement_batch_id(request, 11, &terminal_events).unwrap();
-        assert_ne!(
-            with_return, without_return,
-            "the fingerprint must bind the complete settlement suffix, not only terminal events"
-        );
-    }
-
-    #[test]
     fn run_event_rows_normalize_control_subjects_without_inventing_terminal_subjects() {
         let spawned = build_run_event_insert_row(
             "user-1",
@@ -30591,6 +29489,39 @@ mod tests {
             store.load_run(&user, &run_id).await.unwrap().unwrap(),
             before
         );
+        // Ownership/control reads cannot substitute for complete validation at
+        // the executable resume entrypoint, even with an otherwise valid grant.
+        let opening_parts: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT opening_events_json, opening_context_json FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+        ).bind(&user).bind(&run_id).fetch_one(pool.get()).await.unwrap();
+        let control_before = store.load_run_control(&user, &run_id).await.unwrap();
+        for statement in [
+            "UPDATE agent_run_openings SET opening_events_json = 'invalid' WHERE user_id = ? AND run_id = ?",
+            "UPDATE agent_run_openings SET opening_context_json = 'invalid' WHERE user_id = ? AND run_id = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(&user)
+                .bind(&run_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            assert!(
+                coordinator
+                    .resume_execution_turn(request("resume-owner-a"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store.load_run_control(&user, &run_id).await.unwrap(),
+                control_before
+            );
+            sqlx::query("UPDATE agent_run_openings SET opening_events_json = ?, opening_context_json = ? WHERE user_id = ? AND run_id = ?")
+                .bind(&opening_parts.0).bind(&opening_parts.1).bind(&user).bind(&run_id).execute(pool.get()).await.unwrap();
+            assert_eq!(
+                store.load_run(&user, &run_id).await.unwrap().unwrap(),
+                before
+            );
+        }
         let checkpoint_body: String = sqlx::query_scalar("SELECT checkpoint_json FROM run_checkpoints WHERE user_id = ? AND run_id = ? AND checkpoint_id = ?")
             .bind(&user).bind(&run_id).bind(&checkpoint.checkpoint_id).fetch_one(pool.get()).await.unwrap();
         let reference = before.current_checkpoint.as_ref().unwrap();
@@ -34511,6 +33442,308 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_recovery_control_lock_serializes_with_session_deletion() {
+        async fn observe_statement(
+            connection: &mut sqlx::MySqlConnection,
+            actor_id: u64,
+            fragments: &[&str],
+        ) -> Result<(), String> {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut previous = None;
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("actor never reached its database barrier".into());
+                }
+                let rows = tokio::time::timeout_at(
+                    deadline,
+                    sqlx::query("SHOW PROCESSLIST").fetch_all(&mut *connection),
+                )
+                .await
+                .map_err(|_| "actor never reached its database barrier".to_string())?
+                .map_err(|error| error.to_string())?;
+                let mut current = None;
+                for row in rows {
+                    if row
+                        .try_get::<u64, _>("conn_id")
+                        .map_err(|error| error.to_string())?
+                        != actor_id
+                    {
+                        continue;
+                    }
+                    let command: String =
+                        row.try_get("command").map_err(|error| error.to_string())?;
+                    let info: String = row.try_get("info").map_err(|error| error.to_string())?;
+                    if matches!(command.as_str(), "COM_STMT_EXECUTE" | "COM_QUERY")
+                        && fragments.iter().all(|fragment| info.contains(fragment))
+                    {
+                        let statement: String = row
+                            .try_get("statement_id")
+                            .map_err(|error| error.to_string())?;
+                        if !statement.is_empty() {
+                            current = Some(statement);
+                        }
+                    }
+                }
+                if current.is_some() && current == previous {
+                    return Ok(());
+                }
+                previous = current;
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn finish<T>(mut task: tokio::task::JoinHandle<T>) -> Result<T, String> {
+            match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    Err("database actor did not finish after releasing its barrier".into())
+                }
+            }
+        }
+
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let mut settings = pool.settings().clone();
+        settings.db_pool_min_connections = 1;
+        settings.db_pool_max_connections = 1;
+        let claim_pool = SharedPool::new(&settings).await.unwrap();
+        let delete_pool = SharedPool::new(&settings).await.unwrap();
+        let claimant =
+            DatabaseRunStateStore::new(claim_pool.clone()).with_owner_pod_id(store.owner_pod_id());
+        let mut observer = pool.get().acquire().await.unwrap();
+        for deletion_first in [false, true] {
+            let nonce = Uuid::new_v4();
+            let user = format!("claim-delete-user-{nonce}");
+            let session = format!("claim-delete-session-{nonce}");
+            let id = format!("claim-delete-run-{nonce}");
+            insert_active_database_session_fixture(&pool, &user, &session).await;
+            let mut record = durable_run_record(&id);
+            record.user_id = user.clone();
+            record.session_id = session.clone();
+            record.events = vec![make_event("run_started", json!({}))];
+            store.insert_run(record).await.unwrap();
+            let body = json!({"version":"execution_handoff_v1", "producer_run_id":id,
+                "producer_owner_generation":0, "heavy":{"cursor":7}})
+            .to_string();
+            let checkpoint = store
+                .save_checkpoint(RunCheckpointWriteRequest {
+                    user_id: &user,
+                    expected_session_id: &session,
+                    run_id: &id,
+                    checkpoint_json: &body,
+                    authority: CheckpointWriteAuthority::ExecutionOwner {
+                        expected_owner_generation: 0,
+                    },
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let discovered = store.load_run(&user, &id).await.unwrap().unwrap();
+            let claim_connection: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(claim_pool.get())
+                .await
+                .unwrap();
+            let delete_connection: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(delete_pool.get())
+                .await
+                .unwrap();
+            let mut held = pool.get().begin().await.unwrap();
+            if deletion_first {
+                crate::storage::admit_session_execution_write(&mut held, &session, &user)
+                    .await
+                    .unwrap();
+                crate::session_lifecycle::mark_session_deleting_tx(&mut held, &session, &user)
+                    .await
+                    .unwrap();
+            } else {
+                // This child-row barrier is acquired without any Session/Run
+                // lock. Recovery reaches it after its real generation UPDATE.
+                let locked: String = sqlx::query_scalar("SELECT checkpoint_id FROM run_checkpoints WHERE user_id = ? AND run_id = ? AND checkpoint_id = ? FOR UPDATE")
+                    .bind(&user).bind(&id).bind(&checkpoint.checkpoint_id).fetch_one(&mut *held).await.unwrap();
+                assert_eq!(locked, checkpoint.checkpoint_id);
+            }
+            let claim = {
+                let claimant = claimant.clone();
+                let candidate = discovered.clone();
+                tokio::spawn(async move {
+                    claimant
+                        .claim_run_recovery_candidates(vec![candidate], true)
+                        .await
+                })
+            };
+            if deletion_first {
+                let observed = observe_statement(
+                    &mut observer,
+                    claim_connection,
+                    &[&user, &session, "agent_session_lifecycle_fences"],
+                )
+                .await;
+                let pending = !claim.is_finished();
+                let released = held.commit().await;
+                let outcome = finish(claim).await;
+                observed.expect("claim reaches the held deletion fence in the database");
+                assert!(pending);
+                released.unwrap();
+                assert!(outcome.unwrap().unwrap().is_empty());
+                crate::session_lifecycle::hard_delete_session(delete_pool.get(), &session, &user)
+                    .await
+                    .unwrap();
+            } else {
+                let claim_observed = observe_statement(
+                    &mut observer,
+                    claim_connection,
+                    &[
+                        &user,
+                        &id,
+                        "FROM run_checkpoints",
+                        "checkpoint_kind = 'execution_handoff'",
+                        "FOR UPDATE",
+                    ],
+                )
+                .await;
+                let claim_pending = !claim.is_finished();
+                let delete = {
+                    let pool = delete_pool.clone();
+                    let user = user.clone();
+                    let session = session.clone();
+                    tokio::spawn(async move {
+                        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
+                            .await
+                    })
+                };
+                let delete_observed = observe_statement(
+                    &mut observer,
+                    delete_connection,
+                    &[&user, &session, "agent_session_lifecycle_fences"],
+                )
+                .await;
+                let delete_pending = !delete.is_finished();
+                // Release before assertions and join both actors even if an
+                // observation failed; no callback gate can strand a worker.
+                let released = held.commit().await;
+                let claimed = finish(claim).await;
+                let deleted = finish(delete).await;
+                claim_observed.expect("actual claim waits at its post-update checkpoint read");
+                delete_observed.expect("actual deletion reaches the claim's Session fence");
+                assert!(claim_pending && delete_pending);
+                released.unwrap();
+                let claims = claimed.unwrap().unwrap();
+                deleted.unwrap().unwrap();
+                assert_eq!(claims.len(), 1);
+                let receipt = &claims[0];
+                assert_eq!(receipt.claimed_from_generation, discovered.run_generation);
+                assert_eq!(receipt.run.run_generation, discovered.run_generation + 1);
+                assert_eq!(
+                    receipt.run.owner_pod_id.as_deref(),
+                    Some(claimant.owner_pod_id())
+                );
+                assert!(matches!(receipt.run.opening, OpeningBody::NotLoaded));
+                assert_eq!(
+                    receipt.run.current_checkpoint,
+                    discovered.current_checkpoint
+                );
+                assert_eq!(
+                    receipt.run.last_event_idx,
+                    discovered.last_event_idx + 1,
+                    "the atomic claim includes its checkpoint custody frontier"
+                );
+            }
+            assert!(
+                claimant
+                    .claim_run_recovery_candidates(vec![discovered], true)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            for table in [
+                "agent_sessions",
+                "agent_runs",
+                "agent_run_openings",
+                "agent_run_events",
+                "run_checkpoints",
+            ] {
+                let statement =
+                    format!("SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?");
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+                    .bind(&user)
+                    .bind(&session)
+                    .fetch_one(&mut *observer)
+                    .await
+                    .unwrap();
+                assert_eq!(count, 0, "completed deletion cannot leave {table} behind");
+            }
+            let fenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_lifecycle_fences WHERE user_id = ? AND session_id = ? AND delete_requested_at IS NOT NULL AND database_deleted_at IS NOT NULL")
+                .bind(&user).bind(&session).fetch_one(&mut *observer).await.unwrap();
+            assert_eq!(
+                fenced, 1,
+                "canonical deletion retains its durable tombstone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_recovery_claim_revalidates_control_reference_under_lock() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("claim-corrupt-user-{nonce}");
+        let mut candidates = Vec::new();
+        for prefix in ["a", "z"] {
+            let session = format!("{prefix}-claim-corrupt-session-{nonce}");
+            insert_active_database_session_fixture(&pool, &user, &session).await;
+            let mut record = durable_run_record(&format!("{prefix}-claim-corrupt-{nonce}"));
+            record.user_id = user.clone();
+            record.session_id = session.clone();
+            store.insert_run(record.clone()).await.unwrap();
+            candidates.push(
+                store
+                    .load_run(&user, &record.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        // Hold this physical connection while the store claims on another.
+        // Both candidates were valid at discovery; only the locked reread can
+        // detect the newly malformed reference after locking the healthy row.
+        let mut writer = pool.get().acquire().await.unwrap();
+        sqlx::query("UPDATE agent_runs SET current_checkpoint_id = 'broken', checkpoint_version = 'phase_checkpoint_v1', current_checkpoint_hash = ? WHERE user_id = ? AND run_id = ?")
+            .bind("z".repeat(64)).bind(&user).bind(&candidates[1].run_id).execute(&mut *writer).await.unwrap();
+        let error = store
+            .claim_run_recovery_candidates(candidates.clone(), true)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("partial or invalid current checkpoint reference"),
+            "{error}"
+        );
+        for before in &candidates {
+            let row = sqlx::query("SELECT run_generation, last_event_idx, owner_pod_id FROM agent_runs WHERE user_id = ? AND run_id = ?")
+                .bind(&user).bind(&before.run_id).fetch_one(&mut *writer).await.unwrap();
+            assert_eq!(
+                row.get::<i64, _>("run_generation"),
+                before.run_generation as i64
+            );
+            assert_eq!(row.get::<i64, _>("last_event_idx"), before.last_event_idx);
+            assert_eq!(
+                row.get::<Option<String>, _>("owner_pod_id"),
+                before.owner_pod_id
+            );
+            let custody: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'execution_handoff_claimed'")
+                .bind(&user).bind(&before.run_id).fetch_one(&mut *writer).await.unwrap();
+            assert_eq!(custody, 0);
+        }
+        drop(writer);
+        for candidate in candidates {
+            crate::session_lifecycle::hard_delete_session(pool.get(), &candidate.session_id, &user)
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_overlapping_same_pod_claims_recheck_generation_and_frontier() {
@@ -36425,7 +35658,13 @@ mod tests {
             .await
             .expect("begin canonical lock holder");
         store
-            .load_run_metadata_for_exact_session_tx(&mut held, &user_id, &session_id, &run_id)
+            .load_run_metadata_for_exact_session_tx(
+                &mut held,
+                &user_id,
+                &session_id,
+                &run_id,
+                RunProjection::Opening,
+            )
             .await
             .expect("lock run canonically")
             .expect("checkpoint run exists");
@@ -36497,7 +35736,13 @@ mod tests {
         );
         let mut held = pool.get().begin().await.unwrap();
         let current = store
-            .load_run_metadata_for_exact_session_tx(&mut held, &user_id, &session_id, &run_id)
+            .load_run_metadata_for_exact_session_tx(
+                &mut held,
+                &user_id,
+                &session_id,
+                &run_id,
+                RunProjection::Opening,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -36794,10 +36039,16 @@ mod tests {
         );
         let mut tx = pool.get().begin().await.unwrap();
         assert!(
-            load_run_metadata_for_exact_session_tx(&mut tx, &user_id, &session_b, &run_id)
-                .await
-                .unwrap()
-                .is_none()
+            load_run_metadata_for_exact_session_tx(
+                &mut tx,
+                &user_id,
+                &session_b,
+                &run_id,
+                RunProjection::Opening,
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         assert!(matches!(
             admit_run_action_in_existing_transaction(
@@ -37628,245 +36879,274 @@ mod tests {
             .expect("cleanup approval authority sessions");
     }
 
+    fn canonical_terminal_fixture(
+        run: &DurableRunRecord,
+        outcome: CanonicalTerminalOutcome,
+    ) -> (CanonicalRunTerminalRequest<'_>, CanonicalRunTerminalReceipt) {
+        let origin = match &outcome {
+            CanonicalTerminalOutcome::Cancelled { origin } => Some(*origin),
+            _ => None,
+        };
+        let request = CanonicalRunTerminalRequest {
+            user_id: &run.user_id,
+            run_id: &run.run_id,
+            expected_session_id: &run.session_id,
+            expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
+            expected_owner_generation: run.run_generation,
+            status: outcome.status(),
+            waiting_for: None,
+            error_message: None,
+            error_code: None,
+            error_kind: None,
+            error_metadata: None,
+            interruption: None,
+            cancellation_origin: origin,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"astra.run-terminal-transcript.v1\0");
+        digest.update(0_u64.to_be_bytes());
+        let receipt = CanonicalRunTerminalReceipt {
+            schema_version: 1,
+            user_id: run.user_id.clone(),
+            session_id: run.session_id.clone(),
+            run_id: run.run_id.clone(),
+            generation: run.run_generation,
+            opening_hash: run.opening_hash.clone().expect("real admitted opening"),
+            context_admission_hash: run.context_admission_hash.clone(),
+            outcome,
+            error_hash: None,
+            error_code: None,
+            error_kind: None,
+            error_metadata: None,
+            interruption: None,
+            context: CanonicalTerminalContext::Unowned,
+            transcript: CanonicalTerminalTranscript {
+                item_count: 0,
+                digest: format!("{:x}", digest.finalize()),
+                assistant_source_event_id: None,
+            },
+            usage: None,
+            tool_ledger: None,
+        };
+        (request, receipt)
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_terminal_admission_preserves_identity_and_lineage_cancellation() {
         let (store, pool) = setup_database_run_state_store_it().await;
         for (cancelled, child) in [(false, false), (true, false), (true, true)] {
-            let user_id = format!("terminal-admission-u-{}", Uuid::new_v4());
-            let session_id = format!("terminal-admission-s-{}", Uuid::new_v4());
-            let root_id = format!("terminal-admission-root-{}", Uuid::new_v4());
-            let child_id = format!("terminal-admission-child-{}", Uuid::new_v4());
-            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+            let nonce = Uuid::new_v4();
+            let user = format!("terminal-admission-user-{nonce}");
+            let session = format!("terminal-admission-session-{nonce}");
+            let root_id = format!("terminal-admission-root-{nonce}");
+            let child_id = format!("terminal-admission-child-{nonce}");
+            insert_active_database_session_fixture(&pool, &user, &session).await;
             let mut root = durable_run_record(&root_id);
-            root.user_id = user_id.clone();
-            root.session_id = session_id.clone();
-            store.insert_run(root).await.expect("insert root");
+            root.user_id = user.clone();
+            root.session_id = session.clone();
+            root.events = vec![make_event("run_started", json!({}))];
+            store.insert_run(root).await.unwrap();
             if child {
                 let mut run = durable_run_record(&child_id);
-                run.user_id = user_id.clone();
-                run.session_id = session_id.clone();
+                run.user_id = user.clone();
+                run.session_id = session.clone();
                 run.parent_run_id = Some(root_id.clone());
                 run.root_run_id = Some(root_id.clone());
                 run.ancestor_path = Some(format!("{root_id}/{child_id}"));
                 run.depth = 1;
-                store.insert_run(run).await.expect("insert child");
+                run.events = vec![make_event("run_started", json!({}))];
+                store.insert_run(run).await.unwrap();
             }
             if cancelled {
                 sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NOW(6) WHERE user_id = ? AND run_id = ?")
-                    .bind(&user_id).bind(&root_id).execute(pool.get()).await.expect("mark direct or ancestor cancellation");
+                    .bind(&user).bind(&root_id).execute(pool.get()).await.unwrap();
             }
-            let run_id = if child { &child_id } else { &root_id };
-            let events = [json!({"event_type":"run_finished", "data":{"status":STATUS_COMPLETED}})];
-            let request = AtomicRunTerminalSettlementRequest {
-                user_id: &user_id,
-                run_id,
-                expected_session_id: &session_id,
-                expected_statuses: &[STATUS_RUNNING],
-                expected_owner_generation: 0,
-                status: STATUS_COMPLETED,
-                waiting_for: None,
-                error_message: None,
-                events: &events,
-                prompt_tokens: 1,
-                completion_tokens: 1,
-                tool_calls: 0,
-            };
-            let mut tx = pool.get().begin().await.expect("begin terminal admission");
-            let admission = store
-                .admit_mutation_in_transaction(&mut tx, &user_id, &session_id, run_id)
-                .await
-                .expect("admit exact run")
-                .expect("run exists");
-            let error = store
-                .settle_terminal_in_admitted_transaction(
-                    &mut tx,
-                    AtomicRunTerminalSettlementRequest {
+            let id = if child { &child_id } else { &root_id };
+            let before = store.load_run(&user, id).await.unwrap().unwrap();
+            for outcome in [
+                CanonicalTerminalOutcome::Completed,
+                CanonicalTerminalOutcome::Cancelled {
+                    origin: DurableCancellationOrigin::User,
+                },
+            ] {
+                let is_cancellation = matches!(outcome, CanonicalTerminalOutcome::Cancelled { .. });
+                let (request, receipt) = canonical_terminal_fixture(&before, outcome);
+                let mut tx = pool.get().begin().await.unwrap();
+                crate::storage::admit_session_execution_write(&mut tx, &session, &user)
+                    .await
+                    .unwrap();
+                for invalid in [
+                    CanonicalRunTerminalRequest {
                         expected_session_id: "foreign-session",
                         ..request
                     },
-                    admission,
-                )
-                .await
-                .expect_err("admission cannot cross session identity");
-            assert!(error.contains("admission does not match"));
-            let admission = store
-                .admit_mutation_in_transaction(&mut tx, &user_id, &session_id, run_id)
-                .await
-                .expect("read same locked facts")
-                .expect("run exists");
-            let committed = store
-                .settle_terminal_in_admitted_transaction(&mut tx, request, admission)
-                .await
-                .expect("settle exact locked run");
-            assert_eq!(
-                committed.is_some(),
-                !cancelled,
-                "direct and ancestor cancellation must both reject completion"
-            );
-            tx.rollback()
-                .await
-                .expect("rollback isolated test settlement");
-            let run = store.load_run(&user_id, run_id).await.unwrap().unwrap();
-            assert_eq!(run.status, STATUS_RUNNING);
-            assert_eq!(run.total_prompt_tokens, 0);
-            if child {
-                cleanup_database_run_fixture(&pool, &user_id, &child_id).await;
+                    CanonicalRunTerminalRequest {
+                        status: STATUS_RUNNING,
+                        ..request
+                    },
+                ] {
+                    assert!(
+                        store
+                            .claim_canonical_terminal_with_controls_in_transaction(
+                                &mut tx, invalid, &receipt
+                            )
+                            .await
+                            .is_err()
+                    );
+                }
+                let mut stale_receipt = receipt.clone();
+                stale_receipt.generation += 1;
+                assert!(matches!(
+                    store
+                        .claim_canonical_terminal_with_controls_in_transaction(
+                            &mut tx,
+                            CanonicalRunTerminalRequest {
+                                expected_owner_generation: before.run_generation + 1,
+                                ..request
+                            },
+                            &stale_receipt
+                        )
+                        .await
+                        .unwrap(),
+                    CanonicalTerminalClaim::Conflict
+                ));
+                let claim = store
+                    .claim_canonical_terminal_with_controls_in_transaction(
+                        &mut tx, request, &receipt,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    matches!(claim, CanonicalTerminalClaim::Claimed { .. }),
+                    if is_cancellation {
+                        cancelled
+                    } else {
+                        !cancelled
+                    }
+                );
+                tx.rollback().await.unwrap();
+                assert_eq!(
+                    store.load_run(&user, id).await.unwrap().unwrap(),
+                    before,
+                    "rejected or rolled-back terminal cannot change status, accounting, receipt or events"
+                );
             }
-            cleanup_database_run_fixture(&pool, &user_id, &root_id).await;
-            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
-                .bind(&user_id)
-                .execute(pool.get())
+            crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
                 .await
-                .expect("cleanup session");
+                .unwrap();
         }
     }
 
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_atomic_terminal_settlement_closes_pending_approval_before_terminal_on_matrixone()
-     {
+    async fn database_canonical_terminal_closes_pending_approval_and_verifies_control_receipts() {
         let (store, pool) = setup_database_run_state_store_it().await;
-        let suffix = Uuid::new_v4();
-        let user_id = format!("atomic-term-u-{suffix}");
-        let session_id = format!("atomic-term-s-{suffix}");
-        let run_id = format!("atomic-term-r-{suffix}");
-        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
-        let mut run = durable_run_record(&run_id);
-        run.user_id = user_id.clone();
-        run.session_id = session_id.clone();
-        store
-            .insert_run(run)
-            .await
-            .expect("insert atomic terminal run");
+        let nonce = Uuid::new_v4();
+        let user = format!("terminal-approval-user-{nonce}");
+        let session = format!("terminal-approval-session-{nonce}");
+        let id = format!("terminal-approval-run-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut run = durable_run_record(&id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        run.events = vec![make_event("run_started", json!({}))];
+        store.insert_run(run).await.unwrap();
         let required = [approval_required_event(
-            "atomic-terminal-approval",
+            "terminal-approval",
             "bash",
-            &session_id,
+            &session,
         )];
         assert_eq!(
             store
                 .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
+                    user_id: &user,
+                    run_id: &id,
+                    expected_session_id: &session,
                     expected_control_epoch: -1,
                     expected_owner_generation: 0,
                     events: &required,
-                },)
+                })
                 .await
-                .expect("register pending atomic terminal approval"),
+                .unwrap(),
             AtomicRunInteractionBatchRegistration::Registered
         );
-        let pre_terminal = store
-            .load_run(&user_id, &run_id)
+        let before = store.load_run(&user, &id).await.unwrap().unwrap();
+        let (request, receipt) =
+            canonical_terminal_fixture(&before, CanonicalTerminalOutcome::Completed);
+        let mut tx = pool.get().begin().await.unwrap();
+        crate::storage::admit_session_execution_write(&mut tx, &session, &user)
             .await
-            .expect("load pre-terminal transaction frontier")
-            .expect("atomic terminal run exists");
-        assert_eq!(
-            pre_terminal.events.last().map(extract_event_type),
-            Some("approval_required".to_string())
-        );
-        let closure_event_idx = pre_terminal.last_event_idx + 1;
-        let terminal_event_idx = closure_event_idx + 1;
-
-        let terminal_events = [json!({
-            "event_type": "run_finished",
-            "idempotency_key": format!("atomic-terminal-finished:{run_id}"),
-            "data": {"status": STATUS_COMPLETED},
-        })];
-        let mut tx = pool
-            .get()
-            .begin()
+            .unwrap();
+        let CanonicalTerminalClaim::Claimed { control_events, .. } = store
+            .claim_canonical_terminal_with_controls_in_transaction(&mut tx, request, &receipt)
             .await
-            .expect("begin direct terminal settlement transaction");
-        let commit = store
-            .settle_terminal_in_existing_transaction(
-                &mut tx,
-                AtomicRunTerminalSettlementRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    expected_statuses: &[STATUS_RUNNING],
-                    expected_owner_generation: 0,
-                    status: STATUS_COMPLETED,
-                    waiting_for: None,
-                    error_message: None,
-                    events: &terminal_events,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                },
-            )
+            .unwrap()
+        else {
+            panic!("canonical terminal must close the approval")
+        };
+        assert_eq!(control_events.len(), 1);
+        assert_eq!(control_events[0]["event_type"], "approval_resolved");
+        tx.commit().await.unwrap();
+        let committed = store
+            .resolve_canonical_terminal_receipt(request, &receipt)
             .await
-            .expect("settle terminal in existing transaction")
-            .expect("exact terminal authority");
-        tx.commit()
-            .await
-            .expect("commit direct terminal settlement transaction");
-
-        assert_eq!(commit.event_receipts.len(), 1);
-        assert_eq!(commit.event_receipts[0].event_idx, terminal_event_idx);
-        assert_eq!(commit.last_event_idx, terminal_event_idx);
-        let rows = sqlx::query(
-            "SELECT event_idx, event_type FROM agent_run_events
-             WHERE user_id = ? AND session_id = ? AND run_id = ?
-             ORDER BY event_idx ASC",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(&run_id)
-        .fetch_all(pool.get())
-        .await
-        .expect("load direct terminal event cut");
-        let facts = rows
-            .iter()
-            .map(|row| {
-                Ok::<_, String>((
-                    row.try_get::<i64, _>("event_idx")
-                        .map_err(|error| error.to_string())?,
-                    row.try_get::<String, _>("event_type")
-                        .map_err(|error| error.to_string())?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .expect("decode direct terminal event cut");
-        assert!(
-            facts
-                .iter()
-                .enumerate()
-                .all(|(offset, (event_idx, _))| *event_idx == offset as i64),
-            "the durable event stream must remain contiguous and unique"
-        );
-        assert_eq!(
-            &facts[facts.len() - 2..],
-            &[
-                (closure_event_idx, "approval_resolved".to_string()),
-                (terminal_event_idx, "run_finished".to_string()),
-            ],
-            "the same transaction must append closure immediately before terminal truth"
-        );
-        let durable = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.completion_first(), before.last_event_idx + 2);
+        let durable = store.load_run(&user, &id).await.unwrap().unwrap();
         assert_eq!(durable.status, STATUS_COMPLETED);
-        assert_eq!(durable.last_event_idx, terminal_event_idx);
-        let closure = durable
-            .events
-            .iter()
-            .find(|event| extract_event_type(event) == "approval_resolved")
-            .expect("approval closure committed before terminal");
+        let last = &durable.events[durable.events.len() - 2..];
+        assert_eq!(last[0]["event_type"], "approval_resolved");
+        assert_eq!(last[1]["event_type"], "run_finished");
+        let physical_terminal: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'")
+            .bind(&user).bind(&id).fetch_one(pool.get()).await.unwrap();
         assert_eq!(
-            closure
-                .pointer("/data/_durable_resolution/actual_status")
-                .and_then(serde_json::Value::as_str),
-            Some(STATUS_COMPLETED)
+            physical_terminal, 0,
+            "completion is projected from the canonical receipt"
         );
-
-        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
-        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
-            .bind(&user_id)
-            .execute(pool.get())
+        let original: (String, String) = sqlx::query_as("SELECT payload_json, event_hash FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'approval_resolved'")
+            .bind(&user).bind(&id).fetch_one(pool.get()).await.unwrap();
+        sqlx::query("UPDATE agent_run_events SET payload_json = '{}' WHERE user_id = ? AND run_id = ? AND event_type = 'approval_resolved'")
+            .bind(&user).bind(&id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .resolve_canonical_terminal_receipt(request, &receipt)
+                .await
+                .is_err()
+        );
+        sqlx::query("UPDATE agent_run_events SET event_hash = ? WHERE user_id = ? AND run_id = ? AND event_type = 'approval_resolved'")
+            .bind(sha256_hex(b"{}")).bind(&user).bind(&id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .resolve_canonical_terminal_receipt(request, &receipt)
+                .await
+                .is_err(),
+            "a self-consistent replacement cannot satisfy the committed digest"
+        );
+        sqlx::query("UPDATE agent_run_events SET payload_json = ?, event_hash = ?, event_idx = event_idx + 100 WHERE user_id = ? AND run_id = ? AND event_type = 'approval_resolved'")
+            .bind(original.0).bind(original.1).bind(&user).bind(&id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .resolve_canonical_terminal_receipt(request, &receipt)
+                .await
+                .is_err(),
+            "the original payload at another index is not the committed control range"
+        );
+        sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'approval_resolved'")
+            .bind(&user).bind(&id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .resolve_canonical_terminal_receipt(request, &receipt)
+                .await
+                .is_err()
+        );
+        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
             .await
-            .expect("cleanup atomic terminal session");
+            .unwrap();
     }
 
     #[tokio::test]
@@ -38251,7 +37531,13 @@ mod tests {
 
         let mut held = pool.get().begin().await.expect("begin held user-A lock");
         store
-            .load_run_metadata_for_exact_session_tx(&mut held, &user_a, &session_a, &run_a)
+            .load_run_metadata_for_exact_session_tx(
+                &mut held,
+                &user_a,
+                &session_a,
+                &run_a,
+                RunProjection::Opening,
+            )
             .await
             .expect("hold user-A canonical lock")
             .expect("user-A run exists");

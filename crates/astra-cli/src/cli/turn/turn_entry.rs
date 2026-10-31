@@ -7,7 +7,6 @@ use super::turn_settlement::TurnDispatch;
 use super::turn_stream_runner::{
     TurnAttempt, TurnExecutionInput, TurnExecutionRequest, execute_stream_turn,
 };
-use crate::cli::session::session_adaptation::prepare_turn_adaptation;
 use crate::cli::session::session_input::{finalize_effective_line, prepare_input};
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
@@ -247,7 +246,9 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     ) {
         return TurnAttempt::NotStarted(Box::new(failure));
     }
-    prepare_turn_adaptation(state, input.api, input.token, input.message).await;
+    state
+        .drift_original_query
+        .get_or_insert_with(|| input.message.to_string());
     let attempt = execute_stream_turn(TurnExecutionRequest { state, input }).await;
     let not_started = match &attempt {
         TurnAttempt::NotStarted(_) => true,
@@ -934,7 +935,6 @@ mod tests {
             diagnostics_context: Some("existing diagnostic".into()),
             resume_restricted_tools: vec!["bash".into()],
             pending_bg_notifications: vec!["child completed".into()],
-            session_lessons_loaded: true,
             perm_manager: crate::cli::permission_manager::PermissionManager::new(true),
             tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
             unified_skill_registry: astra_runtime::skills::empty_unified_registry().clone(),

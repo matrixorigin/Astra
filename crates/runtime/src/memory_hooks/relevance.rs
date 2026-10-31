@@ -333,8 +333,6 @@ pub async fn select_memories(
             })
             .collect(),
         elapsed_ms: 0,
-        candidate_coverage: None,
-        prompt_projection: None,
     };
     if items.is_empty() {
         return report;

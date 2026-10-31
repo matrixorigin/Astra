@@ -224,39 +224,6 @@ async fn insert_run_row(
     tx.commit().await.unwrap();
 }
 
-async fn insert_state_item(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    category: &str,
-    item_key: &str,
-    version: i64,
-) -> String {
-    let item_id = id("state");
-    sqlx::query(
-        "INSERT INTO session_state_items
-         (item_id, user_id, session_id, scope, category, item_key, status, priority, source,
-          run_id, title, summary_text, payload_json, token_estimate, version, created_at, updated_at)
-         VALUES (?, ?, ?, 'session', ?, ?, 'active', 10, 'e2e_joint',
-                 ?, ?, ?, ?, 40, ?, NOW(6), NOW(6))",
-    )
-    .bind(&item_id)
-    .bind(user_id)
-    .bind(session_id)
-    .bind(category)
-    .bind(item_key)
-    .bind(run_id)
-    .bind(format!("{category} {item_key}"))
-    .bind(format!("summary for {category} {item_key}"))
-    .bind(json!({"category": category, "item_key": item_key}).to_string())
-    .bind(version)
-    .execute(pool.get())
-    .await
-    .expect("insert_state_item must persist protected state");
-    item_id
-}
-
 fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRecord {
     DurableRunRecord {
         opening: Default::default(),
@@ -1439,212 +1406,71 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
 #[allow(unused_attributes)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 #[ignore = "e2e_joint"]
-async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
+async fn e2e_joint_3_s07_approval_survives_store_restart() {
     let pool = setup_pool().await;
     let user_id = id("user");
     let session_id = id("session");
     let run_id = id("run");
+    let request_id = id("approval");
     insert_session(&pool, &user_id, &session_id).await;
-    let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("joint-approval-a");
+    let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("approval-owner");
     store
-        .insert_run(durable_record(&run_id, &session_id, &user_id))
-        .await
-        .expect("S07 durable run insert must succeed");
-    store
-        .update_run_status_with_events_if_current(
-            &user_id,
-            &session_id,
+        .insert_run(owned_durable_record(
             &run_id,
-            &["running"],
-            None,
-            "waiting",
-            Some("approval"),
-            None,
-            &[],
-        )
-        .await
-        .expect("S07 approval waiting status must persist");
-    let approval_id = id("approval");
-    store
-        .append_event(
-            &user_id,
             &session_id,
-            &run_id,
-            json!({
-                "event_type": "approval_request",
-                "data": {
-                    "approval_id": approval_id,
-                    "requested_at": (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339(),
-                    "condition": "pre_execute: target_branch == main"
-                }
-            }),
-        )
+            &user_id,
+            "approval-owner",
+        ))
         .await
-        .expect("S07 approval_request event must persist");
-
-    let mut writer_store = store;
-    let app = build_joint_app(pool.clone(), user_id.clone(), writer_store.clone());
-    let (addr, handle) = spawn_tcp_router(app).await;
-    let client = local_client();
-    let initial_events = get_stream(&client, addr, &run_id, 0).await;
-    assert!(
-        initial_events.iter().any(|event| event
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind.contains("approval") || kind == "approval_request")),
-        "S07 HTTP stream must replay approval_request event, got {initial_events:?}"
-    );
-
-    for pod in ["joint-approval-b", "joint-approval-c"] {
-        let replacement = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(pod);
-        let _ = replacement
-            .acquire_owner_lease(&user_id, &run_id, pod, Duration::from_secs(30))
-            .await
-            .expect("S07 replacement pod lease acquisition query must succeed");
-        let loaded = replacement
-            .load_run(&user_id, &run_id)
-            .await
-            .expect("S07 replacement pod must load durable run")
-            .expect("S07 durable run must exist after restart");
-        assert!(
-            loaded.status == "waiting" && loaded.waiting_for.as_deref() == Some("approval"),
-            "S07 approval_state must survive restart on {pod}; status={} waiting_for={:?}",
-            loaded.status,
-            loaded.waiting_for
-        );
-        writer_store = replacement;
-    }
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS e2e_schema_upgrade_markers (
-            marker_id VARCHAR(128) PRIMARY KEY,
-            scenario VARCHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-        )",
-    )
-    .execute(pool.get())
-    .await
-    .expect("S07 schema upgrade SQL must run during approval wait");
-
-    let approval_item = insert_state_item(
-        &pool,
-        &user_id,
-        &session_id,
-        &run_id,
-        "approval_state",
-        "release-approval",
-        1,
-    )
+        .unwrap();
+    register_durable_interaction_wait(&store, &user_id, &session_id, &run_id, &request_id,
+        DurableRunInteractionKind::Approval, json!({
+            "event_type": "approval_required", "idempotency_key": format!("approval:{request_id}:required"),
+            "data": {"request_id": request_id, "session_id": session_id, "tool": "bash",
+                "args": {"command": "git status"}, "approval_kind": "standard", "delivery": "durable"}
+        })).await;
+    drop(store);
+    let restored = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("approval-callback");
+    let pending = restored.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(pending.status, "waiting");
+    let (addr, handle) = spawn_tcp_router(build_joint_app(
+        pool.clone(),
+        user_id.clone(),
+        restored.clone(),
+    ))
     .await;
-    sqlx::query(
-        "UPDATE session_state_items
-         SET payload_json = ?, updated_at = NOW(6)
-         WHERE item_id = ?",
-    )
-    .bind(
-        json!({
-            "approval_id": approval_id,
-            "condition": "pre_execute: target_branch == main AND tests_green == true",
-            "condition_chain": [
-                "target_branch == main",
-                "tests_green == true"
-            ]
-        })
-        .to_string(),
-    )
-    .bind(&approval_item)
-    .execute(pool.get())
-    .await
-    .expect("S07 approval condition update must persist");
-    post_user_intent(
+    let client = local_client();
+    let events = get_stream(&client, addr, &run_id, 0).await;
+    assert!(events.iter().any(|e| e["type"] == "approval_required"));
+    let (status, response) = post_json(
         &client,
         addr,
-        &run_id,
-        "intent-final",
-        json!({"content": "continue with the approved release conditions"}),
+        "/approval/respond",
+        &json!({
+            "request_id": request_id, "session_id": session_id, "run_id": run_id,
+            "decision": "allow", "tool_name": "bash", "approval_kind": "standard"
+        }),
     )
     .await;
-    let final_store = writer_store.clone();
-    final_store
-        .append_event(
-            &user_id,
-            &session_id,
-            &run_id,
-            json!({"event_type": "pre_execute_check", "data": {"approval_id": approval_id, "condition_passed": true}}),
-        )
-        .await
-        .expect("S07 pre_execute condition check event must persist");
-    final_store
-        .append_event(
-            &user_id,
-            &session_id,
-            &run_id,
-            json!({"event_type": "run_finished", "data": {"status": "completed"}}),
-        )
-        .await
-        .expect("S07 run_finished must persist");
-    assert!(
-        final_store
-            .update_run_status_with_events_if_current(
-                &user_id,
-                &session_id,
-                &run_id,
-                &["waiting"],
-                None,
-                "completed",
-                None,
-                None,
-                &[]
-            )
-            .await
-            .expect("S07 completed status must persist")
-    );
-    let terminal = final_store
-        .load_run(&user_id, &run_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(terminal.status, "completed");
-    assert!(terminal.waiting_for.is_none());
-
-    let row = sqlx::query(
-        "SELECT payload_json FROM session_state_items
-         WHERE item_id = ? AND category = 'approval_state'",
-    )
-    .bind(&approval_item)
-    .fetch_one(pool.get())
-    .await
-    .expect("S07 approval_state payload query must succeed");
-    let payload: Value = serde_json::from_str(
-        &row.try_get::<String, _>("payload_json")
-            .expect("S07 approval_state payload_json must be text"),
-    )
-    .expect("S07 approval_state payload must be JSON");
-    assert!(
-        payload.get("approval_id").and_then(Value::as_str) == Some(approval_id.as_str()),
-        "S07 final execution must remain bound to original approval_id; payload={payload}"
-    );
-    assert!(
-        payload
-            .get("condition")
-            .and_then(Value::as_str)
-            .is_some_and(
-                |condition| condition.contains("pre_execute") && condition.contains("tests_green")
-            ),
-        "S07 final condition must be a pre_execute guard with modifications replayed; payload={payload}"
-    );
-    let status = sqlx::query("SELECT status FROM agent_runs WHERE run_id = ?")
-        .bind(&run_id)
-        .fetch_one(pool.get())
-        .await
-        .expect("S07 final status query must succeed")
-        .try_get::<String, _>("status")
-        .unwrap_or_default();
-    assert!(
-        status == "completed",
-        "S07 final run status must be completed, got {status}"
-    );
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let resumed = restored.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(resumed.status, "running");
+    assert!(resumed.waiting_for.is_none());
+    let resolutions = resumed
+        .events
+        .iter()
+        .filter(|e| e["event_type"] == "approval_resolved")
+        .collect::<Vec<_>>();
+    assert_eq!(resolutions.len(), 1);
+    assert_eq!(resolutions[0]["data"]["request_id"], request_id);
     handle.abort();
+    cleanup_joint_run(&pool, &user_id, &run_id).await;
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1848,16 +1674,6 @@ async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
     )
     .await
     .expect("S14 workspace metadata artifact insert must succeed");
-    insert_state_item(
-        &pool,
-        &user_id,
-        &session_id,
-        &run_id,
-        "todo_state",
-        "resume-ui",
-        1,
-    )
-    .await;
     DatabaseSessionArtifactStore::new(require_db_it_env())
         .with_pool(pool.clone())
         .persist_json_artifact(SessionArtifactJsonRecord {
@@ -1983,25 +1799,13 @@ async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
         );
         assert_eq!(
             state
-                .pointer("/state_summary/0/category")
-                .and_then(Value::as_str),
-            Some("todo_state"),
-            "S14 bounded session state must summarize active session state categories; state={state}"
-        );
-        assert_eq!(
-            state
-                .pointer("/state_summary/0/count")
-                .and_then(Value::as_u64),
-            Some(1),
-            "S14 bounded session state must count active/backlog state items; state={state}"
-        );
-        assert_eq!(
-            state
                 .pointer("/artifact_previews/0/artifact_kind")
                 .and_then(Value::as_str),
             Some("llm_capture"),
             "S14 bounded session state must include recent non-workspace artifact previews; state={state}"
         );
+        assert!(state.get("state_summary").is_none());
+        assert!(state.get("anchor_memory").is_none());
         let transcript: Value = client
             .get(format!(
                 "http://{addr}/sessions/{session_id}/transcript?limit=2"

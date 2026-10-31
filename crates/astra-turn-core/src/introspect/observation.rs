@@ -1890,7 +1890,7 @@ mod tests {
 
         let mut freshness = base;
         freshness.injection_freshness = vec![crate::injection_tracking::ChannelFreshness {
-            channel: crate::injection_tracking::InjectionChannel::Lessons,
+            channel: crate::injection_tracking::InjectionChannel::SelfAwareness,
             status: crate::injection_tracking::ChannelStatus::Fresh { rounds_alive: 1 },
             preview: "new lesson".into(),
             first_seen_round: Some(1),

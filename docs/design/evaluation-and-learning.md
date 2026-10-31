@@ -89,28 +89,4 @@ Learning data must be filtered for:
 
 Datasets do not change runtime behavior by themselves. Behavior changes go through tuning jobs, evaluation gates, and rollout/rollback policy.
 
-## Offline routing artifacts
-
-The implemented stage-4 router importer lives under the existing evaluation
-owner and enforces explicit per-owner source-hash approvals, redaction revision,
-expiry, lineage, outcome separation and related-group time splits. It exports
-only typed structural evidence and produces offline candidates, with no
-production activation. It does not reuse the session-summary exporter as a
-routing corpus. Approved local evidence/authorization files are operator
-attestations; automatic consent collection and deletion of already exported
-files are not implemented. Operators must invalidate those files through their
-source lineage when consent is revoked. Router lineage includes the containing
-envelope and referenced feedback, execution, verifier evidence and replay
-snapshot IDs. Explicit dependency revocations invalidate containing envelopes
-and exported datasets even when their top-level approvals remain present. See
-[model-routing.md](model-routing.md#offline-router-datasets-and-candidates-stage-4)
-and the [offline workflow](../guides/model-router-offline.md).
-
-Router candidates now have a preregistered qualification and offline shadow
-workflow. The gate uses current source authorization, held-out independent-group
-comparisons, prespecified strata and conservative paired quality/cost bounds.
-Unknown/incomplete groups remain in coverage denominators. Passing qualifies only
-for observational scoring; production qualification remains false. Services owns
-the tuning record, and turn-core shares the trainer, grouping and baseline policy.
-See [the routing contract](model-routing.md#qualification-and-offline-shadow-scoring-stage-5)
-for assumptions, rejection conditions and remaining rollout prerequisites.
+Evaluation and feedback capture do not activate a learned router. Deterministic Auto routing is owned by the [routing contract](model-routing.md).

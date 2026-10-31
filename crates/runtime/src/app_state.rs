@@ -159,7 +159,6 @@ pub struct AppState {
     pub(crate) health_checker: Arc<dyn HealthChecker>,
     pub(crate) auth_service: Arc<dyn AuthService>,
     pub(crate) session_service: Arc<dyn SessionService>,
-    pub(crate) agent_service: Arc<dyn AgentService>,
     pub(crate) event_service: Arc<dyn EventService>,
     pub(crate) model_service: Arc<dyn ModelService>,
     pub(crate) model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
@@ -258,7 +257,6 @@ impl AppState {
             health_checker,
             auth_service: Arc::new(auth::UnconfiguredAuthService),
             session_service: Arc::new(auth::UnconfiguredSessionService),
-            agent_service: Arc::new(UnconfiguredAgentService),
             event_service: Arc::new(UnconfiguredEventService),
             model_service: Arc::new(UnconfiguredModelService),
             model_catalog_cache: Default::default(),
@@ -463,11 +461,6 @@ impl AppState {
 
     pub fn with_session_service(mut self, session_service: Arc<dyn SessionService>) -> Self {
         self.session_service = session_service;
-        self
-    }
-
-    pub fn with_agent_service(mut self, agent_service: Arc<dyn AgentService>) -> Self {
-        self.agent_service = agent_service;
         self
     }
 

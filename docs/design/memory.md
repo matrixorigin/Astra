@@ -61,8 +61,10 @@ never falls back to a client-side purge if the handoff fails. Explicit session
 close enqueues the same maintenance within the canonical close transaction.
 Direct/in-process providers continue to use the same governance algorithm.
 Without a bound memory provider and session identity, CLI exit skips maintenance.
-The CLI memory inference adapter remains available for lesson relevance checks;
-it does not introduce a second extraction service or lesson synthesizer.
+CLI turn entry does not retrieve, select, dismiss, inject or checkpoint automatic
+cross-session lessons. Explicit Memory remains available, including explicitly
+requested lesson-category memories. Session close/finalize retains the single
+Server-owned governance path.
 
 The Server composes one per-user memory authority policy. Explicit `memory` tools, HTTP memory routes, compaction and session-end governance must use that same policy.
 

@@ -3,7 +3,7 @@
 //!
 //! These tests exercise the `/chat/stream` → `ServerAgenticLoopHost` path (NOT the bridge),
 //! using native loopback provider responses through the real Server execution path.
-//! Binding ownership cases enter the sessionless runtime boundary directly;
+//! Binding ownership and provider reasoning cases enter the sessionless runtime boundary directly;
 //! real persistent provider Session admission is covered by `moi_fresh_astra`.
 //!
 //! ```text
@@ -575,6 +575,14 @@ fn build_test_app_with_models(
     models: Arc<TestModelService>,
     inference: Option<&ProviderObservationsFixture>,
 ) -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
+    let (state, ledger) = build_test_state_with_models(models, inference);
+    (build_app(state), ledger)
+}
+
+fn build_test_state_with_models(
+    models: Arc<TestModelService>,
+    inference: Option<&ProviderObservationsFixture>,
+) -> (AppState, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
         .with_model_service(models.clone())
@@ -595,21 +603,28 @@ fn build_test_app_with_models(
     };
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), ledger)
+    (state, ledger)
 }
 
 async fn build_native_test_app(
     scripts: Vec<ProviderScript>,
 ) -> (Router, ProviderGateway, ProviderObservationsFixture) {
+    let (state, gateway, inference) = build_native_test_state(scripts).await;
+    (build_app(state), gateway, inference)
+}
+
+async fn build_native_test_state(
+    scripts: Vec<ProviderScript>,
+) -> (AppState, ProviderGateway, ProviderObservationsFixture) {
     let gateway = ProviderGateway::start(scripts).await;
     let inference = ProviderObservationsFixture::default();
-    let (app, _) = build_test_app_with_models(
+    let (state, _) = build_test_state_with_models(
         Arc::new(TestModelService {
             judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
         }),
         Some(&inference),
     );
-    (app, gateway, inference)
+    (state, gateway, inference)
 }
 
 fn primary_request_for(request: &ProviderRequest, message: &str) -> bool {
@@ -943,26 +958,6 @@ async fn chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
     parse_sse_events(&body_str)
 }
 
-async fn provider_chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
-    let payload = normalize_chat_stream_payload(payload);
-    let req = Request::builder()
-        .method("POST")
-        .uri("/chat/stream")
-        .header("authorization", PROVIDER_TOKEN)
-        .header("content-type", "application/json")
-        .header("x-astra-e2e-test-secret", SECRET)
-        .body(Body::from(payload.to_string()))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body_bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
-        .await
-        .unwrap();
-    let body_str = String::from_utf8_lossy(&body_bytes);
-    parse_sse_events(&body_str)
-}
-
 fn provider_gateway_reasoning_payload(
     endpoint: &str,
     message: &str,
@@ -974,7 +969,6 @@ fn provider_gateway_reasoning_payload(
         metadata["reasoning_control"] = control;
     }
     let mut payload = json!({
-        "session_id": "provider-gateway-reasoning-session",
         "message": message,
         "model_selection": {"offering_id": DEFAULT_MODEL_OFFERING_ID},
         "resolved_model_selection": {"offering_id": DEFAULT_MODEL_OFFERING_ID, "model_name": "test-model"},
@@ -1007,10 +1001,10 @@ async fn provider_gateway_reasoning_efforts_reach_model_and_complete() {
             }))],
         )
     });
-    let (app, gateway, _inference) = build_native_test_app(scripts.into()).await;
+    let (app, gateway, _inference) = build_native_test_state(scripts.into()).await;
     for effort in ["low", "high", "max"] {
         let question = format!("Calculate 2 + 3 using {effort} reasoning.");
-        let events = provider_chat_stream_collect(
+        let events = provider_sessionless_stream_collect(
             &app,
             provider_gateway_reasoning_payload(
                 &gateway.base_url,
@@ -1045,7 +1039,7 @@ async fn provider_gateway_reasoning_efforts_reach_model_and_complete() {
 #[tokio::test]
 async fn provider_gateway_reasoning_rejects_undeclared_efforts_before_model_io() {
     init_env();
-    let (app, gateway, _inference) = build_native_test_app(vec![ProviderScript::new(
+    let (app, gateway, _inference) = build_native_test_state(vec![ProviderScript::new(
         "no provider I/O permitted",
         |_| true,
         vec![],
@@ -1060,7 +1054,7 @@ async fn provider_gateway_reasoning_rejects_undeclared_efforts_before_model_io()
             })),
         ),
     ] {
-        let events = provider_chat_stream_collect(
+        let events = provider_sessionless_stream_collect(
             &app,
             provider_gateway_reasoning_payload(
                 &gateway.base_url,
@@ -1087,7 +1081,7 @@ async fn provider_gateway_reasoning_rejects_undeclared_efforts_before_model_io()
 #[tokio::test]
 async fn provider_gateway_reasoning_rejects_malformed_capabilities() {
     init_env();
-    let (app, gateway, _inference) = build_native_test_app(vec![ProviderScript::new(
+    let (app, gateway, _inference) = build_native_test_state(vec![ProviderScript::new(
         "no provider I/O permitted",
         |_| true,
         vec![],
@@ -1101,7 +1095,7 @@ async fn provider_gateway_reasoning_rejects_malformed_capabilities() {
         json!({"protocol": "reasoning_effort", "supported_efforts": ["extreme"]}),
         json!({"protocol": "reasoning_effort", "supported_efforts": ["high"], "enabled": true}),
     ] {
-        let events = provider_chat_stream_collect(
+        let events = provider_sessionless_stream_collect(
             &app,
             provider_gateway_reasoning_payload(
                 &gateway.base_url,
@@ -1131,14 +1125,14 @@ async fn provider_gateway_reasoning_rejects_malformed_capabilities() {
 #[tokio::test]
 async fn provider_gateway_reasoning_omission_preserves_default_chat() {
     init_env();
-    let (app, gateway, _inference) = build_native_test_app(vec![ProviderScript::new(
+    let (app, gateway, _inference) = build_native_test_state(vec![ProviderScript::new(
         "ordinary gateway turn", |request| primary_request_for(request, "Ordinary gateway question."),
         vec![ProviderResponse::OpenAi(json!({
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "Ordinary answer."}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23}
         }))],
     )]).await;
-    let events = provider_chat_stream_collect(
+    let events = provider_sessionless_stream_collect(
         &app,
         provider_gateway_reasoning_payload(
             &gateway.base_url,
@@ -1322,7 +1316,7 @@ async fn start_agent_binding_gateway(
 
 // Binding ownership is exercised through real provider HTTP and canonical
 // execution. Persistent Session creation/admission is covered by moi_fresh_astra.
-async fn provider_binding_stream_collect(state: &AppState, payload: Value) -> Vec<Value> {
+async fn provider_sessionless_stream_collect(state: &AppState, payload: Value) -> Vec<Value> {
     let mut headers = HeaderMap::new();
     headers.insert("authorization", PROVIDER_TOKEN.parse().unwrap());
     let principal = StubAuth
@@ -1426,7 +1420,7 @@ let inference=ProviderObservationsFixture::default();
 let model_endpoint=format!("{}/v1",gateway.base_url);
 let (app,observer_worker)=build_test_app_with_agent_bindings(binding_service, Arc::new(TestModelService{judgment_base_url:Some(model_endpoint.clone())}),Some(&inference));
 
-        let events = provider_binding_stream_collect(
+        let events = provider_sessionless_stream_collect(
             &app,
             agent_binding_chat_payload(
                 &foundation_binding_id,
@@ -1542,7 +1536,7 @@ async fn multi_agent_binding_http_e2e_reports_exact_missing_binding_id() {
         None,
     );
 
-    let events = provider_binding_stream_collect(
+    let events = provider_sessionless_stream_collect(
         &app,
         agent_binding_chat_payload(
             &foundation_binding_id,

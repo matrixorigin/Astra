@@ -58,7 +58,6 @@ pub mod bash_intent;
 pub mod capabilities;
 pub(crate) mod capability_endpoint_pool;
 pub(crate) mod capacity_model;
-pub mod learning;
 pub(crate) mod llm_provider_admission;
 pub mod matrix_cloud_runtime;
 pub mod memory_hooks;
@@ -126,10 +125,6 @@ pub use astra_services::{
         AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader,
         AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
         AdminUserRoleRequestData, AuthenticatedUser,
-    },
-    agents::{
-        AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
-        AgentUpdateRequestData, DatabaseAgentService, UnconfiguredAgentService,
     },
     auth::{
         AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,

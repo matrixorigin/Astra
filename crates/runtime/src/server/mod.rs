@@ -53,7 +53,6 @@ mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;
 mod router_builder;
-mod router_rollout_handlers;
 pub mod run;
 mod runtime_maintenance_sweeper;
 pub(crate) mod runtime_mcp;
@@ -130,7 +129,6 @@ pub(crate) mod tool_work_plan;
 pub(crate) mod tool_work_proposal;
 pub(crate) mod tool_work_surface_events;
 pub(crate) mod tool_workspace_path_guard;
-mod user_skill_handlers;
 pub(crate) mod work_context;
 #[cfg(test)]
 pub(crate) mod work_test_support;

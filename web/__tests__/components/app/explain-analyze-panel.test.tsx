@@ -61,7 +61,7 @@ describe("ExplainAnalyzePanel", () => {
     expect(usage.textContent).not.toContain("requests reported");
   });
 
-  it("shows memory candidate decisions and distinguishes selection from request projection", () => {
+  it("does not render retired memory-selection evidence as a current context decision", () => {
     const consoleError = vi.spyOn(console, "error");
     render(<ExplainAnalyzePanel events={[{
       ...identity, event_id: "context:finish", node_id: "context", kind: "context_assembly",
@@ -75,11 +75,9 @@ describe("ExplainAnalyzePanel", () => {
         ],
       }] } },
     }]} />);
-    expect(screen.getAllByText(/2 candidates → 1 selected/).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByRole("button", { name: /Inspect Assemble context sources/ }));
-    expect(screen.getByText("Candidate 1")).toBeTruthy();
-    expect(screen.getByText(/selected · model score 90.00%/)).toBeTruthy();
-    expect(screen.getByText(/final request projection unavailable/)).toBeTruthy();
+    expect(screen.queryByText(/2 candidates → 1 selected/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Inspect Assemble context sources/ })).toBeNull();
+    expect(screen.queryByText("Candidate 1")).toBeNull();
     expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });

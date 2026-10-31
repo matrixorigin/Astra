@@ -19,7 +19,6 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | Auth errors (no session token, duplicate user, bad password) | `journey_extended::run_auth_and_session_negative_paths` | `auth_contract` (stub errors) | — |
 | Sessions list/get/put, close/resume, activity | `journey_full` + DB `agent_sessions`; focused `GET`/`PUT` vs row in `e2e_matrix_session_http_db` | `session_contract` | — |
 | Session cancel + delete + 404 | `journey_extended` + DB | `session_contract` | — |
-| Agents CRUD + DB | `journey_full` + `agent_agents` | `agent_crud_contract` | — |
 | Events create/get/list/causal chain | `journey_full` | `event_crud_contract` | — |
 
 ## Product API (context, decisions, memory proxy, jobs, sandbox, …)

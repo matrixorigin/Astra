@@ -207,7 +207,6 @@ impl ObservabilitySession {
         // already has. Preview is populated so introspect can show
         // the first 80 chars of the actual injection.
         let InjectionPreviews {
-            lessons,
             volatile,
             memoria_prefetch,
             self_awareness,
@@ -222,10 +221,8 @@ impl ObservabilitySession {
         // fingerprints below: CLI is authoritative for its own
         // channels. Tags not listed fall through to bridge-fingerprint
         // observation so the wire-derived hash/bytes still register.
-        let cli_owned: &[(InjectionChannel, &str)] = &[
-            (InjectionChannel::Lessons, lessons),
-            (InjectionChannel::SelfAwareness, self_awareness),
-        ];
+        let cli_owned: &[(InjectionChannel, &str)] =
+            &[(InjectionChannel::SelfAwareness, self_awareness)];
         // CLI-owned pairs that may or may not carry text this turn —
         // if the CLI doesn't have an easy source in the post-turn
         // hook, it passes `""` and relies on the bridge fingerprint

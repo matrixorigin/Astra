@@ -3489,17 +3489,6 @@ async fn stream_context_trace_and_restore(continuation_race: bool) {
     )
     .await;
     assert_eq!(full_status, StatusCode::OK);
-    for table in ["session_state_items"] {
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
-        )))
-        .bind(user_id)
-        .bind(&session_id)
-        .fetch_one(pool)
-        .await
-        .expect("ordinary answer projection count");
-        assert_eq!(count, 0, "ordinary answer must not create {table}");
-    }
     sqlx::query("UPDATE agent_sessions SET status='paused' WHERE user_id=? AND session_id=?")
         .bind(user_id)
         .bind(&session_id)

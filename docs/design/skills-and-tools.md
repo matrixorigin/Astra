@@ -319,7 +319,8 @@ regression failures.
 
 ## Optional memory candidate judgment pilot
 
-Memory relevance and explicit lesson dismissal use the existing selector boundary.
+Explicit Memory-judgment comparisons reuse the existing selector boundary.
+Ordinary CLI turns do not load or dismiss automatic cross-session lessons.
 An optional server admin `judgment_offering_id` binds those judgments to a
 registered Offering, including the TypeSafe System One adapter. Offering credentials
 remain encrypted and server-owned. This binding never selects a memory extraction

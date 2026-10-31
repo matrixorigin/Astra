@@ -37,6 +37,32 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         .expect("repeated core schema bootstrap");
 
     let schema = current_schema(&pool).await;
+    for retired in [
+        "agent_agents",
+        "user_skill_sources",
+        "user_skill_versions",
+        "session_state_items",
+        "model_router_deployments",
+    ] {
+        assert!(
+            column_names(&pool, &schema, retired).await.is_empty(),
+            "retired table {retired}"
+        );
+        let claims: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM astra_schema_table_contracts WHERE table_name = ?",
+        )
+        .bind(retired)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(claims, 0, "retired table authority {retired}");
+    }
+    assert!(
+        !column_names(&pool, &schema, "session_artifacts")
+            .await
+            .iter()
+            .any(|column| column == "referenced_by_state_items_count")
+    );
     let run_columns = column_names(&pool, &schema, "agent_runs").await;
     for cold in [
         "opening_events_json",
@@ -494,7 +520,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         .await
         .unwrap();
 
-    sqlx::query("UPDATE astra_schema_contracts SET contract_version = '2026-10-29-v115' WHERE component = 'astra-core'")
+    sqlx::query("UPDATE astra_schema_contracts SET contract_version = '2026-10-29-v116' WHERE component = 'astra-core'")
         .execute(pool.get()).await.unwrap();
     let error = ensure_core_schema(&settings, &bootstrap_catalog)
         .await
@@ -507,7 +533,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     .fetch_one(pool.get())
     .await
     .unwrap();
-    assert_eq!(unchanged, "2026-10-29-v115");
+    assert_eq!(unchanged, "2026-10-29-v116");
 
     sqlx::query(
         "UPDATE astra_schema_contracts SET contract_version = ? WHERE component = 'astra-core'",
@@ -2172,7 +2198,7 @@ async fn observation_collision_schema_contract() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn phase4_state_projection_schema_contract() {
+async fn plan_and_artifact_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
@@ -2198,81 +2224,6 @@ async fn phase4_state_projection_schema_contract() {
             .await
             .is_empty(),
         "plans must not keep ownerless session index idx_plans_session"
-    );
-
-    let state_items = column_names(&pool, &schema, "session_state_items").await;
-    for expected in [
-        "scope",
-        "category",
-        "item_key",
-        "origin_session_id",
-        "origin_chunk_id",
-        "origin_state_item_id",
-    ] {
-        assert!(
-            state_items.iter().any(|column| column == expected),
-            "session_state_items missing {expected}"
-        );
-    }
-    assert_eq!(
-        unique_key_columns(&pool, &schema, "session_state_items", "uq_state_current").await,
-        ["user_id", "session_id", "scope", "category", "item_key"],
-        "state current projection must upsert by owner/session semantic key"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_state_items",
-            "idx_state_owner_session_status_category"
-        )
-        .await,
-        ["user_id", "session_id", "status", "category"],
-        "state summary lookup must use owner/session/status/category index"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_state_items",
-            "idx_state_user_scope_category"
-        )
-        .await,
-        ["user_id", "scope", "category", "status", "priority"],
-        "scope=user memory must use a compound user/scope/category index"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_state_items",
-            "idx_state_owner_origin_session"
-        )
-        .await,
-        ["user_id", "origin_session_id", "category", "status"],
-        "origin-session cleanup must be owner-bound"
-    );
-    assert!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_state_items",
-            "idx_state_session_category"
-        )
-        .await
-        .is_empty(),
-        "session_state_items must not keep ownerless category/status index idx_state_session_category"
-    );
-    assert!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_state_items",
-            "idx_state_origin_session"
-        )
-        .await
-        .is_empty(),
-        "session_state_items must not keep ownerless origin-session index idx_state_origin_session"
     );
 
     let artifacts = column_names(&pool, &schema, "session_artifacts").await;
@@ -2361,7 +2312,7 @@ async fn phase4_state_projection_schema_contract() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn phase5_personal_skill_schema_contract() {
+async fn skill_registry_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
@@ -2375,64 +2326,6 @@ async fn phase5_personal_skill_schema_contract() {
         .await,
         ["is_active", "skill_name", "version"],
         "skills registry seek pagination must be backed by the product schema, not test-only DDL"
-    );
-
-    let sources = column_names(&pool, &schema, "user_skill_sources").await;
-    for expected in [
-        "source_id",
-        "owner_user_id",
-        "skill_name",
-        "visibility",
-        "status",
-        "created_at",
-        "updated_at",
-    ] {
-        assert!(
-            sources.iter().any(|column| column == expected),
-            "user_skill_sources missing {expected}"
-        );
-    }
-    assert_eq!(
-        unique_key_columns(
-            &pool,
-            &schema,
-            "user_skill_sources",
-            "uq_user_skill_source_name"
-        )
-        .await,
-        ["owner_user_id", "skill_name"],
-        "personal skill lookup must be keyed by owner_user_id + skill_name"
-    );
-
-    let versions = column_names(&pool, &schema, "user_skill_versions").await;
-    for expected in [
-        "version_id",
-        "source_id",
-        "owner_user_id",
-        "skill_name",
-        "version",
-        "manifest_json",
-        "content_markdown",
-        "content_hash",
-        "normalize_version",
-        "token_estimate",
-        "status",
-    ] {
-        assert!(
-            versions.iter().any(|column| column == expected),
-            "user_skill_versions missing {expected}"
-        );
-    }
-    assert_eq!(
-        unique_key_columns(
-            &pool,
-            &schema,
-            "user_skill_versions",
-            "uq_user_skill_source_version"
-        )
-        .await,
-        ["source_id", "version"],
-        "skill versions must be append-only per source/version"
     );
 
     let installations = column_names(&pool, &schema, "skill_installations").await;
@@ -2460,7 +2353,6 @@ async fn phase6_artifact_retention_preview_schema_contract() {
         "retention_policy",
         "retention_until",
         "status",
-        "referenced_by_state_items_count",
         "referenced_by_citation_count",
     ] {
         assert!(

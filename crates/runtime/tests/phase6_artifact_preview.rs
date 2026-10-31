@@ -4,11 +4,10 @@ use test_support::require_db_it_env;
 
 use astra_runtime::server::artifact_retention_sweeper::run_artifact_retention_gc_once;
 use astra_services::{
-    DatabaseSessionArtifactStore, DatabaseSessionService, DatabaseStateProjectionStore,
-    SessionArtifactContentChunkV1, SessionArtifactContentDescriptorV1, SessionArtifactContentStore,
-    SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactReference,
-    SessionArtifactReferenceKind, SessionArtifactStoreError, SessionService,
-    build_presigned_artifact_download,
+    DatabaseSessionArtifactStore, DatabaseSessionService, SessionArtifactContentChunkV1,
+    SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
+    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
+    SessionArtifactStoreError, SessionService, build_presigned_artifact_download,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -69,7 +68,7 @@ struct ArtifactSeed<'a> {
     policy: &'a str,
     status: &'a str,
     retention_days: i64,
-    state_refs: i64,
+    citation_refs: i64,
 }
 
 async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) {
@@ -78,7 +77,7 @@ async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) 
     sqlx::query(
         "INSERT INTO session_artifacts
          (artifact_id, session_id, user_id, artifact_kind, content_json, metadata,
-          retention_policy, retention_until, status, referenced_by_state_items_count,
+          retention_policy, retention_until, status, referenced_by_citation_count,
          created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
     )
@@ -91,7 +90,7 @@ async fn insert_artifact(pool: &astra_core::SharedPool, seed: ArtifactSeed<'_>) 
     .bind(seed.policy)
     .bind(retention_until)
     .bind(seed.status)
-    .bind(seed.state_refs)
+    .bind(seed.citation_refs)
     .execute(pool.get())
     .await
     .unwrap();
@@ -757,89 +756,209 @@ async fn l2_49c_sealed_expiry_and_session_delete_do_not_deadlock() {
 shared_db_test! {
 
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_49d_personal_skill_activation_and_session_delete_are_fenced() {
-    let pool = setup_pool().await;
-    let (user_id, session_id, _) = ids();
-    insert_session(&pool, &user_id, &session_id).await;
-    let artifact_id = format!("state-race-artifact-{}", Uuid::new_v4());
-    insert_artifact(
-        &pool,
-        ArtifactSeed {
-            user_id: &user_id,
-            session_id: &session_id,
-            artifact_id: &artifact_id,
-            kind: "state_projection_fixture",
-            policy: "default",
-            status: "active",
-            retention_days: 1,
-            state_refs: 0,
-        },
-    )
-    .await;
-
-    let projection = DatabaseStateProjectionStore::new(pool.clone());
-    let skill_name = format!("activation-race-{}", Uuid::new_v4());
-    let skills = astra_services::DatabasePersonalSkillStore::new(pool.clone());
-    let version = skills.submit_version(
-        &user_id,
-        &skill_name,
-        astra_services::SubmitUserSkillVersion {
-            version: "v1".to_string(),
-            manifest_json: json!({"name": skill_name, "description": "Review changes"}),
-            content_markdown: "## Instructions\n\nReview changes.\n".to_string(),
-            status: Some("published".to_string()),
-        },
-    ).await.unwrap();
-    let service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
-        .with_pool(pool.clone());
-    let (write, deleted) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
-            tokio::join!(
-                projection.activate_personal_skill_from_ui(&user_id, &session_id, &skill_name, &version.version_id),
-                service.delete_session(session_id.clone(), user_id.clone()),
+async fn l2_49d_artifact_reference_and_session_delete_are_fenced() {
+    use std::time::Duration;
+    async fn observe_fence_waiters(
+        connection: &mut sqlx::MySqlConnection,
+        actors: [(u64, &str); 2],
+        user: &str,
+        session: &str,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut previous = [None, None];
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("actor never reached its database barrier".into());
+            }
+            let rows = tokio::time::timeout_at(
+                deadline,
+                sqlx::query("SHOW PROCESSLIST").fetch_all(&mut *connection),
             )
-        },
-    )
-    .await
-    .expect("skill activation and Session delete must not deadlock");
-
-    deleted.expect("Session delete should succeed without saved Work");
-    if let Err(error) = write {
-        assert!(
-            matches!(error, astra_services::StateProjectionError::SessionNotActive { .. }),
-            "a losing skill activation should fail with an actionable lifecycle error: {error}"
-        );
+            .await
+            .map_err(|_| "actor never reached its database barrier".to_string())?
+            .map_err(|error| error.to_string())?;
+            let mut current = [None, None];
+            for row in rows {
+                let id = row.try_get::<u64, _>("conn_id").map_err(|error| error.to_string())?;
+                let Some(index) = actors.iter().position(|(actor, _)| *actor == id) else { continue; };
+                let command: String =
+                    row.try_get("command").map_err(|error| error.to_string())?;
+                let info: String = row.try_get("info").map_err(|error| error.to_string())?;
+                if matches!(command.as_str(), "COM_STMT_EXECUTE" | "COM_QUERY")
+                    && [actors[index].1, "agent_session_lifecycle_fences", user, session]
+                        .iter().all(|fragment| info.contains(fragment))
+                {
+                    let statement: String = row
+                        .try_get("statement_id")
+                        .map_err(|error| error.to_string())?;
+                    if !statement.is_empty() {
+                        current[index] = Some(statement);
+                    }
+                }
+            }
+            if current.iter().all(Option::is_some) && current == previous {
+                return Ok(());
+            }
+            previous = current;
+            tokio::task::yield_now().await;
+        }
     }
 
-    let row = sqlx::query(
-        "SELECT
-            (SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?) AS sessions,
-            (SELECT COUNT(*) FROM session_state_items WHERE user_id = ? AND session_id = ?) AS state_items,
-            (SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?) AS artifacts,
-            (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?) AS activation_events",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<i64, _>("sessions").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("state_items").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("artifacts").unwrap(), 0);
-    assert_eq!(row.try_get::<i64, _>("activation_events").unwrap(), 0);
-    sqlx::query("DELETE FROM user_skill_versions WHERE owner_user_id = ? AND skill_name = ?")
-        .bind(&user_id).bind(&skill_name).execute(pool.get()).await.unwrap();
-    sqlx::query("DELETE FROM user_skill_sources WHERE owner_user_id = ? AND skill_name = ?")
-        .bind(&user_id).bind(&skill_name).execute(pool.get()).await.unwrap();
+    async fn finish<T>(mut task: tokio::task::JoinHandle<T>) -> Result<T, String> {
+        match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err("database actor did not finish after releasing its barrier".into())
+            }
+        }
+    }
 
+    let pool = setup_pool().await;
+    let mut settings = require_db_it_env();
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let writer_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let deletion_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let observer_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let artifacts = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(writer_pool.clone());
+    let service = DatabaseSessionService::new(settings).with_pool(deletion_pool.clone());
+    let mut observer = observer_pool.get().acquire().await.unwrap();
+    for order in ["reference_first", "deletion_first", "contended"] {
+        let (user_id, session_id, _) = ids();
+        insert_session(&pool, &user_id, &session_id).await;
+        let artifact_id = Uuid::new_v4().to_string();
+        insert_artifact(
+            &pool,
+            ArtifactSeed {
+                user_id: &user_id,
+                session_id: &session_id,
+                artifact_id: &artifact_id,
+                kind: "reference_race_fixture",
+                policy: "default",
+                status: "active",
+                retention_days: 1,
+                citation_refs: 0,
+            },
+        )
+        .await;
+        let reference = SessionArtifactReference {
+            kind: SessionArtifactReferenceKind::Citation,
+            reference_id: Uuid::new_v4().to_string(),
+        };
+        if order == "reference_first" {
+            assert!(
+                artifacts
+                    .retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                artifacts
+                    .list_json_artifact_references(&user_id, &session_id, &artifact_id, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            service
+                .delete_session(session_id.clone(), user_id.clone())
+                .await
+                .unwrap();
+        } else if order == "deletion_first" {
+            service
+                .delete_session(session_id.clone(), user_id.clone())
+                .await
+                .unwrap();
+        } else {
+            // Use the setup pool so the actor connections have no earlier
+            // matching statement for this unique Session in process-list history.
+            let seeded = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool.clone());
+            assert!(
+                seeded
+                    .retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                seeded
+                    .release_json_artifact_reference(
+                        &user_id,
+                        &session_id,
+                        &artifact_id,
+                        &reference
+                    )
+                    .await
+                    .unwrap()
+            );
+            // Query the physical identities on each exclusive actor pool.
+            let writer_connection: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(writer_pool.get()).await.unwrap();
+            let deletion_connection: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(deletion_pool.get()).await.unwrap();
+            assert_ne!(writer_connection, deletion_connection);
+            let mut blocker = pool.get().begin().await.unwrap();
+            astra_services::storage::lock_agent_session_write_fence(
+                &mut blocker, &session_id, &user_id,
+            ).await.unwrap();
+            let write = {
+                let artifacts = artifacts.clone();
+                let (user, session, artifact, reference) =
+                    (user_id.clone(), session_id.clone(), artifact_id.clone(), reference.clone());
+                tokio::spawn(async move {
+                    artifacts.retain_json_artifact_reference(&user, &session, &artifact, &reference).await
+                })
+            };
+            let deleted = {
+                let service = service.clone();
+                let (user, session) = (user_id.clone(), session_id.clone());
+                tokio::spawn(async move { service.delete_session(session, user).await })
+            };
+            let observed = observe_fence_waiters(
+                &mut observer,
+                [(writer_connection, "SELECT delete_requested_at"),
+                 (deletion_connection, "INSERT IGNORE INTO agent_session_lifecycle_fences")],
+                &user_id, &session_id,
+            ).await;
+            let pending = !write.is_finished() && !deleted.is_finished();
+            // Always release and join/abort both actors before reporting an
+            // observation failure, so failed evidence cannot strand a worker.
+            let released = blocker.commit().await;
+            let write = finish(write).await;
+            let deleted = finish(deleted).await;
+            observed.expect("both actors reach the held database fence");
+            assert!(pending);
+            released.unwrap();
+            deleted.unwrap().unwrap();
+            let write = write.unwrap();
+            assert!(matches!(write, Ok(true) | Err(SessionArtifactStoreError::SessionNotOwned { .. })));
+
+        }
+        assert!(matches!(
+            artifacts
+                .retain_json_artifact_reference(&user_id, &session_id, &artifact_id, &reference)
+                .await,
+            Err(SessionArtifactStoreError::SessionNotOwned { .. })
+        ));
+        for table in [
+            "agent_sessions",
+            "session_artifacts",
+            "session_artifact_references",
+        ] {
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+            )))
+            .bind(&user_id)
+            .bind(&session_id)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{order}: no orphan {table}");
+        }
+    }
 }
+
 }
 
 shared_db_test! {
@@ -859,7 +978,7 @@ async fn l2_50_gc_preserves_referenced_artifact_deadline_without_fake_cold_stora
             policy: "default",
             status: "active",
             retention_days: -1,
-            state_refs: 1,
+            citation_refs: 1,
         },
     )
     .await;
@@ -888,10 +1007,11 @@ async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
     let store = DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::from_env()).with_pool(pool.clone());
+    assert!(sqlx::query("INSERT INTO session_artifact_references (user_id, session_id, artifact_id, reference_kind, reference_id) VALUES (?, ?, 'retired-kind', 'state_item', 'retired')")
+        .bind(&user_id).bind(&session_id).execute(pool.get()).await.is_err());
     for kind in [
         SessionArtifactReferenceKind::InvocationLedger,
         SessionArtifactReferenceKind::Manifest,
-        SessionArtifactReferenceKind::StateItem,
         SessionArtifactReferenceKind::Citation,
         SessionArtifactReferenceKind::RecoveryPoint,
         SessionArtifactReferenceKind::SessionTranscript,
@@ -905,7 +1025,7 @@ async fn l2_50b_gc_honors_durable_reference_edges_without_payload_inference() {
             policy: "default",
             status: "active",
             retention_days: -1,
-            state_refs: 0,
+            citation_refs: 0,
         }).await;
         let reference = SessionArtifactReference {
             kind,
@@ -950,7 +1070,7 @@ async fn l2_54_project_long_term_artifact_is_extended_not_expired() {
             policy: "project_long_term",
             status: "active",
             retention_days: -1,
-            state_refs: 0,
+            citation_refs: 0,
         },
     )
     .await;
@@ -980,7 +1100,7 @@ async fn l2_54b_expiry_removes_retained_payload_bytes_instead_of_only_relabeling
             policy: "default",
             status: "active",
             retention_days: -1,
-            state_refs: 0,
+            citation_refs: 0,
         },
     )
     .await;
@@ -1045,7 +1165,7 @@ async fn l3_18_s12_14_day_review_retention() {
     let mut insert = QueryBuilder::<MySql>::new(
         "INSERT INTO session_artifacts
          (artifact_id, session_id, user_id, artifact_kind, content_json, metadata,
-          retention_policy, retention_until, status, referenced_by_state_items_count,
+          retention_policy, retention_until, status, referenced_by_citation_count,
           created_at, updated_at) ",
     );
     insert.push_values(0..250, |mut row, i| {

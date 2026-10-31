@@ -95,7 +95,6 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Auth | P0 | `/auth/register`, `/login`, `/refresh`, `/me`, `/logout` | `auth_users` | Every test uses `bootstrap` (register/login); `product_matrix_*` also hits `/auth/refresh` and `/logout` |
 | Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | `product_matrix_*` + `e2e_matrix_session_cancel_delete` + `e2e_matrix_session_http_db` |
 | Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | `agent_events` + HTTP cross-check | `product_matrix_*` (summary/turn counts and token totals); `e2e_matrix_saas_events_and_audit_cross_user_isolation` (foreign-user events/audit/activity isolation) |
-| Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
 | Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list), `e2e_matrix_models` (list/access); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
 | Memory proxy | P1 | `/memory/*` | Memoria stub calls | `product_matrix_*` |

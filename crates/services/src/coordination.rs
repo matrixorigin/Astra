@@ -486,9 +486,6 @@ impl DelegationResult {
 // ─── Agent Profile Registry ─────────────────────────────────────────────────
 
 /// In-memory agent profile registry for coordination.
-///
-/// Production deployments extend this with database-backed storage via
-/// the existing `AgentService` (agents.rs).
 #[derive(Clone)]
 pub struct AgentProfileRegistry {
     profiles: HashMap<String, AgentProfile>,

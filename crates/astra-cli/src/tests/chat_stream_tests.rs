@@ -1213,8 +1213,6 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -1398,8 +1396,6 @@ async fn stream_chat_sse_simple_text_response() {
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -1525,8 +1521,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -1677,8 +1671,6 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             resume_restricted_tools: &[],
             tool_health_entries: &[],
             workspace_observation_quarantine: None,
-            session_lessons: &[],
-            memory_selection_reports: &[],
 
             latest_turn_quality_feedback: None,
             unified_skill_registry: &unified_skill_registry,
@@ -1784,8 +1776,6 @@ async fn stream_chat_sse_api_error_propagated() {
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -1904,8 +1894,6 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             resume_restricted_tools: &[],
             tool_health_entries: &[],
             workspace_observation_quarantine: None,
-            session_lessons: &[],
-            memory_selection_reports: &[],
 
             latest_turn_quality_feedback: None,
             unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -2078,8 +2066,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -2248,8 +2234,6 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
@@ -2416,8 +2400,6 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         resume_restricted_tools: &[],
         tool_health_entries: &[],
         workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
 
         latest_turn_quality_feedback: None,
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),

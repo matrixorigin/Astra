@@ -388,7 +388,6 @@ pub struct SessionArtifactJsonRecord {
 pub enum SessionArtifactReferenceKind {
     InvocationLedger,
     Manifest,
-    StateItem,
     Citation,
     RecoveryPoint,
     SessionTranscript,
@@ -399,7 +398,6 @@ impl SessionArtifactReferenceKind {
         match self {
             Self::InvocationLedger => "invocation_ledger",
             Self::Manifest => "manifest",
-            Self::StateItem => "state_item",
             Self::Citation => "citation",
             Self::RecoveryPoint => "recovery_point",
             Self::SessionTranscript => "session_transcript",
@@ -410,7 +408,6 @@ impl SessionArtifactReferenceKind {
         match value {
             "invocation_ledger" => Ok(Self::InvocationLedger),
             "manifest" => Ok(Self::Manifest),
-            "state_item" => Ok(Self::StateItem),
             "citation" => Ok(Self::Citation),
             "recovery_point" => Ok(Self::RecoveryPoint),
             "session_transcript" => Ok(Self::SessionTranscript),
@@ -441,7 +438,6 @@ pub struct StoredSessionArtifact {
     pub retention_policy: Option<String>,
     pub retention_until: Option<String>,
     pub status: Option<String>,
-    pub referenced_by_state_items_count: u32,
     pub referenced_by_citation_count: u32,
     pub referenced_by_durable_count: u32,
     pub created_at: Option<String>,
@@ -801,7 +797,7 @@ impl DatabaseSessionArtifactStore {
 
         let existing = query(
             "SELECT artifact_kind, \
-                    referenced_by_state_items_count, referenced_by_citation_count \
+                    referenced_by_citation_count \
              FROM session_artifacts \
              WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
         )
@@ -820,14 +816,7 @@ impl DatabaseSessionArtifactStore {
                 },
             );
         }
-        let counter_references = [
-            "referenced_by_state_items_count",
-            "referenced_by_citation_count",
-        ]
-        .into_iter()
-        .try_fold(0_i64, |total, column| {
-            existing.i64_column(column).map(|value| total + value)
-        })?;
+        let counter_references = existing.i64_column("referenced_by_citation_count")?;
         let durable_references: i64 = query_scalar(
             "SELECT COUNT(*) FROM session_artifact_references \
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
@@ -1289,11 +1278,6 @@ fn stored_artifact_from_row(
         retention_policy: artifact_row_optional_string(row, "retention_policy")?,
         retention_until: artifact_row_optional_string(row, "retention_until")?,
         status: artifact_row_optional_string(row, "status")?,
-        referenced_by_state_items_count: artifact_row_u32(
-            row,
-            &artifact_id,
-            "referenced_by_state_items_count",
-        )?,
         referenced_by_citation_count: artifact_row_u32(
             row,
             &artifact_id,
@@ -1319,7 +1303,6 @@ pub(crate) async fn load_latest_json_artifact_from_pool(
         "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                  content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                  CAST(retention_until AS CHAR) AS retention_until, status, \
-                 referenced_by_state_items_count, \
                  referenced_by_citation_count, \
                  (SELECT COUNT(*) FROM session_artifact_references refs \
                   WHERE refs.user_id = session_artifacts.user_id \
@@ -1356,7 +1339,6 @@ pub(crate) async fn load_json_artifact_from_pool(
         "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                 content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                 CAST(retention_until AS CHAR) AS retention_until, status, \
-                referenced_by_state_items_count, \
                 referenced_by_citation_count, \
                 (SELECT COUNT(*) FROM session_artifact_references refs \
                  WHERE refs.user_id = session_artifacts.user_id \
@@ -1448,7 +1430,6 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                     CAST(retention_until AS CHAR) AS retention_until, status, \
-                    referenced_by_state_items_count, \
                     referenced_by_citation_count, \
                     (SELECT COUNT(*) FROM session_artifact_references refs \
                      WHERE refs.user_id = session_artifacts.user_id \
@@ -1719,7 +1700,6 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
                     CAST(retention_until AS CHAR) AS retention_until, status, \
-                    referenced_by_state_items_count, \
                     referenced_by_citation_count, \
                     (SELECT COUNT(*) FROM session_artifact_references refs \
                      WHERE refs.user_id = session_artifacts.user_id \
@@ -2521,7 +2501,6 @@ async fn load_byte_artifact_catalog_in_transaction(
         "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round,
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy,
                     CAST(retention_until AS CHAR) AS retention_until, status,
-                    referenced_by_state_items_count,
                     referenced_by_citation_count,
                     (SELECT COUNT(*) FROM session_artifact_references refs
                      WHERE refs.user_id = session_artifacts.user_id
@@ -3036,7 +3015,6 @@ mod tests {
                 return Ok(*value);
             }
             Ok(match column {
-                "referenced_by_state_items_count" => 2,
                 "referenced_by_citation_count" => 3,
                 "referenced_by_durable_count" => 4,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -3349,7 +3327,6 @@ mod tests {
             Some("2026-06-26 12:00:00")
         );
         assert_eq!(artifact.status.as_deref(), Some("active"));
-        assert_eq!(artifact.referenced_by_state_items_count, 2);
         assert_eq!(artifact.referenced_by_citation_count, 3);
         assert_eq!(artifact.referenced_by_durable_count, 4);
         assert_eq!(artifact.created_at.as_deref(), Some("2026-06-26 10:00:00"));
@@ -3367,7 +3344,6 @@ mod tests {
             "retention_policy",
             "retention_until",
             "status",
-            "referenced_by_state_items_count",
             "referenced_by_citation_count",
             "referenced_by_durable_count",
             "created_at",
@@ -3402,20 +3378,6 @@ mod tests {
         assert_invalid_database_column(
             stored_artifact_from_row(&FakeArtifactRow::with_optional_i32("round", Some(-1))),
             "round",
-        );
-        assert_invalid_database_column(
-            stored_artifact_from_row(&FakeArtifactRow::with_i64(
-                "referenced_by_state_items_count",
-                -1,
-            )),
-            "referenced_by_state_items_count",
-        );
-        assert_invalid_database_column(
-            stored_artifact_from_row(&FakeArtifactRow::with_i64(
-                "referenced_by_state_items_count",
-                i64::from(u32::MAX) + 1,
-            )),
-            "referenced_by_state_items_count",
         );
         assert_invalid_database_column(
             stored_artifact_from_row(&FakeArtifactRow::with_i64(

@@ -1,5 +1,4 @@
 //! Durable Auto selection and the semantic admission that justified it.
-pub mod offline;
 use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
 use serde::{Deserialize, Serialize};
 
@@ -12,8 +11,6 @@ pub const DECISION_KEY: &str = "model-routing-v1";
 #[serde(deny_unknown_fields)]
 pub struct ModelRoutingDecision {
     pub schema_version: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollout: Option<crate::tuning::rollout::RouterRolloutDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<astra_turn_types::model_routing::ModelRoutingFeatures>,
     /// Full canonical semantic decision, including graph, topology and capabilities.
@@ -39,7 +36,9 @@ pub struct ModelRoutingDecision {
 
 impl ModelRoutingDecision {
     pub fn validate_identity(&self, run_id: &str, session_id: &str) -> Result<(), String> {
-        if self.schema_version != 2
+        if self.policy_version
+            != astra_turn_types::model_routing::DETERMINISTIC_ROUTING_POLICY_VERSION
+            || self.schema_version != 2
             || self.run_id != run_id
             || self.session_id != session_id
             || self.delegation_model_requirement.is_some() != self.delegation_model_source.is_some()
@@ -54,29 +53,6 @@ impl ModelRoutingDecision {
                 && self.selected_offering_id != self.policy.strong_offering_id)
         {
             return Err("Auto routing decision does not match its execution".into());
-        }
-        let treatment = self
-            .rollout
-            .as_ref()
-            .is_some_and(|r| r.cohort == crate::tuning::rollout::RolloutCohort::Treatment);
-        if treatment
-            != (self.policy_version
-                == astra_turn_types::model_routing::LEARNED_CANARY_ROUTING_POLICY_VERSION)
-        {
-            return Err("Routing algorithm differs from pinned rollout provenance".into());
-        }
-        if let Some(r) = &self.rollout
-            && (r.deployment_id.is_empty()
-                || !crate::tuning::rollout::opaque(&r.rubric_version)
-                || (r.routing_failure.is_some() && !treatment)
-                || r.candidate_sha256.len() != 64
-                || r.revision == 0
-                || r.cohort_probability_basis_points == 0
-                || r.cohort_probability_basis_points > 10_000
-                || (r.proposed_offering_id != self.policy.economy_offering_id
-                    && r.proposed_offering_id != self.policy.strong_offering_id))
-        {
-            return Err("Invalid rollout decision provenance".into());
         }
         crate::validate_model_offering_id(&self.selected_offering_id)
             .map(|_| ())
@@ -93,7 +69,7 @@ pub(crate) fn selection_for_new_events(
     let mut selection = None;
     for event in events
         .iter()
-        .filter(|event| event["event_type"] == EVENT_TYPE)
+        .filter(|event| crate::runs::extract_event_type(event) == EVENT_TYPE)
     {
         if selection.is_some() || event["idempotency_key"] != DECISION_KEY {
             return Err("Auto routing requires one immutable decision per run".into());
@@ -111,7 +87,7 @@ pub(crate) fn selection_for_new_events(
     Ok(selection)
 }
 
-/// Canonical structural predicate shared by online routing and offline validation.
+/// Canonical structural predicate for deterministic Auto routing.
 pub fn routing_read_only_primary(decision: Option<&crate::WorkAdmissionDecision>) -> bool {
     decision.is_some_and(|decision| {
         matches!(decision, crate::WorkAdmissionDecision::NotRequired { .. })

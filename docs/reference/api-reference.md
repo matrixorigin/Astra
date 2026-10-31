@@ -221,36 +221,6 @@ is acknowledged; ordinary observation uses the run stream.
 
 ---
 
-## Agents
-
-### POST /agents
-
-```json
-// Request
-{"agent_name": "code-reviewer", "system_prompt": "You review code.", "config": {"model": "gpt-4"}}
-
-// Response 201
-{"agent_id": "uuid", "agent_name": "code-reviewer", "owner_user_id": "uuid", "is_active": true, "created_at": "..."}
-```
-
-### GET /agents
-
-List all agents owned by the current user. This endpoint does not accept
-pagination parameters.
-
-### GET /agents/{agent_id}
-
-### PUT /agents/{agent_id}
-
-### DELETE /agents/{agent_id} → 204
-
-Agent names are unique per owner. Creating a duplicate name or renaming an
-agent to another of the owner's names returns 409 without changing either
-record. Different owners may use the same name. Reads and mutations of another
-owner's agent, and reads or deletes of a missing agent, return 404.
-
----
-
 ## Sessions
 
 ### POST /sessions
@@ -430,12 +400,6 @@ All events in a causal chain.
 
 ### GET /skills/{skill_id}/versions
 
-### GET /skills/user
-
-### POST /skills/user
-
-### POST /skills/user/{skill_name}/versions
-
 ---
 
 ## Retired diagnostic products
@@ -451,9 +415,9 @@ remain available.
 
 `/chat/session/{id}/decision-trace` continues to reflect captured execution
 events and semantic/model evidence. The retired diagnostic source and its old count are omitted from current coverage;
-normal views do not carry retirement warnings. Personal-skill authoring,
-publishing and activation remain supported; activation commits its canonical
-`ui.skill.activate` event and current active-skill state atomically.
+normal views do not carry retirement warnings. Executable Skill registry publishing,
+installation and activation retain their canonical owners; personal-skill authoring
+and its separate activation projection are retired.
 
 ---
 
@@ -557,7 +521,7 @@ Run projection no longer includes the prompt-hash `observability` object. Sessio
 `latest_prompt_request`; canonical heads and actual model-request coverage remain.
 Session state also omits `latest_context_manifest`. Artifact responses omit
 `referenced_by_manifest_count`; only the retired diagnostic counter is removed.
-Real durable reference edges, state/citation counts and upload retention remain.
+Real durable reference edges, citation counts and upload retention remain.
 The retired hash-diff history is not equivalent to measured provider cache usage.
 
 `POST /sessions/{id}/resume` returns canonical hydration (`session_id`,
@@ -565,3 +529,16 @@ The retired hash-diff history is not equivalent to measured provider cache usage
 header with `created_at`. Both full and `?continuation_only=true` restore
 require valid owner-scoped canonical Context; missing state returns 404 without
 activating the Session. Corrupt canonical state fails without activation.
+
+## Retired authoring and adaptation APIs
+
+Agent configuration CRUD (`/agents`, `/agents/{agent_id}`), personal Skill
+sources/versions/activation (`/skills/user...`) and `/admin/model-router/...`
+are removed. Edge registration/heartbeat, AgentBindings, executable Skill
+registry/install/configuration and deterministic Auto remain. The platform
+snapshot omits `agents`; Session state omits `state_summary` and `anchor_memory`.
+Artifact responses omit `referenced_by_state_items_count`, and reference requests
+reject `state_item`. Explain assembly omits and rejects `edge_memory_selection`.
+There are no aliases or tombstone handlers. `/skills/user` can resolve to the
+ordinary Skill named `user` through `/skills/{skill_id}`; unsupported methods
+follow normal routing behavior.

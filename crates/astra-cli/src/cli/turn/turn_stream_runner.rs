@@ -208,8 +208,6 @@ fn build_turn_stream_params<'a>(
         deferred_tool_activations: Some(&mut state.deferred_tool_activations),
         tool_health_entries: &state.tool_health_entries,
         resume_restricted_tools: &state.resume_restricted_tools,
-        session_lessons: &state.session_lessons,
-        memory_selection_reports: &state.memory_selection_reports,
 
         latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
         unified_skill_registry: &state.unified_skill_registry,

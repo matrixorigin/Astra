@@ -431,7 +431,6 @@ fn char_literal() { let slash = '/'; }
         second_batch = {
             "session_device_leases",
             "session_device_lease_events",
-            "session_state_items",
             "sweeper_leases",
             "workspace_records",
             "workspace_cleanup_debts",
@@ -456,10 +455,6 @@ fn char_literal() { let slash = '/'; }
                     )
 
     def test_state_task_workspace_metadata_locks_boundary_decisions(self) -> None:
-        self.assertIn(
-            "current projection surface",
-            self.tables["session_state_items"]["merge_guidance"],
-        )
         self.assertIn(
             "mutable current state",
             self.tables["session_device_leases"]["merge_guidance"],
@@ -568,9 +563,6 @@ fn char_literal() { let slash = '/'; }
             "skill_settings",
             "skill_resource_bindings",
             "skill_user_credentials",
-            "user_skill_sources",
-            "user_skill_versions",
-            "agent_agents",
             "agent_bindings",
         }
         for table in skill_agent_tables:
@@ -612,18 +604,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "encrypted user secrets",
             self.tables["skill_user_credentials"]["merge_guidance"],
-        )
-        self.assertIn(
-            "source owns authoring identity",
-            self.tables["user_skill_sources"]["merge_guidance"],
-        )
-        self.assertIn(
-            "authoring/version content",
-            self.tables["user_skill_versions"]["merge_guidance"],
-        )
-        self.assertIn(
-            "user-owned agent definitions",
-            self.tables["agent_agents"]["merge_guidance"],
         )
         self.assertIn(
             "idempotent creation semantics",

@@ -1,6 +1,6 @@
 # Optional judgment backends
 
-Memory relevance, lesson dismissal, request classification, and skill selection can use a
+Explicit Memory-judgment comparisons, request classification, and skill selection can use a
 registered TypeSafe System One Offering or an ordinary LLM explicitly selected with
 `judgment_model`. This selects a model for judgments, not the main agent model. Astra never
 silently reuses the main agent model when this binding is absent or unavailable.
@@ -213,7 +213,8 @@ without modifying the provider adapter or mislabeling their purpose.
 Current message/candidate truncation budgets are preserved. Provider errors,
 timeouts or malformed answers retain the existing lexical relevance fallback
 and no-dismissal fallback. The latter does not delete persistent memory: this
-path removes injected session lessons only. No extra LLM retry is added.
+comparison exercises dismissal judgments only. CLI no longer automatically loads,
+dismisses or injects cross-session lessons. No extra LLM retry is added.
 
 TypeSafe streaming, tools, ordinary chat, extraction, reasoning and arbitrary
 wire overrides are rejected before dispatch. Shared memory/reasoning defaults

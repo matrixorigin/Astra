@@ -5,8 +5,6 @@
 //! - Finalizing workspace state
 //! - Ending observability sessions
 //! - Running authenticated session-end governance
-//!
-//! Signal-derived lessons are checkpointed during turns; exit performs governance.
 
 use astra_services::session_journal;
 use std::time::Duration;
@@ -269,6 +267,47 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::task::JoinSet;
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn finalization_without_attached_memory_authority_does_not_use_global_credentials() {
+        assert!(crate::cli::native_auth::active().is_none());
+        let server = MockServer::start().await;
+        let _api = crate::test_utils::ProcessEnvGuard::remove("ASTRA_API_URL");
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var("ASTRA_API_URL", server.uri());
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "default-account-token");
+        }
+        for endpoint in ["/memory/governance", "/memory/consolidate"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .and(header("authorization", "Bearer default-account-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+        }
+        for session_id in [Some("selected-profile-session".to_string()), None] {
+            let mut state = crate::cli::session::session_state::SessionState {
+                session_id,
+                ingestion_user_id: Some("selected-profile-account".to_string()),
+                ..Default::default()
+            };
+            assert!(state.session_memory_port.is_none());
+            crate::cli::session::session_cleanup::finalize_session_with_budget(
+                &mut state,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("local finalization does not require optional remote maintenance");
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "unbound session maintenance must not use the default account's credentials"
+            );
+        }
+    }
 
     struct DropSignal(Arc<AtomicBool>);
 

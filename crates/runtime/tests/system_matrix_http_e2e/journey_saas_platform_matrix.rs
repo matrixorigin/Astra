@@ -1300,57 +1300,51 @@ pub async fn run_saas_admin_audit_rbac_smoke() {
     ctx.close().await;
 }
 
-/// User-scoped skills are invisible to other users (§5.4).
-pub async fn run_saas_skills_cross_user_isolation() {
+/// Registry publication remains public; only its publisher can unpublish it.
+pub async fn run_saas_skills_publisher_ownership() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
-    let auth_a = &b.auth_header;
-    let skill_name = format!("saas_skill_iso_{}", ctx.suffix);
-
-    let (st_create, create_j) = post_json(
+    let skill_name = format!("saas_skill_owner_{}", ctx.suffix);
+    let (status, published) = post_json(
         app,
-        "/skills/user",
-        Some(auth_a),
+        "/skills/publish",
+        Some(&b.auth_header),
         json!({
-            "skill_name": skill_name,
-            "visibility": "private"
+            "name": skill_name, "version": "1.0.0", "description": "Review changes",
+            "manifest": {"name": skill_name, "instructions": "Review changes"}
         }),
     )
     .await;
-    assert_eq!(st_create, StatusCode::CREATED, "create skill: {create_j}");
-
-    let (st_list_a, list_a) = get_json(app, "/skills/user", Some(auth_a), &[]).await;
-    assert_eq!(
-        st_list_a,
-        StatusCode::OK,
-        "A list personal skills: {list_a}"
-    );
-    let empty: Vec<Value> = vec![];
-    let skills_a = list_a.as_array().unwrap_or(&empty);
-    assert!(
-        skills_a
-            .iter()
-            .any(|s| s["skill_name"].as_str() == Some(skill_name.as_str())),
-        "A list must include A skill: {list_a}"
-    );
-
-    let (auth_b, _, _, _) = register_fresh_user(app, "skill_iso_b").await;
-
-    let (st_list_b, list_b) = get_json(app, "/skills/user", Some(&auth_b), &[]).await;
-    assert_eq!(
-        st_list_b,
-        StatusCode::OK,
-        "B list personal skills: {list_b}"
-    );
-    let skills_b = list_b.as_array().unwrap_or(&empty);
-    assert!(
-        !skills_b
-            .iter()
-            .any(|s| s["skill_name"].as_str() == Some(skill_name.as_str())),
-        "B list must not include A skill: {list_b}"
-    );
-
+    assert_eq!(status, StatusCode::CREATED, "{published}");
+    let skill_id = published["skill_id"].as_str().unwrap();
+    let (auth_b, _, _, _) = register_fresh_user(app, "skill_owner_b").await;
+    let (status, visible) = get_json(app, &format!("/skills/{skill_id}"), Some(&auth_b), &[]).await;
+    assert_eq!(status, StatusCode::OK, "public registry: {visible}");
+    let (status, denied) = post_json(
+        app,
+        &format!("/skills/{skill_name}/unpublish"),
+        Some(&auth_b),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "foreign publisher: {denied}");
+    let (status, _) = get_json(
+        app,
+        &format!("/skills/{skill_id}"),
+        Some(&b.auth_header),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "foreign request must not unpublish");
+    let (status, unpublished) = post_json(
+        app,
+        &format!("/skills/{skill_name}/unpublish"),
+        Some(&b.auth_header),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner unpublish: {unpublished}");
     ctx.close().await;
 }
 

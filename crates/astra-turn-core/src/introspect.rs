@@ -94,7 +94,7 @@ pub struct IntrospectSnapshot {
     #[serde(default)]
     pub stall_state: StallSnapshotSummary,
     /// Per-channel freshness of runtime-injected prompt signals
-    /// (recent_failing_tests, outcome_bias, lessons, volatile_pending).
+    /// (recent_failing_tests, outcome_bias, volatile_pending).
     /// Populated by the agentic loop from `AgenticLoopState.injection_history`
     /// at the start of each round. Feeds `facet=noise`. Empty when
     /// the runtime has not yet observed any round.
@@ -3203,7 +3203,7 @@ mod tests {
             round_index: 0,
         });
         snap.injection_freshness = vec![ChannelFreshness {
-            channel: InjectionChannel::Lessons,
+            channel: InjectionChannel::SelfAwareness,
             status: ChannelStatus::Fresh { rounds_alive: 0 },
             preview: "lesson preview".into(),
             first_seen_round: Some(0),
@@ -3247,7 +3247,7 @@ mod tests {
                     first_seen_round: Some(56),
                 },
                 ChannelFreshness {
-                    channel: InjectionChannel::Lessons,
+                    channel: InjectionChannel::SelfAwareness,
                     status: ChannelStatus::Untracked,
                     preview: String::new(),
                     first_seen_round: None,
@@ -3274,7 +3274,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("lessons") && out.contains("untracked"),
+            out.contains("self_awareness") && out.contains("untracked"),
             "{out}"
         );
         assert!(
@@ -3296,7 +3296,7 @@ mod tests {
         let snap = IntrospectSnapshot {
             current_round: 3,
             injection_freshness: vec![ChannelFreshness {
-                channel: InjectionChannel::Lessons,
+                channel: InjectionChannel::SelfAwareness,
                 status: ChannelStatus::Fresh { rounds_alive: 1 },
                 preview: "recent lesson".into(),
                 first_seen_round: Some(2),
@@ -3339,7 +3339,7 @@ mod tests {
             current_round: 5,
             injection_freshness: vec![
                 ChannelFreshness {
-                    channel: InjectionChannel::Lessons,
+                    channel: InjectionChannel::SelfAwareness,
                     status: ChannelStatus::Empty {
                         first_seen_round: 0,
                     },
