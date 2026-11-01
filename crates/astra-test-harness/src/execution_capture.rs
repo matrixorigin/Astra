@@ -6,8 +6,8 @@ use astra_server_types::{SessionRunLifecycleStatus, SessionRunTreeSnapshot};
 use astra_services::reflect::ReflectReport;
 use astra_services::session_journal::ToolCallDisposition;
 use astra_turn_core::orchestration::agent_result_wire::{
-    AgentFanoutControlExecutionFact, agent_control_result_value,
-    agent_fanout_control_execution_fact,
+    AgentControlReceipt, AgentFanoutControlExecutionFact, DecodedAgentToolResult,
+    agent_control_result_value, agent_fanout_control_execution_fact, decode_agent_tool_result,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -120,11 +120,34 @@ pub(crate) enum ChildProofReason {
     FinalizationUnavailable,
 }
 
+/// Closed observations only: never project an arbitrary profile name or tool body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SpawnPersonaObservation {
+    Omitted,
+    Explore,
+    CodeReview,
+    Task,
+    GeneralPurpose,
+    Custom,
+    Unavailable,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ChildMutationDiagnostic {
+    pub expected: astra_config::user_profile::WorkspaceMutationIntent,
+    // None means qualifying spawn facts are invalid or disagree. The valid
+    // intent `unknown` remains a distinct, serialized enum value.
+    pub actual: Option<astra_config::user_profile::WorkspaceMutationIntent>,
+    pub requested_persona: SpawnPersonaObservation,
+}
+
 #[derive(Debug)]
 pub(crate) struct ChildProofFailure {
     pub reason: ChildProofReason,
+    pub mutation: Option<ChildMutationDiagnostic>,
     // Preserve existing private errors and classification. Public diagnostics
-    // serialize only the reason enum, never this string.
+    // serialize only closed observations, never this string.
     pub unavailable_detail: Option<&'static str>,
 }
 
@@ -137,6 +160,7 @@ impl ChildProofFailure {
     fn contradicted(reason: ChildProofReason) -> Self {
         Self {
             reason,
+            mutation: None,
             unavailable_detail: None,
         }
     }
@@ -144,6 +168,7 @@ impl ChildProofFailure {
     fn unavailable(reason: ChildProofReason, detail: &'static str) -> Self {
         Self {
             reason,
+            mutation: None,
             unavailable_detail: Some(detail),
         }
     }
@@ -460,6 +485,96 @@ impl SessionExecutionCapture {
             }
         }
         content.map(Some).ok_or("child terminal content missing")
+    }
+
+    fn mutation_diagnostic(
+        &self,
+        root: &str,
+        child: &astra_server_types::SessionRunNode,
+        facts: &[&Value],
+        expected: astra_config::user_profile::WorkspaceMutationIntent,
+        trace: Option<&SessionCapture>,
+    ) -> ChildMutationDiagnostic {
+        use astra_config::user_profile::WorkspaceMutationIntent;
+        let facts: Vec<_> = facts
+            .iter()
+            .filter(|fact| fact["kind"] == "agent_spawned" && fact["run_id"] == child.run_id)
+            .collect();
+        let values: Vec<_> = facts
+            .iter()
+            .map(|fact| {
+                serde_json::from_value::<WorkspaceMutationIntent>(
+                    fact["workspace_mutation"].clone(),
+                )
+                .ok()
+            })
+            .collect();
+        let actual = values
+            .first()
+            .copied()
+            .flatten()
+            .filter(|first| values.iter().all(|value| value.as_ref() == Some(first)));
+        let requested_persona = self
+            .tools(root, trace)
+            .ok()
+            .and_then(|calls| {
+                // Count all root spawn claims for this child before validating
+                // a receipt; an inconsistent second claim is not unique evidence.
+                let mut matching = calls.iter().filter(|call| {
+                    let receipt = agent_control_result_value(call.raw_result());
+                    call.run_id.as_deref() == Some(root)
+                        && call.name == "agent"
+                        && call
+                            .arguments
+                            .as_ref()
+                            .is_some_and(|args| args["action"] == "spawn")
+                        && receipt.as_ref().is_some_and(|value| {
+                            value["run_id"] == child.run_id
+                                && child
+                                    .agent_id
+                                    .as_deref()
+                                    .is_some_and(|id| value["agent_id"] == id)
+                        })
+                });
+                let call = matching.next()?;
+                let receipt = agent_control_result_value(call.raw_result())?;
+                if matching.next().is_some()
+                    || call.ok != Some(true)
+                    || call.execution_disposition() != Some(ToolCallDisposition::Executed)
+                    || decode_agent_tool_result(&receipt)
+                        != Some(DecodedAgentToolResult::ControlReceipt(
+                            AgentControlReceipt::Spawn,
+                        ))
+                    || receipt["parent_run_id"] != root
+                    || !facts.iter().all(|fact| {
+                        fact["tool_call_id"].is_null()
+                            || fact["tool_call_id"]
+                                .as_str()
+                                .is_some_and(|id| Some(id) == call.call_id.as_deref())
+                    })
+                {
+                    return None;
+                }
+                Some(match call.arguments.as_ref()?.get("agent_type") {
+                    None => SpawnPersonaObservation::Omitted,
+                    Some(Value::String(value)) if !value.trim().is_empty() => {
+                        match value.as_str() {
+                            "explore" => SpawnPersonaObservation::Explore,
+                            "code-review" => SpawnPersonaObservation::CodeReview,
+                            "task" => SpawnPersonaObservation::Task,
+                            "general-purpose" => SpawnPersonaObservation::GeneralPurpose,
+                            _ => SpawnPersonaObservation::Custom,
+                        }
+                    }
+                    _ => SpawnPersonaObservation::Unavailable,
+                })
+            })
+            .unwrap_or(SpawnPersonaObservation::Unavailable);
+        ChildMutationDiagnostic {
+            expected,
+            actual,
+            requested_persona,
+        }
     }
 
     pub(crate) fn tools<'trace>(
@@ -990,9 +1105,12 @@ impl SessionExecutionCapture {
                     >(fact["workspace_mutation"].clone())
                     {
                         if actual != expected {
-                            return Err(ChildProofFailure::contradicted(
-                                ChildProofReason::MutationMismatch,
-                            ));
+                            let mut failure =
+                                ChildProofFailure::contradicted(ChildProofReason::MutationMismatch);
+                            failure.mutation = Some(
+                                self.mutation_diagnostic(root, child, &facts, expected, trace),
+                            );
+                            return Err(failure);
                         }
                         observed = true;
                     }
@@ -1849,6 +1967,219 @@ pub(crate) mod tests {
         original.transcript = Some(serde_json::from_value(page).unwrap());
         original.transcript.as_mut().unwrap().items.push(terminal);
         original
+    }
+
+    #[test]
+    fn mutation_diagnostic_joins_the_spawn_receipt_without_exposing_profile_values() {
+        use astra_config::user_profile::WorkspaceMutationIntent::{ReadOnly, Unknown};
+        for (value, expected_persona) in [
+            (None, SpawnPersonaObservation::Omitted),
+            (
+                Some(serde_json::json!("explore")),
+                SpawnPersonaObservation::Explore,
+            ),
+            (
+                Some(serde_json::json!("code-review")),
+                SpawnPersonaObservation::CodeReview,
+            ),
+            (
+                Some(serde_json::json!("task")),
+                SpawnPersonaObservation::Task,
+            ),
+            (
+                Some(serde_json::json!("general-purpose")),
+                SpawnPersonaObservation::GeneralPurpose,
+            ),
+            (
+                Some(serde_json::json!("private-profile-sentinel")),
+                SpawnPersonaObservation::Custom,
+            ),
+            (Some(Value::Null), SpawnPersonaObservation::Unavailable),
+        ] {
+            let mut capture = tool_capture();
+            let mut args = serde_json::json!({"action":"spawn"});
+            if let Some(value) = value {
+                args["agent_type"] = value;
+            }
+            capture.transcript.as_mut().unwrap().items[0].tool_calls[0].arguments =
+                args.to_string();
+            capture.transcript.as_mut().unwrap().items[1].content = serde_json::json!({
+                "result_family":"control_receipt", "action":"spawn", "success":true,
+                "status":"launched", "run_id":"child", "agent_id":"member", "parent_run_id":"root"
+            })
+            .to_string();
+            let fact = serde_json::json!({"kind":"agent_spawned", "run_id":"child", "tool_call_id":"call", "workspace_mutation":"unknown"});
+            let child = &capture.run_tree.runs[1];
+            let diagnostic = capture.mutation_diagnostic(
+                "root",
+                child,
+                &[&fact],
+                ReadOnly,
+                Some(&trace(&capture)),
+            );
+            assert_eq!(diagnostic.actual, Some(Unknown));
+            assert_eq!(diagnostic.requested_persona, expected_persona);
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("private-profile-sentinel")
+            );
+            let mut wrong_call = fact.clone();
+            wrong_call["tool_call_id"] = "unrelated".into();
+            assert_eq!(
+                capture
+                    .mutation_diagnostic(
+                        "root",
+                        child,
+                        &[&wrong_call],
+                        ReadOnly,
+                        Some(&trace(&capture))
+                    )
+                    .requested_persona,
+                SpawnPersonaObservation::Unavailable
+            );
+            let mut conflict = fact.clone();
+            conflict["workspace_mutation"] = "may_mutate".into();
+            assert!(
+                capture
+                    .mutation_diagnostic(
+                        "root",
+                        child,
+                        &[&fact, &conflict],
+                        ReadOnly,
+                        Some(&trace(&capture))
+                    )
+                    .actual
+                    .is_none()
+            );
+            for (field, value) in [
+                ("status", "failed"),
+                ("parent_run_id", "foreign"),
+                ("run_id", "unrelated"),
+                ("agent_id", "foreign"),
+            ] {
+                let mut receipt = serde_json::json!({"result_family":"control_receipt", "action":"spawn", "success":true,
+                "status":"launched", "run_id":"child", "agent_id":"member", "parent_run_id":"root"});
+                receipt[field] = value.into();
+                if field == "status" {
+                    receipt["success"] = false.into();
+                }
+                capture.transcript.as_mut().unwrap().items[1].content = receipt.to_string();
+                assert_eq!(
+                    capture
+                        .mutation_diagnostic(
+                            "root",
+                            &capture.run_tree.runs[1],
+                            &[&fact],
+                            ReadOnly,
+                            Some(&trace(&capture))
+                        )
+                        .requested_persona,
+                    SpawnPersonaObservation::Unavailable
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_diagnostic_does_not_choose_between_duplicate_spawn_receipts() {
+        use astra_config::user_profile::WorkspaceMutationIntent::ReadOnly;
+        let mut capture = tool_capture();
+        let page = capture.transcript.as_mut().unwrap();
+        page.items[1].content =
+            serde_json::json!({"result_family":"control_receipt", "action":"spawn", "success":true,
+                "status":"launched", "run_id":"child", "agent_id":"member", "parent_run_id":"root"})
+            .to_string();
+        let mut request = page.items[0].clone();
+        request.item_seq = 4;
+        request.source_event_id = Some("repeat-request".into());
+        request.tool_calls[0].tool_use_id = "repeat".into();
+        let mut response = page.items[1].clone();
+        response.item_seq = 5;
+        response.source_event_id = Some("repeat-response".into());
+        response.tool_result.as_mut().unwrap().tool_use_id = "repeat".into();
+        page.items.extend([request, response]);
+        capture.run_tree.runs[0].total_tool_calls = 2;
+        assert_eq!(
+            capture.tools("root", Some(&trace(&capture))).unwrap().len(),
+            2
+        );
+        let fact = serde_json::json!({"kind":"agent_spawned", "run_id":"child", "workspace_mutation":"unknown"});
+        let diagnostic = capture.mutation_diagnostic(
+            "root",
+            &capture.run_tree.runs[1],
+            &[&fact],
+            ReadOnly,
+            Some(&trace(&capture)),
+        );
+        assert_eq!(
+            diagnostic.requested_persona,
+            SpawnPersonaObservation::Unavailable
+        );
+        capture
+            .transcript
+            .as_mut()
+            .unwrap()
+            .items
+            .last_mut()
+            .unwrap()
+            .content = serde_json::json!({
+            "result_family":"control_receipt", "action":"spawn", "success":false,
+            "status":"failed", "run_id":"child", "agent_id":"member", "parent_run_id":"root"
+        })
+        .to_string();
+        let mut identified = fact.clone();
+        identified["tool_call_id"] = "call".into();
+        assert_eq!(
+            capture
+                .mutation_diagnostic(
+                    "root",
+                    &capture.run_tree.runs[1],
+                    &[&identified],
+                    ReadOnly,
+                    Some(&trace(&capture))
+                )
+                .requested_persona,
+            SpawnPersonaObservation::Unavailable
+        );
+    }
+
+    #[test]
+    fn mutation_diagnostic_preserves_the_hard_proof_verdict_and_public_projection() {
+        use crate::criteria::{Criterion, execution_contract_proof};
+        use astra_config::user_profile::WorkspaceMutationIntent::ReadOnly;
+        let mut capture = tool_capture();
+        capture.transcript.as_mut().unwrap().items[0].tool_calls[0].arguments =
+            serde_json::json!({"action":"spawn", "agent_type":"task"}).to_string();
+        capture.transcript.as_mut().unwrap().items[1].content = serde_json::json!({
+            "result_family":"control_receipt", "action":"spawn", "success":true,
+            "status":"launched", "run_id":"child", "agent_id":"member", "parent_run_id":"root"
+        })
+        .to_string();
+        capture.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()["execution_spine"]["facts"][0]["workspace_mutation"] = "unknown".into();
+        let session = trace(&capture);
+        let mut expected = expectation("observed-value", "test-model", None);
+        expected.workspace_mutation = Some(ReadOnly);
+        let criterion = Criterion::ExecutionChildResultsAdopted {
+            children: vec![expected],
+            fanout_group: None,
+        };
+        let mut outcome = crate::runner::RunOutcome::new("test-model").with_exit_code(0);
+        outcome.run_id = Some("root".into());
+        let mut stream = crate::runner::StreamCapture::default();
+        stream.identity_verified = true;
+        stream.execution = Some(capture);
+        outcome.stream_capture = Some(stream);
+        let (passed, diagnostic) =
+            execution_contract_proof(&criterion, &outcome, Some(&session)).unwrap();
+        assert!(!passed);
+        assert_eq!(
+            diagnostic,
+            serde_json::json!({"kind":"child_adoption", "status":"contradicted", "reason":"mutation_mismatch", "mutation":{"expected":"read_only", "actual":"unknown", "requested_persona":"task"}})
+        );
     }
 
     #[test]

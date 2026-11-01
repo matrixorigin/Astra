@@ -377,6 +377,7 @@ class ManualHarnessProgressTests(unittest.TestCase):
     def test_child_proof_reason_survives_real_summary_entrypoint(self):
         for status, reason in [("proven", None),
                                ("contradicted", "result_digest_mismatch"),
+                               ("contradicted", "mutation_mismatch"),
                                ("unavailable", "adoption_evidence_unavailable")]:
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -384,6 +385,8 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 data = events(("passed" if passed else "failed",))
                 result = next(e["row"] for e in data if e["type"] == "case_completed")
                 diagnostic = {"kind":"child_adoption", "status":status, "reason":reason}
+                if reason == "mutation_mismatch":
+                    diagnostic["mutation"] = {"expected": "read_only", "actual": "unknown", "requested_persona": "custom"}
                 result["steps"] = []
                 result["criteria"] = [{"type":"execution_child_results_adopted",
                     "severity":"hard", "score":None, "passed":passed,
@@ -399,6 +402,24 @@ class ManualHarnessProgressTests(unittest.TestCase):
                 if not passed:
                     self.assertIn(f"{status}: {reason}", (root / "job-summary").read_text())
                 self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
+    def test_child_mutation_observation_is_closed_and_not_a_verdict_override(self):
+        base = {"kind": "child_adoption", "status": "contradicted", "reason": "mutation_mismatch"}
+        for actual in (None, "unknown", "read_only", "may_mutate", "must_mutate"):
+            for persona in ("omitted", "explore", "code_review", "task", "general_purpose", "custom", "unavailable"):
+                diagnostic = dict(base, mutation={"expected": "read_only", "actual": actual, "requested_persona": persona})
+                self.assertIsNone(h.safe_diagnostic(diagnostic, 0))
+                check = {"type": "execution_child_results_adopted", "severity": "hard", "score": None,
+                         "passed": False, "evaluation": "reported", "diagnostic": diagnostic}
+                self.assertIn("mutation observations", " ".join(h.check_lines([check], "root")))
+        valid = dict(base, mutation={"expected": "read_only", "actual": "unknown", "requested_persona": "omitted"})
+        for field in ("expected", "actual", "requested_persona", "private-field"):
+            bad = dict(valid, mutation=dict(valid["mutation"], **{field: "private-sentinel"}))
+            with self.assertRaises(ValueError): h.safe_diagnostic(bad, 0)
+        for reason in ("model_mismatch", None):
+            with self.assertRaises(ValueError): h.safe_diagnostic(dict(valid, reason=reason), 0)
+        for status in ("proven", "unavailable"):
+            with self.assertRaises(ValueError): h.safe_diagnostic(dict(valid, status=status), 0)
 
     def test_child_proof_diagnostic_rejects_untrusted_reasons_and_fields(self):
         valid = {"kind":"child_adoption", "status":"contradicted", "reason":"model_mismatch"}
