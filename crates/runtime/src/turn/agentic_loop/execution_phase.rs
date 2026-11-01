@@ -405,7 +405,10 @@ fn finish_direct_child_barrier_incomplete(state: &mut AgenticLoopState, reason: 
     state.hooks.completion_settlement.latest_provider_text = None;
     state.hooks.completion_settlement.deferred_candidate_text = None;
     state.final_text_model_item_id = None;
-    state.final_text = "Outstanding agent work or an unanswered agent question prevented this run from completing. Progress is preserved, but the request is incomplete.".into();
+    // Lifecycle failure copy belongs to the typed interruption, never to
+    // assistant output. In particular, keep an existing provider failure as
+    // the authoritative cause when its child work is still outstanding.
+    state.final_text.clear();
     state.final_text_streamed = false;
     if state.interruption.is_none() {
         state.interruption = Some(InterruptionRecord::new(
@@ -8311,7 +8314,62 @@ mod tests {
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
     #[tokio::test]
-    async fn semantic_child_message_wakes_parent_without_completing_child() {
+    async fn child_finalization_keeps_interruption_out_of_assistant_output() {
+        for original_kind in [None, Some(InterruptionKind::EmptyCompletion)] {
+            let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                "parent-run",
+                "child-agent",
+            );
+            owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+                applied_user_intents: Vec::new(),
+                agent_id: "child-agent".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: "parent-agent".into(),
+                status: crate::orchestration::AgentStatus::Running {
+                    activity: "working".into(),
+                },
+            });
+            let mut host = MockHost::new(vec![]);
+            host.direct_child_owner = Some(Arc::clone(&owner));
+            let mut state = make_state();
+            state.current_run_id = Some("parent-run".into());
+            state.final_text = "tentative answer without child evidence".into();
+            if let Some(kind) = original_kind {
+                state.interruption = Some(InterruptionRecord::new(
+                    kind,
+                    exhausted_provider_recovery_action(&state),
+                    interruption_state_summary(
+                        &state,
+                        Some("provider returned no usable output".into()),
+                    ),
+                ));
+            }
+            let original = state.interruption.clone();
+            super::super::finalization::finalize_and_render(&mut host, &mut state).await;
+            assert!(
+                state.final_text.is_empty(),
+                "runtime notices are not assistant answers"
+            );
+            let interruption = state.interruption.as_ref().unwrap();
+            assert_eq!(
+                interruption.kind,
+                original_kind.unwrap_or(InterruptionKind::ExecutionIncomplete)
+            );
+            if let Some(original) = original {
+                assert_eq!(interruption, &original);
+            }
+            assert!(owner.has_pending_direct_children());
+            assert!(
+                !state
+                    .messages
+                    .iter()
+                    .any(|message| message["role"] == "assistant")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_child_message_can_yield_empty_response_until_child_completes() {
         use astra_messaging::in_process::InProcessTransport;
         use astra_messaging::router::AgentMailboxRouter;
         use astra_messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget};
@@ -8340,7 +8398,7 @@ mod tests {
         let wait_started = Arc::new(tokio::sync::Notify::new());
         let mut host = MockHost::new(vec![
             text_result("provisional", 10, 2, Some(10)),
-            text_result("still working", 10, 2, Some(10)),
+            text_result("", 10, 0, Some(10)),
             text_result("synthesized", 10, 2, Some(10)),
         ]);
         host.direct_child_owner = Some(Arc::clone(&owner));

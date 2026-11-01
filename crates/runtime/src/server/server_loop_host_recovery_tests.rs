@@ -505,3 +505,57 @@ async fn provider_completion_trace_needs_no_inference_receipt() {
     ledger.assert_quiescent();
     provider.assert_complete();
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+async fn completed_empty_response_uses_loop_settlement_once() {
+    let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+    for final_text in ["settled answer", ""] {
+        let response = |text: &str| {
+            ProviderResponse::Stream {
+            content_type: "text/event-stream",
+            chunks: vec![format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3}})).into_bytes()],
+            release_before_chunk: None,
+        }
+        };
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "complete empty response then one settlement",
+            |request| request.path == "/v1/chat/completions",
+            vec![response(""), response(final_text)],
+        )])
+        .await;
+        let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
+        let mut host = test_host_builder("settlement-user", "empty-settlement")
+            .with_provider_observations(ledger.clone())
+            .with_admitted_model_execution(Some(test_gateway_execution(
+                format!("{}/v1/chat/completions", provider.base_url),
+                Some(2000),
+            )))
+            .build();
+        let mut state = create_durable_execution_test_state("empty-settlement");
+        state
+            .messages
+            .push(json!({"role":"user","content":"answer from available evidence"}));
+        state.message = "answer from available evidence".into();
+        state.user_intent = state.message.clone();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let requests = provider.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].body["messages"]
+                .to_string()
+                .contains("textless_provider_response")
+        );
+        drop(requests);
+        assert_eq!(state.final_text, final_text);
+        assert_eq!(
+            state.interruption.as_ref().map(|r| r.kind),
+            final_text
+                .is_empty()
+                .then_some(astra_turn_core::interruption::InterruptionKind::EmptyCompletion)
+        );
+        ledger.assert_quiescent();
+        provider.assert_complete();
+    }
+}

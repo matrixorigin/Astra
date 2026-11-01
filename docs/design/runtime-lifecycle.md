@@ -643,6 +643,11 @@ typed workspace completion evidence, unsettled execution ownership, and child
 completion/reply obligations. None can be discharged by assistant prose or an
 unrelated successful tool. Their interruption status is separate from useful
 partial assistant output; runtime diagnostics must not overwrite that output.
+Ordinary complete provider responses without an action reach this same completion owner:
+it waits for dependencies before applying the existing bounded text-only
+settlement. Transport failures and mandatory convergence retain their provider recovery path. A child
+finalization fence preserves any prior typed interruption and never manufactures
+assistant text from a lifecycle notice.
 An executed, failed side-effect-capable invocation with cancellation, timeout or
 unknown-outcome evidence remains execution-incomplete until its owning lifecycle
 reconciles it. Settled process ownership does not prove success of the operation.
