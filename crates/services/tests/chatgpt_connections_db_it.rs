@@ -204,6 +204,38 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         .filter(|item| model_ids.contains(&item.offering_id))
         .collect();
     assert_eq!(own.len(), 2);
+    let first_item = own
+        .iter()
+        .find(|item| item.offering_id == model_ids[0])
+        .unwrap();
+    assert_eq!(
+        first_item.thinking_protocol,
+        Some(astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning)
+    );
+    assert_eq!(
+        first_item.thinking_capability,
+        Some(astra_services::models::ThinkingCapability::EffortOnly)
+    );
+    assert_eq!(
+        first_item.supported_reasoning_efforts.as_ref().unwrap(),
+        &vec![
+            "low".to_string(),
+            "medium".into(),
+            "high".into(),
+            "xhigh".into(),
+            "max".into()
+        ],
+        "the protocol inventory excludes upstream-only controls such as ultra"
+    );
+    let second_execution = models
+        .admit_model_offering(owner.clone(), model_ids[1].clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        second_execution.supported_reasoning_efforts,
+        Some(vec!["high".into()])
+    );
+
     assert!(own.iter().all(|item| item.access_id==format!("chatgpt:{connection}") && item.pricing.is_none()));
     assert!(
         models

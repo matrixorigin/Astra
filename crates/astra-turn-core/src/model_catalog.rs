@@ -363,6 +363,7 @@ mod tests {
 
     fn item(index: usize) -> ModelListItem {
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: format!("offering-{index:03}"),
             access_id: "access-1".into(),

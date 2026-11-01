@@ -1527,9 +1527,32 @@ impl ChatgptConnections {
                 .ok_or_else(|| {
                     internal_error("OpenAI subscription catalog has an invalid model slug")
                 })?;
-            items.push(
-                json!({"slug":slug,"display_name":model["display_name"].as_str().unwrap_or(slug)}),
-            );
+            let mut efforts = Vec::new();
+            if let Some(levels) = model["supported_reasoning_levels"].as_array() {
+                if levels.len() > 16 {
+                    return Err(internal_error("Invalid subscription reasoning inventory"));
+                }
+                for level in levels {
+                    let effort = level["effort"]
+                        .as_str()
+                        .filter(|s| {
+                            !s.is_empty()
+                                && s.len() <= 32
+                                && s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+                        })
+                        .ok_or_else(|| internal_error("Invalid subscription reasoning effort"))?;
+                    if efforts.iter().any(|value| value == effort) {
+                        return Err(internal_error("Duplicate subscription reasoning effort"));
+                    }
+                    if astra_core::model_wire::thinking::ThinkingProtocol::supports_responses_effort(
+                        effort,
+                    ) {
+                        efforts.push(effort.to_owned());
+                    }
+                }
+            }
+            items.push(json!({"slug":slug,"display_name":model["display_name"].as_str().unwrap_or(slug),
+                "supported_reasoning_efforts":efforts,"default_reasoning_effort":model["default_reasoning_level"].as_str().filter(|effort| efforts.iter().any(|value| value == effort))}));
         }
         Ok(json!({"connection_id":binding.connection_id(),"items":items}))
     }
@@ -1538,19 +1561,22 @@ impl ChatgptConnections {
         owner: &str,
         id: &str,
         model: &str,
-    ) -> ApiResult<ExecutionCredential> {
+    ) -> ApiResult<(ExecutionCredential, Vec<String>)> {
         let binding = self.binding(owner, id).await?;
         let catalog = self.catalog(&binding).await?;
-        if !catalog["items"]
+        let selected = catalog["items"]
             .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["slug"] == model))
-        {
-            return Err(fail(
-                StatusCode::BAD_REQUEST,
-                "chatgpt_model_unavailable",
-                "Choose a model from this connection's current catalog",
-            ));
-        }
+            .and_then(|items| items.iter().find(|item| item["slug"] == model))
+            .ok_or_else(|| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "chatgpt_model_unavailable",
+                    "Choose a model from this connection's current catalog",
+                )
+            })?;
+        let efforts: Vec<String> =
+            serde_json::from_value(selected["supported_reasoning_efforts"].clone())
+                .map_err(internal_error)?;
         let body = astra_core::model_wire::responses::request(
             model,
             &[json!({"role":"user","content":"Reply briefly with OK."})],
@@ -1579,7 +1605,7 @@ impl ChatgptConnections {
                 "Subscription model check returned no text",
             ));
         }
-        Ok(binding)
+        Ok((binding, efforts))
     }
     async fn disconnect(&self, owner: &str, id: &str) -> ApiResult<Value> {
         let pool = self.pool()?;

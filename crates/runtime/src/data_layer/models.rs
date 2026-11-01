@@ -678,6 +678,7 @@ mod tests {
 
     fn edge_item(id: &str, name: &str) -> ModelListItem {
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: id.to_string(),
             access_id: "this-device".to_string(),

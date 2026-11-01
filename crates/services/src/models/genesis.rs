@@ -261,6 +261,7 @@ impl DatabaseModelService {
                     return Err(unavailable());
                 }
                 items.push(ModelListItem {
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     offering_id: offering_id(&provider.settings.issuer, subject, &model.id),
                     access_id: "genesis".into(),

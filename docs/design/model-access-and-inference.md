@@ -100,6 +100,15 @@ assistant tool calls; private metadata retains no second raw argument copy. Resu
 replays them only for the same connection and model; other protocols remove
 that metadata at the existing internal-marker projection boundary. No
 `previous_response_id` thread store or parallel history projection exists.
+Subscription reasoning controls come from `supported_reasoning_levels` in the
+connection's upstream catalog, intersected with the Responses wire protocol's
+supported controls. Creation and explicit checks retain the declared
+effort inventory in the existing configuration-bound model capability snapshot;
+model discovery, exact admission and delegation consume that same inventory.
+Inference performs no catalog fetch. The shared `responses_reasoning` adapter
+emits `reasoning.effort`; Model default omits the field. Unsupported effort,
+binary suppression and token-budget requests fail before provider dispatch.
+
 Only completed streams authorize tool dispatch; partial/truncated streams fail.
 When a completed subscription response has an empty output array, the shared
 codec uses its fully received `response.output_item.done` items. Text deltas

@@ -159,6 +159,7 @@ fn runtime_provider_principal() -> AuthPrincipal {
 
 fn fixture(index: usize) -> ModelListItem {
     ModelListItem {
+        supported_reasoning_efforts: None,
         thinking_protocol: None,
         offering_id: format!("id-{index:03}"),
         name: format!("name-{index:03}"),

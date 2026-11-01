@@ -1556,7 +1556,8 @@ export type RuntimeModelCatalogPricing = {
 };
 
 export type RuntimeModelListItem = {
-  thinking_protocol: "unknown" | "enable_thinking" | "thinking_object" | "reasoning_effort" | "moonshot" | null;
+  supported_reasoning_efforts?: string[];
+  thinking_protocol: "unknown" | "enable_thinking" | "thinking_object" | "reasoning_effort" | "responses_reasoning" | "moonshot" | null;
   offering_id: string;
   access_id: string;
   access_kind: RuntimeModelAccessKind;

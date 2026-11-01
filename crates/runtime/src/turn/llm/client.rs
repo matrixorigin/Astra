@@ -1227,7 +1227,7 @@ impl LlmCall<'_> {
         {
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::InvalidRequest,
-                "reasoning effort is not supported by the admitted model gateway",
+                "reasoning effort is not supported by the admitted model",
             ));
         }
         Ok(())

@@ -63,13 +63,18 @@ pub(super) fn prepare(
     }
     if !matches!(
         call.thinking,
-        ThinkingConfig::ModelDefault | ThinkingConfig::Off
-    ) {
+        ThinkingConfig::ModelDefault | ThinkingConfig::Adaptive { .. }
+    ) || matches!(call.thinking, ThinkingConfig::Adaptive { .. })
+        && (call.route.thinking_protocol
+            != Some(astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning)
+            || call.route.supported_reasoning_efforts.is_none())
+    {
         return Err(error(
             astra_core::ErrorKind::InvalidRequest,
             "unsupported_subscription_reasoning_control",
         ));
     }
+    call.validate_declared_reasoning()?;
     let model = call.route.wire_model_name.unwrap_or(call.route.model_name);
     // Direct and pre-projected calls share runtime authority/order, continuation
     // and provider-call-ID projection before the codec encodes the request.
@@ -82,7 +87,7 @@ pub(super) fn prepare(
     for tool in &mut tools {
         strip_internal_schema_extensions(tool);
     }
-    let body = astra_core::model_wire::responses::request(
+    let mut body = astra_core::model_wire::responses::request(
         model,
         &messages,
         Some(&tools),
@@ -95,6 +100,10 @@ pub(super) fn prepare(
             "unsupported_subscription_input",
         )
     })?;
+    call.thinking.apply_openai_protocol(
+        &mut body,
+        astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning,
+    );
     let authorized_tool_names = if matches!(tool_choice, RuntimeToolChoice::None) {
         HashSet::new()
     } else {

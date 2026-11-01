@@ -2625,6 +2625,7 @@ mod tests {
         context_window: i32,
     ) -> ModelListItemResponse {
         ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: offering_id.to_string(),
             access_id: "self-hosted".to_string(),

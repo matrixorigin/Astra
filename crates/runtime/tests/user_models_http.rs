@@ -42,6 +42,7 @@ async fn published_0_2_12_keeps_reasoning_and_pricing_without_version_negotiatio
         let service = TestModelService {
             allows_deployment: true,
             catalog: vec![ModelListItem {
+                supported_reasoning_efforts: None,
                 thinking_protocol: Some(protocol),
                 offering_id: "published-reasoning-offering".into(),
                 access_id: "self-hosted".into(),
@@ -153,6 +154,7 @@ async fn catalog_formats_preserve_published_0_2_12_and_reject_0_2_10() {
 
     for protocol in [None, Some(ThinkingProtocol::EnableThinking)] {
         let offering = ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: protocol,
             offering_id: "offer-public".into(),
             access_id: "self-hosted".into(),
@@ -528,6 +530,7 @@ impl ModelService for TestModelService {
 async fn model_access_matches_run_eligibility_across_catalog_pages() {
     use astra_services::{ModelAccessKind, ModelExecutionPlacement};
     let offering = |name: &str, kind: ModelAccessKind| ModelListItem {
+        supported_reasoning_efforts: None,
         thinking_protocol: None,
         offering_id: name.into(),
         access_id: if kind == ModelAccessKind::CloudByok {
@@ -609,6 +612,7 @@ async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access
     ]
     .into_iter()
     .map(|(id, provider, is_active)| ModelListItem {
+        supported_reasoning_efforts: None,
         thinking_protocol: None,
         offering_id: id.into(),
         access_id: "cloud-byok".into(),
@@ -1116,6 +1120,7 @@ async fn subscription_sources_are_readable_by_published_catalog_v2_clients() {
     let label = "ChatGPT subscription · personal";
     let service = TestModelService {
         catalog: vec![ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "subscription-offering".into(),
             access_id: source.into(),

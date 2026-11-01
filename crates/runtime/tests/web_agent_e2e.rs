@@ -477,6 +477,7 @@ impl ModelService for TestModelService {
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         let model = self.model_record("test-model".to_string());
         Ok(vec![ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: DEFAULT_MODEL_OFFERING_ID.to_string(),
             access_id: "web-e2e-model-access".to_string(),

@@ -299,8 +299,8 @@ async fn models(
     (
         StatusCode::OK,
         Json(
-            json!({"models":[{"slug":"fixture-model","display_name":"Fixture model","visibility":"list"},
-        {"slug":"fixture-second","display_name":"Second fixture","visibility":"list"},{"slug":"hidden","visibility":"hidden"}]}),
+            json!({"models":[{"slug":"fixture-model","display_name":"Fixture model","visibility":"list","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}]},
+        {"slug":"fixture-second","display_name":"Second fixture","visibility":"list","supported_reasoning_levels":[{"effort":"high"}]},{"slug":"hidden","visibility":"hidden"}]}),
         ),
     )
 }

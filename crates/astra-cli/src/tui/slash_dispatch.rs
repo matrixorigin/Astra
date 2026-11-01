@@ -3160,11 +3160,18 @@ pub(crate) fn apply_model_picker_result(
         ));
         return Some(false);
     };
-    let opts = astra_turn_core::thinking_config::thinking_options(
+    let opts: Vec<_> = astra_turn_core::thinking_config::thinking_options(
         (!entry.provider.trim().is_empty()).then_some(entry.provider.trim()),
         entry.thinking_capability.map(|value| value.as_str()),
         entry.thinking_protocol.unwrap_or_default(),
-    );
+    )
+    .into_iter()
+    .filter(|option| {
+        option
+            .config
+            .is_within_declared_efforts(entry.supported_reasoning_efforts.as_deref())
+    })
+    .collect();
     if let Some(config) = config {
         if !opts.iter().any(|option| &option.config == config) {
             chat_widget.commit_system(SystemCell::error(

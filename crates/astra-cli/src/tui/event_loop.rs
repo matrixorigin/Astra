@@ -22843,6 +22843,84 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn subscription_reasoning_picker_revalidates_exact_inventory() {
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session-1");
+        let rows = serde_json::from_value(serde_json::json!([{
+            "offering_id":"subscription-offer", "access_id":"subscription", "access_kind":"cloud_byok",
+            "access_label":"Personal", "execution_placement":"server", "name":"personal GPT", "provider":"chatgpt",
+            "thinking_capability":"effort_only", "thinking_protocol":"responses_reasoning",
+            "supported_reasoning_efforts":["high","xhigh"], "is_active":true, "context_window":128000,
+            "max_completion_tokens":null, "architecture":null
+        }])).unwrap();
+        bottom_pane.cache_model_catalog(rows);
+        let pick = |config| bottom_pane::view::ViewResult::ModelThinking {
+            base_model: "personal GPT".into(),
+            config,
+        };
+        let low = pick(ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Low,
+        });
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &low,
+                &mut state,
+                &mut bottom_pane,
+                &mut widget
+            ),
+            Some(false)
+        );
+        assert!(
+            state.model.is_none(),
+            "a non-declared effort must not change selection"
+        );
+        let xhigh = pick(ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::XHigh,
+        });
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &xhigh,
+                &mut state,
+                &mut bottom_pane,
+                &mut widget
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            bottom_pane.footer.model.as_deref(),
+            Some("personal GPT(thinking:xhigh)")
+        );
+        let selected = state.model.clone();
+        let mut changed = bottom_pane.current_model_catalog().to_vec();
+        changed[0].supported_reasoning_efforts = Some(vec!["high".into()]);
+        bottom_pane.cache_model_catalog(changed);
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &xhigh,
+                &mut state,
+                &mut bottom_pane,
+                &mut widget
+            ),
+            Some(false)
+        );
+        assert_eq!(state.model, selected, "stale choices must be rejected");
+        let default = pick(ThinkingConfig::ModelDefault);
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &default,
+                &mut state,
+                &mut bottom_pane,
+                &mut widget
+            ),
+            Some(false)
+        );
+        assert_eq!(bottom_pane.footer.model.as_deref(), Some("personal GPT"));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn model_catalog_completion_opens_picker_and_retains_structured_metadata() {
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.model = Some("gpt-5".into());

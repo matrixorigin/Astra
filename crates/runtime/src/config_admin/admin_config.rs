@@ -378,6 +378,7 @@ mod tests {
 
     fn jev_item(active: bool) -> ModelListItem {
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "offer-jev".into(),
             access_id: "deployment".into(),

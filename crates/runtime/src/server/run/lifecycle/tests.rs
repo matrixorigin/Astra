@@ -3003,6 +3003,7 @@ impl astra_services::ModelService for ActiveTestModelService {
     ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         *self.catalog_requests.lock().unwrap() += 1;
         Ok(vec![astra_services::ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "model-test-model".to_string(),
             access_id: "self-hosted".to_string(),

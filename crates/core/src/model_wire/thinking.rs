@@ -11,6 +11,9 @@ pub enum ThinkingProtocol {
     EnableThinking,
     ThinkingObject,
     ReasoningEffort,
+    /// Responses uses a nested reasoning object rather than Chat Completions'
+    /// top-level reasoning_effort. Model inventory still owns eligibility.
+    ResponsesReasoning,
     /// Moonshot's binary toggle, without an additional effort field. Sampling
     /// capability is independent of the toggle and is not inferred here.
     Moonshot,
@@ -18,6 +21,15 @@ pub enum ThinkingProtocol {
 
 impl ThinkingProtocol {
     pub const REVISION: u32 = 2;
+
+    /// A model catalog may include controls from other execution protocols.
+    /// Only values accepted by this wire contract can become admitted controls.
+    pub fn supports_responses_effort(effort: &str) -> bool {
+        matches!(
+            effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        )
+    }
 
     pub fn can_disable(self) -> bool {
         matches!(
@@ -27,7 +39,7 @@ impl ThinkingProtocol {
     }
 
     /// Apply known protocols *after* generic overrides. Unknown preserves the
-    /// existing assembly contract. `effort` is canonical low/medium/high/max.
+    /// existing assembly contract. Admission owns the supported effort inventory.
     pub fn apply(self, body: &mut Value, enabled: bool, effort: Option<&str>) {
         // Unknown is absence of adapter knowledge, not authority to erase
         // established provider behavior or explicit administrator overrides.
@@ -72,6 +84,11 @@ impl ThinkingProtocol {
                 }
             }
             Self::ReasoningEffort => {}
+            Self::ResponsesReasoning => {
+                if enabled && let Some(effort) = effort {
+                    body["reasoning"] = json!({"effort": effort});
+                }
+            }
         }
     }
 }
@@ -114,6 +131,9 @@ pub fn canonical_thinking_protocol(
     let host = url.as_ref().and_then(|url| url.host_str()).unwrap_or("");
     let host = host.trim_end_matches('.');
     let provider = provider.trim().to_ascii_lowercase();
+    if provider == "chatgpt" {
+        return ThinkingProtocol::ResponsesReasoning;
+    }
     if matches!(provider.as_str(), "anthropic" | "bedrock") {
         return ThinkingProtocol::Unknown; // Those adapters own their native envelopes.
     }
@@ -190,6 +210,20 @@ pub fn configured_temperature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_effort_uses_only_the_nested_wire_control() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let mut body = json!({"reasoning_effort":"old","enable_thinking":true});
+            ThinkingProtocol::ResponsesReasoning.apply(&mut body, true, Some(effort));
+            assert_eq!(body, json!({"reasoning":{"effort":effort}}));
+        }
+        assert!(!ThinkingProtocol::ResponsesReasoning.can_disable());
+        assert!(!ThinkingProtocol::supports_responses_effort("ultra"));
+        assert!(!ThinkingProtocol::supports_responses_effort(
+            "future-unknown-effort"
+        ));
+    }
 
     #[test]
     fn zero_temperature_requires_native_endpoint_authority() {

@@ -27,7 +27,7 @@ pub use catalog_reader::{
     AuthorizedModelCatalogCache, AuthorizedModelCatalogReader, read_authorized_model_catalog,
 };
 use thinking_probe::{
-    ThinkingProbeSnapshot, cached_capability, probe_chat_protocol, probe_identity,
+    ThinkingProbeSnapshot, cached_capability, cached_efforts, probe_chat_protocol, probe_identity,
 };
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -639,6 +639,8 @@ pub struct ModelRecord {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelListItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_reasoning_efforts: Option<Vec<String>>,
     pub thinking_protocol: Option<ThinkingProtocol>,
     pub offering_id: String,
     pub access_id: String,
@@ -1806,7 +1808,10 @@ fn normalize_model_selector_for_resolution(requested: &str) -> &str {
         return base;
     }
     if let Some(effort) = inner.strip_prefix("thinking:") {
-        if matches!(effort, "on" | "off" | "low" | "medium" | "high" | "max") {
+        if matches!(
+            effort,
+            "on" | "off" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
             return base;
         }
         if let Some(budget) = effort.strip_prefix("budget:")
@@ -2413,25 +2418,20 @@ fn admitted_user_model_from_row(
     let upstream: String = row
         .try_get("model_name")
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-    let (thinking_protocol, thinking_capability) = if connection.is_some() {
-        (None, None)
-    } else {
-        let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
-        let snapshot: Option<String> = row
-            .try_get("thinking_probe_json")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        let identity = probe_identity(
-            &provider,
-            &base_url,
-            &upstream,
-            encrypted.as_deref().unwrap_or(""),
-            "",
-        );
-        (
-            Some(protocol),
-            cached_capability(snapshot.as_deref(), &identity, protocol),
-        )
-    };
+    let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
+    let snapshot: Option<String> = row
+        .try_get("thinking_probe_json")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let identity = probe_identity(
+        &provider,
+        &base_url,
+        &upstream,
+        encrypted.as_deref().unwrap_or(""),
+        connection.as_deref().unwrap_or(""),
+    );
+    let thinking_protocol = Some(protocol);
+    let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
+    let supported_efforts = cached_efforts(snapshot.as_deref(), &identity, protocol);
     Ok(AdmittedModelExecution {
         subscription: None,
         admitted_at: std::time::Instant::now(),
@@ -2451,7 +2451,7 @@ fn admitted_user_model_from_row(
         cache_capability: None,
         thinking_capability,
         fixed_temperature: None,
-        supported_reasoning_efforts: None,
+        supported_reasoning_efforts: supported_efforts,
         thinking_protocol,
         request_body_overrides: None,
         context_window: Some(context_window),
@@ -3447,6 +3447,25 @@ impl DatabaseModelService {
         self
     }
 
+    fn subscription_thinking_snapshot(
+        binding: &crate::chatgpt::ExecutionCredential,
+        model: &str,
+        efforts: Vec<String>,
+    ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+        let protocol = ThinkingProtocol::ResponsesReasoning;
+        let identity = probe_identity(
+            crate::chatgpt::PROVIDER,
+            binding.api_base()?,
+            model,
+            "",
+            binding.connection_id(),
+        );
+        ThinkingProbeSnapshot::declared(identity, protocol, efforts)
+            .map(|snapshot| serde_json::to_string(&snapshot))
+            .transpose()
+            .map_err(internal_error)
+    }
+
     async fn create_subscription_model(
         &self,
         user_id: String,
@@ -3473,10 +3492,11 @@ impl DatabaseModelService {
         let model = validate_user_model_identifier("model", &request.model)?;
         validate_context_window_value(request.context_window, "context_window")
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
-        let binding = self
+        let (binding, efforts) = self
             .subscriptions
             .probe(&user_id, connection_id, &model)
             .await?;
+        let thinking_snapshot = Self::subscription_thinking_snapshot(&binding, &model, efforts)?;
         let pool = self.get_pool().await.map_err(internal_error)?;
         let duplicate: i64 =
             query_scalar("SELECT COUNT(*) FROM user_llm_models WHERE user_id=? AND model_alias=?")
@@ -3501,9 +3521,9 @@ impl DatabaseModelService {
                 .await
                 .map_err(internal_error)?;
         }
-        query("INSERT INTO user_llm_models (model_id,user_id,model_alias,model_name,provider,api_key_encrypted,connection_id,base_url,context_window,is_default,is_active) VALUES (?,?,?,?,?,NULL,?,?,?,?,1)")
+        query(astra_core::matrixone_statement_with_null_shape("INSERT INTO user_llm_models (model_id,user_id,model_alias,model_name,provider,api_key_encrypted,connection_id,base_url,context_window,is_default,is_active,thinking_probe_json) VALUES (?,?,?,?,?,NULL,?,?,?,?,1,?)", [thinking_snapshot.is_some()]))
             .bind(&model_id).bind(&user_id).bind(name).bind(model).bind(crate::chatgpt::PROVIDER).bind(connection_id)
-            .bind(self.subscriptions.api_base()?).bind(request.context_window).bind(if request.is_default {1_i16} else {0_i16})
+            .bind(self.subscriptions.api_base()?).bind(request.context_window).bind(if request.is_default {1_i16} else {0_i16}).bind(thinking_snapshot)
             .execute(&mut *tx).await.map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
         self.get_user_model(user_id, model_id).await
@@ -3662,6 +3682,7 @@ impl DatabaseModelService {
         });
 
         Ok(ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: Some(protocol),
             offering_id: row.try_get("model_id").map_err(internal_error)?,
             access_id: "self-hosted".to_string(),
@@ -3695,6 +3716,7 @@ impl DatabaseModelService {
         let model: String = row.try_get("model_name").map_err(internal_error)?;
         let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
         let raw: Option<String> = row.try_get("thinking_probe_json").map_err(internal_error)?;
+        let connection: Option<String> = row.try_get("connection_id").map_err(internal_error)?;
         let thinking_probe = raw
             .as_deref()
             .and_then(|value| serde_json::from_str::<ThinkingProbeSnapshot>(value).ok())
@@ -3705,7 +3727,7 @@ impl DatabaseModelService {
                         &base,
                         &model,
                         encrypted.as_deref().unwrap_or(""),
-                        "",
+                        connection.as_deref().unwrap_or(""),
                     ),
                     canonical_thinking_protocol(&provider, &base, &model),
                 )
@@ -3818,12 +3840,21 @@ impl DatabaseModelService {
                         result.error.is_none() || result.capability != ThinkingCapability::None
                     })
                     .map(|result| result.capability);
+                let raw: Option<String> =
+                    row.try_get("thinking_probe_json").map_err(internal_error)?;
+                let encrypted: Option<String> =
+                    row.try_get("api_key_encrypted").map_err(internal_error)?;
+                let identity = probe_identity(
+                    &record.provider,
+                    &record.base_url,
+                    &record.model,
+                    encrypted.as_deref().unwrap_or(""),
+                    connection_id.as_deref().unwrap_or(""),
+                );
+                let efforts = cached_efforts(raw.as_deref(), &identity, protocol);
                 models.push(ModelListItem {
-                    thinking_protocol: if connection_id.is_some() {
-                        None
-                    } else {
-                        Some(protocol)
-                    },
+                    supported_reasoning_efforts: efforts,
+                    thinking_protocol: Some(protocol),
                     offering_id: record.model_id,
                     access_id: connection_id
                         .as_ref()
@@ -4390,9 +4421,14 @@ impl ModelService for DatabaseModelService {
         };
 
         let mut tx = pool.begin().await.map_err(internal_error)?;
-        if let Some(binding) = subscription_binding {
+        let subscription_snapshot = if let Some((binding, efforts)) = subscription_binding {
             binding.lock_current(&mut tx).await?;
-        }
+            Some(Self::subscription_thinking_snapshot(
+                &binding, &model, efforts,
+            )?)
+        } else {
+            None
+        };
         if request.is_default == Some(true) {
             query(
                 "UPDATE user_llm_models SET is_default = 0, updated_at = NOW(6) WHERE user_id = ?",
@@ -4421,9 +4457,10 @@ impl ModelService for DatabaseModelService {
                 .map_err(internal_error)?;
         }
         if let Some(is_active) = request.is_active {
-            query("UPDATE user_llm_models SET is_active = ?, is_default = CASE WHEN ? = 0 THEN 0 ELSE is_default END, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
+            query(astra_core::matrixone_statement_with_null_shape("UPDATE user_llm_models SET is_active = ?, is_default = CASE WHEN ? = 0 THEN 0 ELSE is_default END, thinking_probe_json=CASE WHEN ? THEN ? ELSE thinking_probe_json END, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?", [subscription_snapshot.as_ref().is_some_and(|value| value.is_some())]))
                 .bind(if is_active { 1_i16 } else { 0_i16 })
                 .bind(if is_active { 1_i16 } else { 0_i16 })
+                .bind(subscription_snapshot.is_some()).bind(subscription_snapshot.as_ref().and_then(|s| s.as_deref()))
                 .bind(&user_id)
                 .bind(&model_id)
                 .execute(&mut *tx)
@@ -4431,9 +4468,10 @@ impl ModelService for DatabaseModelService {
                 .map_err(internal_error)?;
         }
         if let Some(is_default) = request.is_default {
-            query("UPDATE user_llm_models SET is_default = ?, is_active = CASE WHEN ? = 1 THEN 1 ELSE is_active END, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
+            query(astra_core::matrixone_statement_with_null_shape("UPDATE user_llm_models SET is_default = ?, is_active = CASE WHEN ? = 1 THEN 1 ELSE is_active END, thinking_probe_json=CASE WHEN ? THEN ? ELSE thinking_probe_json END, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?", [subscription_snapshot.as_ref().is_some_and(|value| value.is_some())]))
                 .bind(if is_default { 1_i16 } else { 0_i16 })
                 .bind(if is_default { 1_i16 } else { 0_i16 })
+                .bind(subscription_snapshot.is_some()).bind(subscription_snapshot.as_ref().and_then(|s| s.as_deref()))
                 .bind(&user_id)
                 .bind(&model_id)
                 .execute(&mut *tx)
@@ -4483,15 +4521,16 @@ impl ModelService for DatabaseModelService {
             let model = existing
                 .try_get::<String, _>("model_name")
                 .map_err(internal_error)?;
-            let binding = self
+            let (binding, efforts) = self
                 .subscriptions
                 .probe(&user_id, &connection, &model)
                 .await?;
+            let snapshot = Self::subscription_thinking_snapshot(&binding, &model, efforts)?;
             let pool = self.get_pool().await.map_err(internal_error)?;
             let mut tx = pool.begin().await.map_err(internal_error)?;
             binding.lock_current(&mut tx).await?;
-            query("UPDATE user_llm_models SET is_active=1,updated_at=NOW(6) WHERE user_id=? AND model_id=?")
-                .bind(&user_id).bind(&model_id).execute(&mut *tx).await.map_err(internal_error)?;
+            query(astra_core::matrixone_statement_with_null_shape("UPDATE user_llm_models SET is_active=1,thinking_probe_json=?,updated_at=NOW(6) WHERE user_id=? AND model_id=?", [snapshot.is_some()]))
+                .bind(snapshot).bind(&user_id).bind(&model_id).execute(&mut *tx).await.map_err(internal_error)?;
             tx.commit().await.map_err(internal_error)?;
             return self.get_user_model(user_id, model_id).await;
         }
@@ -6212,6 +6251,8 @@ pub struct ModelResponse {
 // admission decisions, and their enum values retain their strict contracts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelListItemResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_reasoning_efforts: Option<Vec<String>>,
     pub thinking_protocol: Option<ThinkingProtocol>,
     pub offering_id: String,
     pub access_id: String,
@@ -6257,6 +6298,7 @@ impl From<ModelRecord> for ModelResponse {
 impl From<ModelListItem> for ModelListItemResponse {
     fn from(r: ModelListItem) -> Self {
         Self {
+            supported_reasoning_efforts: r.supported_reasoning_efforts,
             thinking_protocol: r.thinking_protocol,
             offering_id: r.offering_id,
             access_id: r.access_id,
@@ -6279,6 +6321,7 @@ impl From<ModelListItem> for ModelListItemResponse {
 impl From<ModelListItemResponse> for ModelListItem {
     fn from(item: ModelListItemResponse) -> Self {
         Self {
+            supported_reasoning_efforts: item.supported_reasoning_efforts,
             thinking_protocol: item.thinking_protocol,
             offering_id: item.offering_id,
             access_id: item.access_id,
@@ -6932,6 +6975,7 @@ mod tests {
 
     fn test_model_list_item(provider: &str, name: &str, offering_id: &str) -> ModelListItem {
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: offering_id.to_string(),
             access_id: "self-hosted".to_string(),
@@ -8467,6 +8511,7 @@ mod tests {
         )
         .expect("explicit configured USD price");
         let item = ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "m1".into(),
             access_id: "self-hosted".into(),
@@ -8500,6 +8545,7 @@ mod tests {
     #[test]
     fn model_list_item_with_none_optionals() {
         let item = ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "m2".into(),
             access_id: "self-hosted".into(),
@@ -8534,6 +8580,7 @@ mod tests {
             availability: ModelAccessAvailability::Ready,
         };
         let offering = ModelListItemResponse::from(ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "offer-1".into(),
             access_id: declared.id.clone(),
@@ -8701,6 +8748,7 @@ mod tests {
             },
         };
         let offering = ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "offer-1".into(),
             access_id: declared.id.clone(),
@@ -8737,6 +8785,7 @@ mod tests {
             availability: ModelAccessAvailability::Ready,
         };
         let offering = |id: &str, name: &str| ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: id.into(),
             access_id: declared.id.clone(),
@@ -8785,6 +8834,7 @@ mod tests {
             availability: ModelAccessAvailability::Ready,
         };
         let offering = |id: &str, provider: &str, name: &str| ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: id.into(),
             access_id: declared.id.clone(),
@@ -8840,6 +8890,7 @@ mod tests {
             availability: ModelAccessAvailability::Ready,
         };
         let byok_offering = ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "byok-1".into(),
             access_id: cloud_byok.id.clone(),
@@ -8887,6 +8938,7 @@ mod tests {
             availability: ModelAccessAvailability::Ready,
         };
         let offering = |id: &str, name: &str| ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: id.into(),
             access_id: declared.id.clone(),
@@ -8934,6 +8986,7 @@ mod tests {
             availability: ModelAccessAvailability::Ready,
         };
         let offering = ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "offer-alpha".into(),
             access_id: declared.id.clone(),
@@ -8983,6 +9036,7 @@ mod tests {
             availability: ModelAccessAvailability::Ready,
         };
         let offering = ModelListItemResponse {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "offer-alpha".into(),
             access_id: declared.id.clone(),
@@ -9035,6 +9089,7 @@ mod tests {
                 availability: ModelAccessAvailability::Ready,
             }],
             vec![ModelListItemResponse {
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 offering_id: "offer-1".into(),
                 access_id: "self-hosted".into(),
@@ -9288,6 +9343,7 @@ mod tests {
     #[test]
     fn model_list_item_response_json_uses_is_active_snake_case() {
         let item = ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "m3".into(),
             access_id: "self-hosted".into(),

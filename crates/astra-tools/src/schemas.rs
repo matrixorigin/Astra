@@ -1870,7 +1870,7 @@ fn fanout_reasoning_schema() -> Value {
         "oneOf": [
             {"properties": {"mode": {"enum": ["model_default", "on", "off"]}}, "additionalProperties": false},
             {"properties": {"mode": {"const": "enabled"}, "budget_tokens": {"type": "integer", "minimum": 1024, "maximum": 4294967295_u64}}, "required": ["budget_tokens"], "additionalProperties": false},
-            {"properties": {"mode": {"const": "adaptive"}, "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]}}, "required": ["effort"], "additionalProperties": false}
+            {"properties": {"mode": {"const": "adaptive"}, "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}}, "required": ["effort"], "additionalProperties": false}
         ]
     })
 }

@@ -54,6 +54,7 @@ async fn infer(
         tools,
         attempts,
         Duration::from_secs(12),
+        &ThinkingConfig::ModelDefault,
     )
     .await
 }
@@ -63,6 +64,7 @@ async fn infer_with_budget(
     tools: &[Value],
     attempts: &Attempts,
     budget: Duration,
+    thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     call_llm_and_collect_with_stream_callback(
         LlmCall {
@@ -73,7 +75,7 @@ async fn infer_with_budget(
             route: LlmExecutionRoute::from_admitted(execution),
             max_output_tokens: Some(1024),
             temperature: Some(0.7),
-            thinking: &ThinkingConfig::ModelDefault,
+            thinking,
         },
         LlmCancel::None,
         None,
@@ -292,6 +294,55 @@ async fn responses_transport_recovery_and_credential_fencing() {
         flag.store(false, Ordering::SeqCst);
     }
 
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let thinking: ThinkingConfig =
+            serde_json::from_value(json!({"mode":"adaptive","effort":effort})).unwrap();
+        let result = infer_with_budget(
+            &admitted,
+            &messages,
+            &[],
+            &attempts,
+            Duration::from_secs(12),
+            &thinking,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "Continued successfully");
+        let requests = provider.state.requests.lock().unwrap();
+        assert_eq!(
+            requests.last().unwrap()["reasoning"],
+            json!({"effort":effort})
+        );
+        assert!(requests.last().unwrap().get("reasoning_effort").is_none());
+    }
+    let mut restricted = admitted.clone();
+    restricted.supported_reasoning_efforts = Some(vec!["high".into()]);
+    let before = provider.state.responses_calls.load(Ordering::SeqCst);
+    let low: ThinkingConfig =
+        serde_json::from_value(json!({"mode":"adaptive","effort":"low"})).unwrap();
+    assert!(
+        infer_with_budget(
+            &restricted,
+            &messages,
+            &[],
+            &attempts,
+            Duration::from_secs(12),
+            &low
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        provider.state.responses_calls.load(Ordering::SeqCst),
+        before,
+        "unsupported control must fail before HTTP dispatch"
+    );
+    assert!(
+        provider.state.requests.lock().unwrap()[0]
+            .get("reasoning")
+            .is_none()
+    );
+
     provider.state.truncate.store(true, Ordering::SeqCst);
     let before = provider.state.responses_calls.load(Ordering::SeqCst);
     assert!(
@@ -327,6 +378,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
             &tools,
             &attempts,
             Duration::from_millis(100),
+            &ThinkingConfig::ModelDefault,
         )
         .await
         .unwrap_err();

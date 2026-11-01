@@ -49,6 +49,8 @@ pub enum ThinkingEffort {
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
     Max,
 }
 
@@ -87,6 +89,7 @@ impl From<&astra_turn_types::DelegationReasoningRequirement> for ThinkingConfig 
                     DelegationReasoningEffort::Low => ThinkingEffort::Low,
                     DelegationReasoningEffort::Medium => ThinkingEffort::Medium,
                     DelegationReasoningEffort::High => ThinkingEffort::High,
+                    DelegationReasoningEffort::XHigh => ThinkingEffort::XHigh,
                     DelegationReasoningEffort::Max => ThinkingEffort::Max,
                 },
             },
@@ -158,12 +161,16 @@ impl ThinkingConfig {
             Self::Enabled { budget_tokens } => {
                 *budget_tokens >= 1024 && capability == Some("both") && native
             }
-            Self::Adaptive { .. } => {
-                matches!(capability, Some("both" | "effort_only"))
+            Self::Adaptive { effort } => {
+                (!matches!(effort, ThinkingEffort::XHigh)
+                    || protocol == ThinkingProtocol::ResponsesReasoning)
+                    && matches!(capability, Some("both" | "effort_only"))
                     && (native
                         || matches!(
                             protocol,
-                            ThinkingProtocol::ReasoningEffort | ThinkingProtocol::ThinkingObject
+                            ThinkingProtocol::ReasoningEffort
+                                | ThinkingProtocol::ThinkingObject
+                                | ThinkingProtocol::ResponsesReasoning
                         ))
             }
         }
@@ -405,6 +412,7 @@ fn effort_str(e: ThinkingEffort) -> &'static str {
         ThinkingEffort::Low => "low",
         ThinkingEffort::Medium => "medium",
         ThinkingEffort::High => "high",
+        ThinkingEffort::XHigh => "xhigh",
         ThinkingEffort::Max => "max",
     }
 }
@@ -435,27 +443,17 @@ pub fn thinking_suffix_for(config: &ThinkingConfig) -> String {
         ThinkingConfig::Enabled { budget_tokens } => {
             format!("(thinking:budget:{})", budget_tokens)
         }
-        ThinkingConfig::Adaptive {
-            effort: ThinkingEffort::Low,
-        } => "(thinking:low)".to_string(),
-        ThinkingConfig::Adaptive {
-            effort: ThinkingEffort::Medium,
-        } => "(thinking:medium)".to_string(),
-        ThinkingConfig::Adaptive {
-            effort: ThinkingEffort::High,
-        } => "(thinking:high)".to_string(),
-        ThinkingConfig::Adaptive {
-            effort: ThinkingEffort::Max,
-        } => "(thinking:max)".to_string(),
+        ThinkingConfig::Adaptive { effort } => format!("(thinking:{effort})"),
     }
 }
 
-/// Parse an effort token (`low` | `medium` | `high` | `max`) into `ThinkingEffort`.
+/// Parse an effort token (`low` | `medium` | `high` | `xhigh` | `max` ) into `ThinkingEffort`.
 fn parse_effort_token(token: &str) -> Option<ThinkingEffort> {
     match token {
         "low" => Some(ThinkingEffort::Low),
         "medium" => Some(ThinkingEffort::Medium),
         "high" => Some(ThinkingEffort::High),
+        "xhigh" => Some(ThinkingEffort::XHigh),
         "max" => Some(ThinkingEffort::Max),
         _ => None,
     }
@@ -467,7 +465,7 @@ fn parse_effort_token(token: &str) -> Option<ThinkingEffort> {
 ///
 /// Recognized suffixes (longest/most-specific first):
 ///   - `(thinking:budget:N)` → `Enabled { budget_tokens: N }`
-///   - `(thinking:low|medium|high|max)` → `Adaptive { effort }`
+///   - `(thinking:low|medium|high|xhigh|max)` → `Adaptive { effort }`
 ///   - `(thinking)` → `Adaptive { effort: High }` (shorthand)
 pub fn resolve_model_thinking(model_selector: &str) -> (&str, ThinkingConfig) {
     // Fast path: no trailing ')' → no suffix possible.
@@ -579,6 +577,30 @@ pub fn thinking_options(
             } else {
                 thinking_options_for_adaptive_reasoning()
             }
+        }
+        Some("effort_only")
+            if protocol
+                == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning =>
+        {
+            let mut options = vec![ThinkingOption {
+                label: "Model default",
+                config: ThinkingConfig::ModelDefault,
+                is_default: true,
+            }];
+            for (label, effort) in [
+                ("Low", ThinkingEffort::Low),
+                ("Medium", ThinkingEffort::Medium),
+                ("High", ThinkingEffort::High),
+                ("Extra high", ThinkingEffort::XHigh),
+                ("Max", ThinkingEffort::Max),
+            ] {
+                options.push(ThinkingOption {
+                    label,
+                    config: ThinkingConfig::Adaptive { effort },
+                    is_default: false,
+                });
+            }
+            options
         }
         Some("effort_only") => thinking_options_for_effort_only(),
         None | Some("none") | Some("native_only") => vec![],
@@ -711,6 +733,48 @@ pub fn strip_think_tags(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn responses_picker_and_selectors_preserve_declared_efforts() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        let allowed = vec!["high".into(), "xhigh".into()];
+        let options: Vec<_> = thinking_options(
+            Some("chatgpt"),
+            Some("effort_only"),
+            ThinkingProtocol::ResponsesReasoning,
+        )
+        .into_iter()
+        .filter(|option| option.config.is_within_declared_efforts(Some(&allowed)))
+        .collect();
+        assert_eq!(
+            options.iter().map(|o| o.config.clone()).collect::<Vec<_>>(),
+            vec![
+                ThinkingConfig::ModelDefault,
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::High
+                },
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::XHigh
+                }
+            ]
+        );
+        let effort = ThinkingEffort::XHigh;
+        let config = ThinkingConfig::Adaptive { effort };
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["effort"],
+            effort.as_str()
+        );
+        let selector = format!("model{}", thinking_suffix_for(&config));
+        assert_eq!(resolve_model_thinking(&selector), ("model", config.clone()));
+        assert!(!config.is_supported_by("anthropic", Some("both"), ThinkingProtocol::Unknown));
+        let mut body = json!({});
+        config.apply_openai_protocol(&mut body, ThinkingProtocol::ResponsesReasoning);
+        assert_eq!(body, json!({"reasoning":{"effort":effort.as_str()}}));
+        let mut body = json!({});
+        ThinkingConfig::ModelDefault
+            .apply_openai_protocol(&mut body, ThinkingProtocol::ResponsesReasoning);
+        assert_eq!(body, json!({}));
+    }
     #[test]
     fn auxiliary_reasoning_respects_exact_gateway_effort_inventory() {
         use astra_core::model_wire::thinking::ThinkingProtocol;

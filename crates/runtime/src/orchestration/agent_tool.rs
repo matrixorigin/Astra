@@ -3352,6 +3352,9 @@ fn delegation_reasoning_requirement(
                 astra_turn_core::thinking_config::ThinkingEffort::High => {
                     DelegationReasoningEffort::High
                 }
+                astra_turn_core::thinking_config::ThinkingEffort::XHigh => {
+                    DelegationReasoningEffort::XHigh
+                }
                 astra_turn_core::thinking_config::ThinkingEffort::Max => {
                     DelegationReasoningEffort::Max
                 }

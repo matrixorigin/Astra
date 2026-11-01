@@ -41636,6 +41636,7 @@ mod tests {
         > {
             *self.reads.lock().unwrap() += 1;
             Ok(vec![astra_services::ModelListItem {
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 offering_id: "offer-a".into(),
                 access_id: "self-hosted".into(),

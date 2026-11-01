@@ -19935,6 +19935,9 @@ fn native_stage_reasoning_arguments(
         ThinkingConfig::Adaptive {
             effort: ThinkingEffort::Max,
         } => "xhigh",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::XHigh,
+        } => "xhigh",
         ThinkingConfig::On {} | ThinkingConfig::Enabled { .. } => {
             return Err("selected native stage does not support this reasoning control".into());
         }

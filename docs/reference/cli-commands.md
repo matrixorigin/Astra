@@ -139,7 +139,7 @@ Recovery and removal:
 
 ```bash
 astra model connect chatgpt --connection <connection-uuid>
-astra model check coding
+astra model probe coding
 astra model disconnect <connection-uuid>
 ```
 
@@ -155,8 +155,11 @@ explicitly choose another default. Quota errors never select a paid fallback.
 
 V1 supports text and Astra function tools through the Responses HTTP API.
 Images/audio, hosted tools, realtime/WebSocket sessions, custom endpoints and
-reasoning controls are not exposed. Availability and eligibility come from
-OpenAI; a ChatGPT subscription does not imply every model is available.
+custom sampling controls are not exposed. Reasoning depth uses the selected
+model's declared inventory: choose Model default to preserve OpenAI's default,
+or select an available effort in `/model` (including `xhigh` when declared). Run `astra model probe coding` to refresh an existing model's
+capability snapshot. Availability and eligibility come from OpenAI; a ChatGPT
+subscription does not imply every model or effort is available.
 See [Server configuration](configuration.md#chatgpt-subscription-connections)
 for deployment and rollback requirements.
 
