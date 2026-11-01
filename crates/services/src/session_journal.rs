@@ -1152,6 +1152,10 @@ pub enum ToolCallDisposition {
 #[serde(rename_all = "snake_case")]
 pub enum ToolPreDispatchRejection {
     ProviderSchemaValidation,
+    /// The executor explicitly reported an unavailable capability without
+    /// starting execution or leaving possible side effects. This is retry
+    /// evidence only, never a successful execution or observation.
+    CapabilityUnavailable,
 }
 
 impl ToolCallDisposition {
