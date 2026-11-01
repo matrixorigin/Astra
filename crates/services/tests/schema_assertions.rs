@@ -2022,6 +2022,22 @@ async fn phase2_web_hydration_schema_contract() {
     );
     let invocation_columns = column_names(&pool, &schema, "tool_invocation_ledger").await;
     assert!(
+        !invocation_columns
+            .iter()
+            .any(|column| column == "created_at" || column == "updated_at"),
+        "ledger timestamps without a consumer must not add writes to every state or lease update"
+    );
+    assert!(
+        index_columns(
+            &pool,
+            &schema,
+            "tool_invocation_ledger",
+            "idx_tool_invocation_updated"
+        )
+        .await
+        .is_empty()
+    );
+    assert!(
         invocation_columns
             .iter()
             .any(|column| column == "identity_key"),

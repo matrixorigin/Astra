@@ -16,9 +16,15 @@ use astra_turn_types::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Row, Transaction};
+use sqlx::{MySql, QueryBuilder, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
+
+const TOOL_INVOCATION_RECORD_COLUMNS: &str = "JSON_UNQUOTE(fingerprint_json) AS fingerprint_json,
+    JSON_UNQUOTE(decision_json) AS decision_json,
+    JSON_UNQUOTE(outcome_json) AS outcome_json,
+    JSON_UNQUOTE(completion_source_json) AS completion_source_json,
+    state, dispatch_certainty, attempt_count, dispatch_owner";
 
 const TOOL_INVOCATION_ARCHIVE_VERSION: &str = "tool-invocation-run-archive-v1";
 const TOOL_INVOCATION_COMPACTION_BATCH_RECORDS: i64 = 32;
@@ -271,10 +277,8 @@ impl DatabaseToolInvocationLedger {
         let inserted = sqlx::query(
             "INSERT IGNORE INTO tool_invocation_ledger (
                 user_id, session_id, run_id, turn_chain_id, invocation_id,
-                identity_key, fingerprint_json, decision_json, state, dispatch_certainty, attempt_count,
-                created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 'not_dispatched', 0,
-                       CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))",
+                identity_key, fingerprint_json, decision_json, state, dispatch_certainty, attempt_count
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 'not_dispatched', 0)",
         )
         .bind(&identity.user_id)
         .bind(&identity.session_id)
@@ -569,8 +573,7 @@ impl DatabaseToolInvocationLedger {
             "UPDATE tool_invocation_ledger
              SET state = 'rejected', dispatch_certainty = 'not_dispatched',
                  outcome_json = ?, completion_source_json = ?,
-                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
-                 updated_at = CURRENT_TIMESTAMP(6)
+                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND state = 'prepared' AND attempt_count = 0",
         )
@@ -585,8 +588,7 @@ impl DatabaseToolInvocationLedger {
         let inconsistent_prepared_unknown = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
-                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
-                 updated_at = CURRENT_TIMESTAMP(6)
+                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND state = 'prepared' AND attempt_count > 0",
         )
@@ -599,8 +601,7 @@ impl DatabaseToolInvocationLedger {
         let expired_dispatches_unknown = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
-                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
-                 updated_at = CURRENT_TIMESTAMP(6)
+                 dispatch_owner = NULL, dispatch_lease_expires_at = NULL
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND state = 'dispatched'
                AND (dispatch_owner IS NULL
@@ -784,21 +785,15 @@ impl DatabaseToolInvocationLedger {
         // the unresolved effect after compaction. Archiving it would make a
         // later recovery capture look quiescent even though replay still needs
         // human/provider reconciliation.
-        let rows = sqlx::query(
-            "SELECT turn_chain_id, invocation_id, identity_key,
-                    JSON_UNQUOTE(fingerprint_json) AS fingerprint_json,
-                    JSON_UNQUOTE(decision_json) AS decision_json,
-                    JSON_UNQUOTE(outcome_json) AS outcome_json,
-                    JSON_UNQUOTE(completion_source_json) AS completion_source_json,
-                    state, dispatch_certainty, attempt_count, dispatch_owner,
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT turn_chain_id, invocation_id, identity_key, {TOOL_INVOCATION_RECORD_COLUMNS},
                     CAST(UNIX_TIMESTAMP(dispatch_lease_expires_at) * 1000 AS UNSIGNED)
                         AS dispatch_lease_expires_at_epoch_ms
-             FROM tool_invocation_ledger
-             WHERE user_id = ? AND session_id = ? AND run_id = ?
-               AND state <> 'outcome_unknown'
-             ORDER BY identity_key
-             LIMIT ? FOR UPDATE",
-        )
+                 FROM tool_invocation_ledger
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND state <> 'outcome_unknown'
+                 ORDER BY identity_key LIMIT ? FOR UPDATE",
+        )))
         .bind(user_id)
         .bind(session_id)
         .bind(run_id)
@@ -926,42 +921,79 @@ impl DatabaseToolInvocationLedger {
         // reachability to the run archive without rewriting the artifact's
         // retention policy; otherwise per-invocation references grow forever
         // in long-lived sessions.
-        for record in &chunk.records {
-            let invocation_key = record.identity.storage_key();
-            let result_artifact_ids = sqlx::query_scalar::<_, String>(
-                "SELECT artifact_id FROM session_artifact_references
-                 WHERE user_id = ? AND session_id = ?
-                   AND reference_kind = 'invocation_ledger' AND reference_id = ?
-                 FOR UPDATE",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(&invocation_key)
-            .fetch_all(&mut *tx)
-            .await?;
-            for result_artifact_id in result_artifact_ids {
-                sqlx::query(
-                    "INSERT IGNORE INTO session_artifact_references
-                     (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
-                     VALUES (?, ?, ?, 'invocation_ledger', ?, CURRENT_TIMESTAMP(6))",
-                )
-                .bind(user_id)
-                .bind(session_id)
-                .bind(&result_artifact_id)
-                .bind(run_id)
-                .execute(&mut *tx)
-                .await?;
+        // Bound both the SQL parameter count and memory even when one result
+        // owns many artifacts. Delete only the observed, locked edges: shared
+        // artifacts and references belonging to other invocations remain live.
+        let mut after = (String::new(), String::new());
+        loop {
+            let mut query = QueryBuilder::<MySql>::new(
+                "SELECT artifact_id, reference_id FROM session_artifact_references WHERE user_id = ",
+            );
+            query
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND reference_kind = 'invocation_ledger' AND reference_id IN (");
+            let mut keys = query.separated(", ");
+            for key in &identity_keys {
+                keys.push_bind(key);
             }
-            sqlx::query(
-                "DELETE FROM session_artifact_references
-                 WHERE user_id = ? AND session_id = ?
-                   AND reference_kind = 'invocation_ledger' AND reference_id = ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(invocation_key)
-            .execute(&mut *tx)
-            .await?;
+            keys.push_unseparated(")");
+            query
+                .push(" AND (artifact_id, reference_id) > (")
+                .push_bind(&after.0)
+                .push(", ")
+                .push_bind(&after.1)
+                .push(") ORDER BY artifact_id, reference_id LIMIT 128 FOR UPDATE");
+            let edges = query.build().fetch_all(&mut *tx).await?;
+            if edges.is_empty() {
+                break;
+            }
+            let pairs = edges
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<String, _>("artifact_id")?,
+                        row.try_get::<String, _>("reference_id")?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, sqlx::Error>>()?;
+            after = pairs.last().expect("non-empty edge page").clone();
+            let artifacts = pairs
+                .iter()
+                .map(|(artifact, _)| artifact)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut insert = QueryBuilder::<MySql>::new(
+                "INSERT IGNORE INTO session_artifact_references (user_id, session_id, artifact_id, reference_kind, reference_id, created_at) ",
+            );
+            insert.push_values(artifacts, |mut row, artifact| {
+                row.push_bind(user_id)
+                    .push_bind(session_id)
+                    .push_bind(artifact)
+                    .push_bind("invocation_ledger")
+                    .push_bind(run_id)
+                    .push("CURRENT_TIMESTAMP(6)");
+            });
+            insert.build().execute(&mut *tx).await?;
+            let mut delete = QueryBuilder::<MySql>::new(
+                "DELETE FROM session_artifact_references WHERE user_id = ",
+            );
+            delete.push_bind(user_id).push(" AND session_id = ").push_bind(session_id)
+                .push(" AND reference_kind = 'invocation_ledger' AND (artifact_id, reference_id) IN (");
+            let mut tuples = delete.separated(", ");
+            for (artifact, reference) in &pairs {
+                tuples
+                    .push("(")
+                    .push_bind_unseparated(artifact)
+                    .push_unseparated(", ")
+                    .push_bind_unseparated(reference)
+                    .push_unseparated(")");
+            }
+            tuples.push_unseparated(")");
+            delete.build().execute(&mut *tx).await?;
+            if pairs.len() < 128 {
+                break;
+            }
         }
         sqlx::query(
             "INSERT INTO tool_invocation_archive_chunks
@@ -980,20 +1012,33 @@ impl DatabaseToolInvocationLedger {
         .bind(content_json.len() as u64)
         .execute(&mut *tx)
         .await?;
+        let mut delete =
+            QueryBuilder::<MySql>::new("DELETE FROM tool_invocation_ledger WHERE user_id = ");
+        delete
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND run_id = ")
+            .push_bind(run_id)
+            .push(" AND (turn_chain_id, invocation_id, identity_key) IN (");
+        let mut tuples = delete.separated(", ");
         for record in &chunk.records {
-            sqlx::query(
-                "DELETE FROM tool_invocation_ledger
-                 WHERE user_id = ? AND session_id = ? AND run_id = ?
-                   AND turn_chain_id = ? AND invocation_id = ? AND identity_key = ?",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .bind(run_id)
-            .bind(&record.identity.turn_chain_id)
-            .bind(&record.identity.invocation_id)
-            .bind(record.identity.storage_key())
-            .execute(&mut *tx)
-            .await?;
+            tuples
+                .push("(")
+                .push_bind_unseparated(&record.identity.turn_chain_id)
+                .push_unseparated(", ")
+                .push_bind_unseparated(&record.identity.invocation_id)
+                .push_unseparated(", ")
+                .push_bind_unseparated(record.identity.storage_key())
+                .push_unseparated(")");
+        }
+        tuples.push_unseparated(")");
+        let deleted = delete.build().execute(&mut *tx).await?.rows_affected();
+        if deleted != chunk.records.len() as u64 {
+            return Err(ToolInvocationLedgerStoreError::CompactionDeleteMismatch {
+                expected: chunk.records.len(),
+                actual: deleted,
+            });
         }
         let remaining_records: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tool_invocation_ledger
@@ -1020,8 +1065,15 @@ impl DatabaseToolInvocationLedger {
         identity: &ToolInvocationIdentity,
     ) -> Result<Option<ToolInvocationRecord>, ToolInvocationLedgerStoreError> {
         let identity_key = identity.storage_key();
-        let rows = sqlx::query(
-            "SELECT chunks.artifact_id, artifacts.status, artifacts.content_json
+        let mut found = None;
+        let mut had_candidate = false;
+        let mut after_chunk: Option<u64> = None;
+        loop {
+            let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+            // Keep candidate bodies bounded on both sides of the connection.
+            // A single ordinary chunk still needs just one archive query.
+            let rows = sqlx::query(
+            "SELECT chunks.chunk_index, chunks.artifact_id, artifacts.status, artifacts.content_json
              FROM tool_invocation_archive_chunks chunks
              LEFT JOIN session_artifacts artifacts
                ON artifacts.user_id = chunks.user_id
@@ -1029,6 +1081,7 @@ impl DatabaseToolInvocationLedger {
               AND artifacts.artifact_id = chunks.artifact_id
              WHERE chunks.user_id = ? AND chunks.session_id = ? AND chunks.run_id = ?
                AND chunks.first_identity_key <= ? AND chunks.last_identity_key >= ?
+               AND (? IS NULL OR chunks.chunk_index > ?)
              ORDER BY chunks.chunk_index LIMIT 2",
         )
         .bind(&identity.user_id)
@@ -1036,14 +1089,60 @@ impl DatabaseToolInvocationLedger {
         .bind(&identity.run_id)
         .bind(&identity_key)
         .bind(&identity_key)
-        .fetch_all(self.pool.get())
-        .await?;
-        if rows.len() > 1 {
-            return Err(ToolInvocationLedgerStoreError::OverlappingArchiveRanges {
-                identity: identity.clone(),
-            });
+        .bind(after_chunk)
+        .bind(after_chunk)
+        .fetch_all(connection.connection_mut()).await?;
+            connection.release();
+            let count = rows.len();
+            if rows.is_empty() {
+                break;
+            }
+            had_candidate = true;
+            for row in rows {
+                after_chunk = Some(row.try_get("chunk_index")?);
+                let artifact_id: String = row.try_get("artifact_id")?;
+                let status: Option<String> = row.try_get("status")?;
+                let content_json: Option<String> = row.try_get("content_json")?;
+                if status.as_deref() != Some("active") || content_json.is_none() {
+                    return Err(ToolInvocationLedgerStoreError::ArchiveUnavailable {
+                        artifact_id,
+                        status,
+                    });
+                }
+                let chunk: ToolInvocationArchiveChunk =
+                    serde_json::from_str(&content_json.expect("checked archive content")).map_err(
+                        |source| ToolInvocationLedgerStoreError::InvalidArchive {
+                            artifact_id: artifact_id.clone(),
+                            source,
+                        },
+                    )?;
+                if chunk.version != TOOL_INVOCATION_ARCHIVE_VERSION
+                    || chunk.user_id != identity.user_id
+                    || chunk.session_id != identity.session_id
+                    || chunk.run_id != identity.run_id
+                {
+                    return Err(ToolInvocationLedgerStoreError::ArchiveScopeMismatch {
+                        artifact_id,
+                    });
+                }
+                // Ranges are candidate indexes, not unique identities. A formerly
+                // unknown invocation can settle inside an earlier chunk's range.
+                for record in chunk.records {
+                    if record.identity == *identity {
+                        if found.is_some() {
+                            return Err(ToolInvocationLedgerStoreError::DuplicateArchiveIdentity {
+                                identity: identity.clone(),
+                            });
+                        }
+                        found = Some(record);
+                    }
+                }
+            }
+            if count < 2 {
+                break;
+            }
         }
-        let Some(row) = rows.first() else {
+        if !had_candidate {
             let status: Option<String> = sqlx::query_scalar(
                 "SELECT status FROM agent_runs
                  WHERE user_id = ? AND session_id = ? AND run_id = ?",
@@ -1063,36 +1162,8 @@ impl DatabaseToolInvocationLedger {
                     },
                 );
             }
-            return Ok(None);
-        };
-        let artifact_id: String = row.try_get("artifact_id")?;
-        let status: Option<String> = row.try_get("status")?;
-        let content_json: Option<String> = row.try_get("content_json")?;
-        if status.as_deref() != Some("active") || content_json.is_none() {
-            return Err(ToolInvocationLedgerStoreError::ArchiveUnavailable {
-                artifact_id,
-                status,
-            });
         }
-        let content_json = content_json.expect("checked archive content");
-        let chunk: ToolInvocationArchiveChunk =
-            serde_json::from_str(&content_json).map_err(|source| {
-                ToolInvocationLedgerStoreError::InvalidArchive {
-                    artifact_id: artifact_id.clone(),
-                    source,
-                }
-            })?;
-        if chunk.version != TOOL_INVOCATION_ARCHIVE_VERSION
-            || chunk.user_id != identity.user_id
-            || chunk.session_id != identity.session_id
-            || chunk.run_id != identity.run_id
-        {
-            return Err(ToolInvocationLedgerStoreError::ArchiveScopeMismatch { artifact_id });
-        }
-        Ok(chunk
-            .records
-            .into_iter()
-            .find(|record| record.identity == *identity))
+        Ok(found)
     }
 
     /// Atomically grant one worker the right to cross the provider boundary.
@@ -1212,8 +1283,7 @@ impl DatabaseToolInvocationLedger {
                     "UPDATE tool_invocation_ledger
                      SET state = 'rejected', dispatch_certainty = 'not_dispatched',
                          outcome_json = ?, completion_source_json = ?,
-                         dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
-                         updated_at = CURRENT_TIMESTAMP(6)
+                         dispatch_owner = NULL, dispatch_lease_expires_at = NULL
                      WHERE user_id = ? AND session_id = ? AND run_id = ?
                        AND turn_chain_id = ? AND invocation_id = ?
                        AND state = 'prepared' AND attempt_count = 0",
@@ -1340,8 +1410,7 @@ impl DatabaseToolInvocationLedger {
             "UPDATE tool_invocation_ledger
              SET state = 'dispatched', dispatch_certainty = 'dispatched',
                  attempt_count = attempt_count + 1, dispatch_owner = ?,
-                 dispatch_lease_expires_at = TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
-                 updated_at = CURRENT_TIMESTAMP(6)
+                 dispatch_lease_expires_at = TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6))
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ? AND state = 'prepared'",
         )
@@ -1439,8 +1508,7 @@ impl DatabaseToolInvocationLedger {
                  SET state = 'dispatched', dispatch_certainty = 'dispatched',
                      attempt_count = attempt_count + 1, dispatch_owner = ?,
                      dispatch_lease_expires_at =
-                         TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
-                     updated_at = CURRENT_TIMESTAMP(6)
+                         TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6))
                  WHERE user_id = ? AND session_id = ? AND run_id = ?
                    AND turn_chain_id = ? AND invocation_id = ? AND state = 'prepared'",
             )
@@ -1457,8 +1525,7 @@ impl DatabaseToolInvocationLedger {
             crate::runs::TransactionalRunActionAdmission::AlreadyStarted { .. } => sqlx::query(
                 "UPDATE tool_invocation_ledger
                  SET dispatch_lease_expires_at =
-                         TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
-                     updated_at = CURRENT_TIMESTAMP(6)
+                         TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6))
                  WHERE user_id = ? AND session_id = ? AND run_id = ?
                    AND turn_chain_id = ? AND invocation_id = ?
                    AND state = 'dispatched'
@@ -1531,19 +1598,21 @@ impl DatabaseToolInvocationLedger {
         identity: &ToolInvocationIdentity,
         owner_id: &str,
         lease_duration_ms: u64,
-    ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+    ) -> Result<(), ToolInvocationLedgerStoreError> {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
         let mut tx = connection.begin().await?;
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET dispatch_lease_expires_at =
-                     TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
-                 updated_at = CURRENT_TIMESTAMP(6)
+                     TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6))
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ?
-               AND state = 'dispatched' AND dispatch_owner = ?",
+               AND state = 'dispatched' AND dispatch_owner = ?
+               AND dispatch_certainty = 'dispatched' AND attempt_count BETWEEN 1 AND 4294967295
+               AND dispatch_lease_expires_at IS NOT NULL
+               AND TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)) IS NOT NULL",
         )
         .bind(lease_duration_us)
         .bind(&identity.user_id)
@@ -1552,17 +1621,27 @@ impl DatabaseToolInvocationLedger {
         .bind(&identity.turn_chain_id)
         .bind(&identity.invocation_id)
         .bind(owner_id)
+        .bind(lease_duration_us)
         .execute(&mut *tx)
-        .await?;
-        let record = load_record_in_tx(&mut tx, identity).await?.ok_or_else(|| {
-            ToolInvocationLedgerStoreError::NotFound {
-                identity: identity.clone(),
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            let record = load_record_in_tx(&mut tx, identity).await?.ok_or_else(|| {
+                ToolInvocationLedgerStoreError::NotFound {
+                    identity: identity.clone(),
+                }
+            })?;
+            ensure_dispatched_owner(identity, &record, owner_id)?;
+            if record.attempt_count == 0 {
+                return Err(ToolInvocationLedgerStoreError::InvalidAttemptCount(0));
             }
-        })?;
-        ensure_dispatched_owner(identity, &record, owner_id)?;
+            return Err(ToolInvocationLedgerStoreError::DispatchLeaseRenewalFailed {
+                identity: identity.clone(),
+            });
+        }
         tx.commit().await?;
         connection.release();
-        Ok(record)
+        Ok(())
     }
 
     /// Return the authoritative row after atomically converting an expired
@@ -1576,8 +1655,7 @@ impl DatabaseToolInvocationLedger {
         let mut tx = connection.begin().await?;
         sqlx::query(
             "UPDATE tool_invocation_ledger
-             SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
-                 updated_at = CURRENT_TIMESTAMP(6)
+             SET state = 'outcome_unknown', dispatch_certainty = 'unknown'
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ?
                AND state = 'dispatched'
@@ -1610,8 +1688,7 @@ impl DatabaseToolInvocationLedger {
         let mut tx = connection.begin().await?;
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
-             SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
-                 updated_at = CURRENT_TIMESTAMP(6)
+             SET state = 'outcome_unknown', dispatch_certainty = 'unknown'
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ?
                AND state = 'dispatched' AND dispatch_owner = ?",
@@ -1693,8 +1770,7 @@ impl DatabaseToolInvocationLedger {
         let query = format!(
             "UPDATE tool_invocation_ledger
              SET state = ?, dispatch_certainty = 'dispatched', outcome_json = ?,
-                 completion_source_json = NULL,
-                 updated_at = CURRENT_TIMESTAMP(6)
+                 completion_source_json = NULL
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ? AND state = ?{owner_predicate}"
         );
@@ -1780,16 +1856,17 @@ impl DatabaseToolInvocationLedger {
             })?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
         let mut tx = connection.begin().await?;
-        let updated = sqlx::query(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE tool_invocation_ledger
              SET state = 'succeeded', dispatch_certainty = 'not_dispatched',
-                 outcome_json = ?, completion_source_json = ?,
-                 updated_at = CURRENT_TIMESTAMP(6)
+                 outcome_json = ?, completion_source_json = ?
              WHERE user_id = ? AND session_id = ? AND run_id = ?
                AND turn_chain_id = ? AND invocation_id = ?
                AND state = 'prepared' AND attempt_count = 0
-               AND dispatch_owner IS NULL AND dispatch_lease_expires_at IS NULL",
-        )
+               AND dispatch_owner IS NULL AND dispatch_lease_expires_at IS NULL
+             RETURNING {TOOL_INVOCATION_RECORD_COLUMNS},
+                       CAST(NULL AS UNSIGNED) AS dispatch_lease_expires_at_epoch_ms",
+        )))
         .bind(outcome_json)
         .bind(completion_source_json)
         .bind(&identity.user_id)
@@ -1797,10 +1874,13 @@ impl DatabaseToolInvocationLedger {
         .bind(&identity.run_id)
         .bind(&identity.turn_chain_id)
         .bind(&identity.invocation_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        let record = load_record_in_tx(&mut tx, identity).await?;
+        .fetch_all(&mut *tx)
+        .await?;
+        let updated = rows.len();
+        let record = match rows.first() {
+            Some(row) => Some(decode_record(row, identity)?),
+            None => load_record_in_tx(&mut tx, identity).await?,
+        };
         if updated != 1 {
             let error = match record {
                 Some(actual) => ToolInvocationLedgerStoreError::StateMismatch {
@@ -1910,20 +1990,14 @@ async fn lock_terminal_run(
 fn select_record_query(
     identity: &ToolInvocationIdentity,
 ) -> sqlx::query::Query<'_, MySql, sqlx::mysql::MySqlArguments> {
-    sqlx::query(
-        "SELECT JSON_UNQUOTE(fingerprint_json) AS fingerprint_json,
-                JSON_UNQUOTE(decision_json) AS decision_json,
-                JSON_UNQUOTE(outcome_json) AS outcome_json,
-                JSON_UNQUOTE(completion_source_json) AS completion_source_json,
-                state, dispatch_certainty, attempt_count, dispatch_owner,
-                CAST(
-                    UNIX_TIMESTAMP(dispatch_lease_expires_at) * 1000
-                    AS UNSIGNED
-                ) AS dispatch_lease_expires_at_epoch_ms
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {TOOL_INVOCATION_RECORD_COLUMNS},
+                CAST(UNIX_TIMESTAMP(dispatch_lease_expires_at) * 1000 AS UNSIGNED)
+                    AS dispatch_lease_expires_at_epoch_ms
          FROM tool_invocation_ledger
          WHERE user_id = ? AND session_id = ? AND run_id = ?
            AND turn_chain_id = ? AND invocation_id = ?",
-    )
+    )))
     .bind(&identity.user_id)
     .bind(&identity.session_id)
     .bind(&identity.run_id)
@@ -2360,6 +2434,8 @@ pub enum ToolInvocationLedgerStoreError {
     },
     #[error("tool invocation compaction returned invalid row count {0}")]
     InvalidCompactionCount(i64),
+    #[error("tool invocation compaction deleted {actual} records; expected {expected}")]
+    CompactionDeleteMismatch { expected: usize, actual: u64 },
     #[error("invalid tool invocation archive artifact {artifact_id}: {source}")]
     InvalidArchive {
         artifact_id: String,
@@ -2372,8 +2448,8 @@ pub enum ToolInvocationLedgerStoreError {
         artifact_id: String,
         status: Option<String>,
     },
-    #[error("overlapping tool invocation archive ranges for {identity:?}")]
-    OverlappingArchiveRanges { identity: ToolInvocationIdentity },
+    #[error("duplicate tool invocation archive identity for {identity:?}")]
+    DuplicateArchiveIdentity { identity: ToolInvocationIdentity },
     #[error("tool invocation record is no longer retained for terminal run: {identity:?}")]
     TerminalRunRecordUnavailable { identity: ToolInvocationIdentity },
     #[error("tool invocation disappeared after prepare: {identity:?}")]
@@ -2386,6 +2462,8 @@ pub enum ToolInvocationLedgerStoreError {
     InvalidLeaseDuration,
     #[error("tool invocation dispatch lease duration exceeds database range")]
     LeaseDurationOverflow,
+    #[error("dispatch lease was not renewed for invocation: {identity:?}")]
+    DispatchLeaseRenewalFailed { identity: ToolInvocationIdentity },
     #[error("dispatch owner does not own invocation: {identity:?}")]
     DispatchOwnerMismatch { identity: ToolInvocationIdentity },
     #[error("dispatch owner is required to complete invocation: {identity:?}")]

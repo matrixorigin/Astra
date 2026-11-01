@@ -25,6 +25,7 @@
 
 pub mod cleanup_catalog;
 pub mod collaborator_fixture;
+pub mod mysql_response_proxy;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::storage::ensure_core_schema;

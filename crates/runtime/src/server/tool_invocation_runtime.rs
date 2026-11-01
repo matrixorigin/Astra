@@ -717,7 +717,7 @@ impl RuntimeToolInvocationLedger {
         &self,
         identity: &ToolInvocationIdentity,
         owner_id: &str,
-    ) -> Result<ToolInvocationRecord, RuntimeInvocationLedgerError> {
+    ) -> Result<(), RuntimeInvocationLedgerError> {
         match self {
             Self::Database { ledger, .. } => Ok(ledger
                 .renew_dispatch(
@@ -728,11 +728,12 @@ impl RuntimeToolInvocationLedger {
                 .await?),
             Self::InMemory { ledger, .. } => {
                 let lease = lease_from_now(owner_id, DISPATCH_LEASE_DURATION)?;
-                Ok(ledger
+                ledger
                     .run_ledger(identity)
                     .lock()
                     .await
-                    .renew_dispatch(identity, lease)?)
+                    .renew_dispatch(identity, lease)?;
+                Ok(())
             }
         }
     }

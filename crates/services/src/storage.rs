@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-31-v117";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-01-v118";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3620,10 +3620,7 @@ async fn ensure_core_schema_while_leased(
             dispatch_lease_expires_at DATETIME(6) NULL,
             outcome_json        JSON NULL,
             completion_source_json JSON NULL,
-            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, invocation_id),
-            INDEX idx_tool_invocation_updated (updated_at),
             INDEX idx_tool_invocation_run_compaction
                 (user_id, session_id, run_id, state, identity_key),
             INDEX idx_tool_invocation_session_state
