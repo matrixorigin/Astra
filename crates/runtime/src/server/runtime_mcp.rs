@@ -15,7 +15,7 @@ use astra_mcp::{
     mcp_tool_to_schema, mcp_tools_to_provider_snapshot, sanitize_tool_name,
 };
 use astra_services::{
-    McpDiscoveredToolData, McpRegisterRequestData, mcp_binding_tool_namespace, mcp_schema_hash,
+    McpRegisterRequestData, McpRegisteredToolRecord, mcp_binding_tool_namespace,
     runs::RuntimeMcpBindingRequest,
 };
 use astra_turn_types::{
@@ -740,7 +740,7 @@ fn discovery_error(
 pub(crate) async fn discover_binding_tools(
     binding_id: &str,
     request: &McpRegisterRequestData,
-) -> Result<Vec<McpDiscoveredToolData>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Vec<McpRegisteredToolRecord>, (StatusCode, Json<ErrorResponse>)> {
     if binding_id.trim().is_empty() {
         return Err(mcp_error(
             StatusCode::BAD_REQUEST,
@@ -837,17 +837,9 @@ pub(crate) async fn discover_binding_tools(
                     "mcp_provider_projection_invalid",
                 )
             })?;
-        let hash_parts = json!({
-            "descriptor_version": descriptor.descriptor_version.as_str(),
-            "public_name": public_name,
-        });
-        discovered.push(McpDiscoveredToolData {
+        discovered.push(McpRegisteredToolRecord {
             tool_name: descriptor.native_tool_name.clone(),
             public_name,
-            description: descriptor.description.clone(),
-            input_schema_json: Some(descriptor.input_schema.clone()),
-            output_schema_json: descriptor.output_schema.clone(),
-            schema_hash: mcp_schema_hash(&hash_parts),
         });
     }
 

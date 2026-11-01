@@ -61,7 +61,6 @@ use astra_services::runs::{
     RunUserIntentData, RunUserIntentRecord, RuntimeAuthRequest, RuntimeProfileRequest,
     durable_run_status_blocks_session, durable_run_status_is_terminal, durable_run_status_kind,
 };
-use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
 use astra_services::work::{
     DatabaseWorkRepository, InternalSessionId, WorkBranchId, WorkBranchSubjectChange,
@@ -115,13 +114,13 @@ use crate::server::run::workspace_provisioning::{
 };
 use crate::server::session_turn::infer_session_turn;
 
+use crate::DatabaseTraceEventWriter;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
     ContextTracePersistenceContext, MessagingState, RequestConstraints, SkillState, StopHookState,
     run_agentic_loop_with_host,
 };
 use crate::turn::agentic_loop::lifecycle::resolve_cancellation_origin;
-use crate::{DatabaseEventService, DatabaseTraceEventWriter, EventCreateRequestData, EventService};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError, AgentLiveSignal,
@@ -3967,80 +3966,6 @@ fn bind_execution_owner_generation(state: &mut AgenticLoopState, owner_generatio
     state.current_run_owner_generation = Some(owner_generation);
 }
 
-fn build_runtime_event_service(
-    matrixone: &MatrixOneSettings,
-    shared_pool: &SharedPool,
-) -> DatabaseEventService {
-    DatabaseEventService::new(matrixone.clone()).with_pool(shared_pool.clone())
-}
-
-async fn persist_runtime_promotion_events(
-    matrixone: &MatrixOneSettings,
-    shared_pool: Option<&SharedPool>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    promotions: &[RuntimePromotionEventData],
-) -> Result<(), String> {
-    if promotions.is_empty() {
-        return Ok(());
-    }
-    let Some(pool) = shared_pool else {
-        tracing::debug!(
-            session_id,
-            "runtime promotion persistence skipped: shared_pool not configured"
-        );
-        return Ok(());
-    };
-
-    let service = build_runtime_event_service(matrixone, pool);
-    for promotion in promotions {
-        let metadata = match serde_json::to_value(promotion) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                tracing::warn!(
-                    target: "astra_runtime::run_lifecycle",
-                    subject_id = %promotion.subject_id,
-                    error = %err,
-                    "runtime promotion event serialize failed"
-                );
-                continue;
-            }
-        };
-        if let Err((status, response)) = service
-            .create_event(
-                user_id.to_string(),
-                EventCreateRequestData {
-                    ingestion_source: astra_services::events::EventIngestionSource::Client,
-                    event_id: None,
-                    session_id: session_id.to_string(),
-                    event_type: RUNTIME_PROMOTION_EVENT_TYPE.to_string(),
-                    content: promotion.summary.clone(),
-                    agent_id: None,
-                    agent_version: None,
-                    parent_event_id: None,
-                    parent_event_ids: Some(Vec::new()),
-                    causal_chain_id: Some(format!(
-                        "{session_id}:runtime-promotion:{}:{run_id}",
-                        promotion.subject_id
-                    )),
-                    metadata,
-                },
-            )
-            .await
-        {
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                subject_id = %promotion.subject_id,
-                status = %status,
-                detail = %response.0.detail,
-                "runtime promotion event persist failed"
-            );
-        }
-    }
-    Ok(())
-}
-
 pub(crate) use persistence::{
     CanonicalLoopAppend, CanonicalTerminalSettlement, PostLoopPersistContext,
     TranscriptPersistItem, TranscriptPersistPayload,
@@ -5705,8 +5630,6 @@ pub struct AgenticRunLifecycleService {
     model_service: Arc<dyn ModelService>,
     auth_service: Arc<dyn astra_services::AuthService>,
     model_catalog_cache: astra_services::models::AuthorizedModelCatalogCache,
-    /// Registry-backed MCP bindings available to server-side chat loops.
-    mcp_registry_service: Arc<dyn astra_services::McpRegistryService>,
     /// Immutable Agent Binding snapshots for binding-backed chat loops.
     agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
     /// Per-run approval request channel receivers (Phase E).
@@ -5841,7 +5764,6 @@ impl AgenticRunLifecycleService {
             model_service: Arc::new(astra_services::UnconfiguredModelService),
             auth_service: Arc::new(astra_services::auth::UnconfiguredAuthService),
             model_catalog_cache: Default::default(),
-            mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -6234,14 +6156,6 @@ impl AgenticRunLifecycleService {
         fixture: &crate::server::provider_test_support::ProviderObservationsFixture,
     ) -> Self {
         self.provider_observations = Some(fixture.clone());
-        self
-    }
-
-    pub fn with_mcp_registry_service(
-        mut self,
-        service: Arc<dyn astra_services::McpRegistryService>,
-    ) -> Self {
-        self.mcp_registry_service = service;
         self
     }
 
@@ -13769,7 +13683,6 @@ impl AgenticRunLifecycleService {
         let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
         let bg_root_mailbox_agent_id = agent_id.clone().unwrap_or_else(|| "root-agent".to_string());
         let persist_ctx = PostLoopPersistContext {
-            matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
             user_id: user_id.clone(),
             session_id: session_id.clone(),
@@ -24977,15 +24890,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             loop_state.current_session_id.as_deref().unwrap_or(""),
         )
         .await;
-        persist_runtime_promotion_events(
-            &self.matrixone,
-            self.shared_pool.as_ref(),
-            &config.user_id,
-            &config.session_id,
-            &config.run_id,
-            &loop_state.telemetry.promotion_events,
-        )
-        .await?;
         if durable_terminal_committed && control_authority.is_none()
             && let Some(event) = turn_evaluation.as_ref()
         {

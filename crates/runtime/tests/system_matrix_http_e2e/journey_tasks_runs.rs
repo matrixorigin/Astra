@@ -31,6 +31,7 @@ async fn seed_orphan_cancel_race_run(
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
+            terminal_at: None,
             run_id: run_id.clone(),
             user_id: ctx.user_id.clone(),
             session_id: ctx.session_id.clone(),

@@ -36,10 +36,23 @@ visible(tool) and execute(tool_call) must come from the same provider decision.
 
 No host loop, schema builder, or executor should maintain a separate shadow allowlist.
 
-MCP registry registration retains owner-scoped metadata, encrypted credentials
-and discovered tool schemas. Server MCP connections and discovery are prepared
-from the authorized request or Agent Binding. The unused registry-to-runtime
-loader and its Rust source result type are retired; registration remains available.
+MCP registry registration retains owner-scoped metadata and encrypted binding
+credentials. Registration discovers and validates tools live, confirms the
+binding and server are still active for that owner, and returns discovered tool
+identities. The write-only `mcp_tools` snapshot and registry-to-runtime loader
+are retired. Tool schemas, descriptor versions, alias resolution and execution
+remain owned by authorized request or Agent Binding discovery. The retired
+snapshot's SQL collation and column-width checks are no longer acceptance
+rules; provider discovery and exact-name duplicate validation remain.
+
+The unused Marketplace credential bucket and its POST/DELETE
+`/marketplace/credentials` API are retired. No runtime consumed those encrypted
+values. Skill configuration/resource bindings, CLI authentication and MCP binding
+credentials keep their existing owners. Existing encrypted bucket rows are not
+automatically dropped, exported or migrated; the application no longer offers
+save or delete access to them. Owners control any existing-secret disposal
+separately. Fresh same-version deployments omit both retired tables and their
+bootstrap claims, without compatibility or migration paths.
 
 ## Concepts
 

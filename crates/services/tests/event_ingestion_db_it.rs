@@ -382,6 +382,9 @@ fn test_event_for_user(
     event_type: &str,
 ) -> IngestionEvent {
     IngestionEvent {
+        run_id: None,
+        parent_run_id: None,
+        turn_seq: None,
         event_id: event_id.to_string(),
         session_id: session_id.to_string(),
         user_id: user_id.to_string(),

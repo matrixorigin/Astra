@@ -32,7 +32,12 @@ const REFLECT_OVERVIEW_SQL: &str = "SELECT \
        CAST(COALESCE(SUM(CASE WHEN event_type IN ('turn_error', 'error', 'tool_call_failed', 'tool_call_rejected', 'stall_detected', 'pipeline_alert') \
             THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
        CAST(MIN(created_at) AS CHAR) AS first_event, \
-       CAST(MAX(created_at) AS CHAR) AS last_event \
+       CAST(MAX(created_at) AS CHAR) AS last_event, \
+       COUNT(DISTINCT CASE WHEN event_type = 'agent_spawned' THEN COALESCE(run_id, agent_id, event_id) END) AS spawned, \
+       COUNT(DISTINCT CASE WHEN event_type = 'agent_completed' THEN COALESCE(run_id, agent_id, event_id) END) AS completed, \
+       COUNT(DISTINCT CASE WHEN event_type = 'agent_interrupted' THEN COALESCE(run_id, agent_id, event_id) END) AS interrupted, \
+       COUNT(DISTINCT CASE WHEN event_type = 'agent_failed' THEN COALESCE(run_id, agent_id, event_id) END) AS failed, \
+       COUNT(DISTINCT CASE WHEN event_type = 'agent_cancelled' THEN COALESCE(run_id, agent_id, event_id) END) AS cancelled \
      FROM agent_events WHERE session_id = ? AND user_id = ?";
 
 const REFLECT_ERROR_PATTERNS_SQL: &str = "SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
@@ -2298,21 +2303,7 @@ impl ReflectService for DatabaseReflectService {
 
         let overview_agg = reflect_overview_agg_from_row(&overview_row)?;
 
-        let agent_delivery_row = query(
-            "SELECT \
-               COUNT(DISTINCT CASE WHEN event_type = 'agent_spawned' THEN COALESCE(run_id, agent_id, event_id) END) AS spawned, \
-               COUNT(DISTINCT CASE WHEN event_type = 'agent_completed' THEN COALESCE(run_id, agent_id, event_id) END) AS completed, \
-               COUNT(DISTINCT CASE WHEN event_type = 'agent_interrupted' THEN COALESCE(run_id, agent_id, event_id) END) AS interrupted, \
-               COUNT(DISTINCT CASE WHEN event_type = 'agent_failed' THEN COALESCE(run_id, agent_id, event_id) END) AS failed, \
-               COUNT(DISTINCT CASE WHEN event_type = 'agent_cancelled' THEN COALESCE(run_id, agent_id, event_id) END) AS cancelled \
-             FROM agent_events WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| internal_error(format!("agent delivery query: {e}")))?;
-        let agent_delivery = agent_delivery_rollup_from_row(&agent_delivery_row)?;
+        let agent_delivery = agent_delivery_rollup_from_row(&overview_row)?;
 
         // Read optional request-context diagnostics for inference paths that
         // retain them (standalone completion and background inference). Agent

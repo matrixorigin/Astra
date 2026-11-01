@@ -41,26 +41,7 @@ async fn seed_current_checkpoint_fixture(
         .bind(&identity).bind(body.map(|_| "phase_checkpoint_v1")).bind(hash).bind(user).bind(run).execute(pool.get()).await.unwrap();
 }
 
-/// Capture actual statements only within the instrumented store call.
-#[derive(Clone, Default)]
-struct Queries(Arc<std::sync::Mutex<Vec<String>>>);
-
-impl tracing::field::Visit for Queries {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "db.statement" {
-            self.0.lock().unwrap().push(value.to_owned());
-        }
-    }
-    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Queries {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() == "sqlx::query" {
-            event.record(&mut self.clone());
-        }
-    }
-}
+use common::SqlQueries as Queries;
 
 async fn setup() -> (SharedPool, Arc<DatabaseRunStateStore>) {
     let (pool, _settings) = common::setup_pool_and_settings().await;
@@ -91,6 +72,7 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
+        terminal_at: None,
         run_id,
         user_id,
         session_id,
@@ -174,13 +156,14 @@ async fn insert_run_fixture(
 
 /// Complete through C0, the accounting/lifecycle owner, rather than inventing
 /// a second accounting-finalized event in the presentation log.
-async fn complete_run_fixture(
+async fn terminal_run_fixture(
     pool: &SharedPool,
     store: &DatabaseRunStateStore,
     user: &str,
     session: &str,
     run: &str,
     prompt: Option<u64>,
+    failure: Option<&str>,
 ) {
     let opened = store.load_run_admission(user, run).await.unwrap().unwrap();
     let opened = opened.run();
@@ -195,8 +178,12 @@ async fn complete_run_fixture(
         generation: opened.run_generation,
         opening_hash: opened.opening_hash.clone().unwrap(),
         context_admission_hash: opened.context_admission_hash.clone(),
-        outcome: CanonicalTerminalOutcome::Completed,
-        error_hash: None,
+        outcome: if failure.is_some() {
+            CanonicalTerminalOutcome::Failed
+        } else {
+            CanonicalTerminalOutcome::Completed
+        },
+        error_hash: CanonicalRunTerminalReceipt::error_hash(failure),
         error_code: None,
         error_kind: None,
         error_metadata: None,
@@ -224,9 +211,13 @@ async fn complete_run_fixture(
                 expected_session_id: session,
                 expected_statuses: &["running"],
                 expected_owner_generation: opened.run_generation,
-                status: "completed",
+                status: if failure.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                },
                 waiting_for: None,
-                error_message: None,
+                error_message: failure,
                 error_code: None,
                 error_kind: None,
                 error_metadata: None,
@@ -242,6 +233,200 @@ async fn complete_run_fixture(
         .unwrap()
         .expect("canonical terminal claim");
     tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn audit_error_events_project_receipts_without_double_counting_status() {
+    use astra_services::session_audit::{
+        AuditSessionListParams, CrossSessionStatsParams, DatabaseSessionAuditService,
+        SessionAuditService,
+    };
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let store = DatabaseRunStateStore::new(pool.clone());
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    let runs: Vec<_> = (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for run in &runs {
+        let mut record = durable_run_record(run.clone(), user.clone(), session.clone());
+        record.events = vec![make_event("run_started", json!({}))];
+        insert_run_fixture(&pool, &store, record).await;
+    }
+    terminal_run_fixture(
+        &pool,
+        &store,
+        &user,
+        &session,
+        &runs[0],
+        None,
+        Some("receipt failure"),
+    )
+    .await;
+    let physical = make_event("run_error", json!({"error":"crash recovery"}));
+    store
+        .update_run_status_with_events_if_current(
+            &user,
+            &session,
+            &runs[1],
+            &["running"],
+            None,
+            "failed",
+            None,
+            Some("crash recovery"),
+            &[physical],
+        )
+        .await
+        .unwrap();
+    store
+        .update_run_status_with_events_if_current(
+            &user,
+            &session,
+            &runs[2],
+            &["running"],
+            None,
+            "failed",
+            None,
+            Some("status only"),
+            &[],
+        )
+        .await
+        .unwrap();
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(pool.clone());
+    let initial = audit.list_errors(&user, &session).await.unwrap();
+    assert_eq!(
+        initial.total, 2,
+        "receipt and crash recovery each own one event; status alone owns none"
+    );
+    let receipt = initial
+        .errors
+        .iter()
+        .find(|error| error.event_id.starts_with("receipt:"))
+        .unwrap()
+        .clone();
+    assert_eq!(receipt.event_type, "run_error");
+    assert!(receipt.content.contains("receipt failure"));
+    let stored: String = sqlx::query_scalar("SELECT CAST(terminal_receipt_json AS CHAR) FROM agent_runs WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&runs[0]).fetch_one(pool.get()).await.unwrap();
+    let index = receipt.metadata["event_idx"].as_i64().unwrap();
+    let physical_id = initial
+        .errors
+        .iter()
+        .find(|error| !error.event_id.starts_with("receipt:"))
+        .unwrap()
+        .event_id
+        .clone();
+    // Cross-source ID equality is not proof of a duplicate event.
+    sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,content,metadata,payload_hash,ingestion_write_id,created_at) VALUES (?, ?, ?, 'error','independent journal failure',CAST('{}' AS JSON),?,?,'2026-10-01 00:00:59')")
+        .bind(&physical_id).bind(&user).bind(&session).bind("a".repeat(64)).bind(uuid::Uuid::new_v4().to_string()).execute(pool.get()).await.unwrap();
+    store
+        .append_events_batch(
+            &user,
+            &session,
+            &runs[0],
+            &[make_event(
+                "run_error",
+                json!({"error":"independent later failure"}),
+            )],
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_runs SET created_at = '2026-10-01 00:00:00', terminal_at = '2026-10-01 00:01:01' WHERE user_id = ?").bind(&user).execute(pool.get()).await.unwrap();
+    sqlx::query("UPDATE agent_run_events SET created_at = '2026-10-01 00:00:59' WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_run_openings SET opening_events_json = '{invalid' WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let listed = audit.list_errors(&user, &session).await.unwrap();
+    assert_eq!(listed.total, 4);
+    let later = listed
+        .errors
+        .iter()
+        .find(|error| error.event_id == receipt.event_id)
+        .unwrap();
+    assert_eq!(later.metadata["event_idx"], index);
+    assert_eq!(
+        audit
+            .get_summary(&user, &session)
+            .await
+            .unwrap()
+            .error_count,
+        4
+    );
+    let sessions = audit
+        .list_sessions(
+            &user,
+            &serde_json::from_value::<AuditSessionListParams>(json!({})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sessions.sessions[0].error_count, 4);
+    let all = CrossSessionStatsParams {
+        since: None,
+        until: None,
+    };
+    assert_eq!(
+        audit
+            .get_cross_session_stats(&user, &all)
+            .await
+            .unwrap()
+            .total_errors,
+        4
+    );
+    for (since, until, expected) in [
+        (None, Some("2026-10-01 00:01:00".into()), 3),
+        (Some("2026-10-01 00:01:00".into()), None, 1),
+    ] {
+        assert_eq!(
+            audit
+                .get_cross_session_stats(&user, &CrossSessionStatsParams { since, until })
+                .await
+                .unwrap()
+                .total_errors,
+            expected
+        );
+    }
+    assert!(audit.list_errors("foreign-owner", &session).await.is_err());
+    let mut mismatch: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    mismatch["receipt"]["run_id"] = "wrong-run".into();
+    for invalid in ["{invalid".to_string(), mismatch.to_string()] {
+        sqlx::query(
+            "UPDATE agent_runs SET terminal_receipt_json = ? WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(invalid)
+        .bind(&user)
+        .bind(&runs[0])
+        .execute(pool.get())
+        .await
+        .unwrap();
+        assert!(audit.list_errors(&user, &session).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(pool.get())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+    for table in [
+        "agent_run_events",
+        "agent_run_openings",
+        "agent_runs",
+        "agent_events",
+        "agent_sessions",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1910,7 +2095,14 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
         )
         .await
         .unwrap();
-    complete_run_fixture(&pool, &store, &user, &session, &run, Some(20)).await;
+    terminal_run_fixture(&pool, &store, &user, &session, &run, Some(20), None).await;
+    let terminal_at: chrono::NaiveDateTime =
+        sqlx::query_scalar("SELECT terminal_at FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind(&user)
+            .bind(&run)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
     let terminal_tail = store
         .load_run_control(&user, &run)
         .await
@@ -1936,6 +2128,18 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
                 .await
                 .unwrap();
         }
+        let current_terminal_at: chrono::NaiveDateTime = sqlx::query_scalar(
+            "SELECT terminal_at FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user)
+        .bind(&run)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            current_terminal_at, terminal_at,
+            "post-terminal evidence cannot move completion time"
+        );
         let queries = Queries::default();
         let subscriber =
             tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
@@ -2047,7 +2251,7 @@ async fn status_snapshot_preserves_selected_fact_failure_semantics() {
         )
         .await
         .unwrap();
-    complete_run_fixture(&pool, &store, &user, &session, &run, Some(19)).await;
+    terminal_run_fixture(&pool, &store, &user, &session, &run, Some(19), None).await;
     // A bad unrelated payload cannot poison the bounded status read.
     sqlx::query("UPDATE agent_run_events SET payload_json = '{' WHERE user_id = ? AND run_id = ? AND event_type = 'agent_progress'")
         .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
@@ -2088,7 +2292,7 @@ async fn status_snapshot_keeps_zero_positions_and_ignores_unselected_same_type_c
             ),
         )
         .await;
-        complete_run_fixture(&pool, &store, &user, &session, &run, prompt).await;
+        terminal_run_fixture(&pool, &store, &user, &session, &run, prompt, None).await;
         let snapshot = store
             .load_run_status_snapshot(&user, &run)
             .await
@@ -2847,6 +3051,7 @@ async fn terminal_transition_persists_error_code_with_event_batch() {
         .expect("load run")
         .expect("run exists");
     assert_eq!(loaded.status, "failed");
+    assert!(loaded.terminal_at.is_some());
     assert_eq!(loaded.error_code.as_deref(), Some("network"));
     assert_eq!(
         loaded.error_message.as_deref(),
@@ -3858,6 +4063,39 @@ async fn corrupt_cold_openings_do_not_block_control_but_cannot_resume_execution(
                 "paused"
             );
         }
+        let queries = Queries::default();
+        let projection = store
+            .load_run_interaction_projection(
+                &user,
+                &run,
+                astra_services::runs::DurableRunInteractionKind::Approval,
+            )
+            .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.status, "paused");
+        assert_eq!(projection.session_id, session);
+        assert!(projection.recent_events.is_empty());
+        assert!(
+            queries
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|sql| !sql.contains("agent_run_openings"))
+        );
+        assert!(
+            store
+                .load_run_interaction_projection(
+                    "different-owner",
+                    &run,
+                    astra_services::runs::DurableRunInteractionKind::Approval
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
         let control = store.load_run_control(&user, &run).await.unwrap().unwrap();
         assert_eq!(control.status, "paused");
         assert_eq!(control.run_generation, generation);

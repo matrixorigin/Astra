@@ -251,7 +251,11 @@ async fn restore_cloud_cache_token_totals(
     user_id: &str,
     session_id: &str,
 ) -> Result<(i64, i64), String> {
-    let rows = sqlx::query(
+    use futures_util::TryStreamExt;
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(|e| format!("restore_cloud_session.cache_tokens: {e}"))?;
+    let mut rows = sqlx::query(
         "SELECT event_id, IFNULL(CAST(token_usage AS CHAR), '{}') AS token_usage \
          FROM agent_events \
          WHERE session_id = ? AND user_id = ? \
@@ -259,13 +263,15 @@ async fn restore_cloud_cache_token_totals(
     )
     .bind(session_id)
     .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("restore_cloud_session.cache_tokens: {e}"))?;
+    .fetch(connection.connection_mut());
 
     let mut cache_read_total = 0i64;
     let mut cache_creation_total = 0i64;
-    for row in rows {
+    while let Some(row) = rows
+        .try_next()
+        .await
+        .map_err(|e| format!("restore_cloud_session.cache_tokens: {e}"))?
+    {
         let event_id = mysql_string(&row, "restore_cloud_session.cache_tokens", "event_id")
             .unwrap_or_else(|error| {
                 tracing::warn!(
@@ -283,6 +289,8 @@ async fn restore_cloud_cache_token_totals(
             &mut cache_creation_total,
         );
     }
+    drop(rows);
+    connection.release();
     Ok((cache_read_total, cache_creation_total))
 }
 

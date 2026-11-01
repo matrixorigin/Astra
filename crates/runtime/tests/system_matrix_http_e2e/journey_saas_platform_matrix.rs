@@ -1431,15 +1431,48 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     let run_id = chat_j["run_id"].as_str().expect("run_id");
     let large_output = "审计 boundary output ".repeat(8_000);
     assert!(large_output.len() > 65_535);
-    astra_services::DatabaseRunStateStore::new(ctx.shared_pool.clone())
+    let run_store = astra_services::DatabaseRunStateStore::new(ctx.shared_pool.clone());
+    run_store
         .append_events_batch(
             &ctx.user_id,
             session_id,
             run_id,
-            &[
-                json!({"event_type": "tool_call", "data": {
-                    "id": "large-audit-call", "name": "read_file", "arguments": {"path": "fixture.txt"}
-                }}),
+            &[json!({"event_type": "tool_call", "data": {
+                "id": "large-audit-call", "name": "read_file", "arguments": {"path": "fixture.txt"}
+            }})],
+        )
+        .await
+        .expect("persist unfinished audit call");
+    let call_started_at: String = sqlx::query_scalar(
+        "SELECT CAST(created_at AS CHAR) FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = 'tool_call' ORDER BY event_idx DESC LIMIT 1"
+    ).bind(&ctx.user_id).bind(run_id).fetch_one(&ctx.pool).await.unwrap();
+    for path in [
+        format!("/sessions/{session_id}/audit/tools"),
+        "/audit/tools".into(),
+    ] {
+        let (status, body) = get_json(app, &path, Some(auth), &[]).await;
+        assert_eq!(status, StatusCode::OK, "GET {path}: {body}");
+        let tool = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "read_file")
+            .unwrap();
+        if path == "/audit/tools" {
+            assert_eq!(tool["total_calls"], 1);
+            assert_eq!(tool["total_failures"], 0);
+            assert_eq!(tool["total_success"], 0);
+        } else {
+            assert_eq!(tool["call_count"], 1);
+            assert_eq!(tool["fail_count"], 0);
+            assert_eq!(tool["success_count"], 0);
+        }
+        assert!(
+            tool["last_error"].is_null(),
+            "unfinished call has no error: {tool}"
+        );
+    }
+    run_store.append_events_batch(&ctx.user_id, session_id, run_id, &[
                 json!({"event_type": "tool_call_end", "data": {
                     "id": "large-audit-call", "name": "read_file", "success": true,
                     "result": large_output
@@ -1451,17 +1484,65 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         )
         .await
         .expect("persist large canonical audit events");
+    let window_path = format!("/audit/tools?until={}Z", call_started_at.replace(' ', "T"));
+    let (status, window) = get_json(app, &window_path, Some(auth), &[]).await;
+    assert_eq!(status, StatusCode::OK, "GET {window_path}: {window}");
+    let tool = window
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "read_file")
+        .unwrap();
+    assert_eq!(tool["total_calls"], 1);
+    assert_eq!(
+        tool["total_success"], 0,
+        "a later terminal is outside the observation window"
+    );
+    assert_eq!(tool["total_failures"], 0);
+    assert!(tool["last_error"].is_null());
 
     for path in [
         format!("/sessions/{session_id}/audit/summary"),
         format!("/sessions/{session_id}/audit/turns?page=1&per_page=10"),
         format!("/sessions/{session_id}/audit/tools"),
         format!("/sessions/{session_id}/audit/errors"),
+        "/audit/sessions".to_string(),
         "/audit/stats".to_string(),
         "/audit/tools".to_string(),
     ] {
         let (st, body) = get_json(app, &path, Some(auth), &[]).await;
         assert_eq!(st, StatusCode::OK, "GET {path}: {body}");
+        if path.ends_with("/audit/summary") {
+            assert_eq!(body["tool_calls_total"], 1);
+        }
+        if path == "/audit/sessions" {
+            let session = body["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["session_id"] == session_id)
+                .unwrap();
+            assert_eq!(
+                session["tool_calls_total"], 1,
+                "list and summary share the same wrapped-call count: {body}"
+            );
+        }
+        if path == "/audit/stats" {
+            assert_eq!(
+                body["total_turns"], 1,
+                "the root Run admission is a turn fact: {body}"
+            );
+            let expected_model = format!("mock-{}", ctx.suffix);
+            assert!(
+                body["top_models"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["model"] == expected_model),
+                "the admitted Server model must appear in audit stats: {body}"
+            );
+        }
+
         if path.ends_with("/errors") {
             let error = body["errors"]
                 .as_array()
@@ -1629,4 +1710,66 @@ pub async fn run_saas_events_session_after_chat_positive() {
 /// Delegation HTTP boundaries (§4.3).
 pub async fn run_saas_delegate_http_boundaries() {
     super::journey_delegate_http_matrix::run_delegate_http_boundaries().await;
+}
+
+/// Registration returns live discovery without persisting a second tool catalog.
+pub async fn run_saas_mcp_registration_uses_live_discovery() {
+    use axum::{Json, response::IntoResponse, routing::post};
+    use std::sync::{Arc, Mutex};
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let endpoint = Router::new().route("/mcp", post({
+        let methods = methods.clone();
+        move |headers: axum::http::HeaderMap, Json(request): Json<Value>| {
+            let methods = methods.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer mcp-registry-fixture");
+                let method = request["method"].as_str().unwrap();
+                methods.lock().unwrap().push(method.to_owned());
+                if request.get("id").is_none() {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion": request["params"]["protocolVersion"],
+                        "capabilities":{"tools":{}},
+                        "serverInfo":{"name":"registry-fixture","version":"1"}
+                    }),
+                    "tools/list" => json!({"tools":[{
+                        "name":"read_file", "description":"Read fixture content",
+                        "inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+                    }]}),
+                    _ => panic!("unexpected MCP method: {method}"),
+                };
+                Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        axum::serve(listener, endpoint).await.unwrap();
+    }));
+    let b = bootstrap().await;
+    let (status, record) = post_json(&b.ctx.app, "/api/v1/mcp/register-or-update", Some(&b.auth_header), json!({
+        "server":{"name":format!("registry-{}", b.ctx.suffix), "transport":"streamable_http", "url":url},
+        "binding":{"key_value":{"headers":{"Authorization":"Bearer mcp-registry-fixture"}}}
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_eq!(record["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(record["tools"][0]["tool_name"], "read_file");
+    assert!(
+        record["tools"][0]["public_name"]
+            .as_str()
+            .unwrap()
+            .ends_with("__read_file")
+    );
+    assert_eq!(
+        record["tool_namespace"],
+        format!("binding_{}", record["binding_id"].as_str().unwrap())
+    );
+    assert!(!record.to_string().contains("mcp-registry-fixture"));
+    let observed = methods.lock().unwrap().clone();
+    assert!(observed.iter().any(|method| method == "initialize"));
+    assert!(observed.iter().any(|method| method == "tools/list"));
+    b.ctx.close().await;
 }

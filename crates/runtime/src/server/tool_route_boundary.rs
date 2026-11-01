@@ -216,6 +216,7 @@ pub(crate) fn tool_transport_finished_event(
         event.insert("error".to_string(), Value::String(result.output.clone()));
     }
     copy_result_routing_metadata(&mut event, result);
+    copy_result_execution_fact(&mut event, result);
     Some(event)
 }
 
@@ -249,6 +250,7 @@ pub(crate) fn tool_call_end_event(
     copy_result_structured_output_metadata(&mut event, result);
     copy_result_artifacts_metadata(&mut event, result);
     copy_result_routing_metadata(&mut event, result);
+    copy_result_execution_fact(&mut event, result);
     if let Some(observation) = result
         .metadata
         .as_ref()
@@ -294,6 +296,86 @@ mod invocation_identity_tests {
     use super::*;
     use crate::server::tool_execution_binding::ExecutionBindingState;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn bash_preflight_rejection_preserves_non_execution_in_both_events() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = workspace.path().join("must-not-exist");
+        let args =
+            json!({"command":format!("touch {}", marker.display()), "run_in_background":true});
+        let result = crate::server::server_bash_execution::execute_server_bash(
+            &crate::tool_sandbox::SandboxPolicy::for_project(workspace.path()),
+            workspace.path(),
+            &WorkspaceBinding::server_sandbox(workspace.path()),
+            None,
+            &args,
+            None,
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(!marker.exists());
+        let identity =
+            astra_turn_types::ToolInvocationIdentity::new("u", "s", "r", "t", "call").unwrap();
+        let request = ExecutionBindingState::server_sandbox(workspace.path())
+            .tool_execution_request_for_invocation(&identity, "bash", &args);
+        for event in [
+            tool_transport_finished_event(&request, &result, 0).unwrap(),
+            tool_call_end_event(&request, &result, 0).unwrap(),
+        ] {
+            assert_eq!(event["success"], false);
+            assert_eq!(event["executed"], false);
+        }
+    }
+
+    #[test]
+    fn producer_unknown_execution_survives_transport_and_terminal_projection() {
+        let identity =
+            astra_turn_types::ToolInvocationIdentity::new("user", "session", "run", "turn", "call")
+                .unwrap();
+        let request = ExecutionBindingState::server_sandbox(".")
+            .tool_execution_request_for_invocation(
+                &identity,
+                "agent",
+                &json!({"action":"send_message"}),
+            );
+        for (status, executed) in [
+            ("delivery_unknown", Value::Null),
+            ("failed", Value::Bool(true)),
+        ] {
+            let result = crate::server::tool_execution_result::agent_tool_result_from_output(
+                "agent",
+                json!({
+                    "result_family":"control_receipt", "action":"send_message", "success":false,
+                    "status":status, "executed":executed, "reason":"acknowledgement control"
+                })
+                .to_string(),
+            );
+            for event in [
+                tool_transport_finished_event(&request, &result, 5).unwrap(),
+                tool_call_end_event(&request, &result, 5).unwrap(),
+            ] {
+                assert_eq!(event["success"], false);
+                assert_eq!(event["executed"], executed, "{status}: {event:?}");
+            }
+        }
+        let recovered = crate::server::tool_execution_result::tool_result_from_output(
+            "<tool-result-window>\n{\"status\":\"unknown\",\"executed\":null}\n</tool-result-window>".into()
+        );
+        let terminal = tool_call_end_event(&request, &recovered, 5).unwrap();
+        assert_eq!(terminal["success"], true);
+        assert!(
+            !terminal.contains_key("executed"),
+            "artifact window content is not a host producer receipt"
+        );
+        let ordinary =
+            astra_tools::ToolResult::text(r#"{"status":"unknown","executed":null}"#.into());
+        let terminal = tool_call_end_event(&request, &ordinary, 5).unwrap();
+        assert_eq!(terminal["success"], true);
+        assert!(
+            !terminal.contains_key("executed"),
+            "arbitrary output is not producer execution evidence"
+        );
+    }
 
     #[test]
     fn typed_invocation_events_use_request_identity_and_keep_arguments_public() {
@@ -477,6 +559,23 @@ pub(crate) fn copy_result_routing_metadata(
                 .or_insert_with(|| value.clone());
         }
     }
+}
+
+// The executor owns this fact. Copy it before transport success is reduced to
+// a boolean; result text is arbitrary tool content and is not an audit schema.
+fn copy_result_execution_fact(event: &mut Map<String, Value>, result: &astra_tools::ToolResult) {
+    let fact = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("execution_fact"))
+        .and_then(Value::as_str);
+    let executed = match fact {
+        Some("unknown") => Value::Null,
+        Some("not_executed") => Value::Bool(false),
+        Some("executed") => Value::Bool(true),
+        _ => return,
+    };
+    event.entry("executed".to_string()).or_insert(executed);
 }
 
 fn copy_result_structured_output_metadata(

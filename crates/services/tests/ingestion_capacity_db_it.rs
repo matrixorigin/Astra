@@ -185,6 +185,9 @@ fn probe_event(run: &str, index: u64, config: &ProbeConfig, epoch_micros: i64) -
     let timestamp = epoch_micros + arrival_offset(index, config.rate).as_micros() as i64;
     let target_bytes = target_envelope_bytes(index, config.seed);
     let mut event = IngestionEvent {
+        run_id: None,
+        parent_run_id: None,
+        turn_seq: None,
         event_id: format!("probe-{run}-{index}"),
         session_id,
         user_id,

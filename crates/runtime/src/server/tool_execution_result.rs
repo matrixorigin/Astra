@@ -27,6 +27,9 @@ fn insert_parsed_work_unit_observation(parsed: Option<&Value>, metadata: &mut Ma
     }
 }
 
+/// Adapt an in-process, host-rendered control response. Provider/file output
+/// remains `ToolResult` data; artifact readers wrap it in a tool-result window
+/// before using this adapter. Only these producer responses can supply facts.
 pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
     let json_error = parsed

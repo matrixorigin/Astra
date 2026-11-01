@@ -12138,6 +12138,7 @@ pub(crate) mod tests {
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
+            terminal_at: None,
             run_id: run_id.into(),
             user_id: "user-1".into(),
             session_id: "session-1".into(),

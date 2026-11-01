@@ -126,7 +126,6 @@ pub(super) async fn build_runtime_wiring(
     .with_model_service(state.model_service.clone())
     .with_auth_service(state.auth_service.clone())
     .with_model_catalog_cache(state.model_catalog_cache.clone())
-    .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_agent_binding_service(state.agent_binding_service.clone())
     .with_reflect_service(state.reflect_service.clone())
     .with_observer_worker(state.turn_persistence.observer_worker.clone())

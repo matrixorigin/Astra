@@ -172,6 +172,7 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     opening_hash VARCHAR(64) NULL,
     context_admission_hash VARCHAR(64) NULL,
     terminal_receipt_json LONGTEXT NULL,
+    terminal_at DATETIME(6) NULL,
     work_id VARCHAR(64) NULL,
     work_branch_id VARCHAR(64) NULL,
     work_graph_revision BIGINT NULL,
@@ -221,6 +222,7 @@ const AGENT_RUNS_RUNTIME_AUTHORITY_COLUMNS: &[&str] = &[
     "opening_hash",
     "context_admission_hash",
     "terminal_receipt_json",
+    "terminal_at",
 ];
 const AGENT_RUNS_WORK_BINDING_COLUMNS: &[&str] =
     &["work_id", "work_branch_id", "work_graph_revision"];
@@ -3161,6 +3163,7 @@ async fn ensure_core_schema_while_leased(
         session_id VARCHAR(64) NOT NULL,
         opening_events_json LONGTEXT NULL,
         opening_context_json LONGTEXT NULL,
+        admitted_model_name LONGTEXT NULL,
         PRIMARY KEY (user_id, run_id),
         INDEX idx_run_openings_owner_session_run (user_id, session_id, run_id)
     )"
@@ -4437,27 +4440,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "mcp_tools",
-        "CREATE TABLE IF NOT EXISTS mcp_tools (
-            owner_user_id VARCHAR(128) NOT NULL,
-            binding_id VARCHAR(64) NOT NULL,
-            tool_name VARCHAR(256) NOT NULL,
-            public_name VARCHAR(384) NOT NULL,
-            description TEXT NULL,
-            input_schema_json JSON NULL,
-            output_schema_json JSON NULL,
-            schema_hash VARCHAR(128) NOT NULL,
-            discovered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (owner_user_id, binding_id, tool_name),
-            UNIQUE KEY uq_mcp_tools_owner_binding_public (owner_user_id, binding_id, public_name),
-            INDEX idx_mcp_tools_owner_binding (owner_user_id, binding_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Plans: cloud-authoritative plan state (user-owned, session-linked) ──
     // `subtask_count` is denormalized so list endpoints don't need to parse
     // `plan_json` just to render a card. Maintained by `PlanRepository::save`.
@@ -4701,21 +4683,6 @@ async fn ensure_core_schema_while_leased(
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             INDEX idx_srb_user_skill (user_id, skill_name),
             INDEX idx_srb_resource (resource_type, resource_key)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "skill_user_credentials",
-        "CREATE TABLE IF NOT EXISTS skill_user_credentials (
-            credential_id   VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(128) NOT NULL,
-            skill_name      VARCHAR(128) NOT NULL,
-            credential_name VARCHAR(128) NOT NULL,
-            value_encrypted TEXT NOT NULL,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            UNIQUE INDEX idx_suc_user_skill_cred (user_id, skill_name, credential_name)
         )",
     )
     .execute(&pool)
@@ -5150,7 +5117,11 @@ async fn verify_core_schema_shape(
         pool,
         database,
         "agent_run_openings",
-        &["opening_events_json", "opening_context_json"],
+        &[
+            "opening_events_json",
+            "opening_context_json",
+            "admitted_model_name",
+        ],
     )
     .await?;
     ensure_index_shape(
@@ -5679,35 +5650,6 @@ async fn verify_core_schema_shape(
         "mcp_bindings",
         "idx_mcp_bindings_owner_mcp",
         &["owner_user_id", "mcp_id"],
-    )?;
-    fail_if_obsolete_shape(
-        pool,
-        database,
-        "mcp_tools",
-        &["owner_user_id", "binding_id", "tool_name"],
-        &["id"],
-        &["uq_mcp_tools_binding_tool", "uq_mcp_tools_binding_public"],
-    )
-    .await?;
-    fail_if_varchar_columns_shorter_than(pool, database, "mcp_tools", &[("binding_id", 64)])
-        .await?;
-    ensure_index_shape(
-        &indexes,
-        "mcp_tools",
-        "PRIMARY",
-        &["owner_user_id", "binding_id", "tool_name"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "mcp_tools",
-        "uq_mcp_tools_owner_binding_public",
-        &["owner_user_id", "binding_id", "public_name"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "mcp_tools",
-        "idx_mcp_tools_owner_binding",
-        &["owner_user_id", "binding_id"],
     )?;
     ensure_index_shape(&indexes, "plans", "PRIMARY", &["user_id", "plan_id"])?;
     ensure_index_shape(

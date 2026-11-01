@@ -1,7 +1,6 @@
 use super::*;
 use astra_services::session_audit::{
-    AuditSessionListParams, CrossSessionRuntimePromotionListParams, CrossSessionStatsParams,
-    TurnListParams,
+    AuditSessionListParams, CrossSessionStatsParams, TurnListParams,
 };
 
 pub(super) async fn audit_summary_handler(
@@ -83,21 +82,6 @@ pub(super) async fn audit_errors_handler(
     Ok(Json(serde_json::to_value(errors).map_err(internal_error)?))
 }
 
-pub(super) async fn audit_runtime_promotions_handler(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let promotions = state
-        .session_audit_service
-        .list_session_runtime_promotions(&user.user_id, &session_id)
-        .await?;
-    Ok(Json(
-        serde_json::to_value(promotions).map_err(internal_error)?,
-    ))
-}
-
 // ── Cross-session handlers ───────────────────────────────────────────────────
 
 pub(super) async fn list_sessions_handler(
@@ -135,19 +119,6 @@ pub(super) async fn cross_session_tools_handler(
     let result = state
         .session_audit_service
         .get_cross_session_tools(&user.user_id, &params)
-        .await?;
-    Ok(Json(serde_json::to_value(result).map_err(internal_error)?))
-}
-
-pub(super) async fn cross_session_runtime_promotions_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<CrossSessionRuntimePromotionListParams>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let result = state
-        .session_audit_service
-        .list_cross_session_runtime_promotions(&user.user_id, &params)
         .await?;
     Ok(Json(serde_json::to_value(result).map_err(internal_error)?))
 }

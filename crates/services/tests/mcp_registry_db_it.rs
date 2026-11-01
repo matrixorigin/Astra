@@ -6,12 +6,14 @@
 mod common;
 
 use astra_services::{
-    DatabaseMcpRegistryService, FernetTokenEncryptor, McpBindingRequestData, McpDiscoveredToolData,
-    McpRegisterRequestData, McpRegistryService, McpServerRequestData, mcp_schema_hash,
+    DatabaseMcpRegistryService, FernetTokenEncryptor, McpBindingRequestData,
+    McpRegisterRequestData, McpRegisteredToolRecord, McpRegistryService, McpServerRequestData,
 };
 use axum::http::StatusCode;
 use serde_json::json;
 use std::sync::Arc;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::prelude::*;
 use uuid::Uuid;
 
 fn encryptor() -> Arc<FernetTokenEncryptor> {
@@ -37,26 +39,14 @@ fn register_request(server_name: String) -> McpRegisterRequestData {
     }
 }
 
-fn tool(tool_name: &str, public_name: &str, schema: serde_json::Value) -> McpDiscoveredToolData {
-    McpDiscoveredToolData {
-        tool_name: tool_name.to_string(),
-        public_name: public_name.to_string(),
-        description: Some(format!("{tool_name} description")),
-        input_schema_json: Some(schema.clone()),
-        output_schema_json: None,
-        schema_hash: mcp_schema_hash(&schema),
+fn tool(tool_name: &str, public_name: &str) -> McpRegisteredToolRecord {
+    McpRegisteredToolRecord {
+        tool_name: tool_name.into(),
+        public_name: public_name.into(),
     }
 }
 
 async fn cleanup_owner(pool: &sqlx::Pool<sqlx::MySql>, owner_user_id: &str) {
-    let _ = sqlx::query(
-        "DELETE FROM mcp_tools WHERE binding_id IN \
-         (SELECT id FROM mcp_bindings WHERE owner_user_id = ?)",
-    )
-    .bind(owner_user_id)
-    .execute(pool)
-    .await;
-
     let _ = sqlx::query("DELETE FROM mcp_bindings WHERE owner_user_id = ?")
         .bind(owner_user_id)
         .execute(pool)
@@ -70,7 +60,7 @@ async fn cleanup_owner(pool: &sqlx::Pool<sqlx::MySql>, owner_user_id: &str) {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn mcp_registry_persists_registration_and_discovered_tools() {
+async fn mcp_registry_persists_binding_and_confirms_discovery_without_projection() {
     let (shared, settings) = common::setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let owner = format!("mcp-owner-{}", Uuid::new_v4());
@@ -83,30 +73,16 @@ async fn mcp_registry_persists_registration_and_discovered_tools() {
         .await
         .expect("upsert MCP binding");
     let binding_id = binding.binding_id.clone();
-    let first_schema = json!({
-        "type": "object",
-        "properties": {
-            "path": {"type": "string"}
-        },
-        "required": ["path"]
-    });
-    let second_schema = json!({
-        "type": "object",
-        "properties": {
-            "query": {"type": "string"}
-        }
-    });
+    let tools = vec![
+        tool("read_file", "mcp__test__read_file"),
+        tool("search", "mcp__test__search"),
+    ];
+    let queries = common::SqlQueries::default();
     let registered = service
-        .replace_binding_tools(
-            owner.clone(),
-            binding_id.clone(),
-            vec![
-                tool("read_file", "mcp__test__read_file", first_schema.clone()),
-                tool("search", "mcp__test__search", second_schema),
-            ],
-        )
+        .confirm_binding_discovery(owner.clone(), binding_id.clone(), tools.clone())
+        .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
         .await
-        .expect("replace discovered tools");
+        .expect("confirm discovered tools");
     assert_eq!(registered.tools.len(), 2);
 
     assert_eq!(registered.binding_id, binding_id);
@@ -123,24 +99,24 @@ async fn mcp_registry_persists_registration_and_discovered_tools() {
         serde_json::from_str::<serde_json::Value>(&plaintext).unwrap(),
         register_request(server_name).binding.key_value
     );
-    let stored: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT tool_name, public_name, CAST(input_schema_json AS CHAR), schema_hash FROM mcp_tools WHERE owner_user_id = ? AND binding_id = ? ORDER BY public_name",
-    ).bind(&owner).bind(&binding_id).fetch_all(&pool).await.unwrap();
-    assert_eq!(stored.len(), 2);
-    assert_eq!(stored[0].0, "read_file");
-    assert_eq!(stored[0].1, "mcp__test__read_file");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&stored[0].2).unwrap(),
-        first_schema
-    );
-    assert_eq!(stored[0].3, mcp_schema_hash(&first_schema));
+    assert_eq!(registered.tools, tools);
+    {
+        let statements = queries.0.lock().unwrap();
+        assert_eq!(statements.len(), 1, "{statements:?}");
+        let sql = statements[0]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(sql.starts_with("SELECT "), "{sql}");
+        assert!(sql.contains("b.is_active = 1 AND s.is_active = 1"), "{sql}");
+    }
 
     cleanup_owner(&pool, &owner).await;
 }
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn mcp_registry_rejected_replacement_preserves_owned_tools() {
+async fn mcp_registry_rejected_discovery_preserves_owned_binding() {
     let (shared, settings) = common::setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let owner = format!("mcp-owner-{}", Uuid::new_v4());
@@ -153,51 +129,129 @@ async fn mcp_registry_rejected_replacement_preserves_owned_tools() {
         .await
         .expect("upsert MCP binding");
     let binding_id = binding.binding_id.clone();
-    let schema = json!({"type": "object"});
     service
-        .replace_binding_tools(
+        .confirm_binding_discovery(
             owner.clone(),
             binding_id.clone(),
-            vec![tool("valid_name", "mcp__test__valid_name", schema)],
+            vec![tool("valid_name", "mcp__test__valid_name")],
         )
         .await
-        .expect("replace discovered tools");
+        .expect("confirm discovered tools");
 
-    let stored_sql = "SELECT tool_name, public_name, schema_hash FROM mcp_tools WHERE owner_user_id = ? AND binding_id = ? ORDER BY public_name";
-    let before: Vec<(String, String, String)> = sqlx::query_as(stored_sql)
+    let stored_sql =
+        "SELECT key_value_encrypted FROM mcp_bindings WHERE owner_user_id = ? AND id = ?";
+    let before: String = sqlx::query_scalar(stored_sql)
         .bind(&owner)
         .bind(&binding_id)
-        .fetch_all(&pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
     for invalid in ["", " "] {
         let (status, error) = service
-            .replace_binding_tools(
+            .confirm_binding_discovery(
                 owner.clone(),
                 binding_id.clone(),
-                vec![tool(
-                    invalid,
-                    "mcp__test__invalid",
-                    json!({"type":"object"}),
-                )],
+                vec![tool(invalid, "mcp__test__invalid")],
             )
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.0.error_code.as_deref(), Some("mcp_discovery_failed"));
     }
+    for (tools, code) in [
+        (
+            vec![tool("same", "first"), tool("same", "second")],
+            "mcp_tool_name_conflict",
+        ),
+        (
+            vec![tool("first", "same"), tool("second", "same")],
+            "mcp_public_name_conflict",
+        ),
+    ] {
+        let (status, error) = service
+            .confirm_binding_discovery(owner.clone(), binding_id.clone(), tools)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.0.error_code.as_deref(), Some(code));
+    }
     let (status, _) = service
-        .replace_binding_tools(format!("foreign-{owner}"), binding_id.clone(), Vec::new())
+        .confirm_binding_discovery(format!("foreign-{owner}"), binding_id.clone(), Vec::new())
         .await
         .unwrap_err();
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let after: Vec<(String, String, String)> = sqlx::query_as(stored_sql)
+    let after: String = sqlx::query_scalar(stored_sql)
         .bind(&owner)
         .bind(&binding_id)
-        .fetch_all(&pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(after, before);
 
+    cleanup_owner(&pool, &owner).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn discovery_confirmation_rechecks_revocation_after_discovery() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let owner = format!("mcp-owner-{}", Uuid::new_v4());
+    let service = DatabaseMcpRegistryService::new(settings, encryptor()).with_pool(shared);
+    let binding = service
+        .upsert_binding(owner.clone(), register_request(Uuid::new_v4().to_string()))
+        .await
+        .unwrap();
+    for (table, id) in [
+        ("mcp_bindings", &binding.binding_id),
+        ("mcp_servers", &binding.mcp_id),
+    ] {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let confirmation = tokio::spawn({
+            let (service, owner, binding_id, barrier) = (
+                service.clone(),
+                owner.clone(),
+                binding.binding_id.clone(),
+                barrier.clone(),
+            );
+            async move {
+                // The network discovery has finished. Resume confirmation only
+                // after revocation is committed, without retaining stale rights.
+                let discovered = vec![tool("read_file", "mcp__test__read_file")];
+                barrier.wait().await;
+                service
+                    .confirm_binding_discovery(owner, binding_id, discovered)
+                    .await
+            }
+        });
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET is_active = 0 WHERE owner_user_id = ? AND id = ?"
+        )))
+        .bind(&owner)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        barrier.wait().await;
+        let (status, error) = confirmation.await.unwrap().unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error.0.error_code.as_deref(), Some("mcp_binding_not_found"));
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET is_active = 1 WHERE owner_user_id = ? AND id = ?"
+        )))
+        .bind(&owner)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    assert!(
+        service
+            .confirm_binding_discovery(owner.clone(), binding.binding_id, vec![])
+            .await
+            .unwrap()
+            .tools
+            .is_empty()
+    );
     cleanup_owner(&pool, &owner).await;
 }
