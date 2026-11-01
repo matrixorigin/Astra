@@ -33,6 +33,10 @@ const PLAN_SCOPE: &str = "chatgpt.tokens.use.direct";
 const AUTH_LIFETIME: i64 = 900;
 const REFRESH_BUDGET: Duration = Duration::from_secs(25);
 const REFRESH_LEASE_SECONDS: i64 = 30;
+/// Hard bound on the in-memory access-token cache. Entries hold plaintext
+/// bearer tokens, so historical connections must never accumulate without
+/// limit; expired entries are reclaimed before any live one is evicted.
+const MAX_CACHED_TOKENS: usize = 64;
 type ApiResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
 
 fn fail(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json<ErrorResponse>) {
@@ -339,10 +343,84 @@ struct CredentialRow {
 
 type ConnectionKey = (String, String);
 type RefreshKey = (String, String, i64);
-type RefreshWaiter = tokio::sync::watch::Receiver<Option<ApiResult<(String, i64)>>>;
+/// Refresh flights settle into (token, credential_version, expires_at) so
+/// every waiter can replace the stale cache entry, not just bypass it once.
+type RefreshWaiter = tokio::sync::watch::Receiver<Option<ApiResult<(String, i64, i64)>>>;
 struct ActiveConnection {
     monitor: Uuid,
     requests: Vec<(Uuid, i64, CancellationToken)>,
+}
+struct CachedAccessToken {
+    token: String,
+    version: i64,
+    generation: i64,
+    expires_at: i64,
+}
+/// Verdict for a settled refresh flight. The flight produced its token
+/// without holding the cache lock, so a waiter's rejection check and its
+/// final store do not run atomically: only a token the cache accepted may be
+/// served, and a refused store must be re-adjudicated against the fresher
+/// evidence instead of returning the unexamined plaintext.
+enum SettledFlight {
+    /// The store accepted the token: serve it.
+    Serve(String, i64),
+    /// The store refused the token because fresher evidence landed meanwhile
+    /// (a concurrent 401 for the settled version, an invalidation severing
+    /// the flight witness, or a newer entry). `rejected` is true when the
+    /// settled version is now at or below the recorded 401 floor, so the
+    /// caller must carry that evidence and rotate past it.
+    Retry { rejected: bool },
+}
+/// Rejection evidence that must outlive any cache entry. Entries are evicted
+/// by rejection, expiry, capacity and disconnect, so the entry alone cannot
+/// prove a version is still servable; this guard state can.
+#[derive(Default)]
+struct ConnectionGuard {
+    /// Highest (generation, credential version) the provider already answered
+    /// 401 for, compared lexicographically: versions are monotonic within a
+    /// generation and may restart when a reconnect recreates the registration,
+    /// so nothing at or below the floor may be served or cached again, even
+    /// after the entry that carried the rejection was evicted.
+    rejected_floor: (i64, i64),
+}
+#[derive(Default)]
+struct TokenCache {
+    entries: HashMap<ConnectionKey, CachedAccessToken>,
+    guards: HashMap<ConnectionKey, ConnectionGuard>,
+    /// Invalidation clock, bumped by every local invalidation (disconnect,
+    /// re-auth, reconnect) and every recorded provider 401. It is global and
+    /// monotonic on purpose: a per-connection epoch living in the evictable
+    /// guard map would reset on capacity eviction and let a paused reader's
+    /// store witness alias the recreated state (epoch ABA), resurrecting
+    /// plaintext behind a disconnect. This clock never resets or repeats, so
+    /// no eviction can revive a stale witness. Collateral store refusals on
+    /// unrelated connections are safe: the reader loops and re-evaluates
+    /// against fresher evidence instead of caching.
+    epoch: u64,
+}
+impl TokenCache {
+    fn guard_mut(&mut self, key: ConnectionKey) -> &mut ConnectionGuard {
+        if !self.guards.contains_key(&key) {
+            while self.guards.len() >= MAX_CACHED_TOKENS {
+                let Some(victim) = self.guards.keys().next().cloned() else {
+                    break;
+                };
+                self.guards.remove(&victim);
+                // The victim's floor evidence is gone; its cached entry must
+                // not outlive it or it could be served without the floor.
+                self.entries.remove(&victim);
+            }
+        }
+        self.guards.entry(key).or_default()
+    }
+    /// Witness for `store_cached_token`: the current invalidation clock.
+    fn witness(&self) -> u64 {
+        self.epoch
+    }
+    /// Sever every outstanding store witness.
+    fn bump_epoch(&mut self) {
+        self.epoch += 1;
+    }
 }
 struct SigningKeys {
     fetched: std::time::Instant,
@@ -354,6 +432,7 @@ pub struct ChatgptConnections {
     config: Result<ChatgptConfig, String>,
     active: Mutex<HashMap<ConnectionKey, ActiveConnection>>,
     refreshes: Mutex<HashMap<RefreshKey, RefreshWaiter>>,
+    tokens: Mutex<TokenCache>,
     signing_keys: tokio::sync::Mutex<Option<SigningKeys>>,
     inference_client: OnceLock<reqwest::Client>,
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -565,6 +644,7 @@ impl ChatgptConnections {
             config,
             active: Mutex::new(HashMap::new()),
             refreshes: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(TokenCache::default()),
             signing_keys: tokio::sync::Mutex::new(None),
             inference_client: OnceLock::new(),
             #[cfg(any(test, feature = "e2e-hooks"))]
@@ -1133,6 +1213,12 @@ impl ChatgptConnections {
                 query("UPDATE user_llm_authorizations SET status='completed',verifier_encrypted=NULL,callback_digest=?,completed_connection_id=? WHERE user_id=? AND authorization_id=? AND status='exchanging'")
                     .bind(&callback_digest).bind(&connection_id).bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
                 tx.commit().await.map_err(internal_error)?;
+                if existing.is_some() {
+                    // Reconnect replaced the stored credentials: sever every
+                    // store witness taken before this commit so paused readers
+                    // cannot re-insert tokens from the replaced registration.
+                    self.bump_cache_epoch();
+                }
                 return Ok(json!({"connection":self.view(owner,&connection_id).await?}));
             }
             Err(unavailable())
@@ -1203,20 +1289,294 @@ impl ChatgptConnections {
             .map_err(|_| internal_error("Stored subscription credentials are invalid"))
     }
 
+    /// Serve a still-valid token without re-reading or re-decrypting the
+    /// stored credentials. The per-request fence read in `ensure_current`
+    /// still gates revocation and reconnects. A version at or below the
+    /// rejected floor is evicted outright: the provider already answered 401
+    /// for it, so no later independent request may be sent out with it again.
+    fn cached_access_token(
+        &self,
+        owner: &str,
+        id: &str,
+        generation: i64,
+        rejected_version: Option<i64>,
+    ) -> Option<(String, i64)> {
+        let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (owner.to_owned(), id.to_owned());
+        let rejected = rejected_version
+            .map(|version| (generation, version))
+            .unwrap_or((0, 0))
+            .max(
+                cache
+                    .guards
+                    .get(&key)
+                    .map_or((0, 0), |guard| guard.rejected_floor),
+            );
+        let cached = cache.entries.get(&key)?;
+        if (cached.generation, cached.version) <= rejected {
+            cache.entries.remove(&key);
+            return None;
+        }
+        if cached.generation == generation && cached.expires_at > unix_now() + 60 {
+            return Some((cached.token.clone(), cached.version));
+        }
+        // Expired entries are useless and older generations can never be
+        // served again; reclaim both eagerly. A newer-generation entry belongs
+        // to a reconnect this stale caller must not observe or drop.
+        if cached.expires_at <= unix_now() + 60 || cached.generation < generation {
+            cache.entries.remove(&key);
+        }
+        None
+    }
+
+    /// Snapshot the invalidation clock before producing credential evidence
+    /// (a credential-row read or a refresh flight). `store_cached_token`
+    /// refuses any store whose snapshot was overtaken by an invalidation.
+    fn cache_witness(&self) -> u64 {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .witness()
+    }
+
+    /// Record a provider 401 for `version` before touching cache or database
+    /// state, so the evidence survives entry eviction and paused readers. The
+    /// clock bump also severs store witnesses taken before the rejection: the
+    /// floor itself can be capacity-evicted, the clock cannot.
+    fn note_rejected_version(&self, owner: &str, id: &str, generation: i64, version: i64) {
+        let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        cache.bump_epoch();
+        let key = (owner.to_owned(), id.to_owned());
+        let floor = {
+            let guard = cache.guard_mut(key.clone());
+            guard.rejected_floor = guard.rejected_floor.max((generation, version));
+            guard.rejected_floor
+        };
+        if cache
+            .entries
+            .get(&key)
+            .is_some_and(|entry| (entry.generation, entry.version) <= floor)
+        {
+            cache.entries.remove(&key);
+        }
+    }
+
+    /// True when (generation, version) is at or below the recorded 401 floor
+    /// and must be neither served nor cached, even if its row read started
+    /// before the rejection was recorded.
+    fn version_is_rejected(&self, owner: &str, id: &str, generation: i64, version: i64) -> bool {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .guards
+            .get(&(owner.to_owned(), id.to_owned()))
+            .is_some_and(|guard| (generation, version) <= guard.rejected_floor)
+    }
+
+    /// Sever every in-flight store witness. Called after the committing
+    /// transaction of a reconnect; disconnect and re-auth use
+    /// `invalidate_local_connection`, which also evicts entries and cancels
+    /// fenced leases.
+    fn bump_cache_epoch(&self) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bump_epoch();
+    }
+
+    /// Insert a token, keeping the cache bounded and monotonic: a concurrent
+    /// expired or otherwise stale read must never overwrite a newer entry
+    /// left by a completed refresh or reconnect. `epoch` must be a
+    /// `cache_witness` snapshot taken before the credential evidence was
+    /// produced (row read or refresh flight); a mismatch means a disconnect,
+    /// re-auth, reconnect or recorded 401 landed in between, so re-inserting
+    /// this plaintext could resurrect it behind the invalidation. The clock
+    /// is global and never resets, so guard capacity eviction cannot alias a
+    /// stale witness back into validity. Versions at or below the rejected
+    /// floor already answered 401 and are never cached again. Returns whether
+    /// the token was stored.
+    fn store_cached_token(
+        &self,
+        owner: &str,
+        id: &str,
+        generation: i64,
+        token: &str,
+        version: i64,
+        expires_at: i64,
+        epoch: u64,
+    ) -> bool {
+        let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (owner.to_owned(), id.to_owned());
+        if cache.witness() != epoch
+            || cache
+                .guards
+                .get(&key)
+                .is_some_and(|guard| (generation, version) <= guard.rejected_floor)
+        {
+            return false;
+        }
+        if let Some(existing) = cache.entries.get(&key)
+            && (existing.generation, existing.version) > (generation, version)
+        {
+            return false;
+        }
+        if !cache.entries.contains_key(&key) {
+            let cutoff = unix_now() + 60;
+            cache.entries.retain(|_, entry| entry.expires_at > cutoff);
+            while cache.entries.len() >= MAX_CACHED_TOKENS {
+                let Some(oldest) = cache
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                cache.entries.remove(&oldest);
+            }
+        }
+        cache.entries.insert(
+            key,
+            CachedAccessToken {
+                token: token.to_owned(),
+                version,
+                generation,
+                expires_at,
+            },
+        );
+        true
+    }
+
+    /// Adjudicate a settled refresh flight for serving. The flight produced
+    /// its token without holding the cache lock, so between a waiter's
+    /// rejection check and this store a concurrent caller may have recorded
+    /// a 401 for the settled version, an invalidation may have severed the
+    /// flight witness, or a newer entry may have landed. The store's refusal
+    /// is the authoritative evidence that something changed: serve only a
+    /// token the cache accepted, and report whether the settled version was
+    /// refused as provider-invalid so the caller rotates past the floor
+    /// instead of looping on stale evidence.
+    fn adjudicate_settled_flight(
+        &self,
+        owner: &str,
+        id: &str,
+        generation: i64,
+        token: &str,
+        version: i64,
+        expires_at: i64,
+        flight_epoch: u64,
+    ) -> SettledFlight {
+        if self.store_cached_token(
+            owner,
+            id,
+            generation,
+            token,
+            version,
+            expires_at,
+            flight_epoch,
+        ) {
+            return SettledFlight::Serve(token.to_owned(), version);
+        }
+        SettledFlight::Retry {
+            rejected: self.version_is_rejected(owner, id, generation, version),
+        }
+    }
+
+    /// Drop every local trace of a connection whose database credentials were
+    /// cleared: cancel in-flight leases fenced at or before `generation` and
+    /// evict the cached plaintext token so it cannot outlive its credentials.
+    fn invalidate_local_connection(&self, owner: &str, id: &str, generation: i64) {
+        {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (owner.to_owned(), id.to_owned());
+            if let Some(connection) = active.get_mut(&key) {
+                for (_, version, cancel) in &connection.requests {
+                    if *version <= generation {
+                        cancel.cancel();
+                    }
+                }
+                connection
+                    .requests
+                    .retain(|(_, version, _)| *version > generation);
+                if connection.requests.is_empty() {
+                    active.remove(&key);
+                }
+            }
+        }
+        let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (owner.to_owned(), id.to_owned());
+        cache.entries.remove(&key);
+        // Row reads and refresh flights holding a pre-invalidation clock
+        // witness must fail their store instead of resurrecting plaintext.
+        cache.bump_epoch();
+    }
+
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn cached_token_version_for_test(&self, owner: &str, id: &str) -> Option<i64> {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(&(owner.to_owned(), id.to_owned()))
+            .map(|entry| entry.version)
+    }
+
+    /// Test-only cross-instance expiry signal: rewriting the database row
+    /// cannot reach this instance's memory, so integration tests clear the
+    /// entry explicitly to exercise the rediscovery path.
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn clear_cached_token_for_test(&self, owner: &str, id: &str) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .remove(&(owner.to_owned(), id.to_owned()));
+    }
+
     async fn access_token(
         self: &Arc<Self>,
         owner: &str,
         id: &str,
         generation: i64,
-        rejected_version: Option<i64>,
+        mut rejected_version: Option<i64>,
     ) -> ApiResult<(String, i64)> {
         loop {
-            let row = self.credential_row(owner, id, generation).await?;
-            if let Some(token) = self.usable_access_token(&row, rejected_version)? {
-                return Ok(token);
+            // Record the rejection before any cache or row use so the
+            // evidence survives cache eviction and readers paused before it.
+            if let Some(rejected) = rejected_version {
+                self.note_rejected_version(owner, id, generation, rejected);
             }
+            if let Some(cached) = self.cached_access_token(owner, id, generation, rejected_version)
+            {
+                return Ok(cached);
+            }
+            // Witness the invalidation epoch before the row read: a reader
+            // paused across a disconnect/re-auth must not re-insert the
+            // plaintext it decrypted from pre-invalidation credentials.
+            let epoch = self.cache_witness();
+            let row = self.credential_row(owner, id, generation).await?;
+            let mut usable = self.usable_access_token(&row, rejected_version)?;
+            if usable.as_ref().is_some_and(|(_, version, _)| {
+                self.version_is_rejected(owner, id, generation, *version)
+            }) {
+                // This row read started before or beside a 401 for its
+                // version; serve nothing and refresh past the rejected floor.
+                usable = None;
+            }
+            if let Some((token, version, expires_at)) = usable {
+                // A failed store means fresher evidence (an invalidation, a
+                // rejection floor, or a newer entry) landed meanwhile; loop
+                // to re-evaluate against it instead of serving stale state.
+                if self
+                    .store_cached_token(owner, id, generation, &token, version, expires_at, epoch)
+                {
+                    return Ok((token, version));
+                }
+                continue;
+            }
+            let flight_epoch = self.cache_witness();
             let mut refresh = self.refresh(owner, id, generation, rejected_version);
-            let (token, version) = loop {
+            let (token, version, expires_at) = loop {
                 if let Some(result) = refresh.borrow_and_update().clone() {
                     break result?;
                 }
@@ -1228,10 +1588,48 @@ impl ChatgptConnections {
                     )
                 })?;
             };
+            // The flight settled, but a concurrent caller may already have
+            // drawn a 401 for the settled version while the exchange was in
+            // flight. Check the current rejection evidence on this return
+            // path: never issue or cache provider-invalid plaintext; record
+            // the rejection and rotate past the floor instead.
+            if rejected_version != Some(version)
+                && self.version_is_rejected(owner, id, generation, version)
+            {
+                rejected_version = Some(version);
+                continue;
+            }
             // A caller rejecting the next version may have joined an older
             // flight that only reused it. That caller must refresh that version.
             if rejected_version != Some(version) {
-                return Ok((token, version));
+                // Replace the rejected or expired entry so later independent
+                // requests reuse the fresh token instead of re-living the
+                // 401. The rejection check above and this store do not hold
+                // the cache lock across each other: a concurrent 401 for the
+                // settled version, an invalidation severing the flight
+                // witness, or a newer entry can land in between and make the
+                // store refuse the token. Never serve a token the cache
+                // refused; re-adjudicate against the fresher evidence
+                // instead of returning the unexamined plaintext.
+                match self.adjudicate_settled_flight(
+                    owner,
+                    id,
+                    generation,
+                    &token,
+                    version,
+                    expires_at,
+                    flight_epoch,
+                ) {
+                    SettledFlight::Serve(token, version) => return Ok((token, version)),
+                    // The settled version was rejected meanwhile: carry the
+                    // evidence so the next flight rotates past the floor.
+                    SettledFlight::Retry { rejected: true } => {
+                        rejected_version = Some(version);
+                    }
+                    // An invalidation or a newer entry overtook the flight:
+                    // loop to re-evaluate against the fresher state.
+                    SettledFlight::Retry { rejected: false } => {}
+                }
             }
         }
     }
@@ -1265,7 +1663,7 @@ impl ChatgptConnections {
         &self,
         row: &CredentialRow,
         rejected_version: Option<i64>,
-    ) -> ApiResult<Option<(String, i64)>> {
+    ) -> ApiResult<Option<(String, i64, i64)>> {
         if rejected_version != Some(row.credential_version)
             && row.refresh_owner.is_none()
             && row
@@ -1275,7 +1673,16 @@ impl ChatgptConnections {
             let credentials =
                 self.decode_credentials(row.credentials_encrypted.as_deref().ok_or_else(reauth)?)?;
             if credentials.expires_at > unix_now() + 60 {
-                return Ok(Some((credentials.access_token, row.credential_version)));
+                let expires_at = row
+                    .token_expires_at
+                    .map_or(credentials.expires_at, |value| {
+                        value.min(credentials.expires_at)
+                    });
+                return Ok(Some((
+                    credentials.access_token,
+                    row.credential_version,
+                    expires_at,
+                )));
             }
         }
         Ok(None)
@@ -1287,18 +1694,32 @@ impl ChatgptConnections {
         id: &str,
         generation: i64,
         rejected_version: Option<i64>,
-    ) -> ApiResult<(String, i64)> {
+    ) -> ApiResult<(String, i64, i64)> {
         let config = self.enabled()?;
         let pool = self.pool()?;
         let mut metadata_ready = false;
         let mut deadline = tokio::time::Instant::now() + Duration::from_secs(35);
         let mut wait = Duration::from_millis(100);
         loop {
+            // Witness the invalidation epoch before the row read so a racing
+            // disconnect/re-auth cannot find plaintext re-inserted behind it.
+            let epoch = self.cache_witness();
             let row = tokio::time::timeout_at(deadline, self.credential_row(owner, id, generation))
                 .await
                 .map_err(|_| unavailable())??;
-            if let Some(token) = self.usable_access_token(&row, rejected_version)? {
-                return Ok(token);
+            let mut usable = self.usable_access_token(&row, rejected_version)?;
+            if usable.as_ref().is_some_and(|(_, version, _)| {
+                self.version_is_rejected(owner, id, generation, *version)
+            }) {
+                // This row read started before or beside a 401 for its
+                // version; rotate past the rejected floor instead of serving it.
+                usable = None;
+            }
+            if let Some((token, version, expires_at)) = usable {
+                // A cross-instance refresh may have landed between reads;
+                // replace the local entry so waiters stop bypassing it.
+                self.store_cached_token(owner, id, generation, &token, version, expires_at, epoch);
+                return Ok((token, version, expires_at));
             }
             let version = row.credential_version;
             let encrypted = row.credentials_encrypted.as_deref().ok_or_else(reauth)?;
@@ -1396,7 +1817,7 @@ impl ChatgptConnections {
                     .bind(encrypted).bind(replacement.expires_at).bind(owner).bind(id).bind(generation).bind(version).bind(&refresh_id).execute(persistence_connection.as_mut().expect("refresh checkout acquired").connection_mut()).await.map_err(internal_error)?;
                 persistence_connection.take().expect("refresh SQL acknowledged").release();
                 if changed.rows_affected()!=1 {return Err(reauth());}
-                Ok((replacement.access_token,version+1))
+                Ok((replacement.access_token,version+1,replacement.expires_at))
             }).await.unwrap_or_else(|_|Err(fail(StatusCode::SERVICE_UNAVAILABLE,"chatgpt_refresh_deadline","Subscription refresh timed out")));
             if let Some(connection) = persistence_connection {
                 connection.discard();
@@ -1422,7 +1843,16 @@ impl ChatgptConnections {
                     .map_err(|_| unavailable())??;
                 }
             }
-            return refresh_result;
+            // A waiter may have drawn a 401 for the settled version while this
+            // leader was still returning. Check the current rejection evidence
+            // on this return path too: never issue provider-invalid plaintext;
+            // loop to rotate past the recorded floor.
+            match refresh_result {
+                Ok((_, settled, _)) if self.version_is_rejected(owner, id, generation, settled) => {
+                    continue;
+                }
+                result => return result,
+            }
         }
     }
     async fn release_refresh_lease(
@@ -1460,6 +1890,11 @@ impl ChatgptConnections {
                 .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
         }
         tx.commit().await.map_err(internal_error)?;
+        if changed.rows_affected() == 1 {
+            // Credentials are cleared: evict the plaintext cache entry now
+            // instead of waiting for a generation-mismatched read.
+            self.invalidate_local_connection(owner, id, generation);
+        }
         Ok(changed.rows_affected() == 1)
     }
     async fn authenticated_body(
@@ -1626,23 +2061,8 @@ impl ChatgptConnections {
         query("UPDATE user_llm_models SET is_active=0,updated_at=NOW(6) WHERE user_id=? AND connection_id=?")
             .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
-        {
-            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            let key = (owner.to_owned(), id.to_owned());
-            if let Some(connection) = active.get_mut(&key) {
-                for (_, version, cancel) in &connection.requests {
-                    if *version <= generation {
-                        cancel.cancel();
-                    }
-                }
-                connection
-                    .requests
-                    .retain(|(_, version, _)| *version > generation);
-                if connection.requests.is_empty() {
-                    active.remove(&key);
-                }
-            }
-        }
+        // Credentials are gone: cached plaintext tokens must not outlive them.
+        self.invalidate_local_connection(owner, id, generation);
         let confirmed = if let Some(encrypted) = encrypted {
             self.revoke(&client_id, &encrypted).await.is_ok()
         } else {

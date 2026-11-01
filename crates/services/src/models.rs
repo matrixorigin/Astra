@@ -3447,6 +3447,15 @@ impl DatabaseModelService {
         self
     }
 
+    /// Test-only access to this service's own subscription connections: each
+    /// `with_chatgpt_config` stack owns a separate in-memory token cache, so
+    /// integration tests simulating cross-instance expiry must clear every
+    /// instance's cache, not just one.
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn subscription_connections_for_test(&self) -> &Arc<crate::chatgpt::ChatgptConnections> {
+        &self.subscriptions
+    }
+
     fn subscription_thinking_snapshot(
         binding: &crate::chatgpt::ExecutionCredential,
         model: &str,

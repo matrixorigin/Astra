@@ -247,3 +247,619 @@ fn model_check_failures_keep_typed_provider_limits() {
         );
     }
 }
+
+fn service_without_pool() -> Arc<ChatgptConnections> {
+    Arc::new(ChatgptConnections::new(
+        None,
+        encryptor(),
+        Ok(ChatgptConfig::for_test("http://127.0.0.1:1")),
+    ))
+}
+
+/// Store through a fresh epoch witness, as producers do; returns whether the
+/// cache accepted the token.
+fn store(
+    connections: &Arc<ChatgptConnections>,
+    owner: &str,
+    id: &str,
+    generation: i64,
+    token: &str,
+    version: i64,
+    expires_at: i64,
+) -> bool {
+    let epoch = connections.cache_witness();
+    connections.store_cached_token(owner, id, generation, token, version, expires_at, epoch)
+}
+
+#[tokio::test]
+async fn cached_access_token_serves_repeat_reads_without_sql_or_decryption() {
+    let service = service_without_pool();
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "cached-token",
+        3,
+        unix_now() + 3600,
+    );
+    // The pool is absent: any credential-row read or decrypt would fail, so an
+    // Ok result proves the cache served the token directly.
+    for _ in 0..3 {
+        let (token, version) = service
+            .access_token("owner", "conn", 7, None)
+            .await
+            .expect("warm cache must not need the database");
+        assert_eq!((token.as_str(), version), ("cached-token", 3));
+    }
+}
+
+#[tokio::test]
+async fn cached_access_token_evicts_rejected_expired_or_regenerated_entries() {
+    let service = service_without_pool();
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "cached-token",
+        3,
+        unix_now() + 3600,
+    );
+    // A caller rejecting the cached version (e.g. after a 401) must re-read
+    // cross-replica state; with no pool that read fails instead of serving.
+    assert!(
+        service
+            .access_token("owner", "conn", 7, Some(3))
+            .await
+            .is_err()
+    );
+    // The rejected version is provider-invalid for everyone: the entry is
+    // evicted so later independent requests cannot re-live the 401.
+    assert!(service.tokens.lock().unwrap().entries.is_empty());
+    assert!(
+        service
+            .access_token("owner", "conn", 7, None)
+            .await
+            .is_err()
+    );
+    // Entries inside the 60-second refresh window are expired and evicted.
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "expired-token",
+        4,
+        unix_now() + 30,
+    );
+    assert!(
+        service
+            .access_token("owner", "conn", 7, None)
+            .await
+            .is_err()
+    );
+    assert!(service.tokens.lock().unwrap().entries.is_empty());
+    // A reconnect bumps the generation; the stale entry is evicted, not served.
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "old-generation",
+        5,
+        unix_now() + 3600,
+    );
+    assert!(
+        service
+            .access_token("owner", "conn", 8, None)
+            .await
+            .is_err()
+    );
+    assert!(service.tokens.lock().unwrap().entries.is_empty());
+    // A stale-generation caller must not drop the reconnect's fresher entry.
+    store(
+        &service,
+        "owner",
+        "conn",
+        8,
+        "new-generation",
+        1,
+        unix_now() + 3600,
+    );
+    assert!(
+        service
+            .access_token("owner", "conn", 7, None)
+            .await
+            .is_err()
+    );
+    let (token, version) = service
+        .cached_access_token("owner", "conn", 8, None)
+        .expect("newer generation survives stale-generation reads");
+    assert_eq!((token.as_str(), version), ("new-generation", 1));
+}
+
+#[tokio::test]
+async fn cached_access_token_never_skips_the_revocation_fence() {
+    let service = service_without_pool();
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "cached-token",
+        3,
+        unix_now() + 3600,
+    );
+    let credential = ExecutionCredential {
+        service: service.clone(),
+        owner: "owner".into(),
+        connection_id: "conn".into(),
+        generation: 7,
+        label: "label".into(),
+    };
+    // A warm cache still requires the per-request fence read in ensure_current;
+    // without a database the acquire must fail rather than issue a lease.
+    assert!(credential.acquire(None).await.is_err());
+}
+
+#[tokio::test]
+async fn stored_tokens_never_overwrite_newer_versions() {
+    let service = service_without_pool();
+    // A slow reader caching an old version must not clobber a refreshed one.
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "fresh-token",
+        4,
+        unix_now() + 3600,
+    );
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "stale-token",
+        3,
+        unix_now() + 3600,
+    );
+    let (token, version) = service
+        .cached_access_token("owner", "conn", 7, None)
+        .expect("fresher entry survives a stale concurrent store");
+    assert_eq!((token.as_str(), version), ("fresh-token", 4));
+    // The same version is an idempotent re-store, not a regression.
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "fresh-token",
+        4,
+        unix_now() + 3600,
+    );
+    assert!(
+        service
+            .cached_access_token("owner", "conn", 7, None)
+            .is_some()
+    );
+    // A reconnect's newer generation wins over any older-generation version.
+    store(
+        &service,
+        "owner",
+        "conn",
+        8,
+        "reconnected",
+        1,
+        unix_now() + 3600,
+    );
+    let (token, version) = service
+        .cached_access_token("owner", "conn", 8, None)
+        .expect("reconnect replaces the older generation");
+    assert_eq!((token.as_str(), version), ("reconnected", 1));
+    // An older generation never overwrites the reconnect's entry.
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "pre-reconnect",
+        9,
+        unix_now() + 3600,
+    );
+    let (token, version) = service
+        .cached_access_token("owner", "conn", 8, None)
+        .expect("older generation cannot clobber the reconnect entry");
+    assert_eq!((token.as_str(), version), ("reconnected", 1));
+}
+
+#[tokio::test]
+async fn token_cache_is_bounded_and_sweeps_expired_first() {
+    let service = service_without_pool();
+    let now = unix_now();
+    // Expired entries are reclaimed before any live one is evicted.
+    store(&service, "owner", "expired", 1, "dead", 1, now + 10);
+    for index in 0..MAX_CACHED_TOKENS {
+        store(
+            &service,
+            "owner",
+            &format!("live-{index}"),
+            1,
+            "tok",
+            1,
+            now + 3600 + index as i64,
+        );
+    }
+    {
+        let cache = service.tokens.lock().unwrap();
+        assert_eq!(cache.entries.len(), MAX_CACHED_TOKENS);
+        assert!(
+            !cache
+                .entries
+                .contains_key(&("owner".to_owned(), "expired".to_owned()))
+        );
+    }
+    // Beyond capacity the soonest-expiring live entry leaves first.
+    store(&service, "owner", "newest", 1, "tok", 1, now + 7200);
+    let cache = service.tokens.lock().unwrap();
+    assert_eq!(cache.entries.len(), MAX_CACHED_TOKENS);
+    assert!(
+        !cache
+            .entries
+            .contains_key(&("owner".to_owned(), "live-0".to_owned()))
+    );
+    assert!(
+        cache
+            .entries
+            .contains_key(&("owner".to_owned(), "newest".to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn invalidate_local_connection_evicts_tokens_and_cancels_fenced_leases() {
+    let service = service_without_pool();
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "cached-token",
+        3,
+        unix_now() + 3600,
+    );
+    let fenced = CancellationToken::new();
+    service.register_request("owner", "conn", Uuid::new_v4(), 7, fenced.clone());
+    // A request from a newer generation is outside this invalidation fence.
+    let newer = CancellationToken::new();
+    service.register_request("owner", "conn", Uuid::new_v4(), 8, newer.clone());
+    service.invalidate_local_connection("owner", "conn", 7);
+    assert!(fenced.is_cancelled());
+    assert!(!newer.is_cancelled());
+    assert!(
+        service.tokens.lock().unwrap().entries.is_empty(),
+        "cleared credentials must not leave plaintext tokens cached"
+    );
+    let active = service.active.lock().unwrap();
+    let connection = &active[&("owner".to_owned(), "conn".to_owned())];
+    assert_eq!(connection.requests.len(), 1);
+    assert_eq!(connection.requests[0].1, 8);
+}
+
+#[tokio::test]
+async fn rejected_floor_blocks_recache_after_eviction() {
+    let service = service_without_pool();
+    store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "cached-token",
+        3,
+        unix_now() + 3600,
+    );
+    // A 401 for version 3 records the floor and evicts the entry; without a
+    // database the rejected acquire fails instead of serving.
+    assert!(
+        service
+            .access_token("owner", "conn", 7, Some(3))
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .cached_token_version_for_test("owner", "conn")
+            .is_none()
+    );
+    // Eviction must not forget the rejection: a row read paused before the
+    // 401 can neither re-cache nor serve version 3 nor anything older.
+    let epoch = service.cache_witness();
+    assert!(!service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "cached-token",
+        3,
+        unix_now() + 3600,
+        epoch
+    ));
+    assert!(!service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "older-token",
+        2,
+        unix_now() + 3600,
+        epoch
+    ));
+    assert!(
+        service
+            .cached_access_token("owner", "conn", 7, None)
+            .is_none()
+    );
+    // The rotation answering the rejection is above the floor and caches.
+    assert!(service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "fresh-token",
+        4,
+        unix_now() + 3600,
+        epoch
+    ));
+    let (token, version) = service
+        .cached_access_token("owner", "conn", 7, None)
+        .expect("the version above the floor is servable");
+    assert_eq!((token.as_str(), version), ("fresh-token", 4));
+}
+
+#[tokio::test]
+async fn invalidation_severs_paused_store_witnesses() {
+    let service = service_without_pool();
+    // A reader snapshots the epoch, then is paused while disconnect or
+    // re-auth commits and invalidates.
+    let stale_epoch = service.cache_witness();
+    service.invalidate_local_connection("owner", "conn", 7);
+    // Resuming, it must not re-insert the pre-invalidation plaintext.
+    assert!(!service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "paused-read",
+        3,
+        unix_now() + 3600,
+        stale_epoch
+    ));
+    assert!(
+        service
+            .cached_access_token("owner", "conn", 7, None)
+            .is_none()
+    );
+    // A witness taken after the invalidation stores normally again.
+    assert!(store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "post-invalidation",
+        3,
+        unix_now() + 3600
+    ));
+    assert_eq!(
+        service.cached_token_version_for_test("owner", "conn"),
+        Some(3)
+    );
+    // A reconnect severs witnesses from the replaced registration as well.
+    let pre_reconnect = service.cache_witness();
+    service.bump_cache_epoch();
+    assert!(!service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "pre-reconnect",
+        3,
+        unix_now() + 3600,
+        pre_reconnect
+    ));
+}
+
+#[tokio::test]
+async fn guard_state_is_bounded() {
+    let service = service_without_pool();
+    for index in 0..(MAX_CACHED_TOKENS + 8) {
+        service.note_rejected_version("owner", &format!("conn-{index}"), 1, 1);
+    }
+    assert!(service.tokens.lock().unwrap().guards.len() <= MAX_CACHED_TOKENS);
+}
+
+#[tokio::test]
+async fn capacity_eviction_cannot_rebirth_paused_store_witnesses() {
+    let service = service_without_pool();
+    // Regression: a per-connection epoch living in the capacity-evictable
+    // guard map resets when its guard is evicted, so enough unrelated guard
+    // pressure lets a paused reader's witness alias the recreated state
+    // (epoch ABA) and re-insert plaintext behind a disconnect. The global
+    // monotonic clock never resets, so no eviction revives a stale witness.
+    let stale = service.cache_witness();
+    service.invalidate_local_connection("owner", "conn", 7);
+    for index in 0..(MAX_CACHED_TOKENS * 2) {
+        service.note_rejected_version("owner", &format!("other-{index}"), 1, 1);
+    }
+    {
+        let cache = service.tokens.lock().unwrap();
+        assert!(cache.guards.len() <= MAX_CACHED_TOKENS);
+        assert!(cache.entries.len() <= MAX_CACHED_TOKENS);
+    }
+    assert!(!service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "paused-read",
+        3,
+        unix_now() + 3600,
+        stale
+    ));
+    assert!(
+        service
+            .cached_access_token("owner", "conn", 7, None)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn rejection_severs_paused_witnesses_even_after_floor_eviction() {
+    let service = service_without_pool();
+    // A row read paused beside a 401 must not re-cache the rejected version
+    // even if guard capacity pressure later drops the floor record itself:
+    // recording the rejection bumped the invalidation clock, which eviction
+    // cannot reset. The floor check alone had a hole here.
+    let stale = service.cache_witness();
+    service.note_rejected_version("owner", "conn", 7, 3);
+    for index in 0..(MAX_CACHED_TOKENS * 2) {
+        service.note_rejected_version("owner", &format!("other-{index}"), 1, 1);
+    }
+    assert!(!service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "rejected",
+        3,
+        unix_now() + 3600,
+        stale
+    ));
+    assert!(
+        service
+            .cached_access_token("owner", "conn", 7, None)
+            .is_none()
+    );
+    // A post-rejection witness for a rotated version still stores normally.
+    assert!(store(
+        &service,
+        "owner",
+        "conn",
+        7,
+        "rotated",
+        4,
+        unix_now() + 3600
+    ));
+    assert_eq!(
+        service.cached_token_version_for_test("owner", "conn"),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn settled_flight_rejected_between_check_and_store_is_re_adjudicated() {
+    let service = service_without_pool();
+    let expires = unix_now() + 3600;
+    // A refresh flight witnesses the invalidation clock before its exchange.
+    let flight_epoch = service.cache_witness();
+    // The flight settles version 4; the waiter's rejection check passes.
+    // Before its store runs, a concurrent caller draws a 401 for exactly
+    // that settled version and records the floor (which also severs the
+    // flight witness). The store refuses, and the waiter must not serve the
+    // rejected plaintext it is still holding.
+    service.note_rejected_version("owner", "conn", 7, 4);
+    match service.adjudicate_settled_flight("owner", "conn", 7, "token-4", 4, expires, flight_epoch)
+    {
+        SettledFlight::Retry { rejected } => assert!(
+            rejected,
+            "a settled version refused at the recorded floor must rotate past it"
+        ),
+        SettledFlight::Serve(token, version) => panic!(
+            "a concurrently rejected settled version must not be served: ({token}, {version})"
+        ),
+    }
+    // The refused token never entered the cache and stays unservable.
+    assert!(
+        service
+            .cached_access_token("owner", "conn", 7, None)
+            .is_none()
+    );
+    assert!(
+        service
+            .cached_token_version_for_test("owner", "conn")
+            .is_none()
+    );
+    // The rotation answering the rejection settles version 5 above the
+    // floor with a post-rejection witness and is served and cached.
+    let rotated = service.cache_witness();
+    match service.adjudicate_settled_flight("owner", "conn", 7, "token-5", 5, expires, rotated) {
+        SettledFlight::Serve(token, version) => {
+            assert_eq!((token.as_str(), version), ("token-5", 5));
+        }
+        SettledFlight::Retry { .. } => {
+            panic!("a settled version above the floor with a fresh witness must be served")
+        }
+    }
+    assert_eq!(
+        service.cached_token_version_for_test("owner", "conn"),
+        Some(5)
+    );
+}
+
+#[tokio::test]
+async fn settled_flight_overtaken_by_newer_entry_retries_without_rejection() {
+    let service = service_without_pool();
+    let expires = unix_now() + 3600;
+    let flight_epoch = service.cache_witness();
+    // While the flight was exchanging, another caller's rotation cached
+    // version 5. The flight's version 4 store loses the monotonic race; the
+    // waiter must retry and re-evaluate against the newer entry instead of
+    // serving the older token it holds, and version 4 is not rejected.
+    assert!(store(&service, "owner", "conn", 7, "token-5", 5, expires));
+    match service.adjudicate_settled_flight("owner", "conn", 7, "token-4", 4, expires, flight_epoch)
+    {
+        SettledFlight::Retry { rejected } => assert!(
+            !rejected,
+            "a store lost to a newer entry is not rejection evidence"
+        ),
+        SettledFlight::Serve(token, version) => panic!(
+            "a settled version overtaken by a newer entry must not be served: ({token}, {version})"
+        ),
+    }
+    // The retried caller is then served the newer entry from the cache.
+    let (token, version) = service
+        .cached_access_token("owner", "conn", 7, None)
+        .expect("the newer entry remains servable");
+    assert_eq!((token.as_str(), version), ("token-5", 5));
+}
+
+#[tokio::test]
+async fn settled_flight_overtaken_by_invalidation_retries_and_recovers() {
+    let service = service_without_pool();
+    let expires = unix_now() + 3600;
+    let flight_epoch = service.cache_witness();
+    // A disconnect or re-auth commits while the flight is exchanging: the
+    // invalidation severs the flight witness, so the store refuses and the
+    // waiter must retry rather than serve pre-invalidation plaintext. The
+    // settled version itself was never rejected.
+    service.invalidate_local_connection("owner", "conn", 7);
+    match service.adjudicate_settled_flight("owner", "conn", 7, "token-4", 4, expires, flight_epoch)
+    {
+        SettledFlight::Retry { rejected } => assert!(
+            !rejected,
+            "an invalidation-severed witness is not rejection evidence"
+        ),
+        SettledFlight::Serve(token, version) => panic!(
+            "a settled version behind an invalidation must not be served: ({token}, {version})"
+        ),
+    }
+    assert!(
+        service
+            .cached_access_token("owner", "conn", 7, None)
+            .is_none()
+    );
+    // The retried caller re-reads post-invalidation credentials and stores
+    // them under a fresh witness: the retry path recovers instead of
+    // latching on the severed one.
+    let fresh = service.cache_witness();
+    match service.adjudicate_settled_flight("owner", "conn", 7, "token-5", 5, expires, fresh) {
+        SettledFlight::Serve(token, version) => {
+            assert_eq!((token.as_str(), version), ("token-5", 5));
+        }
+        SettledFlight::Retry { .. } => {
+            panic!("a settled version stored under a fresh witness must be served")
+        }
+    }
+}

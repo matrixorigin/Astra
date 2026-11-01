@@ -53,13 +53,39 @@ fn callback(value: &Value, code: &str) -> CompleteAuthorization {
         error: None,
     }
 }
-async fn expire(pool: &sqlx::MySqlPool, key: &FernetTokenEncryptor, owner: &str, id: &str) {
+async fn expire(
+    service: &ChatgptConnections,
+    pool: &sqlx::MySqlPool,
+    key: &FernetTokenEncryptor,
+    owner: &str,
+    id: &str,
+) {
     let encrypted:String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
         .bind(owner).bind(id).fetch_one(pool).await.unwrap();
     let mut value: Value = serde_json::from_str(&key.decrypt(&encrypted).unwrap()).unwrap();
     value["expires_at"] = json!(chrono::Utc::now().timestamp() - 1);
     sqlx::query("UPDATE user_llm_connections SET credentials_encrypted=?,token_expires_at=? WHERE user_id=? AND connection_id=?")
         .bind(key.encrypt(&value.to_string()).unwrap()).bind(chrono::Utc::now().timestamp()-1).bind(owner).bind(id).execute(pool).await.unwrap();
+    // A database rewrite cannot reach the service's in-memory cache; clear
+    // the entry so the test exercises rediscovery like a remote expiry.
+    service.clear_cached_token_for_test(owner, id);
+}
+
+/// `expire` for journeys holding several `ChatgptConnections` instances: a
+/// database rewrite reaches none of their caches, so every instance's entry
+/// is cleared, not just the one the next acquire happens to use.
+async fn expire_all(
+    services: &[&ChatgptConnections],
+    pool: &sqlx::MySqlPool,
+    key: &FernetTokenEncryptor,
+    owner: &str,
+    id: &str,
+) {
+    let (first, rest) = services.split_first().expect("at least one service");
+    expire(first, pool, key, owner, id).await;
+    for service in rest {
+        service.clear_cached_token_for_test(owner, id);
+    }
 }
 
 #[tokio::test]
@@ -167,6 +193,7 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     let models = DatabaseModelService::new(settings.clone(), key.clone())
         .with_pool(shared.clone())
         .with_chatgpt_config(config.clone());
+    let models_tokens = models.subscription_connections_for_test().clone();
     let mut model_ids = Vec::new();
     for (index, slug) in ["fixture-model", "fixture-second"].into_iter().enumerate() {
         let model = models
@@ -251,9 +278,13 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         .unwrap()
         .subscription
         .unwrap();
-    let second = DatabaseModelService::new(settings.clone(), key.clone())
+    // Each `with_chatgpt_config` stack owns a separate in-memory token cache;
+    // keep handles so simulated cross-instance expiry clears every instance.
+    let second_models = DatabaseModelService::new(settings.clone(), key.clone())
         .with_pool(shared.clone())
-        .with_chatgpt_config(config.clone())
+        .with_chatgpt_config(config.clone());
+    let second_tokens = second_models.subscription_connections_for_test().clone();
+    let second = second_models
         .admit_model_offering(owner.clone(), model_ids[1].clone())
         .await
         .unwrap()
@@ -270,7 +301,18 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         .state
         .refresh_delay_ms
         .store(11000, Ordering::SeqCst);
-    expire(&pool, &key, &owner, &connection).await;
+    expire_all(
+        &[
+            service.as_ref(),
+            models_tokens.as_ref(),
+            second_tokens.as_ref(),
+        ],
+        &pool,
+        &key,
+        &owner,
+        &connection,
+    )
+    .await;
     let (a, b) = tokio::join!(first.acquire(None), second.acquire(None));
     let a = a.unwrap();
     let b = b.unwrap();
@@ -280,7 +322,18 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 1);
     drop((a, b));
     let primary = service.binding(&owner, &connection).await.unwrap();
-    expire(&pool, &key, &owner, &connection).await;
+    expire_all(
+        &[
+            service.as_ref(),
+            models_tokens.as_ref(),
+            second_tokens.as_ref(),
+        ],
+        &pool,
+        &key,
+        &owner,
+        &connection,
+    )
+    .await;
     let previous:String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
         .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
     provider.stop().await;
@@ -310,7 +363,18 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     // Even the last waiter can disappear after dispatch. The connection owner
     // must still persist the rotating token instead of stranding its lease.
     let version = primary.acquire(None).await.unwrap().version();
-    expire(&pool, &key, &owner, &connection).await;
+    expire_all(
+        &[
+            service.as_ref(),
+            models_tokens.as_ref(),
+            second_tokens.as_ref(),
+        ],
+        &pool,
+        &key,
+        &owner,
+        &connection,
+    )
+    .await;
     provider.state.refresh_delay_ms.store(200, Ordering::SeqCst);
     let cancelled = tokio::spawn({
         let primary = primary.clone();
@@ -338,9 +402,25 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     assert_eq!(refreshed.version(), version + 1);
     drop(refreshed);
     assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        service.cached_token_version_for_test(&owner, &connection),
+        Some(version + 1),
+        "a settled refresh must replace the cached entry, not bypass it once"
+    );
 
     // A simultaneous expiry shares one worker/result; valid acquisitions reuse it.
-    expire(&pool, &key, &owner, &connection).await;
+    expire_all(
+        &[
+            service.as_ref(),
+            models_tokens.as_ref(),
+            second_tokens.as_ref(),
+        ],
+        &pool,
+        &key,
+        &owner,
+        &connection,
+    )
+    .await;
     for expected_refreshes in [4, 4] {
         let leases = futures_util::future::join_all((0..64).map(|_| primary.acquire(None))).await;
         let leases = leases.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
@@ -356,7 +436,18 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     }
     provider.state.refresh_delay_ms.store(0, Ordering::SeqCst);
     let live = first.acquire(None).await.unwrap();
-    expire(&pool, &key, &owner, &connection).await;
+    expire_all(
+        &[
+            service.as_ref(),
+            models_tokens.as_ref(),
+            second_tokens.as_ref(),
+        ],
+        &pool,
+        &key,
+        &owner,
+        &connection,
+    )
+    .await;
     provider.state.refresh_delay_ms.store(200, Ordering::SeqCst);
     let interrupted_refresh = tokio::spawn({
         let first = first.clone();
@@ -377,6 +468,11 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     .await;
     assert_eq!(disconnected["status"], "disconnected");
     assert_eq!(disconnected["remote_revocation_confirmed"], true);
+    assert_eq!(
+        service.cached_token_version_for_test(&owner, &connection),
+        None,
+        "disconnect must evict cached plaintext tokens immediately"
+    );
     assert_eq!(
         operate_ok(&service, &owner, ConnectionOperation::List).await["items"][0]["remote_revocation_confirmed"],
         true
@@ -473,6 +569,7 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     let bytes = renewed.acquire(None).await.unwrap();
     assert!(!bytes.bearer().is_empty());
     provider.reject_access_token(bytes.bearer(), false);
+    let rejected_version = bytes.version();
     drop(bytes);
     let refreshes = provider.state.refresh_calls.load(Ordering::SeqCst);
     service
@@ -482,6 +579,11 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
     assert_eq!(
         provider.state.refresh_calls.load(Ordering::SeqCst),
         refreshes + 1
+    );
+    assert_eq!(
+        service.cached_token_version_for_test(&owner, &connection),
+        Some(rejected_version + 1),
+        "a 401-rejected version must be replaced by the refreshed one"
     );
     provider.state.stream_quota.store(true, Ordering::SeqCst);
     let failed = service
@@ -506,7 +608,18 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         Some("chatgpt_model_check_failed")
     );
     *provider.state.reject_token.lock().unwrap() = None;
-    expire(&pool, &key, &owner, &connection).await;
+    expire_all(
+        &[
+            service.as_ref(),
+            models_tokens.as_ref(),
+            second_tokens.as_ref(),
+        ],
+        &pool,
+        &key,
+        &owner,
+        &connection,
+    )
+    .await;
     let before:String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
         .bind(&owner).bind(&connection).fetch_one(&pool).await.unwrap();
     provider.state.refresh_error.store(429, Ordering::SeqCst);
@@ -973,7 +1086,7 @@ async fn subscription_sql_timeouts_release_pool_capacity_before_response_arrives
         ));
         let binding = service.binding(&owner, id).await.unwrap();
         if refresh {
-            expire(shared.get(), &key, &owner, id).await;
+            expire(&service, shared.get(), &key, &owner, id).await;
         }
         let mut acquire = Some(tokio::spawn(async move { binding.acquire(None).await }));
         let lease = if refresh {
@@ -1512,7 +1625,7 @@ async fn refresh_failure_cleanup_respects_its_budget() {
         )
         .await;
         let id = linked["connection"]["connection_id"].as_str().unwrap();
-        expire(shared.get(), &key, &owner, id).await;
+        expire(&direct, shared.get(), &key, &owner, id).await;
         provider
             .state
             .refresh_error
@@ -1583,4 +1696,86 @@ async fn proxy_pool(settings: &astra_core::MatrixOneSettings, port: u16) -> astr
     settings.db_pool_max_connections = 1;
     settings.db_pool_min_connections = 0;
     astra_core::SharedPool::new(&settings).await.unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn concurrent_rejection_shares_one_refresh_and_reconnect_fences_old_generation() {
+    let settings = common::require_db_it_env();
+    isolated_database::require_isolated_database(&settings.database);
+    let (_, settings) = common::setup_pool_and_settings().await;
+    let shared = astra_core::SharedPool::new(&settings).await.unwrap();
+    let mut provider = fixture::ProviderFixture::start().await;
+    let key = Arc::new(FernetTokenEncryptor::new("chatgpt-rejection-race-test-key").unwrap());
+    let service = Arc::new(ChatgptConnections::new(
+        Some(shared.clone()),
+        key.clone(),
+        Ok(ChatgptConfig::for_test(&provider.base)),
+    ));
+    let owner = format!("owner-{}", uuid::Uuid::new_v4());
+    let attempt = start(&service, &owner, None).await;
+    let code = provider.issue_code(&attempt, "account-one", true);
+    let linked = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Complete(
+            attempt["authorization_id"].as_str().unwrap().into(),
+            callback(&attempt, &code),
+        ),
+    )
+    .await;
+    let connection = linked["connection"]["connection_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let binding = service.binding(&owner, &connection).await.unwrap();
+    let lease = binding.acquire(None).await.unwrap();
+    let rejected_version = lease.version();
+    provider.reject_access_token(lease.bearer(), false);
+    drop(lease);
+    let refreshes = provider.state.refresh_calls.load(Ordering::SeqCst);
+    // 32 concurrent callers each carry the same 401 evidence: they must share
+    // exactly one refresh flight, none may be issued the rejected version, and
+    // the rotated version must land in the cache for later independent reads.
+    let leases =
+        futures_util::future::join_all((0..32).map(|_| binding.acquire(Some(rejected_version))))
+            .await;
+    let leases = leases.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(
+        provider.state.refresh_calls.load(Ordering::SeqCst),
+        refreshes + 1,
+        "concurrent 401s must share one refresh flight"
+    );
+    for lease in &leases {
+        assert_eq!(lease.version(), rejected_version + 1);
+    }
+    drop(leases);
+    assert_eq!(
+        service.cached_token_version_for_test(&owner, &connection),
+        Some(rejected_version + 1)
+    );
+    // Reconnect replaces the registration: the stale binding is fenced out by
+    // the generation read, and a fresh binding acquires from the new
+    // registration rather than any pre-reconnect residue.
+    let relink = start(&service, &owner, Some(&connection)).await;
+    let code = provider.issue_code(&relink, "account-one", true);
+    let relinked = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Complete(
+            relink["authorization_id"].as_str().unwrap().into(),
+            callback(&relink, &code),
+        ),
+    )
+    .await;
+    assert_eq!(relinked["connection"]["status"], "connected");
+    assert!(
+        binding.acquire(None).await.is_err(),
+        "a pre-reconnect binding must be fenced out after reconnect"
+    );
+    let renewed = service.binding(&owner, &connection).await.unwrap();
+    let renewed_lease = renewed.acquire(None).await.unwrap();
+    assert!(!renewed_lease.bearer().is_empty());
+    drop(renewed_lease);
+    provider.stop().await;
 }
