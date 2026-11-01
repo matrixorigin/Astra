@@ -503,8 +503,8 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn disconnect_fences_inflight_model_creation_check_activation_and_default() {
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
     let (shared, settings) = common::setup_pool_and_settings().await;
-    isolated_database::require_isolated_database(&settings.database);
     let provider = fixture::ProviderFixture::start().await;
     let config = ChatgptConfig::for_test(&provider.base);
     let key = Arc::new(FernetTokenEncryptor::new("subscription-activation-race-test").unwrap());
@@ -616,8 +616,8 @@ async fn disconnect_fences_inflight_model_creation_check_activation_and_default(
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn reauthorization_completion_uses_disconnect_lock_order() {
     use std::time::Duration;
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
     let (shared, mut settings) = common::setup_pool_and_settings().await;
-    isolated_database::require_isolated_database(&settings.database);
     settings.db_pool_max_connections = 1;
     settings.db_pool_min_connections = 1;
     let worker = astra_core::SharedPool::new(&settings).await.unwrap();
@@ -754,4 +754,212 @@ async fn legacy_byok_rows_survive_idempotent_connection_migration() {
         .execute(shared.get())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn repeated_disconnect_cancels_pending_and_exchanging_reauthorization() {
+    use std::time::Duration;
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
+    let shared = common::setup_pool().await;
+    let provider = fixture::ProviderFixture::start().await;
+    let service = Arc::new(ChatgptConnections::new(
+        Some(shared.clone()),
+        Arc::new(FernetTokenEncryptor::new("repeated-disconnect-test").unwrap()),
+        Ok(ChatgptConfig::for_test(&provider.base)),
+    ));
+    let owner = format!("disconnect-{}", uuid::Uuid::new_v4());
+    let initial = start(&service, &owner, None).await;
+    let code = provider.issue_code(&initial, "same-account", true);
+    let linked = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Complete(
+            initial["authorization_id"].as_str().unwrap().into(),
+            callback(&initial, &code),
+        ),
+    )
+    .await;
+    let id = linked["connection"]["connection_id"].as_str().unwrap();
+    operate_ok(&service, &owner, ConnectionOperation::Disconnect(id.into())).await;
+    for exchanging in [false, true] {
+        let attempt = start(&service, &owner, Some(id)).await;
+        let authorization = attempt["authorization_id"].as_str().unwrap();
+        let code = provider.issue_code(&attempt, "same-account", true);
+        provider
+            .state
+            .hold_code_exchange
+            .store(exchanging, Ordering::SeqCst);
+        let mut operation = Some(ConnectionOperation::Complete(
+            authorization.into(),
+            callback(&attempt, &code),
+        ));
+        let exchanges = provider.state.token_calls.load(Ordering::SeqCst);
+        let completion = if exchanging {
+            let service = service.clone();
+            let owner = owner.clone();
+            let operation = operation.take().unwrap();
+            let task = tokio::spawn(async move { service.operate(&owner, operation).await });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                provider.state.code_exchange_started.notified(),
+            )
+            .await
+            .expect("completion must reach the provider exchange");
+            Some(task)
+        } else {
+            None
+        };
+        if exchanging {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?",
+            )
+            .bind(&owner)
+            .bind(authorization)
+            .fetch_one(shared.get())
+            .await
+            .unwrap();
+            assert_eq!(status, "exchanging");
+        }
+        operate_ok(&service, &owner, ConnectionOperation::Disconnect(id.into())).await;
+        if exchanging {
+            provider.state.release_code_exchange.notify_one();
+        }
+        let result = match completion {
+            Some(task) => tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            None => service.operate(&owner, operation.take().unwrap()).await,
+        };
+        let error = result.expect_err("disconnect must fence late authorization completion");
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some(if exchanging {
+                "oauth_attempt_cancelled"
+            } else {
+                "oauth_attempt_expired"
+            })
+        );
+        assert_eq!(
+            provider.state.token_calls.load(Ordering::SeqCst),
+            exchanges + usize::from(exchanging)
+        );
+        let persisted: (String, Option<String>) = sqlx::query_as(
+            "SELECT status,credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+            .bind(&owner).bind(id).fetch_one(shared.get()).await.unwrap();
+        assert_eq!(persisted, ("disconnected".into(), None));
+        let cancelled: (String, Option<String>) = sqlx::query_as(
+            "SELECT status,verifier_encrypted FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?")
+            .bind(&owner).bind(authorization).fetch_one(shared.get()).await.unwrap();
+        assert_eq!(cancelled, ("cancelled".into(), None));
+    }
+}
+
+#[allow(dead_code)]
+#[path = "common/mysql_response_proxy.rs"]
+mod mysql_response_proxy;
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn subscription_sql_timeouts_release_pool_capacity_before_response_arrives() {
+    use mysql_response_proxy::{Boundary, ResponseProxy};
+    use std::time::Duration;
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let provider = fixture::ProviderFixture::start().await;
+    let key = Arc::new(FernetTokenEncryptor::new("subscription-timeout-pool").unwrap());
+    let config = ChatgptConfig::for_test(&provider.base);
+    let direct = Arc::new(ChatgptConnections::new(
+        Some(shared.clone()),
+        key.clone(),
+        Ok(config.clone()),
+    ));
+    for refresh in [false, true] {
+        let owner = format!("sql-timeout-{}", uuid::Uuid::new_v4());
+        let initial = start(&direct, &owner, None).await;
+        let code = provider.issue_code(&initial, "same-account", true);
+        let linked = operate_ok(
+            &direct,
+            &owner,
+            ConnectionOperation::Complete(
+                initial["authorization_id"].as_str().unwrap().into(),
+                callback(&initial, &code),
+            ),
+        )
+        .await;
+        let id = linked["connection"]["connection_id"].as_str().unwrap();
+        let prefix: &'static [u8] = if refresh {
+            b"UPDATE user_llm_connections SET credentials_encrypted="
+        } else {
+            b"SELECT status,generation FROM user_llm_connections"
+        };
+        let proxy = ResponseProxy::start(
+            settings.host.clone(),
+            settings.port,
+            Boundary::Statement(prefix),
+        )
+        .await;
+        let mut worker_settings = settings.clone();
+        worker_settings.host = "127.0.0.1".into();
+        worker_settings.port = proxy.port;
+        worker_settings.db_pool_max_connections = 1;
+        worker_settings.db_pool_min_connections = 0;
+        let worker = astra_core::SharedPool::new(&worker_settings).await.unwrap();
+        let service = Arc::new(ChatgptConnections::new(
+            Some(worker.clone()),
+            key.clone(),
+            Ok(config.clone()),
+        ));
+        let binding = service.binding(&owner, id).await.unwrap();
+        if refresh {
+            expire(shared.get(), &key, &owner, id).await;
+        }
+        let mut acquire = Some(tokio::spawn(async move { binding.acquire(None).await }));
+        let lease = if refresh {
+            None
+        } else {
+            Some(acquire.take().unwrap().await.unwrap().unwrap())
+        };
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .expect("the real database must execute SQL before its response is withheld");
+        if let Some(lease) = &lease {
+            tokio::time::timeout(Duration::from_secs(4), lease.cancel.cancelled())
+                .await
+                .expect("watcher timeout must cancel inference");
+        }
+        // Do not release the response: a pooled SQLx checkout would keep its
+        // sole permit while ping drains that reply. The guard must discard it.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if worker.get().num_idle() > 0 || worker.get().size() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            sqlx::query_scalar::<_, i64>("SELECT 1")
+                .fetch_one(worker.get())
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("pool capacity must recover before releasing the old response");
+        if let Some(acquire) = acquire {
+            let recovered = tokio::time::timeout(Duration::from_secs(3), acquire)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recovered.version(),
+                2,
+                "reuse the committed rotation after losing its SQL acknowledgement"
+            );
+            assert!(!recovered.cancel.is_cancelled());
+        }
+        proxy.gate.release.notify_one();
+        drop(lease);
+        worker.get().close().await;
+    }
 }

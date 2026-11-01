@@ -35,6 +35,9 @@ pub struct ProviderState {
     access: Mutex<HashMap<String, Grant>>,
     pub refresh_calls: AtomicUsize,
     pub token_calls: AtomicUsize,
+    pub hold_code_exchange: AtomicBool,
+    pub code_exchange_started: tokio::sync::Notify,
+    pub release_code_exchange: tokio::sync::Notify,
     pub quota: AtomicBool,
     pub refresh_error: AtomicU16,
     pub requests: Mutex<Vec<Value>>,
@@ -80,6 +83,9 @@ impl ProviderFixture {
             access: Mutex::new(HashMap::new()),
             refresh_calls: AtomicUsize::new(0),
             token_calls: AtomicUsize::new(0),
+            hold_code_exchange: AtomicBool::new(false),
+            code_exchange_started: tokio::sync::Notify::new(),
+            release_code_exchange: tokio::sync::Notify::new(),
             quota: AtomicBool::new(false),
             refresh_error: AtomicU16::new(0),
             requests: Mutex::new(Vec::new()),
@@ -219,6 +225,10 @@ async fn tokens(
     let grant = if form.get("grant_type").map(String::as_str) == Some("authorization_code") {
         let code = form.get("code").cloned().unwrap_or_default();
         let grant = state.codes.lock().unwrap().remove(&code);
+        if state.hold_code_exchange.load(Ordering::SeqCst) {
+            state.code_exchange_started.notify_one();
+            state.release_code_exchange.notified().await;
+        }
         grant.filter(|grant| {
             form.get("code_verifier").is_some_and(|value| {
                 URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes())) == grant.challenge

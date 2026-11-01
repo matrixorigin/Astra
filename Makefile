@@ -1344,7 +1344,7 @@ test-online:
 			ASTRA_TEST_DATABASE=$$RUNTIME_IGNORED_DB \
 			ASTRA_TEST_DB_IT=1 \
 			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
-			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services --features e2e-hooks \
 				--lib --tests --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-services-online"; \

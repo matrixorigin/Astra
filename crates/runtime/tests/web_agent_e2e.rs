@@ -6118,7 +6118,7 @@ mod subscription_isolated_database;
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session() {
     use astra_services::chatgpt::ChatgptConfig;
-    use astra_services::{DatabaseAgentService, DatabaseModelService, DatabaseSessionService};
+    use astra_services::{DatabaseModelService, DatabaseSessionService};
     init_env();
     let settings = test_support::require_db_it_env();
     subscription_isolated_database::require_isolated_database(&settings.database);
@@ -6141,9 +6141,6 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
         let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
             .with_shared_pool(pool.clone())
             .with_auth_service(Arc::new(StubAuth))
-            .with_agent_service(Arc::new(
-                DatabaseAgentService::new(settings.clone()).with_pool(pool.clone()),
-            ))
             .with_session_service(Arc::new(
                 DatabaseSessionService::new(settings.clone()).with_pool(pool.clone()),
             ))
@@ -6212,16 +6209,10 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
     )
     .await;
     let model=post(&app,"/me/models",json!({"name":format!("public-{}",uuid::Uuid::new_v4()),"provider":"chatgpt","model":"fixture-model","connection_id":linked["connection"]["connection_id"],"context_window":128000,"is_default":false})).await;
-    let agent = post(
-        &app,
-        "/agents",
-        json!({"name":format!("subscription-{}",uuid::Uuid::new_v4())}),
-    )
-    .await;
     let session = post(
         &app,
         "/sessions",
-        json!({"agent_id":agent["agent_id"],"title":"Subscription durable history"}),
+        json!({"title":"Subscription durable history"}),
     )
     .await;
     let session_id = session["session_id"].as_str().unwrap();

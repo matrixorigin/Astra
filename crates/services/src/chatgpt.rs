@@ -1,6 +1,7 @@
 //! Owner-scoped ChatGPT subscription connections. OAuth is a model credential,
 //! not an Astra login; renewable credentials never cross the control API.
 
+use crate::CancellationSafePoolConnection;
 use crate::auth::FernetTokenEncryptor;
 use astra_core::{ErrorResponse, SharedPool, error_response_coded, internal_error};
 use axum::{Json, http::StatusCode};
@@ -440,8 +441,13 @@ impl ExecutionCredential {
         self.service
             .fence_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
         let row = sqlx::query_as::<_, ConnectionFence>("SELECT status, generation FROM user_llm_connections WHERE user_id = ? AND connection_id = ?")
-            .bind(&self.owner).bind(&self.connection_id).fetch_optional(&pool).await.map_err(internal_error)?.ok_or_else(not_found)?;
+            .bind(&self.owner).bind(&self.connection_id).fetch_optional(connection.connection_mut()).await.map_err(internal_error)?;
+        connection.release();
+        let row = row.ok_or_else(not_found)?;
         connected_generation(&row, self.generation)
     }
 
@@ -764,12 +770,29 @@ impl ChatgptConnections {
                     service
                         .fence_reads
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let row=tokio::time::timeout(Duration::from_secs(2),async {
-                        sqlx::query_as::<_, ConnectionFence>("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=?")
-                            .bind(&key.0).bind(&key.1).fetch_optional(&service.pool()?).await.map_err(internal_error)
-                    }).await;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    let row = async {
+                        let pool = service.pool()?;
+                        let mut connection = tokio::time::timeout_at(deadline,
+                            CancellationSafePoolConnection::acquire(&pool))
+                            .await.map_err(|_| unavailable())?.map_err(internal_error)?;
+                        let result = tokio::time::timeout_at(deadline,
+                            sqlx::query_as::<_, ConnectionFence>("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=?")
+                                .bind(&key.0).bind(&key.1).fetch_optional(connection.connection_mut()))
+                            .await;
+                        match result {
+                            Ok(result) => {
+                                if result.is_ok() { connection.release(); }
+                                result.map_err(internal_error)
+                            }
+                            Err(_) => {
+                                connection.discard();
+                                Err(unavailable())
+                            }
+                        }
+                    }.await;
                     let observed = match row {
-                        Ok(Ok(Some(row))) => Some((row.status, row.generation)),
+                        Ok(Some(row)) => Some((row.status, row.generation)),
                         _ => None,
                     };
                     let mut active = service.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -1049,15 +1072,20 @@ impl ChatgptConnections {
         generation: i64,
     ) -> ApiResult<CredentialRow> {
         self.enabled()?;
+        let pool = self.pool()?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
         let row = sqlx::query_as::<_, CredentialRow>(
             "SELECT * FROM user_llm_connections WHERE user_id=? AND connection_id=?",
         )
         .bind(owner)
         .bind(id)
-        .fetch_optional(&self.pool()?)
+        .fetch_optional(connection.connection_mut())
         .await
-        .map_err(internal_error)?
-        .ok_or_else(not_found)?;
+        .map_err(internal_error)?;
+        connection.release();
+        let row = row.ok_or_else(not_found)?;
         connected_generation(&row.fence, generation)?;
         Ok(row)
     }
@@ -1141,6 +1169,9 @@ impl ChatgptConnections {
                 continue;
             }
             let mut credentials_unchanged = false;
+            // Keep the SQL guard outside the deadline future: discard an
+            // interrupted checkout before cleanup needs another pool permit.
+            let mut persistence_connection = None;
             let refresh_result=tokio::time::timeout(REFRESH_BUDGET,async {
                 let refresh=credentials.refresh_token.as_deref().ok_or_else(reauth)?;
                 let request=self.client().inspect_err(|_|{credentials_unchanged=true;})?.post(&config.token).form(&[
@@ -1163,11 +1194,16 @@ impl ChatgptConnections {
                 if !scopes.iter().any(|value|value==PLAN_SCOPE) {return Err(reauth());}
                 let replacement=Credentials {access_token:token.access_token,refresh_token:token.refresh_token.or(credentials.refresh_token),scopes,expires_at:unix_now()+token.expires_in};
                 let encrypted=self.encryptor.encrypt(&serde_json::to_string(&replacement).map_err(internal_error)?).map_err(internal_error)?;
+                persistence_connection = Some(CancellationSafePoolConnection::acquire(&pool).await.map_err(internal_error)?);
                 let changed=query("UPDATE user_llm_connections SET credentials_encrypted=?,token_expires_at=?,credential_version=credential_version+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner=? AND status='connected'")
-                    .bind(encrypted).bind(replacement.expires_at).bind(owner).bind(id).bind(generation).bind(version).bind(&refresh_id).execute(&pool).await.map_err(internal_error)?;
+                    .bind(encrypted).bind(replacement.expires_at).bind(owner).bind(id).bind(generation).bind(version).bind(&refresh_id).execute(persistence_connection.as_mut().expect("refresh checkout acquired").connection_mut()).await.map_err(internal_error)?;
+                persistence_connection.take().expect("refresh SQL acknowledged").release();
                 if changed.rows_affected()!=1 {return Err(reauth());}
                 Ok((replacement.access_token,version+1))
             }).await.unwrap_or_else(|_|Err(fail(StatusCode::SERVICE_UNAVAILABLE,"chatgpt_refresh_deadline","Subscription refresh timed out")));
+            if let Some(connection) = persistence_connection {
+                connection.discard();
+            }
             if refresh_result.is_err() {
                 if !credentials_unchanged {
                     if !self.mark_reauth(owner, id, generation, &refresh_id).await? {
@@ -1314,6 +1350,9 @@ impl ChatgptConnections {
         let mut tx = pool.begin().await.map_err(internal_error)?;
         let (status,client_id,encrypted,generation,confirmed):(String,String,Option<String>,i64,Option<i16>)=sqlx::query_as("SELECT status,client_id,credentials_encrypted,generation,revocation_confirmed FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
             .bind(owner).bind(id).fetch_optional(&mut *tx).await.map_err(internal_error)?.ok_or_else(not_found)?;
+        // Cancel consent even when this connection was already disconnected.
+        query("UPDATE user_llm_authorizations SET status='cancelled',verifier_encrypted=NULL WHERE user_id=? AND connection_id=? AND status IN ('pending','exchanging')")
+            .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
         if status == "disconnected" && encrypted.is_none() {
             tx.commit().await.map_err(internal_error)?;
             return Ok(
@@ -1321,8 +1360,6 @@ impl ChatgptConnections {
             );
         }
         query("UPDATE user_llm_connections SET status='disconnected',credentials_encrypted=NULL,token_expires_at=NULL,generation=generation+1,refresh_owner=NULL,refresh_until=NULL,revocation_confirmed=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=?")
-            .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
-        query("UPDATE user_llm_authorizations SET status='cancelled',verifier_encrypted=NULL WHERE user_id=? AND connection_id=? AND status IN ('pending','exchanging')")
             .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
         query("UPDATE user_llm_models SET is_active=0,updated_at=NOW(6) WHERE user_id=? AND connection_id=?")
             .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
