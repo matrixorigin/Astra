@@ -3,6 +3,7 @@
 
 use crate::auth::FernetTokenEncryptor;
 use crate::{CancellationSafePoolConnection, CancellationSafeTransaction};
+use astra_core::model_wire::responses::ResponsesStreamError;
 use astra_core::{ErrorResponse, SharedPool, error_response_coded, internal_error};
 use axum::{Json, http::StatusCode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -118,6 +119,51 @@ async fn provider_body(mut response: reqwest::Response) -> ApiResult<Vec<u8>> {
         return Err(provider_failure(status, &bytes));
     }
     Ok(bytes)
+}
+
+/// Typed failure for a probe whose stream never completed. Recognized protocol
+/// codes keep their own status, so eligibility, quota, and length rejections
+/// stay distinguishable from a transport/format failure. Upstream prose is
+/// never echoed into the public detail; the verbatim provider code is
+/// server-side evidence, length-capped because it is untrusted input.
+fn model_check_failure(failure: &ResponsesStreamError) -> (StatusCode, Json<ErrorResponse>) {
+    let mapped = failure.mapped();
+    let upstream_code: String = match failure {
+        ResponsesStreamError::Provider(Some(code)) => code.chars().take(128).collect(),
+        ResponsesStreamError::Provider(None) => "provider_terminal_event_without_code".into(),
+        ResponsesStreamError::Codec(reason) => (*reason).into(),
+    };
+    tracing::warn!(
+        upstream_code,
+        mapped_status = mapped.map(|(_, status)| status),
+        "ChatGPT subscription model check did not complete"
+    );
+    match mapped {
+        Some((code, status)) => {
+            let detail = match code {
+                "subscription_sharing_user_not_eligible" => {
+                    "This ChatGPT subscription is not eligible for Astra"
+                }
+                "subscription_sharing_usage_limit_exceeded" => {
+                    "ChatGPT subscription usage limit reached"
+                }
+                "subscription_sharing_usage_unavailable" => {
+                    "ChatGPT subscription usage is temporarily unavailable"
+                }
+                _ => "The subscription model rejected the check request",
+            };
+            fail(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                code,
+                detail,
+            )
+        }
+        None => fail(
+            StatusCode::BAD_GATEWAY,
+            "chatgpt_model_check_failed",
+            "Subscription model check did not complete",
+        ),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1523,14 +1569,10 @@ impl ChatgptConnections {
             .await?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| internal_error("Invalid subscription response encoding"))?;
-        let output = astra_core::model_wire::responses::decode_sse(text).map_err(|_| {
-            fail(
-                StatusCode::BAD_GATEWAY,
-                "chatgpt_model_check_failed",
-                "Subscription model check did not complete",
-            )
-        })?;
+        let output = astra_core::model_wire::responses::decode_sse(text)
+            .map_err(|reason| model_check_failure(&reason))?;
         if output.text.trim().is_empty() {
+            tracing::warn!("ChatGPT subscription model check returned no text");
             return Err(fail(
                 StatusCode::BAD_GATEWAY,
                 "chatgpt_model_check_failed",

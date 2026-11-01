@@ -92,6 +92,25 @@ pub fn provider_error(code: &str) -> Option<(&'static str, u16)> {
     }
 }
 
+/// Failure to assemble a Responses stream. `Provider` keeps the upstream
+/// terminal-event code untouched so each caller maps it to its own public
+/// vocabulary; `Codec` carries machine-owned literals only. Neither variant
+/// may be echoed into user-facing details.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResponsesStreamError {
+    Provider(Option<String>),
+    Codec(&'static str),
+}
+impl ResponsesStreamError {
+    /// Canonical (code, HTTP status) for recognized provider failures.
+    pub fn mapped(&self) -> Option<(&'static str, u16)> {
+        match self {
+            ResponsesStreamError::Provider(Some(code)) => provider_error(code),
+            _ => None,
+        }
+    }
+}
+
 fn replay_item(item: &Value) -> Result<Value, String> {
     let keys: &[&str] = match item["type"].as_str() {
         Some("message") => {
@@ -305,13 +324,18 @@ pub struct ResponseAccumulator {
 }
 impl ResponseAccumulator {
     /// Returns a text/reasoning delta for the existing presentation owner.
-    pub fn observe(&mut self, event: &Value) -> Result<Option<(String, bool)>, String> {
-        let kind = event["type"]
-            .as_str()
-            .ok_or("Responses event type is missing")?;
+    pub fn observe(
+        &mut self,
+        event: &Value,
+    ) -> Result<Option<(String, bool)>, ResponsesStreamError> {
+        let kind = event["type"].as_str().ok_or(ResponsesStreamError::Codec(
+            "Responses event type is missing",
+        ))?;
         if self.completed {
             if kind == "response.completed" {
-                return Err("Duplicate Responses completion".into());
+                return Err(ResponsesStreamError::Codec(
+                    "Duplicate Responses completion",
+                ));
             }
             return Ok(None);
         }
@@ -338,39 +362,57 @@ impl ResponseAccumulator {
             "response.output_text.delta" => {
                 let delta = event["delta"]
                     .as_str()
-                    .ok_or("Invalid Responses text delta")?;
+                    .ok_or(ResponsesStreamError::Codec("Invalid Responses text delta"))?;
                 self.output.text.push_str(delta);
                 return Ok(Some((delta.into(), false)));
             }
             "response.reasoning_summary_text.delta" => {
-                let delta = event["delta"]
-                    .as_str()
-                    .ok_or("Invalid Responses reasoning summary")?;
+                let delta = event["delta"].as_str().ok_or(ResponsesStreamError::Codec(
+                    "Invalid Responses reasoning summary",
+                ))?;
                 self.output.reasoning.push_str(delta);
                 return Ok(Some((delta.into(), true)));
             }
             "response.output_item.done" => {
                 let index = event["output_index"]
                     .as_u64()
-                    .ok_or("Responses item index missing")?;
+                    .ok_or(ResponsesStreamError::Codec("Responses item index missing"))?;
                 if self.items.len() >= 4096 && !self.items.contains_key(&index) {
-                    return Err("Too many Responses output items".into());
+                    return Err(ResponsesStreamError::Codec(
+                        "Too many Responses output items",
+                    ));
                 }
                 self.items.insert(index, event["item"].clone());
             }
             "response.completed" => {
                 let response = &event["response"];
                 if response["status"] != "completed" {
-                    return Err("Responses terminal status is not completed".into());
+                    return Err(ResponsesStreamError::Codec(
+                        "Responses terminal status is not completed",
+                    ));
                 }
-                let items = if let Some(items) = response["output"].as_array() {
+                // Subscription streams can leave terminal output empty after
+                // delivering complete output_item.done events. Only those
+                // finished items are eligible; text deltas alone cannot replay.
+                let items = if let Some(items) = response["output"]
+                    .as_array()
+                    .filter(|items| !items.is_empty())
+                {
                     items.clone()
                 } else {
                     self.items.values().cloned().collect()
                 };
-                self.output.items = items.iter().map(replay_item).collect::<Result<_, _>>()?;
+                self.output.items = items
+                    .iter()
+                    .map(replay_item)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        ResponsesStreamError::Codec("Responses terminal output item is invalid")
+                    })?;
                 if self.output.items.is_empty() {
-                    return Err("Responses terminal output is missing".into());
+                    return Err(ResponsesStreamError::Codec(
+                        "Responses terminal output is missing",
+                    ));
                 }
                 let mut text = String::new();
                 let mut call_ids = std::collections::HashSet::new();
@@ -388,29 +430,40 @@ impl ResponseAccumulator {
                             }
                         }
                         Some("function_call") => {
-                            let id = item["call_id"]
-                                .as_str()
-                                .filter(|s| !s.is_empty())
-                                .ok_or("Responses tool call identity missing")?;
+                            let id = item["call_id"].as_str().filter(|s| !s.is_empty()).ok_or(
+                                ResponsesStreamError::Codec("Responses tool call identity missing"),
+                            )?;
                             if !call_ids.insert(id) {
-                                return Err("Duplicate Responses tool call identity".into());
+                                return Err(ResponsesStreamError::Codec(
+                                    "Duplicate Responses tool call identity",
+                                ));
                             }
                             if item
                                 .get("namespace")
                                 .and_then(Value::as_str)
                                 .is_some_and(|n| n != "astra")
                             {
-                                return Err("Responses tool namespace was not admitted".into());
+                                return Err(ResponsesStreamError::Codec(
+                                    "Responses tool namespace was not admitted",
+                                ));
                             }
-                            let name =
-                                item["name"].as_str().ok_or("Responses tool name missing")?;
-                            let arguments = item["arguments"]
-                                .as_str()
-                                .ok_or("Responses tool arguments missing")?;
+                            let name = item["name"].as_str().ok_or(ResponsesStreamError::Codec(
+                                "Responses tool name missing",
+                            ))?;
+                            let arguments =
+                                item["arguments"]
+                                    .as_str()
+                                    .ok_or(ResponsesStreamError::Codec(
+                                        "Responses tool arguments missing",
+                                    ))?;
                             self.output.tool_calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
                         }
                         Some("reasoning") => {}
-                        _ => return Err("Unsupported Responses output item".into()),
+                        _ => {
+                            return Err(ResponsesStreamError::Codec(
+                                "Unsupported Responses output item",
+                            ));
+                        }
                     }
                 }
                 if !text.is_empty() {
@@ -418,24 +471,25 @@ impl ResponseAccumulator {
                 }
                 self.completed = true;
             }
+            // Terminal upstream failures keep the raw provider code verbatim
+            // (structured field only, never prose). Callers own the mapping.
             "error" | "response.failed" | "response.incomplete" => {
                 let code = event
                     .pointer("/response/error/code")
                     .or_else(|| event.get("code"))
                     .and_then(Value::as_str)
-                    .unwrap_or("response_incomplete");
-                let code = provider_error(code)
-                    .map(|value| value.0)
-                    .unwrap_or("response_incomplete");
-                return Err(code.into());
+                    .map(str::to_owned);
+                return Err(ResponsesStreamError::Provider(code));
             }
             _ => {}
         }
         Ok(None)
     }
-    pub fn finish(self) -> Result<ResponseOutput, String> {
+    pub fn finish(self) -> Result<ResponseOutput, ResponsesStreamError> {
         if !self.completed {
-            return Err("Responses stream ended without response.completed".into());
+            return Err(ResponsesStreamError::Codec(
+                "Responses stream ended without response.completed",
+            ));
         }
         Ok(self.output)
     }
@@ -446,7 +500,7 @@ impl ResponseAccumulator {
 
 /// Batch decoder used for bounded connectivity probes. Runtime streaming uses
 /// the same event accumulator with the canonical incremental SSE reader.
-pub fn decode_sse(text: &str) -> Result<ResponseOutput, String> {
+pub fn decode_sse(text: &str) -> Result<ResponseOutput, ResponsesStreamError> {
     let mut output = ResponseAccumulator::default();
     let text = text.replace("\r\n", "\n");
     for block in text.split("\n\n") {
@@ -458,7 +512,9 @@ pub fn decode_sse(text: &str) -> Result<ResponseOutput, String> {
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
-        output.observe(&serde_json::from_str(&data).map_err(|_| "Invalid Responses SSE JSON")?)?;
+        let event = serde_json::from_str(&data)
+            .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE JSON"))?;
+        output.observe(&event)?;
     }
     output.finish()
 }
@@ -544,6 +600,25 @@ mod tests {
         assert_eq!(value.items[0]["phase"], "final_answer");
     }
     #[test]
+    fn completed_stream_uses_finished_items_when_terminal_output_is_empty() {
+        let item = json!({"type":"message","id":"message-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK"}]});
+        let done = json!({"type":"response.output_item.done","output_index":0,"item":item});
+        let output = decode_sse(&sse(&[done.clone(), completion(json!([]))])).unwrap();
+        assert_eq!(output.text, "OK");
+        assert_eq!(output.items, vec![item]);
+        assert_eq!(output.usage["prompt_tokens"], 12);
+        // Finished items alone, or text deltas plus an empty completion, do
+        // not establish a completed, replayable response.
+        assert!(decode_sse(&sse(&[done])).is_err());
+        assert!(
+            decode_sse(&sse(&[
+                json!({"type":"response.output_text.delta","delta":"OK"}),
+                completion(json!([])),
+            ]))
+            .is_err()
+        );
+    }
+    #[test]
     fn incomplete_and_failed_streams_never_become_success() {
         assert!(
             decode_sse(&sse(&[
@@ -563,12 +638,23 @@ mod tests {
             let error = (kind == "response.failed").then(|| json!({"code":"subscription_sharing_usage_limit_exceeded","message":"private-provider-text"}));
             let value = json!({"type":kind,"response":{"id":"failed-response","usage":{"input_tokens":17,"output_tokens":23},"error":error}});
             let mut accumulator = ResponseAccumulator::default();
+            let failure = accumulator.observe(&value).unwrap_err();
             assert_eq!(
-                accumulator.observe(&value).unwrap_err(),
+                failure,
                 if error.is_some() {
-                    "subscription_sharing_usage_limit_exceeded"
+                    ResponsesStreamError::Provider(Some(
+                        "subscription_sharing_usage_limit_exceeded".into(),
+                    ))
                 } else {
-                    "response_incomplete"
+                    ResponsesStreamError::Provider(None)
+                }
+            );
+            assert_eq!(
+                failure.mapped(),
+                if error.is_some() {
+                    Some(("subscription_sharing_usage_limit_exceeded", 429))
+                } else {
+                    None
                 }
             );
             assert_eq!(
@@ -579,6 +665,16 @@ mod tests {
             assert_eq!(accumulator.output.usage["completion_tokens"], 23);
             assert!(accumulator.finish().is_err());
         }
+        // Transport owners must observe the verbatim upstream code, not prose
+        // or a collapsed label.
+        let mut accumulator = ResponseAccumulator::default();
+        let value = json!({"type":"response.failed","response":{"id":"failed-unknown","error":{"code":"raw-provider-code","message":"private-provider-text"}}});
+        let failure = accumulator.observe(&value).unwrap_err();
+        assert_eq!(
+            failure,
+            ResponsesStreamError::Provider(Some("raw-provider-code".into()))
+        );
+        assert_eq!(failure.mapped(), None);
     }
     #[test]
     fn replay_cannot_introduce_privileged_instructions_or_hosted_tools() {

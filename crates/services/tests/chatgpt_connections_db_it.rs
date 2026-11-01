@@ -451,6 +451,28 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         provider.state.refresh_calls.load(Ordering::SeqCst),
         refreshes + 1
     );
+    provider.state.stream_quota.store(true, Ordering::SeqCst);
+    let failed = service
+        .probe(&owner, &connection, "fixture-model")
+        .await
+        .unwrap_err();
+    provider.state.stream_quota.store(false, Ordering::SeqCst);
+    assert_eq!(failed.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        failed.1.0.error_code.as_deref(),
+        Some("subscription_sharing_usage_limit_exceeded")
+    );
+    provider.state.truncate.store(true, Ordering::SeqCst);
+    let failed = service
+        .probe(&owner, &connection, "fixture-model")
+        .await
+        .unwrap_err();
+    provider.state.truncate.store(false, Ordering::SeqCst);
+    assert_eq!(failed.0, axum::http::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        failed.1.0.error_code.as_deref(),
+        Some("chatgpt_model_check_failed")
+    );
     *provider.state.reject_token.lock().unwrap() = None;
     expire(&pool, &key, &owner, &connection).await;
     let before:String=sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?")

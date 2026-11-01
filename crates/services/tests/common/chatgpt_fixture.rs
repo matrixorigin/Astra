@@ -426,13 +426,20 @@ async fn responses(
     } else {
         json!([{"type":"message","id":"message-1","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":if continued {"Continued successfully"} else {"OK"},"annotations":[]}]}])
     };
-    let event = json!({"type":"response.completed","response":{"id":"response-fixture","status":"completed","model":body["model"],"output":output,
+    // Subscription streams deliver completed items separately and may omit
+    // them from the terminal response's output array.
+    let mut events = String::new();
+    for (index, item) in output.as_array().unwrap().iter().enumerate() {
+        let done = json!({"type":"response.output_item.done","output_index":index,"item":item});
+        events.push_str(&format!("data: {done}\n\n"));
+    }
+    let event = json!({"type":"response.completed","response":{"id":"response-fixture","status":"completed","model":body["model"],"output":[],
         "usage":{"input_tokens":20,"output_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":2}}}});
     (
         StatusCode::OK,
         content,
         format!(
-            "data: {event}{}",
+            "{events}data: {event}{}",
             if state.unterminated.load(Ordering::SeqCst) {
                 "\n"
             } else {

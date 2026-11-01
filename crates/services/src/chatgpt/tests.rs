@@ -190,3 +190,60 @@ fn callback_debug_redacts_values_and_provider_urls_reject_untrusted_origins() {
         assert!(production.provider_url(url).is_err());
     }
 }
+#[test]
+fn model_check_failures_keep_typed_provider_limits() {
+    for (reason, status, code) in [
+        (
+            "subscription_sharing_user_not_eligible",
+            StatusCode::FORBIDDEN,
+            "subscription_sharing_user_not_eligible",
+        ),
+        (
+            "subscription_sharing_usage_limit_exceeded",
+            StatusCode::TOO_MANY_REQUESTS,
+            "subscription_sharing_usage_limit_exceeded",
+        ),
+        (
+            "subscription_sharing_usage_unavailable",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "subscription_sharing_usage_unavailable",
+        ),
+        (
+            "context_length_exceeded",
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
+        ),
+    ] {
+        let (actual, Json(error)) =
+            model_check_failure(&ResponsesStreamError::Provider(Some(reason.into())));
+        assert_eq!(actual, status, "{reason}");
+        assert_eq!(error.error_code.as_deref(), Some(code), "{reason}");
+        assert!(
+            !error.detail.contains(reason),
+            "provider prose must not reach the public detail: {reason}"
+        );
+    }
+    for failure in [
+        ResponsesStreamError::Provider(None),
+        ResponsesStreamError::Provider(Some("raw-provider-code".into())),
+        ResponsesStreamError::Codec("Responses stream ended without response.completed"),
+        ResponsesStreamError::Codec("Invalid Responses SSE JSON"),
+        ResponsesStreamError::Codec("Unsupported Responses output item"),
+    ] {
+        let (status, Json(error)) = model_check_failure(&failure);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{failure:?}");
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("chatgpt_model_check_failed"),
+            "{failure:?}"
+        );
+        assert_eq!(
+            error.detail, "Subscription model check did not complete",
+            "{failure:?}"
+        );
+        assert!(
+            !error.detail.contains("raw-provider-code"),
+            "upstream code must not reach the public detail"
+        );
+    }
+}

@@ -1,6 +1,8 @@
 //! Responses execution under the ordinary inference-attempt owner.
 use super::*;
-use astra_core::model_wire::responses::{ResponseAccumulator, ResponseOutput};
+use astra_core::model_wire::responses::{
+    ResponseAccumulator, ResponseOutput, ResponsesStreamError,
+};
 
 #[cfg(test)]
 #[path = "responses/tests.rs"]
@@ -240,17 +242,27 @@ pub(super) async fn collect(
                         idle_deadline =
                             tokio::time::Instant::now() + stream_idle_timeout_after_progress();
                     }
-                    let delta = accumulator.observe(&event).map_err(|code| {
+                    let delta = accumulator.observe(&event).map_err(|failure| {
                         if matches!(
                             event["type"].as_str(),
                             Some("response.failed" | "response.incomplete" | "error")
                         ) {
                             rejected = true;
                         }
-                        let kind = astra_core::model_wire::responses::provider_error(&code)
-                            .map(|(_, status)| provider_http_error_kind(status, &code))
-                            .unwrap_or(astra_core::ErrorKind::StreamTransport);
-                        error(kind, &code)
+                        match failure.mapped() {
+                            Some((code, status)) => {
+                                error(provider_http_error_kind(status, code), code)
+                            }
+                            None => match &failure {
+                                ResponsesStreamError::Provider(_) => error(
+                                    astra_core::ErrorKind::StreamTransport,
+                                    "response_incomplete",
+                                ),
+                                ResponsesStreamError::Codec(reason) => {
+                                    error(astra_core::ErrorKind::StreamTransport, reason)
+                                }
+                            },
+                        }
                     })?;
                     if let Some((delta, reasoning)) = delta {
                         if !delta.trim().is_empty() {

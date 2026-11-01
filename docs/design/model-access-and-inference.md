@@ -101,6 +101,9 @@ replays them only for the same connection and model; other protocols remove
 that metadata at the existing internal-marker projection boundary. No
 `previous_response_id` thread store or parallel history projection exists.
 Only completed streams authorize tool dispatch; partial/truncated streams fail.
+When a completed subscription response has an empty output array, the shared
+codec uses its fully received `response.output_item.done` items. Text deltas
+alone cannot establish a replayable response or authorize tools.
 
 ## Ownership
 
