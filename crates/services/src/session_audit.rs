@@ -684,7 +684,7 @@ fn durable_tool_terminal_outcome(event_type: &str, payload: &serde_json::Value) 
         .map_or(ToolOutcome::Unknown, ToolOutcome::Known)
 }
 
-fn durable_tool_ledger_row(row: &sqlx::mysql::MySqlRow) -> AuditResult<DurableToolLedgerRow> {
+fn durable_tool_ledger_row(row: &impl SessionAuditRow) -> AuditResult<DurableToolLedgerRow> {
     Ok(DurableToolLedgerRow {
         session_id: audit_row_string(row, "durable_tool_event", "session_id")?,
         event_type: audit_row_string(row, "durable_tool_event", "event_type")?,
@@ -1230,6 +1230,122 @@ fn flush_tool_run(
     Ok(())
 }
 
+// The stream keeps raw ledger JSON intact. Only the small Journal branch
+// fields share that lane, avoiding placeholder columns on every ledger row.
+struct ToolStreamRow<'a> {
+    row: &'a sqlx::mysql::MySqlRow,
+    kind: i64,
+    fields: Vec<serde_json::Value>,
+}
+
+impl<'a> ToolStreamRow<'a> {
+    fn new(row: &'a sqlx::mysql::MySqlRow, kind: i64) -> AuditResult<Self> {
+        let fields = match kind {
+            0 | 1 => {
+                let raw = audit_row_string(row, "tool_stream", "payload_json")?;
+                let fields: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                    .map_err(|e| audit_decode_error("tool_stream", "payload_json", e))?;
+                if fields.len() != if kind == 0 { 9 } else { 4 } {
+                    return Err(audit_decode_error(
+                        "tool_stream",
+                        "payload_json",
+                        "invalid Journal field count",
+                    ));
+                }
+                fields
+            }
+            _ => Vec::new(),
+        };
+        Ok(Self { row, kind, fields })
+    }
+
+    fn field(&self, column: &str) -> Option<&serde_json::Value> {
+        let names: &[&str] = match self.kind {
+            0 => &[
+                "tool_name",
+                "total_calls",
+                "total_success",
+                "total_failures",
+                "duration_samples",
+                "error_event_id",
+                "error_at",
+                "max_ms",
+                "total_duration_ms",
+            ],
+            1 => &[
+                "tool_call_id",
+                "tool_name",
+                "meta_duration_ms",
+                "has_content",
+            ],
+            _ => &[],
+        };
+        names
+            .iter()
+            .position(|name| *name == column)
+            .map(|i| &self.fields[i])
+    }
+
+    fn invalid(column: &str) -> sqlx::Error {
+        sqlx::Error::ColumnDecode {
+            index: column.to_owned(),
+            source: "invalid Journal field type".into(),
+        }
+    }
+}
+
+impl SessionAuditRow for ToolStreamRow<'_> {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        use sqlx::Row;
+        if matches!(column, "session_id" | "run_id" | "event_id") {
+            let bytes: Vec<u8> = self.row.try_get(column)?;
+            return String::from_utf8(bytes).map_err(|e| sqlx::Error::ColumnDecode {
+                index: column.to_owned(),
+                source: e.into(),
+            });
+        }
+        if let Some(value) = self.field(column) {
+            return value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Self::invalid(column));
+        }
+        self.row.string_column(column)
+    }
+
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+        if let Some(value) = self.field(column) {
+            return if value.is_null() {
+                Ok(None)
+            } else {
+                self.string_column(column).map(Some)
+            };
+        }
+        self.row.optional_string_column(column)
+    }
+
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+        if let Some(value) = self.field(column) {
+            if column == "has_content" {
+                return value
+                    .as_bool()
+                    .map(i64::from)
+                    .or_else(|| value.as_i64())
+                    .ok_or_else(|| Self::invalid(column));
+            }
+            return value
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| Self::invalid(column));
+        }
+        self.row.i64_column(column)
+    }
+
+    fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error> {
+        self.row.f64_column(column)
+    }
+}
+
 async fn load_tool_totals(
     pool: &Pool<MySql>,
     user: &str,
@@ -1246,6 +1362,9 @@ async fn load_tool_totals(
     let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
         .await
         .map_err(internal_error)?;
+    // Keep actual ledger IDs in the first UNION branch: on MatrixOne a NULL
+    // lane can misorder Journal events tied on time. The public duplicate
+    // candidate regression covers this dependency.
     // All three branches observe the same statement snapshot. Journal-only
     // rows remain grouped; matched identities are reconciled with Run facts.
     let mut sql = sqlx::QueryBuilder::<MySql>::new(
@@ -1253,47 +1372,42 @@ async fn load_tool_totals(
     );
     tool_scope_sql(&mut sql, "d", user, sessions, since, until);
     sql.push(" AND d.event_type IN ('tool_call','tool_call_end','tool_transport_failed')) \
-        SELECT 2 AS kind, p.session_id, p.run_id, p.event_idx, p.event_type, p.payload_json, CAST(p.created_at AS CHAR) AS created_at, \
-        CAST(NULL AS CHAR) AS tool_call_id, p.id AS event_id, CAST(NULL AS CHAR) AS tool_name, \
-        0 AS meta_duration_ms, 0 AS has_content, 0 AS total_calls, 0 AS total_success, \
-        0 AS total_failures, 0 AS avg_ms, 0 AS max_ms, 0 AS total_duration_ms, 0 AS duration_samples, \
-        CAST(NULL AS CHAR) AS error_event_id, CAST(NULL AS CHAR) AS error_at FROM agent_run_events p WHERE ");
+        SELECT 2 AS kind, BINARY p.session_id AS session_id, BINARY p.run_id AS run_id, p.event_idx, p.event_type, p.payload_json, CAST(p.created_at AS CHAR) AS created_at, \
+        BINARY p.id AS event_id, 0 AS avg_ms FROM agent_run_events p WHERE ");
     tool_scope_sql(&mut sql, "p", user, sessions, since, until);
     sql.push(" AND p.event_type IN ('tool_call','tool_call_end','tool_transport_failed') UNION ALL \
-        SELECT 0, e.session_id, NULL, 0, NULL, NULL, NULL, NULL, NULL, COALESCE(e.meta_tool_name, ''), NULL, 0, \
-        COUNT(*), COUNT(CASE WHEN e.event_type = 'tool_call_completed' THEN 1 END), \
-        COUNT(CASE WHEN e.event_type = 'tool_call_failed' THEN 1 END), COALESCE(AVG(e.meta_duration_ms),0), \
-        COALESCE(MAX(e.meta_duration_ms),0), CAST(COALESCE(SUM(e.meta_duration_ms),0) AS SIGNED), COUNT(e.meta_duration_ms), ");
+        SELECT 0, BINARY e.session_id, NULL, 0, NULL, CAST(JSON_ARRAY(COALESCE(e.meta_tool_name, ''), \
+        CAST(COUNT(*) AS CHAR), CAST(COUNT(CASE WHEN e.event_type = 'tool_call_completed' THEN 1 END) AS CHAR), \
+        CAST(COUNT(CASE WHEN e.event_type = 'tool_call_failed' THEN 1 END) AS CHAR), CAST(COUNT(e.meta_duration_ms) AS CHAR), ");
     if include_error_evidence {
         sql.push("MAX_BY_NON_NULL(CASE WHEN e.event_type = 'tool_call_failed' AND e.content IS NOT NULL AND e.content != '' THEN e.event_id END, e.created_at, CAST(e.event_id AS BINARY)), CAST(MAX(CASE WHEN e.event_type = 'tool_call_failed' AND e.content IS NOT NULL AND e.content != '' THEN e.created_at END) AS CHAR)");
     } else {
         sql.push("NULL, NULL");
     }
-    sql.push(JOURNAL_TOOL_JOIN);
+    sql.push(", CAST(COALESCE(MAX(e.meta_duration_ms),0) AS CHAR), CAST(CAST(COALESCE(SUM(e.meta_duration_ms),0) AS SIGNED) AS CHAR)) AS CHAR), NULL, NULL, COALESCE(AVG(e.meta_duration_ms),0)").push(JOURNAL_TOOL_JOIN);
     tool_scope_sql(&mut sql, "e", user, sessions, since, until);
     sql.push(" AND e.event_type IN ('tool_call_completed','tool_call_failed') AND NOT (")
         .push(JOURNAL_TOOL_MATCHABLE).push(") GROUP BY e.session_id, e.meta_tool_name UNION ALL \
-        SELECT 1, e.session_id, e.run_id, 0, e.event_type, NULL, CAST(e.created_at AS CHAR), e.tool_call_id, e.event_id, \
-        e.meta_tool_name, e.meta_duration_ms, ");
+        SELECT 1, BINARY e.session_id, BINARY e.run_id, 0, e.event_type, CAST(JSON_ARRAY(e.tool_call_id, \
+        e.meta_tool_name, CAST(e.meta_duration_ms AS CHAR), ");
     if include_error_evidence {
         sql.push("e.content IS NOT NULL AND e.content != ''");
     } else {
         sql.push("FALSE");
     }
-    sql.push(", 0,0,0,0,0,0,0,NULL,NULL")
+    sql.push(") AS CHAR), CAST(e.created_at AS CHAR), BINARY e.event_id, 0")
         .push(JOURNAL_TOOL_JOIN);
     tool_scope_sql(&mut sql, "e", user, sessions, since, until);
     sql.push(" AND e.event_type IN ('tool_call_completed','tool_call_failed') AND (")
         .push(JOURNAL_TOOL_MATCHABLE)
-        .push(
-            ") ORDER BY BINARY session_id, BINARY run_id, kind, event_idx, created_at DESC, BINARY event_id DESC",
-        );
+        .push(") ORDER BY session_id, run_id, kind, event_idx, created_at DESC, event_id DESC");
     let mut rows = sql.build().fetch(connection.connection_mut());
     let mut candidates = HashMap::<(String, String, String), Vec<JournalToolObservation>>::new();
     let mut run_rows = Vec::<DurableToolLedgerRow>::new();
     let mut active_run: Option<(String, String)> = None;
     while let Some(row) = rows.try_next().await.map_err(internal_error)? {
         let kind = audit_row_i64(&row, "tool_stream", "kind")?;
+        let row = ToolStreamRow::new(&row, kind)?;
         if kind != 0 {
             let current = (
                 audit_row_string(&row, "tool_stream", "session_id")?,
@@ -1362,8 +1476,8 @@ async fn load_tool_totals(
                     .unwrap_or_default();
                 let succeeded = audit_row_string(&row, "journal_tool_candidate", "event_type")?
                     == "tool_call_completed";
-                // MatrixOne resolves the UNION duration column as VARCHAR
-                // when the other branches carry NULL; preserve missing values.
+                // Journal durations use decimal strings in the shared payload lane;
+                // preserve a missing duration separately from a recorded zero.
                 let duration = row
                     .optional_string_column("meta_duration_ms")
                     .map_err(internal_error)?
