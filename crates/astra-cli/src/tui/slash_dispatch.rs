@@ -4873,6 +4873,67 @@ mod model_catalog_loading_tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn model_setup_existing_connection_catalog_retries_without_authorization() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        for status in [503, 200] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/me/model-connections"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"items":[],"management_available":true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/me/model-connections/00000000-0000-4000-8000-000000000001/models",
+                ))
+                .respond_with(ResponseTemplate::new(status).set_body_json(
+                    serde_json::json!({"items":[{"slug":"fixture"}],"configured_models":[]}),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+            let result = model_setup::run(
+                Action::Models("00000000-0000-4000-8000-000000000001".into()),
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                cli_owner_auth_snapshot(),
+                tokio_util::sync::CancellationToken::new(),
+                std::sync::Arc::new(LoginControl::default()),
+                progress,
+            )
+            .await;
+            if status == 200 {
+                assert!(
+                    matches!(result, Ok(Outcome::Models { slugs, .. }) if slugs == ["fixture"])
+                );
+            } else {
+                assert!(matches!(result, Err(error) if error.contains("Choose models")));
+            }
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn model_setup_cancel_releases_stalled_read_without_starting_a_write() {
         use crate::tui::{
             login_control::LoginControl,
@@ -4884,7 +4945,11 @@ mod model_catalog_loading_tests {
         let _identity =
             install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
         // Exercise both preflight and the subsequent personal-model list.
-        for stalled_path in ["/me/model-connections", "/me/models"] {
+        for stalled_path in [
+            "/me/model-connections",
+            "/me/models",
+            "/me/model-connections/00000000-0000-4000-8000-000000000001/models",
+        ] {
             let server = MockServer::start().await;
             let dispatched = std::sync::Arc::new(tokio::sync::Notify::new());
             let notified = dispatched.clone();
@@ -4912,7 +4977,11 @@ mod model_catalog_loading_tests {
             let phase = std::sync::Arc::new(LoginControl::default());
             let (progress, _) = tokio::sync::mpsc::unbounded_channel();
             let task = model_setup::run(
-                Action::Manage,
+                if stalled_path.ends_with("/models") && stalled_path != "/me/models" {
+                    Action::Models("00000000-0000-4000-8000-000000000001".into())
+                } else {
+                    Action::Manage
+                },
                 astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
                 cli_owner_auth_snapshot(),
                 cancel.clone(),
@@ -4929,7 +4998,7 @@ mod model_catalog_loading_tests {
             let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
                 .await
                 .expect("cancel must not await the HTTP timeout");
-            assert!(matches!(result, Err(ref error) if error == "Model setup cancelled"));
+            assert!(matches!(result, Err(ref error) if error.contains("cancelled")));
             assert!(
                 server
                     .received_requests()

@@ -1030,3 +1030,394 @@ async fn personal_management_is_available_before_models_exist_and_keeps_uc_manag
         Some("personal_model_management_unavailable")
     );
 }
+
+#[tokio::test]
+#[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn simultaneous_registration_retries_preserve_canonical_connection() {
+    use mysql_response_proxy::{Boundary, ResponseProxy};
+    use std::time::Duration;
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let provider = fixture::ProviderFixture::start().await;
+    let key = Arc::new(FernetTokenEncryptor::new("review-concurrent-link").unwrap());
+    let config = ChatgptConfig::for_test(&provider.base);
+    let direct = Arc::new(ChatgptConnections::new(
+        Some(shared.clone()),
+        key.clone(),
+        Ok(config.clone()),
+    ));
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::Statement(b"SELECT connection_id FROM user_llm_connections WHERE user_id="),
+    )
+    .await;
+    let mut proxied = settings.clone();
+    proxied.host = "127.0.0.1".into();
+    proxied.port = proxy.port;
+    proxied.db_pool_max_connections = 1;
+    proxied.db_pool_min_connections = 0;
+    let worker = astra_core::SharedPool::new(&proxied).await.unwrap();
+    let delayed = Arc::new(ChatgptConnections::new(Some(worker), key, Ok(config)));
+    let owner = format!("review-{}", uuid::Uuid::new_v4());
+    // A failed first link retains the issued client but has no connection yet.
+    // Two real retry operations reuse that issued registration, as required by OAuth.
+    let failed = start(&direct, &owner, None).await;
+    assert!(
+        direct
+            .operate(
+                &owner,
+                ConnectionOperation::Complete(
+                    failed["authorization_id"].as_str().unwrap().into(),
+                    callback(&failed, "unknown-code")
+                )
+            )
+            .await
+            .is_err()
+    );
+    let first = operate_ok(
+        &direct,
+        &owner,
+        ConnectionOperation::Start(StartAuthorization {
+            retry_authorization_id: Some(failed["authorization_id"].as_str().unwrap().into()),
+            redirect_uri: "http://127.0.0.1:1455/auth/callback".into(),
+            label: None,
+            connection_id: None,
+        }),
+    )
+    .await;
+    let second = operate_ok(
+        &direct,
+        &owner,
+        ConnectionOperation::Start(StartAuthorization {
+            retry_authorization_id: Some(failed["authorization_id"].as_str().unwrap().into()),
+            redirect_uri: "http://127.0.0.1:1455/auth/callback".into(),
+            label: None,
+            connection_id: None,
+        }),
+    )
+    .await;
+    let first_code = provider.issue_code(&first, "same-subject", true);
+    let second_code = provider.issue_code(&second, "same-subject", true);
+    let task = tokio::spawn({
+        let delayed = delayed.clone();
+        let owner = owner.clone();
+        let first = first.clone();
+        let first_code = first_code.clone();
+        async move {
+            delayed
+                .operate(
+                    &owner,
+                    ConnectionOperation::Complete(
+                        first["authorization_id"].as_str().unwrap().into(),
+                        callback(&first, &first_code),
+                    ),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+        .await
+        .unwrap();
+    let winning = operate_ok(
+        &direct,
+        &owner,
+        ConnectionOperation::Complete(
+            second["authorization_id"].as_str().unwrap().into(),
+            callback(&second, &second_code),
+        ),
+    )
+    .await;
+    proxy.gate.release.notify_one();
+    let first_result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let record: (String, Option<String>) = sqlx::query_as("SELECT status, completed_connection_id FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?")
+        .bind(&owner).bind(first["authorization_id"].as_str().unwrap()).fetch_one(shared.get()).await.unwrap();
+    println!(
+        "delayed result status={:?}, authorization={:?}, winner={}",
+        first_result
+            .as_ref()
+            .map(|_| 200)
+            .unwrap_or_else(|e| e.0.as_u16()),
+        record,
+        winning["connection"]["connection_id"]
+    );
+    assert!(
+        first_result.is_ok(),
+        "both valid authorizations must resolve to the actual stored connection"
+    );
+    assert_eq!(
+        first_result.unwrap()["connection"]["connection_id"],
+        winning["connection"]["connection_id"]
+    );
+    let completed: Vec<String> = sqlx::query_scalar("SELECT completed_connection_id FROM user_llm_authorizations WHERE user_id=? AND status='completed'")
+        .bind(&owner).fetch_all(shared.get()).await.unwrap();
+    assert_eq!(completed.len(), 2);
+    assert!(
+        completed
+            .iter()
+            .all(|id| id == winning["connection"]["connection_id"].as_str().unwrap())
+    );
+    let replay = operate_ok(
+        &direct,
+        &owner,
+        ConnectionOperation::Complete(
+            first["authorization_id"].as_str().unwrap().into(),
+            callback(&first, &first_code),
+        ),
+    )
+    .await;
+    assert_eq!(
+        replay["connection"]["connection_id"],
+        winning["connection"]["connection_id"]
+    );
+    assert_eq!(
+        provider
+            .state
+            .token_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn completion_settles_after_waiter_cancellation_and_rolls_back_cancelled_link() {
+    use mysql_response_proxy::{Boundary, ResponseProxy};
+    use std::time::Duration;
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let provider = fixture::ProviderFixture::start().await;
+    let key = Arc::new(FernetTokenEncryptor::new("cancelled-completion").unwrap());
+    let config = ChatgptConfig::for_test(&provider.base);
+    let direct = Arc::new(ChatgptConnections::new(
+        Some(shared.clone()),
+        key.clone(),
+        Ok(config.clone()),
+    ));
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::Statement(b"INSERT INTO user_llm_connections "),
+    )
+    .await;
+    let mut proxied = settings.clone();
+    proxied.host = "127.0.0.1".into();
+    proxied.port = proxy.port;
+    proxied.db_pool_max_connections = 1;
+    proxied.db_pool_min_connections = 0;
+    let worker = astra_core::SharedPool::new(&proxied).await.unwrap();
+    let delayed = Arc::new(ChatgptConnections::new(
+        Some(worker.clone()),
+        key,
+        Ok(config),
+    ));
+    let owner = format!("cancel-complete-{}", uuid::Uuid::new_v4());
+    let auth = start(&direct, &owner, None).await;
+    let code = provider.issue_code(&auth, "cancelled-subject", true);
+    let waiter = tokio::spawn({
+        let owner = owner.clone();
+        let auth = auth.clone();
+        async move {
+            delayed
+                .operate(
+                    &owner,
+                    ConnectionOperation::Complete(
+                        auth["authorization_id"].as_str().unwrap().into(),
+                        callback(&auth, &code),
+                    ),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+        .await
+        .unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    operate_ok(
+        &direct,
+        &owner,
+        ConnectionOperation::Cancel(auth["authorization_id"].as_str().unwrap().into()),
+    )
+    .await;
+    proxy.gate.release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(worker.get()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_llm_connections WHERE user_id=?")
+        .bind(&owner)
+        .fetch_one(shared.get())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "cancelled authorization must roll back its provisional connection"
+    );
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?",
+    )
+    .bind(&owner)
+    .bind(auth["authorization_id"].as_str().unwrap())
+    .fetch_one(shared.get())
+    .await
+    .unwrap();
+    assert_eq!(status, "cancelled");
+    assert_eq!(
+        provider
+            .state
+            .token_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    worker.get().close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn completion_deadline_releases_sql_and_only_settles_its_own_exchange() {
+    use mysql_response_proxy::{Boundary, ResponseProxy};
+    use std::time::Duration;
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    for before_claim in [true, false] {
+        let provider = fixture::ProviderFixture::start().await;
+        let key = Arc::new(FernetTokenEncryptor::new("deadline-completion").unwrap());
+        let config = ChatgptConfig::for_test(&provider.base);
+        let direct = Arc::new(ChatgptConnections::new(
+            Some(shared.clone()),
+            key.clone(),
+            Ok(config.clone()),
+        ));
+        let prefix: &'static [u8] = if before_claim {
+            b"SELECT * FROM user_llm_authorizations"
+        } else {
+            b"SELECT connection_id FROM user_llm_connections WHERE user_id="
+        };
+        let proxy = ResponseProxy::start(
+            settings.host.clone(),
+            settings.port,
+            Boundary::Statement(prefix),
+        )
+        .await;
+        let mut proxied = settings.clone();
+        proxied.host = "127.0.0.1".into();
+        proxied.port = proxy.port;
+        proxied.db_pool_max_connections = 1;
+        proxied.db_pool_min_connections = 0;
+        let worker = astra_core::SharedPool::new(&proxied).await.unwrap();
+        let delayed = Arc::new(ChatgptConnections::new(
+            Some(worker.clone()),
+            key,
+            Ok(config),
+        ));
+        let owner = format!("deadline-complete-{}", uuid::Uuid::new_v4());
+        let auth = start(&direct, &owner, None).await;
+        let code = provider.issue_code(&auth, "deadline-subject", true);
+        let stalled = tokio::spawn({
+            let owner = owner.clone();
+            let auth = auth.clone();
+            let code = code.clone();
+            async move {
+                let mut request = callback(&auth, &code);
+                if before_claim {
+                    request.state = "invalid-state".into();
+                }
+                delayed
+                    .operate(
+                        &owner,
+                        ConnectionOperation::Complete(
+                            auth["authorization_id"].as_str().unwrap().into(),
+                            request,
+                        ),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .unwrap();
+        // Give the competing owner a distinct deadline without sleeping in real time.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(85)).await;
+        tokio::time::resume();
+        let winner = if before_claim {
+            provider
+                .state
+                .hold_code_exchange
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let task = tokio::spawn({
+                let owner = owner.clone();
+                let auth = auth.clone();
+                let direct = direct.clone();
+                async move {
+                    direct
+                        .operate(
+                            &owner,
+                            ConnectionOperation::Complete(
+                                auth["authorization_id"].as_str().unwrap().into(),
+                                callback(&auth, &code),
+                            ),
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                provider.state.code_exchange_started.notified(),
+            )
+            .await
+            .unwrap();
+            Some(task)
+        } else {
+            None
+        };
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), stalled)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(worker.get()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?",
+        )
+        .bind(&owner)
+        .bind(auth["authorization_id"].as_str().unwrap())
+        .fetch_one(shared.get())
+        .await
+        .unwrap();
+        assert_eq!(status, if before_claim { "exchanging" } else { "failed" });
+        proxy.gate.release.notify_one();
+        if let Some(winner) = winner {
+            provider.state.release_code_exchange.notify_one();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), winner)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_ok()
+            );
+        }
+        worker.get().close().await;
+    }
+}

@@ -5,7 +5,7 @@ import { requestJson } from '@/lib/api/request';
 
 type Connection = { connection_id: string; label: string; email?: string; status: string };
 type PersonalModel = { model_id: string; name: string; provider: string; is_active: boolean; is_default: boolean };
-type Settings = { owner_id: string; runtime_scope: string; models: PersonalModel[]; connections: Connection[]; connectionError: string | null };
+type Settings = { owner_id: string; runtime_scope: string; models: PersonalModel[]; connections: Connection[] };
 type Started = { authorization_id: string; state: string; authorization_url: string };
 type Catalog = { items: { slug: string; display_name: string }[]; configured_models: { model_id: string; name: string }[] };
 type Pending = { popup: Window; owner: string; scope: string; id?: string; completing: boolean; cancelled: boolean; stop: () => void };
@@ -18,18 +18,22 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
   const [catalog, setCatalog] = useState<{ connection: string; models: Catalog } | null>(null);
   const pending = useRef<Pending | null>(null);
   const mounted = useRef(true);
+  const readVersion = useRef(0);
 
   const load = async () => {
+    const version = ++readVersion.current;
     const value = await requestJson<Settings>('/api/personal-models');
+    if (version !== readVersion.current) return;
     if (settings && (settings.owner_id !== value.owner_id || settings.runtime_scope !== value.runtime_scope)) throw new Error('Account or deployment changed; close and reopen model settings.');
     if (mounted.current) setSettings(value);
   };
   useEffect(() => {
     mounted.current = true;
     let active = true;
+    const version = ++readVersion.current;
     void requestJson<Settings>('/api/personal-models').then((value) => {
-      if (active) { setSettings(value); setMessage('Credentials belong to you and are stored encrypted on this Astra deployment.'); }
-    }).catch((error: Error) => { if (active) setMessage(error.message); });
+      if (active && version === readVersion.current) { setSettings(value); setMessage('Credentials belong to you and are stored encrypted on this Astra deployment.'); }
+    }).catch((error: Error) => { if (active && version === readVersion.current) setMessage(error.message); });
     return () => { active = false; mounted.current = false; cancelPending(); };
     // The panel pins its account until closed; mutations reject account changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -60,6 +64,18 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
     } catch (error) { if (mounted.current) setMessage(error instanceof Error ? error.message : 'Model operation failed'); }
     finally { if (mounted.current) setBusy(false); }
   }
+  async function chooseModels(connection: string) {
+    setBusy(true);
+    setCatalog(null);
+    try {
+      const models = await call<Catalog>('catalog', { connection_id: connection });
+      if (mounted.current) {
+        setCatalog({ connection, models });
+        setMessage(models.items.length ? 'Account connected. Choose and check a model before chatting.' : 'Account connected, but no usable models are available. Choose another source.');
+      }
+    } catch (error) { if (mounted.current) setMessage(error instanceof Error ? error.message : 'Could not load models. Choose models to retry.'); }
+    finally { if (mounted.current) setBusy(false); }
+  }
   async function connect(connection?: string) {
     if (!settings || busy) return;
     if (location.protocol !== 'http:' || !location.port || !['localhost', '127.0.0.1'].includes(location.hostname)) {
@@ -70,6 +86,7 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
     if (!popup) { setMessage('Allow the authorization popup, then try again.'); return; }
     const current: Pending = { popup, owner: settings.owner_id, scope: settings.runtime_scope, completing: false, cancelled: false, stop: () => {} };
     pending.current = current;
+    setCatalog(null);
     setBusy(true);
     setMessage('Waiting for ChatGPT consent in your browser…');
     try {
@@ -93,15 +110,15 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
         current.stop();
         popup.close();
         setMessage('Completing authorization…');
-        void call<{ connection: { connection_id: string } }>('complete', {
+        void call<{ connection: Connection }>('complete', {
           authorization_id: current.id, state: started.state,
           code: value.code, client_id: value.client_id, error: value.error,
         }, current.owner, current.scope).then(async (linked) => {
-          const models = await call<Catalog>('catalog', { connection_id: linked.connection.connection_id }, current.owner, current.scope);
           if (!mounted.current) return;
-          setCatalog({ connection: linked.connection.connection_id, models });
-          setMessage(models.items.length ? 'Account connected. Choose and check a model before chatting.' : 'Account connected, but no usable models are available. Choose another source.');
-          await load();
+          setSettings((previous) => previous ? { ...previous, connections: [...previous.connections.filter((row) => row.connection_id !== linked.connection.connection_id), linked.connection] } : previous);
+          void load().catch((error: Error) => { if (mounted.current) setMessage(error.message); });
+          if (linked.connection.status === 'connected') await chooseModels(linked.connection.connection_id);
+          else if (mounted.current) setMessage(`Account authorization saved: ${linked.connection.status}. Reconnect to grant plan access or choose another source.`);
         }).catch((error: Error) => { if (mounted.current) setMessage(error.message); })
           .finally(() => { pending.current = null; if (mounted.current) setBusy(false); });
       };
@@ -118,6 +135,7 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
 
   return <section aria-label="Personal model sources" className="space-y-3 border-t border-border p-3 text-sm">
     <p role="status" className="text-text-muted">{message}</p>
+    <button type="button" disabled={busy} onClick={() => { setBusy(true); void load().catch((error: Error) => setMessage(error.message)).finally(() => setBusy(false)); }}>Refresh model sources</button>
     {settings ? <>
       <form className="space-y-2" onSubmit={(event) => {
         event.preventDefault();
@@ -140,13 +158,13 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
       </form>
       <div className="space-y-2">
         <h3 className="font-medium">My ChatGPT accounts</h3>
-        {settings.connectionError ? <p>{settings.connectionError}</p> : null}
-        <button type="button" disabled={busy || Boolean(settings.connectionError)} onClick={() => void connect()}>Continue with ChatGPT</button>
+        <button type="button" disabled={busy} onClick={() => void connect()}>Continue with ChatGPT</button>
         {busy && pending.current && !pending.current.completing ? <button type="button" onClick={cancelPending}>Cancel authorization</button> : null}
         {settings.connections.map((connection) => <div key={connection.connection_id}>
           <span>{connection.email || connection.label} · {connection.status} · Your ChatGPT plan</span>
-          <button type="button" disabled={busy} onClick={() => void connect(connection.connection_id)}>Reconnect</button>
-          <button type="button" disabled={busy} onClick={() => void mutation('disconnect', { connection_id: connection.connection_id })}>Disconnect</button>
+          <button type="button" disabled={busy || connection.status !== 'connected'} onClick={() => void chooseModels(connection.connection_id)}>Choose models</button>
+          <button type="button" disabled={busy} onClick={() => { setCatalog(null); void connect(connection.connection_id); }}>Reconnect</button>
+          <button type="button" disabled={busy} onClick={() => { setCatalog(null); void mutation('disconnect', { connection_id: connection.connection_id }); }}>Disconnect</button>
         </div>)}
       </div>
       {catalog ? <div className="space-y-2">

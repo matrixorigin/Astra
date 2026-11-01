@@ -12,6 +12,7 @@ pub(crate) enum Action {
     Sources,
     ApiKey(String),
     Connect(Option<String>),
+    Models(String),
     Manage,
     Create(UserModelCreateRequestData),
     Subscription {
@@ -196,6 +197,10 @@ pub(crate) fn model_form(
 }
 
 pub(crate) enum Outcome {
+    Connected {
+        connection_id: String,
+        status: String,
+    },
     Connections(
         Vec<serde_json::Value>,
         Vec<astra_services::models::UserModelRecord>,
@@ -299,20 +304,21 @@ pub(crate) async fn run(
                 .as_str()
                 .ok_or("Connection ID missing")?
                 .to_owned();
-            if !owner.is_current() {
-                return Err("Account changed; reopen /model".into());
-            }
-            let token = owner_access_token(&api, &owner, None)
-                .await
-                .ok_or("Astra session expired; sign in again")?;
-            let body = api
-                .get_bearer_path_query_text(
-                    &token,
-                    &model_connections::connection_path(&id, "models")?,
-                    &[],
-                )
-                .await
-                .map_err(map_thin_err)?;
+            Ok(Outcome::Connected {
+                connection_id: id,
+                status: linked["connection"]["status"]
+                    .as_str()
+                    .ok_or("Connection status missing")?
+                    .to_owned(),
+            })
+        }
+        Action::Models(id) => {
+            let path = model_connections::connection_path(&id, "models")?;
+            let body = tokio::select! {
+                _ = cancel.cancelled() => return Err("Model selection cancelled. Your account remains connected.".into()),
+                result = api.get_bearer_path_query_text(&token, &path, &[]) =>
+                    result.map_err(|error| format!("{}; retry /model → Manage → Choose models. Your account remains connected.", map_thin_err(error)))?,
+            };
             let catalog: Value =
                 serde_json::from_str(&body).map_err(|_| "Invalid subscription model catalog")?;
             let slugs: Vec<_> = catalog["items"]

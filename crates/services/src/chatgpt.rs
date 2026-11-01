@@ -1,8 +1,8 @@
 //! Owner-scoped ChatGPT subscription connections. OAuth is a model credential,
 //! not an Astra login; renewable credentials never cross the control API.
 
-use crate::CancellationSafePoolConnection;
 use crate::auth::FernetTokenEncryptor;
+use crate::{CancellationSafePoolConnection, CancellationSafeTransaction};
 use astra_core::{ErrorResponse, SharedPool, error_response_coded, internal_error};
 use axum::{Json, http::StatusCode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -540,7 +540,33 @@ impl ChatgptConnections {
         match operation {
             ConnectionOperation::List => Ok(json!({"items":self.list(owner).await?})),
             ConnectionOperation::Start(request) => self.start(owner, request).await,
-            ConnectionOperation::Complete(id, request) => self.complete(owner, &id, request).await,
+            ConnectionOperation::Complete(id, request) => {
+                // Once a code is submitted, its settlement outlives a dropped HTTP waiter.
+                let service = self.clone();
+                let owner = owner.to_owned();
+                tokio::spawn(async move {
+                    let claimed = std::sync::atomic::AtomicBool::new(false);
+                    match tokio::time::timeout(Duration::from_secs(90), service.complete(&owner, &id, request, &claimed)).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            // Before an acknowledged claim, another callback may own
+                            // this attempt. Leave uncertain claims to explicit cancel.
+                            if !claimed.load(std::sync::atomic::Ordering::Acquire) { return Err(unavailable()); }
+                            // An uncertain commit may already be completed; only settle
+                            // an exchanging attempt. Never exchange its code a second time.
+                            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                                let pool = service.pool()?;
+                                let mut connection = CancellationSafePoolConnection::acquire(&pool).await.map_err(internal_error)?;
+                                query("UPDATE user_llm_authorizations SET status='failed',verifier_encrypted=NULL WHERE user_id=? AND authorization_id=? AND status='exchanging'")
+                                    .bind(&owner).bind(&id).execute(connection.connection_mut()).await.map_err(internal_error)?;
+                                connection.release();
+                                Ok::<_, (StatusCode, Json<ErrorResponse>)>(())
+                            }).await;
+                            Err(unavailable())
+                        }
+                    }
+                }).await.map_err(internal_error)?
+            }
             ConnectionOperation::Cancel(id) => {
                 let status:String=sqlx::query_scalar("SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=?")
                     .bind(owner).bind(&id).fetch_optional(&self.pool()?).await.map_err(internal_error)?.ok_or_else(not_found)?;
@@ -553,8 +579,14 @@ impl ChatgptConnections {
         }
     }
     pub async fn list(&self, owner: &str) -> ApiResult<Vec<ConnectionView>> {
-        sqlx::query_as("SELECT connection_id,provider,label,email,status,token_expires_at AS expires_at,revocation_confirmed <> 0 AS remote_revocation_confirmed FROM user_llm_connections WHERE user_id=? ORDER BY created_at,connection_id")
-            .bind(owner).fetch_all(&self.pool()?).await.map_err(internal_error)
+        let pool = self.pool()?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let rows = sqlx::query_as("SELECT connection_id,provider,label,email,status,token_expires_at AS expires_at,revocation_confirmed <> 0 AS remote_revocation_confirmed FROM user_llm_connections WHERE user_id=? ORDER BY created_at,connection_id")
+            .bind(owner).fetch_all(connection.connection_mut()).await.map_err(internal_error)?;
+        connection.release();
+        Ok(rows)
     }
     pub async fn catalog_labels(&self, owner: &str) -> ApiResult<HashMap<String, String>> {
         let Ok(config) = self.enabled() else {
@@ -866,18 +898,23 @@ impl ChatgptConnections {
         owner: &str,
         id: &str,
         request: CompleteAuthorization,
+        claimed: &std::sync::atomic::AtomicBool,
     ) -> ApiResult<Value> {
         let config = self.enabled()?;
         let pool = self.pool()?;
+        let mut checkout = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
         let row = sqlx::query_as::<_, AuthorizationRow>(
             "SELECT * FROM user_llm_authorizations WHERE user_id = ? AND authorization_id = ?",
         )
         .bind(owner)
         .bind(id)
-        .fetch_optional(&pool)
+        .fetch_optional(checkout.connection_mut())
         .await
         .map_err(internal_error)?
         .ok_or_else(not_found)?;
+        checkout.release();
         if !self
             .encryptor
             .verify_keyed_digest("chatgpt-state", &request.state, &row.state_digest)
@@ -911,8 +948,12 @@ impl ChatgptConnections {
             ));
         }
         if request.error.is_some() {
+            let mut connection = CancellationSafePoolConnection::acquire(&pool)
+                .await
+                .map_err(internal_error)?;
             query("UPDATE user_llm_authorizations SET status='declined', verifier_encrypted=NULL WHERE user_id=? AND authorization_id=? AND status='pending'")
-                .bind(owner).bind(id).execute(&pool).await.map_err(internal_error)?;
+                .bind(owner).bind(id).execute(connection.connection_mut()).await.map_err(internal_error)?;
+            connection.release();
             return Err(fail(
                 StatusCode::FORBIDDEN,
                 "chatgpt_consent_declined",
@@ -939,8 +980,12 @@ impl ChatgptConnections {
             .encryptor
             .decrypt(row.verifier_encrypted.as_deref().ok_or_else(reauth)?)
             .map_err(internal_error)?;
+        let mut checkout = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
         let changed = query("UPDATE user_llm_authorizations SET status='exchanging', client_id=? WHERE user_id=? AND authorization_id=? AND status='pending' AND expires_at>=?")
-            .bind(client_id).bind(owner).bind(id).bind(unix_now()).execute(&pool).await.map_err(internal_error)?;
+            .bind(client_id).bind(owner).bind(id).bind(unix_now()).execute(checkout.connection_mut()).await.map_err(internal_error)?;
+        checkout.release();
         if changed.rows_affected() != 1 {
             return Err(fail(
                 StatusCode::CONFLICT,
@@ -948,6 +993,7 @@ impl ChatgptConnections {
                 "Authorization is already being exchanged",
             ));
         }
+        claimed.store(true, std::sync::atomic::Ordering::Release);
         let result = async {
             let value = self.read_json(self.client()?.post(&config.token).form(&[
                 ("grant_type","authorization_code"),("client_id",client_id),("code",code),
@@ -963,33 +1009,75 @@ impl ChatgptConnections {
             let credentials = Credentials { access_token:token.access_token,refresh_token:token.refresh_token,
                 scopes,expires_at:unix_now()+token.expires_in };
             let encrypted = self.encryptor.encrypt(&serde_json::to_string(&credentials).map_err(internal_error)?).map_err(internal_error)?;
-            let existing = sqlx::query_scalar::<_,String>("SELECT connection_id FROM user_llm_connections WHERE user_id=? AND client_id=? AND subject=?")
-                .bind(owner).bind(client_id).bind(&identity.sub).fetch_optional(&pool).await.map_err(internal_error)?;
-            let connection_id = row.connection_id.clone().or(existing).unwrap_or_else(|| Uuid::new_v4().to_string());
-            let mut tx = pool.begin().await.map_err(internal_error)?;
-            // Match disconnect's connection -> authorization -> model lock order.
-            let _ = sqlx::query_scalar::<_,String>("SELECT connection_id FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
-                .bind(owner).bind(&connection_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
-            let pending: String = sqlx::query_scalar("SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=? FOR UPDATE")
-                .bind(owner).bind(id).fetch_one(&mut *tx).await.map_err(internal_error)?;
-            if pending!="exchanging" { return Err(fail(StatusCode::CONFLICT,"oauth_attempt_cancelled","Authorization was cancelled before linking completed")); }
-            query("INSERT INTO user_llm_connections (connection_id,user_id,provider,label,client_id,subject,email,host_id,status,credentials_encrypted,token_expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE credentials_encrypted=VALUES(credentials_encrypted),token_expires_at=VALUES(token_expires_at),status=VALUES(status),revocation_confirmed=NULL,email=VALUES(email),host_id=VALUES(host_id),generation=generation+1,credential_version=credential_version+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6)")
-                .bind(&connection_id).bind(owner).bind(PROVIDER).bind(&row.label).bind(client_id).bind(identity.sub).bind(identity.email)
-                .bind(&config.host_id).bind(state).bind(encrypted).bind(credentials.expires_at).execute(&mut *tx).await.map_err(internal_error)?;
-            if state!="connected" {
-                query("UPDATE user_llm_models SET is_active=0,updated_at=NOW(6) WHERE user_id=? AND connection_id=?")
-                    .bind(owner).bind(&connection_id).execute(&mut *tx).await.map_err(internal_error)?;
+            let mut existing = row.connection_id.clone();
+            if existing.is_none() {
+                existing = self.registration_id(owner, client_id, &identity.sub).await?;
             }
-            query("UPDATE user_llm_authorizations SET status='completed',verifier_encrypted=NULL,callback_digest=?,completed_connection_id=? WHERE user_id=? AND authorization_id=? AND status='exchanging'")
-                .bind(callback_digest).bind(&connection_id).bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
-            tx.commit().await.map_err(internal_error)?;
-            Ok(json!({"connection":self.view(owner,&connection_id).await?}))
+            // Resolve registration conflicts before taking the authorization lock.
+            // Only a definite duplicate is retried; the consumed OAuth code is not.
+            for attempt in 0..2 {
+                let connection_id = existing.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+                let mut tx = CancellationSafeTransaction::begin(&pool).await.map_err(internal_error)?;
+                if existing.is_some() {
+                    let registration: Option<(String,String)> = sqlx::query_as("SELECT client_id,subject FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
+                        .bind(owner).bind(&connection_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
+                    if registration.as_ref() != Some(&(client_id.to_owned(), identity.sub.clone())) { return Err(reauth()); }
+                } else {
+                    let inserted = query("INSERT INTO user_llm_connections (connection_id,user_id,provider,label,client_id,subject,email,host_id,status,credentials_encrypted,token_expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+                        .bind(&connection_id).bind(owner).bind(PROVIDER).bind(&row.label).bind(client_id).bind(&identity.sub).bind(&identity.email)
+                        .bind(&config.host_id).bind(state).bind(&encrypted).bind(credentials.expires_at).execute(&mut *tx).await;
+                    if let Err(error) = inserted {
+                        let duplicate = error.as_database_error().is_some_and(|e| e.is_unique_violation());
+                        tx.rollback().await.map_err(internal_error)?;
+                        if !duplicate || attempt != 0 { return Err(internal_error(error)); }
+                        existing = self.registration_id(owner, client_id, &identity.sub).await?;
+                        if existing.is_none() { return Err(internal_error(error)); }
+                        continue;
+                    }
+                }
+                let pending: String = sqlx::query_scalar("SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=? FOR UPDATE")
+                    .bind(owner).bind(id).fetch_one(&mut *tx).await.map_err(internal_error)?;
+                if pending!="exchanging" { return Err(fail(StatusCode::CONFLICT,"oauth_attempt_cancelled","Authorization was cancelled before linking completed")); }
+                if existing.is_some() {
+                    query("UPDATE user_llm_connections SET credentials_encrypted=?,token_expires_at=?,status=?,revocation_confirmed=NULL,email=?,host_id=?,generation=generation+1,credential_version=credential_version+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=?")
+                        .bind(&encrypted).bind(credentials.expires_at).bind(state).bind(&identity.email).bind(&config.host_id).bind(owner).bind(&connection_id)
+                        .execute(&mut *tx).await.map_err(internal_error)?;
+                }
+                if state!="connected" {
+                    query("UPDATE user_llm_models SET is_active=0,updated_at=NOW(6) WHERE user_id=? AND connection_id=?")
+                        .bind(owner).bind(&connection_id).execute(&mut *tx).await.map_err(internal_error)?;
+                }
+                query("UPDATE user_llm_authorizations SET status='completed',verifier_encrypted=NULL,callback_digest=?,completed_connection_id=? WHERE user_id=? AND authorization_id=? AND status='exchanging'")
+                    .bind(&callback_digest).bind(&connection_id).bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
+                tx.commit().await.map_err(internal_error)?;
+                return Ok(json!({"connection":self.view(owner,&connection_id).await?}));
+            }
+            Err(unavailable())
         }.await;
         if result.is_err() {
+            let mut connection = CancellationSafePoolConnection::acquire(&pool)
+                .await
+                .map_err(internal_error)?;
             query("UPDATE user_llm_authorizations SET status='failed',verifier_encrypted=NULL WHERE user_id=? AND authorization_id=? AND status='exchanging'")
-                .bind(owner).bind(id).execute(&pool).await.map_err(internal_error)?;
+                .bind(owner).bind(id).execute(connection.connection_mut()).await.map_err(internal_error)?;
+            connection.release();
         }
         result
+    }
+    async fn registration_id(
+        &self,
+        owner: &str,
+        client: &str,
+        subject: &str,
+    ) -> ApiResult<Option<String>> {
+        let pool = self.pool()?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let result = sqlx::query_scalar("SELECT connection_id FROM user_llm_connections WHERE user_id=? AND client_id=? AND subject=?")
+            .bind(owner).bind(client).bind(subject).fetch_optional(connection.connection_mut()).await.map_err(internal_error)?;
+        connection.release();
+        Ok(result)
     }
     async fn view(&self, owner: &str, id: &str) -> ApiResult<ConnectionView> {
         self.list(owner)

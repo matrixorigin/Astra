@@ -87,6 +87,10 @@ without an eligible checked model is not chat-ready. No admin command is needed.
 `/model` selects an exact Offering and shows its source/account. `/model manage`
 reconnects/disconnects personal ChatGPT accounts, restores checked models after
 reconnection, explicitly sets defaults, and removes personal model configurations.
+For a connected ChatGPT account, **Choose models** reads its current catalog
+without another browser authorization. If that read fails, retry it from
+`/model manage`; the account remains connected. Web model settings expose the
+same action and retain a confirmed connection when model discovery fails.
 Cancellation/failure preserves the conversation and draft. Adding a model keeps
 the current usable selection and explicit default. A first sole usable model is
 selected through the existing default resolver; an unpinned fallback still uses

@@ -25,8 +25,7 @@ export async function GET() {
     const linked = await auth.client.get<{ items: unknown[]; management_available: boolean }>(connections);
     if (!linked.management_available) return NextResponse.json({ error: 'Your deployment manages model access; personal model configuration is not available.' }, { status: 403 });
     const models = await auth.client.get<{ items: unknown[] }>('/me/models');
-    const connectionError = null;
-    return NextResponse.json({ owner_id: auth.user.user_id, runtime_scope: runtimeScope(auth.client.config.apiUrl, auth.client.config.accessToken), models: models.items, connections: linked.items, connectionError }, { headers: { 'Cache-Control': 'no-store' } });
+    return NextResponse.json({ owner_id: auth.user.user_id, runtime_scope: runtimeScope(auth.client.config.apiUrl, auth.client.config.accessToken), models: models.items, connections: linked.items }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) { return failure(error); }
 }
 export async function POST(request: NextRequest) {

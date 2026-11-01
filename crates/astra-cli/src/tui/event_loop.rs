@@ -8188,6 +8188,26 @@ pub(crate) async fn run_tui_session(
                 match completed {
                     Ok((owner, epoch, result)) if owner.is_current() && epoch == state.session_attachment_epoch => {
                         match result {
+                            Ok(super::model_setup::Outcome::Connected { connection_id, status }) => {
+                                bottom_pane.clear_model_catalog();
+                                if status != "connected" {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response(format!("ChatGPT authorization saved: {status}. Use /model manage to reconnect or choose another source.")));
+                                    pending_deferred_slash_flush = true;
+                                    frame_requester.schedule_frame();
+                                    continue;
+                                }
+                                chat_widget.commit_system(history_cell::system::SystemCell::response("ChatGPT connected. Loading models; Esc cancels model selection and keeps the connection."));
+                                model_setup_phase.reset();
+                                model_setup_cancel = tokio_util::sync::CancellationToken::new();
+                                let api = api.clone();
+                                let cancel = model_setup_cancel.clone();
+                                let phase = model_setup_phase.clone();
+                                let progress = model_setup_progress_tx.clone();
+                                model_setup_tasks.spawn(async move {
+                                    let result = super::model_setup::run(super::model_setup::Action::Models(connection_id), api, owner.clone(), cancel, phase, progress).await;
+                                    (owner, epoch, result)
+                                });
+                            }
                             Ok(super::model_setup::Outcome::Models { connection_id, slugs, existing }) => {
                                 let mut choices: Vec<_> = existing.into_iter().map(|(id, name)|
                                     (format!("Use {name}"), Some("Check and restore this existing personal model".into()), super::model_setup::Action::Activate(id))).collect();
@@ -8201,6 +8221,9 @@ pub(crate) async fn run_tui_session(
                                     let Some(id) = row["connection_id"].as_str() else { continue; };
                                     let label = row["email"].as_str().or_else(|| row["label"].as_str()).unwrap_or("ChatGPT account");
                                     let status = row["status"].as_str().unwrap_or("unknown");
+                                    if status == "connected" {
+                                        choices.push((format!("Choose models for {label}"), Some("Use this connected account without signing in again".into()), super::model_setup::Action::Models(id.into())));
+                                    }
                                     choices.push((format!("Reconnect {label}"), Some(status.into()), super::model_setup::Action::Connect(Some(id.into()))));
                                     choices.push((format!("Disconnect {label}"), Some("Stops use across this deployment; keeps conversation history".into()), super::model_setup::Action::Disconnect(id.into())));
                                 }
