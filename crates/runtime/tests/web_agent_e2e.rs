@@ -6129,6 +6129,10 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
         .await
         .unwrap();
     let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    astra_services::resource_governor::DatabaseResourceGovernor::new(pool.clone())
+        .ensure_tables()
+        .await
+        .unwrap();
     let provider = subscription_provider::ProviderFixture::start().await;
     let config = ChatgptConfig::for_test(&provider.base);
     let key = test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!");
