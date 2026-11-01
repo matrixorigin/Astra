@@ -6202,15 +6202,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unresolved_local_attempt_is_not_a_complete_aggregate() {
+    fn deferred_local_attempt_requires_its_exact_terminal_callback() {
         let mut accumulator = ToolLedgerReceiptAccumulator::default();
-        accumulator.register_attempt("pending-local").unwrap();
+        let attempts = ToolLedgerAttemptBatch::from_validated_provider_calls(&[receipt_test_call(
+            "pending-local",
+        )]);
+        accumulator.observe_round(
+            &attempts,
+            &[receipt_test_record(
+                "pending-local",
+                false,
+                ToolCallDisposition::Deferred,
+            )],
+        );
 
         let aggregate = accumulator.canonical_aggregate();
         assert_eq!(aggregate.attempted, 1);
         assert_eq!(aggregate.terminal, 0);
         assert_eq!(aggregate.unresolved, 1);
         assert!(!aggregate.is_complete_for(1));
+
+        accumulator.observe_round(
+            &attempts,
+            &[receipt_test_record(
+                "pending-local",
+                true,
+                ToolCallDisposition::Executed,
+            )],
+        );
+        assert!(accumulator.canonical_aggregate().is_complete_for(1));
     }
 
     pub(crate) fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
@@ -12136,6 +12156,22 @@ pub(crate) mod tests {
             content.contains("write_file"),
             "Should mention the deferred tool name"
         );
+        let suppressed = host
+            .terminal_tool_records
+            .iter()
+            .find(|record| record.tool_call_id.as_deref() == Some("call_write"))
+            .expect("the omitted call has a terminal record");
+        assert_eq!(
+            suppressed.effective_disposition(),
+            ToolCallDisposition::Suppressed
+        );
+        assert!(
+            state
+                .tool_ledger_receipt
+                .canonical_aggregate()
+                .is_complete_for(state.total_tool_calls),
+            "the original call is settled even when the model does not retry it"
+        );
 
         // The skill call should still have been executed normally
         let skill_msgs: Vec<&Value> = state
@@ -13979,6 +14015,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
                  placeholders so evaluation/analytics skip them"
             );
         }
+        assert!(
+            state
+                .tool_ledger_receipt
+                .canonical_aggregate()
+                .is_complete_for(state.total_tool_calls),
+            "calls removed after substantial skill output must also be settled"
+        );
 
         // skill_produced_output flag should be set
         assert!(

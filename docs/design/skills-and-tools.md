@@ -160,6 +160,12 @@ that every workload is cheaper. Explicitly pinned utility tools remain supported
 
 A skill may require tools, but it does not make those tools available by itself. Provider decision still controls whether a required capability can run in the current session.
 
+When skill activation omits sibling tool calls from the same model response,
+each omitted attempt settles as `suppressed`, including when the skill fails.
+Retry guidance lets the model issue a new call; it does not queue execution or
+leave the original call awaiting a callback. Actual in-flight `deferred` calls
+still require their own terminal result before run completion.
+
 Capability-source discovery returns an exact `selection_key` and activation
 hint for each result. Names have the form
 `skill__cap__<native-label>__<16hex>` or `mcp__cap__<native-label>__<16hex>`.
