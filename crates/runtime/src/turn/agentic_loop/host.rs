@@ -49,7 +49,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord, TraceSpanBuilder};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -1957,14 +1956,10 @@ pub struct TelemetryState {
     /// Optional event persistence context for mirroring context traces into cloud events.
     pub context_trace_persistence: Option<ContextTracePersistenceContext>,
     pub trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
-    /// Runtime promotion verdicts captured for later audit/report persistence.
-    pub promotion_events: Vec<RuntimePromotionEventData>,
     /// Optional turn trace collector for detailed context assembly observability.
     /// When set, records system prompt, history, memory, and tool selection traces.
     /// Created at turn start, finalized at turn end.
     pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
-    /// Number of turns completed in this loop invocation (for tuning cycle trigger).
-    pub completed_turns_for_tuning: u32,
     /// Deferred context assembly trace: written here by `finalize_turn_trace` so
     /// the journal event is only emitted when the turn actually commits (not on
     /// aborts/retries), preventing ghost `context_assembly_recorded` events.

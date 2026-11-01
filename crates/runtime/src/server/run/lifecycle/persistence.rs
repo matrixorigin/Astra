@@ -1,4 +1,4 @@
-//! Canonical transcript persistence, hook writes, observers and runtime promotions.
+//! Canonical transcript persistence, hook writes and observers.
 //! Optional diagnostics use the existing ingestion owner; they never gate a turn.
 //!
 //! Extracted from [`super`] to keep the lifecycle module manageable.
@@ -23,7 +23,6 @@ use astra_services::runs::{
     CanonicalTerminalContext, CanonicalTerminalOutcome, CanonicalTerminalTranscript,
     DatabaseRunStateStore, DurableCancellationOrigin, RunStateStore,
 };
-use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::session_context_coordinator::{
     DatabaseSessionContextCoordinator, PreparedSessionContextCommit, RunContextAuthority,
 };
@@ -38,15 +37,16 @@ use astra_turn_core::observer::filter_memory_operation_turns;
 use astra_turn_core::trace_event::TraceContext;
 use astra_turn_types::{SessionCursorV1, transcript_content_hash, transcript_payload_identity};
 
+#[cfg(test)]
 use crate::MatrixOneSettings;
 use crate::server::run::engine::{RunOwnerLeaseTerminalAuthority, RunOwnerLeaseTerminalOperation};
 use crate::turn::agentic_loop::host::AgenticLoopState;
+#[cfg(test)]
 use crate::{DatabaseEventService, EventCreateRequestData, EventService};
 use astra_services::storage::admit_session_event_write;
 
 use super::{
-    build_runtime_event_service, build_runtime_turn_evaluation_event, flush_turn_observability,
-    persist_runtime_promotion_events, persist_turn_evaluation_journal,
+    build_runtime_turn_evaluation_event, flush_turn_observability, persist_turn_evaluation_journal,
 };
 
 const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
@@ -130,10 +130,9 @@ fn record_turn_observer_run_metrics(
 
 /// Bundles all handles needed by post-loop best-effort persistence calls.
 ///
-/// Root execution shares canonical transcript settlement and derived hooks,
-/// observers and promotions. These consumers cannot authorize conversation writes.
+/// Root execution shares canonical transcript settlement, derived hooks and
+/// observers. These consumers cannot authorize conversation writes.
 pub(crate) struct PostLoopPersistContext {
-    pub(crate) matrixone: MatrixOneSettings,
     pub(crate) shared_pool: Option<SharedPool>,
     pub(crate) user_id: String,
     pub(crate) session_id: String,
@@ -180,10 +179,9 @@ impl PostLoopPersistContext {
         loop_success: bool,
         canonical_result: Result<(), String>,
     ) -> Result<(), String> {
-        let mut errors = Vec::new();
         if let Err(error) = canonical_result {
-            // Memory extraction, session-end hooks, and promotion
-            // events are derived from the canonical turn. Publishing any of
+            // Memory extraction and session-end hooks are derived
+            // from the canonical turn. Publishing any of
             // them after the canonical transaction
             // failed creates a second, contradictory source of truth. Retain
             // the classified terminal failure and append-only provider/tool
@@ -213,45 +211,29 @@ impl PostLoopPersistContext {
             &state.skills.session_event_hooks,
             state.current_session_id.as_deref().unwrap_or(""),
         );
-        let promotion_persist = persist_runtime_promotion_events(
-            &self.matrixone,
-            self.shared_pool.as_ref(),
-            &self.user_id,
-            &self.session_id,
-            &self.run_id,
-            &state.telemetry.promotion_events,
-        );
-        let (observer_result, (), promotion_result) =
-            tokio::join!(observer_dispatch, session_end, promotion_persist,);
-        if let Err(error) = observer_result {
-            errors.push(format!("observer fire failed: {error}"));
-        }
-        if let Err(error) = promotion_result {
-            errors.push(format!("promotion events persist failed: {error}"));
-        }
+        let (observer_result, ()) = tokio::join!(observer_dispatch, session_end);
+        let Err(error) = observer_result else {
+            return Ok(());
+        };
 
         // Use loop_success to conditionally log severity
-        if loop_success && !errors.is_empty() {
+        if loop_success {
             tracing::warn!(
                 session_id = %self.session_id,
                 run_id = %self.run_id,
-                error_count = errors.len(),
+                error = %error,
                 "post-loop persistence completed with errors"
             );
-        } else if !loop_success && !errors.is_empty() {
+        } else {
             tracing::error!(
                 session_id = %self.session_id,
                 run_id = %self.run_id,
-                error_count = errors.len(),
+                error = %error,
                 "post-loop persistence failed on failed run"
             );
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+        Err(format!("observer fire failed: {error}"))
     }
 
     /// Persist the raw conversation atomically under the current Run owner.
@@ -2606,7 +2588,6 @@ mod tests {
 
     fn test_post_loop_persist_context(session_id: &str) -> PostLoopPersistContext {
         PostLoopPersistContext {
-            matrixone: MatrixOneSettings::default(),
             shared_pool: None,
             user_id: "user-1".to_string(),
             session_id: session_id.to_string(),
@@ -3749,7 +3730,6 @@ mod tests {
     async fn canonical_transcript_keeps_deferred_inputs_without_diagnostic_copies() {
         let pool = setup_pool().await;
         let db = pool.get().clone();
-        let matrixone = MatrixOneSettings::from_env();
         let session_id = Uuid::new_v4().to_string();
         let user_id = Uuid::new_v4().to_string();
         let run_id = Uuid::new_v4().to_string();
@@ -3823,7 +3803,6 @@ mod tests {
         ]);
 
         let persist = PostLoopPersistContext {
-            matrixone,
             shared_pool: Some(pool.clone()),
             user_id: user_id.clone(),
             session_id: session_id.clone(),

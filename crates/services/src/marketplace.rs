@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 use uuid::Uuid;
 
-use crate::auth::FernetTokenEncryptor;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -139,13 +138,6 @@ pub struct InstallRequestData {
     pub skill_name: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct CredentialRequestData {
-    pub skill_name: String,
-    pub credential_name: String,
-    pub value: String,
-}
-
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -180,20 +172,6 @@ pub trait MarketplaceService: Send + Sync {
         limit: i64,
         cursor: Option<InstalledListCursor>,
     ) -> Result<InstalledListResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn save_credential(
-        &self,
-        user_id: String,
-        request: CredentialRequestData,
-        encryptor: &FernetTokenEncryptor,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn delete_credential(
-        &self,
-        user_id: String,
-        skill_name: String,
-        credential_name: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)>;
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -460,62 +438,6 @@ impl MarketplaceService for DatabaseMarketplaceService {
             next_cursor,
         })
     }
-
-    async fn save_credential(
-        &self,
-        user_id: String,
-        request: CredentialRequestData,
-        encryptor: &FernetTokenEncryptor,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        let encrypted = encryptor
-            .encrypt(&request.value)
-            .map_err(|e| internal_error(format!("encryption failed: {}", e)))?;
-
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let credential_id = Uuid::new_v4().to_string();
-
-        query(
-            "INSERT INTO skill_user_credentials \
-             (credential_id, user_id, skill_name, credential_name, value_encrypted, created_at) \
-             VALUES (?, ?, ?, ?, ?, NOW())",
-        )
-        .bind(&credential_id)
-        .bind(&user_id)
-        .bind(&request.skill_name)
-        .bind(&request.credential_name)
-        .bind(&encrypted)
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        Ok(StatusResponse {
-            status: "saved".into(),
-        })
-    }
-
-    async fn delete_credential(
-        &self,
-        user_id: String,
-        skill_name: String,
-        credential_name: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        query(
-            "DELETE FROM skill_user_credentials \
-             WHERE user_id = ? AND skill_name = ? AND credential_name = ?",
-        )
-        .bind(&user_id)
-        .bind(&skill_name)
-        .bind(&credential_name)
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        Ok(StatusResponse {
-            status: "deleted".into(),
-        })
-    }
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────
@@ -560,22 +482,6 @@ impl MarketplaceService for UnconfiguredMarketplaceService {
     ) -> Result<InstalledListResponse, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("marketplace service not configured"))
     }
-    async fn save_credential(
-        &self,
-        _: String,
-        _: CredentialRequestData,
-        _: &FernetTokenEncryptor,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("marketplace service not configured"))
-    }
-    async fn delete_credential(
-        &self,
-        _: String,
-        _: String,
-        _: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("marketplace service not configured"))
-    }
 }
 
 // ── HTTP types ───────────────────────────────────────────────────────────────
@@ -584,21 +490,6 @@ impl MarketplaceService for UnconfiguredMarketplaceService {
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
     pub skill_name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialRequest {
-    pub skill_name: String,
-    pub credential_name: String,
-    pub value: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeleteCredentialQuery {
-    pub skill_name: String,
-    pub credential_name: String,
 }
 
 #[derive(Deserialize)]

@@ -230,6 +230,7 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
+        terminal_at: None,
         run_id: run_id.to_string(),
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),

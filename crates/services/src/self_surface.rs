@@ -464,8 +464,12 @@ impl SelfSurfaceService for LocalSelfSurfaceService {
         dimension: SelfSurfaceDimension,
         journal_limit: usize,
     ) -> Result<SelfSurfaceResponse, String> {
-        let snapshot = self.snapshot(session_id, journal_limit).await?;
         let artifacts = self.artifact_loader.load_artifacts(session_id).await?;
+        let snapshot = build_persistent_snapshot(
+            &artifacts,
+            journal_limit.max(1),
+            self.runtime_support.as_ref(),
+        )?;
 
         Ok(match dimension {
             SelfSurfaceDimension::Snapshot => SelfSurfaceResponse::Snapshot(snapshot),
@@ -1928,6 +1932,54 @@ mod tests {
             _session_id: &str,
         ) -> Result<LoadedSelfSurfaceArtifacts, String> {
             Ok(self.artifacts.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn each_surface_uses_one_artifact_load_even_if_a_second_would_fail() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct OnceLoader(AtomicUsize);
+        #[async_trait]
+        impl SelfSurfaceArtifactLoader for OnceLoader {
+            async fn load_artifacts(
+                &self,
+                session_id: &str,
+            ) -> Result<LoadedSelfSurfaceArtifacts, String> {
+                if self.0.fetch_add(1, Ordering::SeqCst) != 0 {
+                    return Err("state changed after the first read".into());
+                }
+                Ok(LoadedSelfSurfaceArtifacts {
+                    session_id: session_id.into(),
+                    workspace: None,
+                    restored: None,
+                    journal_events: Vec::new(),
+                    latest_full_context_trace: None,
+                })
+            }
+        }
+        for dimension in [
+            SelfSurfaceDimension::Snapshot,
+            SelfSurfaceDimension::Profile,
+            SelfSurfaceDimension::Goal,
+            SelfSurfaceDimension::Trace,
+            SelfSurfaceDimension::Budget,
+            SelfSurfaceDimension::Signals,
+            SelfSurfaceDimension::Health,
+            SelfSurfaceDimension::Journal,
+            SelfSurfaceDimension::Verify,
+        ] {
+            let loader = Arc::new(OnceLoader(AtomicUsize::new(0)));
+            let service = LocalSelfSurfaceService::new()
+                .with_runtime_support(Arc::new(StubRuntimeSupport))
+                .with_artifact_loader(loader.clone());
+            let response = service.surface("one-read", dimension, 0).await.unwrap();
+            let body = serde_json::to_value(response).unwrap();
+            assert_eq!(
+                body.pointer("/body/session_id")
+                    .or_else(|| body.pointer("/body/run/session_id")),
+                Some(&serde_json::json!("one-read")),
+            );
+            assert_eq!(loader.0.load(Ordering::SeqCst), 1);
         }
     }
 

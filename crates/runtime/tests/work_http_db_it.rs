@@ -1562,6 +1562,7 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
+            terminal_at: None,
             run_id: active_run_id.clone(),
             user_id: owner_id.clone(),
             session_id: binding.session_id.as_str().to_string(),

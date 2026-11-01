@@ -77,6 +77,19 @@ The diagnostic-only artifact reference counter is removed. An otherwise
 unreferenced artifact can expire at its existing deadline; canonical tool,
 transcript, recovery-point and other durable reference edges still protect it.
 
+The dedicated runtime-promotion reporting plane is retired. The built-in runtime
+has no producer of promotion verdicts; it no longer carries an empty verdict
+buffer or runs a promotion writer at settlement. The two `/audit/promotions`
+routes (global and Session-scoped), promotion DTOs and nine promotion counters
+in `/audit/stats` are removed. Historical events remain ordinary owner-scoped
+`agent_events` records under existing retention rules. Generic event input does
+not certify a controller verdict. Real policy feedback, observers and turn
+evaluation keep their existing owners.
+
+Turn timeline enrichment reads tool facts only for the selected page's Run IDs.
+An invalid selected fact fails that read; unrelated Runs are not decoded as a
+side effect. Whole-Session tool analytics still reads the complete Session.
+
 ## Introspect
 
 Introspect should answer:
@@ -637,3 +650,110 @@ its empty `/telemetry decisions` view and counters are removed. The unwired gene
 Canonical memory/tool selection and exclusion facts, provider decisions,
 durable journal evidence and Explain Analyze retain their existing owners. Retiring unused adaptive/drift
 journal construction helpers does not remove decoding of durable event records.
+
+Tool analytics count an observed start as a call. Only a known terminal success
+or failure contributes to outcome counts and success rates; pending, unknown
+and explicit non-execution (including rejected/skipped calls) are not failures.
+Both global error rates and named success rates use only known outcomes; the
+numeric rate remains `0.0` when no outcome is known. Duration averages use only
+measured samples, including measured zero, and exclude missing durations. A turn's
+binary tool brief is emitted only for a known outcome.
+
+Audit model admissions use the scalar captured with immutable Run opening
+frames in the same insertion, independently of the current model after Auto
+routing. Admission alone is not a provider
+request or model-specific token measurement. Cross-session model counts merge
+Journal observations and admissions by owner, Session and model. Virtual opening
+facts use Run creation time; terminal facts use the immutable C0 `terminal_at`,
+written in the existing terminal transaction. Later event appends do not move
+that time. Session list date filters continue to select Session creation time.
+Root admissions include bound agents and exclude child Runs. Sparse Journal
+turn counts retain their sequence high watermark. Mixed Session counts retain
+the greater of the Journal high watermark and root admissions; missing identity
+cannot establish an exact union of user turns, guidance and retries.
+
+Tool totals merge already-materialized Journal terminals and canonical durable
+calls using exact owner, Session, Run and producer call identity. Synthetic
+Journal references remain usable for Reflection but carry provenance and cannot
+establish a match. A known durable result wins a conflicting Journal result;
+a pending or unknown durable result retains a known matching Journal terminal.
+Explicit non-execution suppresses a matching Journal execution outcome.
+Missing identities leave independent observations. Session membership is a set
+union. Error counters remain event-fact counts, rather than deduplicated call
+failures. Journal and Run error facts are additive: physical errors and
+failed canonical receipts each own their error events; a failed control status
+without an error event still affects turn health but invents no event count.
+Receipt error projection validates C0 identity and allocation through the canonical
+receipt owner, reading only its error frame without loading answers or cold bodies.
+The error endpoint also includes stall/verdict anomalies and reports its bounded
+returned length, rather than an uncapped global count. Aggregate receipt counts
+assume receipts written by their canonical owner; selected corrupt receipts fail
+strict list decoding. Independent Journal rows are grouped in SQL; only potentially shared
+identities are streamed individually, and error text is fetched for winning
+error IDs with the existing preview cap. Approval facts reconcile by owner, Session, Run, request and event kind;
+unidentified or conflicting Journal facts remain independent. Tool Journal
+partitions and physical tool events share one statement snapshot, so a concurrent
+append cannot count one Journal fact twice. Overall observation reads are
+sequential and may observe concurrent progress; they are not an atomic lifecycle
+snapshot.
+
+This does not add derived writes for embedded tool records in serialized CLI
+outbox turns. The raw Journal remains intact; complete tool-level reporting for
+that non-expanded input is not claimed by the materialized-terminal reader.
+
+Execution uncertainty is copied from the executor-owned result metadata into the
+existing nullable `executed` event field at the route boundary, including the
+transport observation. Audit reads that explicit fact before a projected failure
+boolean. Arbitrary JSON in tool output or error text is not lifecycle evidence.
+Session-list tool counts use the same reducer, restricted to the selected page
+of owner Sessions in a batch. Summary and stats omit error ranking and preview
+reads. Named-tool responses hydrate only their returned winning error IDs.
+
+Selected Journal turns enrich model and terminal facts from their canonical Run
+in one owner-scoped batch with independent physical `run_error` facts. A Run
+with multiple Journal roots supplies no Run-only facts to an arbitrary turn.
+Run lifetime is a duration fallback only when no measured duration is available;
+an explicit zero is a measurement. The latest physical error with a string
+message wins over a failed Run's message, then the Journal message. This source
+precedence does not infer temporal order between independent producers.
+
+Creation-time Session pages select their owner-scoped page before aggregating
+Journal, physical-event and Run facts. Count and numeric-page seeks use the
+same Session filters without those aggregates; a model filter still examines
+owned model candidates. Aggregate-dependent ordering and minimum-turn filters
+retain aggregation before paging. The extra has-more row participates in page
+metrics, while tool totals are loaded only for returned rows. No extra query,
+cache or stored projection is introduced.
+
+The opening owner captures its initially admitted model alongside the original
+frames. Audit model queries read that scalar without parsing the cold opening
+body; malformed cold bytes cannot poison another observation. Execution and
+recovery continue to validate the complete immutable opening and its hash.
+
+Root turn pages include serialized CLI outbox turns and ordinary Journal roots.
+Only returned outbox envelopes are decoded with the existing hash/identity
+verifier; their input/output and executed tool records feed the existing display
+projection. The has-more sentinel never transfers its serialized body. Embedded
+and observed calls reconcile by exact Run/call identity without replacing
+unrelated embedded records. Session duration sorting, cursor values and display
+all use the same observed span with millisecond precision, excluding Session
+idle time outside its first and last observations.
+
+The audit turn number is a display projection of the current owner/session root
+set. Explicit sequences retain their values, including repeated logical turns;
+unsequenced roots follow their maximum in creation order. List and detail share
+this projection, including zero when recorded. It allocates no durable identity:
+a later explicit sequence can renumber unsequenced roots. Timeline counts retain
+the sparse watermark plus unsequenced observations, bounded below by root count.
+List reads retain only previews and display metrics after envelope verification;
+detail reads preserve a verified full response over observed previews. Pagination
+sentinels decode no unused content, metadata or token fields.
+
+Turn body hydration uses one additional read-only batch for each nonempty page
+or detail selection: scalar numbering/keys first, then an owner/session-scoped
+primary-key `IN` query for at most 100 selected IDs (one for detail). This avoids
+body-join plans that materialize off-page content. Selected rows, not physical
+block I/O or the size of a selected envelope, are bounded. A concurrent deletion
+may shorten the returned page; its cursor advances through the selected keys.
+Ordinary metadata tool calls are decoded once into the typed display projection;
+verified outbox turns take their tool records only from the validated envelope.

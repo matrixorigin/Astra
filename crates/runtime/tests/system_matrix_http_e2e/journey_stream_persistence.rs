@@ -7,7 +7,7 @@
 //! The `/chat/stream` path uses the Server-owned agentic loop. Canonical append
 //! and atomic terminal settlement persist user/assistant transcript items,
 //! accepted trace events, run status, and usage under the execution owner fence.
-//! Context trace and promotion events retain their existing publication owners.
+//! Context trace events retain their existing publication owner.
 //!
 //! These tests verify that infrastructure.
 

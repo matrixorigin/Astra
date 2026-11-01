@@ -14,7 +14,7 @@ pub(super) async fn register_or_update_handler(
         runtime_mcp::discover_binding_tools(&binding.binding_id, &request).await?;
     let record = state
         .mcp_registry_service
-        .replace_binding_tools(user.user_id, binding.binding_id, discovered_tools)
+        .confirm_binding_discovery(user.user_id, binding.binding_id, discovered_tools)
         .await?;
     Ok(Json(record))
 }

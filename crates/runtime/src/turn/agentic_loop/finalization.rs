@@ -173,6 +173,9 @@ async fn persist_latest_context_trace_signal(
     };
     if let Some(ingestion) = ingestion {
         ingestion.enqueue(astra_services::event_ingestion::IngestionEvent {
+            run_id: None,
+            parent_run_id: None,
+            turn_seq: None,
             event_id: uuid::Uuid::now_v7().to_string(),
             session_id: session_id.clone(),
             user_id: persistence.user_id,

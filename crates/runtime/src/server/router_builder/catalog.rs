@@ -106,9 +106,4 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/marketplace/installed",
             get(crate::service_handlers::marketplace::list_installed_handler),
         )
-        .route(
-            "/marketplace/credentials",
-            post(crate::service_handlers::marketplace::save_credential_handler)
-                .delete(crate::service_handlers::marketplace::delete_credential_handler),
-        )
 }

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, QueryBuilder, Row, query};
+use sqlx::{MySql, Row, query};
 use std::{collections::HashSet, fmt, sync::Arc};
 
 use crate::auth::FernetTokenEncryptor;
@@ -52,19 +52,6 @@ impl fmt::Debug for McpRegisterRequestData {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpDiscoveredToolData {
-    pub tool_name: String,
-    pub public_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_schema_json: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_schema_json: Option<serde_json::Value>,
-    pub schema_hash: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpRegisteredToolRecord {
     pub tool_name: String,
     pub public_name: String,
@@ -86,12 +73,6 @@ pub struct McpRegisteredBindingRecord {
     pub server_name: String,
 }
 
-pub fn mcp_schema_hash(parts: &serde_json::Value) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(parts.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
 pub fn mcp_binding_tool_namespace(binding_id: &str) -> String {
     format!("binding_{binding_id}")
 }
@@ -104,11 +85,11 @@ pub trait McpRegistryService: Send + Sync {
         request: McpRegisterRequestData,
     ) -> Result<McpRegisteredBindingRecord, (StatusCode, Json<ErrorResponse>)>;
 
-    async fn replace_binding_tools(
+    async fn confirm_binding_discovery(
         &self,
         owner_user_id: String,
         binding_id: String,
-        discovered_tools: Vec<McpDiscoveredToolData>,
+        discovered_tools: Vec<McpRegisteredToolRecord>,
     ) -> Result<McpRegisterRecord, (StatusCode, Json<ErrorResponse>)>;
 }
 
@@ -129,11 +110,11 @@ impl McpRegistryService for UnconfiguredMcpRegistryService {
         ))
     }
 
-    async fn replace_binding_tools(
+    async fn confirm_binding_discovery(
         &self,
         _owner_user_id: String,
         _binding_id: String,
-        _discovered_tools: Vec<McpDiscoveredToolData>,
+        _discovered_tools: Vec<McpRegisteredToolRecord>,
     ) -> Result<McpRegisterRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
@@ -238,7 +219,7 @@ fn validate_binding_request(
 fn validate_discovered_tools(
     owner_user_id: &str,
     binding_id: &str,
-    discovered_tools: &[McpDiscoveredToolData],
+    discovered_tools: &[McpRegisteredToolRecord],
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if owner_user_id.trim().is_empty() {
         return Err(error_response_coded(
@@ -261,13 +242,6 @@ fn validate_discovered_tools(
             return Err(error_response_coded(
                 StatusCode::BAD_GATEWAY,
                 "MCP discovery returned a tool without a valid name",
-                "mcp_discovery_failed",
-            ));
-        }
-        if tool.schema_hash.trim().is_empty() {
-            return Err(error_response_coded(
-                StatusCode::BAD_GATEWAY,
-                "MCP discovery returned a tool without a schema hash",
                 "mcp_discovery_failed",
             ));
         }
@@ -465,16 +439,18 @@ impl McpRegistryService for DatabaseMcpRegistryService {
         })
     }
 
-    async fn replace_binding_tools(
+    async fn confirm_binding_discovery(
         &self,
         owner_user_id: String,
         binding_id: String,
-        discovered_tools: Vec<McpDiscoveredToolData>,
+        discovered_tools: Vec<McpRegisteredToolRecord>,
     ) -> Result<McpRegisterRecord, (StatusCode, Json<ErrorResponse>)> {
         validate_discovered_tools(&owner_user_id, &binding_id, &discovered_tools)?;
 
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut connection = crate::CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
         let binding_row = query(
             "SELECT b.mcp_id AS mcp_id, s.name AS server_name \
              FROM mcp_bindings b JOIN mcp_servers s \
@@ -483,9 +459,10 @@ impl McpRegistryService for DatabaseMcpRegistryService {
         )
         .bind(&owner_user_id)
         .bind(&binding_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(connection.connection_mut())
         .await
         .map_err(internal_error)?;
+        connection.release();
         let Some(binding_row) = binding_row else {
             return Err(error_response_coded(
                 StatusCode::NOT_FOUND,
@@ -496,65 +473,12 @@ impl McpRegistryService for DatabaseMcpRegistryService {
         let mcp_id: String = binding_row.try_get("mcp_id").map_err(internal_error)?;
         let server_name: String = binding_row.try_get("server_name").map_err(internal_error)?;
 
-        query("DELETE FROM mcp_tools WHERE owner_user_id = ? AND binding_id = ?")
-            .bind(&owner_user_id)
-            .bind(&binding_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(internal_error)?;
-
-        if !discovered_tools.is_empty() {
-            let mut builder = QueryBuilder::<MySql>::new(
-                "INSERT INTO mcp_tools \
-                 (owner_user_id, binding_id, tool_name, public_name, description, input_schema_json, \
-                  output_schema_json, schema_hash, discovered_at) ",
-            );
-            builder.push_values(&discovered_tools, |mut row, tool| {
-                let input_json = tool
-                    .input_schema_json
-                    .as_ref()
-                    .map(serde_json::Value::to_string);
-                let output_json = tool
-                    .output_schema_json
-                    .as_ref()
-                    .map(serde_json::Value::to_string);
-                row.push_bind(&owner_user_id)
-                    .push_bind(&binding_id)
-                    .push_bind(&tool.tool_name)
-                    .push_bind(&tool.public_name)
-                    .push_bind(tool.description.as_deref())
-                    .push_bind(input_json)
-                    .push_bind(output_json)
-                    .push_bind(&tool.schema_hash)
-                    .push("NOW(6)");
-            });
-            builder.build().execute(&mut *tx).await.map_err(|error| {
-                if is_duplicate_key_error(&error) {
-                    error_response_coded(
-                        StatusCode::CONFLICT,
-                        "duplicate MCP tool public name",
-                        "mcp_public_name_conflict",
-                    )
-                } else {
-                    internal_error(error)
-                }
-            })?;
-        }
-
-        tx.commit().await.map_err(internal_error)?;
-
         Ok(McpRegisterRecord {
             mcp_id,
             binding_id: binding_id.clone(),
             server_name,
             tool_namespace: mcp_binding_tool_namespace(&binding_id),
-            tools: discovered_tools
-                .into_iter()
-                .map(|tool| McpRegisteredToolRecord {
-                    tool_name: tool.tool_name,
-                    public_name: tool.public_name,
-                })
-                .collect(),
+            tools: discovered_tools,
         })
     }
 }
@@ -574,8 +498,9 @@ mod tests {
     fn register_request_debug_redacts_key_value() {
         let request = McpRegisterRequestData {
             server: McpServerRequestData {
-                name: "server".into(),
                 description: None,
+                name: "server".into(),
+
                 transport: "streamable_http".into(),
                 url: "http://example.test/mcp".into(),
             },
@@ -621,8 +546,9 @@ mod tests {
     fn validate_upsert_rejects_public_name_collision() {
         let request = McpRegisterRequestData {
             server: McpServerRequestData {
-                name: "srv".to_string(),
                 description: None,
+                name: "srv".to_string(),
+
                 transport: "sse".to_string(),
                 url: "http://example.test/mcp".to_string(),
             },
@@ -632,21 +558,13 @@ mod tests {
             },
         };
         let tools = vec![
-            McpDiscoveredToolData {
+            McpRegisteredToolRecord {
                 tool_name: "a".to_string(),
                 public_name: "mcp__binding_mcp_bind_7__a".to_string(),
-                description: None,
-                input_schema_json: Some(serde_json::json!({"type": "object"})),
-                output_schema_json: None,
-                schema_hash: "h1".to_string(),
             },
-            McpDiscoveredToolData {
+            McpRegisteredToolRecord {
                 tool_name: "b".to_string(),
                 public_name: "mcp__binding_mcp_bind_7__a".to_string(),
-                description: None,
-                input_schema_json: Some(serde_json::json!({"type": "object"})),
-                output_schema_json: None,
-                schema_hash: "h2".to_string(),
             },
         ];
         validate_binding_request("u1", &request).unwrap();

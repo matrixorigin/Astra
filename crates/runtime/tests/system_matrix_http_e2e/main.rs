@@ -529,3 +529,9 @@ matrix_test! {
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.3 delegate HTTP",
     journey_saas_platform_matrix::run_saas_delegate_http_boundaries
 }
+
+matrix_test! {
+    e2e_matrix_saas_mcp_registration_uses_live_discovery, 2,
+    "live MatrixOne + loopback MCP; registration retains discovery without a tool projection",
+    journey_saas_platform_matrix::run_saas_mcp_registration_uses_live_discovery
+}

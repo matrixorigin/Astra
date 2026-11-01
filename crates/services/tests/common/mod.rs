@@ -271,3 +271,24 @@ pub async fn controller_attachment(
 
     attachment
 }
+
+/// Capture actual statements only within the instrumented store call.
+#[derive(Clone, Default)]
+pub struct SqlQueries(pub std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for SqlQueries {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.0.lock().unwrap().push(value.to_owned());
+        }
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlQueries {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            event.record(&mut self.clone());
+        }
+    }
+}

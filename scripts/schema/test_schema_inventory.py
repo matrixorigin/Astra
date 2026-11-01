@@ -562,7 +562,6 @@ fn char_literal() { let slash = '/'; }
             "skill_installations",
             "skill_settings",
             "skill_resource_bindings",
-            "skill_user_credentials",
             "agent_bindings",
         }
         for table in skill_agent_tables:
@@ -600,10 +599,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "external resources",
             self.tables["skill_resource_bindings"]["merge_guidance"],
-        )
-        self.assertIn(
-            "encrypted user secrets",
-            self.tables["skill_user_credentials"]["merge_guidance"],
         )
         self.assertIn(
             "idempotent creation semantics",
@@ -815,7 +810,10 @@ fn char_literal() { let slash = '/'; }
         self.assertIn("consumer-scoped delivery state", delivery["merge_guidance"])
 
     def test_retired_projection_tables_are_absent(self) -> None:
-        for table in ("conversation_log", "skill_selection_events", "infra_sandbox_metadata", "skill_metrics", "session_checkpoints"):
+        for table in (
+            "conversation_log", "skill_selection_events", "infra_sandbox_metadata",
+            "skill_metrics", "session_checkpoints", "mcp_tools", "skill_user_credentials",
+        ):
             self.assertNotIn(table, self.tables)
 
     def test_session_high_growth_retention_mentions_bounded_hard_delete(self) -> None:
@@ -919,11 +917,6 @@ fn char_literal() { let slash = '/'; }
         self.assertEqual(binding_row["primary_key"], ["owner_user_id", "id"])
         self.assertEqual(binding_row["auto_increment_columns"], [])
         self.assertIn("encrypted credential", binding_row["rebuildability"])
-
-        tool_row = self.tables["mcp_tools"]
-        self.assertEqual(tool_row["primary_key"], ["owner_user_id", "binding_id", "tool_name"])
-        self.assertEqual(tool_row["auto_increment_columns"], [])
-        self.assertIn("rediscovering tools", tool_row["rebuildability"])
 
     def test_every_auto_increment_table_has_risk_audit_metadata(self) -> None:
         self.assertEqual([], self.summary["unaudited_auto_increment_tables"])

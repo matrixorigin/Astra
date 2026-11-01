@@ -179,10 +179,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(audit_handlers::audit_errors_handler),
         )
         .route(
-            "/sessions/{session_id}/audit/promotions",
-            get(audit_handlers::audit_runtime_promotions_handler),
-        )
-        .route(
             "/audit/sessions",
             get(audit_handlers::list_sessions_handler),
         )
@@ -193,9 +189,5 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/audit/tools",
             get(audit_handlers::cross_session_tools_handler),
-        )
-        .route(
-            "/audit/promotions",
-            get(audit_handlers::cross_session_runtime_promotions_handler),
         )
 }

@@ -647,7 +647,7 @@ impl DatabaseRunStateStore {
             .push(", terminal_receipt_json = JSON_SET(").push_bind(encoded)
             .push(", '$.completion_first', last_event_idx + ").push_bind(i64::from(control_count) + 1)
             .push("), last_event_idx = last_event_idx + ").push_bind(allocation_count)
-            .push(", owner_pod_id = NULL, owner_lease_expires_at = NULL, updated_at = NOW(6) WHERE user_id = ")
+            .push(", terminal_at = COALESCE(terminal_at, NOW(6)), owner_pod_id = NULL, owner_lease_expires_at = NULL, updated_at = NOW(6) WHERE user_id = ")
             .push_bind(request.user_id).push(" AND session_id = ").push_bind(request.expected_session_id)
             .push(" AND run_id = ").push_bind(request.run_id)
             .push(" AND run_generation = ").push_bind(generation)
@@ -986,22 +986,60 @@ fn committed_terminal_for_run(
     let Some(encoded) = &run.terminal_receipt_json else {
         return Ok(None);
     };
-    let stored = CommittedRunTerminalReceipt::decode(encoded, run.last_event_idx)?;
-    let receipt = &stored.receipt;
-    if receipt.user_id != run.user_id
-        || receipt.session_id != run.session_id
-        || receipt.run_id != run.run_id
-        || receipt.generation != run.run_generation
-        || receipt.outcome.status() != run.status
-        || Some(receipt.opening_hash.as_str()) != run.opening_hash.as_deref()
-        || receipt.context_admission_hash != run.context_admission_hash
-        || receipt.error_hash
-            != CanonicalRunTerminalReceipt::error_hash(run.error_message.as_deref())
-        || receipt.error_code != run.error_code
-    {
-        return Err("canonical terminal receipt disagrees with its Run".into());
+    CommittedRunTerminalReceipt::decode_for_identity(
+        encoded,
+        run.last_event_idx,
+        TerminalReceiptRunIdentity {
+            user_id: &run.user_id,
+            session_id: &run.session_id,
+            run_id: &run.run_id,
+            generation: run.run_generation,
+            status: &run.status,
+            opening_hash: run.opening_hash.as_deref(),
+            context_admission_hash: run.context_admission_hash.as_deref(),
+            error_message: run.error_message.as_deref(),
+            error_code: run.error_code.as_deref(),
+        },
+    )
+    .map(Some)
+}
+
+/// C0 identity needed to validate a terminal projection. Readers never need to
+/// load executable opening bodies or fabricate a full Run to check a receipt.
+pub(crate) struct TerminalReceiptRunIdentity<'a> {
+    pub user_id: &'a str,
+    pub session_id: &'a str,
+    pub run_id: &'a str,
+    pub generation: u64,
+    pub status: &'a str,
+    pub opening_hash: Option<&'a str>,
+    pub context_admission_hash: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+    pub error_code: Option<&'a str>,
+}
+
+impl CommittedRunTerminalReceipt {
+    pub(crate) fn decode_for_identity(
+        encoded: &str,
+        last_event_idx: i64,
+        run: TerminalReceiptRunIdentity<'_>,
+    ) -> Result<Self, String> {
+        let stored = Self::decode(encoded, last_event_idx)?;
+        let receipt = &stored.receipt;
+        if receipt.user_id != run.user_id
+            || receipt.session_id != run.session_id
+            || receipt.run_id != run.run_id
+            || receipt.generation != run.generation
+            || receipt.outcome.status() != run.status
+            || Some(receipt.opening_hash.as_str()) != run.opening_hash
+            || receipt.context_admission_hash.as_deref() != run.context_admission_hash
+            || receipt.error_hash != CanonicalRunTerminalReceipt::error_hash(run.error_message)
+            || receipt.error_code.as_deref() != run.error_code
+        {
+            return Err("canonical terminal receipt disagrees with its Run".into());
+        }
+        Ok(stored)
     }
-    Ok(Some(stored))
 }
 
 #[cfg(test)]
@@ -1117,6 +1155,33 @@ mod tests {
         assert_eq!(public[0]["action"], "open_billing_overview");
         assert_eq!(public[1]["type"], "run_finished");
         assert_eq!(public[1]["error_kind"], "unknown");
+    }
+
+    #[test]
+    fn receipt_error_window_never_loads_a_partial_answer() {
+        for has_answer in [false, true] {
+            let mut stored = failed_receipt();
+            if has_answer {
+                stored.receipt.transcript.assistant_source_event_id = Some("answer-source".into());
+                stored.receipt.transcript.item_count = 1;
+                stored.completion_count = 3;
+            }
+            let index = stored.completion_first() + i64::from(has_answer);
+            let events = stored
+                .receipt
+                .completion_events(
+                    None,
+                    None,
+                    Some("Inference rejected"),
+                    Some(stored.completion_first()),
+                    index - 1,
+                    index,
+                )
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event_type"], "run_error");
+            assert_eq!(events[0]["index"], index);
+        }
     }
 
     #[test]

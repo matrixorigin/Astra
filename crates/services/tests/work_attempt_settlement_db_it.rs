@@ -814,6 +814,7 @@ fn item_run(
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
+        terminal_at: None,
         run_id: run_id.into(),
         user_id: owner_id.into(),
         session_id: session_id.into(),

@@ -1,7 +1,4 @@
-//! Session Audit Query Layer — cloud-side structured queries over `agent_events`.
-//!
-//! Provides turn-level, tool-level, and session-level audit views.
-//! All queries run against MatrixOne `agent_events` + `agent_sessions` tables.
+//! Owner-scoped audit views over canonical Run facts and Journal observations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -10,7 +7,6 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, query};
 
-use crate::db_row::RowExt as RuntimePromotionAuditRow;
 use crate::db_row::RowExt as SessionAuditRow;
 use crate::storage::agent_session_exists_for_user;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
@@ -59,31 +55,6 @@ fn normalize_tool_name(name: String) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-fn runtime_promotion_row_string(
-    row: &impl RuntimePromotionAuditRow,
-    column: &str,
-) -> AuditResult<String> {
-    row.string_column(column)
-        .map_err(|e| internal_error(format!("runtime promotion decode column `{column}`: {e}")))
-}
-
-fn runtime_promotion_record_from_row(
-    row: &impl RuntimePromotionAuditRow,
-) -> AuditResult<RuntimePromotionRecord> {
-    let metadata = runtime_promotion_row_string(row, "metadata")?;
-    let data: RuntimePromotionEventData = serde_json::from_str(&metadata).map_err(|e| {
-        internal_error(format!(
-            "runtime promotion metadata JSON decode failed: {e}"
-        ))
-    })?;
-    Ok(RuntimePromotionRecord::from_event(
-        runtime_promotion_row_string(row, "event_id")?,
-        runtime_promotion_row_string(row, "session_id")?,
-        runtime_promotion_row_string(row, "created_at")?,
-        data,
-    ))
 }
 
 fn audit_decode_error(
@@ -148,27 +119,6 @@ fn audit_row_u32(row: &impl SessionAuditRow, context: &str, column: &str) -> Aud
             format!("expected non-negative u32-compatible value, got {value}"),
         )
     })
-}
-
-fn audit_row_optional_u32(
-    row: &impl SessionAuditRow,
-    context: &str,
-    column: &str,
-) -> AuditResult<Option<u32>> {
-    let value = row
-        .optional_i64_column(column)
-        .map_err(|error| audit_decode_error(context, column, error))?;
-    value
-        .map(|value| {
-            u32::try_from(value).map_err(|_| {
-                audit_decode_error(
-                    context,
-                    column,
-                    format!("expected non-negative u32-compatible value, got {value}"),
-                )
-            })
-        })
-        .transpose()
 }
 
 fn audit_row_u64(row: &impl SessionAuditRow, context: &str, column: &str) -> AuditResult<u64> {
@@ -278,50 +228,31 @@ struct SessionAuditMetrics {
 
 /// Canonical lifecycle metrics from the durable run ledger.
 ///
-/// `agent_events` is a compatibility/session journal and may lag, duplicate,
-/// or omit child-run control events.  Once a session has durable run events,
-/// summary fields whose source of truth is run lifecycle must come from this
-/// aggregate instead of presenting a falsely healthy session.
+/// Physical and Run facts supply lifecycle counts and observation bounds.
+/// Approval counts are reconciled separately using their request identities.
 #[derive(Debug, Default)]
 struct SessionDurableMetrics {
+    root_turn_count: u32,
+    models_used: Vec<String>,
     error_count: u32,
-    approval_required_count: u32,
-    approval_decision_count: u32,
-    approval_timeout_count: u32,
-    tool_calls_total: u32,
-    tool_calls_failed: u32,
     first_at: Option<String>,
     last_at: Option<String>,
-}
-
-impl SessionDurableMetrics {
-    fn has_events(&self) -> bool {
-        self.first_at.is_some() || self.last_at.is_some()
-    }
 }
 
 fn session_durable_metrics_from_row(
     row: &impl SessionAuditRow,
 ) -> AuditResult<SessionDurableMetrics> {
     Ok(SessionDurableMetrics {
+        root_turn_count: audit_row_u32(row, "durable_summary_metrics", "root_turn_count")?,
+        models_used: audit_row_optional_string(row, "durable_summary_metrics", "models_concat")?
+            .map(|models| {
+                models
+                    .split(SESSION_AUDIT_MODEL_SEP)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
         error_count: audit_row_u32(row, "durable_summary_metrics", "error_count")?,
-        approval_required_count: audit_row_u32(
-            row,
-            "durable_summary_metrics",
-            "approval_required_count",
-        )?,
-        approval_decision_count: audit_row_u32(
-            row,
-            "durable_summary_metrics",
-            "approval_decision_count",
-        )?,
-        approval_timeout_count: audit_row_u32(
-            row,
-            "durable_summary_metrics",
-            "approval_timeout_count",
-        )?,
-        tool_calls_total: audit_row_u32(row, "durable_summary_metrics", "tool_calls_total")?,
-        tool_calls_failed: audit_row_u32(row, "durable_summary_metrics", "tool_calls_failed")?,
         first_at: audit_row_optional_string(row, "durable_summary_metrics", "first_at")?,
         last_at: audit_row_optional_string(row, "durable_summary_metrics", "last_at")?,
     })
@@ -330,25 +261,17 @@ fn session_durable_metrics_from_row(
 fn merge_session_durable_metrics(
     metrics: &mut SessionAuditMetrics,
     durable: SessionDurableMetrics,
-) {
-    // A non-empty durable stream is authoritative for these lifecycle
-    // counters.  The legacy journal can contain compatibility duplicates
-    // (for example one approval decision per transport plus one per run),
-    // and it can retain stale nonzero values when the durable stream contains
-    // only run-start/terminal events.  Use the stream's timestamp aggregate
-    // as the explicit presence bit rather than treating zero as "missing".
-    if durable.has_events() {
-        metrics.approval_required_count = durable.approval_required_count;
-        metrics.approval_decision_count = durable.approval_decision_count;
-        metrics.approval_timeout_count = durable.approval_timeout_count;
-        metrics.tool_calls_total = durable.tool_calls_total.max(durable.tool_calls_failed);
-        metrics.tool_calls_failed = durable.tool_calls_failed;
+) -> AuditResult<()> {
+    metrics.turn_count = metrics.turn_count.max(durable.root_turn_count);
+    for model in durable.models_used.iter() {
+        if !metrics.models_used.contains(model) {
+            metrics.models_used.push(model.clone());
+        }
     }
-    if durable.error_count > 0 {
-        // Keep any legacy-only anomaly while ensuring durable terminal and
-        // transport failures are never hidden by a zero/partial journal.
-        metrics.error_count = metrics.error_count.max(durable.error_count);
-    }
+    metrics.error_count = metrics
+        .error_count
+        .checked_add(durable.error_count)
+        .ok_or_else(|| internal_error("session audit error count exceeds u32::MAX"))?;
     if let Some(first) = durable.first_at
         && metrics
             .first_at
@@ -365,6 +288,7 @@ fn merge_session_durable_metrics(
     {
         metrics.last_at = Some(last);
     }
+    Ok(())
 }
 
 const SESSION_AUDIT_MODEL_SEP: char = '\u{001f}';
@@ -419,31 +343,6 @@ fn session_audit_metrics_from_row(row: &impl SessionAuditRow) -> AuditResult<Ses
 fn audit_metadata_json(context: &str, column: &str, raw: &str) -> AuditResult<serde_json::Value> {
     serde_json::from_str(raw).map_err(|error| {
         audit_decode_error(context, column, format!("invalid metadata JSON: {error}"))
-    })
-}
-
-fn audit_metadata_u32_field(
-    metadata: &serde_json::Value,
-    context: &str,
-    field: &str,
-    fallback: u32,
-) -> AuditResult<u32> {
-    let Some(value) = metadata.get(field) else {
-        return Ok(fallback);
-    };
-    let raw = value.as_u64().ok_or_else(|| {
-        audit_decode_error(
-            context,
-            field,
-            format!("expected non-negative integer, got {value}"),
-        )
-    })?;
-    u32::try_from(raw).map_err(|_| {
-        audit_decode_error(
-            context,
-            field,
-            format!("expected u32-compatible value, got {raw}"),
-        )
     })
 }
 
@@ -586,47 +485,20 @@ fn audit_pagination_rows_to_skip(page: u32, per_page: u32, context: &str) -> Aud
         })
 }
 
-fn turn_list_fallback_turn(offset: u32, row_index: usize) -> AuditResult<u32> {
-    let row_index = u32::try_from(row_index).map_err(|_| {
-        internal_error(format!(
-            "session audit turn_list_row decode column `row_index`: row index exceeds u32::MAX: {row_index}"
-        ))
-    })?;
-    offset
-        .checked_add(row_index)
-        .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| {
-            internal_error(
-                "session audit turn_list_row decode column `turn`: fallback turn overflow",
-            )
-        })
-}
-
 fn turn_list_rows_to_skip(page: u32, per_page: u32) -> AuditResult<u32> {
     audit_pagination_rows_to_skip(page, per_page.clamp(1, 100), "list_turns")
 }
 
-fn turn_summary_from_row(
-    row: &impl SessionAuditRow,
-    fallback_turn: u32,
-) -> AuditResult<TurnSummary> {
-    let content = audit_row_string(row, "turn_list_row", "content")?;
-    let metadata = audit_metadata_json(
-        "turn_list_row",
-        "metadata",
-        &audit_row_string(row, "turn_list_row", "metadata")?,
-    )?;
-    let token_usage = parse_optional_turn_token_usage(
-        audit_row_optional_string(row, "turn_list_row", "token_usage")?,
-        "turn_list_row",
-    )?;
-    let model = audit_row_optional_string(row, "turn_list_row", "llm_model_used")?;
-    let created_at = audit_row_string(row, "turn_list_row", "created_at")?;
-
-    let fallback_turn =
-        audit_row_optional_u32(row, "turn_list_row", "turn_seq")?.unwrap_or(fallback_turn);
-    let turn = audit_metadata_u32_field(&metadata, "turn_list_row", "turn", fallback_turn)?;
-    let tool_calls = extract_tool_calls_from_metadata(&metadata);
+fn turn_summary_from_parent(parent: &TurnDetailParent, turn: u32) -> AuditResult<TurnSummary> {
+    let TurnDetailParent {
+        content,
+        metadata,
+        token_usage,
+        model,
+        created_at,
+        tool_calls,
+        ..
+    } = parent;
     let has_error = metadata
         .get("error")
         .map(|value| !value.is_null())
@@ -638,18 +510,18 @@ fn turn_summary_from_row(
 
     Ok(TurnSummary {
         turn,
-        user_input_preview: truncate_str(&content, 200),
-        tool_calls,
+        user_input_preview: turn_input_preview(content),
+        tool_calls: tool_calls.clone(),
         tokens_in: token_usage.input_tokens,
         cached_input_tokens: token_usage.cached_input_tokens,
         cache_creation_tokens: token_usage.cache_creation_tokens,
         tokens_out: token_usage.output_tokens,
         total_tokens: token_usage.total_tokens,
-        duration_ms: audit_metadata_u64_field(&metadata, "turn_list_row", "duration_ms", 0)?,
+        duration_ms: audit_metadata_u64_field(metadata, "turn_list_row", "duration_ms", 0)?,
         has_error,
         has_stall,
-        model,
-        created_at,
+        model: model.clone(),
+        created_at: created_at.clone(),
     })
 }
 
@@ -660,13 +532,26 @@ fn turn_summary_from_row(
 /// root row therefore looks healthy (the input is present) while reporting
 /// zero tokens, no model, and no tools.  Keep this projection explicit rather
 /// than copying mutable counters into the prompt-facing event.
+fn turn_input_preview(content: &str) -> String {
+    content
+        .chars()
+        .take(agent_events_content_cap::TURN_LIST_PREVIEW as usize)
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnReadPurpose {
+    List,
+    Detail,
+}
+
 #[derive(Debug, Default)]
 struct TurnObservedMetrics {
     token_usage: Option<ParsedTurnTokenUsage>,
     model: Option<String>,
     assistant_output: Option<String>,
-    tool_calls: Vec<ToolCallBrief>,
-    duration_ms: u64,
+    tool_calls: Option<Vec<ToolCallBrief>>,
+    duration_ms: Option<u64>,
     has_error: bool,
     has_stall: bool,
     error_message: Option<String>,
@@ -681,12 +566,12 @@ struct TurnObservedMetrics {
 #[derive(Debug, Clone)]
 struct DurableToolCallObservation {
     run_id: String,
+    call_id: Option<String>,
     name: String,
     started_at: String,
     ended_at: Option<String>,
-    success: bool,
-    terminal_seen: bool,
-    duration_ms: u64,
+    outcome: ToolOutcome,
+    duration_ms: Option<u64>,
     error: Option<String>,
 }
 
@@ -706,7 +591,9 @@ struct DurableToolTerminal {
     event_type: String,
     call_id: String,
     created_at: String,
-    payload: serde_json::Value,
+    outcome: ToolOutcome,
+    error: Option<String>,
+    duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -760,57 +647,63 @@ fn durable_tool_duration_ms(payload: &serde_json::Value) -> Option<u64> {
         .find_map(|value| value.as_u64())
 }
 
-fn durable_tool_terminal_success(event_type: &str, payload: &serde_json::Value) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolOutcome {
+    Unknown,
+    NotExecuted,
+    Known(bool),
+}
+
+fn durable_tool_terminal_outcome(event_type: &str, payload: &serde_json::Value) -> ToolOutcome {
+    let status = payload.get("status").and_then(serde_json::Value::as_str);
+    // The executor owns whether an execution occurred; transport errors and
+    // opaque result text cannot override an explicit pre-dispatch rejection.
+    if payload.get("executed").and_then(serde_json::Value::as_bool) == Some(false)
+        || matches!(status, Some("rejected" | "skipped"))
+    {
+        return ToolOutcome::NotExecuted;
+    }
+    if payload
+        .get("executed")
+        .is_some_and(serde_json::Value::is_null)
+        || matches!(status, Some("unknown" | "delivery_unknown"))
+    {
+        return ToolOutcome::Unknown;
+    }
     if event_type == "tool_transport_failed" {
-        return false;
+        return ToolOutcome::Known(false);
     }
     payload
         .get("success")
         .and_then(serde_json::Value::as_bool)
-        .or_else(|| {
-            payload
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .map(|status| status == "completed" || status == "succeeded")
+        .or(match status {
+            Some("completed" | "succeeded") => Some(true),
+            Some("failed" | "cancelled") => Some(false),
+            _ => None,
         })
-        .unwrap_or(false)
+        .map_or(ToolOutcome::Unknown, ToolOutcome::Known)
 }
 
-fn durable_tool_terminal_error(event_type: &str, payload: &serde_json::Value) -> Option<String> {
-    durable_tool_error(payload).or_else(|| {
-        (!durable_tool_terminal_success(event_type, payload))
-            .then(|| format!("{event_type} did not complete successfully"))
+fn durable_tool_ledger_row(row: &impl SessionAuditRow) -> AuditResult<DurableToolLedgerRow> {
+    Ok(DurableToolLedgerRow {
+        session_id: audit_row_string(row, "durable_tool_event", "session_id")?,
+        event_type: audit_row_string(row, "durable_tool_event", "event_type")?,
+        event_idx: audit_row_u64(row, "durable_tool_event", "event_idx")?,
+        run_id: audit_row_string(row, "durable_tool_event", "run_id")?,
+        payload: serde_json::from_str(&audit_row_string(
+            row,
+            "durable_tool_event",
+            "payload_json",
+        )?)
+        .map_err(|error| {
+            audit_decode_error(
+                "durable_tool_event",
+                "payload_json",
+                format!("invalid payload JSON: {error}"),
+            )
+        })?,
+        created_at: audit_row_string(row, "durable_tool_event", "created_at")?,
     })
-}
-
-fn durable_tool_observations_from_rows(
-    rows: &[sqlx::mysql::MySqlRow],
-) -> AuditResult<Vec<DurableToolCallObservation>> {
-    let ledger_rows = rows
-        .iter()
-        .map(|row| {
-            Ok(DurableToolLedgerRow {
-                session_id: audit_row_string(row, "durable_tool_event", "session_id")?,
-                event_type: audit_row_string(row, "durable_tool_event", "event_type")?,
-                event_idx: audit_row_u64(row, "durable_tool_event", "event_idx")?,
-                run_id: audit_row_string(row, "durable_tool_event", "run_id")?,
-                payload: serde_json::from_str(&audit_row_string(
-                    row,
-                    "durable_tool_event",
-                    "payload_json",
-                )?)
-                .map_err(|error| {
-                    audit_decode_error(
-                        "durable_tool_event",
-                        "payload_json",
-                        format!("invalid payload JSON: {error}"),
-                    )
-                })?,
-                created_at: audit_row_string(row, "durable_tool_event", "created_at")?,
-            })
-        })
-        .collect::<AuditResult<Vec<_>>>()?;
-    durable_tool_observations_from_ledger_rows(&ledger_rows)
 }
 
 fn durable_tool_observations_from_ledger_rows(
@@ -819,24 +712,39 @@ fn durable_tool_observations_from_ledger_rows(
     let mut starts = Vec::<DurableToolStart>::new();
     let mut terminals = Vec::<DurableToolTerminal>::new();
     for row in rows {
+        let payload = if row.payload.get("event_type").is_some() {
+            row.payload
+                .get("data")
+                .filter(|data| data.is_object())
+                .unwrap_or(&row.payload)
+        } else {
+            &row.payload
+        };
         if row.event_type == "tool_call" {
-            if let Some(name) = durable_tool_name(&row.payload) {
+            if let Some(name) = durable_tool_name(payload) {
                 starts.push(DurableToolStart {
                     event_idx: row.event_idx,
                     run_id: row.run_id.clone(),
                     name,
-                    call_id: durable_tool_call_id(&row.payload),
+                    call_id: durable_tool_call_id(payload),
                     created_at: row.created_at.clone(),
                 });
             }
-        } else if let Some(call_id) = durable_tool_call_id(&row.payload) {
+        } else if let Some(call_id) = durable_tool_call_id(payload) {
+            let outcome = durable_tool_terminal_outcome(&row.event_type, payload);
+            let error = (outcome == ToolOutcome::Known(false)).then(|| {
+                durable_tool_error(payload)
+                    .unwrap_or_else(|| format!("{} did not complete successfully", row.event_type))
+            });
             terminals.push(DurableToolTerminal {
                 run_id: row.run_id.clone(),
                 event_idx: row.event_idx,
                 event_type: row.event_type.clone(),
                 call_id,
                 created_at: row.created_at.clone(),
-                payload: row.payload.clone(),
+                outcome,
+                error,
+                duration_ms: durable_tool_duration_ms(payload),
             });
         }
     }
@@ -848,7 +756,37 @@ fn durable_tool_observations_from_ledger_rows(
     // `event_idx` is only monotonic within one run. Never use it as a
     // session-wide identity: three concurrent children all legitimately have
     // event_idx=0,1,2,... and would otherwise steal one another's envelopes.
-    let mut used_envelopes = HashSet::<(String, u64)>::new();
+    // SQL orders each run by its unique event index. Keep only unmatched
+    // envelopes in ordered indexes instead of rescanning every start per call.
+    let mut by_tool =
+        std::collections::HashMap::<(&str, &str), BTreeMap<u64, &DurableToolStart>>::new();
+    let mut by_run = std::collections::HashMap::<&str, BTreeMap<u64, &DurableToolStart>>::new();
+    for start in starts.iter().filter(|start| start.call_id.is_none()) {
+        by_tool
+            .entry((&start.run_id, &start.name))
+            .or_default()
+            .insert(start.event_idx, start);
+        by_run
+            .entry(&start.run_id)
+            .or_default()
+            .insert(start.event_idx, start);
+    }
+    let mut take_envelope = |run: &str, name: Option<&str>, before: u64| {
+        let envelope = match name {
+            Some(name) => by_tool.get(&(run, name)),
+            None => by_run.get(run),
+        }
+        .and_then(|entries| entries.range(..before).next_back().map(|(_, start)| *start));
+        if let Some(start) = envelope {
+            if let Some(entries) = by_tool.get_mut(&(start.run_id.as_str(), start.name.as_str())) {
+                entries.remove(&start.event_idx);
+            }
+            if let Some(entries) = by_run.get_mut(start.run_id.as_str()) {
+                entries.remove(&start.event_idx);
+            }
+        }
+        envelope
+    };
     let mut observations = BTreeMap::<(String, String), DurableToolCallObservation>::new();
     for start in starts.iter().filter(|start| start.call_id.is_some()) {
         let call_id = start.call_id.clone().expect("filtered call id");
@@ -856,29 +794,20 @@ fn durable_tool_observations_from_ledger_rows(
         if observations.contains_key(&observation_key) {
             continue;
         }
-        let envelope = starts.iter().rev().find(|candidate| {
-            candidate.call_id.is_none()
-                && candidate.event_idx < start.event_idx
-                && candidate.run_id == start.run_id
-                && candidate.name == start.name
-                && !used_envelopes.contains(&(candidate.run_id.clone(), candidate.event_idx))
-        });
-        let started_at = if let Some(envelope) = envelope {
-            used_envelopes.insert((envelope.run_id.clone(), envelope.event_idx));
-            envelope.created_at.clone()
-        } else {
-            start.created_at.clone()
-        };
+        let started_at = take_envelope(&start.run_id, Some(&start.name), start.event_idx)
+            .unwrap_or(start)
+            .created_at
+            .clone();
         observations.insert(
             observation_key,
             DurableToolCallObservation {
                 run_id: start.run_id.clone(),
+                call_id: start.call_id.clone(),
                 name: start.name.clone(),
                 started_at,
                 ended_at: None,
-                success: false,
-                terminal_seen: false,
-                duration_ms: 0,
+                outcome: ToolOutcome::Unknown,
+                duration_ms: None,
                 error: None,
             },
         );
@@ -896,24 +825,17 @@ fn durable_tool_observations_from_ledger_rows(
         if observations.contains_key(&observation_key) {
             continue;
         }
-        let envelope = starts.iter().rev().find(|candidate| {
-            candidate.call_id.is_none()
-                && candidate.event_idx < terminal.event_idx
-                && candidate.run_id == terminal.run_id
-                && !used_envelopes.contains(&(candidate.run_id.clone(), candidate.event_idx))
-        });
-        if let Some(envelope) = envelope {
-            used_envelopes.insert((envelope.run_id.clone(), envelope.event_idx));
+        if let Some(envelope) = take_envelope(&terminal.run_id, None, terminal.event_idx) {
             observations.insert(
                 observation_key,
                 DurableToolCallObservation {
                     run_id: envelope.run_id.clone(),
+                    call_id: Some(terminal.call_id.clone()),
                     name: envelope.name.clone(),
                     started_at: envelope.created_at.clone(),
                     ended_at: None,
-                    success: false,
-                    terminal_seen: false,
-                    duration_ms: 0,
+                    outcome: ToolOutcome::Unknown,
+                    duration_ms: None,
                     error: None,
                 },
             );
@@ -922,7 +844,9 @@ fn durable_tool_observations_from_ledger_rows(
 
     for start in starts.iter().filter(|start| {
         start.call_id.is_none()
-            && !used_envelopes.contains(&(start.run_id.clone(), start.event_idx))
+            && by_run
+                .get(start.run_id.as_str())
+                .is_some_and(|entries| entries.contains_key(&start.event_idx))
     }) {
         observations.insert(
             (
@@ -931,12 +855,12 @@ fn durable_tool_observations_from_ledger_rows(
             ),
             DurableToolCallObservation {
                 run_id: start.run_id.clone(),
+                call_id: start.call_id.clone(),
                 name: start.name.clone(),
                 started_at: start.created_at.clone(),
                 ended_at: None,
-                success: false,
-                terminal_seen: false,
-                duration_ms: 0,
+                outcome: ToolOutcome::Unknown,
+                duration_ms: None,
                 error: None,
             },
         );
@@ -946,14 +870,12 @@ fn durable_tool_observations_from_ledger_rows(
         let Some(observation) = observations.get_mut(&(terminal.run_id, terminal.call_id)) else {
             continue;
         };
-        observation.terminal_seen = true;
         observation.ended_at = Some(terminal.created_at.clone());
-        observation.success =
-            durable_tool_terminal_success(&terminal.event_type, &terminal.payload);
-        observation.error = durable_tool_terminal_error(&terminal.event_type, &terminal.payload);
-        observation.duration_ms = durable_tool_duration_ms(&terminal.payload)
-            .or_else(|| duration_ms_between(&observation.started_at, &terminal.created_at))
-            .unwrap_or(0);
+        observation.outcome = terminal.outcome;
+        observation.error = terminal.error;
+        observation.duration_ms = terminal
+            .duration_ms
+            .or_else(|| duration_ms_between(&observation.started_at, &terminal.created_at));
     }
 
     Ok(observations.into_values().collect())
@@ -963,282 +885,777 @@ async fn load_durable_tool_observations(
     pool: &Pool<MySql>,
     session_id: &str,
     user_id: &str,
+    run_ids: Option<&[String]>,
 ) -> AuditResult<Vec<DurableToolCallObservation>> {
-    let rows = query(
-        "SELECT session_id, event_idx, event_type, run_id, payload_json, \
-                CAST(created_at AS CHAR) AS created_at \
-         FROM agent_run_events \
-         WHERE session_id = ? AND user_id = ? \
-           AND event_type IN ('tool_call', 'tool_call_end', 'tool_transport_failed') \
-         ORDER BY event_idx ASC",
+    if run_ids.is_some_and(|runs| runs.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    let mut result = Vec::new();
+    stream_tool_ledger_observations(
+        connection.connection_mut(),
+        user_id,
+        Some(&[session_id]),
+        run_ids,
+        None,
+        None,
+        |_, calls| {
+            result.extend(calls);
+            Ok(())
+        },
     )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(internal_error)?;
-    durable_tool_observations_from_rows(&rows)
+    .await?;
+    connection.release();
+    Ok(result)
 }
 
-async fn load_durable_tool_observations_by_session(
-    pool: &Pool<MySql>,
+async fn stream_tool_ledger_observations(
+    connection: &mut sqlx::MySqlConnection,
     user_id: &str,
+    session_ids: Option<&[&str]>,
+    run_ids: Option<&[String]>,
     since: Option<&str>,
     until: Option<&str>,
-) -> AuditResult<BTreeMap<String, Vec<DurableToolCallObservation>>> {
-    let mut predicates = vec![
-        "user_id = ?".to_string(),
-        "event_type IN ('tool_call', 'tool_call_end', 'tool_transport_failed')".to_string(),
-    ];
-    let mut binds = vec![user_id.to_string()];
+    mut observe: impl FnMut(String, Vec<DurableToolCallObservation>) -> AuditResult<()>,
+) -> AuditResult<()> {
+    use futures_util::TryStreamExt;
+    if run_ids.is_some_and(|runs| runs.is_empty()) || session_ids.is_some_and(|ids| ids.is_empty())
+    {
+        return Ok(());
+    }
+    let mut sql = sqlx::QueryBuilder::<MySql>::new(
+        "SELECT session_id, event_idx, event_type, run_id, payload_json, CAST(created_at AS CHAR) AS created_at          FROM agent_run_events WHERE user_id = ",
+    );
+    sql.push_bind(user_id)
+        .push(" AND event_type IN ('tool_call', 'tool_call_end', 'tool_transport_failed')");
+    if let Some(sessions) = session_ids {
+        sql.push(" AND session_id IN (");
+        let mut separated = sql.separated(", ");
+        for session in sessions {
+            separated.push_bind(*session);
+        }
+        separated.push_unseparated(")");
+    }
+    if let Some(runs) = run_ids {
+        sql.push(" AND run_id IN (");
+        let mut separated = sql.separated(", ");
+        for run in runs {
+            separated.push_bind(run);
+        }
+        separated.push_unseparated(")");
+    }
     if let Some(since) = since {
-        predicates.push("created_at >= ?".to_string());
-        binds.push(since.to_string());
+        sql.push(" AND created_at >= ").push_bind(since);
     }
     if let Some(until) = until {
-        predicates.push("created_at <= ?".to_string());
-        binds.push(until.to_string());
+        sql.push(" AND created_at <= ").push_bind(until);
     }
-    let sql = format!(
-        "SELECT session_id, event_idx, event_type, run_id, \
-                payload_json, CAST(created_at AS CHAR) AS created_at \
-         FROM agent_run_events WHERE {} ORDER BY session_id, run_id, event_idx",
-        predicates.join(" AND ")
-    );
-    let mut q = query(sqlx::AssertSqlSafe(sql));
-    for bind in binds {
-        q = q.bind(bind);
-    }
-    let rows = q.fetch_all(pool).await.map_err(internal_error)?;
-    let mut ledger_by_session = BTreeMap::<String, Vec<DurableToolLedgerRow>>::new();
-    for row in &rows {
-        let ledger = DurableToolLedgerRow {
-            session_id: audit_row_string(row, "durable_cross_tool_event", "session_id")?,
-            event_type: audit_row_string(row, "durable_cross_tool_event", "event_type")?,
-            event_idx: audit_row_u64(row, "durable_cross_tool_event", "event_idx")?,
-            run_id: audit_row_string(row, "durable_cross_tool_event", "run_id")?,
-            payload: serde_json::from_str(&audit_row_string(
-                row,
-                "durable_cross_tool_event",
-                "payload_json",
-            )?)
-            .map_err(|error| {
-                audit_decode_error(
-                    "durable_cross_tool_event",
-                    "payload_json",
-                    format!("invalid payload JSON: {error}"),
-                )
-            })?,
-            created_at: audit_row_string(row, "durable_cross_tool_event", "created_at")?,
-        };
-        ledger_by_session
-            .entry(ledger.session_id.clone())
-            .or_default()
-            .push(ledger);
-    }
-    ledger_by_session
-        .into_iter()
-        .map(|(session_id, rows)| {
-            durable_tool_observations_from_ledger_rows(&rows)
-                .map(|observations| (session_id, observations))
-        })
-        .collect()
-}
-
-async fn load_durable_model_names(
-    pool: &Pool<MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> AuditResult<Vec<String>> {
-    let rows = query(
-        "SELECT payload_json \
-         FROM agent_run_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'run_started' \
-         ORDER BY event_idx ASC",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(internal_error)?;
-    let mut models = Vec::new();
-    for row in rows {
-        let payload: serde_json::Value =
-            serde_json::from_str(&audit_row_string(&row, "durable_model", "payload_json")?)
-                .map_err(|error| {
-                    audit_decode_error(
-                        "durable_model",
-                        "payload_json",
-                        format!("invalid payload JSON: {error}"),
-                    )
-                })?;
-        if let Some(model) = durable_json_string(
-            &payload,
-            &[
-                "/data/resolved_model_selection/model_name",
-                "/data/model_selection/model_name",
-            ],
-        ) && !models.iter().any(|known| known == &model)
+    sql.push(" ORDER BY session_id, run_id, event_idx");
+    let mut rows = sql.build().fetch(&mut *connection);
+    let mut run_rows = Vec::<DurableToolLedgerRow>::new();
+    while let Some(row) = rows.try_next().await.map_err(internal_error)? {
+        let row = durable_tool_ledger_row(&row)?;
+        if let Some(previous) = run_rows.last()
+            && (previous.session_id != row.session_id || previous.run_id != row.run_id)
         {
-            models.push(model);
+            observe(
+                previous.session_id.clone(),
+                durable_tool_observations_from_ledger_rows(&run_rows)?,
+            )?;
+            run_rows.clear();
         }
+        run_rows.push(row);
     }
-    Ok(models)
+    if let Some(previous) = run_rows.last() {
+        observe(
+            previous.session_id.clone(),
+            durable_tool_observations_from_ledger_rows(&run_rows)?,
+        )?;
+    }
+    drop(rows);
+    Ok(())
 }
 
-fn durable_tool_analytics(
-    observations: &[DurableToolCallObservation],
-) -> AuditResult<Vec<ToolAnalytics>> {
-    #[derive(Default)]
-    struct Aggregate {
-        calls: u64,
-        successes: u64,
-        failures: u64,
-        total_duration_ms: u64,
-        max_duration_ms: u64,
-        latest_error: Option<(String, String)>,
-    }
-    let mut by_name = BTreeMap::<String, Aggregate>::new();
-    for observation in observations {
-        let entry = by_name.entry(observation.name.clone()).or_default();
-        entry.calls = entry.calls.saturating_add(1);
-        if observation.success {
-            entry.successes = entry.successes.saturating_add(1);
-        } else {
-            entry.failures = entry.failures.saturating_add(1);
-            if let Some(error) = observation.error.as_ref() {
-                let error_at = observation
-                    .ended_at
-                    .as_deref()
-                    .unwrap_or(observation.started_at.as_str());
-                if entry
-                    .latest_error
-                    .as_ref()
-                    .is_none_or(|(latest_at, _)| error_at >= latest_at.as_str())
-                {
-                    entry.latest_error = Some((error_at.to_string(), error.clone()));
-                }
-            }
+struct JournalToolObservation {
+    name: String,
+    succeeded: bool,
+    duration_ms: Option<u64>,
+    failure: Option<(String, String, Option<String>)>,
+}
+
+#[derive(Default)]
+struct ToolTotals {
+    calls: u64,
+    successes: u64,
+    failures: u64,
+    duration_ms: u64,
+    duration_samples: u64,
+    max_duration_ms: u64,
+    sessions: HashSet<String>,
+    // Timestamp and stable tie-break, followed by the bounded error preview.
+    // A missing preview is fetched by its winning Journal event ID only.
+    latest_error: Option<(String, String, Option<String>)>,
+}
+
+impl ToolTotals {
+    fn from_call(
+        session: String,
+        call: &DurableToolCallObservation,
+        include_error_evidence: bool,
+    ) -> Self {
+        Self {
+            calls: 1,
+            successes: u64::from(call.outcome == ToolOutcome::Known(true)),
+            failures: u64::from(call.outcome == ToolOutcome::Known(false)),
+            duration_ms: call.duration_ms.unwrap_or(0),
+            duration_samples: u64::from(call.duration_ms.is_some()),
+            max_duration_ms: call.duration_ms.unwrap_or(0),
+            sessions: HashSet::from([session]),
+            latest_error: call
+                .error
+                .as_ref()
+                .filter(|_| include_error_evidence && call.outcome == ToolOutcome::Known(false))
+                .map(|error| {
+                    (
+                        call.ended_at
+                            .clone()
+                            .unwrap_or_else(|| call.started_at.clone()),
+                        error.clone(),
+                        Some(error.clone()),
+                    )
+                }),
         }
-        entry.total_duration_ms = entry
-            .total_duration_ms
-            .saturating_add(observation.duration_ms);
-        entry.max_duration_ms = entry.max_duration_ms.max(observation.duration_ms);
     }
 
-    let mut result = by_name
-        .into_iter()
-        .map(|(name, aggregate)| {
-            let call_count = u32::try_from(aggregate.calls).map_err(|_| {
-                internal_error("session audit durable tool call count exceeds u32::MAX")
-            })?;
-            let success_count = u32::try_from(aggregate.successes).map_err(|_| {
-                internal_error("session audit durable tool success count exceeds u32::MAX")
-            })?;
-            let fail_count = u32::try_from(aggregate.failures).map_err(|_| {
-                internal_error("session audit durable tool failure count exceeds u32::MAX")
-            })?;
-            Ok(ToolAnalytics {
-                name,
-                call_count,
-                success_count,
-                fail_count,
-                success_rate: if call_count == 0 {
-                    0.0
-                } else {
-                    success_count as f64 / call_count as f64
-                },
-                avg_duration_ms: aggregate.total_duration_ms as f64 / call_count.max(1) as f64,
-                max_duration_ms: aggregate.max_duration_ms,
-                total_duration_ms: aggregate.total_duration_ms,
-                last_error: aggregate.latest_error.map(|(_, error)| error),
-            })
+    fn merge(&mut self, other: Self) -> AuditResult<()> {
+        for (total, value) in [
+            (&mut self.calls, other.calls),
+            (&mut self.successes, other.successes),
+            (&mut self.failures, other.failures),
+            (&mut self.duration_ms, other.duration_ms),
+            (&mut self.duration_samples, other.duration_samples),
+        ] {
+            *total = total
+                .checked_add(value)
+                .ok_or_else(|| internal_error("tool analytics total overflow"))?;
+        }
+        self.max_duration_ms = self.max_duration_ms.max(other.max_duration_ms);
+        self.sessions.extend(other.sessions);
+        if let Some(error) = other.latest_error
+            && self
+                .latest_error
+                .as_ref()
+                .is_none_or(|current| (&error.0, &error.1) > (&current.0, &current.1))
+        {
+            self.latest_error = Some(error);
+        }
+        Ok(())
+    }
+
+    fn success_rate(&self) -> f64 {
+        self.successes as f64 / (self.successes + self.failures).max(1) as f64
+    }
+
+    fn session_analytics(&self, name: String) -> AuditResult<ToolAnalytics> {
+        let count = |value| {
+            u32::try_from(value)
+                .map_err(|_| internal_error("tool analytics count exceeds u32::MAX"))
+        };
+        Ok(ToolAnalytics {
+            name,
+            call_count: count(self.calls)?,
+            success_count: count(self.successes)?,
+            fail_count: count(self.failures)?,
+            success_rate: self.success_rate(),
+            avg_duration_ms: self.duration_ms as f64 / self.duration_samples.max(1) as f64,
+            max_duration_ms: self.max_duration_ms,
+            total_duration_ms: self.duration_ms,
+            last_error: self.latest_error.as_ref().and_then(|error| error.2.clone()),
         })
-        .collect::<AuditResult<Vec<_>>>()?;
-    result.sort_by(|left, right| {
-        right
-            .total_duration_ms
-            .cmp(&left.total_duration_ms)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(result)
+    }
 }
 
-fn durable_cross_session_tool_analytics(
-    observations_by_session: &BTreeMap<String, Vec<DurableToolCallObservation>>,
-) -> AuditResult<Vec<CrossSessionToolAnalytics>> {
-    #[derive(Default)]
-    struct Aggregate {
-        calls: u64,
-        successes: u64,
-        failures: u64,
-        total_duration_ms: u64,
-        max_duration_ms: u64,
-        sessions: HashSet<String>,
-        latest_error: Option<(String, String)>,
+fn tool_scope_sql(
+    sql: &mut sqlx::QueryBuilder<MySql>,
+    alias: &str,
+    user: &str,
+    sessions: Option<&[&str]>,
+    since: Option<&str>,
+    until: Option<&str>,
+) {
+    sql.push(format!("{alias}.user_id = ")).push_bind(user);
+    if let Some(sessions) = sessions {
+        sql.push(format!(" AND {alias}.session_id IN ("));
+        let mut separated = sql.separated(", ");
+        for session in sessions {
+            separated.push_bind(*session);
+        }
+        separated.push_unseparated(")");
     }
-    let mut by_name = BTreeMap::<String, Aggregate>::new();
-    for (session_id, observations) in observations_by_session {
+    if let Some(since) = since {
+        sql.push(format!(" AND {alias}.created_at >= "))
+            .push_bind(since);
+    }
+    if let Some(until) = until {
+        sql.push(format!(" AND {alias}.created_at <= "))
+            .push_bind(until);
+    }
+}
+
+// Classification and reduction use one statement snapshot so a concurrent
+// Run append cannot move a Journal row between partitions during a read.
+const JOURNAL_TOOL_MATCHABLE: &str = "d.run_key IS NOT NULL AND e.run_id IS NOT NULL AND e.tool_call_id IS NOT NULL AND e.tool_call_id != '' AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(e.metadata, '$.tool_call_id_is_synthetic')), 'false') != 'true'";
+const JOURNAL_TOOL_JOIN: &str = " FROM agent_events e LEFT JOIN selected_runs d ON d.session_key = BINARY e.session_id AND d.run_key = BINARY e.run_id WHERE ";
+
+// Count physical approval facts and independent Journal facts in one snapshot.
+async fn load_approval_counts(
+    pool: &Pool<MySql>,
+    user: &str,
+    sessions: Option<&[&str]>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> AuditResult<(u32, u32, u32)> {
+    let mut sql = sqlx::QueryBuilder::<MySql>::new(
+        "SELECT COUNT(CASE WHEN kind = 'approval_required' THEN 1 END) AS required_count, \
+         COUNT(CASE WHEN kind = 'approval_decision' THEN 1 END) AS decision_count, \
+         COUNT(CASE WHEN kind = 'approval_timeout' THEN 1 END) AS timeout_count FROM (\
+         SELECT CASE WHEN p.event_type = 'approval_resolved' THEN 'approval_decision' ELSE p.event_type END AS kind \
+         FROM agent_run_events p WHERE ",
+    );
+    tool_scope_sql(&mut sql, "p", user, sessions, since, until);
+    sql.push(" AND p.event_type IN ('approval_required','approval_resolved','approval_timeout') UNION ALL \
+        SELECT e.event_type FROM agent_events e WHERE ");
+    tool_scope_sql(&mut sql, "e", user, sessions, since, until);
+    sql.push(" AND e.event_type IN ('approval_required','approval_decision','approval_timeout') AND NOT EXISTS (\
+        SELECT 1 FROM agent_run_events p WHERE p.user_id = e.user_id AND p.session_id = e.session_id \
+        AND BINARY p.user_id = BINARY e.user_id AND BINARY p.session_id = BINARY e.session_id \
+        AND (e.run_id IS NULL OR BINARY p.run_id = BINARY e.run_id) \
+        AND (JSON_EXTRACT(e.metadata, '$.approval.run_id') IS NULL OR JSON_TYPE(JSON_EXTRACT(e.metadata, '$.approval.run_id')) = 'NULL' OR (JSON_TYPE(JSON_EXTRACT(e.metadata, '$.approval.run_id')) = 'STRING' AND JSON_EXTRACT(e.metadata, '$.approval.run_id') = JSON_EXTRACT(JSON_ARRAY(p.run_id), '$[0]'))) \
+        AND (e.run_id IS NOT NULL OR JSON_TYPE(JSON_EXTRACT(e.metadata, '$.approval.run_id')) = 'STRING') \
+        AND JSON_TYPE(JSON_EXTRACT(e.metadata, '$.approval.request_id')) = 'STRING' AND JSON_EXTRACT(e.metadata, '$.approval.request_id') = JSON_EXTRACT(JSON_ARRAY(p.interaction_request_id), '$[0]') \
+        AND p.interaction_request_id != '' AND ((e.event_type = 'approval_decision' AND p.event_type = 'approval_resolved') OR (e.event_type = p.event_type AND e.event_type IN ('approval_required','approval_timeout'))) ");
+    if let Some(since) = since {
+        sql.push(" AND p.created_at >= ").push_bind(since);
+    }
+    if let Some(until) = until {
+        sql.push(" AND p.created_at <= ").push_bind(until);
+    }
+    sql.push(") ) facts");
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    let rows = sql
+        .build()
+        .fetch_all(connection.connection_mut())
+        .await
+        .map_err(internal_error)?;
+    connection.release();
+    let row = rows
+        .first()
+        .ok_or_else(|| internal_error("approval aggregate returned no row"))?;
+    Ok((
+        audit_row_u32(row, "approvals", "required_count")?,
+        audit_row_u32(row, "approvals", "decision_count")?,
+        audit_row_u32(row, "approvals", "timeout_count")?,
+    ))
+}
+
+fn merge_tool_run(
+    totals: &mut BTreeMap<String, BTreeMap<String, ToolTotals>>,
+    candidates: &mut HashMap<(String, String, String), Vec<JournalToolObservation>>,
+    rows: &[DurableToolLedgerRow],
+    include_error_evidence: bool,
+) -> AuditResult<()> {
+    let Some(first) = rows.first() else {
+        return Ok(());
+    };
+    let session = first.session_id.clone();
+    let calls = durable_tool_observations_from_ledger_rows(rows)?;
+    let session_totals = totals.entry(session.clone()).or_default();
+    for call in calls {
+        let journal = call
+            .call_id
+            .as_ref()
+            .and_then(|id| candidates.remove(&(session.clone(), call.run_id.clone(), id.clone())));
+        let mut contribution =
+            ToolTotals::from_call(session.clone(), &call, include_error_evidence);
+        if call.outcome == ToolOutcome::Unknown
+            && let Some(journal) = journal.as_ref().and_then(|rows| rows.first())
+        {
+            contribution.successes = u64::from(journal.succeeded);
+            contribution.failures = u64::from(!journal.succeeded);
+            if let Some(duration) = journal.duration_ms {
+                contribution.duration_ms = duration;
+                contribution.max_duration_ms = duration;
+                contribution.duration_samples = 1;
+            }
+            contribution.latest_error = journal.failure.clone();
+        }
+        session_totals
+            .entry(call.name)
+            .or_default()
+            .merge(contribution)?;
+    }
+    Ok(())
+}
+
+fn flush_tool_run(
+    totals: &mut BTreeMap<String, BTreeMap<String, ToolTotals>>,
+    candidates: &mut HashMap<(String, String, String), Vec<JournalToolObservation>>,
+    rows: &mut Vec<DurableToolLedgerRow>,
+    include_error_evidence: bool,
+) -> AuditResult<()> {
+    merge_tool_run(totals, candidates, rows, include_error_evidence)?;
+    rows.clear();
+    for ((session, _, _), observations) in candidates.drain() {
+        let session_totals = totals.entry(session.clone()).or_default();
         for observation in observations {
-            let entry = by_name.entry(observation.name.clone()).or_default();
-            entry.calls = entry.calls.saturating_add(1);
-            entry.sessions.insert(session_id.clone());
-            if observation.success {
-                entry.successes = entry.successes.saturating_add(1);
-            } else {
-                entry.failures = entry.failures.saturating_add(1);
-                if let (Some(error), Some(ended_at)) =
-                    (observation.error.as_ref(), observation.ended_at.as_ref())
-                    && entry
-                        .latest_error
-                        .as_ref()
-                        .is_none_or(|(latest_at, _)| ended_at > latest_at)
-                {
-                    entry.latest_error = Some((ended_at.clone(), error.clone()));
-                }
-            }
-            entry.total_duration_ms = entry
-                .total_duration_ms
-                .saturating_add(observation.duration_ms);
-            entry.max_duration_ms = entry.max_duration_ms.max(observation.duration_ms);
+            session_totals
+                .entry(observation.name)
+                .or_default()
+                .merge(ToolTotals {
+                    calls: 1,
+                    successes: u64::from(observation.succeeded),
+                    failures: u64::from(!observation.succeeded),
+                    duration_ms: observation.duration_ms.unwrap_or(0),
+                    duration_samples: u64::from(observation.duration_ms.is_some()),
+                    max_duration_ms: observation.duration_ms.unwrap_or(0),
+                    sessions: HashSet::from([session.clone()]),
+                    latest_error: observation.failure,
+                })?;
         }
     }
-    let mut result = by_name
-        .into_iter()
-        .map(|(name, aggregate)| {
-            let total_calls = u32::try_from(aggregate.calls).map_err(|_| {
-                internal_error("cross-session durable tool call count exceeds u32::MAX")
-            })?;
-            let total_success = u32::try_from(aggregate.successes).map_err(|_| {
-                internal_error("cross-session durable tool success count exceeds u32::MAX")
-            })?;
-            let total_failures = u32::try_from(aggregate.failures).map_err(|_| {
-                internal_error("cross-session durable tool failure count exceeds u32::MAX")
-            })?;
-            let sessions_used_in = u32::try_from(aggregate.sessions.len()).map_err(|_| {
-                internal_error("cross-session durable session count exceeds u32::MAX")
-            })?;
+    Ok(())
+}
+
+// The stream keeps raw ledger JSON intact. Only the small Journal branch
+// fields share that lane, avoiding placeholder columns on every ledger row.
+struct ToolStreamRow<'a> {
+    row: &'a sqlx::mysql::MySqlRow,
+    kind: i64,
+    fields: Vec<serde_json::Value>,
+}
+
+impl<'a> ToolStreamRow<'a> {
+    fn new(row: &'a sqlx::mysql::MySqlRow, kind: i64) -> AuditResult<Self> {
+        let fields = match kind {
+            0 | 1 => {
+                let raw = audit_row_string(row, "tool_stream", "payload_json")?;
+                let fields: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                    .map_err(|e| audit_decode_error("tool_stream", "payload_json", e))?;
+                if fields.len() != if kind == 0 { 9 } else { 4 } {
+                    return Err(audit_decode_error(
+                        "tool_stream",
+                        "payload_json",
+                        "invalid Journal field count",
+                    ));
+                }
+                fields
+            }
+            _ => Vec::new(),
+        };
+        Ok(Self { row, kind, fields })
+    }
+
+    fn field(&self, column: &str) -> Option<&serde_json::Value> {
+        let names: &[&str] = match self.kind {
+            0 => &[
+                "tool_name",
+                "total_calls",
+                "total_success",
+                "total_failures",
+                "duration_samples",
+                "error_event_id",
+                "error_at",
+                "max_ms",
+                "total_duration_ms",
+            ],
+            1 => &[
+                "tool_call_id",
+                "tool_name",
+                "meta_duration_ms",
+                "has_content",
+            ],
+            _ => &[],
+        };
+        names
+            .iter()
+            .position(|name| *name == column)
+            .map(|i| &self.fields[i])
+    }
+
+    fn invalid(column: &str) -> sqlx::Error {
+        sqlx::Error::ColumnDecode {
+            index: column.to_owned(),
+            source: "invalid Journal field type".into(),
+        }
+    }
+}
+
+impl SessionAuditRow for ToolStreamRow<'_> {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        use sqlx::Row;
+        if matches!(column, "session_id" | "run_id" | "event_id") {
+            let bytes: Vec<u8> = self.row.try_get(column)?;
+            return String::from_utf8(bytes).map_err(|e| sqlx::Error::ColumnDecode {
+                index: column.to_owned(),
+                source: e.into(),
+            });
+        }
+        if let Some(value) = self.field(column) {
+            return value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Self::invalid(column));
+        }
+        self.row.string_column(column)
+    }
+
+    fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+        if let Some(value) = self.field(column) {
+            return if value.is_null() {
+                Ok(None)
+            } else {
+                self.string_column(column).map(Some)
+            };
+        }
+        self.row.optional_string_column(column)
+    }
+
+    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+        if let Some(value) = self.field(column) {
+            if column == "has_content" {
+                return value
+                    .as_bool()
+                    .map(i64::from)
+                    .or_else(|| value.as_i64())
+                    .ok_or_else(|| Self::invalid(column));
+            }
+            return value
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| Self::invalid(column));
+        }
+        self.row.i64_column(column)
+    }
+
+    fn f64_column(&self, column: &str) -> Result<f64, sqlx::Error> {
+        self.row.f64_column(column)
+    }
+}
+
+async fn load_tool_totals(
+    pool: &Pool<MySql>,
+    user: &str,
+    sessions: Option<&[&str]>,
+    since: Option<&str>,
+    until: Option<&str>,
+    include_error_evidence: bool,
+) -> AuditResult<BTreeMap<String, BTreeMap<String, ToolTotals>>> {
+    use futures_util::TryStreamExt;
+    if sessions.is_some_and(|ids| ids.is_empty()) {
+        return Ok(BTreeMap::new());
+    }
+    let mut totals = BTreeMap::<String, BTreeMap<String, ToolTotals>>::new();
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    // Keep actual ledger IDs in the first UNION branch: on MatrixOne a NULL
+    // lane can misorder Journal events tied on time. The public duplicate
+    // candidate regression covers this dependency.
+    // All three branches observe the same statement snapshot. Journal-only
+    // rows remain grouped; matched identities are reconciled with Run facts.
+    let mut sql = sqlx::QueryBuilder::<MySql>::new(
+        "WITH selected_runs AS (SELECT DISTINCT BINARY d.session_id AS session_key, BINARY d.run_id AS run_key FROM agent_run_events d WHERE ",
+    );
+    tool_scope_sql(&mut sql, "d", user, sessions, since, until);
+    sql.push(" AND d.event_type IN ('tool_call','tool_call_end','tool_transport_failed')) \
+        SELECT 2 AS kind, BINARY p.session_id AS session_id, BINARY p.run_id AS run_id, p.event_idx, p.event_type, p.payload_json, CAST(p.created_at AS CHAR) AS created_at, \
+        BINARY p.id AS event_id, 0 AS avg_ms FROM agent_run_events p WHERE ");
+    tool_scope_sql(&mut sql, "p", user, sessions, since, until);
+    sql.push(" AND p.event_type IN ('tool_call','tool_call_end','tool_transport_failed') UNION ALL \
+        SELECT 0, BINARY e.session_id, NULL, 0, NULL, CAST(JSON_ARRAY(COALESCE(e.meta_tool_name, ''), \
+        CAST(COUNT(*) AS CHAR), CAST(COUNT(CASE WHEN e.event_type = 'tool_call_completed' THEN 1 END) AS CHAR), \
+        CAST(COUNT(CASE WHEN e.event_type = 'tool_call_failed' THEN 1 END) AS CHAR), CAST(COUNT(e.meta_duration_ms) AS CHAR), ");
+    if include_error_evidence {
+        sql.push("MAX_BY_NON_NULL(CASE WHEN e.event_type = 'tool_call_failed' AND e.content IS NOT NULL AND e.content != '' THEN e.event_id END, e.created_at, CAST(e.event_id AS BINARY)), CAST(MAX(CASE WHEN e.event_type = 'tool_call_failed' AND e.content IS NOT NULL AND e.content != '' THEN e.created_at END) AS CHAR)");
+    } else {
+        sql.push("NULL, NULL");
+    }
+    sql.push(", CAST(COALESCE(MAX(e.meta_duration_ms),0) AS CHAR), CAST(CAST(COALESCE(SUM(e.meta_duration_ms),0) AS SIGNED) AS CHAR)) AS CHAR), NULL, NULL, COALESCE(AVG(e.meta_duration_ms),0)").push(JOURNAL_TOOL_JOIN);
+    tool_scope_sql(&mut sql, "e", user, sessions, since, until);
+    sql.push(" AND e.event_type IN ('tool_call_completed','tool_call_failed') AND NOT (")
+        .push(JOURNAL_TOOL_MATCHABLE).push(") GROUP BY e.session_id, e.meta_tool_name UNION ALL \
+        SELECT 1, BINARY e.session_id, BINARY e.run_id, 0, e.event_type, CAST(JSON_ARRAY(e.tool_call_id, \
+        e.meta_tool_name, CAST(e.meta_duration_ms AS CHAR), ");
+    if include_error_evidence {
+        sql.push("e.content IS NOT NULL AND e.content != ''");
+    } else {
+        sql.push("FALSE");
+    }
+    sql.push(") AS CHAR), CAST(e.created_at AS CHAR), BINARY e.event_id, 0")
+        .push(JOURNAL_TOOL_JOIN);
+    tool_scope_sql(&mut sql, "e", user, sessions, since, until);
+    sql.push(" AND e.event_type IN ('tool_call_completed','tool_call_failed') AND (")
+        .push(JOURNAL_TOOL_MATCHABLE)
+        .push(") ORDER BY session_id, run_id, kind, event_idx, created_at DESC, event_id DESC");
+    let mut rows = sql.build().fetch(connection.connection_mut());
+    let mut candidates = HashMap::<(String, String, String), Vec<JournalToolObservation>>::new();
+    let mut run_rows = Vec::<DurableToolLedgerRow>::new();
+    let mut active_run: Option<(String, String)> = None;
+    while let Some(row) = rows.try_next().await.map_err(internal_error)? {
+        let kind = audit_row_i64(&row, "tool_stream", "kind")?;
+        let row = ToolStreamRow::new(&row, kind)?;
+        if kind != 0 {
+            let current = (
+                audit_row_string(&row, "tool_stream", "session_id")?,
+                audit_row_string(&row, "tool_stream", "run_id")?,
+            );
+            if active_run
+                .as_ref()
+                .is_some_and(|previous| previous != &current)
+            {
+                flush_tool_run(
+                    &mut totals,
+                    &mut candidates,
+                    &mut run_rows,
+                    include_error_evidence,
+                )?;
+            }
+            active_run = Some(current);
+        }
+        match kind {
+            0 => {
+                let decoded = tool_analytics_from_row(&row, &HashMap::new())?;
+                let raw_name = audit_row_string(&row, "journal_tool_group", "tool_name")?;
+                let name = if raw_name.trim().is_empty() {
+                    String::new()
+                } else {
+                    decoded.name
+                };
+                let session = audit_row_string(&row, "journal_tool_group", "session_id")?;
+                let mut group = ToolTotals {
+                    calls: u64::from(decoded.call_count),
+                    successes: u64::from(decoded.success_count),
+                    failures: u64::from(decoded.fail_count),
+                    duration_ms: decoded.total_duration_ms,
+                    duration_samples: audit_row_u64(
+                        &row,
+                        "journal_tool_group",
+                        "duration_samples",
+                    )?,
+                    max_duration_ms: decoded.max_duration_ms,
+                    sessions: HashSet::from([session.clone()]),
+                    ..Default::default()
+                };
+                if let Some(event) =
+                    audit_row_optional_string(&row, "journal_tool_group", "error_event_id")?
+                {
+                    group.latest_error = Some((
+                        audit_row_string(&row, "journal_tool_group", "error_at")?,
+                        event,
+                        None,
+                    ));
+                }
+                totals
+                    .entry(session)
+                    .or_default()
+                    .entry(name)
+                    .or_default()
+                    .merge(group)?;
+            }
+            1 => {
+                let session = audit_row_string(&row, "journal_tool_candidate", "session_id")?;
+                let run = audit_row_string(&row, "journal_tool_candidate", "run_id")?;
+                let call = audit_row_string(&row, "journal_tool_candidate", "tool_call_id")?;
+                let name = audit_row_optional_string(&row, "journal_tool_candidate", "tool_name")?
+                    .filter(|name| !name.trim().is_empty())
+                    .map(normalize_tool_name)
+                    .unwrap_or_default();
+                let succeeded = audit_row_string(&row, "journal_tool_candidate", "event_type")?
+                    == "tool_call_completed";
+                // Journal durations use decimal strings in the shared payload lane;
+                // preserve a missing duration separately from a recorded zero.
+                let duration = row
+                    .optional_string_column("meta_duration_ms")
+                    .map_err(internal_error)?
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| internal_error("invalid Journal tool duration"))
+                    })
+                    .transpose()?;
+                let at = audit_row_string(&row, "journal_tool_candidate", "created_at")?;
+                let failure = if include_error_evidence
+                    && !succeeded
+                    && audit_row_i64(&row, "journal_tool_candidate", "has_content")? != 0
+                {
+                    Some((
+                        at.clone(),
+                        audit_row_string(&row, "journal_tool_candidate", "event_id")?,
+                        None,
+                    ))
+                } else {
+                    None
+                };
+                candidates
+                    .entry((session, run, call))
+                    .or_default()
+                    .push(JournalToolObservation {
+                        name,
+                        succeeded,
+                        duration_ms: duration,
+                        failure,
+                    });
+            }
+            2 => {
+                let row = durable_tool_ledger_row(&row)?;
+                run_rows.push(row);
+            }
+            _ => return Err(internal_error("unexpected tool stream kind")),
+        }
+    }
+    flush_tool_run(
+        &mut totals,
+        &mut candidates,
+        &mut run_rows,
+        include_error_evidence,
+    )?;
+    drop(rows);
+    connection.release();
+    Ok(totals)
+}
+
+fn combine_tool_sessions(
+    sessions: BTreeMap<String, BTreeMap<String, ToolTotals>>,
+) -> AuditResult<BTreeMap<String, ToolTotals>> {
+    let mut totals = BTreeMap::<String, ToolTotals>::new();
+    for tools in sessions.into_values() {
+        for (name, tool) in tools {
+            totals.entry(name).or_default().merge(tool)?;
+        }
+    }
+    Ok(totals)
+}
+
+async fn hydrate_tool_errors(
+    pool: &Pool<MySql>,
+    user: &str,
+    totals: &mut BTreeMap<String, ToolTotals>,
+    names: &[String],
+) -> AuditResult<()> {
+    let errors = names
+        .iter()
+        .filter_map(|name| totals.get(name))
+        .filter_map(|tool| tool.latest_error.as_ref())
+        .filter(|error| error.2.is_none())
+        .map(|error| error.1.clone())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    let mut previews = HashMap::new();
+    for ids in errors.chunks(256) {
+        let mut sql = sqlx::QueryBuilder::<MySql>::new(format!(
+            "SELECT event_id, SUBSTRING(content, 1, {}) AS content FROM agent_events WHERE user_id = ",
+            agent_events_content_cap::TOOL_LAST_ERROR
+        ));
+        sql.push_bind(user).push(" AND event_id IN (");
+        let mut separated = sql.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        let rows = sql
+            .build()
+            .fetch_all(connection.connection_mut())
+            .await
+            .map_err(internal_error)?;
+        for row in rows {
+            previews.insert(
+                audit_row_string(&row, "tool_error_preview", "event_id")?,
+                audit_row_string(&row, "tool_error_preview", "content")?,
+            );
+        }
+    }
+    for name in names {
+        let Some(total) = totals.get_mut(name) else {
+            continue;
+        };
+        if let Some((_, id, preview)) = &mut total.latest_error
+            && preview.is_none()
+        {
+            *preview = previews.remove(id);
+        }
+    }
+    connection.release();
+    Ok(())
+}
+
+fn session_tool_analytics(
+    totals: &BTreeMap<String, ToolTotals>,
+) -> AuditResult<Vec<ToolAnalytics>> {
+    let mut tools = totals
+        .iter()
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, total)| total.session_analytics(name.clone()))
+        .collect::<AuditResult<Vec<_>>>()?;
+    tools.sort_by(|a, b| {
+        b.total_duration_ms
+            .cmp(&a.total_duration_ms)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(tools)
+}
+
+fn tool_counts(totals: &BTreeMap<String, ToolTotals>) -> AuditResult<(u32, u32)> {
+    totals
+        .values()
+        .try_fold((0_u32, 0_u32), |(calls, failures), tool| {
+            let add = |base: u32, value: u64| {
+                u32::try_from(value)
+                    .ok()
+                    .and_then(|value| base.checked_add(value))
+                    .ok_or_else(|| internal_error("tool analytics count exceeds u32::MAX"))
+            };
+            Ok((add(calls, tool.calls)?, add(failures, tool.failures)?))
+        })
+}
+
+fn cross_tool_analytics(
+    totals: &BTreeMap<String, ToolTotals>,
+) -> AuditResult<Vec<CrossSessionToolAnalytics>> {
+    let mut tools = totals
+        .iter()
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, total)| {
+            let tool = total.session_analytics(name.clone())?;
             Ok(CrossSessionToolAnalytics {
-                name,
-                total_calls,
-                total_success,
-                total_failures,
-                success_rate: total_success as f64 / total_calls.max(1) as f64,
-                avg_duration_ms: aggregate.total_duration_ms as f64 / total_calls.max(1) as f64,
-                max_duration_ms: aggregate.max_duration_ms,
-                sessions_used_in,
-                last_error: aggregate.latest_error.map(|(_, error)| error),
+                name: tool.name,
+                total_calls: tool.call_count,
+                total_success: tool.success_count,
+                total_failures: tool.fail_count,
+                success_rate: tool.success_rate,
+                avg_duration_ms: tool.avg_duration_ms,
+                max_duration_ms: tool.max_duration_ms,
+                sessions_used_in: u32::try_from(total.sessions.len())
+                    .map_err(|_| internal_error("tool session count exceeds u32::MAX"))?,
+                last_error: tool.last_error,
             })
         })
         .collect::<AuditResult<Vec<_>>>()?;
-    result.sort_by(|left, right| {
-        right
-            .total_calls
-            .cmp(&left.total_calls)
-            .then_with(|| left.name.cmp(&right.name))
+    tools.sort_by(|a, b| {
+        b.total_calls
+            .cmp(&a.total_calls)
+            .then_with(|| a.name.cmp(&b.name))
     });
-    result.truncate(MAX_CROSS_SESSION_TOOLS as usize);
-    Ok(result)
+    tools.truncate(MAX_CROSS_SESSION_TOOLS as usize);
+    Ok(tools)
 }
 
 fn add_turn_token_usage(
@@ -1262,11 +1679,11 @@ fn apply_turn_observed_metrics(turn: &mut TurnSummary, metrics: &TurnObservedMet
     if metrics.model.is_some() {
         turn.model = metrics.model.clone();
     }
-    if !metrics.tool_calls.is_empty() {
-        turn.tool_calls = metrics.tool_calls.clone();
+    if let Some(tools) = &metrics.tool_calls {
+        turn.tool_calls = tools.clone();
     }
-    if metrics.duration_ms > 0 {
-        turn.duration_ms = metrics.duration_ms;
+    if let Some(duration) = metrics.duration_ms {
+        turn.duration_ms = duration;
     }
     turn.has_error |= metrics.has_error;
     turn.has_stall |= metrics.has_stall;
@@ -1282,46 +1699,92 @@ fn duration_ms_between(start: &str, end: &str) -> Option<u64> {
     u64::try_from((end - start).num_milliseconds()).ok()
 }
 
-/// Load the canonical response/tool rows for a page of root turns in one
-/// bounded query.  This avoids an N+1 query while preserving isolation from
+/// Load response/tool facts for a page of root turns in owner-scoped batches.
+/// No per-Run queries are needed, and the projection preserves isolation from
 /// delegated agent runs (only root run ids and their direct tool children are
 /// admitted).
 async fn load_turn_observed_metrics(
     pool: &Pool<MySql>,
     session_id: &str,
     user_id: &str,
-    root_rows: &[sqlx::mysql::MySqlRow],
+    root_rows: &[AuditTurnRoot],
     content_cap: u32,
+    purpose: TurnReadPurpose,
 ) -> AuditResult<HashMap<String, TurnObservedMetrics>> {
+    use futures_util::TryStreamExt;
     if root_rows.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut root_by_event = HashMap::<String, (String, String)>::new();
+    struct RootObservation {
+        run_id: Option<String>,
+        created_at: String,
+        has_duration: bool,
+    }
+    let mut root_by_event = HashMap::<String, RootObservation>::new();
     let mut root_events = Vec::with_capacity(root_rows.len());
     let mut root_runs = Vec::with_capacity(root_rows.len());
     for row in root_rows {
-        let event_id = audit_row_string(row, "turn_observation_root", "event_id")?;
-        let run_id = audit_row_optional_string(row, "turn_observation_root", "run_id")?;
-        let created_at = audit_row_string(row, "turn_observation_root", "created_at")?;
-        if let Some(run_id) = run_id.filter(|run_id| !run_id.is_empty()) {
-            root_events.push(event_id.clone());
+        let event_id = row.parent.event_id.clone();
+        let run_id = row.run_id.clone();
+        let created_at = row.parent.created_at.clone();
+        if let Some(run_id) = &run_id {
             root_runs.push(run_id.clone());
-            root_by_event.insert(event_id, (run_id, created_at));
         }
+        root_events.push(event_id.clone());
+        let has_duration = row
+            .parent
+            .metadata
+            .get("duration_ms")
+            .is_some_and(|value| !value.is_null());
+        root_by_event.insert(
+            event_id,
+            RootObservation {
+                run_id,
+                created_at,
+                has_duration,
+            },
+        );
     }
-    if root_by_event.is_empty() {
-        return Ok(HashMap::new());
+    root_runs.sort();
+    root_runs.dedup();
+    let mut root_event_by_run = HashMap::new();
+    if !root_runs.is_empty() {
+        let mut sql = sqlx::QueryBuilder::<MySql>::new(
+            "SELECT run_id, COUNT(*) AS root_count FROM agent_events WHERE user_id = ",
+        );
+        sql.push_bind(user_id).push(" AND session_id = ").push_bind(session_id)
+            .push(" AND parent_run_id IS NULL AND event_type IN ('turn', 'user_query') AND run_id IN (");
+        let mut separated = sql.separated(", ");
+        for run in &root_runs {
+            separated.push_bind(run);
+        }
+        separated.push_unseparated(") GROUP BY run_id");
+        for row in sql.build().fetch_all(pool).await.map_err(internal_error)? {
+            if audit_row_u64(&row, "turn_root_identity", "root_count")? == 1 {
+                let run = audit_row_string(&row, "turn_root_identity", "run_id")?;
+                if let Some((event, _)) = root_by_event
+                    .iter()
+                    .find(|(_, root)| root.run_id.as_ref() == Some(&run))
+                {
+                    root_event_by_run.insert(run, event.clone());
+                }
+            }
+        }
     }
 
     let event_placeholders = std::iter::repeat_n("?", root_events.len())
         .collect::<Vec<_>>()
         .join(",");
-    let run_placeholders = std::iter::repeat_n("?", root_runs.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let run_placeholders = if root_runs.is_empty() {
+        "NULL".into()
+    } else {
+        std::iter::repeat_n("?", root_runs.len())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let sql = format!(
-        "SELECT event_type, parent_event_id, run_id, meta_tool_name, meta_duration_ms, \
+        "SELECT event_type, parent_event_id, run_id, tool_call_id, meta_tool_name, meta_duration_ms, \
                 CAST(token_usage AS CHAR) AS token_usage, llm_model_used, \
                 COALESCE(CAST(metadata AS CHAR), '{{}}') AS metadata, \
                 CAST(created_at AS CHAR) AS created_at, \
@@ -1344,11 +1807,40 @@ async fn load_turn_observed_metrics(
     for event_id in &root_events {
         query = query.bind(event_id);
     }
-    let rows = query.fetch_all(pool).await.map_err(internal_error)?;
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    let mut rows = query.fetch(connection.connection_mut());
 
     let mut by_event = HashMap::<String, TurnObservedMetrics>::new();
     let mut response_at = HashMap::<String, String>::new();
-    for row in &rows {
+    let mut journal_call_positions = HashMap::<(String, String), Option<(String, usize)>>::new();
+    for root in root_rows {
+        if root.embedded_calls.is_empty() {
+            continue;
+        }
+        let metrics = by_event.entry(root.parent.event_id.clone()).or_default();
+        for (call_id, brief) in &root.embedded_calls {
+            let position = metrics.tool_calls.get_or_insert_default().len();
+            metrics
+                .tool_calls
+                .get_or_insert_default()
+                .push(brief.clone());
+            if let Some(identity) = root.run_id.clone().zip(call_id.clone()) {
+                match journal_call_positions.entry(identity) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Some((root.parent.event_id.clone(), position)));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some(row) = rows.try_next().await.map_err(internal_error)? {
+        let row = &row;
         let event_type = audit_row_string(row, "turn_observation", "event_type")?;
         let run_id = audit_row_optional_string(row, "turn_observation", "run_id")?;
         let parent_event_id =
@@ -1357,11 +1849,9 @@ async fn load_turn_observed_metrics(
         let Some(root_event_id) = parent_event_id
             .filter(|event_id| is_tool_event && root_by_event.contains_key(event_id))
             .or_else(|| {
-                run_id.as_ref().and_then(|run_id| {
-                    root_by_event.iter().find_map(|(event_id, (root_run, _))| {
-                        (root_run == run_id).then_some(event_id.clone())
-                    })
-                })
+                run_id
+                    .as_ref()
+                    .and_then(|run_id| root_event_by_run.get(run_id).cloned())
             })
         else {
             continue;
@@ -1380,9 +1870,10 @@ async fn load_turn_observed_metrics(
                 {
                     metrics.model = Some(model);
                 }
-                if let Some(content) =
-                    audit_row_optional_string(row, "turn_observation", "content")?
-                        .filter(|content| !content.is_empty())
+                if purpose == TurnReadPurpose::Detail
+                    && let Some(content) =
+                        audit_row_optional_string(row, "turn_observation", "content")?
+                            .filter(|content| !content.is_empty())
                 {
                     metrics.assistant_output = Some(content);
                 }
@@ -1393,14 +1884,16 @@ async fn load_turn_observed_metrics(
                 }
             }
             "llm_round_completed" => {
-                let duration_ms = row
+                if let Some(duration) = row
                     .optional_i64_column("meta_duration_ms")
                     .map_err(|error| {
                         audit_decode_error("turn_observation", "meta_duration_ms", error)
                     })?
                     .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or(0);
-                metrics.duration_ms = metrics.duration_ms.saturating_add(duration_ms);
+                {
+                    metrics.duration_ms =
+                        Some(metrics.duration_ms.unwrap_or(0).saturating_add(duration));
+                }
             }
             "tool_call_completed" | "tool_call_failed" => {
                 let metadata = audit_metadata_json(
@@ -1410,6 +1903,13 @@ async fn load_turn_observed_metrics(
                 )?;
                 let name = audit_row_optional_string(row, "turn_observation", "meta_tool_name")?
                     .filter(|name| !name.trim().is_empty())
+                    .or_else(|| {
+                        metadata
+                            .get("tool_name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .map(normalize_tool_name)
                     .unwrap_or_else(|| "unknown".to_string());
                 let duration_ms = row
                     .optional_i64_column("meta_duration_ms")
@@ -1431,13 +1931,52 @@ async fn load_turn_observed_metrics(
                                 .unwrap_or_else(|| "tool call failed".to_string())
                         })
                     });
-                metrics.tool_calls.push(ToolCallBrief {
+                let identity = if metadata
+                    .get("tool_call_id_is_synthetic")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                {
+                    run_id.clone().zip(audit_row_optional_string(
+                        row,
+                        "turn_observation",
+                        "tool_call_id",
+                    )?)
+                } else {
+                    None
+                };
+                let brief = ToolCallBrief {
                     name,
                     ok: event_type == "tool_call_completed",
                     duration_ms,
                     error,
-                });
-                metrics.has_error |= event_type == "tool_call_failed";
+                };
+                let position = if let Some(identity) = identity {
+                    match journal_call_positions.entry(identity) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(Some((
+                                root_event_id.clone(),
+                                metrics.tool_calls.get_or_insert_default().len(),
+                            )));
+                            None
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            match entry.get() {
+                                Some((root, position)) if root == &root_event_id => Some(*position),
+                                _ => {
+                                    entry.insert(None);
+                                    None
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(position) = position {
+                    metrics.tool_calls.get_or_insert_default()[position] = brief;
+                } else {
+                    metrics.tool_calls.get_or_insert_default().push(brief);
+                }
             }
             "turn_error" | "error" => {
                 metrics.has_error = true;
@@ -1452,127 +1991,164 @@ async fn load_turn_observed_metrics(
             _ => {}
         }
     }
+    drop(rows);
+    connection.release();
     for (event_id, metrics) in &mut by_event {
-        if let Some((_, root_created_at)) = root_by_event.get(event_id)
+        if let Some(root) = root_by_event.get(event_id)
+            && !root.has_duration
             && let Some(response_created_at) = response_at.get(event_id)
-            && metrics.duration_ms == 0
+            && metrics.duration_ms.is_none()
         {
-            metrics.duration_ms =
-                duration_ms_between(root_created_at, response_created_at).unwrap_or(0);
+            metrics.duration_ms = duration_ms_between(&root.created_at, response_created_at);
         }
     }
 
-    // The durable ledger is the source of truth for server-local/control-plane
-    // calls. The compatibility journal may contain only the user_query, which
-    // otherwise makes a real delegated turn look like it used no tools.
-    let durable_tools = load_durable_tool_observations(pool, session_id, user_id).await?;
-    let root_event_by_run = root_by_event
-        .iter()
-        .map(|(event_id, (run_id, _))| (run_id.clone(), event_id.clone()))
-        .collect::<HashMap<_, _>>();
-    for (run_id, root_event_id) in &root_event_by_run {
-        let durable_for_run = durable_tools_for_run(&durable_tools, run_id);
-        if !durable_for_run.is_empty() {
-            let metrics = by_event.entry(root_event_id.clone()).or_default();
-            metrics.tool_calls = durable_for_run
-                .iter()
-                .map(|tool| ToolCallBrief {
-                    name: tool.name.clone(),
-                    ok: tool.success,
-                    duration_ms: tool.duration_ms,
-                    error: tool.error.clone(),
-                })
-                .collect();
-            metrics.has_error |= durable_for_run.iter().any(|tool| !tool.success);
+    // Reconcile canonical calls with selected Journal roots by exact identity.
+    let durable_tools =
+        load_durable_tool_observations(pool, session_id, user_id, Some(&root_runs)).await?;
+    let mut suppressed = HashMap::<String, HashSet<usize>>::new();
+    for tool in &durable_tools {
+        let journal_target = tool
+            .call_id
+            .as_ref()
+            .and_then(|call| journal_call_positions.get(&(tool.run_id.clone(), call.clone())))
+            .and_then(Option::as_ref);
+        let target = journal_target
+            .map(|(root, position)| (root.clone(), Some(*position)))
+            .or_else(|| {
+                root_event_by_run
+                    .get(&tool.run_id)
+                    .map(|root| (root.clone(), None))
+            });
+        let ok = match tool.outcome {
+            ToolOutcome::Unknown => continue,
+            ToolOutcome::NotExecuted => {
+                if let Some((root, position)) = journal_target {
+                    suppressed
+                        .entry(root.clone())
+                        .or_default()
+                        .insert(*position);
+                }
+                continue;
+            }
+            ToolOutcome::Known(ok) => ok,
+        };
+        if let Some((root, position)) = target {
+            let metrics = by_event.entry(root).or_default();
+            let brief = ToolCallBrief {
+                name: tool.name.clone(),
+                ok,
+                duration_ms: tool.duration_ms.unwrap_or(0),
+                error: tool.error.clone(),
+            };
+            if let Some(position) = position {
+                metrics.tool_calls.get_or_insert_default()[position] = brief;
+            } else {
+                metrics.tool_calls.get_or_insert_default().push(brief);
+            }
         }
+    }
+    for (root, metrics) in &mut by_event {
+        if let Some(tools) = &mut metrics.tool_calls {
+            if let Some(positions) = suppressed.get(root) {
+                let mut index = 0;
+                tools.retain(|_| {
+                    let keep = !positions.contains(&index);
+                    index += 1;
+                    keep
+                });
+            }
+            metrics.has_error |= tools.iter().any(|tool| !tool.ok);
+        }
+    }
+    if root_runs.is_empty() {
+        return Ok(by_event);
     }
 
     let run_placeholders = std::iter::repeat_n("?", root_runs.len())
         .collect::<Vec<_>>()
         .join(",");
+    // Openings and terminals are canonical Run facts. Independent physical
+    // run_error facts remain readable even without a canonical Run row.
     let run_sql = format!(
-        "SELECT event_type, run_id, payload_json, \
-                CAST(created_at AS CHAR) AS created_at \
-         FROM agent_run_events \
-         WHERE session_id = ? AND user_id = ? AND run_id IN ({run_placeholders}) \
-           AND event_type IN ('run_started', 'run_error', 'run_finished') \
-         ORDER BY event_idx ASC"
+        "SELECT CAST(0 AS SIGNED) AS kind, r.run_id, CAST(-1 AS SIGNED) AS event_idx, \
+         o.admitted_model_name AS model, CAST(r.created_at AS CHAR) AS started_at, \
+         CAST(r.terminal_at AS CHAR) AS finished_at, r.status, r.error_message, NULL AS payload_json \
+         FROM agent_runs r LEFT JOIN agent_run_openings o \
+           ON o.user_id = r.user_id AND o.session_id = r.session_id AND o.run_id = r.run_id \
+         WHERE r.user_id = ? AND r.session_id = ? AND r.run_id IN ({run_placeholders}) \
+         UNION ALL SELECT CAST(1 AS SIGNED), run_id, event_idx, NULL, NULL, NULL, NULL, NULL, payload_json \
+         FROM agent_run_events WHERE user_id = ? AND session_id = ? AND run_id IN ({run_placeholders}) \
+           AND event_type = 'run_error' ORDER BY kind, run_id, event_idx",
     );
-    let mut run_query = sqlx::query(sqlx::AssertSqlSafe(run_sql))
-        .bind(session_id)
-        .bind(user_id);
-    for run_id in &root_runs {
-        run_query = run_query.bind(run_id);
-    }
-    let run_rows = run_query.fetch_all(pool).await.map_err(internal_error)?;
-    let mut run_started = HashMap::<String, (String, Option<String>)>::new();
-    let mut run_finished = HashMap::<String, (String, bool, Option<String>)>::new();
-    for row in &run_rows {
-        let run_id = audit_row_string(row, "durable_turn_run", "run_id")?;
-        let event_type = audit_row_string(row, "durable_turn_run", "event_type")?;
-        let created_at = audit_row_string(row, "durable_turn_run", "created_at")?;
-        let payload: serde_json::Value =
-            serde_json::from_str(&audit_row_string(row, "durable_turn_run", "payload_json")?)
-                .map_err(|error| {
-                    audit_decode_error(
-                        "durable_turn_run",
-                        "payload_json",
-                        format!("invalid payload JSON: {error}"),
-                    )
-                })?;
-        match event_type.as_str() {
-            "run_started" => {
-                let model = durable_json_string(
-                    &payload,
-                    &[
-                        "/data/resolved_model_selection/model_name",
-                        "/data/model_selection/model_name",
-                    ],
-                );
-                run_started.insert(run_id, (created_at, model));
-            }
-            "run_error" | "run_finished" => {
-                let failed = event_type == "run_error"
-                    || payload.pointer("/data/error").is_some()
-                    || payload.pointer("/data/status").and_then(|v| v.as_str()) == Some("failed");
-                let error = durable_json_string(&payload, &["/data/error", "/error"]);
-                run_finished.insert(run_id, (created_at, failed, error));
-            }
-            _ => {}
+    let mut run_query = sqlx::query(sqlx::AssertSqlSafe(run_sql));
+    for _ in 0..2 {
+        run_query = run_query.bind(user_id).bind(session_id);
+        for run_id in &root_runs {
+            run_query = run_query.bind(run_id);
         }
     }
-    for (run_id, root_event_id) in root_event_by_run {
-        let metrics = by_event.entry(root_event_id).or_default();
-        if let Some((_, model)) = run_started.get(&run_id)
-            && model.is_some()
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    let mut rows = run_query.fetch(connection.connection_mut());
+    while let Some(row) = rows.try_next().await.map_err(internal_error)? {
+        let run_id = audit_row_string(&row, "durable_turn_run", "run_id")?;
+        let physical_error = if audit_row_i64(&row, "durable_turn_run", "kind")? == 1 {
+            let payload: serde_json::Value =
+                serde_json::from_str(&audit_row_string(&row, "durable_turn_run", "payload_json")?)
+                    .map_err(|error| {
+                        audit_decode_error(
+                            "durable_turn_run",
+                            "payload_json",
+                            format!("invalid payload JSON: {error}"),
+                        )
+                    })?;
+            Some(durable_json_string(&payload, &["/data/error", "/error"]))
+        } else {
+            None
+        };
+        let Some(root_event_id) = root_event_by_run.get(&run_id) else {
+            continue;
+        };
+        let metrics = by_event.entry(root_event_id.clone()).or_default();
+        if let Some(message) = physical_error {
+            metrics.has_error = true;
+            if message.is_some() {
+                metrics.error_message = message;
+            }
+            continue;
+        }
+        if let Some(model) = audit_row_optional_string(&row, "durable_turn_run", "model")? {
+            metrics.model = Some(model);
+        }
+        if audit_row_string(&row, "durable_turn_run", "status")? == "failed" {
+            metrics.has_error = true;
+            if let Some(message) =
+                audit_row_optional_string(&row, "durable_turn_run", "error_message")?
+            {
+                metrics.error_message = Some(message);
+            }
+        }
+        if metrics.duration_ms.is_none()
+            && !root_by_event[root_event_id].has_duration
+            && let Some(finished) =
+                audit_row_optional_string(&row, "durable_turn_run", "finished_at")?
         {
-            metrics.model = model.clone();
-        }
-        if let (Some((started_at, _)), Some((finished_at, failed, error))) =
-            (run_started.get(&run_id), run_finished.get(&run_id))
-        {
-            if metrics.duration_ms == 0 {
-                metrics.duration_ms = duration_ms_between(started_at, finished_at).unwrap_or(0);
-            }
-            metrics.has_error |= *failed;
-            if error.is_some() {
-                metrics.error_message = error.clone();
-            }
+            let started = audit_row_string(&row, "durable_turn_run", "started_at")?;
+            metrics.duration_ms = duration_ms_between(&started, &finished);
         }
     }
+    drop(rows);
+    connection.release();
     Ok(by_event)
-}
-
-fn durable_tools_for_run<'a>(
-    tools: &'a [DurableToolCallObservation],
-    run_id: &str,
-) -> Vec<&'a DurableToolCallObservation> {
-    tools.iter().filter(|tool| tool.run_id == run_id).collect()
 }
 
 #[derive(Debug)]
 struct TurnDetailParent {
     event_id: String,
+    tool_calls: Vec<ToolCallBrief>,
+    journal_output: Option<String>,
     content: String,
     metadata: serde_json::Value,
     token_usage: ParsedTurnTokenUsage,
@@ -1581,12 +2157,18 @@ struct TurnDetailParent {
 }
 
 fn turn_detail_parent_from_row(row: &impl SessionAuditRow) -> AuditResult<TurnDetailParent> {
-    let metadata = audit_metadata_json(
+    let mut metadata = audit_metadata_json(
         "turn_detail_parent",
         "metadata",
         &audit_row_string(row, "turn_detail_parent", "metadata")?,
     )?;
+    let tool_calls = extract_tool_calls_from_metadata(&metadata);
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove("tool_calls");
+    }
     Ok(TurnDetailParent {
+        tool_calls,
+        journal_output: None,
         event_id: audit_row_string(row, "turn_detail_parent", "event_id")?,
         content: audit_row_string(row, "turn_detail_parent", "content")?,
         metadata,
@@ -1596,6 +2178,102 @@ fn turn_detail_parent_from_row(row: &impl SessionAuditRow) -> AuditResult<TurnDe
         )?,
         model: audit_row_optional_string(row, "turn_detail_parent", "llm_model_used")?,
         created_at: audit_row_string(row, "turn_detail_parent", "created_at")?,
+    })
+}
+
+/// Selected display facts, decoded while streaming so large serialized envelopes
+/// are released before any batched Run read acquires the pool again.
+struct AuditTurnRoot {
+    parent: TurnDetailParent,
+    run_id: Option<String>,
+    display_turn: u32,
+    embedded_calls: Vec<(Option<String>, ToolCallBrief)>,
+}
+
+fn audit_turn_root_from_row(
+    row: &impl SessionAuditRow,
+    session_id: &str,
+    display_turn: u32,
+    purpose: TurnReadPurpose,
+) -> AuditResult<AuditTurnRoot> {
+    let mut parent = turn_detail_parent_from_row(row)?;
+    let mut embedded_calls = Vec::new();
+    let run_id = audit_row_optional_string(row, "turn_root", "run_id")?.filter(|id| !id.is_empty());
+    let event_type = audit_row_string(row, "turn_root", "event_type")?;
+    let payload_hash = if event_type == "turn" {
+        crate::events::verified_sync_outbox_payload_hash(&parent.content, Some(&parent.metadata))
+            .map_err(|error| audit_decode_error("turn_root", "content", error.1.0.detail))?
+    } else {
+        None
+    };
+    if let Some(hash) = payload_hash {
+        parent.tool_calls.clear();
+        let event = crate::events::verify_sync_outbox_event_identity(
+            &parent.content,
+            &hash,
+            &parent.event_id,
+            session_id,
+            &event_type,
+        )
+        .map_err(|error| audit_decode_error("turn_root", "content", error.1.0.detail))?;
+        let usage = crate::event_ingestion::canonical_token_usage_from_journal_event(&event);
+        parent.token_usage = parse_optional_turn_token_usage(
+            usage.map(|usage| usage.to_json().to_string()),
+            "turn_root",
+        )?;
+        for call in event.tool_calls.unwrap_or_default() {
+            if call.effective_disposition() == crate::session_journal::ToolCallDisposition::Executed
+            {
+                embedded_calls.push((
+                    call.tool_call_id,
+                    ToolCallBrief {
+                        name: normalize_tool_name(call.name),
+                        ok: call.ok,
+                        duration_ms: call.ms,
+                        error: call.error.map(|error| {
+                            if purpose == TurnReadPurpose::List {
+                                error.chars().take(500).collect()
+                            } else {
+                                error
+                            }
+                        }),
+                    },
+                ));
+            }
+        }
+        parent.content = event.user_input.unwrap_or_default();
+        parent.model = event.model;
+        // Reuse the existing presentation decoder. Raw envelope internals never
+        // become user input, child events, or configuration concepts.
+        parent.metadata = serde_json::json!({
+            "error": event.error,
+            "stall_type": event.stall_type, "ttft_ms": event.ttft_ms,
+            "context_ms":event.context_ms, "budget_pressure": event.budget_pressure,
+            "visible_tools": event.visible_tools, "tools_used": event.tools_used,
+            "plan_subtask_id": event.plan_subtask_id,
+        });
+        if purpose == TurnReadPurpose::Detail {
+            parent.journal_output = event.assistant_output;
+        }
+        if let Some(duration) = event.duration_ms {
+            parent.metadata["duration_ms"] = duration.into();
+        }
+    }
+    if purpose == TurnReadPurpose::List {
+        parent.content = turn_input_preview(&parent.content);
+        let mut display = serde_json::json!({"error":parent.metadata.get("error").filter(|value| !value.is_null()).map(|_| true),
+                    "stall_type":parent.metadata.get("stall_type").filter(|value| !value.is_null()).map(|_| true),
+        });
+        if let Some(duration) = parent.metadata.get("duration_ms") {
+            display["duration_ms"] = duration.clone();
+        }
+        parent.metadata = display;
+    }
+    Ok(AuditTurnRoot {
+        parent,
+        run_id,
+        display_turn,
+        embedded_calls,
     })
 }
 
@@ -1629,13 +2307,6 @@ fn audit_error_entry_from_row(row: &impl SessionAuditRow) -> AuditResult<AuditEr
         metadata,
         created_at: audit_row_string(row, "error_list_row", "created_at")?,
     })
-}
-
-fn tool_latest_error_from_row(row: &impl SessionAuditRow) -> AuditResult<(String, String)> {
-    Ok((
-        normalize_tool_name(audit_row_string(row, "tool_latest_error_row", "tool_name")?),
-        audit_row_string(row, "tool_latest_error_row", "content")?,
-    ))
 }
 
 fn tool_analytics_from_row(
@@ -1680,53 +2351,6 @@ fn tool_analytics_from_row(
     })
 }
 
-fn cross_session_tool_analytics_from_row(
-    row: &impl SessionAuditRow,
-    latest_errors: &HashMap<String, String>,
-) -> AuditResult<CrossSessionToolAnalytics> {
-    let context = "cross_session_tool_analytics_row";
-    let name = normalize_tool_name(audit_row_string(row, context, "tool_name")?);
-    let total_calls = audit_row_u32(row, context, "total_calls")?;
-    if total_calls == 0 {
-        return Err(audit_decode_error(
-            context,
-            "total_calls",
-            "expected positive call count",
-        ));
-    }
-    let total_success = audit_row_u32(row, context, "total_success")?;
-    let total_failures = audit_row_u32(row, context, "total_failures")?;
-    if total_success.checked_add(total_failures) != Some(total_calls) {
-        return Err(audit_decode_error(
-            context,
-            "total_calls",
-            format!(
-                "call count mismatch: total={total_calls}, success={total_success}, failures={total_failures}"
-            ),
-        ));
-    }
-    let sessions_used_in = audit_row_u32(row, context, "sessions_used")?;
-    if sessions_used_in == 0 {
-        return Err(audit_decode_error(
-            context,
-            "sessions_used",
-            "expected positive session count",
-        ));
-    }
-
-    Ok(CrossSessionToolAnalytics {
-        name: name.clone(),
-        total_calls,
-        total_success,
-        total_failures,
-        success_rate: total_success as f64 / total_calls as f64,
-        avg_duration_ms: audit_row_non_negative_f64(row, context, "avg_ms")?,
-        max_duration_ms: audit_row_u64_numeric(row, context, "max_ms")?,
-        sessions_used_in,
-        last_error: latest_errors.get(&name).cloned(),
-    })
-}
-
 #[derive(Debug)]
 struct CrossSessionStatsCounters {
     session_count: u32,
@@ -1743,31 +2367,6 @@ struct CrossSessionStatsCounters {
     total_approval_required: u32,
     total_approval_decisions: u32,
     total_approval_timeouts: u32,
-}
-
-fn cross_session_durable_counters_from_row(
-    row: &impl SessionAuditRow,
-) -> AuditResult<(CrossSessionStatsCounters, u64)> {
-    let context = "cross_session_durable_aggregate";
-    Ok((
-        CrossSessionStatsCounters {
-            session_count: audit_row_u32(row, context, "session_count")?,
-            total_turns: audit_row_u32(row, context, "total_turns")?,
-            tokens_in: 0,
-            tokens_out: 0,
-            total_tool_calls: audit_row_u32(row, context, "total_tool_calls")?,
-            total_tool_failures: audit_row_u32(row, context, "total_tool_failures")?,
-            total_errors: audit_row_u32(row, context, "total_errors")?,
-            total_stalls: 0,
-            total_execution_boundaries_opened: 0,
-            total_execution_boundaries_committed: 0,
-            total_execution_boundaries_aborted: 0,
-            total_approval_required: audit_row_u32(row, context, "total_approval_required")?,
-            total_approval_decisions: audit_row_u32(row, context, "total_approval_decisions")?,
-            total_approval_timeouts: audit_row_u32(row, context, "total_approval_timeouts")?,
-        },
-        audit_row_u64(row, context, "durable_event_count")?,
-    ))
 }
 
 fn cross_session_stats_counters_from_row(
@@ -1804,32 +2403,6 @@ fn cross_session_stats_counters_from_row(
     })
 }
 
-fn tool_usage_brief_from_row(row: &impl SessionAuditRow) -> AuditResult<ToolUsageBrief> {
-    let context = "cross_session_top_tool_row";
-    let name = normalize_tool_name(audit_row_string(row, context, "tool_name")?);
-    let call_count = audit_row_u32(row, context, "cnt")?;
-    if call_count == 0 {
-        return Err(audit_decode_error(
-            context,
-            "cnt",
-            "expected positive call count",
-        ));
-    }
-    let ok_count = audit_row_u32(row, context, "ok_cnt")?;
-    if ok_count > call_count {
-        return Err(audit_decode_error(
-            context,
-            "ok_cnt",
-            format!("success count exceeds total: success={ok_count}, total={call_count}"),
-        ));
-    }
-    Ok(ToolUsageBrief {
-        name,
-        call_count,
-        success_rate: ok_count as f64 / call_count as f64,
-    })
-}
-
 fn model_usage_brief_from_row(row: &impl SessionAuditRow) -> AuditResult<ModelUsageBrief> {
     let context = "cross_session_top_model_row";
     let model = audit_row_string(row, context, "model")?;
@@ -1859,9 +2432,7 @@ fn audit_session_list_item_from_row(
     row: &impl SessionAuditRow,
 ) -> AuditResult<AuditSessionListItem> {
     let context = "audit_session_list_row";
-    let first_ts = audit_row_optional_datetime_string(row, context, "first_ts")?;
-    let last_ts = audit_row_optional_datetime_string(row, context, "last_ts")?;
-    let duration_secs = compute_duration_secs(first_ts.as_deref(), last_ts.as_deref());
+    let duration_secs = audit_row_non_negative_f64(row, context, "duration_secs")?;
     Ok(AuditSessionListItem {
         session_id: audit_row_string(row, context, "session_id")?,
         status: audit_row_string(row, context, "status")?,
@@ -1887,19 +2458,23 @@ fn turn_detail_from_parent(
     parent: TurnDetailParent,
     child_events: Vec<ChildEvent>,
 ) -> AuditResult<TurnDetail> {
-    let tool_calls = extract_tool_calls_from_metadata(&parent.metadata);
+    let tool_calls = parent.tool_calls;
     let error_message =
         audit_metadata_optional_string_field(&parent.metadata, "turn_detail_parent", "error")?;
 
-    Ok(TurnDetail {
-        turn,
-        user_input: parent.content,
-        assistant_output: audit_metadata_string_field(
+    let assistant_output = match parent.journal_output {
+        Some(output) => output,
+        None => audit_metadata_string_field(
             &parent.metadata,
             "turn_detail_parent",
             "assistant_output",
             "",
         )?,
+    };
+    Ok(TurnDetail {
+        turn,
+        user_input: parent.content,
+        assistant_output,
         tool_calls,
         tokens_in: parent.token_usage.input_tokens,
         cached_input_tokens: parent.token_usage.cached_input_tokens,
@@ -1955,7 +2530,11 @@ fn turn_detail_from_parent(
     })
 }
 
-fn apply_turn_observed_metrics_to_detail(detail: &mut TurnDetail, metrics: &TurnObservedMetrics) {
+fn apply_turn_observed_metrics_to_detail(
+    detail: &mut TurnDetail,
+    metrics: &TurnObservedMetrics,
+    authoritative_output: bool,
+) {
     if let Some(usage) = metrics.token_usage {
         detail.tokens_in = usage.input_tokens;
         detail.cached_input_tokens = usage.cached_input_tokens;
@@ -1966,14 +2545,14 @@ fn apply_turn_observed_metrics_to_detail(detail: &mut TurnDetail, metrics: &Turn
     if let Some(model) = metrics.model.as_ref() {
         detail.model = Some(model.clone());
     }
-    if let Some(output) = metrics.assistant_output.as_ref() {
+    if !authoritative_output && let Some(output) = metrics.assistant_output.as_ref() {
         detail.assistant_output = output.clone();
     }
-    if !metrics.tool_calls.is_empty() {
-        detail.tool_calls = metrics.tool_calls.clone();
+    if let Some(tools) = &metrics.tool_calls {
+        detail.tool_calls = tools.clone();
     }
-    if metrics.duration_ms > 0 {
-        detail.duration_ms = metrics.duration_ms;
+    if let Some(duration) = metrics.duration_ms {
+        detail.duration_ms = duration;
     }
     detail.has_error |= metrics.has_error;
     if let Some(error) = metrics.error_message.as_ref() {
@@ -1994,8 +2573,25 @@ mod agent_events_content_cap {
     pub const ERROR_LIST_ENTRY: u32 = 8192;
 }
 
-const TURN_LIST_TOTAL_SQL: &str = "SELECT COALESCE(MAX(CASE WHEN event_type = 'user_query' THEN turn_seq END), COUNT(CASE WHEN event_type = 'user_query' THEN 1 END), 0) AS cnt FROM agent_events \
-     WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL";
+// Unsequenced observations follow the explicit sequence watermark. This is a
+// display projection over the current roots, never a persisted lifecycle ID.
+const TURN_ROOT_KEYS_SQL: &str = "SELECT event_id, created_at, \
+    CAST(COALESCE(turn_seq, COALESCE(MAX(turn_seq) OVER(), 0) + \
+      SUM(CASE WHEN turn_seq IS NULL THEN 1 ELSE 0 END) OVER \
+        (ORDER BY created_at, event_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS SIGNED) AS display_turn \
+    FROM agent_events WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL \
+      AND event_type IN ('turn', 'user_query')";
+
+const TURN_LIST_TOTAL_SQL: &str = "SELECT CAST(GREATEST(COALESCE(MAX(turn_seq), 0) + COUNT(CASE WHEN turn_seq IS NULL THEN 1 END), COUNT(*)) AS SIGNED) AS cnt \
+    FROM agent_events WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type IN ('turn', 'user_query')";
+
+fn journal_root_turn_count_sql(alias: &str) -> String {
+    format!(
+        "CAST(GREATEST(COALESCE(MAX(CASE WHEN {alias}.event_type IN ('turn', 'user_query') AND {alias}.parent_run_id IS NULL THEN {alias}.turn_seq END), 0) + \
+      COUNT(CASE WHEN {alias}.event_type IN ('turn', 'user_query') AND {alias}.parent_run_id IS NULL AND {alias}.turn_seq IS NULL THEN 1 END), \
+      COUNT(CASE WHEN {alias}.event_type IN ('turn', 'user_query') AND {alias}.parent_run_id IS NULL THEN 1 END)) AS SIGNED)"
+    )
+}
 
 const TURN_LIST_SEEK_CHUNK_LIMIT: u32 = 100;
 const AUDIT_SESSION_LIST_SEEK_CHUNK_LIMIT: u32 = 100;
@@ -2042,14 +2638,14 @@ async fn fetch_turn_cursor_rows(
     let sql = if cursor.is_some() {
         "SELECT event_id, CAST(created_at AS CHAR) AS created_at \
          FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type = 'user_query' \
+         WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type IN ('turn', 'user_query') \
            AND (created_at > ? OR (created_at = ? AND event_id > ?)) \
          ORDER BY created_at ASC, event_id ASC \
          LIMIT ?"
     } else {
         "SELECT event_id, CAST(created_at AS CHAR) AS created_at \
          FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type = 'user_query' \
+         WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type IN ('turn', 'user_query') \
          ORDER BY created_at ASC, event_id ASC \
          LIMIT ?"
     };
@@ -2088,25 +2684,91 @@ async fn turn_list_cursor_after_skipping(
     Ok(cursor)
 }
 
+struct TurnRootKey {
+    cursor: TurnListCursor,
+    display_turn: u32,
+}
+
+fn turn_root_key_from_row(row: &impl SessionAuditRow) -> AuditResult<TurnRootKey> {
+    Ok(TurnRootKey {
+        cursor: turn_list_cursor_from_row(row, "turn_root_key")?,
+        display_turn: audit_row_u32(row, "turn_root_key", "display_turn")?,
+    })
+}
+
+/// Bind selected IDs directly to the existing primary key. A body join may
+/// materialize every Session body before its runtime filter reaches the scan.
+async fn hydrate_turn_roots(
+    pool: &Pool<MySql>,
+    session_id: &str,
+    user_id: &str,
+    keys: &[TurnRootKey],
+    purpose: TurnReadPurpose,
+) -> AuditResult<Vec<AuditTurnRoot>> {
+    use futures_util::TryStreamExt;
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let content = if purpose == TurnReadPurpose::List {
+        "CASE WHEN event_type = 'turn' AND JSON_EXTRACT(metadata, '$.sync_outbox') IS NOT NULL THEN content ELSE SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 200) END"
+    } else {
+        "content"
+    };
+    let mut sql = sqlx::QueryBuilder::<MySql>::new(format!(
+        "SELECT event_id, run_id, event_type, {content} AS content, CAST(token_usage AS CHAR) AS token_usage, \
+         llm_model_used, COALESCE(CAST(metadata AS CHAR),'{{}}') AS metadata, CAST(created_at AS CHAR) AS created_at \
+         FROM agent_events WHERE user_id = "
+    ));
+    sql.push_bind(user_id)
+        .push(" AND session_id = ")
+        .push_bind(session_id)
+        .push(
+            " AND parent_run_id IS NULL AND event_type IN ('turn','user_query') AND event_id IN (",
+        );
+    let mut ids = sql.separated(", ");
+    for key in keys {
+        ids.push_bind(&key.cursor.event_id);
+    }
+    ids.push_unseparated(")");
+    let numbers = keys
+        .iter()
+        .map(|key| (key.cursor.event_id.as_str(), key.display_turn))
+        .collect::<HashMap<_, _>>();
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    let mut stream = sql.build().fetch(connection.connection_mut());
+    let mut roots = HashMap::new();
+    while let Some(row) = stream.try_next().await.map_err(internal_error)? {
+        let id = audit_row_string(&row, "turn_root_body", "event_id")?;
+        let number = numbers
+            .get(id.as_str())
+            .ok_or_else(|| internal_error("unselected turn body returned"))?;
+        let root = audit_turn_root_from_row(&row, session_id, *number, purpose)?;
+        roots.insert(id, root);
+    }
+    drop(stream);
+    connection.release();
+    Ok(keys
+        .iter()
+        .filter_map(|key| roots.remove(&key.cursor.event_id))
+        .collect())
+}
+
 async fn fetch_turn_page_rows(
     pool: &Pool<MySql>,
     session_id: &str,
     user_id: &str,
     cursor: Option<&TurnListCursor>,
     limit: u32,
-) -> AuditResult<Vec<sqlx::mysql::MySqlRow>> {
+) -> AuditResult<TurnPageRoots> {
+    use futures_util::TryStreamExt;
     let turn_sql = format!(
-        "SELECT event_id, run_id, turn_seq, \
-         SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
-         CAST(token_usage AS CHAR) AS token_usage, llm_model_used, \
-         COALESCE(CAST(metadata AS CHAR), '{{}}') AS metadata, CAST(created_at AS CHAR) AS created_at \
-         FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type = 'user_query'{} \
-         ORDER BY created_at ASC, event_id ASC \
-         LIMIT ?",
-        agent_events_content_cap::TURN_LIST_PREVIEW,
+        "WITH numbered_roots AS ({TURN_ROOT_KEYS_SQL}) \
+         SELECT event_id, CAST(created_at AS CHAR) AS created_at, display_turn FROM numbered_roots {} \
+         ORDER BY created_at, event_id LIMIT ?",
         if cursor.is_some() {
-            " AND (created_at > ? OR (created_at = ? AND event_id > ?))"
+            "WHERE (created_at > ? OR (created_at = ? AND event_id > ?))"
         } else {
             ""
         }
@@ -2120,12 +2782,117 @@ async fn fetch_turn_page_rows(
             .bind(&cursor.created_at)
             .bind(&cursor.event_id);
     }
-    q.bind(limit).fetch_all(pool).await.map_err(internal_error)
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    let mut stream = q.bind(limit).fetch(connection.connection_mut());
+    let mut keys = Vec::new();
+    let mut has_more = false;
+    while let Some(row) = stream.try_next().await.map_err(internal_error)? {
+        if keys.len() + 1 == limit as usize {
+            has_more = true;
+            continue;
+        }
+        keys.push(turn_root_key_from_row(&row)?);
+    }
+    drop(stream);
+    connection.release();
+    // A concurrent deletion can shorten hydration. The cursor still advances
+    // through the selected keys instead of reopening the same vanished page.
+    let next_cursor = if has_more {
+        keys.last().map(|key| key.cursor.clone())
+    } else {
+        None
+    };
+    let roots = hydrate_turn_roots(pool, session_id, user_id, &keys, TurnReadPurpose::List).await?;
+    Ok(TurnPageRoots { roots, next_cursor })
+}
+
+struct TurnPageRoots {
+    roots: Vec<AuditTurnRoot>,
+    next_cursor: Option<TurnListCursor>,
+}
+
+fn receipt_error_entry_from_row(row: &impl SessionAuditRow) -> AuditResult<AuditErrorEntry> {
+    let context = "receipt_error";
+    let user = audit_row_string(row, context, "user_id")?;
+    let session = audit_row_string(row, context, "session_id")?;
+    let run = audit_row_string(row, context, "run_id")?;
+    let status = audit_row_string(row, context, "status")?;
+    let opening = audit_row_optional_string(row, context, "opening_hash")?;
+    let admission = audit_row_optional_string(row, context, "context_admission_hash")?;
+    let message = audit_row_optional_string(row, context, "error_message")?;
+    let code = audit_row_optional_string(row, context, "error_code")?;
+    let encoded = audit_row_string(row, context, "terminal_receipt_json")?;
+    let stored = crate::runs::CommittedRunTerminalReceipt::decode_for_identity(
+        &encoded,
+        audit_row_i64(row, context, "last_event_idx")?,
+        crate::runs::TerminalReceiptRunIdentity {
+            user_id: &user,
+            session_id: &session,
+            run_id: &run,
+            status: &status,
+            generation: audit_row_u64(row, context, "run_generation")?,
+            opening_hash: opening.as_deref(),
+            context_admission_hash: admission.as_deref(),
+            error_message: message.as_deref(),
+            error_code: code.as_deref(),
+        },
+    )
+    .map_err(|error| audit_decode_error(context, "terminal_receipt_json", error))?;
+    if !matches!(
+        stored.receipt.outcome,
+        crate::runs::CanonicalTerminalOutcome::Failed
+    ) {
+        return Err(audit_decode_error(
+            context,
+            "status",
+            "expected failed receipt",
+        ));
+    }
+    let index = stored
+        .completion_first()
+        .checked_add(i64::from(
+            stored
+                .receipt
+                .transcript
+                .assistant_source_event_id
+                .is_some(),
+        ))
+        .ok_or_else(|| {
+            audit_decode_error(context, "terminal_receipt_json", "error index overflow")
+        })?;
+    let mut events = stored
+        .receipt
+        .completion_events(
+            None,
+            None,
+            message.as_deref(),
+            Some(stored.completion_first()),
+            index - 1,
+            index,
+        )
+        .map_err(|error| audit_decode_error(context, "terminal_receipt_json", error))?;
+    let event = events.pop().ok_or_else(|| {
+        audit_decode_error(context, "terminal_receipt_json", "missing error event")
+    })?;
+    Ok(AuditErrorEntry {
+        event_id: format!("receipt:{run}:{index}"),
+        event_type: "run_error".into(),
+        turn: None,
+        content: truncate_str(
+            &event.to_string(),
+            agent_events_content_cap::ERROR_LIST_ENTRY as usize,
+        ),
+        metadata: serde_json::json!({"run_id":run,"event_idx":index}),
+        created_at: audit_row_string(row, context, "created_at")?,
+    })
 }
 
 #[derive(Debug, Clone)]
 struct AuditSessionListQuery {
-    base_sql: String,
+    selection_sql: String,
+    metrics_sql: String,
     bind_values: Vec<String>,
     having_bind_values: Vec<String>,
     sort_expr: &'static str,
@@ -2209,13 +2976,10 @@ fn build_audit_session_list_query(
         having_bind_values.push(min.to_string());
     }
     if let Some(ref model) = params.model {
-        // Model selection is a session-level projection in the durable
-        // ledger. Keep one bound value here: MatrixOne's wire protocol has a
-        // known malformed-packet failure for two repeated string binds in a
-        // grouped HAVING expression. Legacy sessions still fall back to the
-        // event projection when no durable model exists.
-        having_parts.push("COALESCE(MAX(r.model), MAX(e.llm_model_used)) = ?".into());
-        having_bind_values.push(model.clone());
+        where_parts.push(
+            "(EXISTS (SELECT 1 FROM agent_events em                 WHERE em.user_id = s.user_id AND em.session_id = s.session_id AND em.llm_model_used = ?)               OR EXISTS (SELECT 1 FROM agent_runs r JOIN agent_run_openings o                 ON o.user_id = r.user_id AND o.session_id = r.session_id AND o.run_id = r.run_id                 WHERE r.user_id = s.user_id AND r.session_id = s.session_id AND o.admitted_model_name = ?))".into()
+        );
+        bind_values.extend([model.clone(), model.clone()]);
     }
 
     let where_clause = where_parts.join(" AND ");
@@ -2224,64 +2988,87 @@ fn build_audit_session_list_query(
     } else {
         format!("HAVING {}", having_parts.join(" AND "))
     };
-    let base_sql = format!(
-        "SELECT \
+    let selection_sql = format!(
+        "SELECT s.user_id, s.session_id, s.status, s.created_at, s.ended_at \
+         FROM agent_sessions s WHERE {where_clause}"
+    );
+    let journal_turn_count = journal_root_turn_count_sql("e");
+    let metrics_sql = format!(
+        "SELECT observed.*, CAST(COALESCE(FLOOR(TIMESTAMPDIFF(MICROSECOND, first_ts, last_ts) / 1000) / 1000, 0) AS DOUBLE) AS duration_secs \
+         FROM (SELECT \
            s.session_id, s.status, s.created_at, s.ended_at, \
            GREATEST(\
-             COALESCE(MAX(CASE WHEN e.event_type = 'user_query' AND e.parent_run_id IS NULL THEN e.turn_seq END), 0), \
+             {journal_turn_count}, \
              COALESCE(MAX(r.root_run_count), 0)\
            ) AS turn_count, \
-           CAST(COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
+           CAST(COALESCE(SUM(CASE WHEN e.event_type IN ('turn', 'user_query', 'llm_response') AND e.token_usage IS NOT NULL \
              THEN COALESCE(e.token_input, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_in, \
-           CAST(COALESCE(SUM(CASE WHEN e.event_type IN ('user_query', 'llm_response') AND e.token_usage IS NOT NULL \
+           CAST(COALESCE(SUM(CASE WHEN e.event_type IN ('turn', 'user_query', 'llm_response') AND e.token_usage IS NOT NULL \
              THEN COALESCE(e.token_output, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_out, \
-           GREATEST(\
-             COUNT(CASE WHEN e.event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 END), \
-             COALESCE(MAX(r.tool_calls), 0)\
-           ) AS tool_calls, \
-           GREATEST(\
-             COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END), \
-             COALESCE(MAX(r.error_count), 0)\
-           ) AS error_count, \
+           0 AS tool_calls, \
+           COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END) + \
+             COALESCE(MAX(r.error_count), 0) AS error_count, \
            CASE WHEN MIN(e.created_at) IS NULL THEN MAX(r.first_ts) \
-                WHEN MAX(r.first_ts) IS NULL OR MIN(e.created_at) < MAX(r.first_ts) THEN MIN(e.created_at) \
+                WHEN MAX(r.first_ts) IS NULL OR MIN(e.created_at) < MAX(r.first_ts) THEN CAST(MIN(e.created_at) AS CHAR) \
                 ELSE MAX(r.first_ts) END AS first_ts, \
            CASE WHEN MAX(e.created_at) IS NULL THEN MAX(r.last_ts) \
-                WHEN MAX(r.last_ts) IS NULL OR MAX(e.created_at) > MAX(r.last_ts) THEN MAX(e.created_at) \
+                WHEN MAX(r.last_ts) IS NULL OR MAX(e.created_at) > MAX(r.last_ts) THEN CAST(MAX(e.created_at) AS CHAR) \
                 ELSE MAX(r.last_ts) END AS last_ts, \
            COALESCE(\
              MAX(CASE WHEN e.llm_model_used IS NOT NULL AND e.llm_model_used != '' THEN e.llm_model_used END), \
              MAX(r.model)\
-           ) AS model, \
-           TIMESTAMPDIFF(SECOND, s.created_at, COALESCE(s.ended_at, NOW())) AS duration_secs \
-         FROM agent_sessions s \
+           ) AS model \
+         FROM selected_sessions s \
          LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
          LEFT JOIN (\
-           SELECT e1.user_id, e1.session_id, \
-             COUNT(DISTINCT CASE WHEN NULLIF(e1.agent_id, '') IS NULL THEN e1.run_id END) AS root_run_count, \
-             COUNT(CASE WHEN e1.event_type = 'tool_call' \
-                              AND JSON_UNQUOTE(JSON_EXTRACT(e1.payload_json, '$.id')) IS NOT NULL \
-                        THEN 1 END) \
-             + COUNT(CASE WHEN e1.event_type = 'tool_transport_failed' THEN 1 END) AS tool_calls, \
-             COUNT(CASE WHEN e1.event_type IN ('run_error', 'tool_transport_failed') THEN 1 END) AS error_count, \
-             CAST(MIN(e1.created_at) AS CHAR) AS first_ts, \
-             CAST(MAX(e1.created_at) AS CHAR) AS last_ts, \
-             MAX(JSON_UNQUOTE(JSON_EXTRACT(e1.payload_json, '$.data.resolved_model_selection.model_name'))) AS model \
-           FROM agent_run_events e1 \
-           GROUP BY e1.user_id, e1.session_id\
+           SELECT user_id, session_id, CAST(SUM(root_run_count) AS SIGNED) AS root_run_count, \
+             CAST(SUM(error_count) AS SIGNED) AS error_count, \
+             MIN(first_ts) AS first_ts, MAX(last_ts) AS last_ts, MAX(model) AS model \
+           FROM (\
+             SELECT e1.user_id, e1.session_id, 0 AS root_run_count, \
+               COUNT(CASE WHEN e1.event_type IN ('run_error', 'tool_transport_failed') THEN 1 END) AS error_count, \
+               CAST(MIN(e1.created_at) AS CHAR) AS first_ts, \
+               CAST(MAX(e1.created_at) AS CHAR) AS last_ts, CAST(NULL AS TEXT) AS model \
+             FROM agent_run_events e1 JOIN selected_sessions selected \
+               ON selected.user_id = e1.user_id AND selected.session_id = e1.session_id \
+             GROUP BY e1.user_id, e1.session_id \
+             UNION ALL \
+             SELECT r.user_id, r.session_id, \
+               COUNT(CASE WHEN r.parent_run_id IS NULL THEN 1 END), \
+               COUNT(CASE WHEN r.status = 'failed' AND r.terminal_receipt_json IS NOT NULL THEN 1 END), \
+               CAST(MIN(r.created_at) AS CHAR), CAST(MAX(COALESCE(r.terminal_at, r.created_at)) AS CHAR), \
+               MAX(o.admitted_model_name) \
+             FROM agent_runs r JOIN selected_sessions selected \
+               ON selected.user_id = r.user_id AND selected.session_id = r.session_id \
+             LEFT JOIN agent_run_openings o \
+               ON o.user_id = r.user_id AND o.session_id = r.session_id AND o.run_id = r.run_id \
+             GROUP BY r.user_id, r.session_id\
+           ) source_facts GROUP BY user_id, session_id\
          ) r ON r.session_id = s.session_id AND r.user_id = s.user_id \
-         WHERE {where_clause} \
          GROUP BY s.session_id, s.status, s.created_at, s.ended_at \
-         {having_clause}"
+         {having_clause}) observed",
     );
 
     AuditSessionListQuery {
-        base_sql,
+        selection_sql,
+        metrics_sql,
         bind_values,
         having_bind_values,
         sort_expr: audit_session_list_sort_expr(params.sort.as_str()),
         order_dir: if params.order == "asc" { "ASC" } else { "DESC" },
     }
+}
+
+impl AuditSessionListQuery {
+    fn page_sessions_first(&self) -> bool {
+        self.sort_expr == "created_at" && self.having_bind_values.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuditSessionListRead {
+    Cursor,
+    Page,
 }
 
 fn audit_session_list_seek_clause(
@@ -2298,30 +3085,58 @@ fn audit_session_list_seek_clause(
     )
 }
 
-async fn fetch_audit_session_cursor_rows(
+async fn fetch_audit_session_rows(
     pool: &Pool<MySql>,
     query_parts: &AuditSessionListQuery,
     cursor: Option<&AuditSessionListCursor>,
     limit: u32,
+    read: AuditSessionListRead,
 ) -> AuditResult<Vec<sqlx::mysql::MySqlRow>> {
-    let seek_clause = audit_session_list_seek_clause(query_parts, cursor);
+    let seek = audit_session_list_seek_clause(query_parts, cursor);
+    let page_first = query_parts.page_sessions_first();
+    let page_before_metrics = page_first && read == AuditSessionListRead::Page;
+    let needs_metrics = !page_first || read == AuditSessionListRead::Page;
+    let selection = if page_before_metrics {
+        format!(
+            "SELECT * FROM ({}) session_rows {} ORDER BY created_at {}, session_id {} LIMIT ?",
+            query_parts.selection_sql, seek, query_parts.order_dir, query_parts.order_dir,
+        )
+    } else {
+        query_parts.selection_sql.clone()
+    };
+    let prefix = if needs_metrics {
+        format!("WITH selected_sessions AS ({selection}) ")
+    } else {
+        String::new()
+    };
+    let source = if needs_metrics {
+        &query_parts.metrics_sql
+    } else {
+        &query_parts.selection_sql
+    };
+    let projection = if read == AuditSessionListRead::Page {
+        "session_rows.*"
+    } else {
+        "session_id"
+    };
+    // A creation-time page is already selected in the CTE. Aggregate-dependent
+    // ordering and filters still run over all matching Sessions before paging.
+    let final_seek = if page_before_metrics { "" } else { &seek };
+    let final_limit = if page_before_metrics { "" } else { "LIMIT ?" };
     let sql = format!(
-        "SELECT session_id, CAST({sort_expr} AS CHAR) AS sort_cursor_value \
-         FROM ({base_sql}) session_rows \
-         {seek_clause} \
-         ORDER BY {sort_expr} {order_dir}, session_id {order_dir} \
-         LIMIT ?",
+        "{prefix}SELECT {projection}, CAST({sort_expr} AS CHAR) AS sort_cursor_value \
+         FROM ({source}) session_rows {final_seek} \
+         ORDER BY {sort_expr} {order_dir}, session_id {order_dir} {final_limit}",
         sort_expr = query_parts.sort_expr,
-        base_sql = query_parts.base_sql,
-        seek_clause = seek_clause,
-        order_dir = query_parts.order_dir
+        order_dir = query_parts.order_dir,
     );
     let mut q = query(sqlx::AssertSqlSafe(sql));
-    for v in &query_parts.bind_values {
-        q = q.bind(v);
-    }
-    for v in &query_parts.having_bind_values {
-        q = q.bind(v);
+    for value in query_parts
+        .bind_values
+        .iter()
+        .chain(&query_parts.having_bind_values)
+    {
+        q = q.bind(value);
     }
     if let Some(cursor) = cursor {
         q = q
@@ -2343,8 +3158,14 @@ async fn audit_session_list_cursor_after_skipping(
     let mut cursor = None;
     while rows_to_skip > 0 {
         let limit = rows_to_skip.min(AUDIT_SESSION_LIST_SEEK_CHUNK_LIMIT);
-        let rows =
-            fetch_audit_session_cursor_rows(pool, query_parts, cursor.as_ref(), limit).await?;
+        let rows = fetch_audit_session_rows(
+            pool,
+            query_parts,
+            cursor.as_ref(),
+            limit,
+            AuditSessionListRead::Cursor,
+        )
+        .await?;
         if rows.is_empty() {
             return Ok(cursor);
         }
@@ -2362,51 +3183,21 @@ async fn audit_session_list_cursor_after_skipping(
     Ok(cursor)
 }
 
-async fn fetch_audit_session_page_rows(
-    pool: &Pool<MySql>,
-    query_parts: &AuditSessionListQuery,
-    cursor: Option<&AuditSessionListCursor>,
-    limit: u32,
-) -> AuditResult<Vec<sqlx::mysql::MySqlRow>> {
-    let seek_clause = audit_session_list_seek_clause(query_parts, cursor);
-    let sql = format!(
-        "SELECT session_rows.*, CAST({sort_expr} AS CHAR) AS sort_cursor_value \
-         FROM ({base_sql}) session_rows \
-         {seek_clause} \
-         ORDER BY {sort_expr} {order_dir}, session_id {order_dir} \
-         LIMIT ?",
-        sort_expr = query_parts.sort_expr,
-        base_sql = query_parts.base_sql,
-        seek_clause = seek_clause,
-        order_dir = query_parts.order_dir
-    );
-    let mut q = query(sqlx::AssertSqlSafe(sql));
-    for v in &query_parts.bind_values {
-        q = q.bind(v);
-    }
-    for v in &query_parts.having_bind_values {
-        q = q.bind(v);
-    }
-    if let Some(cursor) = cursor {
-        q = q
-            .bind(&cursor.sort_value)
-            .bind(&cursor.sort_value)
-            .bind(&cursor.session_id);
-    }
-    q.bind(i64::from(limit))
-        .fetch_all(pool)
-        .await
-        .map_err(internal_error)
-}
-
 async fn count_audit_session_list_rows(
     pool: &Pool<MySql>,
     query_parts: &AuditSessionListQuery,
 ) -> AuditResult<u32> {
-    let sql = format!(
-        "SELECT COUNT(*) AS cnt FROM ({base_sql}) session_rows",
-        base_sql = query_parts.base_sql
-    );
+    let sql = if query_parts.page_sessions_first() {
+        format!(
+            "SELECT COUNT(*) AS cnt FROM ({}) session_rows",
+            query_parts.selection_sql
+        )
+    } else {
+        format!(
+            "WITH selected_sessions AS ({}) SELECT COUNT(*) AS cnt FROM ({}) session_rows",
+            query_parts.selection_sql, query_parts.metrics_sql
+        )
+    };
     let mut q = query(sqlx::AssertSqlSafe(sql));
     for v in &query_parts.bind_values {
         q = q.bind(v);
@@ -2693,26 +3484,27 @@ struct SessionRequestProjection {
     cost: SessionCostSummary,
 }
 
-fn summarize_session_request_projection(
-    attempts: impl IntoIterator<Item = SessionAttemptUsageRow>,
-) -> AuditResult<SessionRequestProjection> {
-    let mut summary = SessionRequestUsageSummary::default();
-    let mut estimated_cost_usd = 0.0;
-    let mut cost_complete = true;
-    let mut has_attempt = false;
-    for attempt in attempts {
-        has_attempt = true;
-        summary.request_count = summary
+impl SessionRequestProjection {
+    fn observe(&mut self, attempt: SessionAttemptUsageRow) -> AuditResult<()> {
+        if self.usage.request_count == 0 {
+            self.cost = SessionCostSummary {
+                estimated_cost_usd: Some(0.0),
+                unavailable_reason: None,
+            };
+        }
+        self.usage.request_count = self
+            .usage
             .request_count
             .checked_add(1)
             .ok_or_else(|| internal_error("session request count overflow"))?;
         if attempt.status == "started" {
-            summary.nonterminal_attempt_count = summary
+            self.usage.nonterminal_attempt_count = self
+                .usage
                 .nonterminal_attempt_count
                 .checked_add(1)
                 .ok_or_else(|| internal_error("session nonterminal attempt count overflow"))?;
-            cost_complete = false;
-            continue;
+            self.cost = SessionCostSummary::default();
+            return Ok(());
         }
         let usage = crate::inference_execution::projected_auxiliary_usage(
             &attempt.protocol,
@@ -2720,55 +3512,59 @@ fn summarize_session_request_projection(
             attempt.counts,
         )
         .map_err(internal_error)?;
-        if let Some(usage) = usage {
-            summary
-                .fresh_input_tokens
-                .observe(usage.fresh_input_tokens)?;
-            summary.output_tokens.observe(usage.output_tokens)?;
-            summary.cache_read_tokens.observe(usage.cache_read_tokens)?;
-            summary
-                .cache_creation_tokens
-                .observe(usage.cache_creation_tokens)?;
-
-            let attempt_cost = attempt
-                .price_snapshot_json
-                .as_deref()
-                .and_then(crate::models::InferencePriceSnapshot::from_stored)
-                .and_then(|snapshot| {
-                    snapshot.estimated_cost_usd(
-                        usage.fresh_input_tokens,
-                        usage.output_tokens,
-                        usage.cache_read_tokens,
-                        usage.cache_creation_tokens,
-                    )
-                });
-            match attempt_cost {
-                Some(attempt_cost) if attempt_cost.is_finite() => {
-                    let next_cost = estimated_cost_usd + attempt_cost;
-                    if next_cost.is_finite() {
-                        estimated_cost_usd = next_cost;
-                    } else {
-                        cost_complete = false;
-                    }
-                }
-                _ => cost_complete = false,
-            }
-        } else {
-            cost_complete = false;
+        let Some(usage) = usage else {
+            self.cost = SessionCostSummary::default();
+            return Ok(());
+        };
+        self.usage
+            .fresh_input_tokens
+            .observe(usage.fresh_input_tokens)?;
+        self.usage.output_tokens.observe(usage.output_tokens)?;
+        self.usage
+            .cache_read_tokens
+            .observe(usage.cache_read_tokens)?;
+        self.usage
+            .cache_creation_tokens
+            .observe(usage.cache_creation_tokens)?;
+        let attempt_cost = attempt
+            .price_snapshot_json
+            .as_deref()
+            .and_then(crate::models::InferencePriceSnapshot::from_stored)
+            .and_then(|snapshot| {
+                snapshot.estimated_cost_usd(
+                    usage.fresh_input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_creation_tokens,
+                )
+            })
+            .filter(|cost| cost.is_finite());
+        // Once an attempt has incomplete price/usage coverage, later exact
+        // attempts cannot make the Session's historical cost complete again.
+        self.cost.estimated_cost_usd = self
+            .cost
+            .estimated_cost_usd
+            .zip(attempt_cost)
+            .map(|(total, cost)| total + cost)
+            .filter(|cost| cost.is_finite());
+        if self.cost.estimated_cost_usd.is_none() {
+            self.cost = SessionCostSummary::default();
         }
+        Ok(())
     }
-    let cost = if has_attempt && cost_complete && estimated_cost_usd.is_finite() {
-        SessionCostSummary {
-            estimated_cost_usd: Some(estimated_cost_usd),
-            unavailable_reason: None,
-        }
-    } else {
-        SessionCostSummary::default()
-    };
-    Ok(SessionRequestProjection {
-        usage: summary,
-        cost,
-    })
+}
+
+#[cfg(test)]
+fn summarize_session_request_projection(
+    attempts: impl IntoIterator<Item = SessionAttemptUsageRow>,
+) -> AuditResult<SessionRequestProjection> {
+    attempts.into_iter().try_fold(
+        SessionRequestProjection::default(),
+        |mut result, attempt| {
+            result.observe(attempt)?;
+            Ok(result)
+        },
+    )
 }
 
 async fn load_session_request_usage(
@@ -2776,7 +3572,11 @@ async fn load_session_request_usage(
     user_id: &str,
     session_id: &str,
 ) -> AuditResult<SessionRequestProjection> {
-    let rows = query(
+    use futures_util::TryStreamExt;
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    let mut rows = query(
         "SELECT a.status, a.provider_protocol, a.usage_status, a.input_tokens, a.output_tokens, \
                 a.cache_read_tokens, a.cache_creation_tokens, \
                 CAST(r.price_snapshot_json AS CHAR) AS price_snapshot_json \
@@ -2791,32 +3591,26 @@ async fn load_session_request_usage(
     )
     .bind(user_id)
     .bind(session_id)
-    .fetch_all(pool)
-    .await
-    .map_err(internal_error)?;
-    let attempts = rows
-        .into_iter()
-        .map(|row| {
-            let context = "session_attempt_usage";
-            Ok(SessionAttemptUsageRow {
-                status: audit_row_string(&row, context, "status")?,
-                protocol: audit_row_string(&row, context, "provider_protocol")?,
-                usage_status: audit_row_string(&row, context, "usage_status")?,
-                counts: [
-                    audit_row_i64(&row, context, "input_tokens")?,
-                    audit_row_i64(&row, context, "output_tokens")?,
-                    audit_row_i64(&row, context, "cache_read_tokens")?,
-                    audit_row_i64(&row, context, "cache_creation_tokens")?,
-                ],
-                price_snapshot_json: audit_row_optional_string(
-                    &row,
-                    context,
-                    "price_snapshot_json",
-                )?,
-            })
-        })
-        .collect::<AuditResult<Vec<_>>>()?;
-    summarize_session_request_projection(attempts)
+    .fetch(connection.connection_mut());
+    let mut result = SessionRequestProjection::default();
+    while let Some(row) = rows.try_next().await.map_err(internal_error)? {
+        let context = "session_attempt_usage";
+        result.observe(SessionAttemptUsageRow {
+            status: audit_row_string(&row, context, "status")?,
+            protocol: audit_row_string(&row, context, "provider_protocol")?,
+            usage_status: audit_row_string(&row, context, "usage_status")?,
+            counts: [
+                audit_row_i64(&row, context, "input_tokens")?,
+                audit_row_i64(&row, context, "output_tokens")?,
+                audit_row_i64(&row, context, "cache_read_tokens")?,
+                audit_row_i64(&row, context, "cache_creation_tokens")?,
+            ],
+            price_snapshot_json: audit_row_optional_string(&row, context, "price_snapshot_json")?,
+        })?;
+    }
+    drop(rows);
+    connection.release();
+    Ok(result)
 }
 
 /// A child event (tool call or error) linked to a turn via parent_event_id.
@@ -2916,15 +3710,7 @@ pub struct CrossSessionStats {
     pub avg_turns_per_session: f64,
     pub avg_tokens_per_session: f64,
     pub tool_error_rate: f64,
-    pub total_runtime_promotions: u32,
-    pub adaptive_baseline_runtime_promotions: u32,
-    pub promoted_runtime_promotions: u32,
-    pub deferred_runtime_promotions: u32,
-    pub queued_runtime_promotions: u32,
-    pub auto_applied_runtime_promotions: u32,
-    pub runtime_promote_recommendations: u32,
-    pub runtime_canary_recommendations: u32,
-    pub runtime_hold_recommendations: u32,
+
     pub top_tools: Vec<ToolUsageBrief>,
     pub top_models: Vec<ModelUsageBrief>,
 }
@@ -2959,133 +3745,8 @@ pub struct CrossSessionToolAnalytics {
     pub last_error: Option<String>,
 }
 
-pub const RUNTIME_PROMOTION_EVENT_TYPE: &str = "runtime_promotion_verdict";
-pub const MAX_SESSION_RUNTIME_PROMOTION_ROWS: i64 = 200;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimePromotionController {
-    AdaptiveBaseline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimePromotionOutcome {
-    AutoApplied,
-    Queued,
-    CanaryStarted,
-    CanaryPromoted,
-    CanaryRolledBack,
-    Promoted,
-    Deferred,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimePromotionRecommendation {
-    Promote,
-    Canary,
-    Hold,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimePromotionEventData {
-    pub controller: RuntimePromotionController,
-    pub outcome: RuntimePromotionOutcome,
-    pub recommendation: RuntimePromotionRecommendation,
-    pub subject_id: String,
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn: Option<u32>,
-    pub confidence_score: f64,
-    pub support_score: f64,
-    pub safety_score: f64,
-    pub overall_score: f64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blockers: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollback_hint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimePromotionRecord {
-    pub event_id: String,
-    pub session_id: String,
-    pub created_at: String,
-    pub controller: RuntimePromotionController,
-    pub outcome: RuntimePromotionOutcome,
-    pub recommendation: RuntimePromotionRecommendation,
-    pub subject_id: String,
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn: Option<u32>,
-    pub confidence_score: f64,
-    pub support_score: f64,
-    pub safety_score: f64,
-    pub overall_score: f64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blockers: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rollback_hint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-}
-
-impl RuntimePromotionRecord {
-    fn from_event(
-        event_id: String,
-        session_id: String,
-        created_at: String,
-        data: RuntimePromotionEventData,
-    ) -> Self {
-        Self {
-            event_id,
-            session_id,
-            created_at,
-            controller: data.controller,
-            outcome: data.outcome,
-            recommendation: data.recommendation,
-            subject_id: data.subject_id,
-            summary: data.summary,
-            turn: data.turn,
-            confidence_score: data.confidence_score,
-            support_score: data.support_score,
-            safety_score: data.safety_score,
-            overall_score: data.overall_score,
-            blockers: data.blockers,
-            evidence: data.evidence,
-            rollback_hint: data.rollback_hint,
-            run_id: data.run_id,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionRuntimePromotionListResponse {
-    pub promotions: Vec<RuntimePromotionRecord>,
-    pub total: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CrossSessionRuntimePromotionListResponse {
-    pub promotions: Vec<RuntimePromotionRecord>,
-    pub total: u32,
-    pub page: u32,
-    pub per_page: u32,
-}
-
 const MAX_AUDIT_SESSIONS_PER_PAGE: u32 = 100;
 const MAX_CROSS_SESSION_TOOLS: i64 = 100;
-const MAX_CROSS_SESSION_PROMOTIONS_PER_PAGE: u32 = 100;
-
-/// Runtime promotion events are paged in memory; bound DB read before filtering.
-const MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS: i64 = 5_000;
 
 // ── Request params ───────────────────────────────────────────────────────────
 
@@ -3133,20 +3794,6 @@ pub struct CrossSessionStatsParams {
     pub since: Option<String>,
     /// Stats until this ISO 8601 timestamp.
     pub until: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CrossSessionRuntimePromotionListParams {
-    #[serde(default = "default_page")]
-    pub page: u32,
-    #[serde(default = "default_per_page")]
-    pub per_page: u32,
-    pub since: Option<String>,
-    pub until: Option<String>,
-    pub session_id: Option<String>,
-    pub controller: Option<RuntimePromotionController>,
-    pub outcome: Option<RuntimePromotionOutcome>,
-    pub recommendation: Option<RuntimePromotionRecommendation>,
 }
 
 fn default_page() -> u32 {
@@ -3209,13 +3856,6 @@ pub trait SessionAuditService: Send + Sync {
     /// List error/anomaly events in a session.
     async fn list_errors(&self, user_id: &str, session_id: &str) -> AuditResult<ErrorListResponse>;
 
-    /// List runtime promotion verdicts recorded for a single session.
-    async fn list_session_runtime_promotions(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> AuditResult<SessionRuntimePromotionListResponse>;
-
     // ── Cross-session methods ────────────────────────────────────────────────
 
     /// List user's sessions with filtering and pagination.
@@ -3238,13 +3878,6 @@ pub trait SessionAuditService: Send + Sync {
         user_id: &str,
         params: &CrossSessionStatsParams,
     ) -> AuditResult<Vec<CrossSessionToolAnalytics>>;
-
-    /// List runtime promotion verdicts across the user's sessions.
-    async fn list_cross_session_runtime_promotions(
-        &self,
-        user_id: &str,
-        params: &CrossSessionRuntimePromotionListParams,
-    ) -> AuditResult<CrossSessionRuntimePromotionListResponse>;
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -3291,42 +3924,6 @@ impl DatabaseSessionAuditService {
             Err(error_response(StatusCode::NOT_FOUND, "Session not found"))
         }
     }
-
-    async fn load_cross_session_runtime_promotions(
-        &self,
-        pool: &sqlx::Pool<sqlx::MySql>,
-        user_id: &str,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> AuditResult<Vec<RuntimePromotionRecord>> {
-        let mut sql = String::from(
-            "SELECT event_id, session_id, CAST(metadata AS CHAR) AS metadata, \
-             CAST(created_at AS CHAR) AS created_at \
-             FROM agent_events \
-             WHERE user_id = ? AND event_type = ?",
-        );
-        if since.is_some() {
-            sql.push_str(" AND created_at >= ?");
-        }
-        if until.is_some() {
-            sql.push_str(" AND created_at <= ?");
-        }
-        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
-
-        let mut query = query(sqlx::AssertSqlSafe(sql))
-            .bind(user_id)
-            .bind(RUNTIME_PROMOTION_EVENT_TYPE);
-        if let Some(since) = since {
-            query = query.bind(since);
-        }
-        if let Some(until) = until {
-            query = query.bind(until);
-        }
-        query = query.bind(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS);
-
-        let rows = query.fetch_all(pool).await.map_err(internal_error)?;
-        rows.iter().map(runtime_promotion_record_from_row).collect()
-    }
 }
 
 #[async_trait]
@@ -3356,7 +3953,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // MatrixOne rejects `SEPARATOR CHAR(31)`; embed the unit-separator as a literal (same as MySQL).
         let metrics_row = query(sqlx::AssertSqlSafe(format!(
             "SELECT \
-               COALESCE(MAX(CASE WHEN event_type = 'user_query' AND parent_run_id IS NULL THEN turn_seq END), 0) AS turn_count, \
+               {journal_turn_count} AS turn_count, \
                COUNT(CASE WHEN event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END) AS error_count, \
                COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) AS stall_count, \
                COUNT(CASE WHEN event_type = 'checkpoint' THEN 1 END) AS checkpoint_count, \
@@ -3364,14 +3961,14 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'execution_boundary_opened' THEN 1 END) AS execution_boundary_opened_count, \
                COUNT(CASE WHEN event_type = 'execution_boundary_committed' THEN 1 END) AS execution_boundary_committed_count, \
                COUNT(CASE WHEN event_type = 'execution_boundary_aborted' THEN 1 END) AS execution_boundary_aborted_count, \
-               COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) AS approval_required_count, \
-               COUNT(CASE WHEN event_type = 'approval_decision' THEN 1 END) AS approval_decision_count, \
-               COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) AS approval_timeout_count, \
-               COUNT(CASE WHEN event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 END) AS tool_calls_total, \
-               COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) AS tool_calls_failed, \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+               0 AS approval_required_count, \
+               0 AS approval_decision_count, \
+               0 AS approval_timeout_count, \
+               0 AS tool_calls_total, \
+               0 AS tool_calls_failed, \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('turn', 'user_query', 'llm_response') AND token_usage IS NOT NULL \
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_in, \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
+               CAST(COALESCE(SUM(CASE WHEN event_type IN ('turn', 'user_query', 'llm_response') AND token_usage IS NOT NULL \
                  THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_out, \
                CAST(MIN(created_at) AS CHAR) AS first_at, \
                CAST(MAX(created_at) AS CHAR) AS last_at, \
@@ -3382,6 +3979,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              FROM agent_events e \
              WHERE e.session_id = ? AND e.user_id = ?",
             sep = SESSION_AUDIT_MODEL_SEP,
+            journal_turn_count = journal_root_turn_count_sql("e"),
         )))
         .bind(session_id)
         .bind(user_id)
@@ -3398,46 +3996,50 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // duration and counters.  `COUNT(run_error)` intentionally excludes
         // `agent_failed`/`run_finished`, which are parent/terminal projections
         // of the same failure and would otherwise double-count it.
-        let durable_metrics_row = query(
-            "SELECT \
-               COUNT(CASE WHEN event_type IN ('run_error', 'tool_transport_failed') THEN 1 END) AS error_count, \
-               COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) AS approval_required_count, \
-               COUNT(CASE WHEN event_type = 'approval_resolved' THEN 1 END) AS approval_decision_count, \
-               COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) AS approval_timeout_count, \
-               COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) AS tool_calls_total, \
-               COUNT(CASE WHEN event_type = 'tool_transport_failed' THEN 1 END) AS tool_calls_failed, \
-               CAST(MIN(created_at) AS CHAR) AS first_at, \
-               CAST(MAX(created_at) AS CHAR) AS last_at \
-             FROM agent_run_events \
-             WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
-        let mut durable_metrics = session_durable_metrics_from_row(&durable_metrics_row)?;
-        let durable_tools = load_durable_tool_observations(&pool, session_id, user_id).await?;
-        // `tool_call` is emitted once as an admission envelope and once as the
-        // provider-facing call. Use the canonical paired projection rather
-        // than the raw row count, otherwise the summary itself reports the
-        // duplicate that the audit UI is meant to diagnose.
-        if durable_metrics.has_events() {
-            durable_metrics.tool_calls_total =
-                u32::try_from(durable_tools.len()).map_err(|_| {
-                    internal_error("session audit durable tool call count exceeds u32::MAX")
-                })?;
-            durable_metrics.tool_calls_failed =
-                u32::try_from(durable_tools.iter().filter(|tool| !tool.success).count()).map_err(
-                    |_| internal_error("session audit durable tool failure count exceeds u32::MAX"),
-                )?;
-        }
-        for model in load_durable_model_names(&pool, session_id, user_id).await? {
-            if !metrics.models_used.iter().any(|known| known == &model) {
-                metrics.models_used.push(model);
-            }
-        }
-        merge_session_durable_metrics(&mut metrics, durable_metrics);
+        let durable_metrics_sql = format!(
+            r#"
+            SELECT r.root_turn_count, r.models_concat,
+              p.error_count + r.failed_count AS error_count,
+              CAST(CASE WHEN p.first_at IS NULL THEN r.first_at
+                   WHEN r.first_at IS NULL THEN p.first_at ELSE LEAST(p.first_at, r.first_at) END AS CHAR) AS first_at,
+              CAST(CASE WHEN p.last_at IS NULL THEN r.last_at
+                   WHEN r.last_at IS NULL THEN p.last_at ELSE GREATEST(p.last_at, r.last_at) END AS CHAR) AS last_at
+            FROM (
+              SELECT
+                COUNT(CASE WHEN event_type IN ('run_error', 'tool_transport_failed') THEN 1 END) AS error_count,
+                CAST(MIN(created_at) AS CHAR) AS first_at, CAST(MAX(created_at) AS CHAR) AS last_at
+              FROM agent_run_events WHERE session_id = ? AND user_id = ?
+            ) p CROSS JOIN (
+              SELECT COUNT(CASE WHEN r.parent_run_id IS NULL THEN 1 END) AS root_turn_count,
+                COUNT(CASE WHEN r.status = 'failed' AND r.terminal_receipt_json IS NOT NULL THEN 1 END) AS failed_count,
+                GROUP_CONCAT(DISTINCT o.admitted_model_name ORDER BY o.admitted_model_name SEPARATOR '{sep}') AS models_concat,
+                CAST(MIN(r.created_at) AS CHAR) AS first_at, CAST(MAX(COALESCE(r.terminal_at, r.created_at)) AS CHAR) AS last_at
+              FROM agent_runs r LEFT JOIN agent_run_openings o
+                ON o.user_id = r.user_id AND o.session_id = r.session_id AND o.run_id = r.run_id
+              WHERE r.session_id = ? AND r.user_id = ?
+            ) r
+        "#,
+            sep = SESSION_AUDIT_MODEL_SEP,
+        );
+        let durable_metrics_row = query(sqlx::AssertSqlSafe(durable_metrics_sql))
+            .bind(session_id)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(internal_error)?;
+        let durable_metrics = session_durable_metrics_from_row(&durable_metrics_row)?;
+        let tools = combine_tool_sessions(
+            load_tool_totals(&pool, user_id, Some(&[session_id]), None, None, false).await?,
+        )?;
+        merge_session_durable_metrics(&mut metrics, durable_metrics)?;
+        (
+            metrics.approval_required_count,
+            metrics.approval_decision_count,
+            metrics.approval_timeout_count,
+        ) = load_approval_counts(&pool, user_id, Some(&[session_id]), None, None).await?;
+        (metrics.tool_calls_total, metrics.tool_calls_failed) = tool_counts(&tools)?;
         let duration_secs =
             compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
         let request_projection = load_session_request_usage(&pool, user_id, session_id).await?;
@@ -3504,7 +4106,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
             None
         };
         let cursor = explicit_cursor.as_ref().or(derived_cursor.as_ref());
-        let mut rows = fetch_turn_page_rows(
+        let TurnPageRoots {
+            roots: rows,
+            next_cursor,
+        } = fetch_turn_page_rows(
             &pool,
             session_id,
             user_id,
@@ -3512,34 +4117,21 @@ impl SessionAuditService for DatabaseSessionAuditService {
             per_page.saturating_add(1),
         )
         .await?;
-        let has_more = rows.len() > per_page as usize;
-        if has_more {
-            rows.truncate(per_page as usize);
-        }
-        let next_cursor = if has_more {
-            rows.last()
-                .map(|row| turn_list_cursor_from_row(row, "turn_list_next_cursor"))
-                .transpose()?
-        } else {
-            None
-        };
-
         let observed = load_turn_observed_metrics(
             &pool,
             session_id,
             user_id,
             &rows,
             agent_events_content_cap::TOOL_LAST_ERROR,
+            TurnReadPurpose::List,
         )
         .await?;
         let turns: Vec<TurnSummary> = rows
             .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let fallback_turn = turn_list_fallback_turn(rows_to_skip, i)?;
-                let mut turn = turn_summary_from_row(row, fallback_turn)?;
-                let event_id = audit_row_string(row, "turn_list_row", "event_id")?;
-                if let Some(metrics) = observed.get(&event_id) {
+            .map(|row| {
+                let mut turn = turn_summary_from_parent(&row.parent, row.display_turn)?;
+                let event_id = &row.parent.event_id;
+                if let Some(metrics) = observed.get(event_id) {
                     apply_turn_observed_metrics(&mut turn, metrics);
                 }
                 Ok(turn)
@@ -3565,65 +4157,43 @@ impl SessionAuditService for DatabaseSessionAuditService {
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        let turn = turn.max(1);
-        let row = query(
-            "SELECT event_id, run_id, content, CAST(token_usage AS CHAR) AS token_usage, \
-             llm_model_used, COALESCE(CAST(metadata AS CHAR), '{}') AS metadata, CAST(created_at AS CHAR) AS created_at \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type = 'user_query' AND turn_seq = ? \
-             ORDER BY created_at ASC, event_id ASC \
-             LIMIT 1",
+        let detail_sql = format!(
+            "WITH numbered_roots AS ({TURN_ROOT_KEYS_SQL}) \
+             SELECT event_id, CAST(created_at AS CHAR) AS created_at, display_turn FROM numbered_roots \
+             WHERE display_turn = ? ORDER BY created_at, event_id LIMIT 1"
+        );
+        let row = query(sqlx::AssertSqlSafe(detail_sql))
+            .bind(session_id)
+            .bind(user_id)
+            .bind(turn)
+            .fetch_optional(&pool)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
+        let key = turn_root_key_from_row(&row)?;
+        drop(row);
+        let root = hydrate_turn_roots(
+            &pool,
+            session_id,
+            user_id,
+            std::slice::from_ref(&key),
+            TurnReadPurpose::Detail,
         )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(turn)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let row = if row.is_some() {
-            row
-        } else {
-            let rows_to_skip = turn.saturating_sub(1);
-            let cursor =
-                turn_list_cursor_after_skipping(&pool, session_id, user_id, rows_to_skip).await?;
-            let sql = if cursor.is_some() {
-                "SELECT event_id, run_id, content, CAST(token_usage AS CHAR) AS token_usage, \
-                 llm_model_used, COALESCE(CAST(metadata AS CHAR), '{}') AS metadata, CAST(created_at AS CHAR) AS created_at \
-                 FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type = 'user_query' \
-                   AND (created_at > ? OR (created_at = ? AND event_id > ?)) \
-                 ORDER BY created_at ASC, event_id ASC \
-                 LIMIT 1"
-            } else {
-                "SELECT event_id, run_id, content, CAST(token_usage AS CHAR) AS token_usage, \
-                 llm_model_used, COALESCE(CAST(metadata AS CHAR), '{}') AS metadata, CAST(created_at AS CHAR) AS created_at \
-                 FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? AND parent_run_id IS NULL AND event_type = 'user_query' \
-                 ORDER BY created_at ASC, event_id ASC \
-                 LIMIT 1"
-            };
-            let mut q = query(sql).bind(session_id).bind(user_id);
-            if let Some(cursor) = cursor.as_ref() {
-                q = q
-                    .bind(&cursor.created_at)
-                    .bind(&cursor.created_at)
-                    .bind(&cursor.event_id);
-            }
-            q.fetch_optional(&pool).await.map_err(internal_error)?
-        };
-
-        let row = row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
-        let event_id = audit_row_string(&row, "turn_detail_row", "event_id")?;
+        .await?
+        .pop()
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Turn not found"))?;
+        let event_id = root.parent.event_id.clone();
         let observed = load_turn_observed_metrics(
             &pool,
             session_id,
             user_id,
-            std::slice::from_ref(&row),
+            std::slice::from_ref(&root),
             agent_events_content_cap::TURN_OBSERVED_CONTENT,
+            TurnReadPurpose::Detail,
         )
         .await?;
-        let parent = turn_detail_parent_from_row(&row)?;
+        let parent = root.parent;
+        let authoritative_output = parent.journal_output.is_some();
 
         // Child events may carry huge tool I/O; cap content at the SQL layer.
         let child_sql = format!(
@@ -3650,7 +4220,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let mut detail = turn_detail_from_parent(turn, parent, child_events)?;
         if let Some(metrics) = observed.get(&event_id) {
-            apply_turn_observed_metrics_to_detail(&mut detail, metrics);
+            apply_turn_observed_metrics_to_detail(&mut detail, metrics, authoritative_output);
         }
         Ok(detail)
     }
@@ -3704,71 +4274,16 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
-
-        let durable_tools = load_durable_tool_observations(&pool, session_id, user_id).await?;
-        if !durable_tools.is_empty() {
-            return durable_tool_analytics(&durable_tools);
-        }
-
-        let rows = query(
-            "SELECT \
-               agg.tool_name, agg.total_calls, agg.total_success, agg.total_failures, \
-               agg.avg_ms, agg.max_ms, agg.total_duration_ms \
-              FROM (\
-                SELECT \
-                  meta_tool_name AS tool_name, \
-                 COUNT(*) AS total_calls, \
-                 COUNT(CASE WHEN event_type = 'tool_call_completed' THEN 1 END) AS total_success, \
-                 COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) AS total_failures, \
-                 COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
-                 COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
-                 CAST(COALESCE(SUM(meta_duration_ms), 0) AS SIGNED) AS total_duration_ms \
-                FROM agent_events \
-                WHERE session_id = ? AND user_id = ? \
-                  AND event_type IN ('tool_call_completed', 'tool_call_failed') \
-                  AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
-                GROUP BY tool_name \
-              ) agg \
-              ORDER BY agg.total_duration_ms DESC",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let err_sql = format!(
-            "SELECT meta_tool_name AS tool_name, \
-             SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'tool_call_failed' \
-               AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
-             ORDER BY created_at DESC LIMIT 200",
-            agent_events_content_cap::TOOL_LAST_ERROR
-        );
-        let error_rows = query(sqlx::AssertSqlSafe(err_sql))
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_all(&pool)
-            .await
-            .map_err(internal_error)?;
-        let mut latest_errors = std::collections::HashMap::<String, String>::new();
-        for row in error_rows {
-            let (tool_name, content) = tool_latest_error_from_row(&row)?;
-            if latest_errors.contains_key(&tool_name) {
-                continue;
-            }
-            if !content.is_empty() {
-                latest_errors.insert(tool_name, content);
-            }
-        }
-
-        let result: Vec<ToolAnalytics> = rows
-            .iter()
-            .map(|row| tool_analytics_from_row(row, &latest_errors))
-            .collect::<AuditResult<Vec<_>>>()?;
-
-        Ok(result)
+        let mut totals = combine_tool_sessions(
+            load_tool_totals(&pool, user_id, Some(&[session_id]), None, None, true).await?,
+        )?;
+        let names = totals
+            .keys()
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        hydrate_tool_errors(&pool, user_id, &mut totals, &names).await?;
+        session_tool_analytics(&totals)
     }
 
     async fn list_errors(&self, user_id: &str, session_id: &str) -> AuditResult<ErrorListResponse> {
@@ -3799,36 +4314,46 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .map(audit_error_entry_from_row)
             .collect::<AuditResult<Vec<_>>>()?;
 
-        // Terminal child-run failures live in the durable ledger even when
-        // the compatibility journal stopped before it could mirror them.
-        // Include the canonical run/transport errors so the error endpoint
-        // agrees with the summary instead of reporting an empty session.
-        let durable_error_sql = "SELECT id AS event_id, event_type, \
-                    payload_json AS content, \
-                    CAST(JSON_OBJECT('run_id', run_id, 'event_idx', event_idx) AS CHAR) AS metadata, \
-                    CAST(created_at AS CHAR) AS created_at \
-             FROM agent_run_events \
-             WHERE session_id = ? AND user_id = ? \
-               AND event_type IN ('run_error', 'tool_transport_failed') \
-             ORDER BY created_at ASC, event_idx ASC \
-             LIMIT 200";
-        let durable_rows = query(durable_error_sql)
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_all(&pool)
+        // One bounded Run-side read includes physical and receipt-allocated
+        // error events. A failed control status alone does not invent an event.
+        let durable_error_sql = "WITH error_keys AS (SELECT * FROM (\
+             SELECT 0 AS kind, id AS event_id, run_id, created_at AS observed_at FROM agent_run_events \
+             WHERE session_id = ? AND user_id = ? AND event_type IN ('run_error','tool_transport_failed') \
+             UNION ALL SELECT 1, run_id, run_id, terminal_at FROM agent_runs \
+             WHERE session_id = ? AND user_id = ? AND status = 'failed' AND terminal_receipt_json IS NOT NULL\
+             ) candidates ORDER BY observed_at, run_id, event_id LIMIT 200) \
+             SELECT k.kind, k.event_id, CASE WHEN k.kind = 0 THEN p.event_type ELSE 'run_error' END AS event_type, \
+             p.payload_json AS content, CAST(JSON_OBJECT('run_id',k.run_id,'event_idx',p.event_idx) AS CHAR) AS metadata, \
+             CAST(k.observed_at AS CHAR) AS created_at, k.run_id, r.user_id, r.session_id, \
+             r.run_generation, r.last_event_idx, r.status, r.opening_hash, r.context_admission_hash, \
+             r.error_message, r.error_code, CAST(r.terminal_receipt_json AS CHAR) AS terminal_receipt_json \
+             FROM error_keys k \
+             LEFT JOIN agent_run_events p ON k.kind = 0 AND p.id = k.event_id AND p.user_id = ? AND p.session_id = ? \
+             LEFT JOIN agent_runs r ON k.kind = 1 AND r.run_id = k.run_id AND r.user_id = ? AND r.session_id = ?";
+        use futures_util::TryStreamExt;
+        let mut connection = crate::CancellationSafePoolConnection::acquire(&pool)
             .await
             .map_err(internal_error)?;
+        let mut stream = query(durable_error_sql)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(session_id)
+            .fetch(connection.connection_mut());
         let mut errors = errors;
-        let existing_ids = errors
-            .iter()
-            .map(|error| error.event_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        for row in &durable_rows {
-            let event_id = audit_row_string(row, "error_list_row", "event_id")?;
-            if !existing_ids.contains(&event_id) {
-                errors.push(audit_error_entry_from_row(row)?);
-            }
+        while let Some(row) = stream.try_next().await.map_err(internal_error)? {
+            errors.push(if audit_row_i64(&row, "error_list_row", "kind")? == 0 {
+                audit_error_entry_from_row(&row)?
+            } else {
+                receipt_error_entry_from_row(&row)?
+            });
         }
+        drop(stream);
+        connection.release();
         errors.sort_by(|left, right| {
             left.created_at
                 .cmp(&right.created_at)
@@ -3838,40 +4363,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let total = u32::try_from(errors.len())
             .map_err(|_| internal_error("session audit list_errors total exceeds u32::MAX"))?;
         Ok(ErrorListResponse { errors, total })
-    }
-
-    async fn list_session_runtime_promotions(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> AuditResult<SessionRuntimePromotionListResponse> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        self.verify_session_owner(&pool, session_id, user_id)
-            .await?;
-
-        let rows = query(
-            "SELECT event_id, session_id, CAST(metadata AS CHAR) AS metadata, \
-             CAST(created_at AS CHAR) AS created_at \
-             FROM agent_events \
-             WHERE user_id = ? AND session_id = ? AND event_type = ? \
-             ORDER BY created_at DESC LIMIT ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(RUNTIME_PROMOTION_EVENT_TYPE)
-        .bind(MAX_SESSION_RUNTIME_PROMOTION_ROWS)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let promotions = rows
-            .iter()
-            .map(runtime_promotion_record_from_row)
-            .collect::<AuditResult<Vec<_>>>()?;
-        Ok(SessionRuntimePromotionListResponse {
-            total: promotions.len() as u32,
-            promotions,
-        })
     }
 
     // ── Cross-session implementations ────────────────────────────────────────
@@ -3902,9 +4393,14 @@ impl SessionAuditService for DatabaseSessionAuditService {
             None
         };
         let cursor = explicit_cursor.as_ref().or(derived_cursor.as_ref());
-        let mut rows =
-            fetch_audit_session_page_rows(&pool, &query_parts, cursor, per_page.saturating_add(1))
-                .await?;
+        let mut rows = fetch_audit_session_rows(
+            &pool,
+            &query_parts,
+            cursor,
+            per_page.saturating_add(1),
+            AuditSessionListRead::Page,
+        )
+        .await?;
         let has_more = rows.len() > per_page as usize;
         if has_more {
             rows.truncate(per_page as usize);
@@ -3919,10 +4415,23 @@ impl SessionAuditService for DatabaseSessionAuditService {
             None
         };
 
-        let sessions: Vec<AuditSessionListItem> = rows
+        let mut sessions: Vec<AuditSessionListItem> = rows
             .iter()
             .map(audit_session_list_item_from_row)
             .collect::<AuditResult<Vec<_>>>()?;
+
+        let ids = sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>();
+        let tools = load_tool_totals(&pool, user_id, Some(&ids), None, None, false).await?;
+        for session in &mut sessions {
+            session.tool_calls_total = tools
+                .get(&session.session_id)
+                .map(tool_counts)
+                .transpose()?
+                .map_or(0, |counts| counts.0);
+        }
 
         let total = count_audit_session_list_rows(&pool, &query_parts).await?;
 
@@ -3958,204 +4467,156 @@ impl SessionAuditService for DatabaseSessionAuditService {
         }
         let where_clause = where_parts.join(" AND ");
 
-        // Aggregate event stats — session_count derived from same event rows
+        // Aggregate each source by Session before merging. A durable Run in
+        // one Session must never hide independent CLI activity in another.
+        let physical_where = where_clause.replace("e.", "p.");
+        let started_where = where_clause.replace("e.", "r.");
+        let terminal_where = started_where.replace("r.created_at", "r.terminal_at");
+        let journal_turn_count = journal_root_turn_count_sql("e");
         let agg_sql = format!(
-            "SELECT \
-               COUNT(DISTINCT e.session_id) as session_count, \
-               COUNT(CASE WHEN event_type = 'user_query' THEN 1 END) as total_turns, \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) as tokens_in, \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) as tokens_out, \
-                COUNT(CASE WHEN event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 END) as total_tool_calls, \
-                COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) as total_tool_failures, \
-                COUNT(CASE WHEN event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END) as total_errors, \
-                COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) as total_stalls, \
-                COUNT(CASE WHEN event_type = 'execution_boundary_opened' THEN 1 END) as total_execution_boundaries_opened, \
-                COUNT(CASE WHEN event_type = 'execution_boundary_committed' THEN 1 END) as total_execution_boundaries_committed, \
-                COUNT(CASE WHEN event_type = 'execution_boundary_aborted' THEN 1 END) as total_execution_boundaries_aborted, \
-                COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) as total_approval_required, \
-                COUNT(CASE WHEN event_type = 'approval_decision' THEN 1 END) as total_approval_decisions, \
-                COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) as total_approval_timeouts \
-               FROM agent_events e \
-              WHERE {where_clause}"
+            r#"SELECT COUNT(*) AS session_count,
+            CAST(COALESCE(SUM(turns), 0) AS SIGNED) AS total_turns,
+            CAST(COALESCE(SUM(tokens_in), 0) AS SIGNED) AS tokens_in,
+            CAST(COALESCE(SUM(tokens_out), 0) AS SIGNED) AS tokens_out,
+            CAST(COALESCE(SUM(tool_calls), 0) AS SIGNED) AS total_tool_calls,
+            CAST(COALESCE(SUM(tool_failures), 0) AS SIGNED) AS total_tool_failures,
+            CAST(COALESCE(SUM(errors), 0) AS SIGNED) AS total_errors,
+            CAST(COALESCE(SUM(stalls), 0) AS SIGNED) AS total_stalls,
+            CAST(COALESCE(SUM(boundaries_opened), 0) AS SIGNED) AS total_execution_boundaries_opened,
+            CAST(COALESCE(SUM(boundaries_committed), 0) AS SIGNED) AS total_execution_boundaries_committed,
+            CAST(COALESCE(SUM(boundaries_aborted), 0) AS SIGNED) AS total_execution_boundaries_aborted,
+            CAST(COALESCE(SUM(approval_required), 0) AS SIGNED) AS total_approval_required,
+            CAST(COALESCE(SUM(approval_decisions), 0) AS SIGNED) AS total_approval_decisions,
+            CAST(COALESCE(SUM(approval_timeouts), 0) AS SIGNED) AS total_approval_timeouts
+            FROM (
+            SELECT session_id, MAX(turns) AS turns, SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out,
+            CAST(SUM(tool_calls) AS SIGNED) AS tool_calls, SUM(tool_failures) AS tool_failures, SUM(errors) AS errors,
+            SUM(stalls) AS stalls, SUM(boundaries_opened) AS boundaries_opened,
+            SUM(boundaries_committed) AS boundaries_committed, SUM(boundaries_aborted) AS boundaries_aborted,
+            MAX(approval_required) AS approval_required, MAX(approval_decisions) AS approval_decisions,
+            MAX(approval_timeouts) AS approval_timeouts
+            FROM (
+            SELECT e.session_id,
+            {journal_turn_count} AS turns,
+            COALESCE(SUM(CASE WHEN e.event_type IN ('turn', 'user_query', 'llm_response') AND e.token_usage IS NOT NULL THEN COALESCE(e.token_input, 0) ELSE 0 END), 0) AS tokens_in,
+            COALESCE(SUM(CASE WHEN e.event_type IN ('turn', 'user_query', 'llm_response') AND e.token_usage IS NOT NULL THEN COALESCE(e.token_output, 0) ELSE 0 END), 0) AS tokens_out,
+            COUNT(CASE WHEN e.event_type IN ('tool_call_completed', 'tool_call_failed') THEN 1 END) AS tool_calls,
+            COUNT(CASE WHEN e.event_type = 'tool_call_failed' THEN 1 END) AS tool_failures,
+            COUNT(CASE WHEN e.event_type IN ('turn_error', 'error', 'tool_call_failed') THEN 1 END) AS errors,
+            COUNT(CASE WHEN e.event_type = 'stall_detected' THEN 1 END) AS stalls,
+            COUNT(CASE WHEN e.event_type = 'execution_boundary_opened' THEN 1 END) AS boundaries_opened,
+            COUNT(CASE WHEN e.event_type = 'execution_boundary_committed' THEN 1 END) AS boundaries_committed,
+            COUNT(CASE WHEN e.event_type = 'execution_boundary_aborted' THEN 1 END) AS boundaries_aborted,
+            0 AS approval_required,
+            0 AS approval_decisions,
+            0 AS approval_timeouts
+            FROM agent_events e WHERE {where_clause} GROUP BY e.session_id
+            UNION ALL
+            SELECT p.session_id, 0, 0, 0, 0, 0,
+            COUNT(CASE WHEN p.event_type IN ('run_error', 'tool_transport_failed') THEN 1 END),
+            0, 0, 0, 0,
+            0,
+            0,
+            0
+            FROM agent_run_events p WHERE {physical_where} GROUP BY p.session_id
+            UNION ALL
+            SELECT r.session_id, COUNT(CASE WHEN r.parent_run_id IS NULL THEN 1 END),
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            FROM agent_runs r WHERE {started_where} GROUP BY r.session_id
+            UNION ALL
+            SELECT r.session_id, 0, 0, 0, 0, 0, COUNT(CASE WHEN r.status = 'failed' AND r.terminal_receipt_json IS NOT NULL THEN 1 END),
+            0, 0, 0, 0, 0, 0, 0
+            FROM agent_runs r WHERE r.terminal_at IS NOT NULL AND {terminal_where} GROUP BY r.session_id
+            ) source_facts GROUP BY session_id
+            ) session_facts"#
         );
-        let mut aq = sqlx::query(sqlx::AssertSqlSafe(agg_sql));
-        for v in &bind_values {
-            aq = aq.bind(v);
+        let mut aggregate_query = query(sqlx::AssertSqlSafe(agg_sql));
+        for _ in 0..4 {
+            for bind in &bind_values {
+                aggregate_query = aggregate_query.bind(bind);
+            }
         }
-        let agg = aq.fetch_one(&pool).await.map_err(internal_error)?;
-        let mut counters = cross_session_stats_counters_from_row(&agg)?;
-
-        let durable_tools = load_durable_tool_observations_by_session(
-            &pool,
-            user_id,
-            since.as_deref(),
-            until.as_deref(),
-        )
-        .await?;
-        let mut durable_where = vec!["user_id = ?".to_string()];
-        let mut durable_binds = vec![user_id.to_string()];
-        if let Some(since) = since.as_deref() {
-            durable_where.push("created_at >= ?".to_string());
-            durable_binds.push(since.to_string());
-        }
-        if let Some(until) = until.as_deref() {
-            durable_where.push("created_at <= ?".to_string());
-            durable_binds.push(until.to_string());
-        }
-        let durable_agg_sql = format!(
-            "SELECT \
-               COUNT(DISTINCT session_id) AS session_count, \
-               COUNT(DISTINCT CASE WHEN event_type = 'run_started' \
-                                      AND NULLIF(agent_id, '') IS NULL THEN run_id END) AS total_turns, \
-               COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) AS total_approval_required, \
-               COUNT(CASE WHEN event_type = 'approval_resolved' THEN 1 END) AS total_approval_decisions, \
-               COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) AS total_approval_timeouts, \
-               COUNT(CASE WHEN event_type IN ('run_error', 'tool_transport_failed') THEN 1 END) AS total_errors, \
-               0 AS total_tool_calls, \
-               0 AS total_tool_failures, \
-               COUNT(*) AS durable_event_count \
-             FROM agent_run_events WHERE {}",
-            durable_where.join(" AND ")
-        );
-        let mut durable_agg_query = query(sqlx::AssertSqlSafe(durable_agg_sql));
-        for bind in durable_binds {
-            durable_agg_query = durable_agg_query.bind(bind);
-        }
-        let durable_agg = durable_agg_query
+        let aggregate = aggregate_query
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
-        let (durable_counters, durable_event_count) =
-            cross_session_durable_counters_from_row(&durable_agg)?;
-        if durable_event_count > 0 {
-            // Durable lifecycle events supersede compatibility journal
-            // counters. Tool totals/failures come from the canonical Rust
-            // pairing above rather than raw envelope counts.
-            counters.session_count = durable_counters.session_count;
-            counters.total_turns = durable_counters.total_turns;
-            counters.total_errors = durable_counters.total_errors;
-            counters.total_approval_required = durable_counters.total_approval_required;
-            counters.total_approval_decisions = durable_counters.total_approval_decisions;
-            counters.total_approval_timeouts = durable_counters.total_approval_timeouts;
-            counters.total_tool_calls =
-                u32::try_from(durable_tools.values().map(Vec::len).sum::<usize>()).map_err(
-                    |_| internal_error("cross-session durable tool call count exceeds u32::MAX"),
-                )?;
-            counters.total_tool_failures = u32::try_from(
-                durable_tools
-                    .values()
-                    .flat_map(|observations| observations.iter())
-                    .filter(|observation| !observation.success)
-                    .count(),
+        let mut counters = cross_session_stats_counters_from_row(&aggregate)?;
+        (
+            counters.total_approval_required,
+            counters.total_approval_decisions,
+            counters.total_approval_timeouts,
+        ) = load_approval_counts(&pool, user_id, None, since.as_deref(), until.as_deref()).await?;
+        let tools = combine_tool_sessions(
+            load_tool_totals(
+                &pool,
+                user_id,
+                None,
+                since.as_deref(),
+                until.as_deref(),
+                false,
             )
-            .map_err(|_| {
-                internal_error("cross-session durable tool failure count exceeds u32::MAX")
-            })?;
-        }
+            .await?,
+        )?;
+        let known_outcomes: u64 = tools
+            .values()
+            .map(|tool| tool.successes + tool.failures)
+            .sum();
+        let (calls, failures) = tool_counts(&tools)?;
+        counters.total_tool_calls = calls;
+        counters.total_tool_failures = failures;
+        let top_tools = cross_tool_analytics(&tools)?
+            .into_iter()
+            .take(10)
+            .map(|tool| ToolUsageBrief {
+                name: tool.name,
+                call_count: tool.total_calls,
+                success_rate: tool.success_rate,
+            })
+            .collect();
 
-        // Top tools (by usage count)
-        let tools_sql = format!(
-            "SELECT \
-               meta_tool_name as tool_name, \
-               COUNT(*) as cnt, \
-               COUNT(CASE WHEN event_type = 'tool_call_completed' THEN 1 END) as ok_cnt \
-             FROM agent_events e \
-             WHERE {where_clause} AND event_type IN ('tool_call_completed', 'tool_call_failed') \
-               AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
-             GROUP BY tool_name \
-             ORDER BY cnt DESC \
-             LIMIT 10"
-        );
-        let mut tq = sqlx::query(sqlx::AssertSqlSafe(tools_sql));
-        for v in &bind_values {
-            tq = tq.bind(v);
-        }
-        let tool_rows = tq.fetch_all(&pool).await.map_err(internal_error)?;
-        let mut top_tools: Vec<ToolUsageBrief> = tool_rows
-            .iter()
-            .map(tool_usage_brief_from_row)
-            .collect::<AuditResult<Vec<_>>>()?;
-        if durable_event_count > 0 {
-            top_tools = durable_cross_session_tool_analytics(&durable_tools)?
-                .into_iter()
-                .map(|tool| ToolUsageBrief {
-                    name: tool.name,
-                    call_count: tool.total_calls,
-                    success_rate: tool.success_rate,
-                })
-                .collect();
-        }
-
-        // Top models (by session count + tokens)
+        // Merge model admissions and independently observed Journal models by
+        // session identity before counting sessions. Admission is not evidence
+        // of model-specific token usage, so it contributes no tokens.
+        let admission_time_predicates = [
+            since.as_ref().map(|_| " AND r.created_at >= ?"),
+            until.as_ref().map(|_| " AND r.created_at <= ?"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<String>();
         let models_sql = format!(
-            "SELECT \
-               llm_model_used as model, \
-               COUNT(DISTINCT session_id) as sess_cnt, \
-               CAST(COALESCE(SUM(token_total), 0) AS SIGNED) as total_tokens \
-             FROM agent_events e \
-             WHERE {where_clause} AND llm_model_used IS NOT NULL AND llm_model_used != '' \
-             GROUP BY model \
-             ORDER BY sess_cnt DESC \
-             LIMIT 5"
+            r#"SELECT model, COUNT(DISTINCT session_id) AS sess_cnt,
+            CAST(COALESCE(SUM(total_tokens), 0) AS SIGNED) AS total_tokens
+            FROM (
+            SELECT e.session_id, e.llm_model_used AS model,
+            CAST(COALESCE(SUM(e.token_total), 0) AS SIGNED) AS total_tokens
+            FROM agent_events e WHERE {where_clause}
+            AND e.llm_model_used IS NOT NULL AND e.llm_model_used != ''
+            GROUP BY e.session_id, e.llm_model_used
+            UNION ALL
+            SELECT r.session_id, o.admitted_model_name AS model, CAST(0 AS SIGNED) AS total_tokens
+            FROM agent_runs r JOIN agent_run_openings o
+            ON o.user_id = r.user_id AND o.session_id = r.session_id AND o.run_id = r.run_id
+            WHERE r.user_id = ?{admission_time_predicates}
+            ) models WHERE model IS NOT NULL AND model != ''
+            GROUP BY model ORDER BY sess_cnt DESC, model ASC LIMIT 5"#,
         );
-        let mut mq = sqlx::query(sqlx::AssertSqlSafe(models_sql));
-        for v in &bind_values {
-            mq = mq.bind(v);
+        let mut model_query = query(sqlx::AssertSqlSafe(models_sql));
+        for bind in &bind_values {
+            model_query = model_query.bind(bind);
         }
-        let model_rows = mq.fetch_all(&pool).await.map_err(internal_error)?;
-        let mut top_models: Vec<ModelUsageBrief> = model_rows
+        model_query = model_query.bind(user_id);
+        if let Some(since) = since.as_deref() {
+            model_query = model_query.bind(since);
+        }
+        if let Some(until) = until.as_deref() {
+            model_query = model_query.bind(until);
+        }
+        let model_rows = model_query.fetch_all(&pool).await.map_err(internal_error)?;
+        let top_models = model_rows
             .iter()
             .map(model_usage_brief_from_row)
             .collect::<AuditResult<Vec<_>>>()?;
-        if durable_event_count > 0 {
-            let model_time_predicates = [
-                since.as_ref().map(|_| " AND created_at >= ?"),
-                until.as_ref().map(|_| " AND created_at <= ?"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<String>();
-            let durable_model_sql = format!(
-                "SELECT \
-                   JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.resolved_model_selection.model_name')) AS model, \
-                   COUNT(DISTINCT session_id) AS sess_cnt, \
-                   CAST(0 AS SIGNED) AS total_tokens \
-                 FROM agent_run_events \
-                 WHERE user_id = ? AND event_type = 'run_started' \
-                   AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.resolved_model_selection.model_name')) IS NOT NULL{} \
-                 GROUP BY model ORDER BY sess_cnt DESC LIMIT 5",
-                model_time_predicates,
-            );
-            let mut durable_model_query =
-                query(sqlx::AssertSqlSafe(durable_model_sql)).bind(user_id);
-            if let Some(since) = since.as_deref() {
-                durable_model_query = durable_model_query.bind(since);
-            }
-            if let Some(until) = until.as_deref() {
-                durable_model_query = durable_model_query.bind(until);
-            }
-            let rows = durable_model_query
-                .fetch_all(&pool)
-                .await
-                .map_err(internal_error)?;
-            top_models = rows
-                .iter()
-                .map(model_usage_brief_from_row)
-                .collect::<AuditResult<Vec<_>>>()?;
-        }
-
-        let runtime_promotion_stats = aggregate_runtime_promotion_stats(
-            &self
-                .load_cross_session_runtime_promotions(
-                    &pool,
-                    user_id,
-                    since.as_deref(),
-                    until.as_deref(),
-                )
-                .await?,
-        );
 
         let sc = counters.session_count.max(1) as f64;
         Ok(CrossSessionStats {
@@ -4175,23 +4636,11 @@ impl SessionAuditService for DatabaseSessionAuditService {
             total_approval_timeouts: counters.total_approval_timeouts,
             avg_turns_per_session: counters.total_turns as f64 / sc,
             avg_tokens_per_session: (counters.tokens_in + counters.tokens_out) as f64 / sc,
-            tool_error_rate: if counters.total_tool_calls > 0 {
-                counters.total_tool_failures as f64 / counters.total_tool_calls as f64
+            tool_error_rate: if known_outcomes > 0 {
+                counters.total_tool_failures as f64 / known_outcomes as f64
             } else {
                 0.0
             },
-            total_runtime_promotions: runtime_promotion_stats.total_runtime_promotions,
-            adaptive_baseline_runtime_promotions: runtime_promotion_stats
-                .adaptive_baseline_runtime_promotions,
-            promoted_runtime_promotions: runtime_promotion_stats.promoted_runtime_promotions,
-            deferred_runtime_promotions: runtime_promotion_stats.deferred_runtime_promotions,
-            queued_runtime_promotions: runtime_promotion_stats.queued_runtime_promotions,
-            auto_applied_runtime_promotions: runtime_promotion_stats
-                .auto_applied_runtime_promotions,
-            runtime_promote_recommendations: runtime_promotion_stats
-                .runtime_promote_recommendations,
-            runtime_canary_recommendations: runtime_promotion_stats.runtime_canary_recommendations,
-            runtime_hold_recommendations: runtime_promotion_stats.runtime_hold_recommendations,
             top_tools,
             top_models,
         })
@@ -4205,114 +4654,30 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let since = normalize_optional_audit_time_bound(params.since.as_deref())?;
         let until = normalize_optional_audit_time_bound(params.until.as_deref())?;
-
-        // New runs persist tool admission and terminal state in the durable
-        // ledger. Its canonical pairing is the only cross-session source that
-        // can avoid counting transport envelopes as a second invocation.
-        let durable_tools = load_durable_tool_observations_by_session(
-            &pool,
-            user_id,
-            since.as_deref(),
-            until.as_deref(),
-        )
-        .await?;
-        if !durable_tools.is_empty() {
-            return durable_cross_session_tool_analytics(&durable_tools);
-        }
-
-        let mut where_parts: Vec<String> = vec!["e.user_id = ?".into()];
-        let mut bind_values: Vec<String> = vec![user_id.into()];
-        if let Some(ref since) = since {
-            where_parts.push("e.created_at >= ?".into());
-            bind_values.push(since.clone());
-        }
-        if let Some(ref until) = until {
-            where_parts.push("e.created_at <= ?".into());
-            bind_values.push(until.clone());
-        }
-        let where_clause = where_parts.join(" AND ");
-
-        let sql = format!(
-            "SELECT \
-               agg.tool_name, agg.total_calls, agg.total_success, agg.total_failures, \
-               agg.avg_ms, agg.max_ms, agg.sessions_used \
-             FROM (\
-               SELECT \
-                  meta_tool_name AS tool_name, \
-                  COUNT(*) AS total_calls, \
-                  COUNT(CASE WHEN event_type = 'tool_call_completed' THEN 1 END) AS total_success, \
-                  COUNT(CASE WHEN event_type = 'tool_call_failed' THEN 1 END) AS total_failures, \
-                 COALESCE(AVG(meta_duration_ms), 0) AS avg_ms, \
-                 COALESCE(MAX(meta_duration_ms), 0) AS max_ms, \
-                 COUNT(DISTINCT session_id) AS sessions_used \
-                FROM agent_events e \
-                WHERE {where_clause} AND event_type IN ('tool_call_completed', 'tool_call_failed') \
-                  AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
-                GROUP BY tool_name \
-              ) agg \
-              ORDER BY agg.total_calls DESC \
-              LIMIT ?"
-        );
-        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
-        for v in &bind_values {
-            q = q.bind(v);
-        }
-        q = q.bind(MAX_CROSS_SESSION_TOOLS);
-        let rows = q.fetch_all(&pool).await.map_err(internal_error)?;
-
-        let mut error_sql = format!(
-            "SELECT meta_tool_name AS tool_name, \
-             SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {cap}) AS content \
-             FROM agent_events e \
-             WHERE {where_clause} AND event_type = 'tool_call_failed' \
-               AND meta_tool_name IS NOT NULL AND meta_tool_name != '' \
-             ORDER BY created_at DESC",
-            cap = agent_events_content_cap::TOOL_LAST_ERROR
-        );
-        if !rows.is_empty() {
-            error_sql.push_str(" LIMIT 500");
-        }
-        let mut eq = sqlx::query(sqlx::AssertSqlSafe(error_sql));
-        for v in &bind_values {
-            eq = eq.bind(v);
-        }
-        let error_rows = eq.fetch_all(&pool).await.map_err(internal_error)?;
-        let mut latest_errors = std::collections::HashMap::<String, String>::new();
-        for row in error_rows {
-            let (tool_name, content) = tool_latest_error_from_row(&row)?;
-            if latest_errors.contains_key(&tool_name) {
-                continue;
-            }
-            if !content.is_empty() {
-                latest_errors.insert(tool_name, content);
-            }
-        }
-
-        let result: Vec<CrossSessionToolAnalytics> = rows
-            .iter()
-            .map(|row| cross_session_tool_analytics_from_row(row, &latest_errors))
-            .collect::<AuditResult<Vec<_>>>()?;
-
-        Ok(result)
-    }
-
-    async fn list_cross_session_runtime_promotions(
-        &self,
-        user_id: &str,
-        params: &CrossSessionRuntimePromotionListParams,
-    ) -> AuditResult<CrossSessionRuntimePromotionListResponse> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let since = normalize_optional_audit_time_bound(params.since.as_deref())?;
-        let until = normalize_optional_audit_time_bound(params.until.as_deref())?;
-        let promotions = self
-            .load_cross_session_runtime_promotions(
+        let mut totals = combine_tool_sessions(
+            load_tool_totals(
                 &pool,
                 user_id,
+                None,
                 since.as_deref(),
                 until.as_deref(),
+                true,
             )
-            .await?;
-        Ok(select_cross_session_runtime_promotions(promotions, params))
+            .await?,
+        )?;
+        let mut result = cross_tool_analytics(&totals)?;
+        let names = result
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        hydrate_tool_errors(&pool, user_id, &mut totals, &names).await?;
+        for tool in &mut result {
+            tool.last_error = totals
+                .get(&tool.name)
+                .and_then(|total| total.latest_error.as_ref())
+                .and_then(|error| error.2.clone());
+        }
+        Ok(result)
     }
 }
 
@@ -4345,13 +4710,6 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
     async fn list_errors(&self, _: &str, _: &str) -> AuditResult<ErrorListResponse> {
         Err(internal_error("audit service not configured"))
     }
-    async fn list_session_runtime_promotions(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> AuditResult<SessionRuntimePromotionListResponse> {
-        Err(internal_error("audit service not configured"))
-    }
     async fn list_sessions(
         &self,
         _: &str,
@@ -4371,13 +4729,6 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
         _: &str,
         _: &CrossSessionStatsParams,
     ) -> AuditResult<Vec<CrossSessionToolAnalytics>> {
-        Err(internal_error("audit service not configured"))
-    }
-    async fn list_cross_session_runtime_promotions(
-        &self,
-        _: &str,
-        _: &CrossSessionRuntimePromotionListParams,
-    ) -> AuditResult<CrossSessionRuntimePromotionListResponse> {
         Err(internal_error("audit service not configured"))
     }
 }
@@ -4438,107 +4789,189 @@ fn compute_duration_secs(first: Option<&str>, last: Option<&str>) -> f64 {
     }
 }
 
-fn select_cross_session_runtime_promotions(
-    mut promotions: Vec<RuntimePromotionRecord>,
-    params: &CrossSessionRuntimePromotionListParams,
-) -> CrossSessionRuntimePromotionListResponse {
-    if let Some(session_id) = params
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        promotions.retain(|promotion| promotion.session_id == session_id);
-    }
-    if let Some(controller) = params.controller {
-        promotions.retain(|promotion| promotion.controller == controller);
-    }
-    if let Some(outcome) = params.outcome {
-        promotions.retain(|promotion| promotion.outcome == outcome);
-    }
-    if let Some(recommendation) = params.recommendation {
-        promotions.retain(|promotion| promotion.recommendation == recommendation);
-    }
-
-    let total = promotions.len() as u32;
-    let page = params.page.max(1);
-    let per_page = params
-        .per_page
-        .clamp(1, MAX_CROSS_SESSION_PROMOTIONS_PER_PAGE);
-    let offset = (page.saturating_sub(1) * per_page) as usize;
-    let promotions = promotions
-        .into_iter()
-        .skip(offset)
-        .take(per_page as usize)
-        .collect();
-
-    CrossSessionRuntimePromotionListResponse {
-        promotions,
-        total,
-        page,
-        per_page,
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct RuntimePromotionStatsAggregate {
-    total_runtime_promotions: u32,
-    adaptive_baseline_runtime_promotions: u32,
-    promoted_runtime_promotions: u32,
-    deferred_runtime_promotions: u32,
-    queued_runtime_promotions: u32,
-    auto_applied_runtime_promotions: u32,
-    runtime_promote_recommendations: u32,
-    runtime_canary_recommendations: u32,
-    runtime_hold_recommendations: u32,
-}
-
-impl RuntimePromotionStatsAggregate {
-    fn observe_promotion(&mut self, promotion: &RuntimePromotionRecord) {
-        self.total_runtime_promotions += 1;
-        match promotion.controller {
-            RuntimePromotionController::AdaptiveBaseline => {
-                self.adaptive_baseline_runtime_promotions += 1;
-            }
-        }
-        match promotion.outcome {
-            RuntimePromotionOutcome::Promoted => self.promoted_runtime_promotions += 1,
-            RuntimePromotionOutcome::Deferred => self.deferred_runtime_promotions += 1,
-            RuntimePromotionOutcome::Queued => self.queued_runtime_promotions += 1,
-            RuntimePromotionOutcome::AutoApplied => self.auto_applied_runtime_promotions += 1,
-            RuntimePromotionOutcome::CanaryStarted
-            | RuntimePromotionOutcome::CanaryPromoted
-            | RuntimePromotionOutcome::CanaryRolledBack => {}
-        }
-        match promotion.recommendation {
-            RuntimePromotionRecommendation::Promote => {
-                self.runtime_promote_recommendations += 1;
-            }
-            RuntimePromotionRecommendation::Canary => {
-                self.runtime_canary_recommendations += 1;
-            }
-            RuntimePromotionRecommendation::Hold => {
-                self.runtime_hold_recommendations += 1;
-            }
-        }
-    }
-}
-
-fn aggregate_runtime_promotion_stats(
-    promotions: &[RuntimePromotionRecord],
-) -> RuntimePromotionStatsAggregate {
-    let mut aggregate = RuntimePromotionStatsAggregate::default();
-    for promotion in promotions {
-        aggregate.observe_promotion(promotion);
-    }
-    aggregate
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_tool_totals(
+        sessions: &BTreeMap<String, Vec<DurableToolCallObservation>>,
+    ) -> BTreeMap<String, ToolTotals> {
+        let mut totals = BTreeMap::<String, ToolTotals>::new();
+        for (session, calls) in sessions {
+            for call in calls {
+                totals
+                    .entry(call.name.clone())
+                    .or_default()
+                    .merge(ToolTotals::from_call(session.clone(), call, true))
+                    .unwrap();
+            }
+        }
+        totals
+    }
+
+    fn test_session_tools(calls: &[DurableToolCallObservation]) -> AuditResult<Vec<ToolAnalytics>> {
+        session_tool_analytics(&test_tool_totals(&BTreeMap::from([(
+            "s".into(),
+            calls.to_vec(),
+        )])))
+    }
+
+    fn test_cross_tools(
+        sessions: &BTreeMap<String, Vec<DurableToolCallObservation>>,
+    ) -> AuditResult<Vec<CrossSessionToolAnalytics>> {
+        cross_tool_analytics(&test_tool_totals(sessions))
+    }
+
+    #[test]
+    fn selected_turn_projection_bounds_list_content_and_preserves_detail() {
+        struct RootRow {
+            base: FakeSessionAuditRow,
+            id: String,
+            content: String,
+            metadata: String,
+            kind: String,
+        }
+        impl SessionAuditRow for RootRow {
+            fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+                match column {
+                    "event_id" => Ok(self.id.clone()),
+                    "content" => Ok(self.content.clone()),
+                    "metadata" => Ok(self.metadata.clone()),
+                    "event_type" => Ok(self.kind.clone()),
+                    _ => self.base.string_column(column),
+                }
+            }
+            fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
+                if column == "run_id" {
+                    Ok(Some("run-1".into()))
+                } else {
+                    self.base.optional_string_column(column)
+                }
+            }
+            fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+                self.base.optional_i64_column(column)
+            }
+            fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
+                if column == "display_turn" {
+                    self.base
+                        .turn_seq
+                        .ok_or_else(|| sqlx::Error::ColumnNotFound(column.into()))
+                } else {
+                    self.base.i64_column(column)
+                }
+            }
+        }
+        let input = "界".repeat(180_000);
+        let output = "response".repeat(70_000);
+        let mut event = crate::session_journal::JournalEvent::turn(
+            Some("session-1"),
+            4,
+            None,
+            &input,
+            &output,
+            0,
+            1,
+            1,
+            7,
+        );
+        // Serde/ingestion accepts larger valid strings than the ordinary
+        // producer's preview constructor; exercise that accepted boundary.
+        event.user_input = Some(input.clone());
+        event.assistant_output = Some(output.clone());
+        let payload = serde_json::to_value(&event).unwrap();
+        let hash = crate::sync_outbox_canonical_payload_hash(&payload);
+        let row = RootRow {
+            base: FakeSessionAuditRow::complete(),
+            id: crate::sync_outbox_stable_event_id(&event, &hash).unwrap(),
+            content: payload.to_string(),
+            metadata: serde_json::json!({"sync_outbox":{"payload_hash":hash},"tool_calls":[{"name":"outer-only","ok":true,"ms":999}]}).to_string(),
+            kind: "turn".into(),
+        };
+        let page = (0..4)
+            .map(|_| {
+                audit_turn_root_from_row(&row, "session-1", 42, TurnReadPurpose::List).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page.iter()
+                .map(|root| root.parent.content.len())
+                .sum::<usize>(),
+            4 * 200 * 3
+        );
+        for root in &page {
+            assert!(
+                root.parent.tool_calls.is_empty(),
+                "outer metadata cannot invent verified envelope calls"
+            );
+            assert!(root.parent.journal_output.is_none());
+            assert!(
+                !root
+                    .parent
+                    .metadata
+                    .as_object()
+                    .unwrap()
+                    .contains_key("assistant_output")
+            );
+            assert_eq!(
+                turn_summary_from_parent(&root.parent, 42).unwrap().turn,
+                42,
+                "display key cannot be overridden by envelope metadata"
+            );
+        }
+        let root =
+            audit_turn_root_from_row(&row, "session-1", 42, TurnReadPurpose::Detail).unwrap();
+        let mut detail = turn_detail_from_parent(4, root.parent, vec![]).unwrap();
+        assert!(
+            detail.user_input == input,
+            "detail must preserve the accepted input"
+        );
+        assert!(
+            detail.assistant_output == output,
+            "detail must preserve the accepted output"
+        );
+        apply_turn_observed_metrics_to_detail(
+            &mut detail,
+            &TurnObservedMetrics {
+                assistant_output: Some("observed preview".into()),
+                ..Default::default()
+            },
+            true,
+        );
+        assert!(
+            detail.assistant_output == output,
+            "verified full envelope output wins an observed preview"
+        );
+        for kind in ["turn", "user_query"] {
+            for marker in [
+                serde_json::json!({}),
+                serde_json::json!({"payload_hash":" "}),
+                serde_json::json!({"payload_hash":7}),
+            ] {
+                let ordinary = RootRow {
+                    base: FakeSessionAuditRow::complete(),
+                    id: "ordinary".into(),
+                    content: "ordinary input".into(),
+                    metadata: serde_json::json!({"sync_outbox":marker,"tool_calls":[{"name":"bash","ok":true,"ms":123}]}).to_string(),
+                    kind: kind.into(),
+                };
+                let root =
+                    audit_turn_root_from_row(&ordinary, "session-1", 42, TurnReadPurpose::List)
+                        .unwrap();
+                assert_eq!(root.parent.content, "ordinary input");
+                assert_eq!(root.parent.tool_calls[0].duration_ms, 123);
+                assert!(
+                    !root
+                        .parent
+                        .metadata
+                        .as_object()
+                        .unwrap()
+                        .contains_key("tool_calls")
+                );
+            }
+        }
+    }
 
     #[test]
     fn context_trace_projection_reads_turn_from_canonical_signal_metadata() {
@@ -4552,29 +4985,6 @@ mod tests {
         assert_eq!(entry.trace["turn_id"], "turn-7");
     }
 
-    const VALID_RUNTIME_PROMOTION_METADATA: &str = r#"{
-        "controller": "adaptive_baseline",
-        "outcome": "queued",
-        "recommendation": "canary",
-        "subject_id": "model-a",
-        "summary": "quality is improving",
-        "turn": 7,
-        "confidence_score": 0.91,
-        "support_score": 0.82,
-        "safety_score": 0.77,
-        "overall_score": 0.84,
-        "blockers": ["needs canary"],
-        "evidence": ["window passed"],
-        "rollback_hint": "hold if errors rise",
-        "run_id": "run-1"
-    }"#;
-
-    #[derive(Clone)]
-    struct FakeRuntimePromotionRow {
-        failed_column: Option<&'static str>,
-        metadata: &'static str,
-    }
-
     #[derive(Clone)]
     struct FakeSessionAuditRow {
         failed_column: Option<&'static str>,
@@ -4585,37 +4995,6 @@ mod tests {
         token_usage: Option<&'static str>,
         turn_seq: Option<i64>,
         model: Option<&'static str>,
-    }
-
-    impl FakeRuntimePromotionRow {
-        fn complete() -> Self {
-            Self {
-                failed_column: None,
-                metadata: VALID_RUNTIME_PROMOTION_METADATA,
-            }
-        }
-
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-                ..Self::complete()
-            }
-        }
-
-        fn with_metadata(metadata: &'static str) -> Self {
-            Self {
-                metadata,
-                ..Self::complete()
-            }
-        }
-
-        fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
-            if self.failed_column == Some(column) {
-                Err(sqlx::Error::ColumnNotFound(column.to_string()))
-            } else {
-                Ok(())
-            }
-        }
     }
 
     impl FakeSessionAuditRow {
@@ -4683,33 +5062,12 @@ mod tests {
             }
         }
 
-        fn without_turn_seq() -> Self {
-            Self {
-                turn_seq: None,
-                ..Self::complete()
-            }
-        }
-
         fn fail_if_needed(&self, column: &str) -> Result<(), sqlx::Error> {
             if self.failed_column == Some(column) {
                 Err(sqlx::Error::ColumnNotFound(column.to_string()))
             } else {
                 Ok(())
             }
-        }
-    }
-
-    impl RuntimePromotionAuditRow for FakeRuntimePromotionRow {
-        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
-            self.fail_if_needed(column)?;
-            Ok(match column {
-                "event_id" => "event-1",
-                "session_id" => "session-1",
-                "metadata" => self.metadata,
-                "created_at" => "2026-06-26 12:00:00",
-                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-            .to_string())
         }
     }
 
@@ -4762,6 +5120,7 @@ mod tests {
             }
             Ok(match column {
                 "turn_count" => 9,
+                "root_turn_count" => 0,
                 "error_count" => 1,
                 "stall_count" => 2,
                 "checkpoint_count" => 3,
@@ -4833,6 +5192,7 @@ mod tests {
             }
             Ok(match column {
                 "avg_ms" => 25.0,
+                "duration_secs" => 7.0,
                 "max_ms" => 40.0,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
@@ -4922,49 +5282,77 @@ mod tests {
             &mut metrics,
             SessionDurableMetrics {
                 error_count: 4,
-                approval_required_count: 8,
-                approval_decision_count: 8,
-                approval_timeout_count: 0,
-                tool_calls_total: 15,
-                tool_calls_failed: 1,
                 first_at: Some("2026-06-26 11:59:59".into()),
                 last_at: Some("2026-06-26 12:01:09".into()),
+                ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         assert_eq!(metrics.error_count, 4);
-        assert_eq!(metrics.approval_required_count, 8);
-        assert_eq!(metrics.approval_decision_count, 8);
-        assert_eq!(metrics.tool_calls_total, 15);
-        assert_eq!(metrics.tool_calls_failed, 1);
+        assert_eq!(metrics.approval_required_count, 15);
+        assert_eq!(metrics.approval_decision_count, 15);
         assert_eq!(metrics.first_at.as_deref(), Some("2026-06-26 11:59:59"));
         assert_eq!(metrics.last_at.as_deref(), Some("2026-06-26 12:01:09"));
     }
 
     #[test]
-    fn durable_session_stream_clears_stale_legacy_counters_when_no_matching_events_exist() {
-        let mut metrics = SessionAuditMetrics {
-            approval_required_count: 3,
-            approval_decision_count: 3,
-            approval_timeout_count: 1,
-            tool_calls_total: 7,
-            tool_calls_failed: 2,
-            ..session_audit_metrics_from_row(&FakeSessionAuditRow::complete()).unwrap()
-        };
-        merge_session_durable_metrics(
-            &mut metrics,
-            SessionDurableMetrics {
-                first_at: Some("2026-06-26 12:00:00".into()),
-                last_at: Some("2026-06-26 12:00:01".into()),
+    fn mixed_tool_totals_preserve_session_union_unknown_outcomes_and_null_duration() {
+        let mut totals = ToolTotals::default();
+        totals
+            .merge(ToolTotals {
+                calls: 2,
+                successes: 1,
+                failures: 1,
+                duration_ms: 40,
+                duration_samples: 1,
+                max_duration_ms: 40,
+                sessions: HashSet::from(["same-session".into()]),
                 ..Default::default()
-            },
+            })
+            .unwrap();
+        totals
+            .merge(ToolTotals {
+                calls: 1,
+                duration_samples: 1,
+                sessions: HashSet::from(["same-session".into()]),
+                ..Default::default()
+            })
+            .unwrap();
+        let tools = cross_tool_analytics(&BTreeMap::from([("bash".into(), totals)])).unwrap();
+        assert_eq!(
+            (
+                tools[0].total_calls,
+                tools[0].total_success,
+                tools[0].total_failures
+            ),
+            (3, 1, 1)
         );
-
-        assert_eq!(metrics.approval_required_count, 0);
-        assert_eq!(metrics.approval_decision_count, 0);
-        assert_eq!(metrics.approval_timeout_count, 0);
-        assert_eq!(metrics.tool_calls_total, 0);
-        assert_eq!(metrics.tool_calls_failed, 0);
+        assert_eq!(tools[0].success_rate, 0.5);
+        assert_eq!(tools[0].avg_duration_ms, 20.0);
+        assert_eq!(tools[0].sessions_used_in, 1);
+        let mut overflow = ToolTotals {
+            calls: u64::MAX,
+            ..Default::default()
+        };
+        assert!(
+            overflow
+                .merge(ToolTotals {
+                    calls: 1,
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        assert!(
+            tool_counts(&BTreeMap::from([(
+                "bash".into(),
+                ToolTotals {
+                    calls: u64::from(u32::MAX) + 1,
+                    ..Default::default()
+                }
+            )]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -4972,36 +5360,36 @@ mod tests {
         let observations = vec![
             DurableToolCallObservation {
                 run_id: "root".into(),
+                call_id: None,
                 name: "bash".into(),
                 started_at: "2026-06-26 12:00:00".into(),
                 ended_at: Some("2026-06-26 12:00:01".into()),
-                success: true,
-                terminal_seen: true,
-                duration_ms: 1_000,
+                outcome: ToolOutcome::Known(true),
+                duration_ms: Some(1_000),
                 error: None,
             },
             DurableToolCallObservation {
                 run_id: "root".into(),
+                call_id: None,
                 name: "bash".into(),
                 started_at: "2026-06-26 12:00:02".into(),
                 ended_at: Some("2026-06-26 12:00:03".into()),
-                success: true,
-                terminal_seen: true,
-                duration_ms: 1_000,
+                outcome: ToolOutcome::Known(true),
+                duration_ms: Some(1_000),
                 error: None,
             },
             DurableToolCallObservation {
                 run_id: "root".into(),
+                call_id: None,
                 name: "agent_fanout".into(),
                 started_at: "2026-06-26 12:00:04".into(),
                 ended_at: Some("2026-06-26 12:00:05".into()),
-                success: false,
-                terminal_seen: true,
-                duration_ms: 1_000,
+                outcome: ToolOutcome::Known(false),
+                duration_ms: Some(1_000),
                 error: Some("cancelled".into()),
             },
         ];
-        let analytics = durable_tool_analytics(&observations).unwrap();
+        let analytics = test_session_tools(&observations).unwrap();
         let bash = analytics.iter().find(|tool| tool.name == "bash").unwrap();
         assert_eq!(bash.call_count, 2);
         assert_eq!(bash.success_count, 2);
@@ -5088,11 +5476,266 @@ mod tests {
             .iter()
             .find(|observation| observation.run_id == "run-b")
             .unwrap();
-        assert_eq!(run_a.duration_ms, 11);
-        assert!(run_a.success);
-        assert_eq!(run_b.duration_ms, 22);
-        assert!(!run_b.success);
+        assert_eq!(run_a.duration_ms, Some(11));
+        assert_eq!(run_a.outcome, ToolOutcome::Known(true));
+        assert_eq!(run_b.duration_ms, Some(22));
+        assert_eq!(run_b.outcome, ToolOutcome::Known(false));
         assert_eq!(run_b.error.as_deref(), Some("run-b failed"));
+    }
+
+    #[test]
+    fn unfinished_tool_call_is_not_reported_as_failed() {
+        let pending = durable_tool_observations_from_ledger_rows(&[DurableToolLedgerRow {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            event_idx: 1,
+            event_type: "tool_call".into(),
+            payload: serde_json::json!({"name":"bash","id":"pending"}),
+            created_at: "2026-06-26 12:00:00".into(),
+        }])
+        .unwrap();
+        let analytics = test_session_tools(&pending).unwrap();
+        assert_eq!(analytics.len(), 1);
+        assert_eq!(analytics[0].call_count, 1);
+        assert_eq!(analytics[0].success_count, 0);
+        assert_eq!(
+            analytics[0].fail_count, 0,
+            "an admitted call has no failure fact until a terminal arrives"
+        );
+        assert!(analytics[0].last_error.is_none());
+    }
+
+    #[test]
+    fn durable_tool_outcomes_preserve_unknown_and_latest_terminal() {
+        let start = DurableToolLedgerRow {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            event_idx: 0,
+            event_type: "tool_call".into(),
+            payload: serde_json::json!({"name":"bash", "id":"call"}),
+            created_at: "2026-06-26 12:00:00".into(),
+        };
+        for (payload, expected) in [
+            (
+                serde_json::json!({"success":true}),
+                ToolOutcome::Known(true),
+            ),
+            (
+                serde_json::json!({"success":false}),
+                ToolOutcome::Known(false),
+            ),
+            (
+                serde_json::json!({"status":"completed"}),
+                ToolOutcome::Known(true),
+            ),
+            (
+                serde_json::json!({"status":"rejected"}),
+                ToolOutcome::NotExecuted,
+            ),
+            (
+                serde_json::json!({"status":"unknown", "success":false, "executed":null}),
+                ToolOutcome::Unknown,
+            ),
+            (
+                serde_json::json!({"status":"skipped", "success":false}),
+                ToolOutcome::NotExecuted,
+            ),
+            (
+                serde_json::json!({"success":false, "executed":null, "result":r#"{"status":"delivery_unknown","executed":null}"#}),
+                ToolOutcome::Unknown,
+            ),
+            (
+                serde_json::json!({"success":true,"result":r#"{"status":"unknown","executed":null}"#}),
+                ToolOutcome::Known(true),
+            ),
+            (
+                serde_json::json!({"success":false,"status":"delivery_unknown","executed":null}),
+                ToolOutcome::Unknown,
+            ),
+            (serde_json::json!({}), ToolOutcome::Unknown),
+        ] {
+            let mut payload = payload;
+            payload["call_id"] = serde_json::json!("call");
+            let terminal = DurableToolLedgerRow {
+                event_idx: 1,
+                event_type: "tool_call_end".into(),
+                payload,
+                created_at: "2026-06-26 12:00:01".into(),
+                ..start.clone()
+            };
+            let observations =
+                durable_tool_observations_from_ledger_rows(&[start.clone(), terminal]).unwrap();
+            assert_eq!(observations[0].outcome, expected);
+            assert!(observations[0].ended_at.is_some());
+            assert_eq!(
+                observations[0].error.is_some(),
+                expected == ToolOutcome::Known(false)
+            );
+            let session = test_session_tools(&observations).unwrap();
+            assert_eq!(
+                session[0].fail_count,
+                u32::from(expected == ToolOutcome::Known(false))
+            );
+            let cross = test_cross_tools(&BTreeMap::from([("s".into(), observations)])).unwrap();
+            assert_eq!(cross[0].total_failures, session[0].fail_count);
+        }
+        let mut rows = vec![start.clone()];
+        for (index, success) in [(1, false), (2, true)] {
+            rows.push(DurableToolLedgerRow {
+                event_idx: index,
+                event_type: "tool_call_end".into(),
+                payload: serde_json::json!({"call_id":"call", "success":success}),
+                created_at: format!("2026-06-26 12:00:0{index}"),
+                ..start.clone()
+            });
+        }
+        let settled = durable_tool_observations_from_ledger_rows(&rows).unwrap();
+        assert_eq!(settled[0].outcome, ToolOutcome::Known(true));
+        assert!(settled[0].error.is_none());
+        let mut mixed = settled;
+        mixed.extend(durable_tool_observations_from_ledger_rows(&[start]).unwrap());
+        let session = test_session_tools(&mixed).unwrap();
+        assert_eq!(session[0].call_count, 2);
+        assert_eq!(session[0].success_rate, 1.0);
+        let cross = test_cross_tools(&BTreeMap::from([("s".into(), mixed)])).unwrap();
+        assert_eq!(cross[0].success_rate, 1.0);
+    }
+
+    #[test]
+    fn unknown_transport_receipt_is_not_a_failed_execution() {
+        for (executed, failures) in [
+            (serde_json::Value::Null, 0),
+            (serde_json::Value::Bool(false), 0),
+            (serde_json::Value::Bool(true), 1),
+        ] {
+            let rows = [
+                DurableToolLedgerRow {
+                    session_id: "s".into(),
+                    run_id: "r".into(),
+                    event_idx: 0,
+                    event_type: "tool_call".into(),
+                    payload: serde_json::json!({"name":"agent", "data":{"request_id":"call"}}),
+                    created_at: "2026-06-26 12:00:00".into(),
+                },
+                DurableToolLedgerRow {
+                    session_id: "s".into(),
+                    run_id: "r".into(),
+                    event_idx: 1,
+                    event_type: "tool_transport_failed".into(),
+                    payload: serde_json::json!({"call_id":"call", "success":false, "executed":executed, "error":r#"{"status":"delivery_unknown","executed":null}"#}),
+                    created_at: "2026-06-26 12:00:01".into(),
+                },
+            ];
+            let calls = durable_tool_observations_from_ledger_rows(&rows).unwrap();
+            let tools = test_session_tools(&calls).unwrap();
+            assert_eq!(tools[0].call_count, 1);
+            assert_eq!(tools[0].fail_count, failures);
+            assert_eq!(tools[0].last_error.is_some(), failures != 0);
+        }
+    }
+
+    #[test]
+    fn tool_duration_averages_exclude_missing_and_include_measured_zero() {
+        let start = |id: &str, at: &str| DurableToolLedgerRow {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            event_idx: 0,
+            event_type: "tool_call".into(),
+            payload: serde_json::json!({"name":"bash","id":id}),
+            created_at: at.into(),
+        };
+        let mut rows = vec![
+            start("pending", "invalid"),
+            start("unmeasurable", "invalid"),
+            start("zero", "2026-10-01 00:00:00"),
+            start("measured", "invalid"),
+        ];
+        for (id, duration, at) in [
+            ("unmeasurable", None, "invalid"),
+            ("zero", None, "2026-10-01 00:00:00"),
+            ("measured", Some(100_u64), "invalid"),
+        ] {
+            rows.push(DurableToolLedgerRow {
+                event_idx: 1,
+                event_type: "tool_call_end".into(),
+                payload: serde_json::json!({"call_id":id,"success":true,"duration_ms":duration}),
+                ..start(id, at)
+            });
+        }
+        let calls = durable_tool_observations_from_ledger_rows(&rows).unwrap();
+        let totals = test_tool_totals(&BTreeMap::from([("s".into(), calls)]));
+        let bash = &totals["bash"];
+        assert_eq!(
+            (bash.calls, bash.duration_samples, bash.duration_ms),
+            (4, 2, 100)
+        );
+        let tools = session_tool_analytics(&totals).unwrap();
+        assert_eq!(tools[0].avg_duration_ms, 50.0);
+        assert_eq!(tools[0].success_rate, 1.0);
+    }
+
+    #[test]
+    fn durable_pairing_reserves_tool_envelopes_before_transport_failures() {
+        let row = |index, kind: &str, payload| DurableToolLedgerRow {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            event_idx: index,
+            event_type: kind.into(),
+            payload,
+            created_at: format!("2026-06-26 12:00:0{index}"),
+        };
+        let rows = [
+            row(0, "tool_call", serde_json::json!({"name":"bash"})),
+            row(1, "tool_call", serde_json::json!({"name":"grep"})),
+            row(
+                2,
+                "tool_transport_failed",
+                serde_json::json!({"call_id":"cancelled", "error":"cancelled"}),
+            ),
+            row(
+                3,
+                "tool_call",
+                serde_json::json!({"name":"grep", "id":"grep-call"}),
+            ),
+            row(
+                4,
+                "tool_call_end",
+                serde_json::json!({"call_id":"grep-call", "success":true}),
+            ),
+        ];
+        let result = durable_tool_observations_from_ledger_rows(&rows).unwrap();
+        assert_eq!(result.len(), 2);
+        let bash = result.iter().find(|x| x.name == "bash").unwrap();
+        assert_eq!(bash.started_at, rows[0].created_at);
+        assert_eq!(bash.ended_at.as_deref(), Some(rows[2].created_at.as_str()));
+        assert_eq!(bash.outcome, ToolOutcome::Known(false));
+        let grep = result.iter().find(|x| x.name == "grep").unwrap();
+        assert_eq!(grep.started_at, rows[1].created_at);
+        assert_eq!(grep.outcome, ToolOutcome::Known(true));
+    }
+
+    #[test]
+    fn durable_pairing_keeps_nearest_unmatched_envelopes_for_large_runs() {
+        let count = 2048_u64;
+        let rows = (0..count * 2)
+            .map(|index| DurableToolLedgerRow {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                event_idx: index,
+                event_type: "tool_call".into(),
+                payload: if index < count {
+                    serde_json::json!({"name":"bash"})
+                } else {
+                    serde_json::json!({"name":"bash", "id":format!("call-{:04}",index-count)})
+                },
+                created_at: index.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let result = durable_tool_observations_from_ledger_rows(&rows).unwrap();
+        assert_eq!(result.len(), count as usize);
+        assert_eq!(result.first().unwrap().started_at, (count - 1).to_string());
+        assert_eq!(result.last().unwrap().started_at, "0");
+        assert!(result.iter().all(|x| x.ended_at.is_none()));
     }
 
     #[test]
@@ -5102,12 +5745,12 @@ mod tests {
             "session-a".into(),
             vec![DurableToolCallObservation {
                 run_id: "run-a".into(),
+                call_id: None,
                 name: "bash".into(),
                 started_at: "2026-06-26 12:00:00".into(),
                 ended_at: Some("2026-06-26 12:00:01".into()),
-                success: true,
-                terminal_seen: true,
-                duration_ms: 10,
+                outcome: ToolOutcome::Known(true),
+                duration_ms: Some(10),
                 error: None,
             }],
         );
@@ -5115,17 +5758,17 @@ mod tests {
             "session-b".into(),
             vec![DurableToolCallObservation {
                 run_id: "run-b".into(),
+                call_id: None,
                 name: "bash".into(),
                 started_at: "2026-06-26 12:00:02".into(),
                 ended_at: Some("2026-06-26 12:00:03".into()),
-                success: false,
-                terminal_seen: true,
-                duration_ms: 20,
+                outcome: ToolOutcome::Known(false),
+                duration_ms: Some(20),
                 error: Some("failed".into()),
             }],
         );
 
-        let analytics = durable_cross_session_tool_analytics(&by_session).unwrap();
+        let analytics = test_cross_tools(&by_session).unwrap();
         assert_eq!(analytics.len(), 1);
         assert_eq!(analytics[0].total_calls, 2);
         assert_eq!(analytics[0].total_success, 1);
@@ -5143,10 +5786,13 @@ mod tests {
         assert_eq!(durable_tool_name(&envelope).as_deref(), Some("bash"));
         assert_eq!(durable_tool_name(&canonical).as_deref(), Some("bash"));
         assert_eq!(durable_tool_call_id(&canonical).as_deref(), Some("call-1"));
-        assert!(!durable_tool_terminal_success(
-            "tool_transport_failed",
-            &serde_json::json!({ "status": "failed" })
-        ));
+        assert_eq!(
+            durable_tool_terminal_outcome(
+                "tool_transport_failed",
+                &serde_json::json!({ "status": "failed" })
+            ),
+            ToolOutcome::Known(false)
+        );
     }
 
     #[test]
@@ -5176,16 +5822,11 @@ mod tests {
     }
 
     #[test]
-    fn turn_list_total_query_uses_turn_seq_high_watermark_with_legacy_count_fallback() {
-        assert!(
-            TURN_LIST_TOTAL_SQL
-                .contains("MAX(CASE WHEN event_type = 'user_query' THEN turn_seq END)")
-        );
-        assert!(TURN_LIST_TOTAL_SQL.contains("COUNT(CASE WHEN event_type = 'user_query'"));
-        assert!(
-            TURN_LIST_TOTAL_SQL.contains("parent_run_id IS NULL"),
-            "conversation turn counts must exclude delegated producer turns"
-        );
+    fn turn_input_preview_counts_unicode_characters() {
+        let text = "界".repeat(300);
+        let preview = turn_input_preview(&text);
+        assert_eq!(preview.chars().count(), 200);
+        assert!(text.starts_with(&preview));
     }
 
     #[test]
@@ -5203,63 +5844,10 @@ mod tests {
     }
 
     #[test]
-    fn session_audit_turn_list_row_decode_preserves_values_and_fails_loudly() {
-        let turn =
-            turn_summary_from_row(&FakeSessionAuditRow::complete(), 7).expect("turn row decodes");
-        assert_eq!(turn.turn, 42);
-        assert_eq!(turn.user_input_preview, "hello from audit turn");
-        assert_eq!(turn.tokens_in, Some(10));
-        assert_eq!(turn.cached_input_tokens, Some(2));
-        assert_eq!(turn.tokens_out, Some(5));
-        assert_eq!(turn.total_tokens, Some(17));
-        assert_eq!(turn.duration_ms, 321);
-        assert_eq!(turn.model.as_deref(), Some("gpt-5"));
-        assert_eq!(turn.created_at, "2026-06-26 12:00:00");
-
-        let fallback_turn = turn_summary_from_row(
-            &FakeSessionAuditRow::with_metadata(r#"{"duration_ms": 11}"#),
-            7,
-        )
-        .expect("turn row without metadata turn uses turn_seq fallback");
-        assert_eq!(fallback_turn.turn, 42);
-        assert_eq!(fallback_turn.duration_ms, 11);
-
-        let legacy_fallback_turn = turn_summary_from_row(
-            &FakeSessionAuditRow {
-                metadata: r#"{"duration_ms": 11}"#,
-                ..FakeSessionAuditRow::without_turn_seq()
-            },
-            7,
-        )
-        .expect("legacy turn row without turn_seq uses computed fallback");
-        assert_eq!(legacy_fallback_turn.turn, 7);
-
-        assert_audit_internal_error_mentions(
-            turn_summary_from_row(&FakeSessionAuditRow::fail_on("content"), 7),
-            "content",
-        );
-        assert_audit_internal_error_mentions(
-            turn_summary_from_row(&FakeSessionAuditRow::with_metadata("{not-json"), 7),
-            "invalid metadata JSON",
-        );
-        assert_audit_internal_error_mentions(
-            turn_summary_from_row(&FakeSessionAuditRow::with_metadata(r#"{"turn": -1}"#), 7),
-            "expected non-negative integer",
-        );
-        assert_audit_internal_error_mentions(
-            turn_summary_from_row(
-                &FakeSessionAuditRow::with_metadata(r#"{"duration_ms": -1}"#),
-                7,
-            ),
-            "expected non-negative integer",
-        );
-    }
-
-    #[test]
     fn audit_turn_projections_preserve_partial_evidence_as_null() {
         let partial = FakeSessionAuditRow::with_token_usage(r#"{"output_tokens":7}"#);
-        let turn = turn_summary_from_row(&partial, 1).unwrap();
         let parent = turn_detail_parent_from_row(&partial).unwrap();
+        let turn = turn_summary_from_parent(&parent, 1).unwrap();
         let detail = turn_detail_from_parent(1, parent, vec![]).unwrap();
         for value in [
             serde_json::to_value(turn).unwrap(),
@@ -5276,15 +5864,15 @@ mod tests {
             assert_eq!(value["tokens_out"], 7);
         }
         let complete = FakeSessionAuditRow::complete();
-        let mut turn = turn_summary_from_row(&complete, 1).unwrap();
         let parent = turn_detail_parent_from_row(&complete).unwrap();
+        let mut turn = turn_summary_from_parent(&parent, 1).unwrap();
         let mut detail = turn_detail_from_parent(1, parent, vec![]).unwrap();
         let metrics = TurnObservedMetrics {
             token_usage: Some(parse_turn_token_usage(r#"{"output_tokens":7}"#, "test").unwrap()),
             ..Default::default()
         };
         apply_turn_observed_metrics(&mut turn, &metrics);
-        apply_turn_observed_metrics_to_detail(&mut detail, &metrics);
+        apply_turn_observed_metrics_to_detail(&mut detail, &metrics, false);
         assert_eq!(turn.tokens_in, None);
         assert_eq!(detail.tokens_in, None);
         assert_eq!(turn.tokens_out, Some(7));
@@ -5355,11 +5943,12 @@ mod tests {
                 }),
                 model: Some("observed-model".into()),
                 assistant_output: Some("observed terminal output".into()),
-                duration_ms: 999,
+                duration_ms: Some(999),
                 has_error: true,
                 error_message: Some("observed turn error".into()),
                 ..Default::default()
             },
+            false,
         );
         assert_eq!(detail.assistant_output, "observed terminal output");
         assert_eq!(detail.tokens_in, Some(100));
@@ -5451,23 +6040,6 @@ mod tests {
     }
 
     #[test]
-    fn session_audit_tool_latest_error_row_decode_fails_loudly() {
-        let (tool_name, content) = tool_latest_error_from_row(&FakeSessionAuditRow::complete())
-            .expect("latest tool error row decodes");
-        assert_eq!(tool_name, "bash");
-        assert_eq!(content, "hello from audit turn");
-
-        assert_audit_internal_error_mentions(
-            tool_latest_error_from_row(&FakeSessionAuditRow::fail_on("tool_name")),
-            "tool_name",
-        );
-        assert_audit_internal_error_mentions(
-            tool_latest_error_from_row(&FakeSessionAuditRow::fail_on("content")),
-            "content",
-        );
-    }
-
-    #[test]
     fn session_audit_tool_analytics_row_decode_preserves_values_and_fails_loudly() {
         let mut latest_errors = HashMap::new();
         latest_errors.insert("bash".to_string(), "permission denied".to_string());
@@ -5520,61 +6092,6 @@ mod tests {
     }
 
     #[test]
-    fn cross_session_tool_analytics_row_decode_preserves_values_and_fails_loudly() {
-        let mut latest_errors = HashMap::new();
-        latest_errors.insert("bash".to_string(), "timeout".to_string());
-
-        let analytics =
-            cross_session_tool_analytics_from_row(&FakeSessionAuditRow::complete(), &latest_errors)
-                .expect("cross-session tool analytics row decodes");
-        assert_eq!(analytics.name, "bash");
-        assert_eq!(analytics.total_calls, 4);
-        assert_eq!(analytics.total_success, 3);
-        assert_eq!(analytics.total_failures, 1);
-        assert_eq!(analytics.success_rate, 0.75);
-        assert_eq!(analytics.avg_duration_ms, 25.0);
-        assert_eq!(analytics.max_duration_ms, 40);
-        assert_eq!(analytics.sessions_used_in, 2);
-        assert_eq!(analytics.last_error.as_deref(), Some("timeout"));
-
-        assert_audit_internal_error_mentions(
-            cross_session_tool_analytics_from_row(
-                &FakeSessionAuditRow::fail_on("tool_name"),
-                &latest_errors,
-            ),
-            "tool_name",
-        );
-        assert_audit_internal_error_mentions(
-            cross_session_tool_analytics_from_row(
-                &FakeSessionAuditRow::zero_on("total_calls"),
-                &latest_errors,
-            ),
-            "expected positive call count",
-        );
-        assert_audit_internal_error_mentions(
-            cross_session_tool_analytics_from_row(
-                &FakeSessionAuditRow::with_mismatched_tool_counts(),
-                &latest_errors,
-            ),
-            "call count mismatch",
-        );
-        assert_audit_internal_error_mentions(
-            cross_session_tool_analytics_from_row(
-                &FakeSessionAuditRow::zero_on("sessions_used"),
-                &latest_errors,
-            ),
-            "expected positive session count",
-        );
-        assert_audit_internal_error_mentions(
-            cross_session_tool_analytics_from_row(
-                &FakeSessionAuditRow::negative_on("max_ms"),
-                &latest_errors,
-            ),
-            "expected non-negative",
-        );
-    }
-
-    #[test]
     fn cross_session_stats_aggregate_row_decode_preserves_values_and_fails_loudly() {
         let counters = cross_session_stats_counters_from_row(&FakeSessionAuditRow::complete())
             .expect("cross-session stats aggregate decodes");
@@ -5604,28 +6121,6 @@ mod tests {
     }
 
     #[test]
-    fn cross_session_top_tool_row_decode_preserves_values_and_fails_loudly() {
-        let tool = tool_usage_brief_from_row(&FakeSessionAuditRow::complete())
-            .expect("top tool row decodes");
-        assert_eq!(tool.name, "bash");
-        assert_eq!(tool.call_count, 15);
-        assert!((tool.success_rate - 0.8).abs() < 1e-9);
-
-        assert_audit_internal_error_mentions(
-            tool_usage_brief_from_row(&FakeSessionAuditRow::fail_on("tool_name")),
-            "tool_name",
-        );
-        assert_audit_internal_error_mentions(
-            tool_usage_brief_from_row(&FakeSessionAuditRow::zero_on("cnt")),
-            "expected positive call count",
-        );
-        assert_audit_internal_error_mentions(
-            tool_usage_brief_from_row(&FakeSessionAuditRow::with_mismatched_tool_counts()),
-            "success count exceeds total",
-        );
-    }
-
-    #[test]
     fn cross_session_top_model_row_decode_preserves_values_and_fails_loudly() {
         let model = model_usage_brief_from_row(&FakeSessionAuditRow::complete())
             .expect("top model row decodes");
@@ -5648,55 +6143,6 @@ mod tests {
         assert_audit_internal_error_mentions(
             model_usage_brief_from_row(&FakeSessionAuditRow::negative_on("total_tokens")),
             "expected non-negative",
-        );
-    }
-
-    #[test]
-    fn cross_session_input_row_caps_are_positive() {
-        const _: () = {
-            assert!(MAX_SESSION_RUNTIME_PROMOTION_ROWS > 0);
-            assert!(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS > 0);
-        };
-    }
-
-    #[test]
-    fn runtime_promotion_row_decode_preserves_values_and_fails_loudly() {
-        let record = runtime_promotion_record_from_row(&FakeRuntimePromotionRow::complete())
-            .expect("runtime promotion row decodes");
-        assert_eq!(record.event_id, "event-1");
-        assert_eq!(record.session_id, "session-1");
-        assert_eq!(record.created_at, "2026-06-26 12:00:00");
-        assert_eq!(
-            record.controller,
-            RuntimePromotionController::AdaptiveBaseline
-        );
-        assert_eq!(record.outcome, RuntimePromotionOutcome::Queued);
-        assert_eq!(
-            record.recommendation,
-            RuntimePromotionRecommendation::Canary
-        );
-        assert_eq!(record.subject_id, "model-a");
-        assert_eq!(record.summary, "quality is improving");
-        assert_eq!(record.turn, Some(7));
-        assert_eq!(record.blockers, vec!["needs canary".to_string()]);
-        assert_eq!(record.evidence, vec!["window passed".to_string()]);
-        assert_eq!(record.rollback_hint.as_deref(), Some("hold if errors rise"));
-        assert_eq!(record.run_id.as_deref(), Some("run-1"));
-
-        for column in ["event_id", "session_id", "metadata", "created_at"] {
-            assert_audit_internal_error_mentions(
-                runtime_promotion_record_from_row(&FakeRuntimePromotionRow::fail_on(column)),
-                column,
-            );
-        }
-
-        assert_audit_internal_error_mentions(
-            runtime_promotion_record_from_row(&FakeRuntimePromotionRow::with_metadata("{not-json")),
-            "metadata JSON decode failed",
-        );
-        assert_audit_internal_error_mentions(
-            runtime_promotion_record_from_row(&FakeRuntimePromotionRow::with_metadata("{}")),
-            "metadata JSON decode failed",
         );
     }
 
@@ -5923,6 +6369,29 @@ mod tests {
         assert_eq!(projection.usage.request_count, 2);
         assert!((projection.cost.estimated_cost_usd.unwrap() - 0.0004995).abs() < 1e-12);
         assert_eq!(projection.cost.unavailable_reason, None);
+
+        for rows in [
+            [
+                attempt("succeeded", "unavailable", [0; 4], None),
+                attempt("succeeded", "provider_exact", [30, 4, 0, 0], snapshot()),
+            ],
+            [
+                attempt("succeeded", "provider_exact", [30, 4, 0, 0], snapshot()),
+                attempt("succeeded", "unavailable", [0; 4], None),
+            ],
+            [
+                attempt("started", "unavailable", [0; 4], None),
+                attempt("succeeded", "provider_exact", [30, 4, 0, 0], snapshot()),
+            ],
+        ] {
+            let result = summarize_session_request_projection(rows).unwrap();
+            assert_eq!(result.usage.request_count, 2);
+            assert_eq!(result.cost.estimated_cost_usd, None);
+            assert_eq!(
+                result.cost.unavailable_reason,
+                Some(SessionCostUnavailableReason::HistoricalAttemptCoverageIncomplete)
+            );
+        }
 
         let incomplete = summarize_session_request_projection([
             attempt("started", "provider_exact", [100, 20, 0, 0], snapshot()),
@@ -6206,8 +6675,8 @@ mod tests {
             "expected non-negative",
         );
         assert_audit_internal_error_mentions(
-            audit_session_list_item_from_row(&FakeSessionAuditRow::fail_on("first_ts")),
-            "first_ts",
+            audit_session_list_item_from_row(&FakeSessionAuditRow::fail_on("duration_secs")),
+            "duration_secs",
         );
     }
 
@@ -6254,15 +6723,7 @@ mod tests {
             avg_turns_per_session: 15.0,
             avg_tokens_per_session: 80_000.0,
             tool_error_rate: 0.075,
-            total_runtime_promotions: 6,
-            adaptive_baseline_runtime_promotions: 2,
-            promoted_runtime_promotions: 1,
-            deferred_runtime_promotions: 2,
-            queued_runtime_promotions: 2,
-            auto_applied_runtime_promotions: 1,
-            runtime_promote_recommendations: 2,
-            runtime_canary_recommendations: 2,
-            runtime_hold_recommendations: 2,
+
             top_tools: vec![ToolUsageBrief {
                 name: "bash".into(),
                 call_count: 100,
@@ -6277,8 +6738,8 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"session_count\":10"));
         assert!(json.contains("\"total_turns\":150"));
-        assert!(json.contains("\"total_runtime_promotions\":6"));
-        assert!(json.contains("\"runtime_hold_recommendations\":2"));
+        assert!(!json.contains("runtime_promotions"));
+        assert!(!json.contains("runtime_hold_recommendations"));
         assert!(json.contains("\"top_tools\":["));
         assert!(json.contains("\"top_models\":["));
     }
@@ -6303,15 +6764,7 @@ mod tests {
             avg_turns_per_session: 0.0,
             avg_tokens_per_session: 0.0,
             tool_error_rate: 0.0,
-            total_runtime_promotions: 0,
-            adaptive_baseline_runtime_promotions: 0,
-            promoted_runtime_promotions: 0,
-            deferred_runtime_promotions: 0,
-            queued_runtime_promotions: 0,
-            auto_applied_runtime_promotions: 0,
-            runtime_promote_recommendations: 0,
-            runtime_canary_recommendations: 0,
-            runtime_hold_recommendations: 0,
+
             top_tools: vec![],
             top_models: vec![],
         };
@@ -6528,13 +6981,13 @@ mod tests {
                 total_tokens: Some(130),
             }),
             model: Some("deepseek-v4-flash".into()),
-            tool_calls: vec![ToolCallBrief {
+            tool_calls: Some(vec![ToolCallBrief {
                 name: "web_fetch".into(),
                 ok: false,
                 duration_ms: 80,
                 error: Some("timed out".into()),
-            }],
-            duration_ms: 1_200,
+            }]),
+            duration_ms: Some(1_200),
             has_error: true,
             has_stall: true,
             ..Default::default()
@@ -6559,6 +7012,17 @@ mod tests {
         apply_turn_observed_metrics(&mut turn, &empty);
         assert_eq!(turn.model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(turn.duration_ms, 1_200);
+        apply_turn_observed_metrics(
+            &mut turn,
+            &TurnObservedMetrics {
+                duration_ms: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            turn.duration_ms, 0,
+            "an explicit observation of zero replaces stale duration"
+        );
     }
 
     #[test]
@@ -6663,23 +7127,14 @@ mod tests {
             avg_turns_per_session: 10.0,
             avg_tokens_per_session: 8000.0,
             tool_error_rate: 0.025,
-            total_runtime_promotions: 4,
-            adaptive_baseline_runtime_promotions: 1,
-            promoted_runtime_promotions: 1,
-            deferred_runtime_promotions: 1,
-            queued_runtime_promotions: 1,
-            auto_applied_runtime_promotions: 1,
-            runtime_promote_recommendations: 2,
-            runtime_canary_recommendations: 1,
-            runtime_hold_recommendations: 1,
+
             top_tools: vec![],
             top_models: vec![],
         };
         let json = serde_json::to_string(&stats).unwrap();
         let restored: CrossSessionStats = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.session_count, 10);
-        assert_eq!(restored.total_runtime_promotions, 4);
-        assert_eq!(restored.runtime_promote_recommendations, 2);
+
         assert!((restored.tool_error_rate - 0.025).abs() < 0.001);
     }
 
@@ -6711,247 +7166,5 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         let restored: CrossSessionToolAnalytics = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.last_error.as_deref(), Some("timeout"));
-    }
-
-    #[test]
-    fn cross_session_runtime_promotion_list_params_defaults() {
-        let params: CrossSessionRuntimePromotionListParams = serde_json::from_str("{}").unwrap();
-        assert_eq!(params.page, 1);
-        assert_eq!(params.per_page, 20);
-        assert!(params.since.is_none());
-        assert!(params.until.is_none());
-        assert!(params.session_id.is_none());
-        assert!(params.controller.is_none());
-        assert!(params.outcome.is_none());
-        assert!(params.recommendation.is_none());
-    }
-
-    #[test]
-    fn cross_session_runtime_promotions_filter_and_paginate() {
-        let promotions = vec![
-            RuntimePromotionRecord::from_event(
-                "evt-1".into(),
-                "session-a".into(),
-                "2026-04-12T12:00:00Z".into(),
-                RuntimePromotionEventData {
-                    controller: RuntimePromotionController::AdaptiveBaseline,
-                    outcome: RuntimePromotionOutcome::Deferred,
-                    recommendation: RuntimePromotionRecommendation::Hold,
-                    subject_id: "exp-a".into(),
-                    summary: "adaptive baseline deferred".into(),
-                    turn: None,
-                    confidence_score: 0.71,
-                    support_score: 0.48,
-                    safety_score: 0.82,
-                    overall_score: 0.63,
-                    blockers: vec![
-                        "global quality trend is materially below promotion threshold".into(),
-                    ],
-                    evidence: vec![],
-                    rollback_hint: Some("rollback_experiment(\"exp-a\")".into()),
-                    run_id: Some("run-a".into()),
-                },
-            ),
-            RuntimePromotionRecord::from_event(
-                "evt-2".into(),
-                "session-b".into(),
-                "2026-04-12T11:00:00Z".into(),
-                RuntimePromotionEventData {
-                    controller: RuntimePromotionController::AdaptiveBaseline,
-                    outcome: RuntimePromotionOutcome::Queued,
-                    recommendation: RuntimePromotionRecommendation::Canary,
-                    subject_id: "proposal-1".into(),
-                    summary: "queue for review".into(),
-                    turn: None,
-                    confidence_score: 0.76,
-                    support_score: 0.64,
-                    safety_score: 0.70,
-                    overall_score: 0.69,
-                    blockers: vec![],
-                    evidence: vec![],
-                    rollback_hint: None,
-                    run_id: Some("run-b".into()),
-                },
-            ),
-            RuntimePromotionRecord::from_event(
-                "evt-3".into(),
-                "session-b".into(),
-                "2026-04-12T10:00:00Z".into(),
-                RuntimePromotionEventData {
-                    controller: RuntimePromotionController::AdaptiveBaseline,
-                    outcome: RuntimePromotionOutcome::AutoApplied,
-                    recommendation: RuntimePromotionRecommendation::Promote,
-                    subject_id: "proposal-2".into(),
-                    summary: "auto applied".into(),
-                    turn: None,
-                    confidence_score: 0.92,
-                    support_score: 0.88,
-                    safety_score: 0.86,
-                    overall_score: 0.89,
-                    blockers: vec![],
-                    evidence: vec![],
-                    rollback_hint: None,
-                    run_id: Some("run-b".into()),
-                },
-            ),
-        ];
-
-        let response = select_cross_session_runtime_promotions(
-            promotions,
-            &CrossSessionRuntimePromotionListParams {
-                page: 1,
-                per_page: 10,
-                since: None,
-                until: None,
-                session_id: Some("session-b".into()),
-                controller: Some(RuntimePromotionController::AdaptiveBaseline),
-                outcome: Some(RuntimePromotionOutcome::Queued),
-                recommendation: Some(RuntimePromotionRecommendation::Canary),
-            },
-        );
-
-        assert_eq!(response.total, 1);
-        assert_eq!(response.promotions.len(), 1);
-        assert_eq!(response.promotions[0].event_id, "evt-2");
-        assert_eq!(response.promotions[0].summary, "queue for review");
-    }
-
-    #[test]
-    fn aggregate_runtime_promotion_stats_counts_controllers_outcomes_and_recommendations() {
-        let promotions = vec![
-            RuntimePromotionRecord::from_event(
-                "evt-1".into(),
-                "session-a".into(),
-                "2026-04-12T12:00:00Z".into(),
-                RuntimePromotionEventData {
-                    controller: RuntimePromotionController::AdaptiveBaseline,
-                    outcome: RuntimePromotionOutcome::Deferred,
-                    recommendation: RuntimePromotionRecommendation::Hold,
-                    subject_id: "exp-a".into(),
-                    summary: "adaptive baseline deferred".into(),
-                    turn: None,
-                    confidence_score: 0.71,
-                    support_score: 0.48,
-                    safety_score: 0.82,
-                    overall_score: 0.63,
-                    blockers: vec![],
-                    evidence: vec![],
-                    rollback_hint: Some("rollback_experiment(\"exp-a\")".into()),
-                    run_id: Some("run-a".into()),
-                },
-            ),
-            RuntimePromotionRecord::from_event(
-                "evt-2".into(),
-                "session-b".into(),
-                "2026-04-12T11:00:00Z".into(),
-                RuntimePromotionEventData {
-                    controller: RuntimePromotionController::AdaptiveBaseline,
-                    outcome: RuntimePromotionOutcome::Queued,
-                    recommendation: RuntimePromotionRecommendation::Canary,
-                    subject_id: "proposal-1".into(),
-                    summary: "queue for review".into(),
-                    turn: None,
-                    confidence_score: 0.76,
-                    support_score: 0.64,
-                    safety_score: 0.70,
-                    overall_score: 0.69,
-                    blockers: vec![],
-                    evidence: vec![],
-                    rollback_hint: None,
-                    run_id: Some("run-b".into()),
-                },
-            ),
-            RuntimePromotionRecord::from_event(
-                "evt-3".into(),
-                "session-b".into(),
-                "2026-04-12T10:00:00Z".into(),
-                RuntimePromotionEventData {
-                    controller: RuntimePromotionController::AdaptiveBaseline,
-                    outcome: RuntimePromotionOutcome::AutoApplied,
-                    recommendation: RuntimePromotionRecommendation::Promote,
-                    subject_id: "proposal-2".into(),
-                    summary: "auto applied".into(),
-                    turn: None,
-                    confidence_score: 0.92,
-                    support_score: 0.88,
-                    safety_score: 0.86,
-                    overall_score: 0.89,
-                    blockers: vec![],
-                    evidence: vec![],
-                    rollback_hint: None,
-                    run_id: Some("run-b".into()),
-                },
-            ),
-        ];
-
-        let stats = aggregate_runtime_promotion_stats(&promotions);
-
-        assert_eq!(stats.total_runtime_promotions, 3);
-        assert_eq!(stats.adaptive_baseline_runtime_promotions, 3);
-        assert_eq!(stats.promoted_runtime_promotions, 0);
-        assert_eq!(stats.deferred_runtime_promotions, 1);
-        assert_eq!(stats.queued_runtime_promotions, 1);
-        assert_eq!(stats.auto_applied_runtime_promotions, 1);
-        assert_eq!(stats.runtime_promote_recommendations, 1);
-        assert_eq!(stats.runtime_canary_recommendations, 1);
-        assert_eq!(stats.runtime_hold_recommendations, 1);
-    }
-
-    #[test]
-    fn aggregate_runtime_promotion_stats_counts_new_canary_outcomes_only_in_total() {
-        let promotions = vec![
-            RuntimePromotionRecord::from_event(
-                "evt-1".into(),
-                "session-a".into(),
-                "2026-04-12T12:00:00Z".into(),
-                RuntimePromotionEventData {
-                    controller: RuntimePromotionController::AdaptiveBaseline,
-                    outcome: RuntimePromotionOutcome::CanaryStarted,
-                    recommendation: RuntimePromotionRecommendation::Canary,
-                    subject_id: "proposal-1".into(),
-                    summary: "started canary".into(),
-                    turn: None,
-                    confidence_score: 0.76,
-                    support_score: 0.64,
-                    safety_score: 0.70,
-                    overall_score: 0.69,
-                    blockers: vec![],
-                    evidence: vec![],
-                    rollback_hint: Some("rollback".into()),
-                    run_id: Some("run-a".into()),
-                },
-            ),
-            RuntimePromotionRecord::from_event(
-                "evt-2".into(),
-                "session-a".into(),
-                "2026-04-12T12:01:00Z".into(),
-                RuntimePromotionEventData {
-                    controller: RuntimePromotionController::AdaptiveBaseline,
-                    outcome: RuntimePromotionOutcome::CanaryRolledBack,
-                    recommendation: RuntimePromotionRecommendation::Canary,
-                    subject_id: "proposal-1".into(),
-                    summary: "rolled back canary".into(),
-                    turn: None,
-                    confidence_score: 0.76,
-                    support_score: 0.64,
-                    safety_score: 0.70,
-                    overall_score: 0.69,
-                    blockers: vec![],
-                    evidence: vec![],
-                    rollback_hint: Some("rollback".into()),
-                    run_id: Some("run-a".into()),
-                },
-            ),
-        ];
-
-        let stats = aggregate_runtime_promotion_stats(&promotions);
-
-        assert_eq!(stats.total_runtime_promotions, 2);
-        assert_eq!(stats.adaptive_baseline_runtime_promotions, 2);
-        assert_eq!(stats.runtime_canary_recommendations, 2);
-        assert_eq!(stats.promoted_runtime_promotions, 0);
-        assert_eq!(stats.deferred_runtime_promotions, 0);
-        assert_eq!(stats.queued_runtime_promotions, 0);
-        assert_eq!(stats.auto_applied_runtime_promotions, 0);
     }
 }

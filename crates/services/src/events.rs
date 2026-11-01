@@ -170,7 +170,7 @@ fn sync_outbox_content_payload_hash(
     Ok(sync_outbox_canonical_payload_hash(&payload))
 }
 
-fn verified_sync_outbox_payload_hash(
+pub(crate) fn verified_sync_outbox_payload_hash(
     content: &str,
     metadata: Option<&serde_json::Value>,
 ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
@@ -215,13 +215,13 @@ fn verified_sync_outbox_payload_hash_for_source(
     }
 }
 
-fn verify_sync_outbox_event_identity(
+pub(crate) fn verify_sync_outbox_event_identity(
     content: &str,
     payload_hash: &str,
     event_id: &str,
     session_id: &str,
     event_type: &str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<crate::session_journal::JournalEvent, (StatusCode, Json<ErrorResponse>)> {
     let event: crate::session_journal::JournalEvent =
         serde_json::from_str(content).map_err(|error| {
             error_response(
@@ -252,7 +252,7 @@ fn verify_sync_outbox_event_identity(
             "sync_outbox event_type must match the serialized JournalEvent event_type",
         ));
     }
-    Ok(())
+    Ok(event)
 }
 
 fn duplicate_event_matches_request(
@@ -667,7 +667,7 @@ impl EventService for DatabaseEventService {
             &content,
             metadata.as_ref(),
         )?;
-        if sync_outbox_ingestion {
+        let journal_event = if sync_outbox_ingestion {
             let Some(event_id) = client_event_id.as_deref() else {
                 return Err(error_response(
                     StatusCode::BAD_REQUEST,
@@ -679,14 +679,16 @@ impl EventService for DatabaseEventService {
                     "sync_outbox ingestion reached identity verification without payload hash",
                 ));
             };
-            verify_sync_outbox_event_identity(
+            Some(verify_sync_outbox_event_identity(
                 &content,
                 payload_hash,
                 event_id,
                 &session_id,
                 &event_type,
-            )?;
-        }
+            )?)
+        } else {
+            None
+        };
         ensure_event_session_requirement(&mut tx, &session_id, &user_id, sync_outbox_ingestion)
             .await?;
         if let Some(existing_id) = client_event_id.as_deref() {
@@ -766,14 +768,27 @@ impl EventService for DatabaseEventService {
         let tool_call_id = metadata_tool_call_id(metadata.as_ref());
         let meta_tool_name = metadata_tool_name(metadata.as_ref());
         let meta_duration_ms = metadata_duration_ms(metadata.as_ref());
+        let (run_id, parent_run_id, turn_seq) = journal_event
+            .as_ref()
+            .map(crate::event_ingestion::journal_observation_scope)
+            .unwrap_or((None, None, None));
+        let token_fields = crate::event_ingestion::canonical_token_usage_db_fields_or_null(
+            journal_event
+                .as_ref()
+                .and_then(crate::event_ingestion::canonical_token_usage_from_journal_event),
+        );
+        let llm_model_used = journal_event
+            .as_ref()
+            .and_then(|event| event.model.as_deref());
 
         let insert_sql = matrixone_statement_with_null_shape(
             sqlx::AssertSqlSafe(format!(
                 "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
               parent_event_id, causal_chain_id, `metadata`, tool_call_id, meta_tool_name, \
-              meta_duration_ms, payload_hash, ingestion_write_id, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW()) \
+              meta_duration_ms, payload_hash, ingestion_write_id, run_id, parent_run_id, turn_seq, \
+              token_usage, llm_model_used, token_input, token_output, token_total, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW()) \
              RETURNING {EVENT_DETAIL_SELECT_COLS}"
             )),
             [
@@ -781,6 +796,14 @@ impl EventService for DatabaseEventService {
                 tool_call_id.is_some(),
                 meta_tool_name.is_some(),
                 meta_duration_ms.is_some(),
+                run_id.is_some(),
+                parent_run_id.is_some(),
+                turn_seq.is_some(),
+                token_fields.token_usage_json.is_some(),
+                llm_model_used.is_some(),
+                token_fields.token_input.is_some(),
+                token_fields.token_output.is_some(),
+                token_fields.token_total.is_some(),
             ],
         );
         let row = match query(insert_sql)
@@ -799,6 +822,14 @@ impl EventService for DatabaseEventService {
             .bind(meta_duration_ms)
             .bind(&payload_hash)
             .bind(Uuid::new_v4().to_string())
+            .bind(run_id)
+            .bind(parent_run_id)
+            .bind(turn_seq.map(i64::from))
+            .bind(&token_fields.token_usage_json)
+            .bind(llm_model_used)
+            .bind(token_fields.token_input)
+            .bind(token_fields.token_output)
+            .bind(token_fields.token_total)
             .fetch_one(&mut *tx)
             .await
         {

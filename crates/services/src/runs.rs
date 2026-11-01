@@ -22,6 +22,7 @@ use std::{
     collections::{HashMap, HashSet},
     time::Duration,
 };
+pub(crate) use terminal::TerminalReceiptRunIdentity;
 pub use terminal::{
     CanonicalRunTerminalReceipt, CanonicalRunTerminalRequest, CanonicalTerminalClaim,
     CanonicalTerminalContext, CanonicalTerminalOutcome, CanonicalTerminalTranscript,
@@ -1916,9 +1917,20 @@ impl DurableRunOpening {
         for part in parts {
             digest.update(part.as_bytes());
         }
+        let admitted_model_name = self.events.first().and_then(|event| {
+            [
+                "/data/resolved_model_selection/model_name",
+                "/data/model_selection/model_name",
+            ]
+            .into_iter()
+            .filter_map(|path| event.pointer(path).and_then(serde_json::Value::as_str))
+            .find(|name| !name.is_empty())
+            .map(str::to_owned)
+        });
         Ok(EncodedRunOpening {
             events_json,
             context_json,
+            admitted_model_name,
             hash: format!("{:x}", digest.finalize()),
         })
     }
@@ -1946,6 +1958,7 @@ struct RunInsertData<'a> {
 struct EncodedRunOpening {
     events_json: String,
     context_json: Option<String>,
+    admitted_model_name: Option<String>,
     hash: String,
 }
 
@@ -2124,6 +2137,8 @@ pub struct DurableRunRecord {
     /// Exact canonical result committed with Context and the raw transcript.
     /// Derived trace/display rows never participate in this proof.
     pub terminal_receipt_json: Option<String>,
+    /// First committed terminal transition; later event appends never change it.
+    pub terminal_at: Option<String>,
     /// Immutable original admission. Compact control projections omit its body.
     pub opening: OpeningBody,
     pub opening_hash: Option<String>,
@@ -4004,7 +4019,7 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      current_checkpoint_id, current_checkpoint_hash, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     runtime_profile, start_request_fingerprint, opening_events_json, opening_context_json, CASE WHEN agent_run_openings.run_id IS NULL THEN -1 ELSE 1 END AS opening_body_loaded, opening_hash, context_admission_hash, terminal_receipt_json, work_id, \
+     runtime_profile, start_request_fingerprint, opening_events_json, opening_context_json, CASE WHEN agent_run_openings.run_id IS NULL THEN -1 ELSE 1 END AS opening_body_loaded, opening_hash, context_admission_hash, terminal_receipt_json, terminal_at, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
 // Status, observation, event append and recovery-candidate reads need metadata,
@@ -4015,7 +4030,7 @@ const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_ru
      current_checkpoint_id, current_checkpoint_hash, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     runtime_profile, start_request_fingerprint, CAST(NULL AS TEXT) AS opening_events_json, CAST(NULL AS TEXT) AS opening_context_json, 0 AS opening_body_loaded, opening_hash, context_admission_hash, terminal_receipt_json, work_id, \
+     runtime_profile, start_request_fingerprint, CAST(NULL AS TEXT) AS opening_events_json, CAST(NULL AS TEXT) AS opening_context_json, 0 AS opening_body_loaded, opening_hash, context_admission_hash, terminal_receipt_json, terminal_at, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
 const AGENT_RUN_FULL_SOURCE: &str =
@@ -7173,6 +7188,8 @@ impl InMemoryRunStateStore {
                 .map_err(|_| format!("run {} event count exceeds i64", record.run_id))?;
             record.last_event_idx = record.last_event_idx.max(event_high_watermark);
         }
+        record.terminal_at =
+            durable_run_status_is_terminal(&record.status).then(|| chrono::Utc::now().to_rfc3339());
         let action_fence = self.action_fence_for(&record.user_id, &record.run_id);
         let _action_fence = action_fence.lock_owned().await;
         let mut runs = self.runs.write().await;
@@ -7281,6 +7298,9 @@ fn apply_in_memory_status_transition(
         run.error_code = Some(code.to_string());
     }
     run.updated_at = chrono::Utc::now().to_rfc3339();
+    if durable_run_status_is_terminal(status) && run.terminal_at.is_none() {
+        run.terminal_at = Some(run.updated_at.clone());
+    }
     Ok(())
 }
 
@@ -11454,6 +11474,9 @@ impl DatabaseRunStateStore {
         let next_last_event_idx = last_event_idx + events_to_commit.len() as i64;
         let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
         update.push_bind(status);
+        if durable_run_status_is_terminal(status) {
+            update.push(", terminal_at = COALESCE(terminal_at, NOW(6))");
+        }
         update.push(", waiting_for = ");
         update.push_bind(waiting_for);
         if let Some(error_message) = error_message {
@@ -13259,8 +13282,8 @@ impl DatabaseRunStateStore {
               runtime_profile, start_request_fingerprint, opening_hash, context_admission_hash,
               work_id, work_branch_id, work_graph_revision,
               work_item_id, work_item_revision, work_item_attempt_id,
-              created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+              created_at, updated_at, terminal_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), CASE WHEN CAST(? AS SIGNED) = 1 THEN NOW(6) ELSE NULL END)",
             null_shape.iter().copied(),
         );
         sqlx::query(insert_sql)
@@ -13347,6 +13370,7 @@ impl DatabaseRunStateStore {
                     .and_then(DurableWorkRunBinding::item)
                     .map(|item| item.attempt_id().as_str()),
             )
+            .bind(durable_run_status_is_terminal(&record.status))
             .execute(&mut **tx)
             .await
     }
@@ -14750,12 +14774,13 @@ impl DatabaseRunStateStore {
             return Err(RunAdmissionError::SessionBusy);
         }
         sqlx::query(matrixone_statement_with_null_shape(
-            "INSERT INTO agent_run_openings (user_id, run_id, session_id, opening_events_json, opening_context_json) VALUES (?, ?, ?, ?, ?)",
-            [encoded_opening.is_some(), encoded_opening.as_ref().is_some_and(|opening| opening.context_json.is_some())],
+            "INSERT INTO agent_run_openings (user_id, run_id, session_id, opening_events_json, opening_context_json, admitted_model_name) VALUES (?, ?, ?, ?, ?, ?)",
+            [encoded_opening.is_some(), encoded_opening.as_ref().is_some_and(|opening| opening.context_json.is_some()), encoded_opening.as_ref().is_some_and(|opening| opening.admitted_model_name.is_some())],
         ))
         .bind(&record.user_id).bind(&record.run_id).bind(&record.session_id)
         .bind(encoded_opening.as_ref().map(|opening| opening.events_json.as_str()))
         .bind(encoded_opening.as_ref().and_then(|opening| opening.context_json.as_deref()))
+        .bind(encoded_opening.as_ref().and_then(|opening| opening.admitted_model_name.as_deref()))
         .execute(&mut *tx).await
         .map_err(|source| db_error("insert_run_opening", &record.run_id, source))?;
         Self::insert_run_event_rows_tx(
@@ -15586,7 +15611,7 @@ impl DatabaseRunStateStore {
                 .map_err(|error| error.to_string())?;
             let next_last_event_idx = run.last_event_idx + event_rows.len() as i64;
             let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "UPDATE agent_runs SET status = 'cancelled', waiting_for = NULL, error_code = NULL, error_message = NULL, owner_pod_id = NULL, owner_lease_expires_at = NULL, last_event_idx = ",
+                "UPDATE agent_runs SET status = 'cancelled', terminal_at = COALESCE(terminal_at, NOW(6)), waiting_for = NULL, error_code = NULL, error_message = NULL, owner_pod_id = NULL, owner_lease_expires_at = NULL, last_event_idx = ",
             );
             update.push_bind(next_last_event_idx);
             update.push(", updated_at = NOW(6) WHERE user_id = ");
@@ -16812,6 +16837,7 @@ impl RunStateStore for DatabaseRunStateStore {
             let updated = sqlx::query(
                 "UPDATE agent_runs
              SET status = 'cancelled',
+                 terminal_at = COALESCE(terminal_at, NOW(6)),
                  waiting_for = NULL,
                  cancellation_requested_at = COALESCE(cancellation_requested_at, NOW(6)),
                  owner_pod_id = NULL,
@@ -17138,7 +17164,7 @@ impl RunStateStore for DatabaseRunStateStore {
         kind: DurableRunInteractionKind,
     ) -> Result<Option<DurableRunInteractionProjection>, String> {
         let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+            .load_run_metadata_with_columns(user_id, run_id, RunProjection::Control)
             .await
             .map_err(|error| error.to_string())?
         else {
@@ -18722,6 +18748,9 @@ impl RunStateStore for DatabaseRunStateStore {
 
         let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
         update.push_bind(status);
+        if durable_run_status_is_terminal(status) {
+            update.push(", terminal_at = COALESCE(terminal_at, NOW(6))");
+        }
         update.push(", waiting_for = ");
         update.push_bind(waiting_for);
         if let Some(error_message) = error_message {
@@ -23765,6 +23794,7 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
             table,
             "terminal_receipt_json",
         )?,
+        terminal_at: run_row_optional_datetime_string(row, operation, table, "terminal_at")?,
         user_id: run_row_string(row, operation, table, "user_id")?,
         session_id: run_row_string(row, operation, table, "session_id")?,
         parent_run_id: run_row_optional_string(row, operation, table, "parent_run_id")?,
@@ -27248,6 +27278,7 @@ mod tests {
             opening_hash: None,
             context_admission_hash: None,
             terminal_receipt_json: None,
+            terminal_at: None,
             run_id: run_id.to_string(),
             session_id: "s1".into(),
             user_id: "u1".into(),
@@ -27418,6 +27449,46 @@ mod tests {
         assert!(
             opening.encode().is_err(),
             "two individually bounded columns cannot exceed the one aggregate budget"
+        );
+    }
+
+    #[test]
+    fn opening_captures_admitted_model_without_changing_original_frames() {
+        for (resolved, fallback, expected) in [
+            (json!("chosen"), json!("fallback"), Some("chosen")),
+            (json!(""), json!("fallback"), Some("fallback")),
+            (json!(" "), json!("fallback"), Some(" ")),
+            (json!("null"), json!("fallback"), Some("null")),
+            (json!(null), json!("模型-é"), Some("模型-é")),
+            (json!(123), json!("fallback"), Some("fallback")),
+            (json!(true), json!(null), None),
+        ] {
+            let event = make_event(
+                "run_started",
+                json!({
+                    "resolved_model_selection":{"model_name":resolved},
+                    "model_selection":{"model_name":fallback},
+                }),
+            );
+            let opening = DurableRunOpening::new(vec![event.clone()]).unwrap();
+            let encoded = opening.encode().unwrap();
+            assert_eq!(encoded.admitted_model_name.as_deref(), expected);
+            assert_eq!(
+                serde_json::from_str::<Vec<serde_json::Value>>(&encoded.events_json).unwrap(),
+                vec![event]
+            );
+        }
+        let long_model = "m".repeat(70_000);
+        let opening = DurableRunOpening::new(vec![make_event(
+            "run_started",
+            json!({
+                "model_selection":{"model_name":long_model},
+            }),
+        )])
+        .unwrap();
+        assert_eq!(
+            opening.encode().unwrap().admitted_model_name.as_deref(),
+            Some(long_model.as_str())
         );
     }
 
@@ -28532,6 +28603,7 @@ mod tests {
             self.fail_if_needed(column)?;
             Ok(match column {
                 "owner_lease_expires_at" => Some("2026-06-26 12:02:00".to_string()),
+                "terminal_at" => None,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -31013,6 +31085,7 @@ mod tests {
             "opening_hash",
             "context_admission_hash",
             "terminal_receipt_json",
+            "terminal_at",
             "work_id",
             "work_branch_id",
             "work_graph_revision",
@@ -31320,6 +31393,12 @@ mod tests {
 
             apply_in_memory_status_transition(&mut run, terminal, None, None, None)
                 .expect("idempotent terminal replay must succeed");
+            let committed_at = run
+                .terminal_at
+                .clone()
+                .expect("first terminal transition has a time");
+            apply_in_memory_status_transition(&mut run, terminal, None, None, None).unwrap();
+            assert_eq!(run.terminal_at.as_deref(), Some(committed_at.as_str()));
             let error =
                 apply_in_memory_status_transition(&mut run, STATUS_RUNNING, None, None, None)
                     .expect_err("terminal run must not resurrect");
@@ -41545,6 +41624,7 @@ mod tests {
                     opening_hash: None,
                     context_admission_hash: None,
                     terminal_receipt_json: None,
+                    terminal_at: None,
                     run_id: format!("run-{i}"),
                     session_id: "s1".into(),
                     user_id: "u1".into(),

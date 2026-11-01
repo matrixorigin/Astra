@@ -271,6 +271,14 @@ impl std::fmt::Debug for IngestionQueueReservation {
 pub struct IngestionEvent {
     pub event_id: String,
     pub session_id: String,
+    /// Observation correlation only; never execution or ownership authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    /// Root Journal turn number; child-local counters remain in producer scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_seq: Option<u32>,
     pub user_id: String,
     pub event_type: String,
     pub content: Option<String>,
@@ -443,6 +451,34 @@ impl IngestionEvent {
     }
 }
 
+/// Project the producer's existing scope, without promoting child-local turns.
+pub(crate) fn journal_observation_scope(
+    event: &crate::session_journal::JournalEvent,
+) -> (Option<&str>, Option<&str>, Option<u32>) {
+    fn nonempty(value: &str) -> Option<&str> {
+        (!value.trim().is_empty()).then_some(value)
+    }
+    let (run, parent) = if let Some(scope) = &event.producer_scope {
+        (
+            nonempty(&scope.run_id),
+            scope.parent_run_id.as_deref().and_then(nonempty),
+        )
+    } else {
+        let metadata = event.metadata.as_ref();
+        (
+            metadata
+                .and_then(|v| v.get("run_id"))
+                .and_then(Value::as_str)
+                .and_then(nonempty),
+            metadata
+                .and_then(|v| v.get("parent_run_id"))
+                .and_then(Value::as_str)
+                .and_then(nonempty),
+        )
+    };
+    (run, parent, event.turn.filter(|_| parent.is_none()))
+}
+
 fn merged_metadata_from_journal_event(
     event: &crate::session_journal::JournalEvent,
 ) -> Option<serde_json::Value> {
@@ -578,7 +614,9 @@ impl IngestionEvent {
             content
         };
 
-        let token_usage = canonical_token_usage_json_from_journal_event(event);
+        let token_usage =
+            canonical_token_usage_from_journal_event(event).map(CanonicalTokenUsage::to_json);
+        let (run_id, parent_run_id, turn_seq) = journal_observation_scope(event);
 
         let causal_chain_id = event
             .coordination
@@ -594,6 +632,9 @@ impl IngestionEvent {
         Ok(Self {
             event_id,
             session_id,
+            run_id: run_id.map(ToOwned::to_owned),
+            parent_run_id: parent_run_id.map(ToOwned::to_owned),
+            turn_seq,
             user_id: user_id.to_string(),
             event_type,
             content,
@@ -636,6 +677,7 @@ impl IngestionEvent {
         let session_id = main_event.session_id.clone();
         let uid = main_event.user_id.clone();
         let main_event_id = main_event.event_id.clone();
+        let (run_id, parent_run_id, turn_seq) = journal_observation_scope(event);
         let main_parent_event_id = main_event.parent_event_id.clone();
         let main_parent_event_ids = main_event.parent_event_ids.clone();
 
@@ -652,15 +694,15 @@ impl IngestionEvent {
                 let disposition = tc.effective_disposition();
                 let event_type = tc.canonical_terminal_event_type();
                 let index = i.to_string();
-                let tool_call_id = tc
+                let producer_tool_call_id = tc
                     .tool_call_id
                     .as_deref()
                     .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        stable_event_id(&["tool_call", &main_event_id, &index, &tool_name])
-                    });
+                    .filter(|value| !value.is_empty());
+                let synthetic_tool_call_id = producer_tool_call_id.is_none();
+                let tool_call_id = producer_tool_call_id.map(str::to_owned).unwrap_or_else(|| {
+                    stable_event_id(&["tool_call", &main_event_id, &index, &tool_name])
+                });
                 let tc_event_id =
                     stable_event_id(&[event_type, &main_event_id, &index, &tool_name]);
                 let raw_content = match disposition {
@@ -702,6 +744,11 @@ impl IngestionEvent {
                 }
                 metadata.insert("tool_name".into(), Value::String(tool_name.clone()));
                 metadata.insert("tool_call_id".into(), Value::String(tool_call_id));
+                if synthetic_tool_call_id {
+                    // Reflection keeps this stable local reference, but it is
+                    // not a producer identity for cross-source reconciliation.
+                    metadata.insert("tool_call_id_is_synthetic".into(), Value::Bool(true));
+                }
                 metadata.insert("ok".into(), Value::Bool(tc.ok));
                 metadata.insert("duration_ms".into(), Value::from(tc.ms));
                 metadata.insert(
@@ -739,6 +786,9 @@ impl IngestionEvent {
                 }
 
                 events.push(Self {
+                    run_id: run_id.map(ToOwned::to_owned),
+                    parent_run_id: parent_run_id.map(ToOwned::to_owned),
+                    turn_seq,
                     event_id: tc_event_id,
                     session_id: session_id.clone(),
                     user_id: uid.clone(),
@@ -1590,9 +1640,9 @@ fn ingestion_event_has_parent_edges(event: &IngestionEvent) -> bool {
 
 use astra_turn_types::CanonicalTokenUsage;
 
-fn canonical_token_usage_json_from_journal_event(
+pub(crate) fn canonical_token_usage_from_journal_event(
     event: &crate::session_journal::JournalEvent,
-) -> Option<Value> {
+) -> Option<CanonicalTokenUsage> {
     let no_counts = [
         event.tokens_in,
         event.tokens_out,
@@ -1611,7 +1661,7 @@ fn canonical_token_usage_json_from_journal_event(
         }
         // This field is only an unknown-sample witness, never another numeric
         // source. Invalid or contradictory witnesses quarantine all lanes.
-        return Some(serde_json::json!({}));
+        return CanonicalTokenUsage::new(None, None, None, None).ok();
     }
     if no_counts {
         return None;
@@ -1623,7 +1673,6 @@ fn canonical_token_usage_json_from_journal_event(
         event.tokens_out,
     )
     .ok()
-    .map(CanonicalTokenUsage::to_json)
 }
 
 #[derive(Debug)]
@@ -1643,11 +1692,11 @@ struct IngestionEventInsertValues<'a> {
 }
 
 #[derive(Debug, Default)]
-struct TokenUsageDbFields {
-    token_usage_json: Option<String>,
-    token_input: Option<i64>,
-    token_output: Option<i64>,
-    token_total: Option<i64>,
+pub(crate) struct TokenUsageDbFields {
+    pub(crate) token_usage_json: Option<String>,
+    pub(crate) token_input: Option<i64>,
+    pub(crate) token_output: Option<i64>,
+    pub(crate) token_total: Option<i64>,
 }
 
 impl<'a> IngestionEventInsertValues<'a> {
@@ -1700,7 +1749,7 @@ impl<'a> IngestionEventInsertValues<'a> {
         })
     }
 
-    fn nullable_shape(&self) -> [bool; 13] {
+    fn nullable_shape(&self) -> [bool; 16] {
         [
             self.event.content.is_some(),
             self.token_usage_json.is_some(),
@@ -1715,11 +1764,14 @@ impl<'a> IngestionEventInsertValues<'a> {
             self.token_input.is_some(),
             self.token_output.is_some(),
             self.token_total.is_some(),
+            self.event.run_id.is_some(),
+            self.event.parent_run_id.is_some(),
+            self.event.turn_seq.is_some(),
         ]
     }
 }
 
-fn canonical_token_usage_db_fields_or_null(
+pub(crate) fn canonical_token_usage_db_fields_or_null(
     usage: Option<CanonicalTokenUsage>,
 ) -> TokenUsageDbFields {
     let Some(usage) = usage else {
@@ -1830,7 +1882,7 @@ const INGESTION_EVENT_INSERT_PREFIX: &str = "INSERT IGNORE INTO agent_events \
       created_at, parent_event_id, causal_chain_id, \
       tool_call_id, meta_tool_name, meta_duration_ms, \
       token_input, token_output, token_total, payload_hash, \
-      ingestion_write_id) ";
+      ingestion_write_id, run_id, parent_run_id, turn_seq) ";
 
 async fn insert_ingestion_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -1864,7 +1916,10 @@ async fn insert_ingestion_rows(
             .push_bind(values.token_output)
             .push_bind(values.token_total)
             .push_bind(&values.payload_hash)
-            .push_bind(ingestion_write_id);
+            .push_bind(ingestion_write_id)
+            .push_bind(&event.run_id)
+            .push_bind(&event.parent_run_id)
+            .push_bind(event.turn_seq.map(i64::from));
     });
     builder.push(matrixone_null_shape_comment(
         values
@@ -2871,8 +2926,49 @@ impl EventIngestionWorker {
 mod tests {
     use super::*;
 
+    #[test]
+    fn journal_columns_keep_root_and_child_turn_namespaces_separate() {
+        use crate::session_journal::{JournalEvent, JournalProducerScope};
+        let root = JournalEvent::turn(
+            Some("session"),
+            4,
+            Some("model"),
+            "question",
+            "answer",
+            0,
+            10,
+            5,
+            1,
+        )
+        .with_cache_tokens(3, 2)
+        .with_run_id(Some("root"));
+        let projected = IngestionEvent::from_journal_event(&root, "owner").unwrap();
+        assert_eq!(projected.run_id.as_deref(), Some("root"));
+        assert_eq!(projected.turn_seq, Some(4));
+        let usage = IngestionEventInsertValues::from_event(&projected).unwrap();
+        assert_eq!(
+            (usage.token_input, usage.token_output, usage.token_total),
+            (Some(15), Some(5), Some(20))
+        );
+        let mut child = root;
+        child.producer_scope = Some(JournalProducerScope {
+            run_id: "child".into(),
+            parent_run_id: Some("root".into()),
+            agent_id: Some("agent".into()),
+            local_turn: Some(99),
+        });
+        // Even contradictory root-looking metadata cannot override typed scope.
+        let projected = IngestionEvent::from_journal_event(&child, "owner").unwrap();
+        assert_eq!(projected.run_id.as_deref(), Some("child"));
+        assert_eq!(projected.parent_run_id.as_deref(), Some("root"));
+        assert_eq!(projected.turn_seq, None);
+    }
+
     fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEvent {
         IngestionEvent {
+            run_id: None,
+            parent_run_id: None,
+            turn_seq: None,
             event_id: event_id.to_string(),
             session_id: session_id.to_string(),
             user_id: "test-user".to_string(),
@@ -4155,6 +4251,14 @@ mod tests {
             )
             .unwrap()
         );
+        assert!(
+            events[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("tool_call_id_is_synthetic")
+                .is_none()
+        );
         let redacted =
             IngestionEvent::expand_journal_event_with_redact(&journal, "user-1", true).unwrap();
         assert_eq!(
@@ -4327,6 +4431,12 @@ mod tests {
             IngestionEvent::expand_journal_event(&journal, "u1").expect("valid journal event");
         let tc_event = &events[1];
         let meta = tc_event.metadata.as_ref().unwrap();
+        assert_eq!(meta["tool_call_id_is_synthetic"], true);
+        assert!(
+            meta["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
         assert_eq!(meta["tool_name"], "bash");
         assert_eq!(meta["ok"], true);
         assert_eq!(meta["duration_ms"], 500);

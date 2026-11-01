@@ -177,10 +177,9 @@ pub use marketplace::{
     DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService,
 };
 pub use mcp_registry::{
-    DatabaseMcpRegistryService, McpBindingRequestData, McpDiscoveredToolData, McpRegisterRecord,
-    McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
-    McpRegistryService, McpServerRequestData, UnconfiguredMcpRegistryService,
-    mcp_binding_tool_namespace, mcp_schema_hash,
+    DatabaseMcpRegistryService, McpBindingRequestData, McpRegisterRecord, McpRegisterRequestData,
+    McpRegisteredBindingRecord, McpRegisteredToolRecord, McpRegistryService, McpServerRequestData,
+    UnconfiguredMcpRegistryService, mcp_binding_tool_namespace,
 };
 pub use model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestBudget, ModelRequestCache, ModelRequestCompaction,

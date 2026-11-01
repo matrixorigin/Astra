@@ -198,6 +198,21 @@ async fn unhealthy_state_matches_shared_contract() {
 }
 
 #[tokio::test]
+async fn retired_promotion_reports_have_no_http_route() {
+    let app = build_test_app(true);
+    for path in ["/audit/promotions", "/sessions/fixture/audit/promotions"] {
+        for headers in [vec![], vec![("authorization", "Bearer fixture-user")]] {
+            let response = app
+                .clone()
+                .oneshot(build_request("GET", path, &headers, body::Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {path}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn removed_learning_routes_are_not_public_contracts() {
     let app = build_test_app(true);
 
@@ -222,6 +237,11 @@ async fn retired_database_mutation_routes_cannot_execute_through_http() {
     let app = build_test_app(true);
     let payload = serde_json::json!({"name":"fixture_branch","source":"fixture_source","target":"fixture_target","operation":"merge","model":"fixture_model","session_count":2,"checkpoint_name":"fixture_checkpoint"});
     for (method, path) in [
+        ("POST", "/marketplace/credentials"),
+        (
+            "DELETE",
+            "/marketplace/credentials?skill_name=fixture&credential_name=fixture",
+        ),
         ("GET", "/context"),
         ("POST", "/context"),
         ("GET", "/context/snapshot"),

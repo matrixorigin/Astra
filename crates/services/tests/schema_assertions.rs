@@ -43,6 +43,8 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         "user_skill_versions",
         "session_state_items",
         "model_router_deployments",
+        "mcp_tools",
+        "skill_user_credentials",
     ] {
         assert!(
             column_names(&pool, &schema, retired).await.is_empty(),
@@ -64,7 +66,17 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             .any(|column| column == "referenced_by_state_items_count")
     );
     let run_columns = column_names(&pool, &schema, "agent_runs").await;
+    assert!(run_columns.iter().any(|column| column == "terminal_at"));
+    assert_eq!(
+        column_nullable(&pool, &schema, "agent_runs", "terminal_at").await,
+        Some(true)
+    );
+    assert_eq!(
+        column_nullable(&pool, &schema, "agent_run_openings", "admitted_model_name").await,
+        Some(true)
+    );
     for cold in [
+        "admitted_model_name",
         "opening_events_json",
         "opening_context_json",
         "checkpoint_json",

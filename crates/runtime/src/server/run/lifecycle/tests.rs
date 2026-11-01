@@ -28361,6 +28361,7 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
         opening_hash: None,
         context_admission_hash: None,
         terminal_receipt_json: None,
+        terminal_at: None,
         run_id: "run-long".to_string(),
         user_id: "user-1".to_string(),
         session_id: "session-1".to_string(),
