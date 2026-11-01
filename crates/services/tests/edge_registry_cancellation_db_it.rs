@@ -20,6 +20,9 @@ use tokio::task::{JoinHandle, JoinSet};
 enum Boundary {
     Begin,
     CurrentReadWrite,
+    AuditTools,
+    AuditApprovals,
+    AuditApprovalTerminator,
 }
 
 // Only the first matching exchange is gated. Requests reach the real database
@@ -90,13 +93,16 @@ impl ResponseProxy {
                                     // immediately followed by its COM_STMT_EXECUTE on
                                     // this serial checkout. Gate execution, not prepare.
                                     if payload.first() == Some(&0x16) {
-                                        current_read_prepared = payload[1..].starts_with(
-                                            b"UPDATE edge_agent_registry SET last_heartbeat_at = last_heartbeat_at"
-                                        );
+                                        current_read_prepared = match boundary {
+                                            Boundary::CurrentReadWrite => payload[1..].starts_with(b"UPDATE edge_agent_registry SET last_heartbeat_at = last_heartbeat_at"),
+                                            Boundary::AuditTools => payload[1..].starts_with(b"WITH selected_runs AS"),
+                                            Boundary::AuditApprovals | Boundary::AuditApprovalTerminator => payload[1..].starts_with(b"SELECT COUNT(CASE WHEN kind = 'approval_required'"),
+                                            Boundary::Begin => false,
+                                        };
                                     }
                                     let matches = match boundary {
                                         Boundary::Begin => payload == b"\x03BEGIN",
-                                        Boundary::CurrentReadWrite => {
+                                        Boundary::CurrentReadWrite | Boundary::AuditTools | Boundary::AuditApprovals | Boundary::AuditApprovalTerminator => {
                                             payload.first() == Some(&0x17) && current_read_prepared
                                         }
                                     };
@@ -109,12 +115,20 @@ impl ResponseProxy {
                                 Ok::<(), std::io::Error>(())
                             };
                             let responses = async move {
+                                let mut row_seen = false;
                                 loop {
                                     let bytes = packet(&mut server_read).await?;
-                                    if gate.pending.swap(false, Ordering::SeqCst) {
-                                        assert_eq!(bytes[4], 0, "gated SQL must succeed at the server");
+                                    let is_terminator = matches!(boundary, Boundary::AuditApprovalTerminator);
+                                    let should_hold = gate.pending.load(Ordering::SeqCst)
+                                        && (!is_terminator || (row_seen && matches!(bytes[4], 0xfe | 0x00)));
+                                    if should_hold && gate.pending.swap(false, Ordering::SeqCst) {
+                                        if matches!(boundary, Boundary::Begin | Boundary::CurrentReadWrite) {
+                                            assert_eq!(bytes[4], 0, "gated SQL must succeed at the server");
+                                        }
                                         gate.received.notify_one();
                                         gate.release.notified().await;
+                                    } else if is_terminator && gate.pending.load(Ordering::SeqCst) && bytes[4] == 0x00 {
+                                        row_seen = true;
                                     }
                                     client_write.write_all(&bytes).await?;
                                 }
@@ -241,4 +255,170 @@ async fn publication_cancelled_before_begin_ack_discards_connection() {
 #[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn publication_cancelled_after_row_write_releases_lock() {
     cancelled_publication(Boundary::CurrentReadWrite).await;
+}
+
+// Keep the protocol relay plaintext, even when the database advertises TLS.
+async fn audit_proxy_pool(
+    settings: &astra_core::MatrixOneSettings,
+    port: u16,
+) -> astra_core::SharedPool {
+    let mut direct = settings.clone();
+    direct.db_pool_max_connections = 1;
+    direct.db_pool_min_connections = 0;
+    let pool = astra_core::SharedPool::new(&direct).await.unwrap();
+    let initial = pool.get().acquire().await.unwrap();
+    pool.get().set_connect_options(
+        MySqlConnectOptions::new()
+            .host("127.0.0.1")
+            .port(port)
+            .username(&settings.user)
+            .password(&settings.password)
+            .database(&settings.database)
+            .ssl_mode(MySqlSslMode::Disabled),
+    );
+    initial.close().await.unwrap();
+    pool
+}
+
+// Pause a real SELECT response after its server-side execution. The independent
+// writer then commits while the public Audit read is consuming that statement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn audit_tool_snapshot_survives_concurrent_first_run_event() {
+    use astra_services::session_audit::{DatabaseSessionAuditService, SessionAuditService};
+    use astra_services::{DatabaseRunStateStore, RunStateStore};
+    use serde_json::json;
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_sessions (user_id,session_id,status,title) VALUES (?,?,'active','audit snapshot')")
+        .bind(&user).bind(&session).execute(shared.get()).await.unwrap();
+    let mut run = common::collaborator_fixture::record(&user, &session, None);
+    run.events = vec![json!({"event_type":"run_started","data":{}})];
+    let run_id = run.run_id.clone();
+    let store = DatabaseRunStateStore::new(shared.clone());
+    store.insert_run(run).await.unwrap();
+    sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,run_id,tool_call_id,meta_tool_name,metadata,payload_hash,ingestion_write_id) VALUES (?,?,?,'tool_call_completed',?,'call','bash',CAST('{}' AS JSON),?,?)")
+        .bind(uuid::Uuid::new_v4().to_string()).bind(&user).bind(&session).bind(&run_id)
+        .bind("a".repeat(64)).bind(uuid::Uuid::new_v4().to_string()).execute(shared.get()).await.unwrap();
+    let proxy =
+        ResponseProxy::start(settings.host.clone(), settings.port, Boundary::AuditTools).await;
+    let test_pool = audit_proxy_pool(&settings, proxy.port).await;
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(test_pool.clone());
+    let pending = tokio::spawn({
+        let audit = audit.clone();
+        let user = user.clone();
+        let session = session.clone();
+        async move { audit.get_tool_analytics(&user, &session).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), proxy.gate.received.notified())
+        .await
+        .expect("tool SELECT reached server");
+    store.append_events_batch(&user, &session, &run_id, &[
+        json!({"event_type":"tool_call","data":{"name":"bash","id":"call"}}),
+        json!({"event_type":"tool_call_end","data":{"name":"bash","id":"call","success":true}}),
+        json!({"event_type":"tool_call","data":{"name":"rg","id":"later-call"}}),
+        json!({"event_type":"tool_call_end","data":{"name":"rg","id":"later-call","success":true}}),
+    ]).await.unwrap();
+    proxy.gate.release.notify_one();
+    let during = pending.await.unwrap().unwrap();
+    let after = audit.get_tool_analytics(&user, &session).await.unwrap();
+    assert_eq!(during.len(), 1);
+    assert_eq!((during[0].name.as_str(), during[0].call_count), ("bash", 1));
+    assert_eq!(after.len(), 2);
+    assert_eq!(
+        after
+            .iter()
+            .find(|tool| tool.name == "bash")
+            .unwrap()
+            .call_count,
+        1
+    );
+    assert_eq!(
+        after
+            .iter()
+            .find(|tool| tool.name == "rg")
+            .unwrap()
+            .call_count,
+        1
+    );
+    test_pool.close().await;
+    drop(proxy);
+    for table in [
+        "agent_run_events",
+        "agent_run_openings",
+        "agent_runs",
+        "agent_session_lifecycle_fences",
+        "agent_events",
+        "agent_sessions",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ?"
+        )))
+        .bind(&user)
+        .execute(shared.get())
+        .await
+        .unwrap();
+    }
+}
+
+async fn cancelled_audit_approval_query(boundary: Boundary) {
+    use astra_services::session_audit::{DatabaseSessionAuditService, SessionAuditService};
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let user = uuid::Uuid::new_v4().to_string();
+    let session = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_sessions (user_id,session_id,status,title) VALUES (?,?,'active','audit cancellation')")
+        .bind(&user).bind(&session).execute(shared.get()).await.unwrap();
+    let proxy = ResponseProxy::start(settings.host.clone(), settings.port, boundary).await;
+    let pool = audit_proxy_pool(&settings, proxy.port).await;
+    let original: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+    let audit = DatabaseSessionAuditService::new(settings).with_pool(pool.clone());
+    let pending = tokio::spawn({
+        let user = user.clone();
+        let session = session.clone();
+        async move { audit.get_summary(&user, &session).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), proxy.gate.received.notified())
+        .await
+        .expect("approval SELECT reached server");
+    assert!(
+        !pending.is_finished(),
+        "reader must still be consuming the response"
+    );
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    let replacement: u64 = tokio::time::timeout(
+        Duration::from_secs(10),
+        sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(pool.get()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(
+        original, replacement,
+        "cancelled in-flight read must discard its connection"
+    );
+    proxy.gate.release.notify_one();
+    pool.close().await;
+    drop(proxy);
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+        .bind(&user)
+        .execute(shared.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn audit_approval_query_cancellation_releases_single_pool_slot() {
+    cancelled_audit_approval_query(Boundary::AuditApprovals).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn audit_approval_terminator_cancellation_releases_single_pool_slot() {
+    cancelled_audit_approval_query(Boundary::AuditApprovalTerminator).await;
 }

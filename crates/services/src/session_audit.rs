@@ -228,26 +228,15 @@ struct SessionAuditMetrics {
 
 /// Canonical lifecycle metrics from the durable run ledger.
 ///
-/// `agent_events` is a compatibility/session journal and may lag, duplicate,
-/// or omit child-run control events.  Once a session has durable run events,
-/// summary fields whose source of truth is run lifecycle must come from this
-/// aggregate instead of presenting a falsely healthy session.
+/// Physical and Run facts supply lifecycle counts and observation bounds.
+/// Approval counts are reconciled separately using their request identities.
 #[derive(Debug, Default)]
 struct SessionDurableMetrics {
     root_turn_count: u32,
     models_used: Vec<String>,
     error_count: u32,
-    approval_required_count: u32,
-    approval_decision_count: u32,
-    approval_timeout_count: u32,
     first_at: Option<String>,
     last_at: Option<String>,
-}
-
-impl SessionDurableMetrics {
-    fn has_events(&self) -> bool {
-        self.first_at.is_some() || self.last_at.is_some()
-    }
 }
 
 fn session_durable_metrics_from_row(
@@ -264,21 +253,6 @@ fn session_durable_metrics_from_row(
             })
             .unwrap_or_default(),
         error_count: audit_row_u32(row, "durable_summary_metrics", "error_count")?,
-        approval_required_count: audit_row_u32(
-            row,
-            "durable_summary_metrics",
-            "approval_required_count",
-        )?,
-        approval_decision_count: audit_row_u32(
-            row,
-            "durable_summary_metrics",
-            "approval_decision_count",
-        )?,
-        approval_timeout_count: audit_row_u32(
-            row,
-            "durable_summary_metrics",
-            "approval_timeout_count",
-        )?,
         first_at: audit_row_optional_string(row, "durable_summary_metrics", "first_at")?,
         last_at: audit_row_optional_string(row, "durable_summary_metrics", "last_at")?,
     })
@@ -293,17 +267,6 @@ fn merge_session_durable_metrics(
         if !metrics.models_used.contains(model) {
             metrics.models_used.push(model.clone());
         }
-    }
-    // A non-empty durable stream is authoritative for these lifecycle
-    // counters.  The legacy journal can contain compatibility duplicates
-    // (for example one approval decision per transport plus one per run),
-    // and it can retain stale nonzero values when the durable stream contains
-    // only run-start/terminal events.  Use the stream's timestamp aggregate
-    // as the explicit presence bit rather than treating zero as "missing".
-    if durable.has_events() {
-        metrics.approval_required_count = durable.approval_required_count;
-        metrics.approval_decision_count = durable.approval_decision_count;
-        metrics.approval_timeout_count = durable.approval_timeout_count;
     }
     metrics.error_count = metrics
         .error_count
@@ -1141,187 +1104,112 @@ fn tool_scope_sql(
     }
 }
 
-fn journal_tool_query(
-    user: &str,
-    sessions: Option<&[&str]>,
-    since: Option<&str>,
-    until: Option<&str>,
-) -> sqlx::QueryBuilder<MySql> {
-    let mut sql = sqlx::QueryBuilder::new(
-        "WITH selected_runs AS (SELECT DISTINCT BINARY d.session_id AS session_key, BINARY d.run_id AS run_key FROM agent_run_events d WHERE ",
-    );
-    tool_scope_sql(&mut sql, "d", user, sessions, since, until);
-    sql.push(" AND d.event_type IN ('tool_call', 'tool_call_end', 'tool_transport_failed')) ");
-    sql
-}
-
+// Classification and reduction use one statement snapshot so a concurrent
+// Run append cannot move a Journal row between partitions during a read.
 const JOURNAL_TOOL_MATCHABLE: &str = "d.run_key IS NOT NULL AND e.run_id IS NOT NULL AND e.tool_call_id IS NOT NULL AND e.tool_call_id != '' AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(e.metadata, '$.tool_call_id_is_synthetic')), 'false') != 'true'";
 const JOURNAL_TOOL_JOIN: &str = " FROM agent_events e LEFT JOIN selected_runs d ON d.session_key = BINARY e.session_id AND d.run_key = BINARY e.run_id WHERE ";
 
-async fn load_tool_totals(
+// Count physical approval facts and independent Journal facts in one snapshot.
+async fn load_approval_counts(
     pool: &Pool<MySql>,
     user: &str,
     sessions: Option<&[&str]>,
     since: Option<&str>,
     until: Option<&str>,
-    include_error_evidence: bool,
-) -> AuditResult<BTreeMap<String, BTreeMap<String, ToolTotals>>> {
-    use futures_util::TryStreamExt;
-    if sessions.is_some_and(|ids| ids.is_empty()) {
-        return Ok(BTreeMap::new());
+) -> AuditResult<(u32, u32, u32)> {
+    let mut sql = sqlx::QueryBuilder::<MySql>::new(
+        "SELECT COUNT(CASE WHEN kind = 'approval_required' THEN 1 END) AS required_count, \
+         COUNT(CASE WHEN kind = 'approval_decision' THEN 1 END) AS decision_count, \
+         COUNT(CASE WHEN kind = 'approval_timeout' THEN 1 END) AS timeout_count FROM (\
+         SELECT CASE WHEN p.event_type = 'approval_resolved' THEN 'approval_decision' ELSE p.event_type END AS kind \
+         FROM agent_run_events p WHERE ",
+    );
+    tool_scope_sql(&mut sql, "p", user, sessions, since, until);
+    sql.push(" AND p.event_type IN ('approval_required','approval_resolved','approval_timeout') UNION ALL \
+        SELECT e.event_type FROM agent_events e WHERE ");
+    tool_scope_sql(&mut sql, "e", user, sessions, since, until);
+    sql.push(" AND e.event_type IN ('approval_required','approval_decision','approval_timeout') AND NOT EXISTS (\
+        SELECT 1 FROM agent_run_events p WHERE p.user_id = e.user_id AND p.session_id = e.session_id \
+        AND BINARY p.user_id = BINARY e.user_id AND BINARY p.session_id = BINARY e.session_id \
+        AND (e.run_id IS NULL OR BINARY p.run_id = BINARY e.run_id) \
+        AND (JSON_EXTRACT(e.metadata, '$.approval.run_id') IS NULL OR JSON_TYPE(JSON_EXTRACT(e.metadata, '$.approval.run_id')) = 'NULL' OR (JSON_TYPE(JSON_EXTRACT(e.metadata, '$.approval.run_id')) = 'STRING' AND JSON_EXTRACT(e.metadata, '$.approval.run_id') = JSON_EXTRACT(JSON_ARRAY(p.run_id), '$[0]'))) \
+        AND (e.run_id IS NOT NULL OR JSON_TYPE(JSON_EXTRACT(e.metadata, '$.approval.run_id')) = 'STRING') \
+        AND JSON_TYPE(JSON_EXTRACT(e.metadata, '$.approval.request_id')) = 'STRING' AND JSON_EXTRACT(e.metadata, '$.approval.request_id') = JSON_EXTRACT(JSON_ARRAY(p.interaction_request_id), '$[0]') \
+        AND p.interaction_request_id != '' AND ((e.event_type = 'approval_decision' AND p.event_type = 'approval_resolved') OR (e.event_type = p.event_type AND e.event_type IN ('approval_required','approval_timeout'))) ");
+    if let Some(since) = since {
+        sql.push(" AND p.created_at >= ").push_bind(since);
     }
-    let mut totals = BTreeMap::<String, BTreeMap<String, ToolTotals>>::new();
+    if let Some(until) = until {
+        sql.push(" AND p.created_at <= ").push_bind(until);
+    }
+    sql.push(") ) facts");
     let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
         .await
         .map_err(internal_error)?;
-    // Definitely independent Journal facts stay grouped in the database.
-    let mut sql = journal_tool_query(user, sessions, since, until);
-    sql.push("SELECT e.session_id, COALESCE(e.meta_tool_name, '') AS tool_name, COUNT(*) AS total_calls, COUNT(CASE WHEN e.event_type = 'tool_call_completed' THEN 1 END) AS total_success, COUNT(CASE WHEN e.event_type = 'tool_call_failed' THEN 1 END) AS total_failures, COALESCE(AVG(e.meta_duration_ms), 0) AS avg_ms, COALESCE(MAX(e.meta_duration_ms), 0) AS max_ms, CAST(COALESCE(SUM(e.meta_duration_ms), 0) AS SIGNED) AS total_duration_ms, COUNT(e.meta_duration_ms) AS duration_samples, ");
-    if include_error_evidence {
-        // Select the error's ID with its original timestamp and binary tie-break.
-        // Putting the timestamp inside CASE would lose fractional precision.
-        sql.push("MAX_BY_NON_NULL(CASE WHEN e.event_type = 'tool_call_failed' AND e.content IS NOT NULL AND e.content != '' THEN e.event_id END, e.created_at, CAST(e.event_id AS BINARY)) AS error_event_id, CAST(MAX(CASE WHEN e.event_type = 'tool_call_failed' AND e.content IS NOT NULL AND e.content != '' THEN e.created_at END) AS CHAR) AS error_at");
-    } else {
-        sql.push("NULL AS error_event_id, NULL AS error_at");
-    }
-    sql.push(JOURNAL_TOOL_JOIN);
-    tool_scope_sql(&mut sql, "e", user, sessions, since, until);
-    sql.push(" AND e.event_type IN ('tool_call_completed', 'tool_call_failed') AND NOT (")
-        .push(JOURNAL_TOOL_MATCHABLE)
-        .push(") GROUP BY e.session_id, e.meta_tool_name");
-    let mut rows = sql.build().fetch(connection.connection_mut());
-    while let Some(row) = rows.try_next().await.map_err(internal_error)? {
-        let decoded = tool_analytics_from_row(&row, &HashMap::new())?;
-        let raw_name = audit_row_string(&row, "journal_tool_group", "tool_name")?;
-        let name = if raw_name.trim().is_empty() {
-            String::new()
-        } else {
-            decoded.name
-        };
-        let session = audit_row_string(&row, "journal_tool_group", "session_id")?;
-        let mut group = ToolTotals {
-            calls: u64::from(decoded.call_count),
-            successes: u64::from(decoded.success_count),
-            failures: u64::from(decoded.fail_count),
-            duration_ms: decoded.total_duration_ms,
-            duration_samples: audit_row_u64(&row, "journal_tool_group", "duration_samples")?,
-            max_duration_ms: decoded.max_duration_ms,
-            sessions: HashSet::from([session.clone()]),
-            ..Default::default()
-        };
-        if let Some(event) =
-            audit_row_optional_string(&row, "journal_tool_group", "error_event_id")?
+    let rows = sql
+        .build()
+        .fetch_all(connection.connection_mut())
+        .await
+        .map_err(internal_error)?;
+    connection.release();
+    let row = rows
+        .first()
+        .ok_or_else(|| internal_error("approval aggregate returned no row"))?;
+    Ok((
+        audit_row_u32(row, "approvals", "required_count")?,
+        audit_row_u32(row, "approvals", "decision_count")?,
+        audit_row_u32(row, "approvals", "timeout_count")?,
+    ))
+}
+
+fn merge_tool_run(
+    totals: &mut BTreeMap<String, BTreeMap<String, ToolTotals>>,
+    candidates: &mut HashMap<(String, String, String), Vec<JournalToolObservation>>,
+    rows: &[DurableToolLedgerRow],
+    include_error_evidence: bool,
+) -> AuditResult<()> {
+    let Some(first) = rows.first() else {
+        return Ok(());
+    };
+    let session = first.session_id.clone();
+    let calls = durable_tool_observations_from_ledger_rows(rows)?;
+    let session_totals = totals.entry(session.clone()).or_default();
+    for call in calls {
+        let journal = call
+            .call_id
+            .as_ref()
+            .and_then(|id| candidates.remove(&(session.clone(), call.run_id.clone(), id.clone())));
+        let mut contribution =
+            ToolTotals::from_call(session.clone(), &call, include_error_evidence);
+        if call.outcome == ToolOutcome::Unknown
+            && let Some(journal) = journal.as_ref().and_then(|rows| rows.first())
         {
-            group.latest_error = Some((
-                audit_row_string(&row, "journal_tool_group", "error_at")?,
-                event,
-                None,
-            ));
-        }
-        totals
-            .entry(session)
-            .or_default()
-            .entry(name)
-            .or_default()
-            .merge(group)?;
-    }
-    drop(rows);
-    // Only potentially shared identities cross the wire individually. The
-    // canonical pairer remains the sole interpreter of durable tool lifecycle.
-    let mut sql = journal_tool_query(user, sessions, since, until);
-    sql.push("SELECT e.session_id, e.run_id, e.tool_call_id, e.event_id, e.event_type, e.meta_tool_name, e.meta_duration_ms, CAST(e.created_at AS CHAR) AS created_at, ");
-    if include_error_evidence {
-        sql.push("e.content IS NOT NULL AND e.content != '' AS has_content");
-    } else {
-        sql.push("FALSE AS has_content");
-    }
-    sql.push(JOURNAL_TOOL_JOIN);
-    tool_scope_sql(&mut sql, "e", user, sessions, since, until);
-    sql.push(" AND e.event_type IN ('tool_call_completed', 'tool_call_failed') AND (")
-        .push(JOURNAL_TOOL_MATCHABLE)
-        .push(") ORDER BY e.created_at DESC, BINARY e.event_id DESC");
-    let mut rows = sql.build().fetch(connection.connection_mut());
-    let mut candidates = HashMap::<(String, String, String), Vec<JournalToolObservation>>::new();
-    while let Some(row) = rows.try_next().await.map_err(internal_error)? {
-        let session = audit_row_string(&row, "journal_tool_candidate", "session_id")?;
-        let run = audit_row_string(&row, "journal_tool_candidate", "run_id")?;
-        let call = audit_row_string(&row, "journal_tool_candidate", "tool_call_id")?;
-        let name = audit_row_optional_string(&row, "journal_tool_candidate", "meta_tool_name")?
-            .filter(|name| !name.trim().is_empty())
-            .map(normalize_tool_name)
-            .unwrap_or_default();
-        let succeeded = audit_row_string(&row, "journal_tool_candidate", "event_type")?
-            == "tool_call_completed";
-        let duration = row
-            .optional_i64_column("meta_duration_ms")
-            .map_err(internal_error)?
-            .map(|value| {
-                u64::try_from(value).map_err(|_| internal_error("negative Journal tool duration"))
-            })
-            .transpose()?;
-        let at = audit_row_string(&row, "journal_tool_candidate", "created_at")?;
-        let failure = if include_error_evidence
-            && !succeeded
-            && audit_row_i64(&row, "journal_tool_candidate", "has_content")? != 0
-        {
-            Some((
-                at.clone(),
-                audit_row_string(&row, "journal_tool_candidate", "event_id")?,
-                None,
-            ))
-        } else {
-            None
-        };
-        candidates
-            .entry((session, run, call))
-            .or_default()
-            .push(JournalToolObservation {
-                name,
-                succeeded,
-                duration_ms: duration,
-                failure,
-            });
-    }
-    drop(rows);
-    // Reduce and release each Run before reading the next. Only potentially
-    // shared Journal identities need to survive across the durable stream.
-    stream_tool_ledger_observations(
-        connection.connection_mut(),
-        user,
-        sessions,
-        None,
-        since,
-        until,
-        |session, calls| {
-            let session_totals = totals.entry(session.clone()).or_default();
-            for call in calls {
-                let journal = call.call_id.as_ref().and_then(|id| {
-                    candidates.remove(&(session.clone(), call.run_id.clone(), id.clone()))
-                });
-                let mut contribution =
-                    ToolTotals::from_call(session.clone(), &call, include_error_evidence);
-                if call.outcome == ToolOutcome::Unknown
-                    && let Some(journal) = journal.as_ref().and_then(|rows| rows.first())
-                {
-                    contribution.successes = u64::from(journal.succeeded);
-                    contribution.failures = u64::from(!journal.succeeded);
-                    if let Some(duration) = journal.duration_ms {
-                        contribution.duration_ms = duration;
-                        contribution.max_duration_ms = duration;
-                        contribution.duration_samples = 1;
-                    }
-                    contribution.latest_error = journal.failure.clone();
-                }
-                session_totals
-                    .entry(call.name)
-                    .or_default()
-                    .merge(contribution)?;
+            contribution.successes = u64::from(journal.succeeded);
+            contribution.failures = u64::from(!journal.succeeded);
+            if let Some(duration) = journal.duration_ms {
+                contribution.duration_ms = duration;
+                contribution.max_duration_ms = duration;
+                contribution.duration_samples = 1;
             }
-            Ok(())
-        },
-    )
-    .await?;
-    for ((session, _, _), observations) in candidates {
+            contribution.latest_error = journal.failure.clone();
+        }
+        session_totals
+            .entry(call.name)
+            .or_default()
+            .merge(contribution)?;
+    }
+    Ok(())
+}
+
+fn flush_tool_run(
+    totals: &mut BTreeMap<String, BTreeMap<String, ToolTotals>>,
+    candidates: &mut HashMap<(String, String, String), Vec<JournalToolObservation>>,
+    rows: &mut Vec<DurableToolLedgerRow>,
+    include_error_evidence: bool,
+) -> AuditResult<()> {
+    merge_tool_run(totals, candidates, rows, include_error_evidence)?;
+    rows.clear();
+    for ((session, _, _), observations) in candidates.drain() {
         let session_totals = totals.entry(session.clone()).or_default();
         for observation in observations {
             session_totals
@@ -1339,6 +1227,189 @@ async fn load_tool_totals(
                 })?;
         }
     }
+    Ok(())
+}
+
+async fn load_tool_totals(
+    pool: &Pool<MySql>,
+    user: &str,
+    sessions: Option<&[&str]>,
+    since: Option<&str>,
+    until: Option<&str>,
+    include_error_evidence: bool,
+) -> AuditResult<BTreeMap<String, BTreeMap<String, ToolTotals>>> {
+    use futures_util::TryStreamExt;
+    if sessions.is_some_and(|ids| ids.is_empty()) {
+        return Ok(BTreeMap::new());
+    }
+    let mut totals = BTreeMap::<String, BTreeMap<String, ToolTotals>>::new();
+    let mut connection = crate::CancellationSafePoolConnection::acquire(pool)
+        .await
+        .map_err(internal_error)?;
+    // All three branches observe the same statement snapshot. Journal-only
+    // rows remain grouped; matched identities are reconciled with Run facts.
+    let mut sql = sqlx::QueryBuilder::<MySql>::new(
+        "WITH selected_runs AS (SELECT DISTINCT BINARY d.session_id AS session_key, BINARY d.run_id AS run_key FROM agent_run_events d WHERE ",
+    );
+    tool_scope_sql(&mut sql, "d", user, sessions, since, until);
+    sql.push(" AND d.event_type IN ('tool_call','tool_call_end','tool_transport_failed')) \
+        SELECT 2 AS kind, p.session_id, p.run_id, p.event_idx, p.event_type, p.payload_json, CAST(p.created_at AS CHAR) AS created_at, \
+        CAST(NULL AS CHAR) AS tool_call_id, p.id AS event_id, CAST(NULL AS CHAR) AS tool_name, \
+        0 AS meta_duration_ms, 0 AS has_content, 0 AS total_calls, 0 AS total_success, \
+        0 AS total_failures, 0 AS avg_ms, 0 AS max_ms, 0 AS total_duration_ms, 0 AS duration_samples, \
+        CAST(NULL AS CHAR) AS error_event_id, CAST(NULL AS CHAR) AS error_at FROM agent_run_events p WHERE ");
+    tool_scope_sql(&mut sql, "p", user, sessions, since, until);
+    sql.push(" AND p.event_type IN ('tool_call','tool_call_end','tool_transport_failed') UNION ALL \
+        SELECT 0, e.session_id, NULL, 0, NULL, NULL, NULL, NULL, NULL, COALESCE(e.meta_tool_name, ''), NULL, 0, \
+        COUNT(*), COUNT(CASE WHEN e.event_type = 'tool_call_completed' THEN 1 END), \
+        COUNT(CASE WHEN e.event_type = 'tool_call_failed' THEN 1 END), COALESCE(AVG(e.meta_duration_ms),0), \
+        COALESCE(MAX(e.meta_duration_ms),0), CAST(COALESCE(SUM(e.meta_duration_ms),0) AS SIGNED), COUNT(e.meta_duration_ms), ");
+    if include_error_evidence {
+        sql.push("MAX_BY_NON_NULL(CASE WHEN e.event_type = 'tool_call_failed' AND e.content IS NOT NULL AND e.content != '' THEN e.event_id END, e.created_at, CAST(e.event_id AS BINARY)), CAST(MAX(CASE WHEN e.event_type = 'tool_call_failed' AND e.content IS NOT NULL AND e.content != '' THEN e.created_at END) AS CHAR)");
+    } else {
+        sql.push("NULL, NULL");
+    }
+    sql.push(JOURNAL_TOOL_JOIN);
+    tool_scope_sql(&mut sql, "e", user, sessions, since, until);
+    sql.push(" AND e.event_type IN ('tool_call_completed','tool_call_failed') AND NOT (")
+        .push(JOURNAL_TOOL_MATCHABLE).push(") GROUP BY e.session_id, e.meta_tool_name UNION ALL \
+        SELECT 1, e.session_id, e.run_id, 0, e.event_type, NULL, CAST(e.created_at AS CHAR), e.tool_call_id, e.event_id, \
+        e.meta_tool_name, e.meta_duration_ms, ");
+    if include_error_evidence {
+        sql.push("e.content IS NOT NULL AND e.content != ''");
+    } else {
+        sql.push("FALSE");
+    }
+    sql.push(", 0,0,0,0,0,0,0,NULL,NULL")
+        .push(JOURNAL_TOOL_JOIN);
+    tool_scope_sql(&mut sql, "e", user, sessions, since, until);
+    sql.push(" AND e.event_type IN ('tool_call_completed','tool_call_failed') AND (")
+        .push(JOURNAL_TOOL_MATCHABLE)
+        .push(
+            ") ORDER BY BINARY session_id, BINARY run_id, kind, event_idx, created_at DESC, BINARY event_id DESC",
+        );
+    let mut rows = sql.build().fetch(connection.connection_mut());
+    let mut candidates = HashMap::<(String, String, String), Vec<JournalToolObservation>>::new();
+    let mut run_rows = Vec::<DurableToolLedgerRow>::new();
+    let mut active_run: Option<(String, String)> = None;
+    while let Some(row) = rows.try_next().await.map_err(internal_error)? {
+        let kind = audit_row_i64(&row, "tool_stream", "kind")?;
+        if kind != 0 {
+            let current = (
+                audit_row_string(&row, "tool_stream", "session_id")?,
+                audit_row_string(&row, "tool_stream", "run_id")?,
+            );
+            if active_run
+                .as_ref()
+                .is_some_and(|previous| previous != &current)
+            {
+                flush_tool_run(
+                    &mut totals,
+                    &mut candidates,
+                    &mut run_rows,
+                    include_error_evidence,
+                )?;
+            }
+            active_run = Some(current);
+        }
+        match kind {
+            0 => {
+                let decoded = tool_analytics_from_row(&row, &HashMap::new())?;
+                let raw_name = audit_row_string(&row, "journal_tool_group", "tool_name")?;
+                let name = if raw_name.trim().is_empty() {
+                    String::new()
+                } else {
+                    decoded.name
+                };
+                let session = audit_row_string(&row, "journal_tool_group", "session_id")?;
+                let mut group = ToolTotals {
+                    calls: u64::from(decoded.call_count),
+                    successes: u64::from(decoded.success_count),
+                    failures: u64::from(decoded.fail_count),
+                    duration_ms: decoded.total_duration_ms,
+                    duration_samples: audit_row_u64(
+                        &row,
+                        "journal_tool_group",
+                        "duration_samples",
+                    )?,
+                    max_duration_ms: decoded.max_duration_ms,
+                    sessions: HashSet::from([session.clone()]),
+                    ..Default::default()
+                };
+                if let Some(event) =
+                    audit_row_optional_string(&row, "journal_tool_group", "error_event_id")?
+                {
+                    group.latest_error = Some((
+                        audit_row_string(&row, "journal_tool_group", "error_at")?,
+                        event,
+                        None,
+                    ));
+                }
+                totals
+                    .entry(session)
+                    .or_default()
+                    .entry(name)
+                    .or_default()
+                    .merge(group)?;
+            }
+            1 => {
+                let session = audit_row_string(&row, "journal_tool_candidate", "session_id")?;
+                let run = audit_row_string(&row, "journal_tool_candidate", "run_id")?;
+                let call = audit_row_string(&row, "journal_tool_candidate", "tool_call_id")?;
+                let name = audit_row_optional_string(&row, "journal_tool_candidate", "tool_name")?
+                    .filter(|name| !name.trim().is_empty())
+                    .map(normalize_tool_name)
+                    .unwrap_or_default();
+                let succeeded = audit_row_string(&row, "journal_tool_candidate", "event_type")?
+                    == "tool_call_completed";
+                // MatrixOne resolves the UNION duration column as VARCHAR
+                // when the other branches carry NULL; preserve missing values.
+                let duration = row
+                    .optional_string_column("meta_duration_ms")
+                    .map_err(internal_error)?
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| internal_error("invalid Journal tool duration"))
+                    })
+                    .transpose()?;
+                let at = audit_row_string(&row, "journal_tool_candidate", "created_at")?;
+                let failure = if include_error_evidence
+                    && !succeeded
+                    && audit_row_i64(&row, "journal_tool_candidate", "has_content")? != 0
+                {
+                    Some((
+                        at.clone(),
+                        audit_row_string(&row, "journal_tool_candidate", "event_id")?,
+                        None,
+                    ))
+                } else {
+                    None
+                };
+                candidates
+                    .entry((session, run, call))
+                    .or_default()
+                    .push(JournalToolObservation {
+                        name,
+                        succeeded,
+                        duration_ms: duration,
+                        failure,
+                    });
+            }
+            2 => {
+                let row = durable_tool_ledger_row(&row)?;
+                run_rows.push(row);
+            }
+            _ => return Err(internal_error("unexpected tool stream kind")),
+        }
+    }
+    flush_tool_run(
+        &mut totals,
+        &mut candidates,
+        &mut run_rows,
+        include_error_evidence,
+    )?;
+    drop(rows);
     connection.release();
     Ok(totals)
 }
@@ -3776,9 +3847,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'execution_boundary_opened' THEN 1 END) AS execution_boundary_opened_count, \
                COUNT(CASE WHEN event_type = 'execution_boundary_committed' THEN 1 END) AS execution_boundary_committed_count, \
                COUNT(CASE WHEN event_type = 'execution_boundary_aborted' THEN 1 END) AS execution_boundary_aborted_count, \
-               COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) AS approval_required_count, \
-               COUNT(CASE WHEN event_type = 'approval_decision' THEN 1 END) AS approval_decision_count, \
-               COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) AS approval_timeout_count, \
+               0 AS approval_required_count, \
+               0 AS approval_decision_count, \
+               0 AS approval_timeout_count, \
                0 AS tool_calls_total, \
                0 AS tool_calls_failed, \
                CAST(COALESCE(SUM(CASE WHEN event_type IN ('turn', 'user_query', 'llm_response') AND token_usage IS NOT NULL \
@@ -3815,7 +3886,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
             r#"
             SELECT r.root_turn_count, r.models_concat,
               p.error_count + r.failed_count AS error_count,
-              p.approval_required_count, p.approval_decision_count, p.approval_timeout_count,
               CAST(CASE WHEN p.first_at IS NULL THEN r.first_at
                    WHEN r.first_at IS NULL THEN p.first_at ELSE LEAST(p.first_at, r.first_at) END AS CHAR) AS first_at,
               CAST(CASE WHEN p.last_at IS NULL THEN r.last_at
@@ -3823,9 +3893,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
             FROM (
               SELECT
                 COUNT(CASE WHEN event_type IN ('run_error', 'tool_transport_failed') THEN 1 END) AS error_count,
-                COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) AS approval_required_count,
-                COUNT(CASE WHEN event_type = 'approval_resolved' THEN 1 END) AS approval_decision_count,
-                COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) AS approval_timeout_count,
                 CAST(MIN(created_at) AS CHAR) AS first_at, CAST(MAX(created_at) AS CHAR) AS last_at
               FROM agent_run_events WHERE session_id = ? AND user_id = ?
             ) p CROSS JOIN (
@@ -3853,6 +3920,11 @@ impl SessionAuditService for DatabaseSessionAuditService {
             load_tool_totals(&pool, user_id, Some(&[session_id]), None, None, false).await?,
         )?;
         merge_session_durable_metrics(&mut metrics, durable_metrics)?;
+        (
+            metrics.approval_required_count,
+            metrics.approval_decision_count,
+            metrics.approval_timeout_count,
+        ) = load_approval_counts(&pool, user_id, Some(&[session_id]), None, None).await?;
         (metrics.tool_calls_total, metrics.tool_calls_failed) = tool_counts(&tools)?;
         let duration_secs =
             compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
@@ -4321,17 +4393,17 @@ impl SessionAuditService for DatabaseSessionAuditService {
             COUNT(CASE WHEN e.event_type = 'execution_boundary_opened' THEN 1 END) AS boundaries_opened,
             COUNT(CASE WHEN e.event_type = 'execution_boundary_committed' THEN 1 END) AS boundaries_committed,
             COUNT(CASE WHEN e.event_type = 'execution_boundary_aborted' THEN 1 END) AS boundaries_aborted,
-            COUNT(CASE WHEN e.event_type = 'approval_required' THEN 1 END) AS approval_required,
-            COUNT(CASE WHEN e.event_type = 'approval_decision' THEN 1 END) AS approval_decisions,
-            COUNT(CASE WHEN e.event_type = 'approval_timeout' THEN 1 END) AS approval_timeouts
+            0 AS approval_required,
+            0 AS approval_decisions,
+            0 AS approval_timeouts
             FROM agent_events e WHERE {where_clause} GROUP BY e.session_id
             UNION ALL
             SELECT p.session_id, 0, 0, 0, 0, 0,
             COUNT(CASE WHEN p.event_type IN ('run_error', 'tool_transport_failed') THEN 1 END),
             0, 0, 0, 0,
-            COUNT(CASE WHEN p.event_type = 'approval_required' THEN 1 END),
-            COUNT(CASE WHEN p.event_type = 'approval_resolved' THEN 1 END),
-            COUNT(CASE WHEN p.event_type = 'approval_timeout' THEN 1 END)
+            0,
+            0,
+            0
             FROM agent_run_events p WHERE {physical_where} GROUP BY p.session_id
             UNION ALL
             SELECT r.session_id, COUNT(CASE WHEN r.parent_run_id IS NULL THEN 1 END),
@@ -4355,6 +4427,11 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .await
             .map_err(internal_error)?;
         let mut counters = cross_session_stats_counters_from_row(&aggregate)?;
+        (
+            counters.total_approval_required,
+            counters.total_approval_decisions,
+            counters.total_approval_timeouts,
+        ) = load_approval_counts(&pool, user_id, None, since.as_deref(), until.as_deref()).await?;
         let tools = combine_tool_sessions(
             load_tool_totals(
                 &pool,
@@ -5091,9 +5168,6 @@ mod tests {
             &mut metrics,
             SessionDurableMetrics {
                 error_count: 4,
-                approval_required_count: 8,
-                approval_decision_count: 8,
-                approval_timeout_count: 0,
                 first_at: Some("2026-06-26 11:59:59".into()),
                 last_at: Some("2026-06-26 12:01:09".into()),
                 ..Default::default()
@@ -5102,8 +5176,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(metrics.error_count, 4);
-        assert_eq!(metrics.approval_required_count, 8);
-        assert_eq!(metrics.approval_decision_count, 8);
+        assert_eq!(metrics.approval_required_count, 15);
+        assert_eq!(metrics.approval_decision_count, 15);
         assert_eq!(metrics.first_at.as_deref(), Some("2026-06-26 11:59:59"));
         assert_eq!(metrics.last_at.as_deref(), Some("2026-06-26 12:01:09"));
     }

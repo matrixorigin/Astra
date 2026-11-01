@@ -690,8 +690,12 @@ returned length, rather than an uncapped global count. Aggregate receipt counts
 assume receipts written by their canonical owner; selected corrupt receipts fail
 strict list decoding. Independent Journal rows are grouped in SQL; only potentially shared
 identities are streamed individually, and error text is fetched for winning
-error IDs with the existing preview cap. Source reads are sequential and may
-observe concurrent progress; they are not an atomic lifecycle snapshot.
+error IDs with the existing preview cap. Approval facts reconcile by owner, Session, Run, request and event kind;
+unidentified or conflicting Journal facts remain independent. Tool Journal
+partitions and physical tool events share one statement snapshot, so a concurrent
+append cannot count one Journal fact twice. Overall observation reads are
+sequential and may observe concurrent progress; they are not an atomic lifecycle
+snapshot.
 
 This does not add derived writes for embedded tool records in serialized CLI
 outbox turns. The raw Journal remains intact; complete tool-level reporting for
