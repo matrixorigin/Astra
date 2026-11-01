@@ -1046,6 +1046,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     Some("provider_schema_validation") => Some(
                         astra_services::session_journal::ToolPreDispatchRejection::ProviderSchemaValidation,
                     ),
+                    _ if !rec.ok
+                        && rec.disposition == Some(ToolCallDisposition::Rejected)
+                        && rec.error_kind == Some(astra_core::ErrorKind::ToolUnavailable)
+                        && fields.get("execution_started").and_then(Value::as_bool) == Some(false)
+                        && fields.get("side_effects_maybe").and_then(Value::as_bool) == Some(false) =>
+                    {
+                        Some(astra_services::session_journal::ToolPreDispatchRejection::CapabilityUnavailable)
+                    }
                     _ => None,
                 };
                 rec.exit_semantics = fields

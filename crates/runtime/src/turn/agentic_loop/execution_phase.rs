@@ -1757,6 +1757,25 @@ pub(crate) fn enforce_completion_action_window_before_text_completion(
     }
 
     if let Some(pending) = pending_action {
+        if matches!(pending, CompletionAction::PostMutationObservation)
+            && state.stall.tool_call_records.last().is_some_and(|record| {
+                record.pre_dispatch_rejection
+                    == Some(astra_services::session_journal::ToolPreDispatchRejection::CapabilityUnavailable)
+            })
+        {
+            let interruption = InterruptionRecord::new(
+                InterruptionKind::ExecutionIncomplete,
+                ResumeAction::RequiresIntervention {
+                    description: "The required post-change observation is unavailable. Enable a supported trusted observer before continuing. Successful tool results are preserved; the workspace remains unverified.".into(),
+                },
+                interruption_state_summary(state, Some("post_mutation_observation_capability_unavailable".into())),
+            );
+            state.final_text_model_item_id = None;
+            state.final_text = interruption.user_message.clone();
+            state.final_text_streamed = false;
+            state.interruption = Some(interruption);
+            return CompletionActionBoundary::TerminalIncomplete;
+        }
         let pending_label = match pending {
             CompletionAction::RequiredWorkspaceMutation => "workspace mutation".to_string(),
             CompletionAction::CompletionTaskAction => "completion task action".to_string(),
@@ -2187,6 +2206,8 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
     // repair. Give the model one chance to choose a different available
     // observer under the same typed obligation.
     //
+    // Explicit executor rejection without execution or possible effects is
+    // also eligible, but remains Rejected everywhere in evidence accounting.
     // Keep this narrower than generic tool failure recovery. A timeout may
     // still own live descendants, a partial write may have changed state, and
     // an executor-classified test failure belongs to the repair path below.
@@ -2195,11 +2216,15 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             && window.matched
             && !workspace_observation_is_quarantined(state)
             && round_records.is_some_and(|records| {
-                let mut executed = records.iter().filter(|record| record.was_executed());
-                let Some(record) = executed.next() else {
+                let mut outcomes = records.iter().filter(|record| {
+                    record.was_executed()
+                        || record.pre_dispatch_rejection
+                            == Some(astra_services::session_journal::ToolPreDispatchRejection::CapabilityUnavailable)
+                });
+                let Some(record) = outcomes.next() else {
                     return false;
                 };
-                executed.next().is_none()
+                outcomes.next().is_none()
                     && !record.ok
                     && record.error_kind == Some(astra_core::ErrorKind::ToolUnavailable)
                     && record.result_class.as_deref() != Some("test_failure")
@@ -2240,7 +2265,7 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 ),
                 "execution_authority": "one_matching_action",
                 "instruction": "The required workspace observation could not run because the selected capability was unavailable. Perform exactly one different available read-only observation or validator under the same post-mutation obligation. Do not mutate the workspace, retry the unavailable capability, or resume exploration.",
-                "authority": "executed_tool_unavailable_outcome",
+                "authority": "executor_tool_unavailable_outcome",
             }),
         );
         return;
@@ -11294,6 +11319,176 @@ mod tests {
         assert_eq!(pending_completion_action(&state).unwrap(), None);
         assert!(state.interruption.is_none());
         assert_eq!(state.final_text, "The files are ready and verified.");
+    }
+
+    #[tokio::test]
+    async fn rejected_verify_after_web_fetch_recovers_with_typed_observation() {
+        for (execution_started, side_effects_maybe, observer_available) in [
+            (Some(false), Some(false), Some(true)),
+            (Some(false), Some(false), Some(false)),
+            (Some(false), Some(false), None),
+            (Some(false), Some(true), Some(true)),
+            (None, Some(false), Some(true)),
+            (Some(false), None, Some(true)),
+            (Some(true), Some(false), Some(true)),
+        ] {
+            let mut fetch = make_edge_tool("bash", "HTTP 200");
+            fetch.request_id = "fetch-page".into();
+            fetch.args = serde_json::json!({
+                "command": "curl -fsS https://example.com -o /app/page.html",
+            });
+            fetch
+                .tool_result_fields
+                .as_mut()
+                .unwrap()
+                .extend(astra_tools::workspace_observation::changed_receipt());
+            let mut inspect = make_edge_tool("bash", "<title>Example Domain</title>");
+            inspect.request_id = "inspect-page".into();
+            // Inline code reads successfully but carries no trusted workspace
+            // observation, unlike a recognized literal shell reader such as cat.
+            inspect.args = serde_json::json!({
+                "command": "python3 -c 'from pathlib import Path; print(Path(\"/app/page.html\").read_text())'",
+            });
+            let mut verify = make_edge_tool("bash", "Verification capability unavailable");
+            verify.request_id = "rejected-verify".into();
+            verify.status = "failed".into();
+            verify.args = serde_json::json!({"command": "cat /app/page.html", "mode": "verify"});
+            verify.tool_result_fields.as_mut().unwrap().extend(
+                serde_json::json!({
+                    "disposition": "rejected",
+                    "execution_started": execution_started,
+                    "side_effects_maybe": side_effects_maybe,
+                    "error_kind": "tool_unavailable",
+                    "retryable": false,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            );
+            let mut read = make_edge_tool("read_file", "<title>Example Domain</title>");
+            read.request_id = "replacement-observation".into();
+            read.args = serde_json::json!({"path": "/app/page.html"});
+            if observer_available == Some(true) {
+                read.tool_result_fields.as_mut().unwrap().extend(
+                    astra_tools::workspace_observation::typed_workspace_observation_receipt_for(
+                        "read_file",
+                        &read.args,
+                        std::path::Path::new("/app"),
+                        false,
+                    )
+                    .unwrap(),
+                );
+            } else {
+                read.status = "failed".into();
+                read.tool_result_fields
+                    .as_mut()
+                    .unwrap()
+                    .extend(verify.tool_result_fields.as_ref().unwrap().clone());
+            }
+            let answer = "The webpage is accessible and its title is Example Domain.";
+            let mut turns = vec![
+                edge_tool_result(vec![fetch], 20, 10, Some(30)),
+                edge_tool_result(vec![inspect], 20, 10, Some(30)),
+                text_result(answer, 20, 10, Some(30)),
+                edge_tool_result(vec![verify], 20, 10, Some(30)),
+            ];
+            if observer_available.is_some() {
+                turns.push(edge_tool_result(vec![read], 20, 10, Some(30)));
+            } else {
+                // Text consumes the existing mismatch correction, never
+                // evidence that another observation capability is absent.
+                turns.push(text_result(answer, 20, 10, Some(30)));
+            }
+            turns.push(text_result(answer, 20, 10, Some(30)));
+            let mut host = MockHost::new(turns).with_valid_tools(&["bash", "read_file"]);
+            let mut state = make_state();
+            state.message = "Is https://example.com accessible?".into();
+            state.user_intent = state.message.clone();
+            state.hooks.workspace_root_hint = Some("/app".into());
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap();
+            let rejected = state
+                .stall
+                .tool_call_records
+                .iter()
+                .find(|record| record.tool_call_id.as_deref() == Some("rejected-verify"))
+                .expect("the scripted verification must reach the executor boundary");
+            assert_eq!(rejected.disposition, Some(ToolCallDisposition::Rejected));
+            assert!(!rejected.was_executed());
+            assert!(!rejected.ok);
+            assert_eq!(
+                rejected.error_kind,
+                Some(astra_core::ErrorKind::ToolUnavailable)
+            );
+            let recovery_allowed =
+                execution_started == Some(false) && side_effects_maybe == Some(false);
+            assert_eq!(
+                rejected.pre_dispatch_rejection,
+                recovery_allowed.then_some(astra_services::session_journal::ToolPreDispatchRejection::CapabilityUnavailable),
+            );
+            let observer =
+                state.stall.tool_call_records.iter().find(|record| {
+                    record.tool_call_id.as_deref() == Some("replacement-observation")
+                });
+            assert_eq!(
+                host.executed_volatile
+                    .iter()
+                    .flatten()
+                    .any(|entry| entry.payload["signal"]
+                        == "post_mutation_observation_capability_retry_once"),
+                recovery_allowed,
+                "only explicit non-execution without possible effects may reopen observation"
+            );
+            // The successful fetch remains available even if neither observer can run.
+            assert!(state.stall.tool_call_records.iter().any(
+                |record| record.tool_call_id.as_deref() == Some("fetch-page")
+                    && record.was_executed()
+                    && record.ok
+                    && record.result_full.as_deref() == Some("HTTP 200")
+            ));
+            if recovery_allowed && observer_available == Some(true) {
+                assert!(observer.is_some_and(|record| record.was_executed() && record.ok));
+                assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+                assert!(successful_post_mutation_observation(&state).unwrap());
+                assert_eq!(pending_completion_action(&state).unwrap(), None);
+                assert!(state.interruption.is_none());
+                assert_eq!(state.final_text, answer);
+            } else {
+                assert!(!successful_post_mutation_observation(&state).unwrap());
+                assert_eq!(
+                    state.interruption.as_ref().map(|record| record.kind),
+                    Some(InterruptionKind::ExecutionIncomplete)
+                );
+                assert!(observer.is_none_or(|record| !record.was_executed() && !record.ok));
+                if recovery_allowed && observer_available == Some(false) {
+                    let interruption = state.interruption.as_ref().unwrap();
+                    assert_eq!(
+                        interruption.error_detail.as_deref(),
+                        Some("post_mutation_observation_capability_unavailable")
+                    );
+                    assert!(matches!(
+                        interruption.resume_action,
+                        ResumeAction::RequiresIntervention { .. }
+                    ));
+                    assert!(
+                        interruption
+                            .user_message
+                            .contains("observation is unavailable")
+                    );
+                    // Finalization preserves the model's answer as a partial;
+                    // the structured interruption carries the capability blocker.
+                    assert_eq!(state.final_text, answer);
+                    assert!(host.rendered_final_text.iter().any(|text| text == answer));
+                } else {
+                    assert_ne!(
+                        state.interruption.as_ref().unwrap().error_detail.as_deref(),
+                        Some("post_mutation_observation_capability_unavailable")
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -160,6 +160,16 @@ validation evidence. An unchanged Bash fingerprint prevents a false mutation
 barrier but is not, by itself, evidence that any workspace observation or
 requested validation occurred.
 
+A matched post-mutation observer rejected for an unavailable capability may
+use the existing single alternative-observer attempt only when the executor
+explicitly reports no execution and no possible side effects. The journal
+retains that pre-dispatch capability rejection; it is never execution or
+verification success. Missing facts, partial effects and unsettled processes
+do not grant this recovery, and required validation debts remain independent.
+If the alternative is also rejected as unavailable, completion retains the
+successful tool results and reports a capability blocker through the existing
+incomplete terminal and intervention guidance instead of claiming validation.
+
 An incomplete execution remains a terminal failed Run with preserved partial
 output. Its owner-stamped terminal carries the existing sanitized interruption
 record so thin clients can present the actionable continuation notice without
