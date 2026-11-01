@@ -84,6 +84,10 @@ if [[ -z "$MEMORIA_LOGIN_WEBSITE" && "$MEMORIA_LOCAL_ACCESS" != 1 ]]; then
     echo "⚠️  Local user memory is disabled. For self-hosted Memoria 0.5.2+, set MEMORIA_SELF_HOSTED_MASTER_ACCESS=1 in .env and restart the API."
 fi
 
+# Local personal setup reuses the existing secrets and installation env file.
+. "$PROJECT_ROOT/scripts/lib/personal_models.sh"
+initialize_personal_models "$ENV_FILE" update_or_add
+
 # ── Optional: fast linker (mold) ──
 CARGO_CONFIG="$PROJECT_ROOT/.cargo/config.toml"
 if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then

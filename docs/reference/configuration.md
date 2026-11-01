@@ -76,7 +76,15 @@ subscription connections. The default is disabled. Enabling also requires
 installation, retain it across restarts, and share it only with replicas of
 that same installation on the same host. A different host ID requires explicit
 reauthorization. Stable `ASTRA_TOKEN_ENCRYPTION_KEY` and MatrixOne are required;
-back up this key through the deployment's secret-management process.
+back up this key and host ID through the deployment's secret-management process.
+
+`make dev-init` and `make stack-env` prepare these settings for a personal local
+installation, retain an existing host ID/key, and respect an explicit `0` or
+`false` disable. Both `1` and `true` enable the feature. Setup skips this
+configuration when UC is configured; existing MOI/UC model, billing and login
+policy stays authoritative. The supported Compose profiles forward both settings.
+Do not regenerate a lost identity/key to repair an existing connection: restore
+the original configuration or explicitly reconnect affected accounts.
 
 This initial integration targets personal self-hosted installations. Hosted
 commercial offerings, multi-host installations and device-side inference are
@@ -85,7 +93,7 @@ registration and direct Responses API, with fixed trusted origins. No provider
 client secret or Codex authentication file is configured.
 
 Upgrade every Server replica to this source before enabling, then follow
-[CLI linking](cli-commands.md#chatgpt-subscription-models). Startup adds two
+[TUI, CLI and local Web setup](cli-commands.md#chatgpt-subscription-models). Startup adds two
 owner-scoped tables and a nullable connection reference to personal models;
 existing API-key model rows remain valid. Do not run older and newer binaries
 with subscription models in the same database. Disable the flag on every

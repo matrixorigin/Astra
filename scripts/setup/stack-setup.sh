@@ -663,7 +663,7 @@ finish_infrastructure_only() {
     else
         echo "  Model: no active model configured"
     fi
-    echo "  Resume: ${cli_api_prefix}${cli} admin setup"
+    echo "  Resume: ${cli_api_prefix}${cli} (use /register or /login, then /model)"
     echo "  TUI:   ${cli_api_prefix}${cli}"
     echo "  Health: ${cli_api_prefix}${cli} health"
     if [[ -n "${stack_original_env:-}" ]]; then
@@ -676,9 +676,9 @@ finish_infrastructure_only() {
     if [[ "${admin_state:-not configured}" == ready && "${active_model_count:-0}" -gt 0 ]]; then
         echo "Chat configuration is present; provider connectivity was not rechecked in this run."
     elif [[ "${admin_state:-not configured}" == ready ]]; then
-        echo "Chat is not ready: add and activate an LLM model with astra admin setup."
+        echo "Open the TUI and use /model to configure your personal model. Administrator setup is optional."
     else
-        echo "Chat is not ready: configure an administrator and an active model with astra admin setup."
+        echo "Open the TUI, use /register or /login, then /model. No administrator account is required for personal models."
     fi
     exit 0
 }
@@ -788,7 +788,7 @@ step "4/5" "Verifying dependencies and optional user memory access"
 verify_stack
 ok "readiness and dependency memory round trip passed (see verification output for user-access coverage)"
 
-step "5/5" "Reviewing optional administrator and model setup"
+step "5/5" "Opening your Astra account and model setup"
 api_port="$(env_resolve_value "$stack_env" ASTRA_API_PORT 2>/dev/null || true)"
 bind_address="$(env_resolve_value "$stack_env" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
 api_host="$(env_http_host_from_bind "$bind_address")"
@@ -797,6 +797,21 @@ echo "  Model requests originate inside Docker. For a model server on this host,
 echo "  use http://host.docker.internal:<port> instead of localhost."
 save_cli_api_url
 show_setup_state
+echo "Deployment administrator setup is optional; personal accounts configure their own models in the TUI."
+choose "How would you like to continue?" \
+    "Open the TUI for my account and models (recommended)" \
+    "Manage deployment/shared models as an administrator" \
+    "Finish the stack and configure chat later"
+case "$menu_choice" in
+    1)
+        if ! "$cli"; then warn "TUI exited before setup completed; services and data were retained"; fi
+        echo "Astra stack is ready. Model availability and credentials are managed in your TUI account."
+        echo "  Reopen: ${cli_api_prefix}${cli}"
+        echo "  Use /register or /login, then /model."
+        exit 0
+        ;;
+    3) finish_infrastructure_only ;;
+esac
 choose_admin_model_action
 echo
 echo "Continuing with administrator and model verification..."

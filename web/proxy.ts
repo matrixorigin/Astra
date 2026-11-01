@@ -100,6 +100,8 @@ function loginRedirect(request: NextRequest): NextResponse {
 
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
+  // One-time callback codes never become identity headers or login redirects.
+  if (pathname === "/auth/callback") return NextResponse.next();
 
   if (isStaticAsset(pathname)) {
     return NextResponse.next();

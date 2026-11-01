@@ -15,7 +15,7 @@ trap 'rm -rf "$test_root"' EXIT
 # stack configuration. Individual precedence cases set their own overrides.
 for key in ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET \
     MEMORIA_MASTER_KEY MEMORIA_EMBEDDING_PROVIDER MEMORIA_EMBEDDING_API_KEY \
-    MEMORIA_EMBEDDING_BASE_URL; do
+    MEMORIA_EMBEDDING_BASE_URL ASTRA_UC_ISSUER ASTRA_CHATGPT_SUBSCRIPTION_ENABLED ASTRA_CHATGPT_HOST_ID; do
     unset "$key"
 done
 
@@ -73,10 +73,15 @@ mkdir -p "$test_root/scripts/lib"
 cp "$repo_root/.env.example" "$test_root/.env"
 cp "$repo_root/scripts/dev/init.sh" "$test_root/scripts/dev/init.sh"
 cp "$repo_root/scripts/lib/env_file.sh" "$test_root/scripts/lib/env_file.sh"
+cp "$repo_root/scripts/lib/personal_models.sh" "$test_root/scripts/lib/personal_models.sh"
 chmod +x "$test_root/scripts/dev/init.sh"
 
 "$test_root/scripts/dev/init.sh" >/dev/null
 first_snapshot="$(snapshot_secrets "$test_root/.env")"
+first_host_id="$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)"
+[[ "$first_host_id" =~ ^urn:uuid:[[:xdigit:]]{8}-[[:xdigit:]]{4}-4[[:xdigit:]]{3}-[89ab][[:xdigit:]]{3}-[[:xdigit:]]{12}$ ]]
+[[ "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED)" == 1 ]]
+
 [[ "$(read_env_value "$test_root/.env" MEMORIA_SELF_HOSTED_MASTER_ACCESS)" == 1 ]]
 set_env_value "$test_root/.env" MEMORIA_SELF_HOSTED_MASTER_ACCESS 0
 init_output="$("$test_root/scripts/dev/init.sh")"
@@ -94,6 +99,12 @@ done <<< "$first_snapshot"
 
 "$test_root/scripts/dev/init.sh" >/dev/null
 second_snapshot="$(snapshot_secrets "$test_root/.env")"
+[[ "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)" == "$first_host_id" ]]
+set_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED 0
+"$test_root/scripts/dev/init.sh" >/dev/null
+[[ "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED)" == 0 ]]
+[[ "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)" == "$first_host_id" ]]
+
 if [[ "$first_snapshot" != "$second_snapshot" ]]; then
     echo "setup contract failed: init overwrote an existing secret" >&2
     exit 1
@@ -283,5 +294,40 @@ MEMORIA_EMBEDDING_BASE_URL=http://embeddings.internal/v1 \
 [[ "$(env_http_host_from_bind 192.0.2.10)" == "192.0.2.10" ]]
 [[ "$(env_http_host_from_bind ::)" == "[::1]" ]]
 [[ "$(env_http_host_from_bind 2001:db8::10)" == "[2001:db8::10]" ]]
+
+# Exercise actual dev initialization with both canonical boolean spellings.
+cp "$test_root/.env" "$test_root/personal-base.env"
+for flag in true 1 false 0; do
+    awk '!/^ASTRA_CHATGPT_HOST_ID=/' "$test_root/personal-base.env" > "$test_root/.env"
+    set_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED "$flag"
+    "$test_root/scripts/dev/init.sh" >/dev/null
+    host="$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)"
+    case "$flag" in true|1) [[ -n "$host" ]] ;; *) [[ -z "$host" ]] ;; esac
+    cp "$test_root/personal-base.env" "$test_root/.env"
+    env ASTRA_CHATGPT_SUBSCRIPTION_ENABLED="$flag" "$test_root/scripts/dev/init.sh" >/dev/null
+    [[ "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)" == "$first_host_id" ]]
+done
+awk '!/^ASTRA_CHATGPT_/' "$test_root/personal-base.env" > "$test_root/.env"
+env ASTRA_UC_ISSUER=https://uc.example.test "$test_root/scripts/dev/init.sh" >/dev/null
+[[ -z "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)" ]]
+[[ -z "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED)" ]]
+
+# Random failure must propagate under POSIX sh without pipefail.
+failed_crypto_bin="$test_root/failed-crypto-bin"
+mkdir -p "$failed_crypto_bin"
+printf '#!/bin/sh\nexit 1\n' > "$failed_crypto_bin/openssl"
+chmod +x "$failed_crypto_bin/openssl"
+awk '!/^ASTRA_CHATGPT_/' "$test_root/personal-base.env" > "$test_root/.env"
+if PATH="$failed_crypto_bin:$PATH" /bin/sh -c '
+    . "$1/scripts/lib/env_file.sh"
+    . "$1/scripts/lib/personal_models.sh"
+    fixture_env="$1/.env"
+    record_setting() { printf "%s=%s\n" "$1" "$2" >> "$fixture_env"; }
+    initialize_personal_models "$1/.env" record_setting
+' sh "$test_root" >/dev/null 2>&1; then
+    echo "setup contract failed: failed random generation succeeded" >&2
+    exit 1
+fi
+[[ -z "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)" ]]
 
 echo "setup contracts: ok"

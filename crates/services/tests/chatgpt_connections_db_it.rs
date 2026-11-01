@@ -187,6 +187,17 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
             .unwrap();
         model_ids.push(model.model_id);
     }
+    let configured = service
+        .operate(&owner, ConnectionOperation::Models(connection.clone()))
+        .await
+        .unwrap();
+    let configured_ids: HashSet<_> = configured["configured_models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["model_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(configured_ids, model_ids.iter().cloned().collect());
     let catalog = models.list_models(owner.clone(), false).await.unwrap();
     let own: Vec<_> = catalog
         .iter()
@@ -962,4 +973,60 @@ async fn subscription_sql_timeouts_release_pool_capacity_before_response_arrives
         drop(lease);
         worker.get().close().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_management_is_available_before_models_exist_and_keeps_uc_managed() {
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let issuer = "http://127.0.0.1:9/realms/moi";
+    let provider = astra_services::auth::uc::UcNativeProvider::new(astra_core::UcNativeSettings {
+        builtin_memory: false,
+        issuer: issuer.into(),
+        adapter_url: "http://127.0.0.1:9".into(),
+        moi_api_url: "http://127.0.0.1:9/newmoi".into(),
+        genesis_url: "http://127.0.0.1:9".into(),
+        client_secret: "synthetic-service-secret".into(),
+    })
+    .unwrap();
+    let service = DatabaseModelService::new(
+        settings,
+        Arc::new(FernetTokenEncryptor::new("management-policy-test").unwrap()),
+    )
+    .with_pool(shared.clone())
+    .with_uc_native(Some(provider));
+    let local = format!("local-{}", uuid::Uuid::new_v4());
+    let uc = format!("uc-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES (?,?,?)")
+        .bind(format!("uc:{issuer}")).bind(&uc).bind(&uc).execute(shared.get()).await.unwrap();
+    let empty = service
+        .model_connection_operation(local, ConnectionOperation::List)
+        .await
+        .unwrap();
+    assert_eq!(empty["management_available"], true);
+    assert_eq!(empty["items"], json!([]));
+    let managed = service
+        .model_connection_operation(uc.clone(), ConnectionOperation::List)
+        .await
+        .unwrap();
+    assert_eq!(managed["management_available"], false);
+    assert_eq!(managed["items"], json!([]));
+    let denied = service
+        .model_connection_operation(
+            uc,
+            ConnectionOperation::Start(StartAuthorization {
+                retry_authorization_id: None,
+                redirect_uri: "http://127.0.0.1:1455/auth/callback".into(),
+                label: None,
+                connection_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.0, axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        denied.1.0.error_code.as_deref(),
+        Some("personal_model_management_unavailable")
+    );
 }

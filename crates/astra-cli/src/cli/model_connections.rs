@@ -98,11 +98,36 @@ pub fn validate_authorization_url(value: &str, redirect: &str, state: &str) -> R
     Ok(())
 }
 
+#[derive(Debug)]
+pub(crate) enum ConnectProgress {
+    Waiting(String),
+    BrowserLaunchFailed,
+    Completing,
+}
+
 pub async fn connect(
     api: &ThinClient,
     token: &str,
     args: ModelConnectArgs,
     profile: Option<&str>,
+) -> Result<Value, String> {
+    connect_with_progress(api, token, args, profile, CancellationToken::new(), |progress| {
+        match progress {
+            ConnectProgress::Waiting(url) => eprintln!("Authorize ChatGPT in your browser: {url}\nCredentials are stored encrypted on the selected Astra Server."),
+            ConnectProgress::BrowserLaunchFailed => eprintln!("Browser did not open; use the authorization link above."),
+            ConnectProgress::Completing => {},
+        }
+        Ok(())
+    }).await
+}
+
+pub(crate) async fn connect_with_progress(
+    api: &ThinClient,
+    token: &str,
+    args: ModelConnectArgs,
+    profile: Option<&str>,
+    cancel: CancellationToken,
+    mut progress: impl FnMut(ConnectProgress) -> Result<(), String>,
 ) -> Result<Value, String> {
     if args.provider != "chatgpt" {
         return Err("Unsupported subscription provider".into());
@@ -149,6 +174,12 @@ pub async fn connect(
         .as_str()
         .ok_or("Authorization URL missing")?;
     validate_authorization_url(url, &redirect, &state)?;
+    if let Err(error) = progress(ConnectProgress::Waiting(url.to_owned())) {
+        let _ = api
+            .delete_bearer_path_text(token, &format!("{AUTHORIZATIONS}/{id}"))
+            .await;
+        return Err(error);
+    }
     let (sender, receiver) = oneshot::channel();
     let router = Router::new()
         .route("/auth/callback", get(callback))
@@ -167,16 +198,13 @@ pub async fn connect(
         .await
         .is_err()
     {
-        // No ID/access/refresh token is included in this new-registration URL.
-        eprintln!("Open this OpenAI authorization page in your browser:\n{url}");
+        let _ = progress(ConnectProgress::BrowserLaunchFailed);
     }
-    eprintln!(
-        "Waiting for ChatGPT authorization; credentials will be stored encrypted on the selected Astra Server."
-    );
     let result = tokio::select! {
         result=receiver=>result.map_err(|_| "Authorization callback closed".to_owned()),
         _=tokio::time::sleep(Duration::from_secs(900))=>Err("ChatGPT authorization timed out".into()),
         _=tokio::signal::ctrl_c()=>Err("ChatGPT authorization cancelled".into()),
+        _=cancel.cancelled()=>Err("ChatGPT authorization cancelled".into()),
     };
     stop.cancel();
     if tokio::time::timeout(Duration::from_secs(2), &mut server)
@@ -195,6 +223,12 @@ pub async fn connect(
             return Err(error);
         }
     };
+    if let Err(error) = progress(ConnectProgress::Completing) {
+        let _ = api
+            .delete_bearer_path_text(token, &format!("{AUTHORIZATIONS}/{id}"))
+            .await;
+        return Err(error);
+    }
     // Browser consent can outlive an Astra access token. Refresh through the
     // existing Astra session owner before submitting the one-time callback;
     // provider errors never drive Astra login refresh.

@@ -6,6 +6,7 @@ pub(crate) mod chat_composer;
 pub(crate) mod config_edit_view;
 pub(crate) mod context_panel_view;
 pub(crate) mod footer;
+pub(crate) mod form_view;
 pub(crate) mod help_view;
 pub(crate) mod in_flight_agents_view;
 pub(crate) mod info_view;

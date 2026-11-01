@@ -1263,7 +1263,21 @@ impl ChatgptConnections {
         }
     }
     pub async fn models(self: &Arc<Self>, owner: &str, id: &str) -> ApiResult<Value> {
-        self.catalog(&self.binding(owner, id).await?).await
+        let mut catalog = self.catalog(&self.binding(owner, id).await?).await?;
+        let pool = self.pool()?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let configured: Vec<(String, String)> = sqlx::query_as("SELECT model_id,model_alias FROM user_llm_models WHERE user_id=? AND connection_id=? ORDER BY model_alias,model_id")
+            .bind(owner).bind(id).fetch_all(connection.connection_mut()).await.map_err(internal_error)?;
+        connection.release();
+        catalog["configured_models"] = json!(
+            configured
+                .into_iter()
+                .map(|(model_id, name)| json!({"model_id":model_id,"name":name}))
+                .collect::<Vec<_>>()
+        );
+        Ok(catalog)
     }
     async fn catalog(&self, binding: &ExecutionCredential) -> ApiResult<Value> {
         let bytes = self

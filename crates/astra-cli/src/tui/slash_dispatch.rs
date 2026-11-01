@@ -467,6 +467,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             let (sub, rest) = split_sub(trimmed);
             match sub {
+                "add" | "manage" => {
+                    crate::tui::model_setup::sources(ctx.bottom_pane);
+                    SlashResult::Handled
+                }
                 "info" => handle_model_info(ctx, rest).await,
                 "clear" => handle_model_clear(ctx).await,
                 // Everything else is the `/model <name>` shorthand.
@@ -1721,7 +1725,8 @@ pub(crate) fn handle_view_result(
         // These results have async or state-transition handling in the event
         // loop. Keeping them explicit prevents a future picker from silently
         // falling through based on its rendered label.
-        ViewResult::Login { .. }
+        ViewResult::ModelSetup(_)
+        | ViewResult::Login { .. }
         | ViewResult::Register { .. }
         | ViewResult::ConfigEdit { .. }
         | ViewResult::Model { .. }
@@ -3057,29 +3062,64 @@ pub(crate) fn push_model_picker(
         .split_once("-thinking:")
         .map(|(b, _)| b.to_string())
         .unwrap_or(current_raw);
-    let items: Vec<SelectionItem> = models
+    let catalog: Vec<_> = bottom_pane
+        .current_model_catalog()
         .iter()
-        .map(|m| {
-            let is_current = *m == current_base;
-            SelectionItem {
-                name: m.clone(),
-                description: None,
-                is_current,
-            }
-        })
+        .filter(|row| crate::cli::session::session_runtime::model_list_entry_name(row).is_some())
         .collect();
+    let exact_catalog = catalog
+        .iter()
+        .map(|row| row.name.as_str())
+        .eq(models.iter().map(String::as_str));
+    let selected_id = match state.model.as_ref() {
+        Some(crate::cli::session::session_state::SessionModelChoice::Selected(choice)) => {
+            Some(choice.offering_id.as_str())
+        }
+        _ => None,
+    };
+    let (mut items, mut results): (Vec<_>, Vec<_>) = models
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let entry = exact_catalog.then(|| catalog[index]);
+            let id = entry.map(|row| row.offering_id.as_str()).unwrap_or(name);
+            (
+                SelectionItem {
+                    name: name.clone(),
+                    description: entry.map(|row| row.access_label.clone()),
+                    is_current: selected_id
+                        .map(|selected| selected == id)
+                        .unwrap_or(*name == current_base),
+                },
+                ViewResult::Model {
+                    name: id.to_owned(),
+                },
+            )
+        })
+        .unzip();
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let personal = owner.server_account_id.is_some() && owner.native_binding.is_none();
+    if personal {
+        if items.is_empty() {
+            crate::tui::model_setup::sources(bottom_pane);
+            return true;
+        }
+        items.push(SelectionItem {
+            name: "Add or manage my models…".into(),
+            description: Some("Personal API keys and ChatGPT accounts".into()),
+            is_current: false,
+        });
+        results.push(ViewResult::ModelSetup(
+            crate::tui::model_setup::Action::Sources,
+        ));
+    }
     if items.is_empty() {
         chat_widget.commit_system(SystemCell::info("No models available"));
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
             .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
-            .with_results(
-                models
-                    .into_iter()
-                    .map(|name| ViewResult::Model { name })
-                    .collect(),
-            );
+            .with_results(results);
         chat_widget.commit_system(SystemCell::response("Opened model picker"));
         bottom_pane.push_view(Box::new(view));
         true
@@ -3137,7 +3177,7 @@ pub(crate) fn apply_model_picker_result(
         bottom_pane.push_view(Box::new(
             ListSelectionView::new(
                 items,
-                Some(format!("Select thinking mode for {base_model}:")),
+                Some(format!("Select thinking mode for {}:", entry.name)),
             )
             .with_footer_hint(MODEL_THINKING_PICKER_FOOTER_HINT)
             .with_results(
@@ -3154,7 +3194,7 @@ pub(crate) fn apply_model_picker_result(
     let suffix = config
         .map(astra_turn_core::thinking_config::thinking_suffix_for)
         .unwrap_or_default();
-    let name = format!("{base_model}{suffix}");
+    let name = format!("{}{suffix}", entry.name);
     selection.name = name.clone();
     state.cli_context.select_model(Some(&name));
     state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
@@ -4829,6 +4869,76 @@ mod model_catalog_loading_tests {
             },
         );
         save_credentials(&credentials).expect("save isolated credentials");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_cancel_releases_stalled_read_without_starting_a_write() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        // Exercise both preflight and the subsequent personal-model list.
+        for stalled_path in ["/me/model-connections", "/me/models"] {
+            let server = MockServer::start().await;
+            let dispatched = std::sync::Arc::new(tokio::sync::Notify::new());
+            let notified = dispatched.clone();
+            Mock::given(method("GET"))
+                .and(path(stalled_path))
+                .and(header("authorization", "Bearer valid-access"))
+                .respond_with(move |_: &wiremock::Request| {
+                    notified.notify_one();
+                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30))
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            if stalled_path != "/me/model-connections" {
+                Mock::given(method("GET"))
+                    .and(path("/me/model-connections"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"items":[], "management_available":true}),
+                    ))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let phase = std::sync::Arc::new(LoginControl::default());
+            let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+            let task = model_setup::run(
+                Action::Manage,
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                cli_owner_auth_snapshot(),
+                cancel.clone(),
+                phase.clone(),
+                progress,
+            );
+            tokio::pin!(task);
+            tokio::select! {
+                _ = &mut task => panic!("stalled read completed before cancellation"),
+                () = dispatched.notified() => {}
+            }
+            assert!(phase.cancel(), "read must remain cancellable");
+            cancel.cancel();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("cancel must not await the HTTP timeout");
+            assert!(matches!(result, Err(ref error) if error == "Model setup cancelled"));
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.method == "GET")
+            );
+        }
     }
 
     #[serial_test::serial]

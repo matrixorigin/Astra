@@ -79,6 +79,13 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 ## Personal subscription connections
 
+The connection-list response includes `management_available`, the authenticated
+principal's personal-management capability. It is independent of whether any
+model already exists and is false for the managed UC model path. The connection
+model catalog also returns `configured_models` (`model_id`, `name`) so reconnect
+can restore an existing model rather than create another configuration. These
+new connection fields do not change the catalog-v2 DTO or its enums.
+
 All endpoints below require an Astra bearer token. Ownership comes from that
 principal, independently of the ChatGPT identity; other owners receive 404.
 Renewable provider credentials are never returned.

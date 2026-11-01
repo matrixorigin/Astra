@@ -403,10 +403,15 @@ pub(crate) fn find_model_entry_by_name<'a>(
     models: &'a [ModelListItemResponse],
     name: &str,
 ) -> Option<&'a ModelListItemResponse> {
-    models.iter().find(|entry| {
-        entry.offering_id == name
-            || model_list_entry_name(entry).is_some_and(|value| value.eq_ignore_ascii_case(name))
-    })
+    if let Some(entry) = models.iter().find(|entry| entry.offering_id == name) {
+        return Some(entry);
+    }
+    let mut matches = models.iter().filter(|entry| {
+        model_list_entry_is_active(entry)
+            && model_list_entry_name(entry).is_some_and(|value| value.eq_ignore_ascii_case(name))
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 pub(crate) fn model_list_entry_is_active(entry: &ModelListItemResponse) -> bool {
@@ -847,13 +852,8 @@ pub(crate) fn model_selection_for_name_from_catalog(
     model: &str,
 ) -> Option<ServerModelSelection> {
     let registry_model = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
-    models
-        .iter()
+    find_model_entry_by_name(models, &registry_model)
         .filter(|entry| model_list_entry_is_active(entry))
-        .find(|entry| {
-            model_list_entry_name(entry)
-                .is_some_and(|name| name.eq_ignore_ascii_case(registry_model))
-        })
         .and_then(model_selection_from_list_entry)
 }
 

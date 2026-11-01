@@ -2,6 +2,7 @@
 
 import { Check, ChevronDown, Circle } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
+import { PersonalModels } from '@/components/app/personal-models';
 import { Popover } from '@/components/ui/popover';
 import { listModels, type ModelCatalogResponse } from '@/lib/api/models';
 import type { ModelSummary } from '@/lib/api/types';
@@ -92,6 +93,7 @@ export function ModelSwitcher({
   thinking: boolean;
   onThinkingChange: (value: boolean) => void;
 }) {
+  const [manage, setManage] = useState(false);
   const [catalogState, setCatalogState] = useState<CatalogLoadState>({
     kind: 'loading',
   });
@@ -219,6 +221,10 @@ export function ModelSwitcher({
           })}
         </div>
 
+        {catalog && !catalog.accesses.some((access) => access.kind === 'astra_cloud') ? <>
+          <button type="button" className="px-3 py-2 text-left text-sm" onClick={() => setManage(!manage)}>Add or manage my models</button>
+          {manage ? <PersonalModels onChanged={(id) => { loadCatalog(); if (!visibleSelected && id) onChange(id); }} /> : null}
+        </> : null}
         <div className="border-t border-border" />
         <button
           type="button"

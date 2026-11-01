@@ -77,6 +77,35 @@ Server together with the CLI to provide `/me/models/validate-endpoint`.
 
 ## ChatGPT subscription models
 
+For personal/non-MOI deployments, start `astra` and use `/register` or `/login`.
+Registration signs in the normal local user. A confirmed empty model catalog
+opens personal setup; `/model add` opens it again. Choose **Use my API key** or
+**Continue with ChatGPT**. API keys are masked, provider consent opens the system
+browser, and model selection/checking returns to the same TUI. A provider login
+without an eligible checked model is not chat-ready. No admin command is needed.
+
+`/model` selects an exact Offering and shows its source/account. `/model manage`
+reconnects/disconnects personal ChatGPT accounts, restores checked models after
+reconnection, explicitly sets defaults, and removes personal model configurations.
+Cancellation/failure preserves the conversation and draft. Adding a model keeps
+the current usable selection and explicit default. A first sole usable model is
+selected through the existing default resolver; an unpinned fallback still uses
+the Server's existing ordering. Use **Make default** to persist a particular
+personal choice across clients/restarts. An unavailable explicit subscription
+default requires recovery or an explicit replacement; no account/billing fallback
+or automatic replay of an earlier task/tool operation is introduced.
+
+The Web model menu offers **Add or manage my models** for personal deployments,
+using the same owner-scoped model and connection services. API keys work on the
+selected supported deployment. Browser ChatGPT consent requires a local HTTP Web
+listener on `localhost` or `127.0.0.1` with a non-default port (for example,
+3536), on the browser's machine. Port 80 is not supported for browser linking. The callback uses
+`http://127.0.0.1:<Web port>/auth/callback`, including when the opener is localhost.
+For a remote/HTTPS Web deployment, link with the TUI on the browser machine;
+an arbitrary public OAuth callback is not supported. Keys/tokens stay off browser
+storage. A changed account, deployment or session requires reopening settings.
+
+For scripts, the equivalent ordinary-user CLI commands remain available.
 On a self-hosted Server with subscription sharing enabled, sign in to Astra,
 then link a ChatGPT account from a terminal with a local browser:
 
@@ -92,7 +121,7 @@ currently visible to the chosen account. Multiple aliases/model slugs can share
 one connection; link another account to create a separate credential source.
 Adding/checking a model sends a short inference probe against that subscription.
 Linking alone does not change the default model. Existing CLI/Web model pickers
-can select a configured Offering; browser linking is available in the CLI only.
+select the same configured Offering; supported local Web and TUI linking use the same connection owner.
 
 The browser asks OpenAI for sign-in and plan-use consent. Astra Server encrypts
 renewable credentials with its existing token encryption key and can continue

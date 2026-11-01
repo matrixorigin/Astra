@@ -2482,11 +2482,49 @@ async fn sync_default_model_after_auth(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
 ) -> Option<String> {
+    let pinned_api = api.clone().without_bearer_provider();
+    let api = &pinned_api;
+    // A retained explicit selector is intent, not proof that the new account
+    // can use it. Resolve against the authoritative catalog before treating
+    // login as having a usable model; preserve the intent on missing/error.
+    if let Some(crate::cli::session::session_state::SessionModelChoice::Requested(name)) =
+        state.model.as_ref()
+    {
+        let name = name.clone();
+        match crate::cli::session::session_runtime::fetch_model_catalog(api, Some(token)).await {
+            Ok(catalog) => match crate::cli::session::session_runtime::resolve_server_model_selection_from_catalog(&name, &catalog) {
+                Ok(mut selection) => {
+                    selection.name = name;
+                    state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
+                    bottom_pane.cache_model_catalog(catalog);
+                }
+                Err(_) => {
+                    let names = catalog.iter().filter_map(crate::cli::session::session_runtime::model_list_entry_name).map(str::to_owned).collect();
+                    let empty = catalog.is_empty();
+                    bottom_pane.cache_model_catalog(catalog);
+                    if empty {
+                        super::model_setup::sources(bottom_pane);
+                    } else {
+                        slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, names);
+                    }
+                    return None;
+                }
+            },
+            Err(error) => {
+                chat_widget.commit_system(history_cell::system::SystemCell::warning(error.to_string()));
+                return None;
+            }
+        }
+    }
     let model =
         match crate::cli::session::session_runtime::ensure_state_default_model(api, token, state)
             .await
         {
-            Ok(model) => model?,
+            Ok(Some(model)) => model,
+            Ok(None) => {
+                super::model_setup::sources(bottom_pane);
+                return None;
+            }
             Err(error) => {
                 // Login has already committed. A catalog failure is a separate,
                 // recoverable warning, not a reason to undo authentication.
@@ -7816,11 +7854,46 @@ pub(crate) async fn run_tui_session(
     }
     let (model_catalog_tx, mut model_catalog_rx) = tokio::sync::mpsc::channel(2);
     let mut model_catalog_tasks = tokio::task::JoinSet::new();
+    let mut model_setup_tasks = tokio::task::JoinSet::<(
+        crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        u64,
+        Result<super::model_setup::Outcome, String>,
+    )>::new();
+    let (model_setup_progress_tx, mut model_setup_progress_rx) =
+        tokio::sync::mpsc::unbounded_channel();
+    let model_setup_phase = Arc::new(super::login_control::LoginControl::default());
+    let mut model_setup_cancel = tokio_util::sync::CancellationToken::new();
+    let mut model_setup_view_open = false;
     let mut login_tasks = tokio::task::JoinSet::<Result<LoginEffect, String>>::new();
     let (login_progress_tx, mut login_progress_rx) = tokio::sync::mpsc::unbounded_channel();
     let login_phase = Arc::new(super::login_control::LoginControl::default());
     let mut login_view_open = false;
     let mut model_catalog_loading = false;
+    if state.model.is_none() {
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        if owner.server_account_id.is_none() {
+            super::model_setup::sources(&mut bottom_pane);
+        } else if owner.native_binding.is_none() {
+            model_catalog_loading = true;
+            let epoch = state.session_attachment_epoch;
+            let api = api.clone();
+            let tx = model_catalog_tx.clone();
+            model_catalog_tasks.spawn(async move {
+                let result =
+                    crate::cli::session::session_runtime::fetch_owner_model_catalog(&api, &owner)
+                        .await
+                        .map_err(|error| error.to_string());
+                let _ = tx
+                    .send(ModelCatalogEffect::Ready {
+                        owner,
+                        attachment_epoch: epoch,
+                        result,
+                    })
+                    .await;
+            });
+        }
+    }
+
     let (slash_background_read_tx, mut slash_background_read_rx) =
         tokio::sync::mpsc::channel::<SlashBackgroundReadCompletion>(8);
     // Work progress is intentionally separate from the reliable completion
@@ -8100,6 +8173,74 @@ pub(crate) async fn run_tui_session(
                 bottom_pane.enqueue_ask_user(request.prompt, request.response_tx);
                 frame_requester.schedule_frame();
             }
+            Some(progress) = model_setup_progress_rx.recv() => {
+                if model_setup_tasks.is_empty() { continue; }
+                if let crate::cli::model_connections::ConnectProgress::Waiting(url) = progress {
+                    bottom_pane.push_view(Box::new(super::bottom_pane::info_view::InfoView::from_plain(
+                        "Continue with ChatGPT", vec!["Authorize in your browser. Esc cancels while waiting.".into(),
+                        "Your credentials are encrypted on the selected Astra deployment.".into(), url])));
+                    model_setup_view_open = true;
+                }
+                frame_requester.schedule_frame();
+            }
+            Some(completed) = model_setup_tasks.join_next(), if !model_setup_tasks.is_empty() => {
+                if model_setup_view_open { bottom_pane.close_active_view(); model_setup_view_open = false; }
+                match completed {
+                    Ok((owner, epoch, result)) if owner.is_current() && epoch == state.session_attachment_epoch => {
+                        match result {
+                            Ok(super::model_setup::Outcome::Models { connection_id, slugs, existing }) => {
+                                let mut choices: Vec<_> = existing.into_iter().map(|(id, name)|
+                                    (format!("Use {name}"), Some("Check and restore this existing personal model".into()), super::model_setup::Action::Activate(id))).collect();
+                                choices.extend(slugs.into_iter().map(|model|
+                                    (model.clone(), Some("Add this model using your ChatGPT plan".into()), super::model_setup::Action::Subscription { connection_id: connection_id.clone(), model })));
+                                super::model_setup::choices(&mut bottom_pane, "Choose a ChatGPT model", choices);
+                            }
+                            Ok(super::model_setup::Outcome::Connections(rows, models)) => {
+                                let mut choices = Vec::new();
+                                for row in rows {
+                                    let Some(id) = row["connection_id"].as_str() else { continue; };
+                                    let label = row["email"].as_str().or_else(|| row["label"].as_str()).unwrap_or("ChatGPT account");
+                                    let status = row["status"].as_str().unwrap_or("unknown");
+                                    choices.push((format!("Reconnect {label}"), Some(status.into()), super::model_setup::Action::Connect(Some(id.into()))));
+                                    choices.push((format!("Disconnect {label}"), Some("Stops use across this deployment; keeps conversation history".into()), super::model_setup::Action::Disconnect(id.into())));
+                                }
+                                for model in models {
+                                    if model.is_active && !model.is_default {
+                                        choices.push((format!("Make {} my default", model.name), Some("Default for future conversations".into()), super::model_setup::Action::MakeDefault(model.model_id.clone())));
+                                    }
+                                    choices.push((format!("Remove {}", model.name), Some(model.provider), super::model_setup::Action::ConfirmRemove { model_id: model.model_id, name: model.name }));
+                                }
+                                choices.push(("Connect another ChatGPT account".into(), None, super::model_setup::Action::Connect(None)));
+                                super::model_setup::choices(&mut bottom_pane, "Your personal connections", choices);
+                            }
+                            Ok(super::model_setup::Outcome::Created { model_id, catalog }) => {
+                                bottom_pane.cache_model_catalog(catalog);
+                                let current_usable = super::model_setup::current_model_is_usable(
+                                    state.model.as_ref(), bottom_pane.current_model_catalog(),
+                                );
+                                if current_usable {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response("Personal model added and checked. Your current model is unchanged; choose another with /model."));
+                                } else {
+                                    slash_dispatch::apply_model_picker_result(&bottom_pane::view::ViewResult::Model { name: model_id }, &mut state, &mut bottom_pane, &mut chat_widget);
+                                }
+                            }
+                            Ok(super::model_setup::Outcome::Removed) => {
+                                bottom_pane.clear_model_catalog();
+                                chat_widget.commit_system(history_cell::system::SystemCell::response("Personal model removed. Conversation history is retained. Use /model to select a usable model."));
+                            }
+                            Ok(super::model_setup::Outcome::Disconnected) => {
+                                bottom_pane.clear_model_catalog();
+                                chat_widget.commit_system(history_cell::system::SystemCell::response("ChatGPT disconnected. Your conversation is retained. Use /model to select a model or reconnect."));
+                            }
+                            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
+                        }
+                    }
+                    Ok(_) => {},
+                    Err(_) => chat_widget.commit_system(history_cell::system::SystemCell::error("Model setup task did not complete. Reopen /model.")),
+                }
+                pending_deferred_slash_flush = true;
+                frame_requester.schedule_frame();
+            }
             Some(progress) = login_progress_rx.recv() => {
                 if login_tasks.is_empty() { continue; }
                 if let crate::cli::auth_flow::LoginProgress::BrowserLaunchFailed(reason) = &progress {
@@ -8216,7 +8357,7 @@ pub(crate) async fn run_tui_session(
                                 plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api.clone(), profile, None);
                                 server_agent_projection_sequence = None;
                                 plan_task_projection_sequence = None;
-                                chat_widget.commit_system(history_cell::system::SystemCell::response("Logged in. You can continue chatting."));
+                                chat_widget.commit_system(history_cell::system::SystemCell::response("Signed in. Use /model to select or configure your model."));
                                 let report = crate::post_auth_cloud_resync(profile, &mut state).await;
                                 if let Some(notice) = report.user_notice() {
                                     chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
@@ -8622,6 +8763,15 @@ pub(crate) async fn run_tui_session(
                                 }
                             }
                             TuiEvent::Key(key) => {
+                        if !model_setup_tasks.is_empty() {
+                            use crossterm::event::{KeyCode, KeyModifiers};
+                            if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+                                if model_setup_phase.cancel() { model_setup_cancel.cancel(); }
+                                else { chat_widget.commit_system(history_cell::system::SystemCell::info("Finishing model setup; waiting for its result.")); }
+                                frame_requester.schedule_frame();
+                            }
+                            continue;
+                        }
                         if !login_tasks.is_empty() {
                             if let Some(cancelled) = cancel_login_on_key(key, &login_phase, &mut login_tasks) {
                                 if !cancelled {
@@ -11710,6 +11860,37 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
 
+                                    if let bottom_pane::view::ViewResult::ModelSetup(action) = &result {
+                                        use super::model_setup::Action;
+                                        match action.clone() {
+                                            Action::Sources => super::model_setup::sources(&mut bottom_pane),
+                                            Action::ApiKey(provider) => super::model_setup::api_key_form(&mut bottom_pane, &provider),
+                                            Action::ConfirmRemove { model_id, name } => super::model_setup::choices(&mut bottom_pane, &format!("Remove {name}? Conversation history is retained."), vec![
+                                                ("Keep model".into(), None, Action::Sources),
+                                                ("Remove personal model".into(), None, Action::Remove(model_id)),
+                                            ]),
+                                            Action::Subscription { connection_id, model } => super::model_setup::model_form(&mut bottom_pane, "chatgpt".into(), Some(connection_id), Some(model)),
+                                            action => {
+                                                model_setup_phase.reset();
+                                                model_setup_cancel = tokio_util::sync::CancellationToken::new();
+                                                let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                                                let epoch = state.session_attachment_epoch;
+                                                let api = api.clone();
+                                                let cancel = model_setup_cancel.clone();
+                                                let phase = model_setup_phase.clone();
+                                                let progress = model_setup_progress_tx.clone();
+                                                model_setup_tasks.spawn(async move {
+                                                    let result = super::model_setup::run(action, api, owner.clone(), cancel, phase, progress).await;
+                                                    (owner, epoch, result)
+                                                });
+                                                chat_widget.commit_system(history_cell::system::SystemCell::info("Configuring your personal model…"));
+                                            }
+                                        }
+                                        pending_deferred_slash_flush = true;
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
                                     if let Some(picker_open) = slash_dispatch::apply_model_picker_result(
                                         &result, &mut state, &mut bottom_pane, &mut chat_widget,
                                     ) {
@@ -12783,6 +12964,9 @@ pub(crate) async fn run_tui_session(
     model_catalog_tasks.abort_all();
     // Once exchange starts, the login owns credential publication. Joining it
     // prevents a blocking writer from committing after the workbench exits.
+    model_setup_phase.cancel();
+    model_setup_cancel.cancel();
+    while model_setup_tasks.join_next().await.is_some() {}
     login_phase.shutdown(&mut login_tasks).await;
     while model_catalog_tasks.join_next().await.is_some() {}
     for task in startup_observation_tasks {
@@ -22747,6 +22931,118 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn duplicate_model_names_keep_exact_offering_identity_and_human_thinking_label() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        let mut first: astra_services::ModelListItemResponse = serde_json::from_value(serde_json::json!({
+            "offering_id":"first-offering", "access_id":"self-hosted", "access_kind":"self_hosted", "access_label":"Team model", "execution_placement":"server", "name":"same-name", "provider":"openai", "thinking_capability":"both", "thinking_protocol":"enable_thinking", "is_active":true, "context_window":128000
+        })).unwrap();
+        let second = first.clone();
+        first.offering_id = "second-offering".into();
+        pane.cache_model_catalog(vec![second, first]);
+        slash_dispatch::push_model_picker(
+            &state,
+            &mut pane,
+            &mut widget,
+            vec!["same-name".into(), "same-name".into()],
+        );
+        pane.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let BottomPaneAction::ViewCompleted {
+            result: Some(picked),
+            ..
+        } = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("picker did not complete");
+        };
+        assert!(
+            matches!(&picked, bottom_pane::view::ViewResult::Model { name } if name == "second-offering")
+        );
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(&picked, &mut state, &mut pane, &mut widget),
+            Some(true)
+        );
+        let BottomPaneAction::ViewCompleted {
+            result: Some(thinking),
+            ..
+        } = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("thinking picker did not complete");
+        };
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &thinking,
+                &mut state,
+                &mut pane,
+                &mut widget
+            ),
+            Some(false)
+        );
+        let Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection)) =
+            state.model
+        else {
+            panic!("selection missing");
+        };
+        assert_eq!(selection.offering_id, "second-offering");
+        assert!(selection.name.starts_with("same-name"));
+        assert_eq!(pane.footer.model.as_deref(), Some(selection.name.as_str()));
+        assert!(!selection.name.contains("second-offering"));
+        use crate::cli::session::session_state::SessionModelChoice;
+        let catalog = pane.current_model_catalog();
+        assert!(super::super::model_setup::current_model_is_usable(
+            Some(&SessionModelChoice::Requested("second-offering".into())),
+            catalog
+        ));
+        assert!(!super::super::model_setup::current_model_is_usable(
+            Some(&SessionModelChoice::Requested("same-name".into())),
+            catalog
+        ));
+        let mut unique = catalog.to_vec();
+        unique[1].name = "unique-model".into();
+        assert!(super::super::model_setup::current_model_is_usable(
+            Some(&SessionModelChoice::Requested(
+                "unique-model(thinking:on)".into()
+            )),
+            &unique
+        ));
+        unique[1].is_active = false;
+        assert!(!super::super::model_setup::current_model_is_usable(
+            Some(&SessionModelChoice::Requested(
+                "unique-model(thinking:on)".into()
+            )),
+            &unique
+        ));
+        let mut stale_catalog = pane.current_model_catalog().to_vec();
+        stale_catalog.retain(|row| row.offering_id != selection.offering_id);
+        stale_catalog[0].name = selection.offering_id.clone();
+        assert!(!super::super::model_setup::current_model_is_usable(
+            Some(&SessionModelChoice::Selected(selection.clone())),
+            &stale_catalog
+        ));
+        let mut aliases = pane.current_model_catalog().to_vec();
+        aliases[0].name = "second-offering".into();
+        assert_eq!(
+            crate::cli::session::session_runtime::find_model_entry_by_name(
+                &aliases,
+                "second-offering"
+            )
+            .unwrap()
+            .offering_id,
+            "second-offering"
+        );
+        aliases[0].name = aliases[1].name.clone();
+        assert!(
+            crate::cli::session::session_runtime::find_model_entry_by_name(
+                &aliases,
+                &aliases[0].name
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn model_catalog_failure_is_visible_and_does_not_open_a_stale_picker() {
         let state = crate::cli::session::session_state::SessionState::default();
         let mut bottom_pane = BottomPane::new();
@@ -23643,6 +23939,56 @@ mod tests {
             response_idx, slash_rows,
             "slash response should start right after the slash card's own breathing room"
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn default_model_after_auth_offers_setup_for_retained_but_unavailable_intent() {
+        use crate::cli::session::session_state::SessionModelChoice;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // Password login preserves an old selected model as Requested. A
+        // confirmed empty new account must still offer first-model setup.
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items":[], "next_cursor":null, "limit":50, "total":0, "catalog_revision":"sha256:empty"
+            }))).expect(1).mount(&server).await;
+        #[derive(Debug)]
+        struct OldOwner;
+        impl astra_thin_client::client::BearerProvider for OldOwner {
+            fn token(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<String, astra_thin_client::ThinClientError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { panic!("post-auth catalog must use the new token") })
+            }
+        }
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+            .unwrap()
+            .with_bearer_provider(std::sync::Arc::new(OldOwner));
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.model = Some(SessionModelChoice::Requested("previous-owner-model".into()));
+        let mut pane = BottomPane::new();
+        pane.replace_composer_text("unsent conversation");
+        let mut widget = chat_widget::ChatWidget::new("");
+        assert!(
+            sync_default_model_after_auth(&api, "token", &mut state, &mut pane, &mut widget)
+                .await
+                .is_none()
+        );
+        assert!(pane.has_active_view());
+        assert_eq!(pane.composer.text(), "unsent conversation");
+        assert!(
+            matches!(state.model, Some(SessionModelChoice::Requested(ref name)) if name == "previous-owner-model")
+        );
+        assert!(widget.history().is_empty());
     }
 
     #[tokio::test]

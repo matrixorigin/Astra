@@ -2999,7 +2999,7 @@ pub struct UserModelRecord {
     pub updated_at: String,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UserModelCreateRequestData {
     pub connection_id: Option<String>,
     pub name: String,
@@ -3938,6 +3938,23 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         operation: crate::chatgpt::ConnectionOperation,
     ) -> Result<Value, (StatusCode, Json<ErrorResponse>)> {
+        let available = self.uc_subject(&user_id).await?.is_none();
+        if matches!(&operation, crate::chatgpt::ConnectionOperation::List) {
+            let mut value = if available {
+                self.subscriptions.operate(&user_id, operation).await?
+            } else {
+                serde_json::json!({"items": []})
+            };
+            value["management_available"] = serde_json::json!(available);
+            return Ok(value);
+        }
+        if !available {
+            return Err(error_response_coded(
+                StatusCode::FORBIDDEN,
+                "This deployment manages your model access through MOI",
+                "personal_model_management_unavailable",
+            ));
+        }
         self.subscriptions.operate(&user_id, operation).await
     }
     async fn allows_deployment_models(

@@ -690,6 +690,8 @@ stack-env:
 	ensure_secret ASTRA_TOKEN_ENCRYPTION_KEY; \
 	ensure_secret ASTRA_RUNTIME_ROOT_SECRET; \
 	ensure_secret MEMORIA_MASTER_KEY; \
+	. scripts/lib/personal_models.sh; \
+	initialize_personal_models "$(STACK_ENV)" set_env_value; \
 	embedding_provider="$$(env_file_read "$(STACK_ENV)" MEMORIA_EMBEDDING_PROVIDER 2>/dev/null || true)"; \
 	embedding_provider="$$(printf '%s' "$$embedding_provider" | tr '[:upper:]' '[:lower:]')"; \
 	embedding_url="$$(env_file_read "$(STACK_ENV)" MEMORIA_EMBEDDING_BASE_URL 2>/dev/null || true)"; \
