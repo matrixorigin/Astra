@@ -210,9 +210,9 @@ pub(crate) enum Outcome {
         slugs: Vec<String>,
         existing: Vec<(String, String)>,
     },
-    Created {
+    Saved {
         model_id: String,
-        catalog: Vec<astra_services::ModelListItemResponse>,
+        catalog: Result<Vec<astra_services::ModelListItemResponse>, String>,
     },
     Disconnected,
     Removed,
@@ -275,7 +275,7 @@ pub(crate) async fn run(
         }
         phase.begin_exchange()
     };
-    match action {
+    let model_id = match action {
         Action::Connect(connection) => {
             let linked = model_connections::connect_with_progress(
                 &api,
@@ -304,13 +304,13 @@ pub(crate) async fn run(
                 .as_str()
                 .ok_or("Connection ID missing")?
                 .to_owned();
-            Ok(Outcome::Connected {
+            return Ok(Outcome::Connected {
                 connection_id: id,
                 status: linked["connection"]["status"]
                     .as_str()
                     .ok_or("Connection status missing")?
                     .to_owned(),
-            })
+            });
         }
         Action::Models(id) => {
             let path = model_connections::connection_path(&id, "models")?;
@@ -341,11 +341,11 @@ pub(crate) async fn run(
                     ))
                 })
                 .collect();
-            Ok(Outcome::Models {
+            return Ok(Outcome::Models {
                 connection_id: id,
                 slugs,
                 existing,
-            })
+            });
         }
         Action::Create(request) => {
             begin_write()?;
@@ -362,14 +362,7 @@ pub(crate) async fn run(
                 .as_str()
                 .ok_or("Model ID missing")?
                 .to_owned();
-            let catalog =
-                crate::cli::session::session_runtime::fetch_owner_model_catalog(&api, &owner)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            Ok(Outcome::Created {
-                model_id: id,
-                catalog,
-            })
+            Ok::<_, String>(id)
         }
         Action::Activate(id) => {
             begin_write()?;
@@ -380,14 +373,7 @@ pub(crate) async fn run(
             )
             .await
             .map_err(map_thin_err)?;
-            let catalog =
-                crate::cli::session::session_runtime::fetch_owner_model_catalog(&api, &owner)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            Ok(Outcome::Created {
-                model_id: id,
-                catalog,
-            })
+            Ok::<_, String>(id)
         }
         Action::MakeDefault(id) => {
             begin_write()?;
@@ -398,21 +384,14 @@ pub(crate) async fn run(
             )
             .await
             .map_err(map_thin_err)?;
-            let catalog =
-                crate::cli::session::session_runtime::fetch_owner_model_catalog(&api, &owner)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            Ok(Outcome::Created {
-                model_id: id,
-                catalog,
-            })
+            Ok::<_, String>(id)
         }
         Action::Remove(id) => {
             begin_write()?;
             api.delete_bearer_path_text(&token, &astra_thin_client::paths::me_model(&id))
                 .await
                 .map_err(map_thin_err)?;
-            Ok(Outcome::Removed)
+            return Ok(Outcome::Removed);
         }
         Action::Manage => {
             let body = tokio::select! {
@@ -423,13 +402,13 @@ pub(crate) async fn run(
                        };
             let models: astra_services::models::UserModelListResponse =
                 serde_json::from_str(&body).map_err(|_| "Invalid personal model list")?;
-            Ok(Outcome::Connections(
+            return Ok(Outcome::Connections(
                 availability["items"]
                     .as_array()
                     .ok_or("Invalid connection list")?
                     .clone(),
                 models.items,
-            ))
+            ));
         }
         Action::Disconnect(id) => {
             begin_write()?;
@@ -439,10 +418,14 @@ pub(crate) async fn run(
             )
             .await
             .map_err(map_thin_err)?;
-            Ok(Outcome::Disconnected)
+            return Ok(Outcome::Disconnected);
         }
         _ => Err("Choose a model source in /model".into()),
-    }
+    }?;
+    let catalog = crate::cli::session::session_runtime::fetch_owner_model_catalog(&api, &owner)
+        .await
+        .map_err(|error| error.to_string());
+    Ok(Outcome::Saved { model_id, catalog })
 }
 
 #[cfg(test)]

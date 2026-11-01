@@ -4873,6 +4873,58 @@ mod model_catalog_loading_tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn model_setup_keeps_acknowledged_write_when_catalog_read_fails() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/model-connections"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"management_available":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let id = "00000000-0000-4000-8000-000000000001";
+        Mock::given(method("PUT"))
+            .and(path(format!("/me/models/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"model_id":id})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+        let result = model_setup::run(
+            Action::Activate(id.into()),
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            cli_owner_auth_snapshot(),
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(LoginControl::default()),
+            progress,
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Outcome::Saved { model_id, catalog: Err(_), .. }) if model_id == id)
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn model_setup_existing_connection_catalog_retries_without_authorization() {
         use crate::tui::{
             login_control::LoginControl,

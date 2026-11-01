@@ -1211,7 +1211,9 @@ impl ChatgptConnections {
         let mut deadline = tokio::time::Instant::now() + Duration::from_secs(35);
         let mut wait = Duration::from_millis(100);
         loop {
-            let row = self.credential_row(owner, id, generation).await?;
+            let row = tokio::time::timeout_at(deadline, self.credential_row(owner, id, generation))
+                .await
+                .map_err(|_| unavailable())??;
             if let Some(token) = self.usable_access_token(&row, rejected_version)? {
                 return Ok(token);
             }
@@ -1219,9 +1221,12 @@ impl ChatgptConnections {
             let encrypted = row.credentials_encrypted.as_deref().ok_or_else(reauth)?;
             if let Some(refresh_owner) = row.refresh_owner.as_deref() {
                 if row.refresh_until.is_none_or(|until| until < unix_now()) {
-                    if self
-                        .mark_reauth(owner, id, generation, refresh_owner)
-                        .await?
+                    if tokio::time::timeout_at(
+                        deadline,
+                        self.mark_reauth(owner, id, generation, refresh_owner),
+                    )
+                    .await
+                    .map_err(|_| unavailable())??
                     {
                         return Err(reauth());
                     }
@@ -1243,7 +1248,9 @@ impl ChatgptConnections {
             if !metadata_ready {
                 // Discovery is independent of token rotation. Warm its cache
                 // before claiming the refresh lease, then re-read the winner.
-                self.signing_keys(None).await?;
+                tokio::time::timeout_at(deadline, self.signing_keys(None))
+                    .await
+                    .map_err(|_| unavailable())??;
                 metadata_ready = true;
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 continue;
@@ -1251,8 +1258,27 @@ impl ChatgptConnections {
             let credentials = self.decode_credentials(encrypted)?;
             let client_id = &row.client_id;
             let refresh_id = Uuid::new_v4().to_string();
-            let lease=query("UPDATE user_llm_connections SET refresh_owner=?,refresh_until=? WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner IS NULL AND status='connected'")
-                .bind(&refresh_id).bind(unix_now()+REFRESH_LEASE_SECONDS).bind(owner).bind(id).bind(generation).bind(version).execute(&pool).await.map_err(internal_error)?;
+            let settlement_deadline = tokio::time::Instant::now() + REFRESH_BUDGET;
+            let exchange_deadline = settlement_deadline - Duration::from_secs(5);
+            let claim_result = tokio::time::timeout_at(exchange_deadline.min(deadline), async {
+                let mut claim = CancellationSafeTransaction::begin(&pool).await.map_err(internal_error)?;
+                let lease=query("UPDATE user_llm_connections SET refresh_owner=?,refresh_until=? WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner IS NULL AND status='connected'")
+                .bind(&refresh_id).bind(unix_now()+REFRESH_LEASE_SECONDS).bind(owner).bind(id).bind(generation).bind(version).execute(claim.connection_mut()).await.map_err(internal_error)?;
+                claim.commit().await.map_err(internal_error)?;
+                Ok::<_, (StatusCode, Json<ErrorResponse>)>(lease)
+            }).await;
+            let lease = match claim_result {
+                Ok(Ok(lease)) => lease,
+                Ok(Err(_)) | Err(_) => {
+                    tokio::time::timeout_at(
+                        settlement_deadline,
+                        self.release_refresh_lease(owner, id, generation, version, &refresh_id),
+                    )
+                    .await
+                    .map_err(|_| unavailable())??;
+                    return Err(unavailable());
+                }
+            };
             if lease.rows_affected() != 1 {
                 continue;
             }
@@ -1260,7 +1286,7 @@ impl ChatgptConnections {
             // Keep the SQL guard outside the deadline future: discard an
             // interrupted checkout before cleanup needs another pool permit.
             let mut persistence_connection = None;
-            let refresh_result=tokio::time::timeout(REFRESH_BUDGET,async {
+            let refresh_result=tokio::time::timeout_at(exchange_deadline,async {
                 let refresh=credentials.refresh_token.as_deref().ok_or_else(reauth)?;
                 let request=self.client().inspect_err(|_|{credentials_unchanged=true;})?.post(&config.token).form(&[
                     ("grant_type","refresh_token"),("client_id",client_id.as_str()),("refresh_token",refresh),("resource",API_BASE),
@@ -1294,17 +1320,44 @@ impl ChatgptConnections {
             }
             if refresh_result.is_err() {
                 if !credentials_unchanged {
-                    if !self.mark_reauth(owner, id, generation, &refresh_id).await? {
+                    if !tokio::time::timeout_at(
+                        settlement_deadline,
+                        self.mark_reauth(owner, id, generation, &refresh_id),
+                    )
+                    .await
+                    .map_err(|_| unavailable())??
+                    {
                         continue;
                     }
                 } else {
                     // Release only our lease; another generation may have won.
-                    query("UPDATE user_llm_connections SET refresh_owner=NULL,refresh_until=NULL WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner=?")
-                        .bind(owner).bind(id).bind(generation).bind(version).bind(&refresh_id).execute(&pool).await.map_err(internal_error)?;
+                    tokio::time::timeout_at(
+                        settlement_deadline,
+                        self.release_refresh_lease(owner, id, generation, version, &refresh_id),
+                    )
+                    .await
+                    .map_err(|_| unavailable())??;
                 }
             }
             return refresh_result;
         }
+    }
+    async fn release_refresh_lease(
+        &self,
+        owner: &str,
+        id: &str,
+        generation: i64,
+        version: i64,
+        refresh_id: &str,
+    ) -> ApiResult<()> {
+        let pool = self.pool()?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        query("UPDATE user_llm_connections SET refresh_owner=NULL,refresh_until=NULL WHERE user_id=? AND connection_id=? AND generation=? AND credential_version=? AND refresh_owner=?")
+            .bind(owner).bind(id).bind(generation).bind(version).bind(refresh_id).execute(connection.connection_mut()).await.map_err(internal_error)?;
+        connection.release();
+        Ok(())
     }
     async fn mark_reauth(
         &self,
@@ -1314,7 +1367,9 @@ impl ChatgptConnections {
         refresh_owner: &str,
     ) -> ApiResult<bool> {
         let pool = self.pool()?;
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut tx = CancellationSafeTransaction::begin(&pool)
+            .await
+            .map_err(internal_error)?;
         let changed=query("UPDATE user_llm_connections SET status='reauth_required',credentials_encrypted=NULL,token_expires_at=NULL,generation=generation+1,refresh_owner=NULL,refresh_until=NULL,updated_at=NOW(6) WHERE user_id=? AND connection_id=? AND generation=? AND refresh_owner=? AND status='connected'")
             .bind(owner).bind(id).bind(generation).bind(refresh_owner).execute(&mut *tx).await.map_err(internal_error)?;
         if changed.rows_affected() == 1 {

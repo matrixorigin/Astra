@@ -39,7 +39,7 @@ describe('personal source setup', () => {
   it('accepts only the bound popup origin and state and completes each code once', async () => {
     const browser = popup(); vi.spyOn(window, 'open').mockReturnValue(browser);
     request.mockImplementation(async (_path, init) => {
-      if (!init) return { ...settings, connections: [{ connection_id: authorization, label: 'Existing', status: 'connected' }] } as never;
+      if (!init?.method) return { ...settings, connections: [{ connection_id: authorization, label: 'Existing', status: 'connected' }] } as never;
       const body = JSON.parse(init.body as string);
       if (body.action === 'start') return started() as never;
       if (body.action === 'complete') return { connection: { connection_id: authorization, label: 'Personal', status: 'connected' } } as never;
@@ -68,7 +68,7 @@ describe('personal source setup', () => {
   it('cancels a pending attempt without completing it or losing the account binding', async () => {
     const browser = popup(); vi.spyOn(window, 'open').mockReturnValue(browser);
     request.mockImplementation(async (_path, init) => {
-      if (!init) return settings as never;
+      if (!init?.method) return settings as never;
       return (JSON.parse(init.body as string).action === 'start' ? started() : {}) as never;
     });
     const panel = render(<PersonalModels onChanged={vi.fn()} />); await ready();
@@ -82,7 +82,7 @@ describe('personal source setup', () => {
     const browser = popup(); vi.spyOn(window, 'open').mockReturnValue(browser);
     let finish!: (value: unknown) => void;
     request.mockImplementation(async (_path, init) => {
-      if (!init) return settings as never;
+      if (!init?.method) return settings as never;
       if (JSON.parse(init.body as string).action === 'start') return new Promise((resolve) => { finish = resolve; }) as never;
       return {} as never;
     });
@@ -98,7 +98,7 @@ describe('personal source setup', () => {
   it.each(['owner_id', 'runtime_scope'] as const)('does not adopt a different %s during a post-mutation refresh', async (binding) => {
     let reads = 0;
     request.mockImplementation(async (_path, init) => {
-      if (!init) return (++reads === 1 ? settings : { ...settings, [binding]: 'different-binding' }) as never;
+      if (!init?.method) return (++reads === 1 ? settings : { ...settings, [binding]: 'different-binding' }) as never;
       return { model_id: authorization } as never;
     });
     const changed = vi.fn(); render(<PersonalModels onChanged={changed} />); await ready();
@@ -106,19 +106,21 @@ describe('personal source setup', () => {
     fireEvent.change(screen.getByLabelText('Provider model ID'), { target: { value: 'fixture' } });
     fireEvent.change(screen.getByLabelText('API key'), { target: { value: 'synthetic-key' } });
     fireEvent.click(screen.getByRole('button', { name: 'Check and add personal model' }));
-    await screen.findByText('Account or deployment changed; close and reopen model settings.');
-    expect(changed).not.toHaveBeenCalled();
+    await screen.findByText(/Account or deployment changed; close and reopen model settings/);
+    expect(changed).not.toHaveBeenCalledWith(authorization, expect.anything());
     expect(actions()[0]).toMatchObject({ action: 'create', owner_id: settings.owner_id, runtime_scope: settings.runtime_scope });
   });
-  it.each(['failed', 'stalled'])('retains the committed connection when settings %s and retries models without authorization', async (read) => {
+  it.each(['failed', 'stalled', 'late'])('retains the committed connection when settings %s and retries models without authorization', async (read) => {
     const browser = popup(); vi.spyOn(window, 'open').mockReturnValue(browser);
     let connected = false;
+    let finishRead!: (value: unknown) => void;
     request.mockImplementation(async (_path, init) => {
-      if (!init && connected) {
+      if (!init?.method && connected) {
         if (read === 'failed') throw new Error('Settings temporarily unavailable');
+        if (read === 'late') return new Promise((resolve) => { finishRead = resolve; }) as never;
         return new Promise(() => {}) as never;
       }
-      if (!init) return { ...settings, connections: connected ? [{ connection_id: authorization, email: 'account@example.test', label: 'Personal', status: 'connected' }] : [] } as never;
+      if (!init?.method) return { ...settings, connections: connected ? [{ connection_id: authorization, email: 'account@example.test', label: 'Personal', status: 'connected' }] : [] } as never;
       const body = JSON.parse(init.body as string);
       if (body.action === 'start') return started() as never;
       if (body.action === 'complete') { connected = true; return { connection: { connection_id: authorization, email: 'account@example.test', label: 'Personal', status: 'connected' } } as never; }
@@ -132,11 +134,15 @@ describe('personal source setup', () => {
     await act(async () => window.dispatchEvent(new MessageEvent('message', { source: browser, origin, data: { type: 'astra-chatgpt-callback', state: 'bound-state', code: 'synthetic-code', client_id: 'fixture' } })));
     await screen.findByText(/temporarily unavailable/);
     expect(connected).toBe(true);
+    if (read === 'late') {
+      await act(async () => finishRead({ ...settings, connections: [{ connection_id: authorization, email: 'account@example.test', status: 'connected' }], catalog: { items: [], accesses: [], defaultOfferingId: null } }));
+      expect(screen.getByRole('status')).toHaveTextContent(/Could not load models/);
+    }
     // The authoritative connection is already committed. The view should
     // retain it and allow a read-only catalog retry without another consent.
     expect(screen.queryByText(/account@example.test/)).not.toBeNull();
     request.mockImplementation(async (_path, init) => {
-      if (!init) return settings as never;
+      if (!init?.method) return settings as never;
       return { items: [{ slug: 'fixture', display_name: 'Fixture' }], configured_models: [] } as never;
     });
     fireEvent.click(screen.getByRole('button', { name: 'Choose models' }));
@@ -167,7 +173,7 @@ describe('personal source setup', () => {
     let initial!: (value: unknown) => void;
     const connection = { connection_id: authorization, email: 'current@example.test', label: 'Personal', status: 'connected' };
     request.mockImplementation(async (_path, init) => {
-      if (!init) {
+      if (!init?.method) {
         if (++reads === 1) return new Promise((resolve) => { initial = resolve; }) as never;
         return (reads === 2 ? settings : { ...settings, connections: [connection] }) as never;
       }
@@ -189,5 +195,38 @@ describe('personal source setup', () => {
     await act(async () => initial(settings));
     expect(screen.queryByText(/current@example.test/)).not.toBeNull();
     expect(screen.getByRole('button', { name: 'Choose models' })).toBeEnabled();
+  });
+  it('keeps a confirmed write when refreshing sources fails and retries only the read', async () => {
+    let saved = false; let retry = false;
+    const catalog = { items: [], accesses: [], defaultOfferingId: null };
+    request.mockImplementation(async (_path, init) => {
+      if (!init?.method) { if (saved && !retry) throw new Error('offline'); return { ...settings, catalog } as never; }
+      saved = true; return { model_id: authorization } as never;
+    });
+    const changed = vi.fn(); render(<PersonalModels onChanged={changed} />); await ready();
+    fireEvent.change(screen.getByLabelText('Model name'), { target: { value: 'mine' } });
+    fireEvent.change(screen.getByLabelText('Provider model ID'), { target: { value: 'fixture' } });
+    fireEvent.change(screen.getByLabelText('API key'), { target: { value: 'synthetic-key' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Check and add personal model' }));
+    await screen.findByText(/Model change saved. Could not refresh/);
+    expect(changed).toHaveBeenCalledWith(); retry = true;
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh model sources' }));
+    await waitFor(() => expect(changed).toHaveBeenCalledWith(authorization, catalog));
+    expect(actions().filter((row) => row.action === 'create')).toHaveLength(1);
+  });
+  it('hands a late committed write to the parent after settings unmount', async () => {
+    let finish!: (value: unknown) => void;
+    request.mockImplementation(async (_path, init) => {
+      if (!init?.method) return settings as never;
+      return new Promise((resolve) => { finish = resolve; }) as never;
+    });
+    const changed = vi.fn(); const panel = render(<PersonalModels onChanged={changed} />); await ready();
+    fireEvent.change(screen.getByLabelText('Model name'), { target: { value: 'mine' } });
+    fireEvent.change(screen.getByLabelText('Provider model ID'), { target: { value: 'fixture' } });
+    fireEvent.change(screen.getByLabelText('API key'), { target: { value: 'synthetic-key' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Check and add personal model' }));
+    await waitFor(() => expect(finish).toBeDefined()); panel.unmount();
+    await act(async () => finish({ model_id: authorization }));
+    expect(changed).toHaveBeenCalledWith(undefined, null);
   });
 });

@@ -1,3 +1,4 @@
+import { runtimeModelCatalog } from '@/lib/api/model-catalog';
 import { createHash } from 'node:crypto';
 import { jwtSessionHint } from '@/lib/auth/session-cookie';
 import { NextRequest, NextResponse } from 'next/server';
@@ -18,14 +19,17 @@ function failure(error: unknown) {
   return NextResponse.json({ error: error instanceof Error ? error.message : 'Personal model operation failed' },
     { status: error instanceof RuntimeClientError ? error.status : 400, headers: { 'Cache-Control': 'no-store' } });
 }
-export async function GET() {
+export async function GET(request?: NextRequest) {
   const auth = await requireRuntimeUser();
   if (auth.response) return auth.response;
   try {
+    const expected = request ? new URL(request.url).searchParams : null;
+    if (expected?.has('owner_id') && (expected.get('owner_id') !== auth.user.user_id || expected.get('runtime_scope') !== runtimeScope(auth.client.config.apiUrl, auth.client.config.accessToken))) return NextResponse.json({ error: 'Account or deployment changed; reopen model settings.' }, { status: 409 });
     const linked = await auth.client.get<{ items: unknown[]; management_available: boolean }>(connections);
     if (!linked.management_available) return NextResponse.json({ error: 'Your deployment manages model access; personal model configuration is not available.' }, { status: 403 });
     const models = await auth.client.get<{ items: unknown[] }>('/me/models');
-    return NextResponse.json({ owner_id: auth.user.user_id, runtime_scope: runtimeScope(auth.client.config.apiUrl, auth.client.config.accessToken), models: models.items, connections: linked.items }, { headers: { 'Cache-Control': 'no-store' } });
+    const catalog = expected?.has('catalog') ? await runtimeModelCatalog(auth.client) : undefined;
+    return NextResponse.json({ catalog, owner_id: auth.user.user_id, runtime_scope: runtimeScope(auth.client.config.apiUrl, auth.client.config.accessToken), models: models.items, connections: linked.items }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) { return failure(error); }
 }
 export async function POST(request: NextRequest) {

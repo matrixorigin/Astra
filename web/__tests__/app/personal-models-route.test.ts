@@ -19,6 +19,21 @@ function request(body: unknown, origin = 'http://localhost:3536') {
 }
 describe('personal model public routes', () => {
   beforeEach(() => vi.clearAllMocks());
+  it('returns the canonical effective catalog with the same authenticated settings binding', async () => {
+    const runtime = client();
+    runtime.sdk.getModelAccess.mockResolvedValue({ offerings: [], accesses: [], default_offering_id: null } as never);
+    auth.mockResolvedValue({ user: { user_id: 'user' }, client: runtime, response: null } as never);
+    const response = await GET(new NextRequest(`http://localhost:3536/api/personal-models?catalog=1&owner_id=user&runtime_scope=${binding}`));
+    expect(response.status).toBe(200);
+    expect((await response.json()).catalog.items).toEqual([]);
+    expect(runtime.sdk.getModelAccess).toHaveBeenCalledTimes(1);
+  });
+  it('rejects an unbound combined catalog before reading model data', async () => {
+    const runtime = client(); auth.mockResolvedValue({ user: { user_id: 'different' }, client: runtime, response: null } as never);
+    const response = await GET(new NextRequest(`http://localhost:3536/api/personal-models?catalog=1&owner_id=user&runtime_scope=${binding}`));
+    expect(response.status).toBe(409); expect(runtime.get).not.toHaveBeenCalled();
+    expect(runtime.sdk.getModelAccess).not.toHaveBeenCalled();
+  });
   it('pins model mutations to the account that opened settings', async () => {
     const runtime = client();
     auth.mockResolvedValue({ user: { user_id: 'new-user' }, client: runtime, response: null } as never);

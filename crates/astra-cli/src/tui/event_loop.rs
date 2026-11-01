@@ -8210,7 +8210,7 @@ pub(crate) async fn run_tui_session(
                             }
                             Ok(super::model_setup::Outcome::Models { connection_id, slugs, existing }) => {
                                 let mut choices: Vec<_> = existing.into_iter().map(|(id, name)|
-                                    (format!("Use {name}"), Some("Check and restore this existing personal model".into()), super::model_setup::Action::Activate(id))).collect();
+                                    (format!("Check and restore {name}"), Some("Check and restore this existing personal model".into()), super::model_setup::Action::Activate(id))).collect();
                                 choices.extend(slugs.into_iter().map(|model|
                                     (model.clone(), Some("Add this model using your ChatGPT plan".into()), super::model_setup::Action::Subscription { connection_id: connection_id.clone(), model })));
                                 super::model_setup::choices(&mut bottom_pane, "Choose a ChatGPT model", choices);
@@ -8236,15 +8236,24 @@ pub(crate) async fn run_tui_session(
                                 choices.push(("Connect another ChatGPT account".into(), None, super::model_setup::Action::Connect(None)));
                                 super::model_setup::choices(&mut bottom_pane, "Your personal connections", choices);
                             }
-                            Ok(super::model_setup::Outcome::Created { model_id, catalog }) => {
+                            Ok(super::model_setup::Outcome::Saved { model_id, catalog }) => {
+                                let Ok(catalog) = catalog else {
+                                    bottom_pane.clear_model_catalog();
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response("Model change saved. Could not refresh models; reopen /model to retry without saving again."));
+                                    pending_deferred_slash_flush = true;
+                                    frame_requester.schedule_frame();
+                                    continue;
+                                };
                                 bottom_pane.cache_model_catalog(catalog);
                                 let current_usable = super::model_setup::current_model_is_usable(
                                     state.model.as_ref(), bottom_pane.current_model_catalog(),
                                 );
                                 if current_usable {
-                                    chat_widget.commit_system(history_cell::system::SystemCell::response("Personal model added and checked. Your current model is unchanged; choose another with /model."));
-                                } else {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response("Model change saved. Your current model is unchanged; choose another with /model."));
+                                } else if bottom_pane.current_model_catalog().iter().any(|row| row.offering_id == model_id && crate::cli::session::session_runtime::model_list_entry_is_active(row)) {
                                     slash_dispatch::apply_model_picker_result(&bottom_pane::view::ViewResult::Model { name: model_id }, &mut state, &mut bottom_pane, &mut chat_widget);
+                                } else {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response("Model change saved. The model is unavailable in the current catalog; reopen /model to choose a usable model."));
                                 }
                             }
                             Ok(super::model_setup::Outcome::Removed) => {

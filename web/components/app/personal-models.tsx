@@ -1,16 +1,17 @@
 'use client';
+import type { ModelCatalogResponse } from '@/lib/api/models';
 
 import { useEffect, useRef, useState } from 'react';
 import { requestJson } from '@/lib/api/request';
 
 type Connection = { connection_id: string; label: string; email?: string; status: string };
 type PersonalModel = { model_id: string; name: string; provider: string; is_active: boolean; is_default: boolean };
-type Settings = { owner_id: string; runtime_scope: string; models: PersonalModel[]; connections: Connection[] };
+type Settings = { owner_id: string; runtime_scope: string; models: PersonalModel[]; connections: Connection[]; catalog?: ModelCatalogResponse };
 type Started = { authorization_id: string; state: string; authorization_url: string };
 type Catalog = { items: { slug: string; display_name: string }[]; configured_models: { model_id: string; name: string }[] };
 type Pending = { popup: Window; owner: string; scope: string; id?: string; completing: boolean; cancelled: boolean; stop: () => void };
 
-export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) => void }) {
+export function PersonalModels({ onChanged }: { onChanged: (modelId?: string, catalog?: ModelCatalogResponse | null) => void }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [message, setMessage] = useState('Loading your model sources…');
   const [busy, setBusy] = useState(false);
@@ -19,13 +20,18 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
   const pending = useRef<Pending | null>(null);
   const mounted = useRef(true);
   const readVersion = useRef(0);
+  const receipt = useRef<{ modelId?: string } | null>(null);
 
-  const load = async () => {
+  const load = async (announce = true) => {
     const version = ++readVersion.current;
-    const value = await requestJson<Settings>('/api/personal-models');
-    if (version !== readVersion.current) return;
+    const query = settings ? `?catalog=1&owner_id=${encodeURIComponent(settings.owner_id)}&runtime_scope=${encodeURIComponent(settings.runtime_scope)}` : '';
+    const value = await requestJson<Settings>(`/api/personal-models${query}`, { signal: AbortSignal.timeout(15000) }).catch((error: Error) => { if (version !== readVersion.current) return null; throw error; });
+    if (!value || version !== readVersion.current) return;
     if (settings && (settings.owner_id !== value.owner_id || settings.runtime_scope !== value.runtime_scope)) throw new Error('Account or deployment changed; close and reopen model settings.');
-    if (mounted.current) setSettings(value);
+    if (mounted.current) {
+      setSettings(value);
+      if (value.catalog) { onChanged(receipt.current?.modelId, value.catalog); if (announce && receipt.current) setMessage('Model change saved. Model sources refreshed.'); receipt.current = null; }
+    }
   };
   useEffect(() => {
     mounted.current = true;
@@ -40,7 +46,7 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
   }, []);
 
   function call<T>(action: string, body: Record<string, unknown> = {}, owner = settings?.owner_id, scope = settings?.runtime_scope) {
-    return requestJson<T>('/api/personal-models', { method: 'POST', body: JSON.stringify({ ...body, action, owner_id: owner, runtime_scope: scope }) });
+    return requestJson<T>('/api/personal-models', { method: 'POST', signal: action === 'catalog' ? AbortSignal.timeout(15000) : undefined, body: JSON.stringify({ ...body, action, owner_id: owner, runtime_scope: scope }) });
   }
   function cancelPending() {
     const current = pending.current;
@@ -56,11 +62,13 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
     setBusy(true);
     try {
       const result = await call<{ model_id?: string }>(action, body);
-      await load();
-      if (mounted.current) {
-        setMessage(select ? 'Model checked. You can select it in the model menu.' : 'Model sources updated. Your conversation is unchanged.');
-        onChanged(select ? result.model_id : undefined);
-      }
+      if (!mounted.current) { onChanged(undefined, null); return; }
+      receipt.current = { modelId: select ? result.model_id : undefined };
+      onChanged();
+      setMessage('Model change saved. Refreshing model sources…');
+      try { await load(); }
+      catch (error) { if (mounted.current) setMessage(`Model change saved. Could not refresh sources; use Refresh model sources to retry without saving again. ${error instanceof Error ? error.message : ''}`); }
+
     } catch (error) { if (mounted.current) setMessage(error instanceof Error ? error.message : 'Model operation failed'); }
     finally { if (mounted.current) setBusy(false); }
   }
@@ -73,7 +81,7 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
         setCatalog({ connection, models });
         setMessage(models.items.length ? 'Account connected. Choose and check a model before chatting.' : 'Account connected, but no usable models are available. Choose another source.');
       }
-    } catch (error) { if (mounted.current) setMessage(error instanceof Error ? error.message : 'Could not load models. Choose models to retry.'); }
+    } catch (error) { if (mounted.current) setMessage(`Authorization already saved. Could not load models; choose models to retry. ${error instanceof Error ? error.message : ''}`); }
     finally { if (mounted.current) setBusy(false); }
   }
   async function connect(connection?: string) {
@@ -114,9 +122,11 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
           authorization_id: current.id, state: started.state,
           code: value.code, client_id: value.client_id, error: value.error,
         }, current.owner, current.scope).then(async (linked) => {
-          if (!mounted.current) return;
+          if (!mounted.current) { onChanged(undefined, null); return; }
+          receipt.current = {};
+          onChanged();
           setSettings((previous) => previous ? { ...previous, connections: [...previous.connections.filter((row) => row.connection_id !== linked.connection.connection_id), linked.connection] } : previous);
-          void load().catch((error: Error) => { if (mounted.current) setMessage(error.message); });
+          void load(false).catch(() => {});
           if (linked.connection.status === 'connected') await chooseModels(linked.connection.connection_id);
           else if (mounted.current) setMessage(`Account authorization saved: ${linked.connection.status}. Reconnect to grant plan access or choose another source.`);
         }).catch((error: Error) => { if (mounted.current) setMessage(error.message); })
@@ -135,7 +145,7 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string) =>
 
   return <section aria-label="Personal model sources" className="space-y-3 border-t border-border p-3 text-sm">
     <p role="status" className="text-text-muted">{message}</p>
-    <button type="button" disabled={busy} onClick={() => { setBusy(true); void load().catch((error: Error) => setMessage(error.message)).finally(() => setBusy(false)); }}>Refresh model sources</button>
+    <button type="button" disabled={busy} onClick={() => { setBusy(true); void load().catch((error: Error) => setMessage(`${receipt.current ? 'Model change saved. ' : ''}${error.message}`)).finally(() => setBusy(false)); }}>Refresh model sources</button>
     {settings ? <>
       <form className="space-y-2" onSubmit={(event) => {
         event.preventDefault();

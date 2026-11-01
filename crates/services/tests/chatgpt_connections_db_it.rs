@@ -911,12 +911,7 @@ async fn subscription_sql_timeouts_release_pool_capacity_before_response_arrives
             Boundary::Statement(prefix),
         )
         .await;
-        let mut worker_settings = settings.clone();
-        worker_settings.host = "127.0.0.1".into();
-        worker_settings.port = proxy.port;
-        worker_settings.db_pool_max_connections = 1;
-        worker_settings.db_pool_min_connections = 0;
-        let worker = astra_core::SharedPool::new(&worker_settings).await.unwrap();
+        let worker = proxy_pool(&settings, proxy.port).await;
         let service = Arc::new(ChatgptConnections::new(
             Some(worker.clone()),
             key.clone(),
@@ -1052,12 +1047,7 @@ async fn simultaneous_registration_retries_preserve_canonical_connection() {
         Boundary::Statement(b"SELECT connection_id FROM user_llm_connections WHERE user_id="),
     )
     .await;
-    let mut proxied = settings.clone();
-    proxied.host = "127.0.0.1".into();
-    proxied.port = proxy.port;
-    proxied.db_pool_max_connections = 1;
-    proxied.db_pool_min_connections = 0;
-    let worker = astra_core::SharedPool::new(&proxied).await.unwrap();
+    let worker = proxy_pool(&settings, proxy.port).await;
     let delayed = Arc::new(ChatgptConnections::new(Some(worker), key, Ok(config)));
     let owner = format!("review-{}", uuid::Uuid::new_v4());
     // A failed first link retains the issued client but has no connection yet.
@@ -1203,12 +1193,7 @@ async fn completion_settles_after_waiter_cancellation_and_rolls_back_cancelled_l
         Boundary::Statement(b"INSERT INTO user_llm_connections "),
     )
     .await;
-    let mut proxied = settings.clone();
-    proxied.host = "127.0.0.1".into();
-    proxied.port = proxy.port;
-    proxied.db_pool_max_connections = 1;
-    proxied.db_pool_min_connections = 0;
-    let worker = astra_core::SharedPool::new(&proxied).await.unwrap();
+    let worker = proxy_pool(&settings, proxy.port).await;
     let delayed = Arc::new(ChatgptConnections::new(
         Some(worker.clone()),
         key,
@@ -1306,12 +1291,7 @@ async fn completion_deadline_releases_sql_and_only_settles_its_own_exchange() {
             Boundary::Statement(prefix),
         )
         .await;
-        let mut proxied = settings.clone();
-        proxied.host = "127.0.0.1".into();
-        proxied.port = proxy.port;
-        proxied.db_pool_max_connections = 1;
-        proxied.db_pool_min_connections = 0;
-        let worker = astra_core::SharedPool::new(&proxied).await.unwrap();
+        let worker = proxy_pool(&settings, proxy.port).await;
         let delayed = Arc::new(ChatgptConnections::new(
             Some(worker.clone()),
             key,
@@ -1420,4 +1400,116 @@ async fn completion_deadline_releases_sql_and_only_settles_its_own_exchange() {
         }
         worker.get().close().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn refresh_failure_cleanup_respects_its_budget() {
+    use mysql_response_proxy::{Boundary, ResponseProxy};
+    use std::time::Duration;
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    for (boundary, claim) in [
+        (Boundary::Begin, true),
+        (
+            Boundary::Statement(b"UPDATE user_llm_connections SET refresh_owner=?"),
+            true,
+        ),
+        (
+            Boundary::Statement(b"UPDATE user_llm_connections SET status='reauth_required'"),
+            false,
+        ),
+    ] {
+        let provider = fixture::ProviderFixture::start().await;
+        let key = Arc::new(FernetTokenEncryptor::new("review-refresh-cleanup").unwrap());
+        let config = ChatgptConfig::for_test(&provider.base);
+        let direct = Arc::new(ChatgptConnections::new(
+            Some(shared.clone()),
+            key.clone(),
+            Ok(config.clone()),
+        ));
+        let owner = format!("review-refresh-cleanup-{}", uuid::Uuid::new_v4());
+        let auth = start(&direct, &owner, None).await;
+        let code = provider.issue_code(&auth, "cleanup-subject", true);
+        let linked = operate_ok(
+            &direct,
+            &owner,
+            ConnectionOperation::Complete(
+                auth["authorization_id"].as_str().unwrap().into(),
+                callback(&auth, &code),
+            ),
+        )
+        .await;
+        let id = linked["connection"]["connection_id"].as_str().unwrap();
+        expire(shared.get(), &key, &owner, id).await;
+        provider
+            .state
+            .refresh_error
+            .store(if claim { 0 } else { 400 }, Ordering::SeqCst);
+        let saved: String = sqlx::query_scalar("SELECT credentials_encrypted FROM user_llm_connections WHERE user_id=? AND connection_id=?").bind(&owner).bind(id).fetch_one(shared.get()).await.unwrap();
+        let proxy = ResponseProxy::start(settings.host.clone(), settings.port, boundary).await;
+        let worker = proxy_pool(&settings, proxy.port).await;
+        let delayed = Arc::new(ChatgptConnections::new(
+            Some(worker.clone()),
+            key,
+            Ok(config),
+        ));
+        let binding = delayed.binding(&owner, id).await.unwrap();
+        let waiting = tokio::spawn(async move { binding.acquire(None).await });
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        let completed_before_release = waiting.is_finished();
+        let healthy_before_release = tokio::time::timeout(
+            Duration::from_millis(200),
+            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(worker.get()),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        assert!(
+            healthy_before_release,
+            "pool must be healthy before releasing the failed settlement reply"
+        );
+        proxy.gate.release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(worker.get()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        println!(
+            "after 120s virtual time: refresh_complete={completed_before_release}, pool_healthy={healthy_before_release}; both recovered after releasing SQL"
+        );
+        if claim {
+            assert_eq!(provider.state.refresh_calls.load(Ordering::SeqCst), 0);
+            let retained: (String, Option<String>, String) = sqlx::query_as("SELECT credentials_encrypted,refresh_owner,status FROM user_llm_connections WHERE user_id=? AND connection_id=?").bind(&owner).bind(id).fetch_one(shared.get()).await.unwrap();
+            assert_eq!(retained, (saved, None, "connected".into()));
+        }
+        worker.get().close().await;
+        assert!(
+            completed_before_release,
+            "refresh failure cleanup exceeded the operation and lease budgets"
+        );
+    }
+}
+
+async fn proxy_pool(settings: &astra_core::MatrixOneSettings, port: u16) -> astra_core::SharedPool {
+    let mut settings = settings.clone();
+    settings.host = "127.0.0.1".into();
+    settings.port = port;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 0;
+    astra_core::SharedPool::new(&settings).await.unwrap()
 }
