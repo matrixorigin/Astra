@@ -133,15 +133,24 @@ pub struct ChatgptConfig {
 }
 impl ChatgptConfig {
     pub fn from_env() -> Result<Self, String> {
-        let enabled = match std::env::var("ASTRA_CHATGPT_SUBSCRIPTION_ENABLED").as_deref() {
-            Err(_) | Ok("") | Ok("0") | Ok("false") => false,
-            Ok("1") | Ok("true") => true,
+        Self::from_settings(
+            std::env::var("ASTRA_CHATGPT_SUBSCRIPTION_ENABLED")
+                .ok()
+                .as_deref(),
+            std::env::var("ASTRA_CHATGPT_HOST_ID").unwrap_or_default(),
+        )
+    }
+    fn from_settings(enabled: Option<&str>, host_id: String) -> Result<Self, String> {
+        let enabled = match enabled {
+            None | Some("" | "1" | "true") => true,
+            Some("0" | "false") => false,
             _ => return Err("ASTRA_CHATGPT_SUBSCRIPTION_ENABLED must be 0 or 1".into()),
         };
-        let host_id = std::env::var("ASTRA_CHATGPT_HOST_ID").unwrap_or_default();
-        if enabled && (!host_id.starts_with("urn:uuid:") || Uuid::parse_str(&host_id[9..]).is_err())
+        if enabled
+            && !host_id.is_empty()
+            && (!host_id.starts_with("urn:uuid:") || Uuid::parse_str(&host_id[9..]).is_err())
         {
-            return Err("Enabled ChatGPT connections require a stable ASTRA_CHATGPT_HOST_ID=urn:uuid:<UUID>".into());
+            return Err("ASTRA_CHATGPT_HOST_ID must be urn:uuid:<UUID> when explicitly set".into());
         }
         Ok(Self {
             enabled,
@@ -486,6 +495,24 @@ impl ChatgptConnections {
         encryptor: Arc<FernetTokenEncryptor>,
         config: Result<ChatgptConfig, String>,
     ) -> Self {
+        let config = config.map(|mut config| {
+            if config.host_id.is_empty() {
+                // The existing deployment key is stable across restarts and replicas.
+                // Derive a public, purpose-separated identity without new storage or setup.
+                let digest = Sha256::digest(
+                    encryptor
+                        .keyed_digest("astra.chatgpt.host-id.v1", "installation")
+                        .as_bytes(),
+                );
+                let mut bytes = [0; 16];
+                bytes.copy_from_slice(&digest[..16]);
+                config.host_id = uuid::Builder::from_random_bytes(bytes)
+                    .into_uuid()
+                    .urn()
+                    .to_string();
+            }
+            config
+        });
         Self {
             pool,
             encryptor,
@@ -517,6 +544,16 @@ impl ChatgptConnections {
             ));
         }
         Ok(config)
+    }
+    pub fn availability(&self) -> Value {
+        match self.enabled() {
+            Ok(_) => json!({"available": true}),
+            Err((_, Json(error))) => json!({
+                "available": false,
+                "error_code": error.error_code,
+                "detail": error.detail,
+            }),
+        }
     }
     fn pool(&self) -> ApiResult<MySqlPool> {
         self.pool

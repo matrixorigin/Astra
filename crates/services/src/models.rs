@@ -3946,6 +3946,11 @@ impl ModelService for DatabaseModelService {
                 serde_json::json!({"items": []})
             };
             value["management_available"] = serde_json::json!(available);
+            value["chatgpt"] = if available {
+                self.subscriptions.availability()
+            } else {
+                serde_json::json!({"available": false})
+            };
             return Ok(value);
         }
         if !available {

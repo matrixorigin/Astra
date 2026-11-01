@@ -79,7 +79,8 @@ Server together with the CLI to provide `/me/models/validate-endpoint`.
 
 For personal/non-MOI deployments, start `astra` and use `/register` or `/login`.
 Registration signs in the normal local user. A confirmed empty model catalog
-opens personal setup; `/model add` opens it again. Choose **Use my API key** or
+opens personal setup; `/model add` opens it again. Both `add` and `manage` appear
+in `/model ` completion and command help. Choose **Use my API key** or
 **Continue with ChatGPT**. API keys are masked, provider consent opens the system
 browser, and model selection/checking returns to the same TUI. A provider login
 without an eligible checked model is not chat-ready. No admin command is needed.
@@ -110,7 +111,7 @@ an arbitrary public OAuth callback is not supported. Keys/tokens stay off browse
 storage. A changed account, deployment or session requires reopening settings.
 
 For scripts, the equivalent ordinary-user CLI commands remain available.
-On a self-hosted Server with subscription sharing enabled, sign in to Astra,
+On a personal self-hosted Server, sign in to Astra,
 then link a ChatGPT account from a terminal with a local browser:
 
 ```bash

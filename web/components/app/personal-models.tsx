@@ -6,7 +6,7 @@ import { requestJson } from '@/lib/api/request';
 
 type Connection = { connection_id: string; label: string; email?: string; status: string };
 type PersonalModel = { model_id: string; name: string; provider: string; is_active: boolean; is_default: boolean };
-type Settings = { owner_id: string; runtime_scope: string; models: PersonalModel[]; connections: Connection[]; catalog?: ModelCatalogResponse };
+type Settings = { owner_id: string; runtime_scope: string; models: PersonalModel[]; connections: Connection[]; chatgpt: { available: boolean; detail?: string }; catalog?: ModelCatalogResponse };
 type Started = { authorization_id: string; state: string; authorization_url: string };
 type Catalog = { items: { slug: string; display_name: string }[]; configured_models: { model_id: string; name: string }[] };
 type Pending = { popup: Window; owner: string; scope: string; id?: string; completing: boolean; cancelled: boolean; stop: () => void };
@@ -85,7 +85,7 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string, ca
     finally { if (mounted.current) setBusy(false); }
   }
   async function connect(connection?: string) {
-    if (!settings || busy) return;
+    if (!settings?.chatgpt?.available || busy) return;
     if (location.protocol !== 'http:' || !location.port || !['localhost', '127.0.0.1'].includes(location.hostname)) {
       setMessage('For browser authorization, open this local Astra installation using HTTP on localhost or 127.0.0.1 with a non-default port (for example, 3536). Use the TUI on your browser machine for other deployments.');
       return;
@@ -168,12 +168,13 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string, ca
       </form>
       <div className="space-y-2">
         <h3 className="font-medium">My ChatGPT accounts</h3>
-        <button type="button" disabled={busy} onClick={() => void connect()}>Continue with ChatGPT</button>
+        <button type="button" disabled={busy || !settings.chatgpt?.available} onClick={() => void connect()}>Continue with ChatGPT</button>
+        {!settings.chatgpt?.available ? <p>{settings.chatgpt?.detail || 'ChatGPT connections are unavailable on this Server.'} Use an API key model, or ask the Server operator to enable ChatGPT connections.</p> : null}
         {busy && pending.current && !pending.current.completing ? <button type="button" onClick={cancelPending}>Cancel authorization</button> : null}
         {settings.connections.map((connection) => <div key={connection.connection_id}>
           <span>{connection.email || connection.label} · {connection.status} · Your ChatGPT plan</span>
-          <button type="button" disabled={busy || connection.status !== 'connected'} onClick={() => void chooseModels(connection.connection_id)}>Choose models</button>
-          <button type="button" disabled={busy} onClick={() => { setCatalog(null); void connect(connection.connection_id); }}>Reconnect</button>
+          <button type="button" disabled={busy || !settings.chatgpt?.available || connection.status !== 'connected'} onClick={() => void chooseModels(connection.connection_id)}>Choose models</button>
+          <button type="button" disabled={busy || !settings.chatgpt?.available} onClick={() => { setCatalog(null); void connect(connection.connection_id); }}>Reconnect</button>
           <button type="button" disabled={busy} onClick={() => { setCatalog(null); void mutation('disconnect', { connection_id: connection.connection_id }); }}>Disconnect</button>
         </div>)}
       </div>

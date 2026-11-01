@@ -3,7 +3,7 @@ import { PersonalModels } from '@/components/app/personal-models';
 import { requestJson } from '@/lib/api/request';
 vi.mock('@/lib/api/request', () => ({ requestJson: vi.fn() }));
 const request = vi.mocked(requestJson);
-const settings = { owner_id: 'original-user', runtime_scope: 'original-runtime', models: [], connections: [], connectionError: null };
+const settings = { owner_id: 'original-user', runtime_scope: 'original-runtime', models: [], connections: [], chatgpt: { available: true } };
 const authorization = '00000000-0000-4000-8000-000000000001';
 function popup() {
   return { closed: false, close: vi.fn(), location: { replace: vi.fn() } } as unknown as Window;
@@ -21,6 +21,20 @@ function actions() {
 describe('personal source setup', () => {
   beforeEach(() => { vi.clearAllMocks(); request.mockResolvedValue(settings as never); });
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  it('keeps API keys and cleanup usable when the Server disables ChatGPT', async () => {
+    request.mockResolvedValue({ ...settings, chatgpt: { available: false, detail: 'ChatGPT disabled by Server' },
+      connections: [{ connection_id: authorization, label: 'personal', status: 'connected' }] } as never);
+    const open = vi.spyOn(window, 'open');
+    render(<PersonalModels onChanged={vi.fn()} />); await ready();
+    expect(screen.getByRole('button', { name: 'Continue with ChatGPT' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Reconnect' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Choose models' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Disconnect' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Check and add personal model' })).toBeEnabled();
+    expect(screen.getByText(/ChatGPT disabled by Server/)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with ChatGPT' }));
+    expect(actions()).toEqual([]); expect(open).not.toHaveBeenCalled();
+  });
   it('explains the non-default port requirement before opening a popup', async () => {
     vi.stubGlobal('location', new URL('http://localhost'));
     const open = vi.spyOn(window, 'open').mockReturnValue(popup());

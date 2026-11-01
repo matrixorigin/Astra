@@ -40,7 +40,7 @@ Model access and inference defines how Astra presents model capability as a prod
 
 ## Implemented ChatGPT subscription connection boundary
 
-The opt-in self-hosted ChatGPT adapter uses the same Offering admission, agent
+The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
 backbone, invocation/provider-attempt ledger, tool execution, cancellation,
 canonical history and checkpoint paths as API-key models. `chatgpt` selects
 the shared Responses codec; it does not create another session state machine.

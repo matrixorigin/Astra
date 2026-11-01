@@ -467,8 +467,15 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
             let (sub, rest) = split_sub(trimmed);
             match sub {
-                "add" | "manage" => {
+                "add" => {
                     crate::tui::model_setup::sources(ctx.bottom_pane);
+                    SlashResult::Handled
+                }
+                "manage" => {
+                    crate::tui::model_setup::open(
+                        ctx.bottom_pane,
+                        crate::tui::model_setup::Action::Manage,
+                    );
                     SlashResult::Handled
                 }
                 "info" => handle_model_info(ctx, rest).await,
@@ -4920,6 +4927,56 @@ mod model_catalog_loading_tests {
         .await;
         assert!(
             matches!(result, Ok(Outcome::Saved { model_id, catalog: Err(_), .. }) if model_id == id)
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_disabled_chatgpt_is_discovered_before_authorization() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/me/model-connections"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [], "management_available": true,
+                "chatgpt": {"available": false, "error_code": "chatgpt_subscription_disabled", "detail": "ChatGPT disabled by Server"}
+            }))).expect(2).mount(&server).await;
+        for action in [Action::Sources, Action::Connect(None)] {
+            let connecting = matches!(action, Action::Connect(_));
+            let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+            let result = model_setup::run(
+                action,
+                astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                cli_owner_auth_snapshot(),
+                tokio_util::sync::CancellationToken::new(),
+                std::sync::Arc::new(LoginControl::default()),
+                progress,
+            )
+            .await;
+            if connecting {
+                let message = result.err().expect("disabled feature cannot start OAuth");
+                assert!(message.contains("Server operator"));
+                assert!(!message.contains("try again shortly"));
+            } else {
+                assert!(
+                    matches!(result, Ok(Outcome::Sources(value)) if value["available"] == false)
+                );
+            }
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method == "GET")
         );
     }
 

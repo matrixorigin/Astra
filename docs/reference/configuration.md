@@ -70,21 +70,26 @@ select optional tools separately.
 
 ### ChatGPT subscription connections
 
-`ASTRA_CHATGPT_SUBSCRIPTION_ENABLED=1` enables explicit per-user ChatGPT
-subscription connections. The default is disabled. Enabling also requires
-`ASTRA_CHATGPT_HOST_ID=urn:uuid:<UUID>`: generate a UUID once per self-hosted
-installation, retain it across restarts, and share it only with replicas of
-that same installation on the same host. A different host ID requires explicit
-reauthorization. Stable `ASTRA_TOKEN_ENCRYPTION_KEY` and MatrixOne are required;
-back up this key and host ID through the deployment's secret-management process.
+Personal ChatGPT connections are available by default. Users sign in to Astra
+and choose **Continue with ChatGPT**; no administrator command or feature-enabling
+step is required. The existing owner policy still excludes UC/MOI-managed
+accounts from personal model configuration.
 
-`make dev-init` and `make stack-env` prepare these settings for a personal local
-installation, retain an existing host ID/key, and respect an explicit `0` or
-`false` disable. Both `1` and `true` enable the feature. Setup skips this
-configuration when UC is configured; existing MOI/UC model, billing and login
-policy stays authoritative. The supported Compose profiles forward both settings.
-Do not regenerate a lost identity/key to repair an existing connection: restore
-the original configuration or explicitly reconnect affected accounts.
+Astra derives its stable installation UUID from the existing
+`ASTRA_TOKEN_ENCRYPTION_KEY`, with a separate cryptographic purpose. It does not
+store another identity or write configuration at startup. Retain this key across
+restarts and replicas; changing it already makes stored credentials unreadable
+and also changes the derived identity. A key belongs to one installation; do not
+reuse it across independent deployments. If `ASTRA_CHATGPT_HOST_ID=urn:uuid:<UUID>`
+is explicitly configured, it remains authoritative and must be retained.
+
+An operator can explicitly disable ChatGPT with
+`ASTRA_CHATGPT_SUBSCRIPTION_ENABLED=0` (or `false`) and restart the Server.
+`1`/`true` and an unset value allow the feature. Invalid configuration fails
+closed. TUI and Web discover availability through the existing model-connection
+list; disabling ChatGPT leaves personal API-key configuration and connection
+cleanup available. No OAuth or inference request is sent merely by starting the
+Server or reading availability.
 
 This initial integration targets personal self-hosted installations. Hosted
 commercial offerings, multi-host installations and device-side inference are
@@ -92,7 +97,7 @@ outside this version. It uses OpenAI's public Sign in with ChatGPT dynamic
 registration and direct Responses API, with fixed trusted origins. No provider
 client secret or Codex authentication file is configured.
 
-Upgrade every Server replica to this source before enabling, then follow
+Upgrade every Server replica to this source, then follow
 [TUI, CLI and local Web setup](cli-commands.md#chatgpt-subscription-models). Startup adds two
 owner-scoped tables and a nullable connection reference to personal models;
 existing API-key model rows remain valid. Do not run older and newer binaries

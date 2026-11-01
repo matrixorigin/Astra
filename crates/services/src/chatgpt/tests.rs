@@ -13,6 +13,62 @@ fn encryptor() -> Arc<FernetTokenEncryptor> {
 }
 
 #[test]
+fn personal_setup_defaults_on_with_stable_key_scoped_identity() {
+    let config = || ChatgptConfig::from_settings(None, String::new()).unwrap();
+    let key = encryptor();
+    let first = ChatgptConnections::new(None, key.clone(), Ok(config()));
+    let restarted = ChatgptConnections::new(None, key, Ok(config()));
+    assert_eq!(first.availability()["available"], true);
+    let host = &first.enabled().unwrap().host_id;
+    assert_eq!(host, &restarted.enabled().unwrap().host_id);
+    assert!(host.starts_with("urn:uuid:"));
+    assert!(Uuid::parse_str(&host[9..]).is_ok());
+    let separate = ChatgptConnections::new(
+        None,
+        Arc::new(FernetTokenEncryptor::new("another-installation-key").unwrap()),
+        Ok(config()),
+    );
+    assert_ne!(host, &separate.enabled().unwrap().host_id);
+    let explicit = Uuid::new_v4().urn().to_string();
+    let service = ChatgptConnections::new(
+        None,
+        encryptor(),
+        ChatgptConfig::from_settings(None, explicit.clone()),
+    );
+    assert_eq!(service.enabled().unwrap().host_id, explicit);
+    for flag in ["", "1", "true"] {
+        assert!(
+            ChatgptConfig::from_settings(Some(flag), String::new())
+                .unwrap()
+                .enabled
+        );
+    }
+    for flag in ["0", "false"] {
+        let service = ChatgptConnections::new(
+            None,
+            encryptor(),
+            ChatgptConfig::from_settings(Some(flag), String::new()),
+        );
+        assert_eq!(service.availability()["available"], false);
+        assert_eq!(
+            service.availability()["error_code"],
+            "chatgpt_subscription_disabled"
+        );
+    }
+    for config in [
+        ChatgptConfig::from_settings(Some("unexpected"), String::new()),
+        ChatgptConfig::from_settings(None, "not-a-uuid".into()),
+    ] {
+        assert!(config.is_err());
+        let service = ChatgptConnections::new(None, encryptor(), config);
+        assert_eq!(
+            service.availability()["error_code"],
+            "chatgpt_subscription_unconfigured"
+        );
+    }
+}
+
+#[test]
 fn callback_policy_accepts_only_the_bound_loopback_path() {
     assert!(validate_redirect("http://127.0.0.1:12345/auth/callback").is_ok());
     for value in [

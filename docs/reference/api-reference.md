@@ -81,7 +81,11 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 The connection-list response includes `management_available`, the authenticated
 principal's personal-management capability. It is independent of whether any
-model already exists and is false for the managed UC model path. The connection
+model already exists and is false for the managed UC model path. The same
+response includes `chatgpt: {available, error_code?, detail?}`, derived from Server
+configuration without another database read. Clients use it before offering
+ChatGPT linking; a disabled adapter does not disable API-key model management
+or connection cleanup. The connection
 model catalog also returns `configured_models` (`model_id`, `name`) so reconnect
 can restore an existing model rather than create another configuration. These
 new connection fields do not change the catalog-v2 DTO or its enums.

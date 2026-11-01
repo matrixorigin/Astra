@@ -996,16 +996,18 @@ async fn personal_management_is_available_before_models_exist_and_keeps_uc_manag
     sqlx::query("INSERT INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES (?,?,?)")
         .bind(format!("uc:{issuer}")).bind(&uc).bind(&uc).execute(shared.get()).await.unwrap();
     let empty = service
-        .model_connection_operation(local, ConnectionOperation::List)
+        .model_connection_operation(local.clone(), ConnectionOperation::List)
         .await
         .unwrap();
     assert_eq!(empty["management_available"], true);
     assert_eq!(empty["items"], json!([]));
+    assert_eq!(empty["chatgpt"]["available"], true);
     let managed = service
         .model_connection_operation(uc.clone(), ConnectionOperation::List)
         .await
         .unwrap();
     assert_eq!(managed["management_available"], false);
+    assert_eq!(managed["chatgpt"]["available"], false);
     assert_eq!(managed["items"], json!([]));
     let denied = service
         .model_connection_operation(
@@ -1023,6 +1025,21 @@ async fn personal_management_is_available_before_models_exist_and_keeps_uc_manag
     assert_eq!(
         denied.1.0.error_code.as_deref(),
         Some("personal_model_management_unavailable")
+    );
+    let mut config = astra_services::chatgpt::ChatgptConfig::for_test("http://127.0.0.1:9");
+    config.enabled = false;
+    let disabled = service
+        .with_chatgpt_config(config)
+        .model_connection_operation(local, ConnectionOperation::List)
+        .await
+        .unwrap();
+    assert_eq!(
+        disabled["management_available"], true,
+        "disabling ChatGPT must retain API-key management"
+    );
+    assert_eq!(
+        disabled["chatgpt"]["error_code"],
+        "chatgpt_subscription_disabled"
     );
 }
 

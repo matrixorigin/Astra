@@ -152,9 +152,11 @@ make test-runtime-profiles
 
 ## Personal accounts and models
 
-`make stack-env` prepares stable encryption and ChatGPT installation settings for
-personal deployments; repeat runs keep existing values and explicit disables.
-Retain the encryption key and `ASTRA_CHATGPT_HOST_ID` when upgrading/restoring.
+`make stack-env` prepares the existing encryption key; ChatGPT connections need
+no extra enabling or installation configuration. Repeat runs retain existing
+values and explicit operator overrides. Retain the encryption key when upgrading
+or restoring; it also supplies the default ChatGPT installation identity. Retain
+`ASTRA_CHATGPT_HOST_ID` too if explicitly configured.
 Start `astra`, register or sign in, then use `/model` to configure your own source.
 An administrator's personal connection is still personal; `astra admin model ...`
 is the separate path for deployment-shared models. MOI/UC deployments retain their

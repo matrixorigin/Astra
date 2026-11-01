@@ -53,6 +53,10 @@ pub(crate) fn choices(
 }
 
 pub(crate) fn sources(pane: &mut BottomPane) {
+    open(pane, Action::Sources);
+}
+
+pub(crate) fn open(pane: &mut BottomPane, action: Action) {
     let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     if owner.server_account_id.is_none() {
         let items = vec![
@@ -81,27 +85,36 @@ pub(crate) fn sources(pane: &mut BottomPane) {
         return;
     }
 
-    choices(
-        pane,
-        "Your model sources",
-        vec![
-            (
-                "Use my API key".into(),
-                Some("Personal credentials, encrypted on this Astra deployment".into()),
-                Action::ApiKey(String::new()),
-            ),
-            (
-                "Continue with ChatGPT".into(),
-                Some("Use your ChatGPT account and its plan usage".into()),
-                Action::Connect(None),
-            ),
-            (
-                "Manage my connections".into(),
-                Some("Reconnect or disconnect your ChatGPT accounts".into()),
-                Action::Manage,
-            ),
-        ],
-    );
+    pane.pending_model_setup_read = Some(action);
+}
+
+pub(crate) fn show_sources(pane: &mut BottomPane, chatgpt_available: bool) {
+    let mut rows = vec![(
+        "Use my API key".into(),
+        Some("Personal credentials, encrypted on this Astra deployment".into()),
+        Action::ApiKey(String::new()),
+    )];
+    if chatgpt_available {
+        rows.push((
+            "Continue with ChatGPT".into(),
+            Some("Use your ChatGPT account and its plan usage".into()),
+            Action::Connect(None),
+        ));
+    }
+    rows.push((
+        "Manage my models and connections".into(),
+        Some("Defaults, removal and ChatGPT connections".into()),
+        Action::Manage,
+    ));
+    choices(pane, "Your model sources", rows);
+}
+
+pub(crate) fn unavailable_message(chatgpt: &serde_json::Value) -> String {
+    if chatgpt["detail"].is_string() {
+        crate::cli::cli_config::cli_utils::read_api_error(503, &chatgpt.to_string())
+    } else {
+        "ChatGPT connections are unavailable on this Server. Use an API key model, or ask the Server operator to check its version and ChatGPT configuration.".into()
+    }
 }
 
 pub(crate) fn api_key_form(pane: &mut BottomPane, provider: &str) {
@@ -197,12 +210,13 @@ pub(crate) fn model_form(
 }
 
 pub(crate) enum Outcome {
+    Sources(serde_json::Value),
     Connected {
         connection_id: String,
         status: String,
     },
     Connections(
-        Vec<serde_json::Value>,
+        serde_json::Value,
         Vec<astra_services::models::UserModelRecord>,
     ),
     Models {
@@ -262,12 +276,19 @@ pub(crate) async fn run(
     }
     let body = tokio::select! {
         _ = cancel.cancelled() => return Err("Model setup cancelled".into()),
-        result = api.get_bearer_path_query_text(&token, model_connections::CONNECTIONS, &[]) => result.map_err(map_thin_err)?,
+        result = tokio::time::timeout(std::time::Duration::from_secs(15), api.get_bearer_path_query_text(&token, model_connections::CONNECTIONS, &[])) =>
+            result.map_err(|_| "Loading model sources timed out; reopen /model to retry")?.map_err(map_thin_err)?,
     };
     let availability: Value =
         serde_json::from_str(&body).map_err(|_| "Invalid model management response")?;
     if availability["management_available"] != true {
         return Err("Personal model configuration is unavailable for this account.".into());
+    }
+    if matches!(action, Action::Sources) {
+        return Ok(Outcome::Sources(availability["chatgpt"].clone()));
+    }
+    if matches!(action, Action::Connect(_)) && availability["chatgpt"]["available"] != true {
+        return Err(unavailable_message(&availability["chatgpt"]));
     }
     let begin_write = || {
         if !owner.is_current() {
@@ -402,13 +423,7 @@ pub(crate) async fn run(
                        };
             let models: astra_services::models::UserModelListResponse =
                 serde_json::from_str(&body).map_err(|_| "Invalid personal model list")?;
-            return Ok(Outcome::Connections(
-                availability["items"]
-                    .as_array()
-                    .ok_or("Invalid connection list")?
-                    .clone(),
-                models.items,
-            ));
+            return Ok(Outcome::Connections(availability, models.items));
         }
         Action::Disconnect(id) => {
             begin_write()?;
@@ -491,5 +506,27 @@ mod tests {
             BottomPaneAction::ViewCompleted { result: None, .. }
         ));
         assert_eq!(pane.composer.text(), "keep this input");
+    }
+
+    #[test]
+    fn source_picker_omits_disabled_chatgpt_and_preserves_api_key_setup() {
+        for available in [false, true] {
+            let mut pane = BottomPane::new();
+            pane.replace_composer_text("unsent draft");
+            show_sources(&mut pane, available);
+            let area = ratatui::layout::Rect::new(0, 0, 110, 20);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            pane.render(area, &mut buffer);
+            let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+            assert_eq!(rendered.contains("Continue with ChatGPT"), available);
+            assert!(matches!(
+                key(&mut pane, KeyCode::Enter),
+                BottomPaneAction::ViewCompleted {
+                    result: Some(ViewResult::ModelSetup(Action::ApiKey(_))),
+                    ..
+                }
+            ));
+            assert_eq!(pane.composer.text(), "unsent draft");
+        }
     }
 }

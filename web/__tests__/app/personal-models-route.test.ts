@@ -11,7 +11,7 @@ const binding = createHash('sha256').update(JSON.stringify(['http://runtime.exam
 const id = '00000000-0000-4000-8000-000000000001';
 function client() {
   return { config: { apiUrl: 'http://runtime.example' }, sdk: { getModelAccess: vi.fn().mockResolvedValue({ accesses: [{ kind: 'cloud_byok' }] }) },
-    get: vi.fn().mockResolvedValue({ items: [], management_available: true }), post: vi.fn().mockResolvedValue({ model_id: id }),
+    get: vi.fn().mockResolvedValue({ items: [], management_available: true, chatgpt: { available: true } }), post: vi.fn().mockResolvedValue({ model_id: id }),
     put: vi.fn().mockResolvedValue({ model_id: id }), delete: vi.fn().mockResolvedValue({}) };
 }
 function request(body: unknown, origin = 'http://localhost:3536') {
@@ -19,6 +19,15 @@ function request(body: unknown, origin = 'http://localhost:3536') {
 }
 describe('personal model public routes', () => {
   beforeEach(() => vi.clearAllMocks());
+  it('projects disabled ChatGPT without disabling personal API-key management', async () => {
+    const runtime = client();
+    runtime.get.mockResolvedValue({ items: [], management_available: true, chatgpt: { available: false, detail: 'Disabled by Server' } });
+    auth.mockResolvedValue({ user: { user_id: 'user' }, client: runtime, response: null } as never);
+    const response = await GET();
+    expect(response.status).toBe(200);
+    expect((await response.json()).chatgpt).toEqual({ available: false, detail: 'Disabled by Server' });
+    expect(runtime.get).toHaveBeenCalledTimes(2);
+  });
   it('returns the canonical effective catalog with the same authenticated settings binding', async () => {
     const runtime = client();
     runtime.sdk.getModelAccess.mockResolvedValue({ offerings: [], accesses: [], default_offering_id: null } as never);

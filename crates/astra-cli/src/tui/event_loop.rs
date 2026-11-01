@@ -8159,6 +8159,32 @@ pub(crate) async fn run_tui_session(
             }
             continue;
         }
+        if model_setup_tasks.is_empty()
+            && let Some(action) = bottom_pane.pending_model_setup_read.take()
+        {
+            model_setup_phase.reset();
+            model_setup_cancel = tokio_util::sync::CancellationToken::new();
+            let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+            let epoch = state.session_attachment_epoch;
+            let api = api.clone();
+            let cancel = model_setup_cancel.clone();
+            let phase = model_setup_phase.clone();
+            let progress = model_setup_progress_tx.clone();
+            model_setup_tasks.spawn(async move {
+                let result =
+                    super::model_setup::run(action, api, owner.clone(), cancel, phase, progress)
+                        .await;
+                (owner, epoch, result)
+            });
+            bottom_pane.push_view(Box::new(
+                super::bottom_pane::info_view::InfoView::from_plain(
+                    "Loading personal model sources",
+                    vec!["Esc cancels.".into()],
+                ),
+            ));
+            model_setup_view_open = true;
+            frame_requester.schedule_frame();
+        }
         tokio::select! {
             _ = session_shutdown_token.cancelled() => {
                 break 'main Ok(());
@@ -8188,6 +8214,13 @@ pub(crate) async fn run_tui_session(
                 match completed {
                     Ok((owner, epoch, result)) if owner.is_current() && epoch == state.session_attachment_epoch => {
                         match result {
+                            Ok(super::model_setup::Outcome::Sources(chatgpt)) => {
+                                if chatgpt["available"] != true {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                        super::model_setup::unavailable_message(&chatgpt)));
+                                }
+                                super::model_setup::show_sources(&mut bottom_pane, chatgpt["available"] == true);
+                            }
                             Ok(super::model_setup::Outcome::Connected { connection_id, status }) => {
                                 bottom_pane.clear_model_catalog();
                                 if status != "connected" {
@@ -8215,16 +8248,23 @@ pub(crate) async fn run_tui_session(
                                     (model.clone(), Some("Add this model using your ChatGPT plan".into()), super::model_setup::Action::Subscription { connection_id: connection_id.clone(), model })));
                                 super::model_setup::choices(&mut bottom_pane, "Choose a ChatGPT model", choices);
                             }
-                            Ok(super::model_setup::Outcome::Connections(rows, models)) => {
+                            Ok(super::model_setup::Outcome::Connections(availability, models)) => {
+                                let chatgpt_available = availability["chatgpt"]["available"] == true;
+                                if !chatgpt_available {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                        super::model_setup::unavailable_message(&availability["chatgpt"])));
+                                }
                                 let mut choices = Vec::new();
-                                for row in rows {
+                                for row in availability["items"].as_array().into_iter().flatten() {
                                     let Some(id) = row["connection_id"].as_str() else { continue; };
                                     let label = row["email"].as_str().or_else(|| row["label"].as_str()).unwrap_or("ChatGPT account");
                                     let status = row["status"].as_str().unwrap_or("unknown");
-                                    if status == "connected" {
+                                    if chatgpt_available && status == "connected" {
                                         choices.push((format!("Choose models for {label}"), Some("Use this connected account without signing in again".into()), super::model_setup::Action::Models(id.into())));
                                     }
-                                    choices.push((format!("Reconnect {label}"), Some(status.into()), super::model_setup::Action::Connect(Some(id.into()))));
+                                    if chatgpt_available {
+                                        choices.push((format!("Reconnect {label}"), Some(status.into()), super::model_setup::Action::Connect(Some(id.into()))));
+                                    }
                                     choices.push((format!("Disconnect {label}"), Some("Stops use across this deployment; keeps conversation history".into()), super::model_setup::Action::Disconnect(id.into())));
                                 }
                                 for model in models {
@@ -8233,7 +8273,10 @@ pub(crate) async fn run_tui_session(
                                     }
                                     choices.push((format!("Remove {}", model.name), Some(model.provider), super::model_setup::Action::ConfirmRemove { model_id: model.model_id, name: model.name }));
                                 }
-                                choices.push(("Connect another ChatGPT account".into(), None, super::model_setup::Action::Connect(None)));
+                                if chatgpt_available {
+                                    choices.push(("Connect another ChatGPT account".into(), None, super::model_setup::Action::Connect(None)));
+                                }
+                                choices.push(("Add a personal model".into(), None, super::model_setup::Action::Sources));
                                 super::model_setup::choices(&mut bottom_pane, "Your personal connections", choices);
                             }
                             Ok(super::model_setup::Outcome::Saved { model_id, catalog }) => {
