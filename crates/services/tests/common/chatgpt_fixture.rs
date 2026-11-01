@@ -380,12 +380,9 @@ async fn responses(
     }
     assert_eq!(body["store"], false);
     assert_eq!(body["stream"], true);
-    for key in [
-        "temperature",
-        "max_output_tokens",
-        "previous_response_id",
-        "messages",
-    ] {
+    // Budgeted subscription calls legitimately carry `max_output_tokens`; the
+    // remaining keys stay forbidden on the subscription v1 wire.
+    for key in ["temperature", "previous_response_id", "messages"] {
         assert!(body.get(key).is_none(), "unexpected {key}");
     }
     assert!(

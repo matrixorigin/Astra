@@ -1779,3 +1779,114 @@ async fn concurrent_rejection_shares_one_refresh_and_reconnect_fences_old_genera
     drop(renewed_lease);
     provider.stop().await;
 }
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn duplicate_rejection_with_rotated_row_completes_bounded_under_single_pool() {
+    duplicate_rejection_with_rotated_row_completes_bounded(8).await;
+}
+
+// Two callers are the minimal race: one duplicate record is enough to sever
+// the other's row-read witness under the old re-bumping behavior.
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn duplicate_rejection_with_rotated_row_completes_bounded_with_two_callers() {
+    duplicate_rejection_with_rotated_row_completes_bounded(2).await;
+}
+
+async fn duplicate_rejection_with_rotated_row_completes_bounded(caller_count: usize) {
+    let settings = common::require_db_it_env();
+    isolated_database::require_isolated_database(&settings.database);
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    // The starvation report ran behind a single pooled connection: every row
+    // read serializes, so a rejection-record/witness livelock cannot hide
+    // behind spare pool capacity.
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let shared = astra_core::SharedPool::new(&settings).await.unwrap();
+    let mut provider = fixture::ProviderFixture::start().await;
+    let key = Arc::new(FernetTokenEncryptor::new("chatgpt-duplicate-rejection-race-key").unwrap());
+    let service = Arc::new(ChatgptConnections::new(
+        Some(shared.clone()),
+        key.clone(),
+        Ok(ChatgptConfig::for_test(&provider.base)),
+    ));
+    let owner = format!("owner-{}", uuid::Uuid::new_v4());
+    let attempt = start(&service, &owner, None).await;
+    let code = provider.issue_code(&attempt, "account-one", true);
+    let linked = operate_ok(
+        &service,
+        &owner,
+        ConnectionOperation::Complete(
+            attempt["authorization_id"].as_str().unwrap().into(),
+            callback(&attempt, &code),
+        ),
+    )
+    .await;
+    let connection = linked["connection"]["connection_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let binding = service.binding(&owner, &connection).await.unwrap();
+    let lease = binding.acquire(None).await.unwrap();
+    let rejected_version = lease.version();
+    provider.reject_access_token(lease.bearer(), false);
+    drop(lease);
+    // Rotate once: the database row now holds a valid new token version.
+    let rotated = binding.acquire(Some(rejected_version)).await.unwrap();
+    let rotated_version = rotated.version();
+    assert_eq!(rotated_version, rejected_version + 1);
+    drop(rotated);
+    let refreshes = provider.state.refresh_calls.load(Ordering::SeqCst);
+    // Drop the local plaintext copy so every racing caller must re-read the
+    // rotated row instead of being served from memory.
+    service.clear_cached_token_for_test(&owner, &connection);
+    // Concurrent callers arrive carrying the same stale 401 evidence for the
+    // pre-rotation version. Each records the rejection before reading the
+    // row. A re-bumping duplicate record would sever the other callers'
+    // row-read witnesses, forcing another SQL read and another record — the
+    // livelock this regression test bounds.
+    let fence_reads_before = binding.fence_reads_for_test();
+    let callers: Vec<_> = (0..caller_count)
+        .map(|_| {
+            let service = service.clone();
+            let owner = owner.clone();
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                let binding = service.binding(&owner, &connection).await.unwrap();
+                binding.acquire(Some(rejected_version)).await
+            })
+        })
+        .collect();
+    let leases = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        futures_util::future::join_all(callers),
+    )
+    .await
+    .expect("duplicate rejection records must complete bounded");
+    for lease in leases {
+        let lease = lease.unwrap().unwrap();
+        assert_eq!(lease.version(), rotated_version);
+        assert!(!lease.bearer().is_empty());
+    }
+    // Direct DB-read observation: `fence_reads` (existing e2e-hooks fixture)
+    // counts the `ensure_current` row read each acquire performs. Every
+    // caller must fence exactly once; a witness-severing duplicate record
+    // would force extra reads, so the delta is exactly the caller count.
+    assert_eq!(
+        binding.fence_reads_for_test() - fence_reads_before,
+        caller_count,
+        "each concurrent caller must perform exactly one fence DB read; \
+         additional reads mean a duplicate record severed row-read witnesses"
+    );
+    assert_eq!(
+        provider.state.refresh_calls.load(Ordering::SeqCst),
+        refreshes,
+        "the rotated row must be reused; no refresh flight may be re-lived"
+    );
+    assert_eq!(
+        service.cached_token_version_for_test(&owner, &connection),
+        Some(rotated_version)
+    );
+    provider.stop().await;
+}

@@ -1345,13 +1345,24 @@ impl ChatgptConnections {
     /// floor itself can be capacity-evicted, the clock cannot.
     fn note_rejected_version(&self, owner: &str, id: &str, generation: i64, version: i64) {
         let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
-        cache.bump_epoch();
         let key = (owner.to_owned(), id.to_owned());
         let floor = {
             let guard = cache.guard_mut(key.clone());
-            guard.rejected_floor = guard.rejected_floor.max((generation, version));
+            if (generation, version) <= guard.rejected_floor {
+                // Recording is idempotent: the floor already covers this
+                // version, so the first record severed every earlier witness
+                // and evicted every covered entry. Re-bumping the clock would
+                // only sever witnesses of concurrent requests holding a valid
+                // rotated token, which then re-read and re-record the same
+                // rejection and sever this caller in turn — under a single
+                // connection pool two such requests can starve each other
+                // indefinitely despite a usable new token.
+                return;
+            }
+            guard.rejected_floor = (generation, version);
             guard.rejected_floor
         };
+        cache.bump_epoch();
         if cache
             .entries
             .get(&key)
@@ -2018,6 +2029,7 @@ impl ChatgptConnections {
             None,
             id,
             true,
+            None,
         )
         .map_err(internal_error)?;
         let bytes = self

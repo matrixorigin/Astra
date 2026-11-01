@@ -502,7 +502,7 @@ fn responses_and_openai_share_runtime_role_projection() {
             responses
         );
 
-        let body = request("fixture-model", &responses, None, connection, false).unwrap();
+        let body = request("fixture-model", &responses, None, connection, false, None).unwrap();
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["role"], "developer");
         assert!(!input[0].to_string().contains(fact));
@@ -534,4 +534,57 @@ fn responses_continuation_is_private_to_its_protocol() {
             .is_none()
     );
     assert_eq!(messages[0]["content"], "visible");
+}
+
+#[test]
+fn responses_wire_output_limit_reads_the_subscription_budget_key() {
+    // The Responses protocol cap is `max_output_tokens`; Chat Completions and
+    // Bedrock keys keep their existing precedence.
+    assert_eq!(
+        super::super::provider_request_output_limit(&json!({"max_output_tokens": 512})),
+        Some(512)
+    );
+    assert_eq!(
+        super::super::provider_request_output_limit(
+            &json!({"max_completion_tokens": 128, "max_output_tokens": 512})
+        ),
+        Some(128)
+    );
+    assert_eq!(
+        super::super::provider_request_output_limit(&json!({})),
+        None
+    );
+}
+
+#[test]
+fn responses_finish_reason_comes_from_provider_truncation_evidence() {
+    use astra_core::model_wire::responses::ResponseOutput;
+    // A provider-declared max_output_tokens truncation is terminal `length`.
+    let truncated = super::result(
+        ResponseOutput {
+            text: "partial".into(),
+            finish_reason: Some("length".into()),
+            ..Default::default()
+        },
+        "conn",
+        "model",
+        "display-model",
+    );
+    assert_eq!(truncated.finish_reason.as_deref(), Some("length"));
+    assert_eq!(truncated.full_text, "partial");
+    // Without truncation evidence the stop/tool_calls distinction is kept.
+    let stopped = super::result(ResponseOutput::default(), "conn", "model", "display-model");
+    assert_eq!(stopped.finish_reason.as_deref(), Some("stop"));
+    let calls = super::result(
+        ResponseOutput {
+            tool_calls: vec![
+                json!({"id":"c","type":"function","function":{"name":"read_file","arguments":"{}"}}),
+            ],
+            ..Default::default()
+        },
+        "conn",
+        "model",
+        "display-model",
+    );
+    assert_eq!(calls.finish_reason.as_deref(), Some("tool_calls"));
 }

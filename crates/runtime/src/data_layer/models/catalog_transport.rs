@@ -4,8 +4,13 @@
 //! Never infer a client version from identity or strip execution metadata.
 
 use astra_core::{ErrorResponse, error_response_coded};
-use astra_server_types::{MODEL_CATALOG_VERSION, MODEL_CATALOG_VERSION_HEADER};
-use astra_services::models::{ModelAccessProjectionResponse, ModelListPageResponse};
+use astra_server_types::{
+    MODEL_CATALOG_VERSION, MODEL_CATALOG_VERSION_HEADER, MODEL_CATALOG_VERSION_V2,
+};
+use astra_services::models::{
+    ModelAccessProjectionResponse, ModelAccessProjectionResponseV2, ModelListPageResponse,
+    ModelListPageResponseV2,
+};
 use axum::{
     Json,
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -13,8 +18,14 @@ use axum::{
 };
 use serde::Serialize;
 
+/// Negotiated catalog response format. Version 2 is the frozen published
+/// 0.2.12 contract; version 3 is the current production projection, which
+/// adds `supported_reasoning_efforts` and newer thinking-protocol values.
 #[derive(Clone, Copy)]
-pub(super) struct CatalogVersion;
+pub(super) enum CatalogVersion {
+    V2,
+    V3,
+}
 
 impl CatalogVersion {
     pub(super) fn from_headers(
@@ -24,24 +35,27 @@ impl CatalogVersion {
         let first = values.next();
         if values.next().is_none() {
             match first.map(HeaderValue::as_bytes) {
-                None => return Ok(Self),
-                Some(value) if value == MODEL_CATALOG_VERSION.as_bytes() => return Ok(Self),
+                None => return Ok(Self::V2),
+                Some(value) if value == MODEL_CATALOG_VERSION_V2.as_bytes() => {
+                    return Ok(Self::V2);
+                }
+                Some(value) if value == MODEL_CATALOG_VERSION.as_bytes() => return Ok(Self::V3),
                 _ => {}
             }
         }
         Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            "Unsupported model catalog response version. This server supports version 2; update Astra to use its supported catalog format.",
+            "Unsupported model catalog response version. This server supports versions 2 and 3; update Astra to use its supported catalog format.",
             "model_catalog_version_unsupported",
         ))
     }
 
-    fn response(self, value: impl Serialize) -> Response {
+    fn response(self, version: &'static str, value: impl Serialize) -> Response {
         let mut response = Json(value).into_response();
         let headers = response.headers_mut();
         headers.insert(
             MODEL_CATALOG_VERSION_HEADER,
-            HeaderValue::from_static(MODEL_CATALOG_VERSION),
+            HeaderValue::from_static(version),
         );
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         headers.append(
@@ -52,10 +66,22 @@ impl CatalogVersion {
     }
 
     pub(super) fn models(self, page: ModelListPageResponse) -> Response {
-        self.response(page)
+        match self {
+            Self::V2 => self.response(
+                MODEL_CATALOG_VERSION_V2,
+                ModelListPageResponseV2::from(page),
+            ),
+            Self::V3 => self.response(MODEL_CATALOG_VERSION, page),
+        }
     }
 
     pub(super) fn access(self, page: ModelAccessProjectionResponse) -> Response {
-        self.response(page)
+        match self {
+            Self::V2 => self.response(
+                MODEL_CATALOG_VERSION_V2,
+                ModelAccessProjectionResponseV2::from(page),
+            ),
+            Self::V3 => self.response(MODEL_CATALOG_VERSION, page),
+        }
     }
 }

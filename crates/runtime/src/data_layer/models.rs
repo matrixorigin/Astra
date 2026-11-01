@@ -320,6 +320,21 @@ async fn effective_model_catalog(
         .await?;
         catalog.items.retain(|item| !active_only || item.is_active);
         catalog.items = model_catalog_for_purpose(catalog.items, query.purpose);
+        // The seek cursor contract orders lexicographically by (provider,
+        // name, offering_id); paginating the service's natural list order
+        // would silently drop every Offering that sorts before the cursor.
+        catalog.items.sort_by(|left, right| {
+            (
+                left.provider.as_str(),
+                left.name.as_str(),
+                left.offering_id.as_str(),
+            )
+                .cmp(&(
+                    right.provider.as_str(),
+                    right.name.as_str(),
+                    right.offering_id.as_str(),
+                ))
+        });
         let declared = astra_services::models::server_model_access_declarations_for_models(
             catalog.allows_deployment,
             &catalog.items,

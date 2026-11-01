@@ -1029,7 +1029,7 @@ describe("AstraClient — Models", () => {
     expect(
       new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
         .get("x-astra-model-catalog-version"),
-    ).toBe("2");
+    ).toBe("3");
   });
 
   test("listModels follows seek cursors and rejects a repeated page", async () => {
@@ -1120,7 +1120,116 @@ describe("AstraClient — Models", () => {
     expect(
       new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
         .get("x-astra-model-catalog-version"),
-    ).toBe("2");
+    ).toBe("3");
+  });
+
+  test("both catalog endpoints preserve the v3 subscription reasoning projection", async () => {
+    // The real production v3 projection: a ChatGPT-subscription Offering
+    // declares the Responses reasoning protocol and its effort inventory.
+    // The SDK requests v3 explicitly and must surface these fields intact —
+    // dropping them would be silent degradation back to the frozen v2 view.
+    const subscriptionOffering = {
+      offering_id: "subscription-offering",
+      access_id: "chatgpt:00000000-0000-4000-8000-000000000001",
+      access_kind: "cloud_byok",
+      access_label: "ChatGPT subscription · personal",
+      execution_placement: "server",
+      name: "coding",
+      provider: "chatgpt",
+      description: null,
+      is_active: true,
+      context_window: 128000,
+      max_completion_tokens: null,
+      architecture: null,
+      thinking_capability: "effort_only",
+      thinking_protocol: "responses_reasoning",
+      supported_reasoning_efforts: ["low", "medium", "high"],
+      pricing: null,
+    };
+    const access = {
+      id: "chatgpt:00000000-0000-4000-8000-000000000001",
+      kind: "cloud_byok",
+      label: "ChatGPT subscription · personal",
+      execution_placement: "server",
+      status: "ready",
+      reason: null,
+      usable: true,
+      retry_after_seconds: null,
+      available_model_count: 1,
+      actions: [],
+    };
+
+    globalThis.fetch = mockFetch(200, {
+      items: [subscriptionOffering],
+      next_cursor: null,
+      limit: 200,
+      total: 1,
+      catalog_revision: "sha256:catalog",
+    });
+    const models = await createClient().listModels();
+    expect(models[0].thinking_protocol).toBe("responses_reasoning");
+    expect(models[0].supported_reasoning_efforts).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(models[0].thinking_capability).toBe("effort_only");
+    expect(models[0].access_label).toBe("ChatGPT subscription · personal");
+    expect(
+      new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
+        .get("x-astra-model-catalog-version"),
+    ).toBe("3");
+
+    globalThis.fetch = mockFetch(200, {
+      accesses: [access],
+      offerings: [subscriptionOffering],
+      default_offering_id: "subscription-offering",
+      default_resolution: { state: "resolved", offering_id: "subscription-offering" },
+      next_cursor: null,
+      limit: 200,
+      total: 1,
+      catalog_revision: "sha256:catalog",
+      observed_at: "2026-07-20T00:00:00Z",
+    });
+    const projection = await createClient().getModelAccess();
+    expect(projection.offerings[0].thinking_protocol).toBe(
+      "responses_reasoning",
+    );
+    expect(projection.offerings[0].supported_reasoning_efforts).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(projection.accesses[0].usable).toBe(true);
+    expect(
+      new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers)
+        .get("x-astra-model-catalog-version"),
+    ).toBe("3");
+  });
+
+  test("both catalog endpoints propagate a plain HTTP 400 without a silent v2 retry", async () => {
+    // A server that does not accept the requested catalog version answers a
+    // plain 400. The SDK must surface that failure to the caller; silently
+    // re-requesting as v2 would mask the rejection behind the frozen v2 view.
+    for (const endpoint of ["listModels", "getModelAccess"] as const) {
+      const fetchMock = mockFetch(400, {
+        detail: "unsupported model catalog version",
+      });
+      globalThis.fetch = fetchMock;
+      try {
+        const client = createClient();
+        if (endpoint === "listModels") {
+          await client.listModels();
+        } else {
+          await client.getModelAccess();
+        }
+        expect.unreachable();
+      } catch (e) {
+        expect(e).toBeInstanceOf(AstraApiError);
+        expect((e as AstraApiError).status).toBe(400);
+      }
+      expect(fetchMock.mock.calls).toHaveLength(1);
+    }
   });
 
   test("getModelAccess drains pages while preserving first-page default", async () => {

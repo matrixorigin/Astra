@@ -6350,6 +6350,144 @@ impl From<ModelListItemResponse> for ModelListItem {
     }
 }
 
+/// Whether the frozen published 0.2.12 catalog format (version 2) can name
+/// this thinking protocol. Its strict decoder covers exactly the protocols
+/// published with 0.2.12; a newer protocol must not be disguised as one of
+/// them.
+fn thinking_protocol_is_catalog_v2_representable(protocol: ThinkingProtocol) -> bool {
+    matches!(
+        protocol,
+        ThinkingProtocol::Unknown
+            | ThinkingProtocol::EnableThinking
+            | ThinkingProtocol::ThinkingObject
+            | ThinkingProtocol::ReasoningEffort
+            | ThinkingProtocol::Moonshot
+    )
+}
+
+/// Frozen published 0.2.12 (catalog format version 2) projection of one
+/// catalog Offering. It carries exactly the published field set; additive
+/// metadata such as `supported_reasoning_efforts` is negotiated through
+/// newer explicit formats instead.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelListItemResponseV2 {
+    pub thinking_protocol: Option<ThinkingProtocol>,
+    pub offering_id: String,
+    pub access_id: String,
+    pub access_kind: ModelAccessKind,
+    pub access_label: String,
+    pub execution_placement: ModelExecutionPlacement,
+    pub name: String,
+    pub provider: String,
+    pub description: Option<String>,
+    pub is_active: bool,
+    pub context_window: i32,
+    pub max_completion_tokens: Option<i32>,
+    pub architecture: Option<String>,
+    pub thinking_capability: Option<ThinkingCapability>,
+    pub pricing: Option<ModelCatalogPricing>,
+}
+
+impl From<ModelListItemResponse> for ModelListItemResponseV2 {
+    fn from(item: ModelListItemResponse) -> Self {
+        // An Offering whose protocol the frozen enum cannot name stays
+        // listed, but its thinking controls are conservatively hidden:
+        // `null` means unknown/unexpressed here, never a differently meaning
+        // published protocol. Full thinking options for such Offerings
+        // require an explicitly negotiated newer catalog format.
+        let representable = item
+            .thinking_protocol
+            .map_or(true, thinking_protocol_is_catalog_v2_representable);
+        Self {
+            thinking_protocol: if representable {
+                item.thinking_protocol
+            } else {
+                None
+            },
+            offering_id: item.offering_id,
+            access_id: item.access_id,
+            access_kind: item.access_kind,
+            access_label: item.access_label,
+            execution_placement: item.execution_placement,
+            name: item.name,
+            provider: item.provider,
+            description: item.description,
+            is_active: item.is_active,
+            context_window: item.context_window,
+            max_completion_tokens: item.max_completion_tokens,
+            architecture: item.architecture,
+            thinking_capability: if representable {
+                item.thinking_capability
+            } else {
+                None
+            },
+            pricing: item.pricing,
+        }
+    }
+}
+
+/// Frozen published 0.2.12 (catalog format version 2) page envelope: the
+/// same seek pagination and revision, with items already projected.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelListPageResponseV2 {
+    pub items: Vec<ModelListItemResponseV2>,
+    pub next_cursor: Option<ModelListCursor>,
+    pub limit: u32,
+    pub total: u32,
+    pub catalog_revision: String,
+}
+
+impl From<ModelListPageResponse> for ModelListPageResponseV2 {
+    fn from(page: ModelListPageResponse) -> Self {
+        Self {
+            items: page.items.into_iter().map(Into::into).collect(),
+            next_cursor: page.next_cursor,
+            limit: page.limit,
+            total: page.total,
+            catalog_revision: page.catalog_revision,
+        }
+    }
+}
+
+/// Frozen published 0.2.12 (catalog format version 2) Model Access
+/// projection.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ModelAccessProjectionResponseV2 {
+    pub accesses: Vec<ModelAccessViewResponse>,
+    pub offerings: Vec<ModelListItemResponseV2>,
+    pub default_offering_id: Option<String>,
+    /// The Astra-owned result of resolving a default against this effective
+    /// catalog.  Clients must not infer a replacement default when this is
+    /// `invalid`; the listed Offerings remain available for an explicit user
+    /// choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_resolution: Option<ModelDefaultResolution>,
+    pub next_cursor: Option<ModelListCursor>,
+    /// Requested page size after server-side clamping.
+    pub limit: u32,
+    /// Number of effective Offerings in the complete catalog, not this page.
+    pub total: u32,
+    pub catalog_revision: String,
+    pub observed_at: String,
+}
+
+impl From<ModelAccessProjectionResponse> for ModelAccessProjectionResponseV2 {
+    fn from(projection: ModelAccessProjectionResponse) -> Self {
+        Self {
+            accesses: projection.accesses,
+            offerings: projection.offerings.into_iter().map(Into::into).collect(),
+            default_offering_id: projection.default_offering_id,
+            default_resolution: projection.default_resolution,
+            next_cursor: projection.next_cursor,
+            limit: projection.limit,
+            total: projection.total,
+            catalog_revision: projection.catalog_revision,
+            observed_at: projection.observed_at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredModelAccess {

@@ -738,10 +738,10 @@ mod tests {
         let canonical =
             super::sanitize_canonical_continuation_messages_with_turn_semantics(messages.clone())
                 .unwrap();
-        let replay = request("model", &canonical, None, &connection, false).unwrap();
+        let replay = request("model", &canonical, None, &connection, false, None).unwrap();
         assert_eq!(replay["input"][1]["encrypted_content"], encrypted);
         assert_eq!(replay["input"][2]["phase"], "final_answer");
-        let switched = request("model", &canonical, None, "other-connection", false).unwrap();
+        let switched = request("model", &canonical, None, "other-connection", false, None).unwrap();
         assert!(!switched.to_string().contains(encrypted));
         assert!(
             sanitize_prompt_facing_messages(messages)[1]

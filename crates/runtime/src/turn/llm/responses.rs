@@ -93,6 +93,7 @@ pub(super) fn prepare(
         Some(&tools),
         credential.connection_id(),
         matches!(tool_choice, RuntimeToolChoice::None),
+        call.max_output_tokens,
     )
     .map_err(|_| {
         error(
@@ -125,7 +126,7 @@ pub(super) fn prepare(
         purpose: call.purpose,
         route: call.route,
         request,
-        wire_output_limit: None,
+        wire_output_limit: provider_request_output_limit(&body),
         authorized_tool_names,
         url,
         judgment_provenance,
@@ -144,11 +145,13 @@ fn result(
         crate::turn::token_usage::UsageDialect::OpenAi,
         &output.usage,
     );
-    let finish_reason = if output.tool_calls.is_empty() {
-        "stop"
-    } else {
-        "tool_calls"
-    };
+    let finish_reason = output.finish_reason.clone().unwrap_or_else(|| {
+        if output.tool_calls.is_empty() {
+            "stop".to_owned()
+        } else {
+            "tool_calls".to_owned()
+        }
+    });
     LlmCallResult {
         provider_continuation: Some(continuation),
         response_id: output.response_id,
@@ -158,7 +161,7 @@ fn result(
         usage: output.usage,
         usage_presence: presence,
         model_used: display_model.into(),
-        finish_reason: Some(finish_reason.into()),
+        finish_reason: Some(finish_reason),
         ..Default::default()
     }
 }

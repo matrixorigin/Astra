@@ -978,6 +978,7 @@ fn canonicalize_provider_tool_calls(tool_calls: &mut [Value]) {
 fn provider_request_output_limit(body: &Value) -> Option<usize> {
     [
         body.get("max_completion_tokens"),
+        body.get("max_output_tokens"),
         body.get("max_tokens"),
         body.pointer("/inferenceConfig/maxTokens"),
     ]

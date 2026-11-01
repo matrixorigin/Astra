@@ -225,10 +225,11 @@ the same purpose throughout a drain, as well as checking revision and total.
 #### Catalog response compatibility
 
 The executable support baseline is published CLI and Edge **0.2.12**. The two
-HTTP catalog endpoints retain that release's complete response field set,
-including `thinking_protocol` and `pricing`. A missing
-`x-astra-model-catalog-version` header and explicit `2` select the same format;
-current thin-client and TypeScript SDK requests send `2` on every page.
+HTTP catalog endpoints retain that release's complete response field set as
+the frozen format version 2, including `thinking_protocol` and `pricing`. A
+missing `x-astra-model-catalog-version` header and explicit `2` select the
+same frozen format; current thin-client and TypeScript SDK requests negotiate
+the current format `3` on every page.
 Unknown, repeated, or malformed versions (including `1`) return
 `400 model_catalog_version_unsupported`. The response identifies its format
 in the same header and is not cached.
@@ -263,7 +264,18 @@ is not permission to extend v2 responses: the published 0.2.12 decoder is
 strict, and an independent frozen fixture protects its complete response
 shape. New response fields, type changes, or enum/state values require a new
 explicitly negotiated format while unversioned responses retain the 0.2.12
-contract. Future clients may continue requesting v2 when its semantics suffice;
+contract. Format version 3 is the current production projection: it adds
+`supported_reasoning_efforts` and newer `thinking_protocol` values such as
+`responses_reasoning`. Version 2 remains frozen. An Offering whose thinking
+protocol the frozen 0.2.12 enum cannot name stays listed in v2 — Model
+Access and selection keep working — but its thinking controls are
+conservatively hidden: `thinking_protocol` and `thinking_capability` are
+`null` (unknown/unexpressed), never disguised as a differently meaning
+published protocol, and `supported_reasoning_efforts` is absent. For v2
+clients such an Offering therefore runs only the provider default thinking
+mode; the complete thinking options require explicitly negotiated v3. Every
+other model's existing v2 metadata is unchanged. Future clients may continue
+requesting v2 when its semantics suffice;
 requesting a newer format from an older Server is an explicit compatibility
 failure. A generic HTTP 400 must not trigger automatic downgrade. Any future
 negotiation strategy must recognize the version-specific machine code and

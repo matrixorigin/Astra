@@ -145,6 +145,34 @@ fn published_0_2_12_response(
     }
 }
 
+/// GET one catalog page as an authenticated ordinary user, negotiating the
+/// given response format when `version` is set.
+async fn catalog_page(
+    service: TestModelService,
+    path: &str,
+    version: Option<&str>,
+) -> (StatusCode, serde_json::Value, axum::http::HeaderMap) {
+    use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
+    let mut builder = Request::builder()
+        .uri(path)
+        .header("authorization", "Bearer catalog-user");
+    if let Some(version) = version {
+        builder = builder.header(MODEL_CATALOG_VERSION_HEADER, version);
+    }
+    let response = app(service)
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("catalog page is JSON: {error}: {bytes:?}"));
+    (status, value, headers)
+}
+
 #[tokio::test]
 async fn catalog_formats_preserve_published_0_2_12_and_reject_0_2_10() {
     use astra_core::model_wire::thinking::ThinkingProtocol;
@@ -284,7 +312,7 @@ async fn catalog_formats_preserve_published_0_2_12_and_reject_0_2_10() {
 async fn catalog_version_does_not_authorize_access_or_silently_accept_unknown_versions() {
     use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
     for route in ["/models", "/model-access"] {
-        for version in [None, Some("2")] {
+        for version in [None, Some("2"), Some("3")] {
             let mut request = Request::builder().uri(route);
             if let Some(version) = version {
                 request = request.header(MODEL_CATALOG_VERSION_HEADER, version);
@@ -295,7 +323,7 @@ async fn catalog_version_does_not_authorize_access_or_silently_accept_unknown_ve
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
-        for version in ["", "0", "1", "3", "2,1", " 2"] {
+        for version in ["", "0", "1", "4", "2,1", " 2"] {
             let response = app(TestModelService::default())
                 .oneshot(
                     Request::builder()
@@ -1115,13 +1143,19 @@ async fn subscription_connection_http_uses_authenticated_owner_for_every_operati
 
 #[tokio::test]
 async fn subscription_sources_are_readable_by_published_catalog_v2_clients() {
+    use astra_core::model_wire::thinking::ThinkingProtocol;
+    use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
+    use astra_services::models::ThinkingCapability;
     use astra_services::{ModelAccessKind, ModelExecutionPlacement};
     let source = "chatgpt:00000000-0000-4000-8000-000000000001";
     let label = "ChatGPT subscription · personal";
+    // The real production projection: subscription Offerings declare the
+    // Responses reasoning protocol, its effort inventory, and an effort-only
+    // capability. Published 0.2.12 strict decoders cannot name any of these.
     let service = TestModelService {
         catalog: vec![ModelListItem {
-            supported_reasoning_efforts: None,
-            thinking_protocol: None,
+            supported_reasoning_efforts: Some(vec!["low".into(), "medium".into(), "high".into()]),
+            thinking_protocol: Some(ThinkingProtocol::ResponsesReasoning),
             offering_id: "subscription-offering".into(),
             access_id: source.into(),
             access_kind: ModelAccessKind::CloudByok,
@@ -1134,41 +1168,215 @@ async fn subscription_sources_are_readable_by_published_catalog_v2_clients() {
             context_window: 128000,
             max_completion_tokens: None,
             architecture: None,
-            thinking_capability: None,
+            thinking_capability: Some(ThinkingCapability::EffortOnly),
             pricing: None,
         }],
         ..Default::default()
     };
     for route in ["/models", "/model-access"] {
-        let (status, body) = request(
-            app(service.clone()),
-            "GET",
-            route,
-            Some("connection-owner"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(
-            published_0_2_12_response(route, value.clone()).is_ok(),
-            "{body}"
-        );
-        let items = if route == "/models" {
-            &value["items"]
+        let field = if route == "/models" {
+            "items"
         } else {
-            &value["offerings"]
+            "offerings"
         };
-        assert_eq!(items[0]["access_id"], source);
-        assert_eq!(items[0]["access_label"], label);
-        if route == "/model-access" {
+        for version in [None, Some("2")] {
+            // v2 keeps the Offering listed for published 0.2.12 clients; the
+            // thinking controls its frozen enum cannot name are conservatively
+            // hidden (null = unknown/unexpressed), never disguised as a
+            // differently meaning published protocol.
+            let (status, value, headers) = catalog_page(service.clone(), route, version).await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            assert_eq!(headers[MODEL_CATALOG_VERSION_HEADER], "2");
             assert!(
-                value["accesses"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|access| access["id"] == source && access["label"] == label)
+                published_0_2_12_response(route, value.clone()).is_ok(),
+                "{value}"
+            );
+            let items = &value[field];
+            assert_eq!(items[0]["access_id"], source);
+            assert_eq!(items[0]["access_label"], label);
+            assert!(items[0]["thinking_protocol"].is_null(), "{value}");
+            assert!(items[0]["thinking_capability"].is_null(), "{value}");
+            assert!(
+                items[0].get("supported_reasoning_efforts").is_none(),
+                "{value}"
+            );
+            if route == "/model-access" {
+                assert!(
+                    value["accesses"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|access| access["id"] == source && access["label"] == label)
+                );
+            }
+        }
+        // Explicit v3 is the current production projection: the full thinking
+        // metadata stays available to clients that negotiate it.
+        let (status, value, headers) = catalog_page(service.clone(), route, Some("3")).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(headers[MODEL_CATALOG_VERSION_HEADER], "3");
+        assert_eq!(value[field][0]["thinking_protocol"], "responses_reasoning");
+        assert_eq!(value[field][0]["thinking_capability"], "effort_only");
+        assert_eq!(
+            value[field][0]["supported_reasoning_efforts"],
+            serde_json::json!(["low", "medium", "high"])
+        );
+        if route == "/models" {
+            let page: astra_services::ModelListPageResponse =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                page.items[0].thinking_protocol,
+                Some(ThinkingProtocol::ResponsesReasoning)
+            );
+        } else {
+            let page: astra_services::ModelAccessProjectionResponse =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                page.offerings[0].supported_reasoning_efforts.as_deref(),
+                Some(["low".to_owned(), "medium".to_owned(), "high".to_owned()].as_slice())
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn catalog_v3_keeps_full_metadata_while_v2_projects_conservatively_across_pages() {
+    use astra_core::model_wire::thinking::ThinkingProtocol;
+    use astra_server_types::MODEL_CATALOG_VERSION_HEADER;
+    use astra_services::models::ThinkingCapability;
+    use astra_services::{ModelAccessKind, ModelCatalogPricing, ModelExecutionPlacement};
+    let catalog = vec![
+        ModelListItem {
+            supported_reasoning_efforts: Some(vec!["low".into(), "high".into()]),
+            thinking_protocol: Some(ThinkingProtocol::ReasoningEffort),
+            offering_id: "offer-reasoning".into(),
+            access_id: "self-hosted".into(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: "reasoning-model".into(),
+            provider: "openai".into(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: Some(4096),
+            architecture: None,
+            thinking_capability: Some(ThinkingCapability::Both),
+            pricing: Some(ModelCatalogPricing {
+                currency: "USD".into(),
+                unit: "per_token".into(),
+                source: "deployment".into(),
+                prompt: 0.000001,
+                completion: 0.000002,
+                cache_read: None,
+                cache_write: None,
+                configuration_updated_at: "2026-10-01T00:00:00Z".into(),
+            }),
+        },
+        ModelListItem {
+            supported_reasoning_efforts: Some(vec!["low".into(), "medium".into(), "high".into()]),
+            thinking_protocol: Some(ThinkingProtocol::ResponsesReasoning),
+            offering_id: "offer-subscription".into(),
+            access_id: "chatgpt:00000000-0000-4000-8000-000000000002".into(),
+            access_kind: ModelAccessKind::CloudByok,
+            access_label: "ChatGPT subscription · personal".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: "subscription-model".into(),
+            provider: "chatgpt".into(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: Some(ThinkingCapability::EffortOnly),
+            pricing: None,
+        },
+    ];
+    let service = TestModelService {
+        allows_deployment: true,
+        catalog,
+        ..Default::default()
+    };
+    for (route, field) in [("/models", "items"), ("/model-access", "offerings")] {
+        let mut drained: HashMap<&str, (Vec<String>, serde_json::Value)> = HashMap::new();
+        for version in ["2", "3"] {
+            let mut path = format!("{route}?limit=1");
+            let mut ids = Vec::new();
+            let mut revision = None;
+            loop {
+                let (status, body, headers) =
+                    catalog_page(service.clone(), &path, Some(version)).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(headers[MODEL_CATALOG_VERSION_HEADER], version);
+                assert_eq!(body["total"], 2);
+                assert_eq!(
+                    revision.get_or_insert(body["catalog_revision"].clone()),
+                    &body["catalog_revision"]
+                );
+                if version == "2" {
+                    // The frozen published 0.2.12 strict reader accepts every
+                    // v2 page of a mixed catalog, byte for byte.
+                    assert_eq!(
+                        published_0_2_12_response(route, body.clone()).unwrap(),
+                        body
+                    );
+                }
+                let page = body[field].as_array().unwrap();
+                assert_eq!(page.len(), 1, "{route} {version} {path}: {body}");
+                let item = page[0].clone();
+                let offering_id = item["offering_id"].as_str().unwrap().to_owned();
+                match (version, offering_id.as_str()) {
+                    ("2", "offer-reasoning") => {
+                        // Representable models keep their existing v2
+                        // metadata; only the additive field is absent.
+                        assert_eq!(item["thinking_protocol"], "reasoning_effort");
+                        assert_eq!(item["thinking_capability"], "both");
+                        assert!(item.get("pricing").is_some());
+                        assert!(item.get("supported_reasoning_efforts").is_none(), "{item}");
+                    }
+                    ("3", "offer-reasoning") => {
+                        assert_eq!(
+                            item["supported_reasoning_efforts"],
+                            serde_json::json!(["low", "high"])
+                        );
+                    }
+                    ("2", "offer-subscription") => {
+                        assert!(item["thinking_protocol"].is_null(), "{item}");
+                        assert!(item["thinking_capability"].is_null(), "{item}");
+                        assert!(item.get("supported_reasoning_efforts").is_none(), "{item}");
+                    }
+                    ("3", "offer-subscription") => {
+                        assert_eq!(item["thinking_protocol"], "responses_reasoning");
+                        assert_eq!(item["thinking_capability"], "effort_only");
+                        assert_eq!(
+                            item["supported_reasoning_efforts"],
+                            serde_json::json!(["low", "medium", "high"])
+                        );
+                    }
+                    other => panic!("unexpected catalog entry: {other:?}"),
+                }
+                ids.push(offering_id);
+                let cursor = &body["next_cursor"];
+                if cursor.is_null() {
+                    break;
+                }
+                assert!(ids.len() < 2, "cursor must terminate");
+                path = format!(
+                    "{route}?limit=1&after_provider={}&after_name={}&after_offering_id={}",
+                    cursor["provider"].as_str().unwrap(),
+                    cursor["model_name"].as_str().unwrap(),
+                    cursor["model_id"].as_str().unwrap()
+                );
+            }
+            drained.insert(version, (ids, revision.unwrap()));
+        }
+        let (v2_ids, v2_revision) = &drained["2"];
+        let (v3_ids, v3_revision) = &drained["3"];
+        assert_eq!(v2_ids.len(), 2);
+        assert_eq!(
+            v2_ids, v3_ids,
+            "format negotiation must not reorder or filter the catalog"
+        );
+        assert_eq!(v2_revision, v3_revision);
     }
 }

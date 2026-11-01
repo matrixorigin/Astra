@@ -673,6 +673,69 @@ async fn guard_state_is_bounded() {
 }
 
 #[tokio::test]
+async fn duplicate_rejection_recording_does_not_sever_fresh_witnesses() {
+    let service = service_without_pool();
+    // Two callers racing the same 401 both record it; only the first record
+    // advances the floor and severs witnesses. A caller that witnessed the
+    // clock between the two records must still cache the rotated token:
+    // re-bumping on a duplicate record would refuse its store, send it back
+    // to re-read and re-record the same rejection, and sever the other
+    // caller in turn, so both could starve behind a single connection pool
+    // despite holding a usable new token.
+    service.note_rejected_version("owner", "conn", 7, 3);
+    let between = service.cache_witness();
+    service.note_rejected_version("owner", "conn", 7, 3);
+    service.note_rejected_version("owner", "conn", 7, 2);
+    assert!(service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "rotated",
+        4,
+        unix_now() + 3600,
+        between
+    ));
+    assert_eq!(
+        service.cached_token_version_for_test("owner", "conn"),
+        Some(4)
+    );
+}
+
+#[tokio::test]
+async fn newer_rejection_still_severs_witnesses() {
+    let service = service_without_pool();
+    service.note_rejected_version("owner", "conn", 7, 3);
+    let stale = service.cache_witness();
+    // A genuinely newer 401 is fresh evidence: the floor advances and
+    // witnesses taken in between are severed.
+    service.note_rejected_version("owner", "conn", 7, 4);
+    assert!(!service.store_cached_token(
+        "owner",
+        "conn",
+        7,
+        "paused-read",
+        5,
+        unix_now() + 3600,
+        stale
+    ));
+    // A reconnect restarts the version sequence under a new generation: its
+    // first rejection advances the floor again, and a duplicate record of it
+    // is a no-op.
+    service.note_rejected_version("owner", "conn", 8, 1);
+    let between = service.cache_witness();
+    service.note_rejected_version("owner", "conn", 8, 1);
+    assert!(service.store_cached_token(
+        "owner",
+        "conn",
+        8,
+        "gen-eight",
+        2,
+        unix_now() + 3600,
+        between
+    ));
+}
+
+#[tokio::test]
 async fn capacity_eviction_cannot_rebirth_paused_store_witnesses() {
     let service = service_without_pool();
     // Regression: a per-connection epoch living in the capacity-evictable
