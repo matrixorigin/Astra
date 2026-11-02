@@ -1041,7 +1041,7 @@ async fn subscription_sql_timeouts_release_pool_capacity_before_response_arrives
         let prefix: &'static [u8] = if refresh {
             b"UPDATE user_llm_connections SET credentials_encrypted="
         } else {
-            b"SELECT status,generation FROM user_llm_connections"
+            b"SELECT requested.ordinal, c.status"
         };
         let proxy = ResponseProxy::start(
             settings.host.clone(),
@@ -1059,10 +1059,23 @@ async fn subscription_sql_timeouts_release_pool_capacity_before_response_arrives
             key.clone(),
             Ok(config.clone()),
         ));
+        if !refresh {
+            proxy.gate.armed.store(false, Ordering::SeqCst);
+        }
         let binding = service.binding(&owner, id).await.unwrap();
         if refresh {
             expire(&service, shared.get(), &key, &owner, id).await;
         }
+        if !refresh {
+            // The proxy gates PREPARE followed by EXECUTE. Singleton binding
+            // uses the same canonical lookup as monitoring; discard that cached
+            // statement so the fault is attached to the monitor's exchange.
+            let mut connection = worker.get().acquire().await.unwrap();
+            sqlx::Connection::clear_cached_statements(&mut *connection)
+                .await
+                .unwrap();
+        }
+        proxy.gate.armed.store(true, Ordering::SeqCst);
         let mut acquire = Some(tokio::spawn(async move { binding.acquire(None).await }));
         let lease = if refresh {
             None
@@ -1861,16 +1874,22 @@ async fn duplicate_rejection_with_rotated_row_completes_bounded(caller_count: us
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn cross_connection_rejections_preserve_bounded_progress() {
-    cross_connection_rejections(100).await;
+    cross_connection_rejections(100, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn thousand_connections_reuse_rotated_credentials_without_read_amplification() {
-    cross_connection_rejections(1000).await;
+    cross_connection_rejections(1000, false).await;
 }
 
-async fn cross_connection_rejections(count: usize) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne database"]
+async fn thousand_active_connections_use_bounded_monitor_batches() {
+    cross_connection_rejections(1000, true).await;
+}
+
+async fn cross_connection_rejections(count: usize, hold: bool) {
     let settings = common::require_db_it_env();
     isolated_database::require_isolated_database(&settings.database);
     let (_, mut settings) = common::setup_pool_and_settings().await;
@@ -1922,24 +1941,164 @@ async fn cross_connection_rejections(count: usize) {
     let completed = tokio::time::timeout(
         std::time::Duration::from_secs(if count == 100 { 4 } else { 15 }),
         async {
-            let mut completed = 0;
+            let mut completed = Vec::new();
             while let Some(lease) = pending.join_next().await {
-                assert_eq!(lease.unwrap().unwrap().version(), 2);
-                completed += 1;
+                let lease = lease.unwrap().unwrap();
+                assert_eq!(lease.version(), 2);
+                if hold {
+                    completed.push(Some(lease));
+                } else {
+                    completed.push(None);
+                }
             }
             completed
         },
     )
     .await
     .expect("independent accounts must not invalidate each other's reads");
-    assert_eq!(completed, count);
+    assert_eq!(completed.len(), count);
     assert_eq!(
         service.credential_row_reads_for_test() - before,
         count,
         "each cold connection reads its committed replacement exactly once"
     );
+    if hold {
+        let before = service.connection_read_queries_for_test();
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let queries = service.connection_read_queries_for_test() - before;
+        assert!((4..=12).contains(&queries), "monitor SQL count: {queries}");
+        assert!(
+            completed
+                .iter()
+                .all(|lease| !lease.as_ref().unwrap().cancel.is_cancelled())
+        );
+        sqlx::query("UPDATE user_llm_connections SET status='disconnected',generation=generation+1 WHERE user_id=?")
+            .bind(&owner).execute(&pool).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            while completed
+                .iter()
+                .any(|lease| !lease.as_ref().unwrap().cancel.is_cancelled())
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every active identity must observe remote revocation");
+        drop(completed);
+        let before = service.connection_read_queries_for_test();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            service.connection_read_queries_for_test(),
+            before,
+            "idle monitor must stop"
+        );
+        eprintln!("1000 active connections: {queries} monitor queries over5seconds");
+    }
     eprintln!(
         "{count} independent connections completed in {:?} with {count} credential reads",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne database"]
+async fn subscription_model_batches_read_connections_once() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    isolated_database::require_isolated_database(&settings.database);
+    let config = ChatgptConfig::for_test("http://127.0.0.1:1");
+    let host = config.host_id.clone();
+    let service = DatabaseModelService::new(
+        settings,
+        Arc::new(FernetTokenEncryptor::new("batch-admission-fixture").unwrap()),
+    )
+    .with_pool(shared.clone())
+    .with_chatgpt_config(config);
+    let owner = uuid::Uuid::new_v4().to_string();
+    for distinct in [false, true] {
+        let connections: Vec<_> = (0..if distinct { 64 } else { 1 })
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO user_llm_connections (connection_id,user_id,provider,label,client_id,subject,host_id,status) ",
+        );
+        insert.push_values(&connections, |mut row, id| {
+            row.push_bind(id)
+                .push_bind(&owner)
+                .push_bind("chatgpt")
+                .push_bind("Fixture")
+                .push_bind("batch-client")
+                .push_bind(id)
+                .push_bind(&host)
+                .push_bind("connected");
+        });
+        insert.build().execute(shared.get()).await.unwrap();
+        let models: Vec<_> = (0..64).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO user_llm_models (model_id,user_id,model_alias,model_name,provider,api_key_encrypted,connection_id,base_url,context_window) ",
+        );
+        insert.push_values(models.iter().enumerate(), |mut row, (index, id)| {
+            row.push_bind(id)
+                .push_bind(&owner)
+                .push_bind(id)
+                .push_bind("fixture-model")
+                .push_bind("chatgpt")
+                .push("NULL")
+                .push_bind(&connections[if distinct { index } else { 0 }])
+                .push_bind(astra_services::chatgpt::API_BASE)
+                .push_bind(128000);
+        });
+        insert.build().execute(shared.get()).await.unwrap();
+        let before = service
+            .subscription_connections_for_test()
+            .connection_read_queries_for_test();
+        assert!(
+            service
+                .admit_model_offerings(
+                    owner.clone(),
+                    vec![uuid::Uuid::new_v4().to_string(), models[0].clone()]
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .subscription_connections_for_test()
+                .connection_read_queries_for_test(),
+            before,
+            "known first error must not perform connection I/O"
+        );
+        for ids in [models.clone(), vec![models[0].clone(); 64]] {
+            let before = service
+                .subscription_connections_for_test()
+                .connection_read_queries_for_test();
+            let admitted = service
+                .admit_model_offerings(owner.clone(), ids.clone())
+                .await
+                .unwrap();
+            assert_eq!(admitted.len(), ids.len());
+            assert_eq!(
+                admitted
+                    .iter()
+                    .map(|value| &value.offering_id)
+                    .collect::<Vec<_>>(),
+                ids.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                service
+                    .subscription_connections_for_test()
+                    .connection_read_queries_for_test()
+                    - before,
+                1
+            );
+        }
+        sqlx::query("UPDATE user_llm_connections SET status='disconnected', generation=generation+1 WHERE user_id=? AND connection_id=?")
+            .bind(&owner).bind(&connections[0]).execute(shared.get()).await.unwrap();
+        assert!(
+            service
+                .admit_model_offerings(owner.clone(), models)
+                .await
+                .is_err(),
+            "a failed connection rejects the whole batch"
+        );
+    }
 }

@@ -76,9 +76,13 @@ rate-limited refreshes release the lease and preserve credentials. A lost/expire
 outcome requires reauthentication instead of reusing a potentially consumed
 refresh token. A delayed 401 for an older version reuses a committed winner. Connection generations fence reauthorization
 and disconnect against old execution bindings. Disconnect clears ciphertext,
-disables dependent models and cancels local requests; each replica shares one
-database generation watcher per active connection, and each request performs a
-fresh fence before accepting completion. Watchers stop with their last request.
+disables dependent models and cancels local requests; each connection-service instance batches active owner/connection keys in one
+monitor: up to 256 keys per query and four concurrent batches on a two-second
+cadence, with one two-second cycle deadline including queued work. Failed or
+missing observations cancel only the matching entry identities; idle monitors
+stop. Model admission deduplicates connection IDs into one bounded lookup.
+Each request performs a
+fresh fence before accepting completion. The monitor stops with its last request.
 Interrupted delivered requests settle as delivery-unknown through the existing
 attempt owner. A disabled selected default cannot silently choose deployment
 credentials. OAuth identity is never Astra identity or login-session authority.

@@ -22,7 +22,7 @@ pub enum Boundary {
 // unchanged; its response is retained until the test cancels the caller. This
 // exercises cancellation after server execution, not a sleep before any SQL.
 pub struct ResponseGate {
-    armed: AtomicBool,
+    pub armed: AtomicBool,
     pending: AtomicBool,
     pub received: Notify,
     pub release: Notify,

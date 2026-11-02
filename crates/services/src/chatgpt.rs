@@ -8,12 +8,13 @@ use astra_core::{ErrorResponse, SharedPool, error_response_coded, internal_error
 use axum::{Json, http::StatusCode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
+use futures_util::{StreamExt, stream};
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header, jwk::JwkSet};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{MySqlPool, query};
+use sqlx::{MySqlPool, Row, query};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock, Weak},
@@ -346,6 +347,83 @@ type RefreshKey = (String, String, i64);
 /// Refresh flights settle into (token, credential_version, expires_at) so
 /// every waiter can replace the stale cache entry, not just bypass it once.
 type RefreshWaiter = tokio::sync::watch::Receiver<Option<ApiResult<(String, i64, i64)>>>;
+#[derive(Default)]
+struct ActiveRegistry {
+    connections: HashMap<ConnectionKey, ActiveConnection>,
+    monitor: Option<ConnectionMonitor>,
+}
+impl ActiveRegistry {
+    fn apply_observations(
+        &mut self,
+        targets: &[(ConnectionKey, Uuid)],
+        rows: Option<&[Option<ConnectionRow>]>,
+    ) {
+        for (index, (key, identity)) in targets.iter().enumerate() {
+            let Some(entry) = self
+                .connections
+                .get_mut(key)
+                .filter(|entry| entry.monitor == *identity)
+            else {
+                continue;
+            };
+            let row = rows.and_then(|rows| rows[index].as_ref());
+            for (_, generation, cancel) in &entry.requests {
+                if row.is_none_or(|row| {
+                    *generation < row.generation
+                        || (*generation == row.generation && row.status != "connected")
+                }) {
+                    cancel.cancel();
+                }
+            }
+            entry
+                .requests
+                .retain(|(_, _, cancel)| !cancel.is_cancelled());
+            if entry.requests.is_empty() {
+                self.connections.remove(key);
+            }
+        }
+    }
+}
+struct ConnectionMonitor {
+    id: Uuid,
+    stop: CancellationToken,
+}
+struct MonitorGuard {
+    service: Weak<ChatgptConnections>,
+    id: Uuid,
+    restart: bool,
+}
+impl Drop for MonitorGuard {
+    fn drop(&mut self) {
+        let Some(service) = self.service.upgrade() else {
+            return;
+        };
+        let mut active = service.active.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_) = active.monitor.as_ref().filter(|m| m.id == self.id) else {
+            return;
+        };
+        if !self.restart {
+            for entry in active.connections.values() {
+                for (_, _, cancel) in &entry.requests {
+                    cancel.cancel();
+                }
+            }
+            active.connections.clear();
+        }
+        active.monitor = None;
+        service.start_monitor(&mut active);
+    }
+}
+#[derive(sqlx::FromRow)]
+struct ConnectionRow {
+    status: String,
+    generation: i64,
+    host_id: String,
+    label: String,
+}
+const CONNECTION_READ_BATCH: usize = 256;
+const CONNECTION_READ_CONCURRENCY: usize = 4;
+
 struct ActiveConnection {
     monitor: Uuid,
     requests: Vec<(Uuid, i64, CancellationToken)>,
@@ -474,7 +552,7 @@ pub struct ChatgptConnections {
     pool: Option<SharedPool>,
     encryptor: Arc<FernetTokenEncryptor>,
     config: Result<ChatgptConfig, String>,
-    active: Mutex<HashMap<ConnectionKey, ActiveConnection>>,
+    active: Mutex<ActiveRegistry>,
     refreshes: Mutex<HashMap<RefreshKey, RefreshWaiter>>,
     tokens: Mutex<TokenCache>,
     token_producers: Arc<tokio::sync::Semaphore>,
@@ -482,6 +560,8 @@ pub struct ChatgptConnections {
     inference_client: OnceLock<reqwest::Client>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     fence_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    connection_read_queries: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "e2e-hooks"))]
     credential_row_reads: std::sync::atomic::AtomicUsize,
 }
@@ -537,18 +617,31 @@ impl Drop for CredentialLease {
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(connection) = active.get_mut(&(self.owner.clone(), self.connection_id.clone()))
+        if let Some(connection) = active
+            .connections
+            .get_mut(&(self.owner.clone(), self.connection_id.clone()))
         {
             connection
                 .requests
                 .retain(|(id, _, _)| *id != self.request_id);
             if connection.requests.is_empty() {
-                active.remove(&(self.owner.clone(), self.connection_id.clone()));
+                active
+                    .connections
+                    .remove(&(self.owner.clone(), self.connection_id.clone()));
+                if active.connections.is_empty()
+                    && let Some(monitor) = &active.monitor
+                {
+                    monitor.stop.cancel();
+                }
             }
         }
     }
 }
 impl ExecutionCredential {
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn connection_read_queries_for_test(&self) -> usize {
+        self.service.connection_read_queries_for_test()
+    }
     #[cfg(any(test, feature = "e2e-hooks"))]
     pub fn fence_reads_for_test(&self) -> usize {
         self.service
@@ -689,7 +782,7 @@ impl ChatgptConnections {
             pool,
             encryptor,
             config,
-            active: Mutex::new(HashMap::new()),
+            active: Mutex::new(ActiveRegistry::default()),
             refreshes: Mutex::new(HashMap::new()),
             tokens: Mutex::new(TokenCache::default()),
             token_producers: Arc::new(tokio::sync::Semaphore::new(MAX_CACHED_TOKENS)),
@@ -697,6 +790,8 @@ impl ChatgptConnections {
             inference_client: OnceLock::new(),
             #[cfg(any(test, feature = "e2e-hooks"))]
             fence_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            connection_read_queries: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "e2e-hooks"))]
             credential_row_reads: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -986,88 +1081,198 @@ impl ChatgptConnections {
         generation: i64,
         cancel: CancellationToken,
     ) {
-        let key = (owner.to_owned(), id.to_owned());
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        let first = !active.contains_key(&key);
-        let connection = active
-            .entry(key.clone())
+        active
+            .connections
+            .entry((owner.into(), id.into()))
             .or_insert_with(|| ActiveConnection {
                 monitor: Uuid::new_v4(),
                 requests: Vec::new(),
-            });
-        connection.requests.push((request, generation, cancel));
-        if first {
-            let monitor = connection.monitor;
-            let service = Arc::downgrade(self);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let Some(service) = service.upgrade() else {
-                        return;
-                    };
-                    if !service
-                        .active
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&key)
-                        .is_some_and(|value| value.monitor == monitor)
-                    {
-                        return;
-                    }
-                    #[cfg(any(test, feature = "e2e-hooks"))]
-                    service
-                        .fence_reads
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-                    let row = async {
-                        let pool = service.pool()?;
-                        let mut connection = tokio::time::timeout_at(deadline,
-                            CancellationSafePoolConnection::acquire(&pool))
-                            .await.map_err(|_| unavailable())?.map_err(internal_error)?;
-                        let result = tokio::time::timeout_at(deadline,
-                            sqlx::query_as::<_, ConnectionFence>("SELECT status,generation FROM user_llm_connections WHERE user_id=? AND connection_id=?")
-                                .bind(&key.0).bind(&key.1).fetch_optional(connection.connection_mut()))
-                            .await;
-                        match result {
-                            Ok(result) => {
-                                if result.is_ok() { connection.release(); }
-                                result.map_err(internal_error)
-                            }
-                            Err(_) => {
-                                connection.discard();
-                                Err(unavailable())
-                            }
+            })
+            .requests
+            .push((request, generation, cancel));
+        self.start_monitor(&mut active);
+    }
+
+    fn start_monitor(self: &Arc<Self>, active: &mut ActiveRegistry) {
+        if active.connections.is_empty() || active.monitor.is_some() {
+            return;
+        }
+        let id = Uuid::new_v4();
+        let stop = CancellationToken::new();
+        active.monitor = Some(ConnectionMonitor {
+            id,
+            stop: stop.clone(),
+        });
+        let service = Arc::downgrade(self);
+        let guard = MonitorGuard {
+            service: service.clone(),
+            id,
+            restart: false,
+        };
+        tokio::spawn(async move {
+            let mut guard = guard;
+            let period = Duration::from_secs(2);
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let tick = tokio::select! { biased; _ = stop.cancelled() => { guard.restart = true; return; }, tick = ticks.tick() => tick };
+                let Some(service) = service.upgrade() else {
+                    return;
+                };
+                let snapshot: Vec<_> = service
+                    .active
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .connections
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), entry.monitor))
+                    .collect();
+                let deadline = tick + period;
+                let chunks: Vec<_> = snapshot
+                    .chunks(CONNECTION_READ_BATCH)
+                    .map(|chunk| chunk.to_vec())
+                    .collect();
+                let mut batches = stream::iter(chunks.into_iter().map(|targets| {
+                    let service = service.clone();
+                    let stop = stop.clone();
+                    async move {
+                        let keys: Vec<_> = targets.iter().map(|(key, _)| key.clone()).collect();
+                        if tokio::time::Instant::now() >= deadline {
+                            return (targets, None);
                         }
-                    }.await;
-                    let observed = match row {
-                        Ok(Some(row)) => Some((row.status, row.generation)),
-                        _ => None,
-                    };
+                        let rows = service
+                            .lookup_connection_rows(&keys, Some((deadline, stop.clone())))
+                            .await
+                            .ok();
+                        (targets, rows)
+                    }
+                }))
+                .buffer_unordered(CONNECTION_READ_CONCURRENCY);
+                while let Some((targets, rows)) = batches.next().await {
                     let mut active = service.active.lock().unwrap_or_else(|e| e.into_inner());
-                    let Some(connection) = active
-                        .get_mut(&key)
-                        .filter(|value| value.monitor == monitor)
-                    else {
-                        return;
-                    };
-                    for (_, generation, cancel) in &connection.requests {
-                        if observed.as_ref().is_none_or(|(status, current)| {
-                            *generation < *current
-                                || (status != "connected" && generation == current)
-                        }) {
-                            cancel.cancel();
-                        }
-                    }
-                    connection
-                        .requests
-                        .retain(|(_, _, cancel)| !cancel.is_cancelled());
-                    if connection.requests.is_empty() {
-                        active.remove(&key);
-                        return;
+                    active.apply_observations(&targets, rows.as_deref());
+                    if active.connections.is_empty() {
+                        stop.cancel();
                     }
                 }
-            });
+            }
+        });
+    }
+
+    /// One bounded, owner-scoped lookup; no credentials leave this query.
+    async fn lookup_connection_rows(
+        &self,
+        keys: &[ConnectionKey],
+        control: Option<(tokio::time::Instant, CancellationToken)>,
+    ) -> ApiResult<Vec<Option<ConnectionRow>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
         }
+        if keys.len() > CONNECTION_READ_BATCH {
+            return Err(unavailable());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT requested.ordinal, c.status, c.generation, c.host_id, c.label FROM (VALUES ",
+        );
+        for (ordinal, (owner, id)) in keys.iter().enumerate() {
+            if ordinal != 0 {
+                query.push(",");
+            }
+            query
+                .push("ROW(")
+                .push(ordinal)
+                .push(",")
+                .push_bind(owner)
+                .push(",")
+                .push_bind(id)
+                .push(")");
+        }
+        query.push(") requested(ordinal, requested_owner, requested_id) LEFT JOIN user_llm_connections c ON c.user_id=requested_owner AND c.connection_id=requested_id AND (c.user_id,c.connection_id) IN (");
+        for (ordinal, (owner, id)) in keys.iter().enumerate() {
+            if ordinal != 0 {
+                query.push(",");
+            }
+            query
+                .push("(")
+                .push_bind(owner)
+                .push(",")
+                .push_bind(id)
+                .push(")");
+        }
+        query.push(")");
+        let pool = self.pool()?;
+        let mut connection = if let Some((deadline, stop)) = &control {
+            tokio::select! { biased;
+                _ = stop.cancelled() => return Err(unavailable()),
+                _ = tokio::time::sleep_until(*deadline) => return Err(unavailable()),
+                result = CancellationSafePoolConnection::acquire(&pool) => result.map_err(internal_error)?,
+            }
+        } else {
+            CancellationSafePoolConnection::acquire(&pool)
+                .await
+                .map_err(internal_error)?
+        };
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        self.connection_read_queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rows = if let Some((deadline, stop)) = &control {
+            tokio::select! { biased;
+                _ = stop.cancelled() => Err(unavailable()),
+                _ = tokio::time::sleep_until(*deadline) => Err(unavailable()),
+                result = query.build().fetch_all(connection.connection_mut()) => result.map_err(internal_error),
+            }
+        } else {
+            query
+                .build()
+                .fetch_all(connection.connection_mut())
+                .await
+                .map_err(internal_error)
+        };
+        let rows = match rows {
+            Ok(rows) => {
+                connection.release();
+                rows
+            }
+            Err(error) => {
+                connection.discard();
+                return Err(error);
+            }
+        };
+        let mut result: Vec<Option<ConnectionRow>> = (0..keys.len()).map(|_| None).collect();
+        let mut seen = vec![false; keys.len()];
+        for row in rows {
+            let ordinal =
+                usize::try_from(row.try_get::<i64, _>("ordinal").map_err(internal_error)?)
+                    .map_err(internal_error)?;
+            let Some(slot) = seen.get_mut(ordinal) else {
+                return Err(unavailable());
+            };
+            if *slot {
+                return Err(unavailable());
+            }
+            *slot = true;
+            if let Some(status) = row
+                .try_get::<Option<String>, _>("status")
+                .map_err(internal_error)?
+            {
+                result[ordinal] = Some(ConnectionRow {
+                    status,
+                    generation: row.try_get("generation").map_err(internal_error)?,
+                    host_id: row.try_get("host_id").map_err(internal_error)?,
+                    label: row.try_get("label").map_err(internal_error)?,
+                });
+            }
+        }
+        if seen.iter().any(|seen| !seen) {
+            return Err(unavailable());
+        }
+        if control.as_ref().is_some_and(|(deadline, stop)| {
+            stop.is_cancelled() || tokio::time::Instant::now() >= *deadline
+        }) {
+            return Err(unavailable());
+        }
+        Ok(result)
     }
 
     async fn identity(
@@ -1313,26 +1518,50 @@ impl ChatgptConnections {
         owner: &str,
         id: &str,
     ) -> ApiResult<ExecutionCredential> {
+        self.bindings(owner, &[id.to_owned()])
+            .await?
+            .remove(id)
+            .ok_or_else(not_found)?
+    }
+
+    pub(crate) async fn bindings(
+        self: &Arc<Self>,
+        owner: &str,
+        ids: &[String],
+    ) -> ApiResult<HashMap<String, ApiResult<ExecutionCredential>>> {
         let config = self.enabled()?;
-        let (status,generation,host,label):(String,i64,String,String)=sqlx::query_as("SELECT status,generation,host_id,label FROM user_llm_connections WHERE user_id=? AND connection_id=?")
-            .bind(owner).bind(id).fetch_optional(&self.pool()?).await.map_err(internal_error)?.ok_or_else(not_found)?;
-        if status == "plan_disabled" {
-            return Err(fail(
-                StatusCode::FORBIDDEN,
-                "chatgpt_plan_usage_disabled",
-                "Authorize ChatGPT plan usage for this connection",
-            ));
-        }
-        if status != "connected" || host != config.host_id {
-            return Err(reauth());
-        }
-        Ok(ExecutionCredential {
-            service: self.clone(),
-            owner: owner.into(),
-            connection_id: id.into(),
-            generation,
-            label,
-        })
+        let unique: std::collections::BTreeSet<_> = ids.iter().cloned().collect();
+        let keys: Vec<_> = unique
+            .into_iter()
+            .map(|id| (owner.to_owned(), id))
+            .collect();
+        let rows = self.lookup_connection_rows(&keys, None).await?;
+        Ok(keys
+            .into_iter()
+            .zip(rows)
+            .map(|((_, id), row)| {
+                let value = row.ok_or_else(not_found).and_then(|row| {
+                    if row.status == "plan_disabled" {
+                        return Err(fail(
+                            StatusCode::FORBIDDEN,
+                            "chatgpt_plan_usage_disabled",
+                            "Authorize ChatGPT plan usage for this connection",
+                        ));
+                    }
+                    if row.status != "connected" || row.host_id != config.host_id {
+                        return Err(reauth());
+                    }
+                    Ok(ExecutionCredential {
+                        service: self.clone(),
+                        owner: owner.into(),
+                        connection_id: id.clone(),
+                        generation: row.generation,
+                        label: row.label,
+                    })
+                });
+                (id, value)
+            })
+            .collect())
     }
     pub fn api_base(&self) -> ApiResult<&str> {
         Ok(&self.enabled()?.api_base)
@@ -1523,7 +1752,7 @@ impl ChatgptConnections {
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
             let key = (owner.to_owned(), id.to_owned());
-            if let Some(connection) = active.get_mut(&key) {
+            if let Some(connection) = active.connections.get_mut(&key) {
                 for (_, version, cancel) in &connection.requests {
                     if *version <= generation {
                         cancel.cancel();
@@ -1533,7 +1762,12 @@ impl ChatgptConnections {
                     .requests
                     .retain(|(_, version, _)| *version > generation);
                 if connection.requests.is_empty() {
-                    active.remove(&key);
+                    active.connections.remove(&key);
+                    if active.connections.is_empty()
+                        && let Some(monitor) = &active.monitor
+                    {
+                        monitor.stop.cancel();
+                    }
                 }
             }
         }
@@ -1565,6 +1799,11 @@ impl ChatgptConnections {
             .map(|entry| entry.version)
     }
 
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn connection_read_queries_for_test(&self) -> usize {
+        self.connection_read_queries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     #[cfg(any(test, feature = "e2e-hooks"))]
     pub fn credential_row_reads_for_test(&self) -> usize {
         self.credential_row_reads

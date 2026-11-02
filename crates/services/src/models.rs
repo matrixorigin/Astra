@@ -2285,64 +2285,89 @@ async fn revalidate_admitted_model_executions_with_access(
     }
 
     let mut resolved: HashMap<&str, AdmittedModelExecution> = HashMap::new();
-    let mut ordered = Vec::with_capacity(offering_ids.len());
+    let mut staged = Vec::with_capacity(offering_ids.len());
     for offering_id in offering_ids {
         if let Some(execution) = resolved.get(offering_id.as_str()) {
-            ordered.push(execution.clone());
+            staged.push(Ok(execution.clone()));
             continue;
         }
-        let execution = if let Some(row) = personal.get(offering_id) {
-            {
-                let mut execution = admitted_user_model_from_row(row, offering_id, encryptor)?;
-                if let Some(connection_id) = row
-                    .try_get::<Option<String>, _>("connection_id")
-                    .map_err(|e| ModelOfferingResolutionError::Backend(e.to_string()))?
-                {
-                    let service = subscriptions.ok_or_else(|| {
-                        ModelOfferingResolutionError::CredentialUnavailable {
-                            offering_id: offering_id.clone(),
-                        }
-                    })?;
-                    execution.subscription = Some(
-                        service
-                            .binding(user_id, &connection_id)
-                            .await
-                            .map_err(|_| ModelOfferingResolutionError::CredentialUnavailable {
-                                offering_id: offering_id.clone(),
-                            })?,
-                    );
-                    if let Some(binding) = &execution.subscription
-                        && let Some(source) = execution.source_identity.as_mut()
-                    {
-                        source.access_label = format!("ChatGPT subscription · {}", binding.label());
-                    }
-                }
-                execution
-            }
-        } else {
-            let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
-            let row = deployment.get(offering_id).ok_or_else(|| {
-                active_llm_model_resolution_cache_remove(&cache_key);
-                ModelOfferingResolutionError::NotFound {
-                    offering_id: offering_id.clone(),
-                }
-            })?;
-            let model = resolved_active_llm_from_offering_row(row, offering_id, encryptor)
-                .inspect_err(|_| {
+        let result = (|| {
+            let execution = if let Some(row) = personal.get(offering_id) {
+                admitted_user_model_from_row(row, offering_id, encryptor)?
+            } else {
+                let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+                let row = deployment.get(offering_id).ok_or_else(|| {
                     active_llm_model_resolution_cache_remove(&cache_key);
+                    ModelOfferingResolutionError::NotFound {
+                        offering_id: offering_id.clone(),
+                    }
                 })?;
-            let execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
-                offering_id: offering_id.clone(),
-                model: model.clone(),
-            })
-            .map_err(|error| {
-                active_llm_model_resolution_cache_remove(&cache_key);
-                ModelOfferingResolutionError::Backend(error)
-            })?;
-            active_llm_model_resolution_cache_store(cache_key, model);
-            execution
-        };
-        resolved.insert(offering_id.as_str(), execution.clone());
+                let model = resolved_active_llm_from_offering_row(row, offering_id, encryptor)
+                    .inspect_err(|_| {
+                        active_llm_model_resolution_cache_remove(&cache_key);
+                    })?;
+                let execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+                    offering_id: offering_id.clone(),
+                    model: model.clone(),
+                })
+                .map_err(|error| {
+                    active_llm_model_resolution_cache_remove(&cache_key);
+                    ModelOfferingResolutionError::Backend(error)
+                })?;
+                active_llm_model_resolution_cache_store(cache_key, model);
+                execution
+            };
+            Ok(execution)
+        })();
+        if let Ok(execution) = &result {
+            resolved.insert(offering_id.as_str(), execution.clone());
+        }
+        let failed = result.is_err();
+        staged.push(result);
+        if failed {
+            break;
+        }
+    }
+    let connection_ids: Vec<_> = staged
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .filter_map(|execution| personal.get(&execution.offering_id))
+        .filter_map(|row| {
+            row.try_get::<Option<String>, _>("connection_id")
+                .ok()
+                .flatten()
+        })
+        .collect();
+    let bindings = match subscriptions.filter(|_| !connection_ids.is_empty()) {
+        Some(service) => Some(service.bindings(user_id, &connection_ids).await),
+        None => None,
+    };
+    let mut ordered = Vec::with_capacity(offering_ids.len());
+    for result in staged {
+        let mut execution = result?;
+        if let Some(connection_id) = personal.get(&execution.offering_id).and_then(|row| {
+            row.try_get::<Option<String>, _>("connection_id")
+                .ok()
+                .flatten()
+        }) {
+            execution.subscription = Some(
+                bindings
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .and_then(|bindings| bindings.get(&connection_id))
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned()
+                    .ok_or_else(|| ModelOfferingResolutionError::CredentialUnavailable {
+                        offering_id: execution.offering_id.clone(),
+                    })?,
+            );
+            if let Some(source) = execution.source_identity.as_mut() {
+                source.access_label = format!(
+                    "ChatGPT subscription · {}",
+                    execution.subscription.as_ref().unwrap().label()
+                );
+            }
+        }
         ordered.push(execution);
     }
     let compatible_endpoints = ordered

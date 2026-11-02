@@ -507,3 +507,89 @@ async fn expired_or_short_lived_candidates_do_not_leave_hot_entries() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn monitor_exit_after_stop_fails_closed_but_normal_handoff_restarts() {
+    for normal in [false, true] {
+        let service = service_without_pool();
+        let cancel = CancellationToken::new();
+        service.register_request("owner", "connection", Uuid::new_v4(), 7, cancel.clone());
+        let id = {
+            let active = service.active.lock().unwrap();
+            let monitor = active.monitor.as_ref().unwrap();
+            monitor.stop.cancel();
+            monitor.id
+        };
+        // A stop signal alone does not prove that the task reached its normal
+        // handoff. Aborted/unwound tasks must never spawn a successor in Drop.
+        drop(MonitorGuard {
+            service: Arc::downgrade(&service),
+            id,
+            restart: normal,
+        });
+        let active = service.active.lock().unwrap();
+        assert_eq!(cancel.is_cancelled(), !normal);
+        if normal {
+            let successor = active.monitor.as_ref().unwrap();
+            assert_ne!(successor.id, id);
+            assert!(!successor.stop.is_cancelled());
+        } else {
+            assert!(active.monitor.is_none());
+            assert!(active.connections.is_empty());
+        }
+        drop(active);
+        service.invalidate_local_connection("owner", "connection", 7);
+    }
+}
+
+#[test]
+fn monitor_observations_fence_entry_identity_owner_and_generation() {
+    let old = Uuid::new_v4();
+    let current = Uuid::new_v4();
+    let mut active = ActiveRegistry::default();
+    let mut tokens = Vec::new();
+    for owner in ["alice", "bob"] {
+        let mut requests = Vec::new();
+        for generation in [4, 5, 6] {
+            let token = CancellationToken::new();
+            tokens.push(token.clone());
+            requests.push((Uuid::new_v4(), generation, token));
+        }
+        active.connections.insert(
+            (owner.into(), "same-id".into()),
+            ActiveConnection {
+                monitor: current,
+                requests,
+            },
+        );
+    }
+    let alice = ("alice".into(), "same-id".into());
+    active.apply_observations(&[(alice.clone(), old)], None);
+    assert!(
+        tokens.iter().all(|token| !token.is_cancelled()),
+        "late old entry cannot cancel its replacement"
+    );
+    active.apply_observations(
+        &[(alice.clone(), current)],
+        Some(&[Some(ConnectionRow {
+            status: "disconnected".into(),
+            generation: 5,
+            host_id: String::new(),
+            label: String::new(),
+        })]),
+    );
+    assert!(tokens[0].is_cancelled() && tokens[1].is_cancelled());
+    assert!(
+        !tokens[2].is_cancelled(),
+        "older observation cannot cancel a newer generation"
+    );
+    assert!(
+        tokens[3..].iter().all(|token| !token.is_cancelled()),
+        "owner isolation"
+    );
+    active.apply_observations(&[(alice, current)], None);
+    assert!(
+        tokens[2].is_cancelled(),
+        "failed observation fails closed for the matching entry"
+    );
+}

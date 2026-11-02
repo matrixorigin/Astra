@@ -502,10 +502,10 @@ async fn responses_transport_recovery_and_credential_fencing() {
         .await
         .unwrap();
         let binding = admitted.subscription.as_ref().unwrap();
-        let reads = binding.fence_reads_for_test();
+        let reads = binding.connection_read_queries_for_test();
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(
-            binding.fence_reads_for_test() - reads <= 2,
+            (1..=2).contains(&(binding.connection_read_queries_for_test() - reads)),
             "active requests must share one connection watcher"
         );
         replica
