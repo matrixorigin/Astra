@@ -65,6 +65,12 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             .iter()
             .any(|column| column == "referenced_by_state_items_count")
     );
+    for column in ["api_key_encrypted", "connection_id"] {
+        assert_eq!(
+            column_nullable(&pool, &schema, "user_llm_models", column).await,
+            Some(true)
+        );
+    }
     let run_columns = column_names(&pool, &schema, "agent_runs").await;
     assert!(run_columns.iter().any(|column| column == "terminal_at"));
     assert_eq!(
@@ -152,6 +158,12 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     let contracts = load_core_schema_table_contracts(pool.get())
         .await
         .expect("load generated core schema table authority");
+    let model_claim_hash = contracts
+        .iter()
+        .find(|table| table.name == "user_llm_models")
+        .unwrap()
+        .ddl_sha256
+        .clone();
     assert!(
         contracts.len() >= 90,
         "bootstrap must publish the complete generated authority, got {} claims",
@@ -395,6 +407,36 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
 
     for (change, restore, expected) in [
         (
+            "ALTER TABLE user_llm_models DROP COLUMN api_key_encrypted",
+            "ALTER TABLE user_llm_models ADD api_key_encrypted TEXT NULL",
+            "api_key_encrypted",
+        ),
+        (
+            "ALTER TABLE user_llm_models MODIFY api_key_encrypted VARCHAR(100) NULL",
+            "ALTER TABLE user_llm_models MODIFY api_key_encrypted TEXT NULL",
+            "api_key_encrypted",
+        ),
+        (
+            "ALTER TABLE user_llm_models MODIFY connection_id VARCHAR(64) NOT NULL",
+            "ALTER TABLE user_llm_models MODIFY connection_id VARCHAR(64) NULL",
+            "connection_id",
+        ),
+        (
+            "ALTER TABLE user_llm_models MODIFY api_key_encrypted TEXT NOT NULL",
+            "ALTER TABLE user_llm_models MODIFY api_key_encrypted TEXT NULL",
+            "api_key_encrypted",
+        ),
+        (
+            "ALTER TABLE user_llm_models MODIFY connection_id VARCHAR(63) NULL",
+            "ALTER TABLE user_llm_models MODIFY connection_id VARCHAR(64) NULL",
+            "connection_id",
+        ),
+        (
+            "ALTER TABLE user_llm_models DROP COLUMN connection_id",
+            "ALTER TABLE user_llm_models ADD connection_id VARCHAR(64) NULL",
+            "connection_id",
+        ),
+        (
             "ALTER TABLE auth_refresh_tokens MODIFY session_id VARCHAR(63) NOT NULL",
             "ALTER TABLE auth_refresh_tokens MODIFY session_id VARCHAR(64) NOT NULL",
             "session_id",
@@ -436,12 +478,69 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         ),
     ] {
         sqlx::query(change).execute(pool.get()).await.unwrap();
-        let error = ensure_core_schema(&settings, &bootstrap_catalog)
-            .await
-            .expect_err("browser owner drift must reject startup")
-            .to_string();
-        assert!(error.contains(expected), "{error}");
+        let shape = async || {
+            sqlx::query_as::<_, (String, String, String, Option<i64>)>(
+                "SELECT COLUMN_NAME,DATA_TYPE,IS_NULLABLE,CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME='user_llm_models' ORDER BY COLUMN_NAME"
+            ).bind(&schema).fetch_all(pool.get()).await.unwrap()
+        };
+        let drifted = shape().await;
+        for completed in if change.contains("user_llm_models") {
+            &[true, false][..]
+        } else {
+            &[true][..]
+        } {
+            if !completed {
+                sqlx::query("DELETE FROM astra_schema_contracts WHERE component='astra-core'")
+                    .execute(pool.get())
+                    .await
+                    .unwrap();
+            }
+            let error = ensure_core_schema(&settings, &bootstrap_catalog)
+                .await
+                .expect_err("browser owner drift must reject startup")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(
+                shape().await,
+                drifted,
+                "startup must never repair model columns"
+            );
+            if !completed {
+                let ready: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM astra_schema_contracts WHERE component='astra-core'",
+                )
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+                assert_eq!(ready, 0);
+            }
+        }
         sqlx::query(restore).execute(pool.get()).await.unwrap();
+        ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .unwrap();
+    }
+    for completed in [true, false] {
+        if !completed {
+            sqlx::query("DELETE FROM astra_schema_contracts WHERE component='astra-core'")
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE astra_schema_table_contracts SET ddl_sha256=? WHERE table_name='user_llm_models'").bind("a".repeat(64)).execute(pool.get()).await.unwrap();
+        assert!(
+            ensure_core_schema(&settings, &bootstrap_catalog)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("user_llm_models")
+        );
+        let unchanged: String = sqlx::query_scalar("SELECT ddl_sha256 FROM astra_schema_table_contracts WHERE table_name='user_llm_models'").fetch_one(pool.get()).await.unwrap();
+        assert_eq!(unchanged, "a".repeat(64));
+        sqlx::query("UPDATE astra_schema_table_contracts SET ddl_sha256=? WHERE table_name='user_llm_models'").bind(&model_claim_hash).execute(pool.get()).await.unwrap();
+        ensure_core_schema(&settings, &bootstrap_catalog)
+            .await
+            .unwrap();
     }
     for (index, create, drop_index) in [
         (

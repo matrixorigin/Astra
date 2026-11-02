@@ -737,3 +737,8 @@ candidate evidence. No user-facing execution or recovery capability is retired.
 Fresh schema contract `2026-11-02-v119` combines personal model connection and
 authorization storage with v118 invocation archival. It rejects a main-only v118
 database under the existing fresh-database contract; no implicit migration runs.
+
+Personal API-key and connection model fields are declared together in the canonical
+`user_llm_models` CREATE. Startup checks their types, nullability and declaration
+fingerprint on both completed and interrupted bootstrap paths; it rejects drift
+without provider-specific ALTER or legacy-row migration.

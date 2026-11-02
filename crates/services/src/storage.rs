@@ -107,6 +107,27 @@ pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
 pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-02-v119";
+const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
+            model_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            model_alias VARCHAR(100) NOT NULL,
+            model_name VARCHAR(255) NOT NULL,
+            provider VARCHAR(50) NOT NULL,
+            api_key_encrypted TEXT NULL,
+            connection_id VARCHAR(64) NULL,
+            base_url VARCHAR(500) NOT NULL,
+            context_window INT NOT NULL,
+            thinking_probe_json JSON NULL,
+            is_default SMALLINT NOT NULL DEFAULT 0,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, model_id),
+            UNIQUE KEY uq_user_llm_models_alias (user_id, model_alias),
+            CONSTRAINT chk_user_llm_models_context_window CHECK (context_window > 0),
+            INDEX idx_user_llm_models_catalog (user_id, is_active, provider, model_alias, model_id),
+            INDEX idx_user_llm_models_default (user_id, is_default, is_active)
+        )";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -714,6 +735,19 @@ async fn inspect_core_schema_catalog(
     if contracts.is_empty() {
         return Ok(CoreSchemaCatalogState::Invalid(
             "core schema table authority is empty for the current contract".to_string(),
+        ));
+    }
+    let model_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(USER_LLM_MODELS_CREATE_SQL.trim().as_bytes())
+    );
+    if contracts
+        .iter()
+        .find(|table| table.name == "user_llm_models")
+        .is_none_or(|table| table.owner != "storage" || table.ddl_sha256 != model_hash)
+    {
+        return Ok(CoreSchemaCatalogState::Invalid(
+            "invalid user_llm_models schema declaration; recreate the database".into(),
         ));
     }
     let malformed = contracts
@@ -3911,32 +3945,9 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    core_schema_create!(
-        pool,
-        "user_llm_models",
-        "CREATE TABLE IF NOT EXISTS user_llm_models (
-            model_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            model_alias VARCHAR(100) NOT NULL,
-            model_name VARCHAR(255) NOT NULL,
-            provider VARCHAR(50) NOT NULL,
-            api_key_encrypted TEXT NOT NULL,
-            base_url VARCHAR(500) NOT NULL,
-            context_window INT NOT NULL,
-            thinking_probe_json JSON NULL,
-            is_default SMALLINT NOT NULL DEFAULT 0,
-            is_active SMALLINT NOT NULL DEFAULT 1,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, model_id),
-            UNIQUE KEY uq_user_llm_models_alias (user_id, model_alias),
-            CONSTRAINT chk_user_llm_models_context_window CHECK (context_window > 0),
-            INDEX idx_user_llm_models_catalog (user_id, is_active, provider, model_alias, model_id),
-            INDEX idx_user_llm_models_default (user_id, is_default, is_active)
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    core_schema_create!(pool, "user_llm_models", USER_LLM_MODELS_CREATE_SQL,)
+        .execute(&pool)
+        .await?;
 
     core_schema_create!(
         pool,
@@ -3952,7 +3963,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    crate::chatgpt::bootstrap(&pool).await?;
 
     // Canonical inference execution ledger. Admission writes the immutable route
     // and logical invocation together; each physical attempt is then committed
@@ -4731,6 +4741,22 @@ async fn verify_core_schema_shape(
     .map(|row| {
         let table: String = row.try_get("TABLE_NAME")?;
         let column: String = row.try_get("COLUMN_NAME")?;
+        if table == "user_llm_models"
+            && matches!(column.as_str(), "api_key_encrypted" | "connection_id")
+        {
+            let connection = column == "connection_id";
+            if !row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case(if connection { "varchar" } else { "text" })
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || (connection
+                    && row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "invalid user_llm_models.{column} shape"
+                )));
+            }
+        }
         if table == "agent_run_events"
             && column == "invocation_supersession_scope_key"
             && (!row
@@ -4875,7 +4901,7 @@ async fn verify_core_schema_shape(
         ("infra_llm_models", &["thinking_probe_json"][..]),
         (
             "user_llm_models",
-            &["thinking_probe_json", "connection_id"][..],
+            &["thinking_probe_json", "api_key_encrypted", "connection_id"][..],
         ),
     ] {
         for column in required {

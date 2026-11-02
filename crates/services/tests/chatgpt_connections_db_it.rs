@@ -908,45 +908,6 @@ async fn reauthorization_completion_uses_disconnect_lock_order() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
-async fn legacy_byok_rows_survive_idempotent_connection_migration() {
-    let settings = common::require_db_it_env();
-    isolated_database::require_isolated_database(&settings.database);
-    let (shared, mut settings) = common::setup_pool_and_settings().await;
-    let database = format!("sub_auth_migration_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
-        .execute(shared.get())
-        .await
-        .unwrap();
-    settings.database = database.clone();
-    let migration_pool = astra_core::SharedPool::new(&settings).await.unwrap();
-    let pool = migration_pool.get();
-    sqlx::query("CREATE TABLE user_llm_models (model_id VARCHAR(64) PRIMARY KEY, api_key_encrypted TEXT NOT NULL)").execute(pool).await.unwrap();
-    let key = FernetTokenEncryptor::new("legacy-migration-test-key").unwrap();
-    let ciphertext = key.encrypt("legacy-fake-byok-key").unwrap();
-    sqlx::query("INSERT INTO user_llm_models (model_id,api_key_encrypted) VALUES ('legacy',?)")
-        .bind(&ciphertext)
-        .execute(pool)
-        .await
-        .unwrap();
-    astra_services::chatgpt::bootstrap(pool).await.unwrap();
-    astra_services::chatgpt::bootstrap(pool).await.unwrap();
-    let stored: (String, Option<String>) = sqlx::query_as(
-        "SELECT api_key_encrypted,connection_id FROM user_llm_models WHERE model_id='legacy'",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    assert_eq!(stored, (ciphertext, None));
-    sqlx::query("INSERT INTO user_llm_models (model_id,api_key_encrypted,connection_id) VALUES ('subscription',NULL,'fixture-connection')").execute(pool).await.unwrap();
-    migration_pool.get().close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
-        .execute(shared.get())
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn repeated_disconnect_cancels_pending_and_exchanging_reauthorization() {
     use std::time::Duration;
     isolated_database::require_isolated_database(&common::require_db_it_env().database);

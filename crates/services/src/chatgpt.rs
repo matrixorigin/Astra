@@ -2170,27 +2170,3 @@ pub(crate) const AUTHORIZATIONS_TABLE_SQL: &str =
         callback_digest VARCHAR(64) NULL, completed_connection_id VARCHAR(64) NULL,
         PRIMARY KEY (user_id, authorization_id)
     )";
-
-pub async fn bootstrap(pool: &MySqlPool) -> Result<(), sqlx::Error> {
-    let nullable: String = sqlx::query_scalar("SELECT IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_llm_models' AND COLUMN_NAME = 'api_key_encrypted'")
-        .fetch_one(pool).await?;
-    if nullable != "YES" {
-        query("ALTER TABLE user_llm_models MODIFY COLUMN api_key_encrypted TEXT NULL")
-            .execute(pool)
-            .await?;
-    }
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_llm_models' AND COLUMN_NAME = 'connection_id'")
-        .fetch_one(pool).await?;
-    if count == 0
-        && let Err(error) =
-            query("ALTER TABLE user_llm_models ADD COLUMN connection_id VARCHAR(64) NULL")
-                .execute(pool)
-                .await
-    {
-        let exists:i64=sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='user_llm_models' AND COLUMN_NAME='connection_id'").fetch_one(pool).await?;
-        if exists != 1 {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
