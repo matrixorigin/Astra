@@ -387,6 +387,7 @@ struct RunOwnerLeaseKey {
 struct RunOwnerLeaseAuthority {
     state: tokio::sync::watch::Sender<RunOwnerLeaseState>,
     operation: tokio::sync::Mutex<()>,
+    execution_cancel_token: Arc<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Clone, Copy)]
@@ -462,7 +463,10 @@ impl Drop for RunOwnerLeaseTerminalOperation<'_> {
 }
 
 impl RunOwnerLeaseAuthority {
-    fn new(deadline: tokio::time::Instant) -> Self {
+    fn new(
+        deadline: tokio::time::Instant,
+        execution_cancel_token: Arc<tokio_util::sync::CancellationToken>,
+    ) -> Self {
         let (state, _) = tokio::sync::watch::channel(RunOwnerLeaseState {
             deadline,
             active: true,
@@ -472,6 +476,7 @@ impl RunOwnerLeaseAuthority {
         Self {
             state,
             operation: tokio::sync::Mutex::new(()),
+            execution_cancel_token,
         }
     }
 
@@ -1442,7 +1447,10 @@ impl RunEngine {
             run_id: run_id.clone(),
             owner_generation: expected_owner_generation,
         };
-        let authority = Arc::new(RunOwnerLeaseAuthority::new(initial_fence_deadline));
+        let authority = Arc::new(RunOwnerLeaseAuthority::new(
+            initial_fence_deadline,
+            execution_cancel_token.clone(),
+        ));
         self.owner_lease_authorities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1727,6 +1735,21 @@ impl RunEngine {
                 owner_lease_fence_deadline: deadline,
             },
         ))
+    }
+
+    /// The cached lifecycle task must be the executor for this exact lease.
+    pub(crate) fn local_execution_is_current(
+        &self,
+        user: &str,
+        session: &str,
+        run: &str,
+        generation: u64,
+        token: &Arc<tokio_util::sync::CancellationToken>,
+    ) -> bool {
+        self.owner_lease_authority(user, session, run, generation)
+            .is_ok_and(|authority| {
+                Arc::ptr_eq(token, &authority.execution_cancel_token) && !token.is_cancelled()
+            })
     }
 
     /// Preparation remains inside the heartbeat's already proven lease window.

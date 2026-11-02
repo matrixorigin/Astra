@@ -18907,6 +18907,11 @@ impl RunStateStore for DatabaseRunStateStore {
         update.push_bind(run_id);
         update.push(" AND last_event_idx = ");
         update.push_bind(last_event_idx);
+        // Resume is control of an existing executor, never acquisition of
+        // execution ownership. Recheck under the same locked transaction.
+        if status == STATUS_RUNNING {
+            update.push(" AND owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)");
+        }
         update.push(" AND status IN (");
         {
             let mut separated = update.separated(", ");
