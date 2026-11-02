@@ -6603,7 +6603,8 @@ fn call_is_pending_canonical_validation(call: &Value) -> bool {
             other => other.to_string(),
         });
     raw_args.is_some_and(|args| {
-        astra_turn_core::evaluation::normalize_validation_attempt_prefix(name, &args).is_some()
+        crate::turn::agentic_loop::execution_phase::classify_work_validation_attempt(name, &args)
+            .is_some()
     })
 }
 
@@ -47561,6 +47562,26 @@ mod tests {
             vec![delivered],
             "a server-owned fresh assignment starts a new validation epoch"
         );
+    }
+
+    #[test]
+    fn pending_work_validation_requires_a_recognized_or_declared_check() {
+        for (command, mode, expected) in [
+            ("python3 - <<'PY'\nprint('result')\nPY", None, false),
+            (
+                "python3 - <<'PY'\nprint('result')\nPY",
+                Some("verify"),
+                true,
+            ),
+            ("cargo check", None, true),
+        ] {
+            let mut args = json!({"command": command});
+            if let Some(mode) = mode {
+                args["mode"] = json!(mode);
+            }
+            let call = json!({"function": {"name": "bash", "arguments": args.to_string()}});
+            assert_eq!(call_is_pending_canonical_validation(&call), expected);
+        }
     }
 
     #[test]

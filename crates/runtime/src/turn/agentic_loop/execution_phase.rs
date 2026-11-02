@@ -5973,25 +5973,31 @@ fn record_starts_fresh_work_attempt(
             .is_some_and(|attempt_id| !attempt_id.trim().is_empty())
 }
 
-/// Classify a record once for the Work and bounded-recovery consumers. Opaque
-/// inferred attempts remain conservative; only an explicit declaration can
-/// own a generic verification rather than named project validation.
+/// A Work obligation comes from a recognized validator or an explicit verify
+/// request. An unscannable ordinary command supplies neither validation debt
+/// nor validation proof; its effects and custody are checked independently.
+pub(crate) fn classify_work_validation_attempt(
+    name: &str,
+    args: &str,
+) -> Option<(astra_turn_core::evaluation::ValidationAttempt, bool)> {
+    let attempt = astra_turn_core::evaluation::classify_validation_attempt(name, args)?;
+    let opaque = matches!(
+        attempt,
+        astra_turn_core::evaluation::ValidationAttempt::Opaque(_)
+    );
+    let declared = opaque
+        && super::lifecycle::extract_tool_args(Some(args)).is_some_and(|args| {
+            astra_tools::workspace_observation::is_explicit_workspace_verification_request(
+                name, &args,
+            )
+        });
+    (!opaque || declared).then_some((attempt, declared))
+}
+
 fn classify_record_validation_attempt(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> Option<(astra_turn_core::evaluation::ValidationAttempt, bool)> {
-    let args = record.authoritative_args_full()?;
-    let attempt = astra_turn_core::evaluation::classify_validation_attempt(&record.name, args)?;
-    let opaque_declared =
-        matches!(
-            &attempt,
-            astra_turn_core::evaluation::ValidationAttempt::Opaque(_)
-        ) && super::lifecycle::extract_tool_args(Some(args)).is_some_and(|args| {
-            astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-                &record.name,
-                &args,
-            )
-        });
-    Some((attempt, opaque_declared))
+    classify_work_validation_attempt(&record.name, record.authoritative_args_full()?)
 }
 
 /// Only a completed, known-negative custom verification may reserve a retry.
@@ -6085,17 +6091,28 @@ impl WorkValidationEvidence {
             let args = record.authoritative_args_full();
             let attempt = classify_record_validation_attempt(record);
             let opaque_declared = attempt.as_ref().is_some_and(|(_, declared)| *declared);
-            if tool_record_may_have_mutated_bound_workspace(
-                state.hooks.workspace_root_hint.as_deref(),
-                record,
-            ) && !(opaque_declared
-                && record.workspace_mutation_partial != Some(true)
-                && (super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
+            // Unknown shell effects can stale existing proof without inventing
+            // a validator obligation for an ordinary read/fetch task.
+            let unknown_effect_risk = saw_validation
+                && attempt.is_none()
+                && record.name == "bash"
+                && !record_is_proven_external_scratch_mutation(
+                    state.hooks.workspace_root_hint.as_deref(),
                     record,
                 )
-                    || super::lifecycle::is_authoritative_unchanged_bash_observation_record(
-                        record,
-                    )))
+                && super::lifecycle::extract_tool_args(args).is_none_or(|args| {
+                    crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
+                        &record.name,
+                        Some(&args),
+                    )
+                });
+            if (tool_record_may_have_mutated_bound_workspace(
+                state.hooks.workspace_root_hint.as_deref(),
+                record,
+            ) || unknown_effect_risk) && !(record.workspace_mutation_partial != Some(true)
+                && (super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
+                    || (opaque_declared
+                        && super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record))))
             {
                 evidence.last_workspace_mutation_index = Some(index);
                 if saw_validation {
@@ -10200,6 +10217,78 @@ mod tests {
             ),
             disposition: Some(ToolCallDisposition::Executed),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn opaque_activity_does_not_invent_or_discharge_work_validation() {
+        for command in [
+            "python3 - <<'PY'\nprint('reader result')\nPY",
+            "for url in https://example.org; do curl -sS \"$url\"; done",
+        ] {
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            let activity = validation_record(command, "success");
+            state.stall.tool_call_records = vec![activity.clone()];
+            assert_eq!(
+                current_work_validation_state(&state),
+                WorkValidationState::None
+            );
+            assert!(failed_work_validation_operation(&state).is_none());
+
+            state.stall.tool_call_records = vec![
+                validation_record("cargo check", "test_failure"),
+                activity.clone(),
+            ];
+            assert_ne!(
+                current_work_validation_state(&state),
+                WorkValidationState::Passed
+            );
+            assert_eq!(
+                failed_work_validation_operation(&state).as_deref(),
+                Some("cargo check")
+            );
+
+            state.stall.tool_call_records = vec![
+                validation_record("cargo check", "success"),
+                activity.clone(),
+            ];
+            assert_eq!(
+                current_work_validation_state(&state),
+                WorkValidationState::Stale
+            );
+
+            let mut unchanged = activity.clone();
+            unchanged.workspace_mutation_scope =
+                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+            unchanged.workspace_mutation_receipt =
+                astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+                ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
+            state.stall.tool_call_records =
+                vec![validation_record("cargo check", "success"), unchanged];
+            assert_eq!(
+                current_work_validation_state(&state),
+                WorkValidationState::Passed
+            );
+
+            let mut partial = activity;
+            partial.workspace_mutation_partial = Some(true);
+            partial.workspace_mutation_observed = Some(true);
+            partial.runtime_args_full = partial.args_full.clone();
+            partial.workspace_mutation_scope =
+                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+            partial.workspace_mutation_receipt =
+                astra_tools::workspace_observation::changed_receipt_with_ownership(
+                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+                )
+                .remove(astra_tools::workspace_observation::RECEIPT_FIELD);
+            state.stall.tool_call_records =
+                vec![validation_record("cargo check", "success"), partial];
+            assert_eq!(
+                current_work_validation_state(&state),
+                WorkValidationState::Stale
+            );
         }
     }
 

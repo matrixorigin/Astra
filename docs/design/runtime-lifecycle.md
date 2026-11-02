@@ -135,9 +135,12 @@ or without scratch preparation. Plain output and static printf formats using
 literal text, `%s` and `%%` remain neutral; variable-writing or dynamic formats
 do not. Go checks use the complete invocation as identity, including any
 fallible prefix reader or output stage. A recognizable unsafe check retains only
-attempt identity. Sensitive or unscannable invocations reuse the existing opaque
+attempt identity. Recognized validators with sensitive arguments reuse the existing opaque
 exact-argument identity, so failures remain debts without copying credentials
-into recovery state. Only an exact retry can resolve a named validation debt;
+into recovery state. An ordinary unscannable command is unknown activity: it
+neither creates nor discharges a validation obligation. Explicit verify-mode
+requests retain their exact receipt contract regardless of shell syntax.
+Mutation freshness and executor custody remain independent of classification. Only an exact retry can resolve a named validation debt;
 an unproven success still needs a separate eligible validation. An explicit
 verify receipt proves workspace freshness under the executor-owned lease,
 successful exit and unchanged fingerprint contract. This declared custom verifier path is
@@ -148,7 +151,7 @@ fingerprint cannot clear it. That receipt does not certify which tests ran or
 clear named Work validation debts. A failed custom invocation without an
 authoritative unchanged fingerprint also makes earlier named proof stale. Go
 semantic inference owns inferred observations and named Work validation
-independently; a freshness receipt never overrides an existing named debt.. These are invocation receipts under the
+independently; a freshness receipt never overrides an existing named debt. These are invocation receipts under the
 existing trusted executor environment, not a guarantee about inherited tool
 configuration or test counts. Executors enable pipefail for pipelines; commands
 that may disable that setting cannot use the final pipeline stage's success as
