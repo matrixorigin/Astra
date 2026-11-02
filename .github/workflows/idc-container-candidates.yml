@@ -82,7 +82,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
           username: ${{ secrets.IDC_REGISTRY_USERNAME }}
@@ -162,7 +162,7 @@ jobs:
           name: idc-digest-${{ matrix.slug }}
           path: /tmp/digest
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
           username: ${{ secrets.IDC_REGISTRY_USERNAME }}
