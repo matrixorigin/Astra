@@ -4168,12 +4168,7 @@ impl RunEngine {
         {
             match tokio::time::timeout(
                 OWNER_LEASE_RELEASE_MAX_WAIT,
-                self.store.release_owner_lease(
-                    &current.user_id,
-                    &current.session_id,
-                    &current.run_id,
-                    stale_run.run_generation,
-                ),
+                self.store.release_settled_recovery_lease(stale_run),
             )
             .await
             {

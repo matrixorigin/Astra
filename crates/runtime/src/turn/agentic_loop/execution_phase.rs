@@ -3294,7 +3294,12 @@ pub(crate) fn fanout_nonterminal_receipt_superseded(
     })
 }
 
-fn should_retry_textless_response(state: &AgenticLoopState, turn_result: &HostTurnResult) -> bool {
+/// A completed provider turn delivered no text and selected no tool. That is
+/// not a deliverable answer even when the transport reported success.
+fn provider_turn_without_actionable_output(
+    state: &AgenticLoopState,
+    turn_result: &HostTurnResult,
+) -> bool {
     turn_result.accum.tool_calls.is_empty()
         && turn_result.accum.full_text.trim().is_empty()
         && state.final_text.trim().is_empty()
@@ -3304,10 +3309,39 @@ fn should_retry_textless_response(state: &AgenticLoopState, turn_result: &HostTu
             .deferred_candidate_text
             .as_deref()
             .is_none_or(|text| text.trim().is_empty())
+}
+
+fn should_retry_textless_response(state: &AgenticLoopState, turn_result: &HostTurnResult) -> bool {
+    provider_turn_without_actionable_output(state, turn_result)
         && state.interruption.is_none()
         && state.remaining_turns > 0
         && state.hooks.completion_settlement.textless_response_retries
             < MAX_TEXTLESS_RESPONSE_RETRIES
+}
+
+/// A repeated textless completion is the exhausted side of the same bound the
+/// recovery request consumed. Record the typed interruption here so the
+/// provider cause and its intervention guidance reach run finalization
+/// instead of a generic settlement notice invented later.
+fn record_exhausted_textless_completion(state: &mut AgenticLoopState) -> bool {
+    if state.interruption.is_some()
+        || state.hooks.completion_settlement.textless_response_retries
+            < MAX_TEXTLESS_RESPONSE_RETRIES
+    {
+        return false;
+    }
+    state.interruption = Some(InterruptionRecord::new(
+        InterruptionKind::EmptyCompletion,
+        exhausted_provider_recovery_action(state),
+        interruption_state_summary(
+            state,
+            Some(
+                "provider ended without user-visible text after the bounded textless recovery"
+                    .into(),
+            ),
+        ),
+    ));
+    true
 }
 
 fn begin_textless_response_retry(state: &mut AgenticLoopState) {
@@ -6102,6 +6136,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state,
                 terminal_completion_disposition,
             );
+
+            // The bounded textless recovery is the only automatic response to
+            // a provider turn that delivered neither text nor a tool. Once it
+            // has been spent, settle through the same typed interruption path
+            // as an exhausted provider recovery.
+            if provider_turn_without_actionable_output(state, &turn_result) {
+                record_exhausted_textless_completion(state);
+            }
 
             // A completion guard may discover the exhausted side of its
             // bounded recovery window while this response is being settled

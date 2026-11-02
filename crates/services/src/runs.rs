@@ -6922,6 +6922,17 @@ pub trait RunStateStore: Send + Sync {
         Ok(false)
     }
 
+    /// Retire a recovery claim after a control transition won settlement.
+    /// Recheck owner/generation and the current idle outcome atomically: a
+    /// paused snapshot is not authority to release a subsequently resumed run.
+    /// A paused execution handoff retains its custody even without a wait.
+    async fn release_settled_recovery_lease(
+        &self,
+        _claimed_run: &DurableRunRecord,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Find the newest run that blocks starting another run in the same session.
     async fn find_blocking_session_run(
         &self,
@@ -10782,6 +10793,31 @@ impl RunStateStore for InMemoryRunStateStore {
                 && run.run_generation == expected_owner_generation
                 && run.owner_pod_id.is_some()
                 && run.owner_pod_id.as_deref() == self.execution_owner_pod_id()
+        }) else {
+            return Ok(false);
+        };
+        run.owner_pod_id = None;
+        run.owner_lease_expires_at = None;
+        Ok(true)
+    }
+
+    async fn release_settled_recovery_lease(
+        &self,
+        claimed_run: &DurableRunRecord,
+    ) -> Result<bool, String> {
+        let fence = self.action_fence_for(&claimed_run.user_id, &claimed_run.run_id);
+        let _fence = fence.lock_owned().await;
+        let mut runs = self.runs.write().await;
+        let Some(run) = runs.get_mut(&claimed_run.run_id).filter(|run| {
+            run.user_id == claimed_run.user_id
+                && run.session_id == claimed_run.session_id
+                && run.run_generation == claimed_run.run_generation
+                && run.owner_pod_id.is_some()
+                && run.owner_pod_id.as_deref() == self.execution_owner_pod_id()
+                && (durable_run_status_is_terminal(&run.status)
+                    || (run.status == STATUS_PAUSED
+                        && run.waiting_for.is_none()
+                        && run.current_checkpoint_version() != Some("execution_handoff_v1")))
         }) else {
             return Ok(false);
         };
@@ -22908,6 +22944,43 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(released)
     }
 
+    async fn release_settled_recovery_lease(
+        &self,
+        claimed_run: &DurableRunRecord,
+    ) -> Result<bool, String> {
+        let deadline = RunControlDeadline::after(BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT);
+        let mut connection = acquire_cancellation_safe_connection(
+            &self.pool,
+            deadline,
+            "release_settled_recovery_lease_prepare",
+            &claimed_run.run_id,
+        )
+        .await?;
+        let result = tokio::time::timeout_at(deadline.at, sqlx::query(
+            "UPDATE agent_runs
+             SET owner_pod_id = NULL, owner_lease_expires_at = NULL
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND owner_pod_id = ? AND run_generation = ?
+               AND (status IN (?, ?, ?, ?) OR (status = ? AND waiting_for IS NULL
+                    AND (checkpoint_version IS NULL OR checkpoint_version <> 'execution_handoff_v1')))",
+        )
+        .bind(&claimed_run.user_id)
+        .bind(&claimed_run.session_id)
+        .bind(&claimed_run.run_id)
+        .bind(&self.owner_pod_id)
+        .bind(claimed_run.run_generation as i64)
+        .bind(STATUS_COMPLETED)
+        .bind(STATUS_DELEGATED)
+        .bind(STATUS_FAILED)
+        .bind(STATUS_CANCELLED)
+        .bind(STATUS_PAUSED)
+        .execute(connection.connection_mut()))
+        .await
+        .map_err(|_| deadline.timeout("release_settled_recovery_lease", &claimed_run.run_id))?
+        .map_err(|source| db_error("release_settled_recovery_lease", &claimed_run.run_id, source).to_string())?;
+        connection.release();
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn find_blocking_session_run(
         &self,
         user_id: &str,
@@ -30570,6 +30643,193 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("clean root-child session");
+    }
+
+    async fn assert_recovery_conflict_release_fences_current_state(
+        store: &dyn RunStateStore,
+        claim: &DurableRunRecord,
+        handoff: bool,
+    ) {
+        let set_status = async |from: &str, to: &str, wait: Option<&str>| {
+            assert!(
+                store
+                    .update_run_status_with_events_if_current(
+                        &claim.user_id,
+                        &claim.session_id,
+                        &claim.run_id,
+                        &[from],
+                        Some(claim.run_generation),
+                        to,
+                        wait,
+                        None,
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+            );
+        };
+        set_status(STATUS_RUNNING, STATUS_PAUSED, None).await;
+        // This is the conflict reload. A resume then wins before release, in
+        // the same generation: checking only the snapshot would clear it.
+        let snapshot = store
+            .load_run(&claim.user_id, &claim.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        set_status(STATUS_PAUSED, STATUS_RUNNING, None).await;
+        if handoff {
+            let body = json!({"version":"execution_handoff_v1", "producer_run_id":claim.run_id,
+                "producer_owner_generation":claim.run_generation, "heavy":{"cursor":7}})
+            .to_string();
+            assert!(
+                store
+                    .save_checkpoint(RunCheckpointWriteRequest {
+                        user_id: &claim.user_id,
+                        expected_session_id: &claim.session_id,
+                        run_id: &claim.run_id,
+                        checkpoint_json: &body,
+                        authority: CheckpointWriteAuthority::ExecutionOwner {
+                            expected_owner_generation: claim.run_generation,
+                        },
+                    })
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        for (from, status, wait) in [
+            (STATUS_RUNNING, STATUS_RUNNING, None),
+            (STATUS_RUNNING, STATUS_WAITING, None),
+            (STATUS_WAITING, STATUS_PAUSED, Some("approval")),
+        ] {
+            set_status(from, status, wait).await;
+            assert!(
+                !store
+                    .release_settled_recovery_lease(&snapshot)
+                    .await
+                    .unwrap(),
+                "a stale pause must not release {status} with wait={wait:?}"
+            );
+            let current = store
+                .load_run(&claim.user_id, &claim.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.status, status);
+            assert_eq!(current.owner_pod_id, claim.owner_pod_id);
+            assert_eq!(current.owner_lease_expires_at, claim.owner_lease_expires_at);
+            assert_eq!(current.events, snapshot.events);
+        }
+        set_status(STATUS_PAUSED, STATUS_PAUSED, None).await;
+        for wrong_identity in [
+            DurableRunRecord {
+                run_generation: claim.run_generation + 1,
+                ..snapshot.clone()
+            },
+            DurableRunRecord {
+                session_id: "wrong-session".into(),
+                ..snapshot.clone()
+            },
+            DurableRunRecord {
+                user_id: "wrong-user".into(),
+                ..snapshot.clone()
+            },
+        ] {
+            assert!(
+                !store
+                    .release_settled_recovery_lease(&wrong_identity)
+                    .await
+                    .unwrap()
+            );
+        }
+        if handoff {
+            assert!(
+                !store
+                    .release_settled_recovery_lease(&snapshot)
+                    .await
+                    .unwrap(),
+                "a nonblocking pause still retains execution-handoff custody"
+            );
+            set_status(STATUS_PAUSED, STATUS_COMPLETED, None).await;
+        }
+        assert!(
+            store
+                .release_settled_recovery_lease(&snapshot)
+                .await
+                .unwrap()
+        );
+        let settled = store
+            .load_run(&claim.user_id, &claim.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled.status,
+            if handoff {
+                STATUS_COMPLETED
+            } else {
+                STATUS_PAUSED
+            }
+        );
+        assert!(settled.owner_pod_id.is_none());
+        assert!(settled.owner_lease_expires_at.is_none());
+        assert_eq!(settled.events, snapshot.events);
+        assert!(
+            !store
+                .release_settled_recovery_lease(&snapshot)
+                .await
+                .unwrap(),
+            "release is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_recovery_conflict_release_fences_resumed_runs_and_handoffs() {
+        for handoff in [false, true] {
+            let store = InMemoryRunStateStore::new()
+                .with_execution_owner("recovery", Duration::from_secs(120));
+            store
+                .insert_run(durable_run_record("release-race"))
+                .await
+                .unwrap();
+            let claim = store
+                .claim_recoverable_active_runs(1)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_recovery_conflict_release_fences_current_state(&store, &claim.run, handoff)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_recovery_conflict_release_fences_resumed_runs_and_handoffs() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        for handoff in [false, true] {
+            let nonce = Uuid::new_v4();
+            let user = format!("release-race-u-{nonce}");
+            let session = format!("release-race-s-{nonce}");
+            let id = format!("release-race-r-{nonce}");
+            insert_active_database_session_fixture(&pool, &user, &session).await;
+            let mut run = durable_run_record(&id);
+            run.user_id = user.clone();
+            run.session_id = session.clone();
+            store.insert_run(run).await.unwrap();
+            let claim = store
+                .claim_exact_recovery_candidate_for_test(&user, &id)
+                .await
+                .unwrap();
+            assert_recovery_conflict_release_fences_current_state(&store, &claim.run, handoff)
+                .await;
+            cleanup_database_run_fixture(&pool, &user, &id).await;
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                .bind(&user)
+                .bind(&session)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

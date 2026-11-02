@@ -120,12 +120,18 @@ async fn unhappy_tool_call_to_unknown_tool_name() {
             .iter()
             .all(|message| message.get("tool_calls").is_none() && message["role"] != "tool")
     );
-    assert!(
-        messages.iter().any(|message| message["content"]
-            .as_str()
-            .is_some_and(|text| text
-                .contains("provider_attempt_ended_without_executable_or_visible_delivery")))
-    );
+    let settlement = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .filter_map(|content| content.strip_prefix("<astra-runtime-context>\n"))
+        .filter_map(|content| content.strip_suffix("\n</astra-runtime-context>"))
+        .filter_map(|content| serde_json::from_str::<Value>(content).ok())
+        .find(|context| context["schema"] == "final_answer_settlement.v1")
+        .expect("text-only settlement accompanies recovery");
+    assert_eq!(settlement["signal"], "textless_provider_response");
+    assert_eq!(settlement["authority"], "runtime_bounded_text_only_retry");
+    assert_eq!(settlement["evidence"]["rounds_completed"], 1);
+    assert_eq!(settlement["evidence"]["tool_calls_completed"], 0);
 }
 
 #[tokio::test]
