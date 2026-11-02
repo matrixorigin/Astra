@@ -74,6 +74,7 @@ impl ResponseProxy {
                         let gate = relay_gate.clone();
                         connections.spawn(async move {
                             let server = TcpStream::connect((host.as_str(), port)).await.unwrap();
+                            assert!(server.peer_addr().unwrap().ip().is_loopback(), "plaintext response proxy requires a loopback database");
                             let (mut client_read, mut client_write) = client.into_split();
                             let (mut server_read, mut server_write) = server.into_split();
                             let request_gate = gate.clone();
@@ -112,6 +113,7 @@ impl ResponseProxy {
                                     let should_hold = gate.pending.load(Ordering::SeqCst)
                                         && (!is_terminator || (row_seen && matches!(bytes[4], 0xfe | 0x00)));
                                     if should_hold && gate.pending.swap(false, Ordering::SeqCst) {
+                                        assert_ne!(bytes[4], 0xff, "gated SQL must succeed at the server");
                                         if matches!(boundary, Boundary::Begin | Boundary::Commit | Boundary::Write(_)) {
                                             assert_eq!(bytes[4], 0, "gated SQL must succeed at the server");
                                         }

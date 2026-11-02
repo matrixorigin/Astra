@@ -1046,8 +1046,7 @@ async fn repeated_disconnect_cancels_pending_and_exchanging_reauthorization() {
 }
 
 #[allow(dead_code)]
-#[path = "common/mysql_response_proxy.rs"]
-mod mysql_response_proxy;
+use common::mysql_response_proxy::{self, proxy_pool};
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
@@ -1086,7 +1085,11 @@ async fn subscription_sql_timeouts_release_pool_capacity_before_response_arrives
         let proxy = ResponseProxy::start(
             settings.host.clone(),
             settings.port,
-            Boundary::Statement(prefix),
+            if refresh {
+                Boundary::Write(prefix)
+            } else {
+                Boundary::Rows(prefix)
+            },
         )
         .await;
         let worker = proxy_pool(&settings, proxy.port).await;
@@ -1239,7 +1242,7 @@ async fn simultaneous_registration_retries_preserve_canonical_connection() {
     let proxy = ResponseProxy::start(
         settings.host.clone(),
         settings.port,
-        Boundary::Statement(b"SELECT connection_id FROM user_llm_connections WHERE user_id="),
+        Boundary::Rows(b"SELECT connection_id FROM user_llm_connections WHERE user_id="),
     )
     .await;
     let worker = proxy_pool(&settings, proxy.port).await;
@@ -1385,7 +1388,7 @@ async fn completion_settles_after_waiter_cancellation_and_rolls_back_cancelled_l
     let proxy = ResponseProxy::start(
         settings.host.clone(),
         settings.port,
-        Boundary::Statement(b"INSERT INTO user_llm_connections "),
+        Boundary::Write(b"INSERT INTO user_llm_connections "),
     )
     .await;
     let worker = proxy_pool(&settings, proxy.port).await;
@@ -1480,12 +1483,9 @@ async fn completion_deadline_releases_sql_and_only_settles_its_own_exchange() {
         } else {
             b"SELECT connection_id FROM user_llm_connections WHERE user_id="
         };
-        let proxy = ResponseProxy::start(
-            settings.host.clone(),
-            settings.port,
-            Boundary::Statement(prefix),
-        )
-        .await;
+        let proxy =
+            ResponseProxy::start(settings.host.clone(), settings.port, Boundary::Rows(prefix))
+                .await;
         let worker = proxy_pool(&settings, proxy.port).await;
         let delayed = Arc::new(ChatgptConnections::new(
             Some(worker.clone()),
@@ -1607,11 +1607,11 @@ async fn refresh_failure_cleanup_respects_its_budget() {
     for (boundary, claim) in [
         (Boundary::Begin, true),
         (
-            Boundary::Statement(b"UPDATE user_llm_connections SET refresh_owner=?"),
+            Boundary::Write(b"UPDATE user_llm_connections SET refresh_owner=?"),
             true,
         ),
         (
-            Boundary::Statement(b"UPDATE user_llm_connections SET status='reauth_required'"),
+            Boundary::Write(b"UPDATE user_llm_connections SET status='reauth_required'"),
             false,
         ),
     ] {
@@ -1698,15 +1698,6 @@ async fn refresh_failure_cleanup_respects_its_budget() {
             "refresh failure cleanup exceeded the operation and lease budgets"
         );
     }
-}
-
-async fn proxy_pool(settings: &astra_core::MatrixOneSettings, port: u16) -> astra_core::SharedPool {
-    let mut settings = settings.clone();
-    settings.host = "127.0.0.1".into();
-    settings.port = port;
-    settings.db_pool_max_connections = 1;
-    settings.db_pool_min_connections = 0;
-    astra_core::SharedPool::new(&settings).await.unwrap()
 }
 
 #[tokio::test]
