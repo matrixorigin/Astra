@@ -109,7 +109,9 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         Ok(config.clone()),
     ));
     let owner = format!("owner-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(shared.get(), &owner).await;
     let other = format!("other-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(shared.get(), &other).await;
     let attempt = start(&service, &owner, None).await;
     let id = attempt["authorization_id"].as_str().unwrap();
     let code = provider.issue_code(&attempt, "account-one", true);
@@ -709,6 +711,7 @@ async fn disconnect_fences_inflight_model_creation_check_activation_and_default(
     );
     for operation in ["check", "activate", "default", "create"] {
         let owner = format!("activation-{}", uuid::Uuid::new_v4());
+        fixture::ensure_owner(shared.get(), &owner).await;
         let connection = provider.connect(models.as_ref(), &owner).await;
         let model_request = UserModelCreateRequestData {
             connection_id: Some(connection.clone()),
@@ -821,6 +824,7 @@ async fn reauthorization_completion_uses_disconnect_lock_order() {
         Ok(ChatgptConfig::for_test(&provider.base)),
     ));
     let owner = format!("reauthorization-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(shared.get(), &owner).await;
     let initial = start(&service, &owner, None).await;
     let code = provider.issue_code(&initial, "same-account", true);
     let linked = operate_ok(
@@ -919,6 +923,7 @@ async fn repeated_disconnect_cancels_pending_and_exchanging_reauthorization() {
         Ok(ChatgptConfig::for_test(&provider.base)),
     ));
     let owner = format!("disconnect-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(shared.get(), &owner).await;
     let initial = start(&service, &owner, None).await;
     let code = provider.issue_code(&initial, "same-account", true);
     let linked = operate_ok(
@@ -1026,6 +1031,7 @@ async fn subscription_sql_timeouts_release_pool_capacity_before_response_arrives
     ));
     for refresh in [false, true] {
         let owner = format!("sql-timeout-{}", uuid::Uuid::new_v4());
+        fixture::ensure_owner(shared.get(), &owner).await;
         let initial = start(&direct, &owner, None).await;
         let code = provider.issue_code(&initial, "same-account", true);
         let linked = operate_ok(
@@ -1222,6 +1228,7 @@ async fn simultaneous_registration_retries_preserve_canonical_connection() {
     let worker = proxy_pool(&settings, proxy.port).await;
     let delayed = Arc::new(ChatgptConnections::new(Some(worker), key, Ok(config)));
     let owner = format!("review-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(shared.get(), &owner).await;
     // A failed first link retains the issued client but has no connection yet.
     // Two real retry operations reuse that issued registration, as required by OAuth.
     let failed = start(&direct, &owner, None).await;
@@ -1372,6 +1379,7 @@ async fn completion_settles_after_waiter_cancellation_and_rolls_back_cancelled_l
         Ok(config),
     ));
     let owner = format!("cancel-complete-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(shared.get(), &owner).await;
     let auth = start(&direct, &owner, None).await;
     let code = provider.issue_code(&auth, "cancelled-subject", true);
     let waiter = tokio::spawn({
@@ -1467,6 +1475,7 @@ async fn completion_deadline_releases_sql_and_only_settles_its_own_exchange() {
             Ok(config),
         ));
         let owner = format!("deadline-complete-{}", uuid::Uuid::new_v4());
+        fixture::ensure_owner(shared.get(), &owner).await;
         let auth = start(&direct, &owner, None).await;
         let code = provider.issue_code(&auth, "deadline-subject", true);
         let stalled = tokio::spawn({
@@ -1598,6 +1607,7 @@ async fn refresh_failure_cleanup_respects_its_budget() {
             Ok(config.clone()),
         ));
         let owner = format!("review-refresh-cleanup-{}", uuid::Uuid::new_v4());
+        fixture::ensure_owner(shared.get(), &owner).await;
         let auth = start(&direct, &owner, None).await;
         let code = provider.issue_code(&auth, "cleanup-subject", true);
         let linked = operate_ok(
@@ -1689,6 +1699,7 @@ async fn concurrent_rejection_shares_one_refresh_and_reconnect_fences_old_genera
         Ok(ChatgptConfig::for_test(&provider.base)),
     ));
     let owner = format!("owner-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(shared.get(), &owner).await;
     let attempt = start(&service, &owner, None).await;
     let code = provider.issue_code(&attempt, "account-one", true);
     let linked = operate_ok(
@@ -1788,6 +1799,7 @@ async fn duplicate_rejection_with_rotated_row_completes_bounded(caller_count: us
         Ok(ChatgptConfig::for_test(&provider.base)),
     ));
     let owner = format!("owner-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(shared.get(), &owner).await;
     let attempt = start(&service, &owner, None).await;
     let code = provider.issue_code(&attempt, "account-one", true);
     let linked = operate_ok(
@@ -2101,4 +2113,182 @@ async fn subscription_model_batches_read_connections_once() {
             "a failed connection rejects the whole batch"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne database"]
+async fn authorization_capacity_is_atomic_across_instances_and_releases_slots() {
+    let (shared, mut settings) = common::setup_pool_and_settings().await;
+    isolated_database::require_isolated_database(&settings.database);
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let key = Arc::new(FernetTokenEncryptor::new("authorization-capacity-fixture").unwrap());
+    let mut services = Vec::new();
+    let mut pools = Vec::new();
+    for _ in 0..2 {
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        pools.push(pool.clone());
+        services.push(Arc::new(ChatgptConnections::new(
+            Some(pool),
+            key.clone(),
+            Ok(ChatgptConfig::for_test("http://127.0.0.1:1")),
+        )));
+    }
+    let request = || {
+        ConnectionOperation::Start(StartAuthorization {
+            redirect_uri: "http://127.0.0.1:14555/auth/callback".into(),
+            label: None,
+            connection_id: None,
+            retry_authorization_id: None,
+        })
+    };
+    let serial = uuid::Uuid::new_v4().to_string();
+    fixture::ensure_owner(shared.get(), &serial).await;
+    let mut attempts = Vec::new();
+    for _ in 0..8 {
+        attempts.push(services[0].operate(&serial, request()).await.unwrap());
+    }
+    assert_eq!(
+        services[1]
+            .operate(&serial, request())
+            .await
+            .unwrap_err()
+            .0
+            .as_u16(),
+        429
+    );
+    services[0]
+        .operate(
+            &serial,
+            ConnectionOperation::Cancel(attempts[0]["authorization_id"].as_str().unwrap().into()),
+        )
+        .await
+        .unwrap();
+    services[1]
+        .operate(&serial, request())
+        .await
+        .expect("cancelled attempt releases capacity");
+    sqlx::query(
+        "UPDATE user_llm_authorizations SET expires_at=? WHERE user_id=? AND authorization_id=?",
+    )
+    .bind(chrono::Utc::now().timestamp() - 1)
+    .bind(&serial)
+    .bind(attempts[1]["authorization_id"].as_str().unwrap())
+    .execute(shared.get())
+    .await
+    .unwrap();
+    services[0]
+        .operate(&serial, request())
+        .await
+        .expect("expired attempt releases capacity");
+    assert_eq!(
+        services[1]
+            .operate(&serial, request())
+            .await
+            .unwrap_err()
+            .0
+            .as_u16(),
+        429
+    );
+
+    let owner = uuid::Uuid::new_v4().to_string();
+    fixture::ensure_owner(shared.get(), &owner).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..16 {
+        let service = services[index % 2].clone();
+        let owner = owner.clone();
+        let barrier = barrier.clone();
+        let operation = request();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            service.operate(&owner, operation).await
+        });
+    }
+    let mut successes = 0;
+    let mut limited = 0;
+    while let Some(result) = tasks.join_next().await {
+        match result.unwrap() {
+            Ok(_) => successes += 1,
+            Err(error) => {
+                assert_eq!(error.0.as_u16(), 429);
+                limited += 1;
+            }
+        }
+    }
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_llm_authorizations WHERE user_id=? AND status='pending'",
+    )
+    .bind(&owner)
+    .fetch_one(shared.get())
+    .await
+    .unwrap();
+    assert_eq!((successes, limited, pending), (8, 8, 8));
+    assert_eq!(
+        services[0]
+            .operate(&uuid::Uuid::new_v4().to_string(), request())
+            .await
+            .unwrap_err()
+            .0
+            .as_u16(),
+        401
+    );
+
+    // One owner's fence must not serialize a different owner or leave an
+    // authorization row when a caller is cancelled before admission.
+    let blocked = uuid::Uuid::new_v4().to_string();
+    let other = uuid::Uuid::new_v4().to_string();
+    fixture::ensure_owner(shared.get(), &blocked).await;
+    fixture::ensure_owner(shared.get(), &other).await;
+    let mut lock = shared.get().begin().await.unwrap();
+    sqlx::query("SELECT user_id FROM auth_users WHERE user_id=? FOR UPDATE")
+        .bind(&blocked)
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap();
+    let worker: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pools[0].get())
+        .await
+        .unwrap();
+    let task = tokio::spawn({
+        let service = services[0].clone();
+        let owner = blocked.clone();
+        let operation = request();
+        async move { service.operate(&owner, operation).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let sql: Option<String> = sqlx::query_scalar("SELECT info FROM information_schema.processlist WHERE db=? AND conn_id=? AND info IS NOT NULL")
+                .bind(&settings.database).bind(worker).fetch_optional(shared.get()).await.unwrap().flatten();
+            if sql.is_some_and(|sql| sql.contains("auth_users") && sql.contains("FOR UPDATE")) { break; }
+            assert!(!task.is_finished(), "admission ended before reaching the owner fence");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("observe the blocked owner-lock SQL before cancellation");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        services[1].operate(&other, request()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !task.is_finished(),
+        "same-owner admission must wait for the durable fence"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    lock.rollback().await.unwrap();
+    services[0].operate(&blocked, request()).await.unwrap();
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_llm_authorizations WHERE user_id=? AND status='pending'",
+    )
+    .bind(&blocked)
+    .fetch_one(shared.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        pending, 1,
+        "cancelled pre-admission caller must not consume a slot"
+    );
 }

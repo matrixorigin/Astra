@@ -6130,6 +6130,7 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
         .await
         .unwrap();
     let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    subscription_provider::ensure_owner(pool.get(), USER_ID).await;
     astra_services::resource_governor::DatabaseResourceGovernor::new(pool.clone())
         .ensure_tables()
         .await

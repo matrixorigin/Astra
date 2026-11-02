@@ -104,9 +104,10 @@ async fn responses_transport_recovery_and_credential_fencing() {
         .with_pool(pool.clone())
         .with_chatgpt_config(config.clone());
     let replica = DatabaseModelService::new(settings.clone(), key.clone())
-        .with_pool(pool)
+        .with_pool(pool.clone())
         .with_chatgpt_config(config);
     let owner = format!("runtime-{}", uuid::Uuid::new_v4());
+    fixture::ensure_owner(pool.get(), &owner).await;
     let connection = provider.connect(&service, &owner).await;
     let model = service
         .create_user_model(

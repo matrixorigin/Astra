@@ -522,11 +522,15 @@ async fn monitor_exit_after_stop_fails_closed_but_normal_handoff_restarts() {
         };
         // A stop signal alone does not prove that the task reached its normal
         // handoff. Aborted/unwound tasks must never spawn a successor in Drop.
-        drop(MonitorGuard {
+        let mut guard = MonitorGuard {
             service: Arc::downgrade(&service),
             id,
-            restart: normal,
-        });
+            armed: true,
+        };
+        if normal {
+            service.finish_monitor(&mut guard);
+        }
+        drop(guard);
         let active = service.active.lock().unwrap();
         assert_eq!(cancel.is_cancelled(), !normal);
         if normal {
@@ -592,4 +596,73 @@ fn monitor_observations_fence_entry_identity_owner_and_generation() {
         tokens[2].is_cancelled(),
         "failed observation fails closed for the matching entry"
     );
+}
+
+#[test]
+fn registration_during_runtime_shutdown_does_not_deadlock() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    // Positive control: normal registration and invalidation return normally.
+    let control = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let live = service_without_pool();
+    control.block_on(async {
+        live.register_request("owner", "live", Uuid::new_v4(), 1, CancellationToken::new());
+        live.invalidate_local_connection("owner", "live", 1);
+    });
+    control.shutdown_timeout(Duration::from_secs(1));
+    eprintln!("CONTROL: live-runtime registration and invalidation returned");
+
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .on_thread_stop(move || {
+            let _ = stopped_tx.send(());
+        })
+        .build()
+        .unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let service = service_without_pool();
+    runtime.spawn(async move {
+        entered_tx.send(()).unwrap();
+        // Simulate an already-running acquire poll reaching registration while
+        // another runtime worker begins shutdown. This is a synchronous gate,
+        // not a new task submitted to an already-dead runtime.
+        release_rx.recv().unwrap();
+        let cancel = CancellationToken::new();
+        service.register_request("owner", "shutdown", Uuid::new_v4(), 1, cancel.clone());
+        assert!(cancel.is_cancelled());
+        let active = service.active.lock().unwrap();
+        assert!(active.monitor.is_none() && active.connections.is_empty());
+        done_tx.send(()).unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    runtime.shutdown_background();
+    stopped_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("other worker has completed shutdown");
+    release_tx.send(()).unwrap();
+    done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("registration already running during shutdown must return without locking itself");
+}
+
+#[test]
+fn rejected_monitor_spawn_unwinds_without_poisoning_registry() {
+    let service = service_without_pool();
+    let cancel = CancellationToken::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // No runtime: spawn panics and must drop its prebuilt guard safely.
+        service.register_request("owner", "unwind", Uuid::new_v4(), 1, cancel.clone());
+    }));
+    assert!(result.is_err());
+    assert!(cancel.is_cancelled());
+    let active = service.active.lock().unwrap();
+    assert!(active.monitor.is_none() && active.connections.is_empty());
 }

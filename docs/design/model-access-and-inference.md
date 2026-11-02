@@ -54,7 +54,9 @@ issued client registration and provider subject. Multiple personal model rows
 reference it. A row has exactly one source: API-key ciphertext or connection ID;
 admission rejects malformed combinations. `user_llm_authorizations` owns
 short-lived, owner-bound OAuth attempts, encrypted PKCE verifiers and keyed
-state/nonce digests. ID tokens are verified and discarded; only renewable
+state/nonce digests. Starting an attempt locks the existing Astra account row
+and atomically checks and inserts against an eight-unexpired-pending limit
+shared across service instances; cancellation and expiry release capacity. ID tokens are verified and discarded; only renewable
 credentials are stored encrypted. Credentials never enter serializable routes, catalogs,
 checkpoints or public errors. The CLI relays only the browser callback and uses
 a loopback listener; Server never reads local CLI/Codex credentials.
@@ -80,7 +82,9 @@ disables dependent models and cancels local requests; each connection-service in
 monitor: up to 256 keys per query and four concurrent batches on a two-second
 cadence, with one two-second cycle deadline including queued work. Failed or
 missing observations cancel only the matching entry identities; idle monitors
-stop. Model admission deduplicates connection IDs into one bounded lookup.
+stop. Monitor identity reservation and normal handoff use the existing registry;
+task launch happens after unlocking, and destructor cleanup only fails closed.
+Model admission deduplicates connection IDs into one bounded lookup.
 Each request performs a
 fresh fence before accepting completion. The monitor stops with its last request.
 Interrupted delivered requests settle as delivery-unknown through the existing

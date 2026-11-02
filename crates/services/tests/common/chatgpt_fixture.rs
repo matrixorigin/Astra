@@ -459,3 +459,12 @@ async fn responses(
         ),
     )
 }
+
+
+/// Public connection operations are authenticated-account operations.
+/// Seed the same durable owner that production authentication establishes.
+pub async fn ensure_owner(pool: &sqlx::MySqlPool, owner: &str) {
+    let name = format!("subscription_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query("INSERT IGNORE INTO auth_users (user_id,username,email,password_hash) VALUES (?,?,?,'!')")
+        .bind(owner).bind(&name).bind(format!("{name}@astra.invalid")).execute(pool).await.unwrap();
+}

@@ -391,27 +391,29 @@ struct ConnectionMonitor {
 struct MonitorGuard {
     service: Weak<ChatgptConnections>,
     id: Uuid,
-    restart: bool,
+    armed: bool,
 }
 impl Drop for MonitorGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        let mut active = service.active.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(_) = active.monitor.as_ref().filter(|m| m.id == self.id) else {
-            return;
-        };
-        if !self.restart {
-            for entry in active.connections.values() {
-                for (_, _, cancel) in &entry.requests {
-                    cancel.cancel();
-                }
+        let connections = {
+            let mut active = service.active.lock().unwrap_or_else(|e| e.into_inner());
+            if active.monitor.as_ref().map(|monitor| monitor.id) != Some(self.id) {
+                return;
             }
-            active.connections.clear();
+            active.monitor = None;
+            std::mem::take(&mut active.connections)
+        };
+        for entry in connections.into_values() {
+            for (_, _, cancel) in entry.requests {
+                cancel.cancel();
+            }
         }
-        active.monitor = None;
-        service.start_monitor(&mut active);
     }
 }
 #[derive(sqlx::FromRow)]
@@ -982,9 +984,27 @@ impl ChatgptConnections {
             .execute(&pool)
             .await
             .map_err(internal_error)?;
+        let mut tx = CancellationSafeTransaction::begin(&pool)
+            .await
+            .map_err(internal_error)?;
+        let account: Option<String> =
+            sqlx::query_scalar("SELECT user_id FROM auth_users WHERE user_id=? FOR UPDATE")
+                .bind(owner)
+                .fetch_optional(tx.connection_mut())
+                .await
+                .map_err(internal_error)?;
+        if account.is_none() {
+            tx.rollback().await.map_err(internal_error)?;
+            return Err(fail(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Your account is no longer available. Sign in again.",
+            ));
+        }
         let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_llm_authorizations WHERE user_id = ? AND expires_at > ? AND status = 'pending'")
-            .bind(owner).bind(unix_now()).fetch_one(&pool).await.map_err(internal_error)?;
+            .bind(owner).bind(unix_now()).fetch_one(tx.connection_mut()).await.map_err(internal_error)?;
         if pending >= 8 {
+            tx.rollback().await.map_err(internal_error)?;
             return Err(fail(
                 StatusCode::TOO_MANY_REQUESTS,
                 "oauth_attempt_limit",
@@ -996,7 +1016,8 @@ impl ChatgptConnections {
             .bind(&id).bind(owner).bind(if request.connection_id.is_some() {"1"} else {"0"}).bind(request.connection_id.as_deref().unwrap_or("")).bind(label).bind(request.redirect_uri)
             .bind(self.encryptor.keyed_digest("chatgpt-state",&state)).bind(self.encryptor.keyed_digest("chatgpt-nonce",&nonce))
             .bind(self.encryptor.encrypt(&verifier).map_err(internal_error)?).bind(client_id).bind(if subject.is_some() {"1"} else {"0"}).bind(subject.as_deref().unwrap_or("")).bind(expires)
-            .execute(&pool).await.map_err(internal_error)?;
+            .execute(tx.connection_mut()).await.map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
         Ok(
             json!({"authorization_id":id,"authorization_url":url.as_str(),"state":state,"expires_at":expires}),
         )
@@ -1081,42 +1102,74 @@ impl ChatgptConnections {
         generation: i64,
         cancel: CancellationToken,
     ) {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        active
-            .connections
-            .entry((owner.into(), id.into()))
-            .or_insert_with(|| ActiveConnection {
-                monitor: Uuid::new_v4(),
-                requests: Vec::new(),
-            })
-            .requests
-            .push((request, generation, cancel));
-        self.start_monitor(&mut active);
+        let launch;
+        {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            active
+                .connections
+                .entry((owner.into(), id.into()))
+                .or_insert_with(|| ActiveConnection {
+                    monitor: Uuid::new_v4(),
+                    requests: Vec::new(),
+                })
+                .requests
+                .push((request, generation, cancel));
+            launch = self.reserve_monitor(&mut active, None);
+        }
+        if let Some(launch) = launch {
+            Self::spawn_monitor(launch);
+        }
     }
 
-    fn start_monitor(self: &Arc<Self>, active: &mut ActiveRegistry) {
-        if active.connections.is_empty() || active.monitor.is_some() {
-            return;
+    // Reserve under the registry lock; the returned guard must outlive that
+    // critical section so rejected spawn/unwind cleanup can safely take it.
+    fn reserve_monitor(
+        self: &Arc<Self>,
+        active: &mut ActiveRegistry,
+        predecessor: Option<Uuid>,
+    ) -> Option<(MonitorGuard, CancellationToken)> {
+        if active.monitor.as_ref().map(|monitor| monitor.id) != predecessor {
+            return None;
+        }
+        if active.connections.is_empty() {
+            active.monitor = None;
+            return None;
         }
         let id = Uuid::new_v4();
         let stop = CancellationToken::new();
+        let mut guard = MonitorGuard {
+            service: Arc::downgrade(self),
+            id,
+            armed: false,
+        };
         active.monitor = Some(ConnectionMonitor {
             id,
             stop: stop.clone(),
         });
-        let service = Arc::downgrade(self);
-        let guard = MonitorGuard {
-            service: service.clone(),
-            id,
-            restart: false,
-        };
+        guard.armed = true;
+        Some((guard, stop))
+    }
+
+    fn finish_monitor(self: &Arc<Self>, guard: &mut MonitorGuard) {
+        let launch;
+        {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            launch = self.reserve_monitor(&mut active, Some(guard.id));
+            guard.armed = false;
+        }
+        if let Some(launch) = launch {
+            Self::spawn_monitor(launch);
+        }
+    }
+
+    fn spawn_monitor((mut guard, stop): (MonitorGuard, CancellationToken)) {
+        let service = guard.service.clone();
         tokio::spawn(async move {
-            let mut guard = guard;
             let period = Duration::from_secs(2);
             let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                let tick = tokio::select! { biased; _ = stop.cancelled() => { guard.restart = true; return; }, tick = ticks.tick() => tick };
+                let tick = tokio::select! { biased; _ = stop.cancelled() => { if let Some(service) = service.upgrade() { service.finish_monitor(&mut guard); } return; }, tick = ticks.tick() => tick };
                 let Some(service) = service.upgrade() else {
                     return;
                 };
