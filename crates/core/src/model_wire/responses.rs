@@ -337,6 +337,10 @@ impl ResponseOutput {
 pub struct ResponseAccumulator {
     pub output: ResponseOutput,
     items: BTreeMap<u64, Value>,
+    text_ranges: BTreeMap<(u64, u64), Vec<std::ops::Range<usize>>>,
+    range_count: usize,
+    unindexed_text: bool,
+    tracking_overflow: bool,
     completed: bool,
 }
 impl ResponseAccumulator {
@@ -380,6 +384,43 @@ impl ResponseAccumulator {
                 let delta = event["delta"]
                     .as_str()
                     .ok_or(ResponsesStreamError::Codec("Invalid Responses text delta"))?;
+                // Store observations once; ranges preserve their item/part ownership.
+                if self.output.text.len().saturating_add(delta.len()) > 16 * 1024 * 1024 {
+                    return Err(ResponsesStreamError::Codec("Responses text limit exceeded"));
+                }
+                if !delta.is_empty() && !self.tracking_overflow {
+                    match (
+                        event["output_index"].as_u64(),
+                        event["content_index"].as_u64(),
+                    ) {
+                        (Some(item), Some(part)) => {
+                            let key = (item, part);
+                            if self.text_ranges.len() >= 4096
+                                && !self.text_ranges.contains_key(&key)
+                            {
+                                self.tracking_overflow = true;
+                            } else {
+                                let ranges = self.text_ranges.entry(key).or_default();
+                                let start = self.output.text.len();
+                                let end = start + delta.len();
+                                if let Some(last) =
+                                    ranges.last_mut().filter(|last| last.end == start)
+                                {
+                                    last.end = end;
+                                } else if self.range_count >= 65536 {
+                                    self.tracking_overflow = true;
+                                } else {
+                                    ranges.push(start..end);
+                                    self.range_count += 1;
+                                }
+                            }
+                            if self.tracking_overflow {
+                                self.text_ranges.clear();
+                            }
+                        }
+                        _ => self.unindexed_text = true,
+                    }
+                }
                 self.output.text.push_str(delta);
                 return Ok(Some((delta.into(), false)));
             }
@@ -453,35 +494,65 @@ impl ResponseAccumulator {
     }
     /// A typed budget terminal preserves observations, never execution or replay authority.
     fn observe_truncated_output(&mut self, response: &Value) -> Result<(), ResponsesStreamError> {
-        let items: Vec<&Value> = match response.get("output") {
-            Some(Value::Array(items)) if !items.is_empty() => items.iter().collect(),
-            None | Some(Value::Array(_)) => self.items.values().collect(),
+        let terminal = match response.get("output") {
+            Some(Value::Array(items)) if !items.is_empty() => Some(items),
+            None | Some(Value::Array(_)) => None,
             _ => {
                 return Err(ResponsesStreamError::Codec(
                     "Invalid Responses terminal output",
                 ));
             }
         };
+        if terminal.is_none() && self.tracking_overflow {
+            return Err(ResponsesStreamError::Codec(
+                "Responses partial text tracking limit exceeded",
+            ));
+        }
         let mut text = String::new();
-        for item in items {
+        let mut append = |part: &str| -> Result<(), ResponsesStreamError> {
+            if text.len().saturating_add(part.len()) > 16 * 1024 * 1024 {
+                return Err(ResponsesStreamError::Codec("Responses text limit exceeded"));
+            }
+            text.push_str(part);
+            Ok(())
+        };
+        let mut parts = BTreeMap::new();
+        let items: Vec<(u64, &Value)> = match terminal {
+            Some(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| (i as u64, item))
+                .collect(),
+            None => self.items.iter().map(|(i, item)| (*i, item)).collect(),
+        };
+        for (index, item) in items {
             match item["type"].as_str() {
                 Some("message") => {
                     if item["role"] != "assistant" {
                         return Err(ResponsesStreamError::Codec("Invalid partial message role"));
                     }
-                    let parts = item["content"]
+                    let content = item["content"]
                         .as_array()
                         .ok_or(ResponsesStreamError::Codec(
                             "Invalid partial message content",
                         ))?;
-                    for part in parts {
-                        let value = match part["type"].as_str() {
-                            Some("output_text") => part["text"].as_str(),
-                            Some("refusal") => part["refusal"].as_str(),
+                    for (part, value) in content.iter().enumerate() {
+                        let text = match value["type"].as_str() {
+                            Some("output_text") => value["text"].as_str(),
+                            Some("refusal") => value["refusal"].as_str(),
                             _ => None,
                         }
                         .ok_or(ResponsesStreamError::Codec("Invalid partial message part"))?;
-                        text.push_str(value);
+                        if terminal.is_some() {
+                            append(text)?;
+                        } else if !text.is_empty() {
+                            if parts.len() >= 4096 {
+                                return Err(ResponsesStreamError::Codec(
+                                    "Too many Responses text parts",
+                                ));
+                            }
+                            parts.insert((index, part as u64), text);
+                        }
                     }
                 }
                 Some("reasoning" | "function_call") => {}
@@ -489,6 +560,27 @@ impl ResponseAccumulator {
                     return Err(ResponsesStreamError::Codec(
                         "Unsupported partial output item",
                     ));
+                }
+            }
+        }
+        if terminal.is_none() && (!parts.is_empty() || !self.text_ranges.is_empty()) {
+            if self.unindexed_text {
+                return Err(ResponsesStreamError::Codec(
+                    "Ambiguous Responses partial text ownership",
+                ));
+            }
+            let keys: std::collections::BTreeSet<_> = parts
+                .keys()
+                .chain(self.text_ranges.keys())
+                .copied()
+                .collect();
+            for key in keys {
+                if let Some(part) = parts.get(&key) {
+                    append(part)?;
+                } else if let Some(ranges) = self.text_ranges.get(&key) {
+                    for range in ranges {
+                        append(&self.output.text[range.clone()])?;
+                    }
                 }
             }
         }

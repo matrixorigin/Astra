@@ -133,3 +133,122 @@ fn completed_functions_require_complete_items_including_saved_replay() {
         );
     }
 }
+
+fn message(id: &str, text: &str, status: &str) -> Value {
+    json!({"type":"message","id":id,"role":"assistant","status":status,"content":[{"type":"output_text","text":text,"annotations":[]}]})
+}
+fn stream(full_terminal: bool) -> String {
+    let first = message("msg-first", "First part. ", "completed");
+    let second = message("msg-second", "Second part is unfinished", "incomplete");
+    let mut events = vec![
+        json!({"type":"response.output_text.delta","item_id":"msg-first","output_index":0,"content_index":0,"delta":"First part. "}),
+        json!({"type":"response.output_item.done","output_index":0,"item":first}),
+        json!({"type":"response.output_item.added","output_index":1,"item":message("msg-second","","in_progress")}),
+        json!({"type":"response.output_text.delta","item_id":"msg-second","output_index":1,"content_index":0,"delta":"Second part is unfinished"}),
+    ];
+    events.push(json!({"type":"response.incomplete","response":{"id":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":if full_terminal {json!([first,second])} else {json!([])},"usage":{"input_tokens":10,"output_tokens":50}}}));
+    events.iter().map(|e| format!("data: {e}\n\n")).collect()
+}
+#[test]
+fn full_terminal_control_preserves_both_messages() {
+    let out = decode_sse(&stream(true)).unwrap();
+    assert_eq!(out.text, "First part. Second part is unfinished");
+    assert!(out.tool_calls.is_empty());
+    assert!(out.items.is_empty());
+}
+#[test]
+fn empty_budget_terminal_does_not_drop_streamed_tail_after_a_done_item() {
+    let out = decode_sse(&stream(false)).unwrap();
+    assert_eq!(out.finish_reason.as_deref(), Some("length"));
+    assert_eq!(out.text, "First part. Second part is unfinished");
+}
+
+#[test]
+fn indexed_truncation_merges_done_parts_and_interleaved_utf8_without_text_deduplication() {
+    for prefix_delta in [false, true] {
+        let mut accumulator = astra_core::model_wire::responses::ResponseAccumulator::default();
+        if prefix_delta {
+            accumulator.observe(&json!({"type":"response.output_text.delta","output_index":7,"content_index":0,"delta":"相同"})).unwrap();
+        }
+        accumulator.observe(&json!({"type":"response.output_item.done","output_index":7,"item":message("prefix","相同","completed")})).unwrap();
+        for (item, part, text) in [(42, 0, "相"), (42, 1, "尾"), (42, 0, "同")] {
+            accumulator.observe(&json!({"type":"response.output_text.delta","output_index":item,"content_index":part,"delta":text})).unwrap();
+        }
+        accumulator
+            .observe(&terminal("incomplete", json!([])))
+            .unwrap();
+        let out = accumulator.finish().unwrap();
+        assert_eq!(out.text, "相同相同尾");
+        assert_eq!(out.finish_reason.as_deref(), Some("length"));
+        assert!(out.items.is_empty() && out.tool_calls.is_empty());
+    }
+}
+
+#[test]
+fn ambiguous_unindexed_tail_fails_without_erasing_observations() {
+    let mut accumulator = astra_core::model_wire::responses::ResponseAccumulator::default();
+    accumulator.observe(&json!({"type":"response.output_item.done","output_index":0,"item":message("prefix","first","completed")})).unwrap();
+    accumulator
+        .observe(&json!({"type":"response.output_text.delta","delta":"unowned tail"}))
+        .unwrap();
+    assert!(
+        accumulator
+            .observe(&terminal("incomplete", json!([])))
+            .is_err()
+    );
+    assert_eq!(accumulator.output.text, "unowned tail");
+    assert_eq!(accumulator.output.usage["completion_tokens"], 512);
+}
+
+#[test]
+fn indexed_text_storage_rejects_resource_exhaustion_without_allocating_by_index() {
+    use astra_core::model_wire::responses::ResponseAccumulator;
+    let mut accumulator = ResponseAccumulator::default();
+    for index in 0..4096_u64 {
+        accumulator.observe(&json!({"type":"response.output_text.delta","output_index":index,"content_index":u64::MAX,"delta":"x"})).unwrap();
+    }
+    accumulator.observe(&json!({"type":"response.output_text.delta","output_index":u64::MAX,"content_index":0,"delta":"x"})).unwrap();
+    assert_eq!(accumulator.output.text.len(), 4097);
+    assert!(
+        accumulator
+            .observe(&terminal("incomplete", json!([])))
+            .is_err()
+    );
+    accumulator
+        .observe(&terminal(
+            "completed",
+            json!([message("final", "authoritative", "completed")]),
+        ))
+        .unwrap();
+    assert_eq!(accumulator.finish().unwrap().text, "authoritative");
+    let mut accumulator = ResponseAccumulator::default();
+    assert!(
+        accumulator
+            .observe(
+                &json!({"type":"response.output_text.delta","delta":"x".repeat(16*1024*1024+1)})
+            )
+            .is_err()
+    );
+    assert!(accumulator.output.text.is_empty());
+    let mut accumulator = ResponseAccumulator::default();
+    let parts = vec![json!({"type":"output_text","text":"x"}); 4097];
+    accumulator.observe(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":parts}})).unwrap();
+    assert!(
+        accumulator
+            .observe(&terminal("incomplete", json!([])))
+            .is_err()
+    );
+}
+
+#[test]
+fn populated_terminal_does_not_require_partial_tracking() {
+    let parts = vec![json!({"type":"output_text","text":"x"}); 4097];
+    let end = terminal(
+        "incomplete",
+        json!([{"type":"message","role":"assistant","content":parts}]),
+    );
+    let delta = json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"old delta must be replaced"});
+    let out = decode_sse(&format!("data: {delta}\n\ndata: {end}\n\n")).unwrap();
+    assert_eq!(out.text, "x".repeat(4097));
+    assert!(out.tool_calls.is_empty() && out.items.is_empty());
+}

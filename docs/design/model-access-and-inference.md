@@ -118,7 +118,11 @@ binary suppression and token-budget requests fail before provider dispatch.
 
 Only completed responses authorize tool dispatch and replayable provider state.
 A typed `max_output_tokens` truncation retains partial text, response identity,
-usage and `length` even without output items. It creates neither executable
+usage and `length` even without output items. Empty-terminal text fallback
+merges completed parts and partial deltas by output/content index, retaining
+streamed tails without duplicating done text. Ambiguous unindexed mixed text
+fails with streamed deltas, response identity and usage retained rather than
+guessing ownership; done-only text is not recovered on that error path. It creates neither executable
 calls nor continuation metadata, including when individual function items look
 complete. The existing output-cap owner handles continuation or interruption;
 other incomplete reasons remain failures. Explicitly unfinished saved items

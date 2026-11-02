@@ -685,3 +685,26 @@ fn responses_finish_reason_comes_from_provider_truncation_evidence() {
     );
     assert_eq!(calls.finish_reason.as_deref(), Some("tool_calls"));
 }
+
+#[test]
+fn truncated_multi_item_text_reaches_runtime_without_provider_replay() {
+    let mut accumulator = ResponseAccumulator::default();
+    for event in [
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prefix "}]}}),
+        json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"partial tail"}),
+        json!({"type":"response.incomplete","response":{"id":"partial","status":"incomplete","output":[],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":12,"output_tokens":34}}}),
+    ] {
+        accumulator.observe(&event).unwrap();
+    }
+    let value = result(
+        accumulator.finish().unwrap(),
+        "connection",
+        "wire",
+        "display",
+    );
+    assert_eq!(value.full_text, "prefix partial tail");
+    assert_eq!(value.finish_reason.as_deref(), Some("length"));
+    assert_eq!(value.usage["completion_tokens"], 34);
+    assert!(value.tool_calls.is_empty());
+    assert!(value.provider_continuation.is_none());
+}
