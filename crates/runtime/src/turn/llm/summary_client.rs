@@ -1393,9 +1393,10 @@ mod tests {
         let provider = fixture::ProviderFixture::start().await;
         let key = Arc::new(FernetTokenEncryptor::new("summary-responses-budget-key").unwrap());
         let service = DatabaseModelService::new(settings, key)
-            .with_pool(pool)
+            .with_pool(pool.clone())
             .with_chatgpt_config(ChatgptConfig::for_test(&provider.base));
         let owner = format!("summary-{}", uuid::Uuid::new_v4());
+        fixture::ensure_owner(pool.get(), &owner).await;
         let connection = provider.connect(&service, &owner).await;
         let model = service
             .create_user_model(
