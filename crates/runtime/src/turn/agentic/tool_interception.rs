@@ -939,10 +939,10 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
             };
         let disposition = if skill_locked_out == Some(true) {
             astra_services::session_journal::ToolCallDisposition::Rejected
-        } else if skill_reentry_count.is_some() {
+        } else if skill_reentry_count.is_some() || result.result_class.is_some() {
+            // Re-entry and skill exclusivity omit this attempt, with no queued
+            // callback for its ID. A model retry creates a new attempt.
             astra_services::session_journal::ToolCallDisposition::Suppressed
-        } else if result.result_class.is_some() {
-            astra_services::session_journal::ToolCallDisposition::Deferred
         } else {
             astra_services::session_journal::ToolCallDisposition::Executed
         };

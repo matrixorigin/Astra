@@ -11,6 +11,9 @@ mod native_stage_tests;
 
 #[path = "trace_ingestion_tests.rs"]
 mod trace_ingestion_tests;
+
+#[path = "skill_ledger_tests.rs"]
+mod skill_ledger_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[tokio::test(start_paused = true)]
