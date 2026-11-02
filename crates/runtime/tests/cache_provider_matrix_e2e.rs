@@ -161,7 +161,7 @@ fn response(case: ProviderCase, text: &str, call: Option<(&str, &str)>) -> Provi
                 message["tool_calls"] = calls;
             }
             ProviderResponse::OpenAi(
-                json!({"id":format!("native-response-{}", uuid::Uuid::new_v4()),"model":case.model,"choices":[{"index":0,"message":message,"finish_reason":if call.is_some(){"tool_calls"}else{"stop"}}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}),
+                json!({"id":format!("native-response-{}", uuid::Uuid::new_v4()),"model":case.model,"choices":[{"index":0,"message":message,"finish_reason":if call.is_some(){"tool_calls"}else{"stop"}}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}),
             )
         }
         other => panic!("unsupported explicit native provider {other}"),
@@ -174,7 +174,7 @@ fn distinct_native_usage(mut response: ProviderResponse, index: usize) -> Provid
     match &mut response {
         ProviderResponse::OpenAi(body) => {
             body["usage"] = json!({
-                "prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":prompt + completion
+                "prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":prompt + completion
             })
         }
         ProviderResponse::Anthropic(body) => {

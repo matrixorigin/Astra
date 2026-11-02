@@ -1079,6 +1079,25 @@ pub(crate) struct ProviderAttemptObservation {
     pub terminal: Option<astra_services::InferenceInvocationTerminal>,
     /// None means not dispatched; an empty sample means dispatched, unknown.
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    /// Inclusive physical input, independent of disjoint billing qualification.
+    pub measured_input_tokens: Option<u64>,
+}
+
+impl ProviderAttemptObservation {
+    /// Inclusive observed input, falling back to the proven lane subtotal.
+    pub(crate) fn observed_input_tokens(&self) -> u64 {
+        if !self.dispatch_started {
+            return 0;
+        }
+        let known = self.qualified_usage.map_or(0, |usage| {
+            usage
+                .input_tokens()
+                .unwrap_or(0)
+                .saturating_add(usage.cached_input_tokens().unwrap_or(0))
+                .saturating_add(usage.cache_creation_tokens().unwrap_or(0))
+        });
+        self.measured_input_tokens.unwrap_or(known)
+    }
 }
 
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;

@@ -2364,6 +2364,7 @@ mod tests {
             self.requests.lock().unwrap().push(messages.to_vec());
             match self.response.lock().unwrap().as_ref() {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),

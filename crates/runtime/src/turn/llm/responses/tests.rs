@@ -21,6 +21,7 @@ mod fixture {
 struct Attempts {
     next: AtomicU32,
     finished: Mutex<Vec<astra_services::InferenceInvocationTerminal>>,
+    measured_inputs: Mutex<Vec<u64>>,
 }
 #[async_trait]
 impl ProviderAttemptObserver for Attempts {
@@ -32,6 +33,11 @@ impl ProviderAttemptObserver for Attempts {
         Ok(ProviderAttemptAdmission::Admitted(
             self.next.fetch_add(1, Ordering::SeqCst),
         ))
+    }
+    fn note_usage_presence(&self, _: u32, presence: crate::turn::token_usage::TokenUsagePresence) {
+        if let Some(total) = presence.measured_input_tokens {
+            self.measured_inputs.lock().unwrap().push(total);
+        }
     }
     async fn finish_attempt(
         &self,
@@ -382,7 +388,10 @@ async fn responses_transport_recovery_and_credential_fencing() {
         if has_usage {
             let terminals = attempts.finished.lock().unwrap();
             let terminal = terminals.last().unwrap();
-            assert_eq!(terminal.usage.input.total_input_tokens(), 17);
+            assert_eq!(
+                attempts.measured_inputs.lock().unwrap().last().copied(),
+                Some(17)
+            );
             assert_eq!(terminal.usage.output_tokens, 23);
             assert_eq!(
                 terminal.provider_response_id.as_deref(),

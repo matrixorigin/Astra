@@ -4434,6 +4434,7 @@ mod context_cache_contract_tests {
             .expect("prepare provider body once");
             let wire = prepared.identity();
             attempts.push(crate::turn::llm::client::ProviderAttemptObservation {
+                measured_input_tokens: None,
                 qualified_usage: Some(
                     astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap(),
                 ),

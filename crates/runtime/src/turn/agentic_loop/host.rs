@@ -2725,6 +2725,10 @@ pub(crate) struct OriginalLoopExecutionFacts {
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub root_user_query_event_id: Option<String>,
     pub total_prompt: u64,
+    // Older handoffs did not retain this observed subtotal; absence is not a
+    // claim that any canonical billing lane was measured as zero.
+    #[serde(default)]
+    pub unpartitioned_input_tokens: u64,
     pub total_completion: u64,
     pub total_cache_read: u64,
     pub total_cache_creation: u64,
@@ -2787,6 +2791,7 @@ impl OriginalLoopExecutionFacts {
             canonical_turn_chain_id: state.canonical_turn_chain_id.clone(),
             root_user_query_event_id: state.root_user_query_event_id.clone(),
             total_prompt: state.total_prompt,
+            unpartitioned_input_tokens: state.unpartitioned_input_tokens,
             total_completion: state.total_completion,
             total_cache_read: state.total_cache_read,
             total_cache_creation: state.total_cache_creation,
@@ -3698,6 +3703,8 @@ pub struct AgenticLoopState {
     // - total_cache_creation → cache write tokens (premium rate)
     // - total_completion     → output tokens
     pub total_prompt: u64,
+    /// Observed input not assignable to a proven disjoint billing lane.
+    pub unpartitioned_input_tokens: u64,
     pub total_completion: u64,
     pub total_cache_read: u64,
     pub total_cache_creation: u64,
@@ -4056,6 +4063,7 @@ impl AgenticLoopState {
             final_text_streamed: false,
             final_output_ready_notified: false,
             total_prompt: 0,
+            unpartitioned_input_tokens: 0,
             total_completion: 0,
             total_cache_read: 0,
             total_cache_creation: 0,
@@ -4495,12 +4503,8 @@ impl AgenticLoopState {
     /// cost signal that is meant to cap actual provider usage must use this
     /// total instead of only `prompt + completion`.
     pub fn provider_total_tokens(&self) -> u64 {
-        astra_turn_types::NormalizedPromptCacheUsage::new(
-            self.total_prompt,
-            self.total_cache_read,
-            self.total_cache_creation,
-        )
-        .total_tokens_with_output(self.total_completion)
+        self.provider_input_tokens()
+            .saturating_add(self.total_completion)
     }
 
     /// Provider-reported input tokens, including cache reads and cache writes.
@@ -4511,6 +4515,7 @@ impl AgenticLoopState {
             self.total_cache_creation,
         )
         .total_input_tokens()
+        .saturating_add(self.unpartitioned_input_tokens)
     }
 
     #[must_use]
@@ -10969,6 +10974,7 @@ pub(crate) mod tests {
             state.remaining_turns = 5;
             state.charged_iterations = 3;
             state.total_prompt = 123;
+            state.unpartitioned_input_tokens = 17;
             state.context_compression_triggered = true;
             state.skills.resolver = Some(Arc::new(StubSkillResolver::new()));
             state.skills.session_event_hooks =
@@ -10998,7 +11004,19 @@ pub(crate) mod tests {
             }
             let wire =
                 serde_json::to_value(OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap();
+            let mut legacy = wire.clone();
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("unpartitioned_input_tokens");
+            assert_eq!(
+                serde_json::from_value::<OriginalLoopExecutionFacts>(legacy)
+                    .unwrap()
+                    .unpartitioned_input_tokens,
+                0
+            );
             let original: OriginalLoopExecutionFacts = serde_json::from_value(wire).unwrap();
+            assert_eq!(original.unpartitioned_input_tokens, 17);
             state.loop_entry = original.loop_entry;
             state.volatile_pending = original.pending_context;
             let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
@@ -11013,6 +11031,7 @@ pub(crate) mod tests {
             assert_eq!(state.charged_iterations, 4);
             assert_eq!(state.remaining_turns, 4);
             assert_eq!(state.total_prompt, 133);
+            assert_eq!(state.provider_input_tokens(), 150);
             assert_eq!(
                 host.injected_schemas,
                 vec![

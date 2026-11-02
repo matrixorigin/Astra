@@ -28839,6 +28839,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     facts.original.canonical_turn_chain_id = Some("original-chain".to_string());
     facts.original.root_user_query_event_id = Some("original-query".to_string());
     facts.original.total_prompt = 11;
+    facts.original.unpartitioned_input_tokens = 19;
     facts.original.total_completion = 13;
     facts.original.total_cache_read = 101;
     facts.original.total_cache_creation = 17;
@@ -28969,6 +28970,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         ),
         (11, 13, 101, 17)
     );
+    assert_eq!(state.provider_input_tokens(), 148);
     assert!(state.has_any_usage);
     assert_eq!(
         (state.total_tool_calls, state.total_observation_tool_calls),
@@ -29027,6 +29029,12 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     for field in wire.as_object().unwrap().keys() {
         let mut missing = wire.clone();
         missing.as_object_mut().unwrap().remove(field);
+        if field == "unpartitioned_input_tokens" {
+            let legacy: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts =
+                serde_json::from_value(missing).unwrap();
+            assert_eq!(legacy.unpartitioned_input_tokens, 0);
+            continue;
+        }
         assert!(
             serde_json::from_value::<crate::turn::agentic_loop::host::OriginalLoopExecutionFacts>(
                 missing

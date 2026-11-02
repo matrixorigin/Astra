@@ -66,6 +66,9 @@ impl RunScopedProviderObserver {
             .map(|(fact, presence)| {
                 let mut fact = fact.clone();
                 if fact.dispatch_started {
+                    fact.measured_input_tokens = (!presence.input_invalid)
+                        .then_some(presence.measured_input_tokens)
+                        .flatten();
                     let unknown =
                         astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
                             .expect("unknown usage is valid");
@@ -157,6 +160,7 @@ impl ProviderAttemptObserver for RunScopedProviderObserver {
                         dispatch_started: false,
                         terminal: None,
                         qualified_usage: None,
+                        measured_input_tokens: None,
                     },
                     TokenUsagePresence::default(),
                 ),
@@ -332,5 +336,89 @@ mod tests {
             Some(astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap())
         );
         assert!(observer.begin_attempt(&wire(), Some(0)).await.is_err());
+    }
+    #[tokio::test]
+    async fn physical_input_survives_partial_failed_and_missing_attempts_without_double_counting() {
+        let observer = RunScopedProviderObserver::new(authority(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        // A measured prompt-only failed attempt, a partitioned successful one,
+        // and a dispatched attempt with no usage must retain separate evidence.
+        for index in 0..3 {
+            observer.begin_attempt(&wire(), None).await.unwrap();
+            observer.note_dispatch_started(index);
+        }
+        observer.note_usage_presence(
+            0,
+            TokenUsagePresence {
+                measured_input_tokens: Some(17),
+                ..Default::default()
+            },
+        );
+        observer
+            .finish_attempt(
+                0,
+                &crate::turn::llm::durable::terminal_from_error(&astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::Cancelled,
+                    "cancelled",
+                )),
+            )
+            .await
+            .unwrap();
+        observer.note_usage_presence(
+            1,
+            TokenUsagePresence {
+                fresh_input_tokens: true,
+                cache_read_tokens: true,
+                cache_creation_tokens: true,
+                measured_input_tokens: Some(30),
+                ..Default::default()
+            },
+        );
+        observer
+            .finish_attempt(
+                1,
+                &astra_services::InferenceInvocationTerminal {
+                    status: astra_services::InferenceTerminalStatus::Succeeded,
+                    usage: astra_services::InferenceUsage {
+                        input: astra_turn_types::NormalizedPromptCacheUsage::new(10, 13, 7),
+                        output_tokens: 0,
+                    },
+                    usage_status: astra_services::InferenceUsageStatus::ProviderPartial,
+                    provider_response_id: None,
+                    error_kind: None,
+                    error_message: None,
+                },
+            )
+            .await
+            .unwrap();
+        let facts = observer.facts();
+        assert_eq!(facts[0].measured_input_tokens, Some(17));
+        assert_eq!(facts[0].qualified_usage.unwrap().input_tokens(), None);
+        assert_eq!(facts[1].qualified_usage.unwrap().input_tokens(), Some(10));
+        assert_eq!(facts[2].measured_input_tokens, None);
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.observed_input_tokens())
+                .sum::<u64>(),
+            47
+        );
+        assert_eq!(
+            observer.facts(),
+            facts,
+            "reading facts never consumes or adds usage"
+        );
+        observer.note_usage_presence(
+            0,
+            TokenUsagePresence {
+                input_invalid: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(observer.facts()[0].measured_input_tokens, None);
+        assert_eq!(observer.facts()[0].observed_input_tokens(), 0);
     }
 }

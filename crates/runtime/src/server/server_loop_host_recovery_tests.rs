@@ -272,7 +272,8 @@ async fn assert_exhausted_provider_recovery_trace(measured: bool) {
         let mut chunk =
             json!({"choices":[{"delta":{"reasoning_content":"fixture"},"finish_reason":null}]});
         if measured {
-            chunk["usage"] = json!({"prompt_tokens":8,"completion_tokens":3});
+            chunk["usage"] =
+                json!({"prompt_tokens":8,"prompt_cache_miss_tokens":8,"completion_tokens":3});
         }
         ProviderResponse::Stream {
             content_type: "text/event-stream",
@@ -385,7 +386,7 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
     let responses = [(8, 3), (5, 2)].map(|(input, output)| ProviderResponse::Stream {
         content_type: "text/event-stream",
         chunks: vec![format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"fixture\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{input},\"completion_tokens\":{output}}}}}\n\ndata: [DONE]\n\n"
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"fixture\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens_details\":{{\"cached_tokens\":0,\"cache_write_tokens\":0}},\"prompt_tokens\":{input},\"completion_tokens\":{output}}}}}\n\ndata: [DONE]\n\n"
         ).into_bytes()],
         release_before_chunk: None,
     });
@@ -415,8 +416,18 @@ async fn clean_empty_recovery_reaches_run_finalizer_with_intervention() {
     let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
     crate::server::run::lifecycle::tests::assert_empty_recovery_run_finalization(outcome, &state);
     assert!(state.final_text.is_empty());
-    assert!(state.interruption.as_ref().is_some_and(|record| record.user_message.contains("unfinished")));
-    assert!(state.messages.iter().all(|message| message["role"] != "assistant"));
+    assert!(
+        state
+            .interruption
+            .as_ref()
+            .is_some_and(|record| record.user_message.contains("unfinished"))
+    );
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|message| message["role"] != "assistant")
+    );
     assert_eq!(provider.requests.lock().await.len(), 2);
     assert_eq!(state.qualified_usage.unwrap().input_tokens(), Some(13));
     assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(5));
@@ -460,7 +471,7 @@ async fn provider_completion_trace_needs_no_inference_receipt() {
         |request| request.path == "/v1/chat/completions",
         vec![ProviderResponse::OpenAi(json!({
             "choices":[{"message":{"content":"completed provider result"},"finish_reason":"stop"}],
-            "usage":{"prompt_tokens":8,"completion_tokens":3}
+            "usage":{"prompt_tokens":8,"prompt_cache_miss_tokens":8,"completion_tokens":3}
         }))],
     )])
     .await;
@@ -514,7 +525,7 @@ async fn completed_empty_response_uses_loop_settlement_once() {
         let response = |text: &str| {
             ProviderResponse::Stream {
             content_type: "text/event-stream",
-            chunks: vec![format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3}})).into_bytes()],
+            chunks: vec![format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":8,"completion_tokens":3}})).into_bytes()],
             release_before_chunk: None,
         }
         };
@@ -558,4 +569,64 @@ async fn completed_empty_response_uses_loop_settlement_once() {
         ledger.assert_quiescent();
         provider.assert_complete();
     }
+}
+
+#[tokio::test]
+async fn length_continuation_failure_keeps_inclusive_input_when_cache_lane_becomes_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let _journal = astra_services::session_journal::JournalDirGuard::new(temp.path());
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "length then failure", |request| request.path == "/v1/chat/completions",
+        vec![
+            ProviderResponse::OpenAi(json!({
+                "choices":[{"message":{"content":"partial"},"finish_reason":"length"}],
+                "usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens":2}
+            })),
+            ProviderResponse::Json { status: axum::http::StatusCode::BAD_REQUEST,
+                body: json!({"error":{"message":"continuation rejected"}}) },
+        ],
+    )]).await;
+    let session = "00000000-0000-0000-0000-000000000129";
+    let ledger = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let mut host = test_host_builder("input-retry-owner", session)
+        .with_provider_observations(ledger.clone())
+        .with_admitted_model_execution(Some(test_gateway_execution(
+            format!("{}/v1/chat/completions", provider.base_url),
+            Some(2000),
+        )))
+        .build();
+    let mut state = create_durable_execution_test_state(session);
+    state
+        .messages
+        .push(json!({"role":"user","content":"continue the answer"}));
+    state.message = "continue the answer".into();
+    state.user_intent = state.message.clone();
+    state.step_recorder.begin_turn(0);
+    let error = host
+        .execute_turn(&mut state)
+        .await
+        .err()
+        .expect("second provider call fails");
+    assert_eq!(
+        provider.requests.lock().await.len(),
+        2,
+        "unexpected failure boundary: {}",
+        error.message
+    );
+    assert_eq!(
+        state.provider_input_tokens(),
+        100,
+        "unknown retry qualification must not erase the observed 40-token lane"
+    );
+    assert_eq!(
+        state.total_prompt, 0,
+        "inclusive input never becomes fresh input"
+    );
+    let details: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["qualified_usage"]["cached_input_tokens"],
+        Value::Null
+    );
+    ledger.assert_quiescent();
+    provider.assert_complete();
 }
