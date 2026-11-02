@@ -510,6 +510,12 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
     let loaded = engine.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(loaded.status, "paused");
     assert!(loaded.waiting_for.is_none());
+    assert!(loaded.owner_pod_id.is_none());
+    assert!(loaded.owner_lease_expires_at.is_none());
+    engine
+        .start_run(&format!("{run_id}-next"), &user_id, &session_id)
+        .await
+        .expect("graceful recovery releases admission without waiting for its lease TTL");
     assert!(loaded.events.iter().any(|event| {
         event.get("event_type").and_then(serde_json::Value::as_str)
             == Some("run_interrupted_after_restart")
@@ -539,8 +545,84 @@ async fn l2_crash_recovery_marks_running_failed() {
         loaded.error_message.as_deref(),
         Some("recovered from crash")
     );
+    assert!(loaded.owner_pod_id.is_none());
+    assert!(loaded.owner_lease_expires_at.is_none());
+    engine
+        .start_run(&format!("{run_id}-next"), &user_id, &session_id)
+        .await
+        .expect("crash recovery releases admission without waiting for its lease TTL");
 }
 
+}
+
+shared_db_test! {
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn l2_recovered_child_releases_admission_after_parent_finishes() {
+    let pool = setup_pool().await;
+    let (root, session, user) = test_ids();
+    insert_session(&pool, &user, &session).await;
+    let owner = Arc::new(DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("live-parent"));
+    let engine = RunEngine::new(owner.clone());
+    let authority = engine.start_run(&root, &user, &session).await.unwrap();
+    let child = format!("{root}-child");
+    engine
+        .start_run_ext(
+            &child,
+            &user,
+            &session,
+            Some(&root),
+            Some("child-recovery"),
+            Some("worker"),
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_runs SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&child).execute(pool.get()).await.unwrap();
+    let recovery = RunEngine::new(Arc::new(
+        DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("child-recovery"),
+    ));
+    let recovered = recovery.recover_active_runs().await.unwrap();
+    let child_run = recovered.iter().find(|run| run.run_id == child).unwrap();
+    assert_eq!(child_run.status, "failed");
+    assert!(child_run.owner_pod_id.is_none());
+    assert!(child_run.owner_lease_expires_at.is_none());
+    let next = format!("{root}-next");
+    assert!(
+        engine.start_run(&next, &user, &session).await.is_err(),
+        "recovery must not release a still-executing parent"
+    );
+    assert!(
+        owner
+            .update_run_status_with_events_if_current(
+                &user,
+                &session,
+                &root,
+                &["running"],
+                Some(authority.owner_generation),
+                "completed",
+                None,
+                None,
+                &[]
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        engine.start_run(&next, &user, &session).await.is_err(),
+        "terminal publication must retain a real executor's lease until it exits"
+    );
+    assert!(
+        owner
+            .release_owner_lease(&user, &session, &root, authority.owner_generation)
+            .await
+            .unwrap()
+    );
+    engine
+        .start_run(&next, &user, &session)
+        .await
+        .expect("a recovered child's lease must not block the next message");
+}
 }
 
 shared_db_test! {
@@ -747,7 +829,8 @@ async fn reconnect_replays_recovery_and_guidance_uses_a_new_run() {
             .all(|event| event["data"]["intent_id"] != "rejected-old-run")
     );
 
-    assert!(store_a.release_owner_lease(&user_id, &session_id, &run_id, loaded.run_generation).await.unwrap());
+    assert!(loaded.owner_pod_id.is_none());
+    assert!(loaded.owner_lease_expires_at.is_none());
     let continuation_id = format!("{run_id}-continuation");
     engine
         .start_run(&continuation_id, &user_id, &session_id)

@@ -176,6 +176,12 @@ or evidence that same-run recovery is implemented.
   post-commit timeout refreshes the display projection on that exceptional
   path; ordinary commits do not add a second refresh.
 - Recovery must avoid double execution of non-idempotent actions.
+- Recovery classification that fails, cancels or parks an orphan for session
+  continuation retires that exact recovery owner's lease in the status/event
+  transaction. No executor was started by this classification, so its lease
+  must not block the next turn until expiry. Execution-handoff custody keeps
+  its existing reconciliation contract; real executors retain their leases
+  until they exit, including after publishing a terminal result.
 - Independent execution admission uses lifecycle fence -> owned Session ->
   actual Run/custody mutations. Blocking Run status, any live execution lease
   (including a terminal executor still exiting), and prepared/dispatched/unknown

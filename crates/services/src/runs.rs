@@ -6498,6 +6498,23 @@ pub trait RunStateStore: Send + Sync {
         events: &[serde_json::Value],
     ) -> Result<bool, String>;
 
+    /// Settle a claimed orphan and retire its recovery ownership in the same
+    /// status/event transaction. Recovery has no executor to drain. Ordinary
+    /// executors must retain their leases until they actually exit.
+    ///
+    /// Compare the exact claimed owner, generation, live lease and status. Only
+    /// failed, cancelled or nonblocking paused outcomes are supported. A stale
+    /// recovery must neither settle a successor nor release its ownership.
+    async fn settle_recovered_run(
+        &self,
+        _claimed_run: &DurableRunRecord,
+        _status: &str,
+        _error_message: Option<&str>,
+        _events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        Err("atomic recovery settlement is not implemented for this run store".to_string())
+    }
+
     /// Append immutable facts and their model-selection identity without rewriting
     /// lifecycle state, but only
     /// while the exact execution generation and one of the expected statuses
@@ -6955,7 +6972,16 @@ impl InMemoryRunStateStore {
         error_message: Option<&str>,
         events: &[serde_json::Value],
         recovery_claim: Option<&RecoveryClaim>,
+        release_recovery_owner: bool,
     ) -> Result<StatusTransitionCommit, String> {
+        if release_recovery_owner
+            && (expected_owner_generation.is_none()
+                || !matches!(status, STATUS_FAILED | STATUS_CANCELLED | STATUS_PAUSED))
+        {
+            return Err(
+                "recovery settlement requires an owner generation and an idle outcome".into(),
+            );
+        }
         if expected_statuses.is_empty() {
             return Ok(StatusTransitionCommit::default());
         }
@@ -6973,6 +6999,13 @@ impl InMemoryRunStateStore {
                 user_id,
                 run_id,
             )?;
+            if release_recovery_owner
+                && let Some(run) = runs.get(run_id)
+                && (run.owner_pod_id.as_deref() != self.execution_owner_pod_id()
+                    || !in_memory_action_owner_lease_is_active(run)?)
+            {
+                return Ok(StatusTransitionCommit::default());
+            }
             let recovery_event = if let Some(claim) = recovery_claim {
                 let Some(current) = runs.get(run_id) else {
                     return Ok(StatusTransitionCommit::default());
@@ -7074,6 +7107,10 @@ impl InMemoryRunStateStore {
                     if !new_events.is_empty() {
                         run.events.extend(new_events);
                         run.last_event_idx = run.events.len() as i64 - 1;
+                    }
+                    if release_recovery_owner {
+                        run.owner_pod_id = None;
+                        run.owner_lease_expires_at = None;
                     }
                     Some((run.clone(), recovery_event))
                 } else {
@@ -8120,6 +8157,7 @@ impl RunStateStore for InMemoryRunStateStore {
             None,
             &[],
             Some(claim),
+            false,
         )
         .await
         .map(|commit| commit.recovery)
@@ -9376,6 +9414,31 @@ impl RunStateStore for InMemoryRunStateStore {
             error_message,
             events,
             None,
+            false,
+        )
+        .await
+        .map(|commit| commit.applied)
+    }
+
+    async fn settle_recovered_run(
+        &self,
+        claimed_run: &DurableRunRecord,
+        status: &str,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        self.transition_run_status(
+            &claimed_run.user_id,
+            &claimed_run.session_id,
+            &claimed_run.run_id,
+            &[claimed_run.status.as_str()],
+            Some(claimed_run.run_generation),
+            status,
+            None,
+            error_message,
+            events,
+            None,
+            true,
         )
         .await
         .map(|commit| commit.applied)
@@ -10703,6 +10766,30 @@ impl RunStateStore for InMemoryRunStateStore {
         })
     }
 
+    async fn release_owner_lease(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        expected_owner_generation: u64,
+    ) -> Result<bool, String> {
+        let fence = self.action_fence_for(user_id, run_id);
+        let _fence = fence.lock_owned().await;
+        let mut runs = self.runs.write().await;
+        let Some(run) = runs.get_mut(run_id).filter(|run| {
+            run.user_id == user_id
+                && run.session_id == expected_session_id
+                && run.run_generation == expected_owner_generation
+                && run.owner_pod_id.is_some()
+                && run.owner_pod_id.as_deref() == self.execution_owner_pod_id()
+        }) else {
+            return Ok(false);
+        };
+        run.owner_pod_id = None;
+        run.owner_lease_expires_at = None;
+        Ok(true)
+    }
+
     async fn find_blocking_session_run(
         &self,
         user_id: &str,
@@ -11237,7 +11324,16 @@ impl DatabaseRunStateStore {
         error_message: Option<&str>,
         events: &[serde_json::Value],
         recovery_claim: Option<&RecoveryClaim>,
+        release_recovery_owner: bool,
     ) -> Result<StatusTransitionCommit, String> {
+        if release_recovery_owner
+            && (expected_owner_generation.is_none()
+                || !matches!(status, STATUS_FAILED | STATUS_CANCELLED | STATUS_PAUSED))
+        {
+            return Err(
+                "recovery settlement requires an owner generation and an idle outcome".into(),
+            );
+        }
         if expected_statuses.is_empty() {
             return Ok(StatusTransitionCommit::default());
         }
@@ -11476,6 +11572,9 @@ impl DatabaseRunStateStore {
         update.push_bind(status);
         if durable_run_status_is_terminal(status) {
             update.push(", terminal_at = COALESCE(terminal_at, NOW(6))");
+        }
+        if release_recovery_owner {
+            update.push(", owner_pod_id = NULL, owner_lease_expires_at = NULL");
         }
         update.push(", waiting_for = ");
         update.push_bind(waiting_for);
@@ -16358,6 +16457,7 @@ impl RunStateStore for DatabaseRunStateStore {
             None,
             &[],
             Some(claim),
+            false,
         )
         .await
         .map(|commit| commit.recovery)
@@ -18886,6 +18986,31 @@ impl RunStateStore for DatabaseRunStateStore {
             error_message,
             events,
             None,
+            false,
+        )
+        .await
+        .map(|commit| commit.applied)
+    }
+
+    async fn settle_recovered_run(
+        &self,
+        claimed_run: &DurableRunRecord,
+        status: &str,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        self.transition_run_status(
+            &claimed_run.user_id,
+            &claimed_run.session_id,
+            &claimed_run.run_id,
+            &[claimed_run.status.as_str()],
+            Some(claimed_run.run_generation),
+            status,
+            None,
+            error_message,
+            events,
+            None,
+            true,
         )
         .await
         .map(|commit| commit.applied)
@@ -30445,6 +30570,172 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("clean root-child session");
+    }
+
+    #[tokio::test]
+    async fn in_memory_recovery_settlement_retires_only_current_ownership() {
+        let store =
+            InMemoryRunStateStore::new().with_execution_owner("recovery", Duration::from_secs(120));
+        let run = durable_run_record("recovery-owner-test");
+        store.insert_run(run.clone()).await.unwrap();
+        let stale = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .unwrap()
+            .remove(0);
+        let current = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .unwrap()
+            .remove(0);
+        let events = [json!({"event_type": "run_finished", "data": {"status": "failed"}})];
+        assert!(
+            !store
+                .settle_recovered_run(&stale.run, STATUS_FAILED, None, &events)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .release_owner_lease(
+                    &run.user_id,
+                    &run.session_id,
+                    &run.run_id,
+                    stale.run.run_generation
+                )
+                .await
+                .unwrap()
+        );
+        let before = store
+            .load_run(&run.user_id, &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.run_generation, current.run.run_generation);
+        assert_eq!(before.owner_pod_id.as_deref(), Some("recovery"));
+        assert_eq!(before.status, STATUS_RUNNING);
+        assert!(
+            store
+                .settle_recovered_run(&current.run, STATUS_FAILED, None, &events)
+                .await
+                .unwrap()
+        );
+        let settled = store
+            .load_run(&run.user_id, &run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.status, STATUS_FAILED);
+        assert!(settled.owner_pod_id.is_none());
+        assert!(settled.owner_lease_expires_at.is_none());
+        let mut next = durable_run_record("after-recovery-owner-test");
+        next.session_id = run.session_id;
+        store
+            .insert_run(next)
+            .await
+            .expect("recovery must release admission immediately");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_recovery_settlement_fences_stale_claims_and_reconciles_commit_ack_loss() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("recovery-retire-u-{nonce}");
+        let session = format!("recovery-retire-s-{nonce}");
+        let run_id = format!("recovery-retire-r-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user.clone();
+        run.session_id = session.clone();
+        store.insert_run(run.clone()).await.unwrap();
+        store.append_event(&user, &session, &run_id,
+            json!({"event_type": "fixture_fact", "idempotency_key": "existing-fact", "data": {}}))
+            .await.unwrap();
+        let stale = store
+            .claim_exact_recovery_candidate_for_test(&user, &run_id)
+            .await
+            .unwrap();
+        let current = store
+            .claim_exact_recovery_candidate_for_test(&user, &run_id)
+            .await
+            .unwrap();
+        let events = [json!({"event_type": "run_finished", "data": {"status": "failed"}})];
+        let duplicate = [
+            json!({"event_type": "run_finished", "idempotency_key": "existing-fact", "data": {"status": "failed"}}),
+        ];
+        assert!(
+            store
+                .settle_recovered_run(&current.run, STATUS_FAILED, None, &duplicate)
+                .await
+                .is_err(),
+            "an event insert failure must roll back status and lease retirement"
+        );
+        let wrong_owner = store.clone().with_owner_pod_id("not-the-recovery-owner");
+        for (claimant, claim) in [(&store, &stale.run), (&wrong_owner, &current.run)] {
+            assert!(
+                !claimant
+                    .settle_recovered_run(claim, STATUS_FAILED, None, &events)
+                    .await
+                    .unwrap()
+            );
+        }
+        let mut wrong_session = current.run.clone();
+        wrong_session.session_id = format!("other-{nonce}");
+        assert!(
+            !store
+                .settle_recovered_run(&wrong_session, STATUS_FAILED, None, &events)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .settle_recovered_run(&current.run, STATUS_RUNNING, None, &events)
+                .await
+                .is_err()
+        );
+        let unchanged = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.run_generation, current.run.run_generation);
+        assert_eq!(
+            unchanged.owner_pod_id.as_deref(),
+            Some(store.owner_pod_id())
+        );
+        assert_eq!(unchanged.status, STATUS_RUNNING);
+        assert_eq!(unchanged.last_event_idx, current.run.last_event_idx);
+        assert!(
+            store
+                .clone()
+                .with_terminal_transition_commit_ack_loss_once()
+                .settle_recovered_run(
+                    &current.run,
+                    STATUS_FAILED,
+                    Some("recovered from crash"),
+                    &events
+                )
+                .await
+                .expect("the exact durable event receipt reconciles a lost acknowledgement")
+        );
+        let settled = store.load_run(&user, &run_id).await.unwrap().unwrap();
+        assert_eq!(settled.status, STATUS_FAILED);
+        assert!(settled.owner_pod_id.is_none());
+        assert!(settled.owner_lease_expires_at.is_none());
+        assert_eq!(settled.last_event_idx, current.run.last_event_idx + 1);
+        let next_id = format!("recovery-retire-next-{nonce}");
+        let mut next = durable_run_record(&next_id);
+        next.user_id = user.clone();
+        next.session_id = session.clone();
+        store
+            .insert_run(next)
+            .await
+            .expect("no recovery TTL wait after the exact commit");
+        cleanup_database_run_fixture(&pool, &user, &next_id).await;
+        cleanup_database_run_fixture(&pool, &user, &run_id).await;
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

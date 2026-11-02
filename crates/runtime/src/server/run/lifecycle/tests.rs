@@ -1225,15 +1225,10 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         engine
             .recover_session_continuation_for_test(&owner, &old_run)
             .await;
-        assert_eq!(
-            engine
-                .load_run(&owner, &old_run)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            STATUS_PAUSED
-        );
+        let recovered = engine.load_run(&owner, &old_run).await.unwrap().unwrap();
+        assert_eq!(recovered.status, STATUS_PAUSED);
+        assert!(recovered.owner_pod_id.is_none());
+        assert!(recovered.owner_lease_expires_at.is_none());
     } else {
         assert!(
             attempts
@@ -1251,14 +1246,14 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
             .execute(pool.get())
             .await
             .expect("pause old run");
+        assert!(
+            engine
+                .store()
+                .release_owner_lease(&owner, &session, &old_run, old_authority.owner_generation)
+                .await
+                .expect("stop the old execution before continuation")
+        );
     }
-    assert!(
-        engine
-            .store()
-            .release_owner_lease(&owner, &session, &old_run, old_authority.owner_generation)
-            .await
-            .expect("stop the old execution before continuation")
-    );
     if through_new_turn {
         exercise_primary_continuation_entry(
             &pool,
@@ -9719,6 +9714,18 @@ impl FaultInjectedRunStateStore {
 
 #[async_trait]
 impl RunStateStore for FaultInjectedRunStateStore {
+    async fn settle_recovered_run(
+        &self,
+        claimed_run: &DurableRunRecord,
+        status: &str,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        self.inner
+            .settle_recovered_run(claimed_run, status, error_message, events)
+            .await
+    }
+
     async fn apply_run_user_intents(
         &self,
         request: astra_services::runs::AtomicRunUserIntentApplyRequest<'_>,

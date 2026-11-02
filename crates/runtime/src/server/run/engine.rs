@@ -3910,7 +3910,6 @@ impl RunEngine {
         claim: astra_services::runs::RecoveryClaim,
     ) -> Option<DurableRunRecord> {
         let run = &claim.run;
-        let expected_status = run.status.clone();
         let direct_cancellation_requested = match self
             .store
             .is_run_cancellation_requested(&run.user_id, &run.run_id)
@@ -3980,17 +3979,7 @@ impl RunEngine {
             let event = crash_recovery_cancellation_event(&run.run_id, cancellation_origin);
             return match self
                 .store
-                .update_run_status_with_events_if_current(
-                    &run.user_id,
-                    &run.session_id,
-                    &run.run_id,
-                    &[expected_status.as_str()],
-                    Some(run.run_generation),
-                    STATUS_CANCELLED,
-                    None,
-                    None,
-                    std::slice::from_ref(&event),
-                )
+                .settle_recovered_run(run, STATUS_CANCELLED, None, std::slice::from_ref(&event))
                 .await
             {
                 Ok(true) => {
@@ -4001,6 +3990,8 @@ impl RunEngine {
                     );
                     let mut run = claim.run;
                     run.status = STATUS_CANCELLED.to_string();
+                    run.owner_pod_id = None;
+                    run.owner_lease_expires_at = None;
                     run.waiting_for = None;
                     run.last_event_idx += 1;
                     run.events.push(event);
@@ -4067,17 +4058,7 @@ impl RunEngine {
             let event = restart_session_continuation_event(&expected_status, checkpoint_available);
             match self
                 .store
-                .update_run_status_with_events_if_current(
-                    &run.user_id,
-                    &run.session_id,
-                    &run.run_id,
-                    &[expected_status.as_str()],
-                    Some(run.run_generation),
-                    STATUS_PAUSED,
-                    None,
-                    None,
-                    std::slice::from_ref(&event),
-                )
+                .settle_recovered_run(&run, STATUS_PAUSED, None, std::slice::from_ref(&event))
                 .await
             {
                 Ok(true) => {
@@ -4087,6 +4068,8 @@ impl RunEngine {
                         "committed",
                     );
                     run.status = STATUS_PAUSED.to_string();
+                    run.owner_pod_id = None;
+                    run.owner_lease_expires_at = None;
                     run.waiting_for = None;
                     run.last_event_idx += 1;
                     run.events.push(event);
@@ -4112,17 +4095,7 @@ impl RunEngine {
             let events = crash_recovery_terminal_events();
             match self
                 .store
-                .update_run_status_with_events_if_current(
-                    &run.user_id,
-                    &run.session_id,
-                    &run.run_id,
-                    &[expected_status.as_str()],
-                    Some(run.run_generation),
-                    STATUS_FAILED,
-                    None,
-                    Some("recovered from crash"),
-                    &events,
-                )
+                .settle_recovered_run(&run, STATUS_FAILED, Some("recovered from crash"), &events)
                 .await
             {
                 Ok(true) => {
@@ -4132,6 +4105,8 @@ impl RunEngine {
                         "committed",
                     );
                     run.status = STATUS_FAILED.to_string();
+                    run.owner_pod_id = None;
+                    run.owner_lease_expires_at = None;
                     run.waiting_for = None;
                     run.error_message = Some("recovered from crash".to_string());
                     run.error_code = Some("crash_recovery".to_string());
@@ -4171,7 +4146,7 @@ impl RunEngine {
                 return None;
             }
         };
-        let Some(current) = current else {
+        let Some(mut current) = current else {
             record_recovery_run(self.metrics_registry.as_ref(), "conflict_reload", "missing");
             tracing::warn!(
                 target: "astra_runtime::run_engine",
@@ -4180,6 +4155,41 @@ impl RunEngine {
             );
             return None;
         };
+        // A control-plane terminal or pause can win after the recovery claim.
+        // Recovery started no executor. Retire only its exact generation,
+        // preserving the winning status/events and execution-handoff custody.
+        let released_outcome = durable_run_status_is_terminal(&current.status)
+            || (current.status == STATUS_PAUSED
+                && current.waiting_for.is_none()
+                && current.current_checkpoint_version() != Some("execution_handoff_v1"));
+        if current.run_generation == stale_run.run_generation
+            && current.owner_pod_id.is_some()
+            && released_outcome
+        {
+            match tokio::time::timeout(
+                OWNER_LEASE_RELEASE_MAX_WAIT,
+                self.store.release_owner_lease(
+                    &current.user_id,
+                    &current.session_id,
+                    &current.run_id,
+                    stale_run.run_generation,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(true)) => {
+                    current.owner_pod_id = None;
+                    current.owner_lease_expires_at = None;
+                }
+                Ok(Ok(false)) => {}
+                result => tracing::warn!(
+                    target: "astra_runtime::run_engine",
+                    run_id = %current.run_id,
+                    result = ?result,
+                    "could not retire settled recovery ownership after a status race"
+                ),
+            }
+        }
         if current.status == STATUS_WAITING || current.status == STATUS_FAILED {
             record_recovery_run(
                 self.metrics_registry.as_ref(),
@@ -6970,6 +6980,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunStateStore for FlakyBatchTransitionStore {
+        async fn settle_recovered_run(
+            &self,
+            claimed_run: &DurableRunRecord,
+            status: &str,
+            error_message: Option<&str>,
+            events: &[serde_json::Value],
+        ) -> Result<bool, String> {
+            self.inner
+                .settle_recovered_run(claimed_run, status, error_message, events)
+                .await
+        }
+
         async fn reconcile_execution_handoff(
             &self,
             claim: &astra_services::runs::RecoveryClaim,
@@ -11433,7 +11455,10 @@ mod tests {
 
     #[tokio::test]
     async fn recover_active_runs_releases_orphaned_waiting_for_session_continuation() {
-        let engine = test_engine();
+        let engine = RunEngine::new(Arc::new(
+            InMemoryRunStateStore::new()
+                .with_execution_owner("recovery-owner", Duration::from_secs(120)),
+        ));
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine.start_run("run-2", "user-1", "sess-2").await.unwrap();
         assert!(
@@ -11499,7 +11524,10 @@ mod tests {
 
     #[tokio::test]
     async fn recover_active_child_persists_ancestor_user_cancellation_origin() {
-        let engine = test_engine();
+        let engine = RunEngine::new(Arc::new(
+            InMemoryRunStateStore::new()
+                .with_execution_owner("recovery-owner", Duration::from_secs(120)),
+        ));
         engine
             .start_run("recovery-root", "user-1", "session-1")
             .await
@@ -11524,6 +11552,15 @@ mod tests {
         );
 
         let recovered = engine.recover_active_runs().await.unwrap();
+        assert!(
+            recovered
+                .iter()
+                .all(|run| run.owner_pod_id.is_none() && run.owner_lease_expires_at.is_none())
+        );
+        engine
+            .start_run("after-cancelled-recovery", "user-1", "session-1")
+            .await
+            .expect("cancelled recovery must release parent and child ownership");
         let child = recovered
             .iter()
             .find(|run| run.run_id == "recovery-child")
@@ -12103,7 +12140,10 @@ mod tests {
 
     #[tokio::test]
     async fn recover_active_runs_cas_miss_does_not_overwrite_completed() {
-        let engine = test_engine();
+        let engine = RunEngine::new(Arc::new(
+            InMemoryRunStateStore::new()
+                .with_execution_owner("recovery-owner", Duration::from_secs(120)),
+        ));
         engine
             .start_run("run-race", "user-1", "sess-race")
             .await
@@ -12135,6 +12175,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(durable.status, astra_core::STATUS_COMPLETED);
+        assert!(durable.owner_pod_id.is_none());
+        assert!(durable.owner_lease_expires_at.is_none());
+        engine
+            .start_run("run-after-recovery-race", "user-1", "sess-race")
+            .await
+            .expect("a winning terminal must not retain the recovery owner's lease");
         assert!(durable.error_message.is_none());
         assert!(durable.error_code.is_none());
         assert!(
