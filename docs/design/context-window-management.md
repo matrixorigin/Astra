@@ -131,10 +131,11 @@ When semantic preparation projected authority, an unavailable or rejected
 summary restores the protected input and reports no selected compaction
 boundary. Conservative mechanical fallback and final wire budget enforcement
 remain available. If a provider projection has rehomed an active authority
-frame, final wire enforcement cannot infer the protected suffix from that
-frame-free history; an input that still exceeds the hard limit is rejected
-with the existing context-window error instead of trimming the suffix. The
-coordinator's first canonical admission authorizes working-set
+frame, final wire enforcement can compact an exactly matching canonical source
+to discard older history while preserving the complete protected current-turn
+suffix. It then projects the selected history and rechecks the provider budget.
+An unrecognized projection or a protected suffix that still cannot fit returns
+the existing context-window error. The coordinator's first canonical admission authorizes working-set
 rewrites from an empty base; the initial Context commit remains Append, and
 provider WAL replacement still requires the existing exact rewrite proof.
 An empty WAL base alone grants no authority. Prior summary generations are

@@ -17722,10 +17722,9 @@ impl ServerAgenticLoopHost {
                 selected_output_tokens = requested_output_tokens.min(available_output_tokens);
                 break;
             }
-            // The request pipeline can rehome active canonical authority out
-            // of TailSuffix history. The generic mechanical compactor cannot
-            // see that protected suffix in this frame-free projection, so it
-            // must not trim it to satisfy a hard provider limit.
+            // TailSuffix can rehome active authority out of history. Give
+            // the shared compactor the canonical source only at this hard
+            // budget boundary, so it can protect the exact current suffix.
             let projected_protected_authority = !history.iter().any(|message| {
                 astra_turn_types::runtime_message_delivery(message)
                     == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
@@ -17735,10 +17734,10 @@ impl ServerAgenticLoopHost {
                 )
                 .is_some();
             if pass == 0
-                && !projected_protected_authority
                 && let Some(boundary) = crate::turn::wire_assembly::compact_history_for_wire_budget(
                     &mut history,
                     candidate_status,
+                    projected_protected_authority.then_some(state.messages.as_slice()),
                 )
             {
                 // The emergency recomposition is a real compaction boundary,
@@ -17749,11 +17748,13 @@ impl ServerAgenticLoopHost {
                 crate::turn::wire_assembly::maybe_append_continuation_prompt(&mut history, true);
                 let active_work_context =
                     self.active_work_attempt_start_context(state, &history, true);
-                crate::turn::wire_assembly::replace_required_runtime_authority(
-                    &mut volatile_preamble,
-                    crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
-                    active_work_context,
-                );
+                if active_work_context.is_some() || !projected_protected_authority {
+                    crate::turn::wire_assembly::replace_required_runtime_authority(
+                        &mut volatile_preamble,
+                        crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                        active_work_context,
+                    );
+                }
                 final_wire_compaction_boundary = Some(boundary);
                 continue;
             }
@@ -28594,6 +28595,120 @@ mod tests {
     }
 
     #[test]
+    fn final_wire_budget_keeps_refreshed_full_work_contract_after_prefix_eviction() {
+        for append_only in [false, true] {
+            let mut host = test_host_builder("u-work-refresh", "s-work-refresh").build();
+            let dir = tempfile::TempDir::new().expect("workspace");
+            let executor = runtime_tool_executor_with_agent_context(dir.path());
+            executor
+                .install_active_primary_work_attempt(
+                    crate::server::runtime_tool_executor::ActivePrimaryWorkAttempt {
+                        attempt_id: "attempt-refresh".into(),
+                        executor_run_id: "run-refresh".into(),
+                        item_id: "task-refresh".into(),
+                        item_revision: 3,
+                        objective: "Inspect the bounded subject".into(),
+                        expected_result: "One direct evidence result".into(),
+                    },
+                )
+                .expect("install active attempt");
+            let mut state = create_test_state();
+            state.runtime_tool_executor = Some(Arc::new(executor));
+
+            let first = host
+                .active_work_attempt_start_context(&state, &state.messages, false)
+                .expect("first Work contract");
+            let first_frame =
+                crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                    first["content"].as_str().unwrap(),
+                    crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                    astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                )
+                .unwrap()
+                .unwrap();
+            let mut canonical = compaction_reuse_history(CONTINUITY_FACT, 0);
+            canonical.pop(); // Replace the fixture's control with the real Work contract.
+            for round in 0..3 {
+                append_compaction_tool_pair(
+                    &mut canonical,
+                    &format!("work-current-{round}"),
+                    &format!("WORK_CURRENT_EVIDENCE_{round}"),
+                );
+            }
+            canonical.push(first_frame);
+            state.messages = canonical.clone();
+            let suffix =
+                astra_turn_types::active_append_only_authority_protected_suffix_start(&canonical)
+                    .unwrap();
+            let continuation = host
+                .active_work_attempt_start_context(&state, &state.messages, false)
+                .expect("later Work contract");
+            assert!(
+                continuation["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("active_work_attempt_continuation.v1")
+            );
+
+            let mut history = canonical.clone();
+            let mut preamble = if append_only {
+                Vec::new()
+            } else {
+                crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut history)
+                    .unwrap()
+            };
+            preamble.push(continuation);
+            let mut config = compaction_reuse_config(append_only);
+            if append_only {
+                config.cache_capability = Some(append_only_test_cache_capability());
+            }
+            let (wire, _, boundary) = host
+                .assemble_llm_messages_with_final_budget(
+                    Vec::new(),
+                    preamble,
+                    history,
+                    &mut state,
+                    &config,
+                    &PromptCacheConfig::default(),
+                    &[],
+                    1_000,
+                )
+                .expect("the safely compacted Work request must fit");
+            assert!(boundary.is_some());
+            assert!(
+                state.messages.starts_with(&canonical),
+                "budget compaction must not rewrite canonical history"
+            );
+            let committed = &state.messages[canonical.len()..];
+            if append_only {
+                assert_eq!(committed.len(), 1);
+                assert_eq!(
+                    astra_turn_types::runtime_authority_kind(&committed[0]),
+                    Some("compaction_continuation")
+                );
+            } else {
+                assert!(committed.is_empty());
+            }
+            let mut cursor = 0;
+            for expected in canonical[suffix..].iter().filter(|message| {
+                astra_turn_types::runtime_message_delivery(message)
+                    != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            }) {
+                let offset = wire[cursor..]
+                    .iter()
+                    .position(|message| message == expected)
+                    .expect("protected Work messages must remain in order");
+                cursor += offset + 1;
+            }
+            astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
+            let rendered = serde_json::to_string(&wire).unwrap();
+            assert_eq!(rendered.matches("active_work_attempt_start.v1").count(), 1);
+            assert!(!rendered.contains("active_work_attempt_continuation.v1"));
+            assert!(rendered.contains("One direct evidence result"));
+        }
+    }
+
+    #[test]
     fn final_work_synthesis_contract_is_user_facing_and_evidence_backed() {
         let mut state = create_test_state();
         assert!(ServerAgenticLoopHost::final_work_synthesis_context(&state).is_none());
@@ -37498,64 +37613,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn request_local_compaction_baseline_repeats_summary_for_small_rounds() {
-        for append_only in [false, true] {
-            let memory = CompactionMemoryFixture::default();
-            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let summary = ContinuitySummaryClient {
-                requests: requests.clone(),
-            };
-            let mut host = test_host_builder("reuse-owner", "reuse-session").build();
-            let config = compaction_reuse_config(append_only);
-            let mut state = create_test_state();
-            state.current_session_id = Some("reuse-session".into());
-            state.max_turn_input_tokens = 28_000;
-            state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
-            for round in 0..8 {
-                state.current_round_index = round;
-                state.llm_rounds_completed = round;
-                let pipeline = host
-                    .run_turn_pipeline_with_model_limits_and_session_memory(
-                        &mut state,
-                        &[],
-                        &config.provider,
-                        &config.model_name,
-                        config.context_window,
-                        config.max_completion_tokens,
-                        config.cache_capability,
-                        None,
-                        &[],
-                        "continue",
-                    )
-                    .unwrap();
-                let mut fixed = pipeline.system_messages;
-                fixed.extend(pipeline.volatile_preamble);
-                let ctx = crate::turn::wire_assembly::MemoriaContext {
-                    session_id: "reuse-session",
-                    model_name: &config.model_name,
-                    context_window: config.context_window,
-                    memoria_client: Some(&memory),
-                    summary_client: Some(&summary),
-                    tier: pipeline.tier,
-                    session_facts: None,
-                };
-                let result = ctx.compact(&pipeline.messages, &fixed, &[], None).await.0;
-                assert!(result.history_summary.is_some());
-                // The old call chain used this result only for the provider
-                // wire. Match the new-path fixture's pipeline, budgets and tail.
-                if round > 0 {
-                    append_compaction_tool_pair(
-                        &mut state.messages,
-                        &format!("small-0-{round}"),
-                        &format!("NEW_SMALL_EVIDENCE_0_{round}"),
-                    );
-                }
-            }
-            assert_eq!(requests.lock().unwrap().len(), 8);
-        }
-    }
-
     struct InterruptedCompactionSummary {
         started: Arc<tokio::sync::Notify>,
         pending: bool,
@@ -37604,6 +37661,143 @@ mod tests {
                 execution: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn request_compaction_tail_projection_evicts_only_old_prefix() {
+        let mut canonical = compaction_reuse_history(CONTINUITY_FACT, 0);
+        for round in 0..3 {
+            append_compaction_tool_pair(
+                &mut canonical,
+                &format!("current-{round}"),
+                &format!("CURRENT_EVIDENCE_{round}"),
+            );
+        }
+        let suffix =
+            astra_turn_types::active_append_only_authority_protected_suffix_start(&canonical)
+                .unwrap();
+        let expected_suffix = canonical[suffix..]
+            .iter()
+            .filter(|message| {
+                astra_turn_types::runtime_message_delivery(message)
+                    != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut projected = canonical.clone();
+        let authority =
+            crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut projected)
+                .unwrap();
+        let config = compaction_reuse_config(false);
+
+        // Exercise no memory, transient failure, malformed response, and a
+        // missing rewrite permit through the same request-local fallback.
+        for scenario in 0..4 {
+            let memory = Arc::new(CompactionMemoryFixture::default());
+            let mut host = test_host_builder("prefix-owner", "prefix-session")
+                .with_memoria_client((scenario != 0).then_some(memory.clone()))
+                .build();
+            let invalid_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let healthy_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            host.test_compaction_client = match scenario {
+                1 => Some(Box::new(InterruptedCompactionSummary {
+                    started: Arc::new(tokio::sync::Notify::new()),
+                    pending: false,
+                })),
+                2 => Some(Box::new(InvalidCompactionSummary {
+                    requests: invalid_calls.clone(),
+                })),
+                3 => Some(Box::new(ContinuitySummaryClient {
+                    requests: healthy_calls.clone(),
+                })),
+                _ => None,
+            };
+            let mut state = create_test_state();
+            state.messages = canonical.clone();
+            state.initialize_provider_canonical_wal_base(&[]);
+            if scenario != 3 {
+                state.initialize_initial_canonical_rewrite_proof();
+            }
+            let result = host
+                .compact_messages_via_memoria(
+                    &mut state,
+                    &projected,
+                    &authority,
+                    &[],
+                    CompactionTier::AggressivePrune,
+                    &config,
+                )
+                .await;
+            assert_eq!(result.messages, projected);
+            assert!(result.boundary.is_none());
+            assert!(result.history_summary.is_none());
+            assert_eq!(state.messages, canonical);
+            assert_eq!(
+                memory.sessions.lock().unwrap().len(),
+                usize::from(scenario != 0)
+            );
+            assert_eq!(
+                invalid_calls.load(Ordering::Relaxed),
+                usize::from(scenario == 2)
+            );
+            assert!(healthy_calls.lock().unwrap().is_empty());
+
+            let (wire, _, boundary) = host
+                .assemble_llm_messages_with_final_budget(
+                    Vec::new(),
+                    authority.clone(),
+                    result.messages,
+                    &mut state,
+                    &config,
+                    &PromptCacheConfig::default(),
+                    &[],
+                    1_000,
+                )
+                .expect("safe old-prefix eviction must let the protected turn fit");
+            let boundary = boundary.expect("the selected prefix eviction is observable");
+            assert!(boundary.messages_after < boundary.messages_before);
+            assert_eq!(state.messages, canonical);
+            let mut cursor = 0;
+            for expected in &expected_suffix {
+                let offset = wire[cursor..]
+                    .iter()
+                    .position(|message| message == expected)
+                    .expect(
+                        "every protected current-turn message must reach the provider in order",
+                    );
+                cursor += offset + 1;
+            }
+            astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
+            assert_eq!(
+                serde_json::to_string(&wire)
+                    .unwrap()
+                    .matches("CONTROL_0")
+                    .count(),
+                1
+            );
+        }
+
+        // A frame-free view that is not the exact canonical projection has
+        // no proven suffix mapping and must not be mechanically rewritten.
+        let mut stale = projected;
+        stale[1]["content"] = json!("different request projection");
+        let mut state = create_test_state();
+        state.messages = canonical.clone();
+        let mut host = test_host_builder("prefix-owner", "prefix-session").build();
+        let error = host
+            .assemble_llm_messages_with_final_budget(
+                Vec::new(),
+                authority,
+                stale,
+                &mut state,
+                &config,
+                &PromptCacheConfig::default(),
+                &[],
+                1_000,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(state.messages, canonical);
     }
 
     #[tokio::test]

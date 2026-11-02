@@ -402,6 +402,7 @@ pub(crate) fn augment_manifest_trace_with_wire_budget_and_metadata(
 pub(crate) fn compact_history_for_wire_budget(
     history: &mut Vec<Value>,
     status: WireBudgetStatus,
+    canonical_source: Option<&[Value]>,
 ) -> Option<crate::turn::cloud::compaction::CompactBoundary> {
     if history.is_empty() || !status.hard_limit_exceeded() {
         return None;
@@ -434,14 +435,52 @@ pub(crate) fn compact_history_for_wire_budget(
             .checked_div(history_tokens)
             .unwrap_or(0)
     };
-    let result = crate::turn::cloud::compaction::compact_tiered_impl(
-        history,
+    // A TailSuffix request can have moved active authority to the fixed
+    // preamble. Compact its exact canonical source so the shared mechanical
+    // owner can still see and protect the current-turn suffix.
+    let (source, budget_chars, protected_suffix) = if let Some(canonical) = canonical_source {
+        let suffix =
+            astra_turn_types::active_append_only_authority_protected_suffix_start(canonical)?;
+        if history.iter().any(|message| {
+            astra_turn_types::runtime_message_delivery(message)
+                == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+        }) || !crate::turn::cloud::compaction::request_summary_source_matches(canonical, history)
+        {
+            return None;
+        }
+        // The wire budget already includes the rehomed frames as fixed
+        // context. Add their serialized size only for this temporary
+        // canonical representation, then remeasure the actual wire below.
+        let canonical_chars = crate::turn::cloud::compaction::serialized_message_chars(canonical);
+        (
+            canonical,
+            budget_chars.saturating_add(canonical_chars.saturating_sub(history_chars)),
+            Some(suffix),
+        )
+    } else {
+        (history.as_slice(), budget_chars, None)
+    };
+    let mut result = crate::turn::cloud::compaction::compact_tiered_impl(
+        source,
         budget_chars,
         2_000,
         CompactionTier::AggressivePrune,
         4,
     );
-    let boundary = result.boundary?;
+    let mut boundary = result.boundary?;
+    if let Some(suffix) = protected_suffix {
+        if !result.messages.ends_with(&source[suffix..]) {
+            return None;
+        }
+        // The original required preamble already contains the active frames.
+        // Drop the temporary canonical frames without injecting a second copy.
+        rehome_append_only_runtime_authority(&mut result.messages).ok()?;
+        if result.messages == *history {
+            return None;
+        }
+        boundary.messages_before = history.len();
+        boundary.messages_after = result.messages.len();
+    }
     *history = result.messages;
     Some(boundary)
 }
@@ -549,29 +588,37 @@ pub(crate) fn project_artifact_recovery_guidance(
     );
 }
 
-/// Replace one producer-owned required authority in a volatile preamble while
-/// retaining its original ordering.  A boundary may require a fresh complete
-/// contract; replacing by its typed provenance avoids text-based matching and
-/// prevents duplicate authority frames.
+/// Replace producer-owned authority at its latest position and remove older
+/// entries of the same kind. A boundary may require a fresh complete contract;
+/// retaining a later stale continuation would otherwise override it at assembly.
 pub(crate) fn replace_required_runtime_authority(
     messages: &mut Vec<Value>,
     kind: RuntimeAuthorityKind,
-    replacement: Option<Value>,
+    mut replacement: Option<Value>,
 ) {
     let kind = kind.as_str();
-    if let Some(index) = messages
+    let Some(last) = messages
         .iter()
-        .position(|message| runtime_authority_kind_for_projection(message) == Some(kind))
-    {
-        match replacement {
-            Some(message) => messages[index] = message,
-            None => {
-                messages.remove(index);
-            }
+        .rposition(|message| runtime_authority_kind_for_projection(message) == Some(kind))
+    else {
+        if let Some(message) = replacement {
+            messages.push(message);
         }
-    } else if let Some(message) = replacement {
-        messages.push(message);
-    }
+        return;
+    };
+    let mut index = 0;
+    messages.retain_mut(|message| {
+        let is_last = index == last;
+        index += 1;
+        if runtime_authority_kind_for_projection(message) != Some(kind) {
+            return true;
+        }
+        if is_last && let Some(new_message) = replacement.take() {
+            *message = new_message;
+            return true;
+        }
+        false
+    });
 }
 
 /// Read the producer-owned authority identity from either wire projection:
@@ -3014,6 +3061,50 @@ mod tests {
     }
 
     #[test]
+    fn required_authority_replacement_removes_duplicates_at_latest_position() {
+        let make = |text, kind| {
+            required_runtime_preamble_message(
+                text,
+                kind,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+        };
+        let old = make("old full", RuntimeAuthorityKind::ActiveWorkAttemptStart);
+        let continuation = make("continuation", RuntimeAuthorityKind::ActiveWorkAttemptStart);
+        let unrelated = make("other authority", RuntimeAuthorityKind::FinalWorkSynthesis);
+        let replacement = make(
+            "refreshed full",
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+        );
+        let mut preamble = vec![old, unrelated.clone(), continuation];
+
+        replace_required_runtime_authority(
+            &mut preamble,
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            Some(replacement.clone()),
+        );
+        assert_eq!(preamble, vec![unrelated.clone(), replacement.clone()]);
+
+        preamble.push(make(
+            "duplicate",
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+        ));
+        replace_required_runtime_authority(
+            &mut preamble,
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            None,
+        );
+        assert_eq!(preamble, vec![unrelated.clone()]);
+        replace_required_runtime_authority(
+            &mut preamble,
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            Some(replacement.clone()),
+        );
+        assert_eq!(preamble, vec![unrelated, replacement]);
+    }
+
+    #[test]
     fn provider_switch_rehomes_only_unconsumed_append_only_authority() {
         let mut active_system = runtime_system_context_message("active", true).unwrap();
         mark_runtime_authority(
@@ -3835,7 +3926,7 @@ mod tests {
             model_limit: 2_500,
         };
 
-        assert!(compact_history_for_wire_budget(&mut history, status).is_some());
+        assert!(compact_history_for_wire_budget(&mut history, status, None).is_some());
         assert!(
             history.len() < 16,
             "bounded final-wire repair should reduce canonical history, not add another context lane"
@@ -3874,7 +3965,7 @@ mod tests {
         };
 
         assert!(
-            compact_history_for_wire_budget(&mut history, status).is_some(),
+            compact_history_for_wire_budget(&mut history, status, None).is_some(),
             "schema cost must consume history budget instead of being handed back to the compactor"
         );
     }

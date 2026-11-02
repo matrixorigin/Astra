@@ -2322,18 +2322,17 @@ impl ChatWidget {
                             .unwrap_or_else(|| node.run_id.clone());
                         // A response can arrive after a newer live lifecycle
                         // observation, even when the backend page is complete.
-                        if self.agent_runs.get(&run_key).is_some_and(|projection| {
-                            matches!(
-                                projection.state.source,
-                                AgentProjectionSource::LiveStream
-                                    | AgentProjectionSource::LocalIntent
-                                    | AgentProjectionSource::DurableServer
-                            ) && !server
-                                .fetch_started_at
-                                .is_some_and(|started| projection.state_observed_at < started)
-                        }) {
-                            continue;
-                        }
+                        let lifecycle_fenced =
+                            self.agent_runs.get(&run_key).is_some_and(|projection| {
+                                matches!(
+                                    projection.state.source,
+                                    AgentProjectionSource::LiveStream
+                                        | AgentProjectionSource::LocalIntent
+                                        | AgentProjectionSource::DurableServer
+                                ) && !server
+                                    .fetch_started_at
+                                    .is_some_and(|started| projection.state_observed_at < started)
+                            });
                         if self
                             .agent_runs
                             .get(&run_key)
@@ -2365,22 +2364,30 @@ impl ChatWidget {
                                     AgentRunLabelKind::RoutingFallback,
                                 )
                             });
-                        let accepted =
+                        let accepted = if lifecycle_fenced {
+                            if let Some(projection) = self.agent_runs.get_mut(&run_key) {
+                                projection.set_label(label, label_kind);
+                            }
+                            false
+                        } else {
                             self.agent_runs
-                                .ensure(run_key.clone(), label, label_kind, state);
+                                .ensure(run_key.clone(), label, label_kind, state)
+                        };
                         let Some(projection) = self.agent_runs.get_mut(&run_key) else {
                             continue;
                         };
                         if accepted && let Some(started) = server.fetch_started_at {
                             projection.state_observed_at = started;
                         }
-                        projection.set_controls(
-                            AgentProjectionSource::DurableServer,
-                            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
-                                run_id: node.run_id.clone(),
-                            },
-                            node.available_actions.clone(),
-                        );
+                        if !lifecycle_fenced {
+                            projection.set_controls(
+                                AgentProjectionSource::DurableServer,
+                                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                                    run_id: node.run_id.clone(),
+                                },
+                                node.available_actions.clone(),
+                            );
+                        }
                         projection.set_transcript_target(
                             AgentProjectionSource::DurableServer,
                             crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
@@ -2389,12 +2396,6 @@ impl ChatWidget {
                             AgentProjectionSource::DurableServer,
                             node.runtime.clone(),
                         );
-                        if !accepted
-                            && projection.durable_event_high_watermark
-                                == Some(node.run_event_high_watermark)
-                        {
-                            continue;
-                        }
                         projection.durable_event_high_watermark =
                             Some(node.run_event_high_watermark);
                         projection.set_runtime_metadata(
@@ -2412,7 +2413,7 @@ impl ChatWidget {
                         projection.reported_tool_calls = node.total_tool_calls as usize;
                         if let Some(started_at) = parse_run_timestamp(&node.created_at) {
                             align_projection_start_time(projection, started_at);
-                            if status.is_terminal() {
+                            if !lifecycle_fenced && status.is_terminal() {
                                 align_projection_end_time(
                                     projection,
                                     started_at,
@@ -2420,7 +2421,9 @@ impl ChatWidget {
                                 );
                             }
                         }
-                        apply_server_agent_detail(projection, node, status);
+                        if !lifecycle_fenced {
+                            apply_server_agent_detail(projection, node, status);
+                        }
                     }
 
                     if !snapshot.truncated {
@@ -12063,5 +12066,96 @@ mod tests {
         assert!(registry.contains_key("latest"));
         assert!(registry.contains_key("parent"));
         assert!(!registry.contains_key("evict"));
+    }
+
+    #[test]
+    fn review_live_chunks_do_not_starve_durable_progress_updates() {
+        use crate::tui::server_agent_observer::ServerAgentTruthState;
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        let mut widget = fresh();
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "child",
+                SessionRunLifecycleStatus::Running,
+                1,
+            )],
+            false,
+        ));
+        for progress in 3..6 {
+            let mut node = server_run_node("child", SessionRunLifecycleStatus::Running, progress);
+            node.total_tool_calls = progress as u32;
+            node.agent_name = Some(format!("Reviewer {progress}"));
+            let response =
+                server_agent_projection(ServerAgentTruthState::Confirmed, vec![node], false);
+            widget.on_agent_live_event(AgentLiveEvent {
+                run_id: "child".into(),
+                agent_id: "reviewer".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: "streaming".into(),
+                },
+            });
+            widget.reconcile_server_agent_projection(&response);
+            let row = widget.agent_runs.get("child").unwrap();
+            assert_eq!(row.state.status, AgentRunStatus::Running);
+            assert_eq!(row.detail.description, format!("Reviewer {progress}"));
+            assert_eq!(
+                row.reported_tool_calls, progress as usize,
+                "a newer live text chunk must not discard independent durable tool progress"
+            );
+        }
+        // A stale durable page never overwrites newer counters.
+        let mut stale = server_run_node("child", SessionRunLifecycleStatus::Running, 4);
+        stale.total_tool_calls = 99;
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            ServerAgentTruthState::Confirmed,
+            vec![stale],
+            false,
+        ));
+        assert_eq!(
+            widget.agent_runs.get("child").unwrap().reported_tool_calls,
+            5
+        );
+        // Child membership may advance without changing the parent's watermark.
+        let mut child = server_run_node("grandchild", SessionRunLifecycleStatus::Running, 1);
+        child.parent_run_id = Some("child".into());
+        child.depth = 2;
+        let response = server_agent_projection(
+            ServerAgentTruthState::Confirmed,
+            vec![
+                server_run_node("child", SessionRunLifecycleStatus::Running, 5),
+                child,
+            ],
+            false,
+        );
+        widget
+            .agent_runs
+            .get_mut("child")
+            .unwrap()
+            .set_state(AgentRunState::observed(AgentRunStatus::Waiting));
+        widget.reconcile_server_agent_projection(&response);
+        let row = widget.agent_runs.get("child").unwrap();
+        assert_eq!(row.state.status, AgentRunStatus::Waiting);
+        assert_eq!(row.reported_child_agents, 1);
+        // A newer local cancellation keeps its overlay while progress refreshes.
+        let row = widget.agent_runs.get_mut("child").unwrap();
+        assert!(
+            row.begin_control(astra_thin_client::SessionRunAction::Cancel)
+                .is_some()
+        );
+        let mut terminal = server_run_node("child", SessionRunLifecycleStatus::Completed, 6);
+        terminal.total_tool_calls = 6;
+        let mut response =
+            server_agent_projection(ServerAgentTruthState::Confirmed, vec![terminal], false);
+        response.fetch_started_at =
+            Some(row.state_observed_at - std::time::Duration::from_millis(1));
+        widget.reconcile_server_agent_projection(&response);
+        let row = widget.agent_runs.get("child").unwrap();
+        assert_eq!(row.state.status, AgentRunStatus::Cancelling);
+        assert!(row.pending_control.is_some());
+        assert_eq!(row.reported_tool_calls, 6);
+        assert!(row.detail.completed_at.is_none());
     }
 }
