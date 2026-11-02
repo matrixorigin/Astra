@@ -453,9 +453,13 @@ impl ToolInvocationDecisionSnapshot {
         });
         request.selected_offer = self.selected_offer.clone();
         let execution_binding_generation = request.policy.execution_binding_generation;
+        let admission_deadline = request.policy.admission_deadline;
+        let execution_deadline_unix_ms = request.policy.execution_deadline_unix_ms;
         request.policy = self.transport_policy.clone();
         request.policy.work_attribution = self.work_attribution.clone();
         request.policy.execution_binding_generation = execution_binding_generation;
+        request.policy.admission_deadline = admission_deadline;
+        request.policy.execution_deadline_unix_ms = execution_deadline_unix_ms;
         request.policy.resolved_provider_policy = self.provider_policy.clone();
         request.policy.permission_grant = self.permission_grant.as_ref().map(|grant| {
             super::tool_execution_binding::ToolPermissionGrantSnapshot {
@@ -1155,6 +1159,9 @@ mod tests {
         request.runtime_edge_dispatch_authorization = None;
         request.runtime_edge_dispatch_authorization_required = false;
         request.policy.admission_snapshot = Some(Default::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        request.policy.admission_deadline = Some(deadline);
+        request.policy.execution_deadline_unix_ms = Some(4_102_444_800_000);
         let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
         restored.apply_to_request(&mut request).unwrap();
 
@@ -1165,6 +1172,11 @@ mod tests {
             astra_runtime_env::ExecutorStatus::Online
         );
         assert_eq!(request.policy.max_output_bytes, Some(4096));
+        assert_eq!(request.policy.admission_deadline, Some(deadline));
+        assert_eq!(
+            request.policy.execution_deadline_unix_ms,
+            Some(4_102_444_800_000)
+        );
         assert_eq!(request.policy.work_attribution, original.work_attribution);
         let mut missing_scope = durable.clone();
         missing_scope

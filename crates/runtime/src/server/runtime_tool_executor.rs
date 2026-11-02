@@ -4355,13 +4355,11 @@ impl RuntimeToolExecutor {
                     tool_invocation_decision_rejected_result(error.to_string()),
                 );
             }
-            let admission_deadline = request.policy.admission_deadline;
             if let Err(error) = frozen.apply_to_request(&mut request) {
                 return GovernableRuntimeToolResult::completed(
                     tool_invocation_decision_rejected_result(error.to_string()),
                 );
             }
-            request.policy.admission_deadline = admission_deadline;
             let semantic_read_preparation = self
                 .prepare_semantic_read(&frozen, &identity, &request.args)
                 .await;
