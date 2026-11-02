@@ -83,7 +83,7 @@ upload protocols keep their existing transactions and retention deadlines.
 
 This is a fresh empty database and same-version deployment contract. There is
 no additional marker mechanism, migration, compatibility API or old-data cleanup.
-The existing schema contract version advances to v117 and rejects earlier versions. Strict
+The existing schema contract version advances to v118 and rejects earlier versions. Strict
 request-context JSON decoding is not promised for historical payloads. Existing
 engine snapshots and in-flight old Git operations are not reconciled by the new
 build; stop old workers before handing their workspaces to a new deployment.
@@ -705,3 +705,31 @@ are not Server startup and do not perform contract admission themselves.
 Artifact retention keeps citation counters and durable reference edges. The
 retired `state_item` reference kind is rejected; retained kinds continue to pin
 payloads until their owning lifecycle releases them.
+
+
+## Tool invocation persistence cost
+
+Fresh schema contract `2026-11-01-v118` removes the unused invocation ledger
+`created_at`, `updated_at` and timestamp index. Lease deadlines, custody indexes,
+archive retention and the maintenance cursor keep their existing owners. This
+uses the existing fresh-database contract check; there is no migration path.
+
+Cache completion returns the stored record directly from its conditional update.
+Its predicate guarantees an absent lease and owner, so its returned epoch is
+null. Dispatch and completion retain their authoritative post-update reads and
+database-side epoch conversion, including non-UTC sessions. Heartbeats renew
+only the database-clock lease without reading result JSON; state, owner, lease
+and certainty predicates remain enforced. Decision and outcome validation stays
+at admission, completion and replay; a heartbeat grants no new dispatch authority.
+Failed updates still read the authoritative state for owner/state errors, and
+receipts are usable only after commit. The full-identity completion lock and
+lost-acknowledgement recovery remain mandatory.
+
+Terminal compaction still commits at most 32 records and 4 MiB per chunk.
+Artifact reachability transfers in bounded pages of 128 observed edges; shared
+artifacts keep their references and retention deadlines. The selected full
+identities are deleted together only if the deleted count matches the archive.
+Unknown effects remain hot. Archive key ranges are candidate indexes: a late
+settlement can overlap an earlier range. Replay validates candidate artifacts
+and full identities, rejecting duplicate exact identities or unavailable
+candidate evidence. No user-facing execution or recovery capability is retired.

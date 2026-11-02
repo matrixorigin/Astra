@@ -2,156 +2,12 @@
 //! ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test edge_registry_cancellation_db_it -- --ignored
 
 mod common;
+use common::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool as audit_proxy_pool};
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::time::Duration;
 
 use astra_services::multi_agent::{DatabaseEdgeRegistryService, EdgeRegistryService};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
-use tokio::task::{JoinHandle, JoinSet};
-
-#[derive(Clone, Copy)]
-enum Boundary {
-    Begin,
-    CurrentReadWrite,
-    AuditTools,
-    AuditApprovals,
-    AuditApprovalTerminator,
-}
-
-// Only the first matching exchange is gated. Requests reach the real database
-// unchanged; its response is retained until the test cancels the caller. This
-// exercises cancellation after server execution, not a sleep before any SQL.
-struct ResponseGate {
-    armed: AtomicBool,
-    pending: AtomicBool,
-    received: Notify,
-    release: Notify,
-}
-
-struct ResponseProxy {
-    port: u16,
-    gate: Arc<ResponseGate>,
-    task: JoinHandle<()>,
-}
-
-impl Drop for ResponseProxy {
-    fn drop(&mut self) {
-        // Dropping the accept task drops its JoinSet and closes every relay,
-        // including on assertion failure. No fault-injection socket survives.
-        self.task.abort();
-    }
-}
-
-async fn packet(reader: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
-    let mut header = [0; 4];
-    reader.read_exact(&mut header).await?;
-    let length =
-        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
-    let mut bytes = vec![0; length + 4];
-    bytes[..4].copy_from_slice(&header);
-    reader.read_exact(&mut bytes[4..]).await?;
-    Ok(bytes)
-}
-
-impl ResponseProxy {
-    async fn start(host: String, port: u16, boundary: Boundary) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_port = listener.local_addr().unwrap().port();
-        let gate = Arc::new(ResponseGate {
-            armed: AtomicBool::new(true),
-            pending: AtomicBool::new(false),
-            received: Notify::new(),
-            release: Notify::new(),
-        });
-        let relay_gate = gate.clone();
-        let task = tokio::spawn(async move {
-            let mut connections = JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (client, _) = accepted.unwrap();
-                        let host = host.clone();
-                        let gate = relay_gate.clone();
-                        connections.spawn(async move {
-                            let server = TcpStream::connect((host.as_str(), port)).await.unwrap();
-                            let (mut client_read, mut client_write) = client.into_split();
-                            let (mut server_read, mut server_write) = server.into_split();
-                            let request_gate = gate.clone();
-                            let requests = async move {
-                                let mut current_read_prepared = false;
-                                loop {
-                                    let bytes = packet(&mut client_read).await?;
-                                    let payload = &bytes[4..];
-                                    // COM_STMT_PREPARE for the current-read barrier is
-                                    // immediately followed by its COM_STMT_EXECUTE on
-                                    // this serial checkout. Gate execution, not prepare.
-                                    if payload.first() == Some(&0x16) {
-                                        current_read_prepared = match boundary {
-                                            Boundary::CurrentReadWrite => payload[1..].starts_with(b"UPDATE edge_agent_registry SET last_heartbeat_at = last_heartbeat_at"),
-                                            Boundary::AuditTools => payload[1..].starts_with(b"WITH selected_runs AS"),
-                                            Boundary::AuditApprovals | Boundary::AuditApprovalTerminator => payload[1..].starts_with(b"SELECT COUNT(CASE WHEN kind = 'approval_required'"),
-                                            Boundary::Begin => false,
-                                        };
-                                    }
-                                    let matches = match boundary {
-                                        Boundary::Begin => payload == b"\x03BEGIN",
-                                        Boundary::CurrentReadWrite | Boundary::AuditTools | Boundary::AuditApprovals | Boundary::AuditApprovalTerminator => {
-                                            payload.first() == Some(&0x17) && current_read_prepared
-                                        }
-                                    };
-                                    if matches && request_gate.armed.swap(false, Ordering::SeqCst) {
-                                        request_gate.pending.store(true, Ordering::SeqCst);
-                                    }
-                                    server_write.write_all(&bytes).await?;
-                                }
-                                #[allow(unreachable_code)]
-                                Ok::<(), std::io::Error>(())
-                            };
-                            let responses = async move {
-                                let mut row_seen = false;
-                                loop {
-                                    let bytes = packet(&mut server_read).await?;
-                                    let is_terminator = matches!(boundary, Boundary::AuditApprovalTerminator);
-                                    let should_hold = gate.pending.load(Ordering::SeqCst)
-                                        && (!is_terminator || (row_seen && matches!(bytes[4], 0xfe | 0x00)));
-                                    if should_hold && gate.pending.swap(false, Ordering::SeqCst) {
-                                        if matches!(boundary, Boundary::Begin | Boundary::CurrentReadWrite) {
-                                            assert_eq!(bytes[4], 0, "gated SQL must succeed at the server");
-                                        }
-                                        gate.received.notify_one();
-                                        gate.release.notified().await;
-                                    } else if is_terminator && gate.pending.load(Ordering::SeqCst) && bytes[4] == 0x00 {
-                                        row_seen = true;
-                                    }
-                                    client_write.write_all(&bytes).await?;
-                                }
-                                #[allow(unreachable_code)]
-                                Ok::<(), std::io::Error>(())
-                            };
-                            tokio::select! {
-                                _ = requests => {},
-                                _ = responses => {},
-                            }
-                        });
-                    }
-                    Some(result) = connections.join_next() => { result.unwrap(); }
-                }
-            }
-        });
-        Self {
-            port: proxy_port,
-            gate,
-            task,
-        }
-    }
-}
 
 async fn cancelled_publication(boundary: Boundary) {
     let (shared, settings) = common::setup_pool_and_settings().await;
@@ -254,30 +110,10 @@ async fn publication_cancelled_before_begin_ack_discards_connection() {
 #[tokio::test]
 #[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn publication_cancelled_after_row_write_releases_lock() {
-    cancelled_publication(Boundary::CurrentReadWrite).await;
-}
-
-// Keep the protocol relay plaintext, even when the database advertises TLS.
-async fn audit_proxy_pool(
-    settings: &astra_core::MatrixOneSettings,
-    port: u16,
-) -> astra_core::SharedPool {
-    let mut direct = settings.clone();
-    direct.db_pool_max_connections = 1;
-    direct.db_pool_min_connections = 0;
-    let pool = astra_core::SharedPool::new(&direct).await.unwrap();
-    let initial = pool.get().acquire().await.unwrap();
-    pool.get().set_connect_options(
-        MySqlConnectOptions::new()
-            .host("127.0.0.1")
-            .port(port)
-            .username(&settings.user)
-            .password(&settings.password)
-            .database(&settings.database)
-            .ssl_mode(MySqlSslMode::Disabled),
-    );
-    initial.close().await.unwrap();
-    pool
+    cancelled_publication(Boundary::Write(
+        b"UPDATE edge_agent_registry SET last_heartbeat_at = last_heartbeat_at",
+    ))
+    .await;
 }
 
 // Pause a real SELECT response after its server-side execution. The independent
@@ -301,8 +137,12 @@ async fn audit_tool_snapshot_survives_concurrent_first_run_event() {
     sqlx::query("INSERT INTO agent_events (event_id,user_id,session_id,event_type,run_id,tool_call_id,meta_tool_name,metadata,payload_hash,ingestion_write_id) VALUES (?,?,?,'tool_call_completed',?,'call','bash',CAST('{}' AS JSON),?,?)")
         .bind(uuid::Uuid::new_v4().to_string()).bind(&user).bind(&session).bind(&run_id)
         .bind("a".repeat(64)).bind(uuid::Uuid::new_v4().to_string()).execute(shared.get()).await.unwrap();
-    let proxy =
-        ResponseProxy::start(settings.host.clone(), settings.port, Boundary::AuditTools).await;
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::Rows(b"WITH selected_runs AS"),
+    )
+    .await;
     let test_pool = audit_proxy_pool(&settings, proxy.port).await;
     let audit = DatabaseSessionAuditService::new(settings).with_pool(test_pool.clone());
     let pending = tokio::spawn({
@@ -414,11 +254,17 @@ async fn cancelled_audit_approval_query(boundary: Boundary) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn audit_approval_query_cancellation_releases_single_pool_slot() {
-    cancelled_audit_approval_query(Boundary::AuditApprovals).await;
+    cancelled_audit_approval_query(Boundary::Rows(
+        b"SELECT COUNT(CASE WHEN kind = 'approval_required'",
+    ))
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires isolated live MatrixOne (ASTRA_TEST_DB_IT=1)"]
 async fn audit_approval_terminator_cancellation_releases_single_pool_slot() {
-    cancelled_audit_approval_query(Boundary::AuditApprovalTerminator).await;
+    cancelled_audit_approval_query(Boundary::RowTerminator(
+        b"SELECT COUNT(CASE WHEN kind = 'approval_required'",
+    ))
+    .await;
 }

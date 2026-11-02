@@ -1640,8 +1640,7 @@ async fn seal_forced_takeover_effects(
     sqlx::query(
         "UPDATE tool_invocation_ledger
          SET state = 'outcome_unknown', dispatch_certainty = 'unknown',
-             dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
-             updated_at = NOW(6)
+             dispatch_owner = NULL, dispatch_lease_expires_at = NULL
          WHERE user_id = ? AND session_id = ?
            AND (state = 'dispatched'
                 OR (state = 'prepared' AND attempt_count > 0))",
