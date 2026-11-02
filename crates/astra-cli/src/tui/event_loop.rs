@@ -15195,6 +15195,7 @@ mod tests {
                 if mismatch == "terminal" {
                     let mut completed = projection.clone();
                     completed.sequence += 1;
+                    completed.fetch_started_at = Some(std::time::Instant::now());
                     let node = completed
                         .snapshot
                         .as_mut()
