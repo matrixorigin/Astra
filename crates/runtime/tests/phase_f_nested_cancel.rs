@@ -218,6 +218,7 @@ impl SubRunExecutor for NestedMockExecutor {
         }
 
         Ok(SubRunExecutionResult {
+            cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
             result: AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,

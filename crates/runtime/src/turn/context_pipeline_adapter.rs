@@ -78,11 +78,8 @@ pub(crate) fn build_external_sources(
     let (mut tool_guidance_text, _signals) =
         crate::prompts::tool_round_guidance_trace(&state.messages);
     if !state.suppress_execution_slice_guidance() {
-        let slice_guidance = crate::prompts::execution_slice_guidance(
-            state.remaining_turns,
-            state.max_turns,
-            super::agentic_loop::lifecycle::adaptive_budget_is_renewable(state),
-        );
+        let slice_guidance =
+            crate::prompts::execution_slice_guidance(state.remaining_turns, state.max_turns, false);
         if !slice_guidance.is_empty() {
             if !tool_guidance_text.is_empty() {
                 tool_guidance_text.push_str("\n\n");
@@ -1068,36 +1065,29 @@ mod tests {
     }
 
     #[test]
-    fn external_sources_keep_renewable_capacity_distinct_from_completion() {
+    fn external_sources_do_not_advertise_renewal_after_exhaustion() {
         let ep = serde_json::Map::new();
         let mut state = make_state();
         state.max_turns = 32;
         state.remaining_turns = 0;
         state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(72);
-        state.agentic_turn_budget.extension_turns = 12;
-
         let guidance = build_external_sources(&ep, &state, &["bash"], None, None)
             .tool_guidance
-            .expect("renewable final-boundary guidance");
+            .expect("final-boundary guidance");
+        assert!(guidance.contains("Do not call any tool"), "{guidance}");
         assert!(
-            guidance.contains("adaptive capacity checkpoint"),
+            !guidance.contains("adaptive capacity checkpoint"),
             "{guidance}"
         );
-        assert!(
-            guidance.contains("not evidence of progress or unfinished work"),
-            "{guidance}"
-        );
-        assert!(!guidance.contains("Do not call any tool"), "{guidance}");
     }
 
     #[test]
-    fn external_sources_keep_no_tool_final_boundary_when_renewal_is_blocked() {
+    fn external_sources_keep_final_boundary_independent_of_historical_advice() {
         let ep = serde_json::Map::new();
         let mut state = make_state();
         state.max_turns = 32;
         state.remaining_turns = 0;
         state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(32);
-        state.agentic_turn_budget.extension_turns = 12;
 
         let nonrenewable = build_external_sources(&ep, &state, &["bash"], None, None)
             .tool_guidance
@@ -1131,7 +1121,7 @@ mod tests {
         let critical = build_external_sources(&ep, &state, &["bash"], None, None)
             .tool_guidance
             .expect("renewable boundary despite historical critical advice");
-        assert!(!critical.contains("Do not call any tool"), "{critical}");
+        assert!(critical.contains("Do not call any tool"), "{critical}");
     }
 
     #[test]

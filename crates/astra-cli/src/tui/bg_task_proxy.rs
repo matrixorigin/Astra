@@ -119,6 +119,7 @@ pub(crate) fn local_agent_status_projection(
         AgentStatus::Failed {
             error,
             finish_reason,
+            ..
         } => (
             "failed",
             Some(error.clone()).filter(|error| !error.trim().is_empty()),
@@ -597,12 +598,13 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
             crate::edge_tools::BgTaskOutputStatus::Interrupted,
             partial_result.clone(),
         ),
-        AgentStatus::Failed { error, .. } => {
-            (crate::edge_tools::BgTaskOutputStatus::Failed, error.clone())
-        }
+        AgentStatus::Failed { error, .. } => (
+            crate::edge_tools::BgTaskOutputStatus::Failed,
+            agent.status.retained_output().unwrap_or(error).to_owned(),
+        ),
         AgentStatus::Cancelled { reason, .. } => (
             crate::edge_tools::BgTaskOutputStatus::Cancelled,
-            reason.clone(),
+            agent.status.retained_output().unwrap_or(reason).to_owned(),
         ),
     };
     let (output, end, total_bytes, total_lines) =

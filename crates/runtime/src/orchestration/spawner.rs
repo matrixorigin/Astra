@@ -457,6 +457,7 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
                 CancellationOrigin::Runtime => AgentStatus::Cancelled {
                     by_user: false,
                     reason: reason.to_string(),
+                    partial_result: String::new(),
                 },
                 CancellationOrigin::Unverified => AgentStatus::Interrupted {
                     partial_result: run_result.output.clone().unwrap_or_default(),
@@ -467,6 +468,7 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
         SpawnRunStatusKind::Failed | SpawnRunStatusKind::Other => AgentStatus::Failed {
             error: spawn_run_failure_message(run_result),
             finish_reason: Some(run_result.finish_reason.clone()),
+            partial_result: String::new(),
         },
         SpawnRunStatusKind::Waiting => AgentStatus::Waiting {
             reason: run_result.output.clone().unwrap_or_default(),
@@ -502,6 +504,7 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
             finish_reason: run_result.finish_reason.clone(),
         },
     }
+    .with_partial_result(run_result.output.as_deref().unwrap_or_default())
 }
 
 fn cancellation_agent_status(reason: &str, origin: CancellationOrigin) -> AgentStatus {
@@ -510,6 +513,7 @@ fn cancellation_agent_status(reason: &str, origin: CancellationOrigin) -> AgentS
         CancellationOrigin::Runtime => AgentStatus::Cancelled {
             by_user: false,
             reason: reason.to_string(),
+            partial_result: String::new(),
         },
         CancellationOrigin::Unverified => AgentStatus::Interrupted {
             partial_result: String::new(),
@@ -661,10 +665,11 @@ fn restored_agent_status(
                 .terminal_reason
                 .clone()
                 .filter(|reason| !reason.trim().is_empty())
-                .unwrap_or(partial),
+                .unwrap_or_else(|| "restored child failed".into()),
             finish_reason: Some("restored_failure".into()),
+            partial_result: partial,
         },
-        "killed" | "cancelled" => AgentStatus::cancelled_anonymous(),
+        "killed" | "cancelled" => AgentStatus::cancelled_anonymous().with_partial_result(&partial),
         "interrupted" => AgentStatus::Interrupted {
             partial_result: partial,
             finish_reason: projection
@@ -1038,9 +1043,13 @@ fn direct_child_result_fingerprint(
         AgentStatus::Failed {
             error,
             finish_reason,
+            partial_result,
         } => serde_json::to_writer(
             &mut writer,
-            &(("failed", error, finish_reason), applied_user_intents),
+            &(
+                ("failed", error, finish_reason, partial_result),
+                applied_user_intents,
+            ),
         ),
         AgentStatus::Waiting { reason } => {
             serde_json::to_writer(&mut writer, &(("waiting", reason), applied_user_intents))
@@ -1048,9 +1057,16 @@ fn direct_child_result_fingerprint(
         AgentStatus::Paused { reason } => {
             serde_json::to_writer(&mut writer, &(("paused", reason), applied_user_intents))
         }
-        AgentStatus::Cancelled { by_user, reason } => serde_json::to_writer(
+        AgentStatus::Cancelled {
+            by_user,
+            reason,
+            partial_result,
+        } => serde_json::to_writer(
             &mut writer,
-            &(("cancelled", by_user, reason), applied_user_intents),
+            &(
+                ("cancelled", by_user, reason, partial_result),
+                applied_user_intents,
+            ),
         ),
     }
     .expect("child result receipt must serialize");
@@ -1059,15 +1075,7 @@ fn direct_child_result_fingerprint(
 
 impl DirectChildCompletion {
     fn result_text(&self) -> &str {
-        match &self.status {
-            AgentStatus::Completed { result, .. } => result.as_str(),
-            AgentStatus::Interrupted { partial_result, .. } => partial_result.as_str(),
-            AgentStatus::Failed { error, .. } => error.as_str(),
-            AgentStatus::Cancelled { reason, .. }
-            | AgentStatus::Waiting { reason }
-            | AgentStatus::Paused { reason } => reason.as_str(),
-            _ => "",
-        }
+        self.status.retained_output().unwrap_or_default()
     }
 
     /// Delivery uses the existing aggregate budget, not the diagnostic preview.
@@ -1084,12 +1092,18 @@ impl DirectChildCompletion {
 
     fn result_projection(&self, inline_result: &str) -> serde_json::Value {
         let result = self.result_text();
-        serde_json::json!({
+        let mut projection =
+            astra_turn_core::orchestration::agent_result_wire::project_wait_for_agent_status(
+                &self.agent_id,
+                &self.status,
+                Some(inline_result),
+            );
+        let metadata = serde_json::json!({
             "agent_id": self.agent_id,
             "run_id": self.run_id,
             "parent_agent_id": self.parent_agent_id,
             "applied_user_intents": self.applied_user_intents,
-            "status": DynamicAgentSpawner::agent_status_trace_label(&self.status),
+            "applied_user_intents_coverage": if self.applied_user_intents.is_empty() { "unknown" } else { "partial" },
             "status_fingerprint": direct_child_result_fingerprint(&self.status, &self.applied_user_intents),
             "result": inline_result,
             "result_sha256": format!("{:x}", Sha256::digest(inline_result.as_bytes())),
@@ -1097,7 +1111,12 @@ impl DirectChildCompletion {
             "result_range": [0, inline_result.len(), result.len()],
             "result_truncated": inline_result.len() < result.len(),
             "get_result": {"action": "get_result", "agent_id": self.agent_id},
-        })
+        });
+        projection
+            .as_object_mut()
+            .expect("typed status projection is an object")
+            .extend(metadata.as_object().expect("metadata object").clone());
+        projection
     }
 }
 
@@ -1742,6 +1761,7 @@ fn durable_pre_durable_child_terminals(
                     "runtime" => AgentStatus::Cancelled {
                         by_user: false,
                         reason: reason.to_string(),
+                        partial_result: String::new(),
                     },
                     "unverified" => AgentStatus::Interrupted {
                         partial_result: String::new(),
@@ -1865,6 +1885,16 @@ fn agent_status_is_terminal(status: &AgentStatus) -> bool {
     )
 }
 
+pub(crate) fn durable_run_cancellation_origin(
+    run: &astra_services::runs::DurableRunRecord,
+) -> CancellationOrigin {
+    match durable_agent_status(run) {
+        AgentStatus::Cancelled { by_user: true, .. } => CancellationOrigin::User,
+        AgentStatus::Cancelled { by_user: false, .. } => CancellationOrigin::Runtime,
+        _ => CancellationOrigin::Unverified,
+    }
+}
+
 pub(crate) fn durable_agent_status(run: &astra_services::runs::DurableRunRecord) -> AgentStatus {
     // Completion text predates the richer applied-intent receipt. Restore the
     // durable result independently; missing optional guidance metadata must
@@ -1911,6 +1941,7 @@ pub(crate) fn durable_agent_status(run: &astra_services::runs::DurableRunRecord)
                 })
                 .unwrap_or_else(|| "durable child failed".into()),
             finish_reason: run.error_code.clone(),
+            partial_result: output,
         },
         astra_core::STATUS_CANCELLED => {
             let terminal =
@@ -1927,10 +1958,13 @@ pub(crate) fn durable_agent_status(run: &astra_services::runs::DurableRunRecord)
                 .and_then(|origin| origin.parse().ok())
                 .unwrap_or(CancellationOrigin::Unverified)
             {
-                CancellationOrigin::User => AgentStatus::cancelled_by_user(reason),
+                CancellationOrigin::User => {
+                    AgentStatus::cancelled_by_user(reason).with_partial_result(&output)
+                }
                 CancellationOrigin::Runtime => AgentStatus::Cancelled {
                     by_user: false,
                     reason: reason.to_string(),
+                    partial_result: output,
                 },
                 CancellationOrigin::Unverified => AgentStatus::Interrupted {
                     partial_result: output,
@@ -1966,10 +2000,21 @@ pub(crate) fn durable_agent_status(run: &astra_services::runs::DurableRunRecord)
 /// win, so cancellation/failure cannot be hidden by stale local success.
 fn reconciled_durable_agent_status(
     current: &AgentStatus,
+    current_generation: Option<u64>,
     run: &astra_services::runs::DurableRunRecord,
 ) -> AgentStatus {
     let durable = durable_agent_status(run);
     match (run.status.as_str(), current, &durable) {
+        (
+            astra_core::STATUS_CANCELLED,
+            AgentStatus::Cancelled { by_user: true, .. },
+            AgentStatus::Interrupted { finish_reason, .. },
+        ) if current_generation == Some(run.run_generation)
+            && finish_reason == CANCELLATION_ORIGIN_UNVERIFIED =>
+        {
+            current.clone()
+        }
+
         (
             astra_core::STATUS_COMPLETED,
             AgentStatus::Completed { result, .. },
@@ -1995,6 +2040,24 @@ fn reconciled_durable_agent_status(
                 partial_result: partial_result.clone(),
                 finish_reason: finish_reason.clone(),
             }
+        }
+        (
+            _,
+            AgentStatus::Failed { partial_result, .. }
+            | AgentStatus::Cancelled { partial_result, .. },
+            AgentStatus::Failed {
+                partial_result: incoming,
+                ..
+            }
+            | AgentStatus::Cancelled {
+                partial_result: incoming,
+                ..
+            },
+        ) if current_generation == Some(run.run_generation)
+            && !partial_result.is_empty()
+            && incoming.is_empty() =>
+        {
+            durable.with_partial_result(partial_result)
         }
         _ => durable,
     }
@@ -2075,7 +2138,9 @@ pub(crate) fn agent_status_to_progress_event(
                 reason: reason.clone(),
             })
         }
-        AgentStatus::Cancelled { by_user, reason } => Some(ProgressEventType::Cancelled {
+        AgentStatus::Cancelled {
+            by_user, reason, ..
+        } => Some(ProgressEventType::Cancelled {
             reason: if reason.is_empty() {
                 if *by_user {
                     "cancelled by user".to_string()
@@ -3778,7 +3843,10 @@ impl DynamicAgentSpawner {
         self.reconcile_durable_agent_runs_for(&[]).await
     }
 
-    async fn reconcile_durable_agent_runs_for(&self, run_ids: &[String]) -> Result<usize, String> {
+    pub(crate) async fn reconcile_durable_agent_runs_for(
+        &self,
+        run_ids: &[String],
+    ) -> Result<usize, String> {
         let _reconcile_guard = self.durable_reconcile_lock.lock().await;
         let Some(reconciler) = self.durable_reconciler.read().await.clone() else {
             return Ok(0);
@@ -3820,10 +3888,30 @@ impl DynamicAgentSpawner {
                 {
                     continue;
                 }
-                let status = reconciled_durable_agent_status(&state.status, run);
+                let status = reconciled_durable_agent_status(
+                    &state.status,
+                    state
+                        .committed_frontier
+                        .as_ref()
+                        .map(|frontier| frontier.run_generation),
+                    run,
+                );
                 let applied_user_intents = durable_child_delivery(run)
                     .map(|(_, intents)| intents)
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| {
+                        // Absence in the canonical projection is unknown, not
+                        // evidence that a confirmed same-generation change was unapplied.
+                        if state
+                            .committed_frontier
+                            .as_ref()
+                            .map(|frontier| frontier.run_generation)
+                            == Some(run.run_generation)
+                        {
+                            state.applied_user_intents.clone()
+                        } else {
+                            Vec::new()
+                        }
+                    });
                 let frontier = SpawnRunFrontier::from_durable(run);
                 if !child_observation_can_replace(
                     &state.status,
@@ -3836,6 +3924,9 @@ impl DynamicAgentSpawner {
                 if state.status == status
                     && state.applied_user_intents == applied_user_intents
                     && state.committed_frontier.as_ref() == Some(&frontier)
+                    && state.metrics.tool_calls >= run.total_tool_calls
+                    && state.metrics.prompt_tokens >= run.total_prompt_tokens
+                    && state.metrics.completion_tokens >= run.total_completion_tokens
                 {
                     continue;
                 }
@@ -3844,9 +3935,15 @@ impl DynamicAgentSpawner {
                 state.committed_frontier = Some(frontier);
                 state.work_revision = state.work_revision.saturating_add(1);
                 state.ended_at = durable_run_is_terminal(&run.status).then(SystemTime::now);
-                state.metrics.tool_calls = run.total_tool_calls;
-                state.metrics.prompt_tokens = run.total_prompt_tokens;
-                state.metrics.completion_tokens = run.total_completion_tokens;
+                // Same-run accounting is monotonic. A delayed observation
+                // may add evidence even when lifecycle and frontier agree.
+                state.metrics.tool_calls = state.metrics.tool_calls.max(run.total_tool_calls);
+                state.metrics.prompt_tokens =
+                    state.metrics.prompt_tokens.max(run.total_prompt_tokens);
+                state.metrics.completion_tokens = state
+                    .metrics
+                    .completion_tokens
+                    .max(run.total_completion_tokens);
                 if state.status.is_terminal()
                     && let Some(address) = state.messaging_address.take()
                 {
@@ -4909,7 +5006,14 @@ impl DynamicAgentSpawner {
                 if existing.run_id == state.run_id && existing.parent_run_id == state.parent_run_id
                 {
                     self.restore_direct_child_completion(&existing);
-                    let merged = reconciled_durable_agent_status(&existing.status, run);
+                    let merged = reconciled_durable_agent_status(
+                        &existing.status,
+                        existing
+                            .committed_frontier
+                            .as_ref()
+                            .map(|frontier| frontier.run_generation),
+                        run,
+                    );
                     if durable_child_terminal_is_authoritative(&merged) {
                         let mut corrected = existing.clone();
                         corrected.status = merged;
@@ -6770,10 +6874,8 @@ impl DynamicAgentSpawner {
             input.complexity.as_deref(),
             agent_def.max_turns,
         );
-        // Reuse the canonical runtime budget owner for the distinction between
-        // a renewable persona slice and an explicit hard control. There is no
-        // deployment ceiling in this context. Inherited runtime deadlines
-        // remain authoritative; the persona slice does not impose a hard cap.
+        // Freeze the persona's allowance with the shared budget owner.
+        // The inherited absolute deadline also bounds the child lifetime.
         let turn_budget =
             astra_turn_core::chat_turn_heuristics::resolve_spawned_agentic_turn_budget(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
@@ -8141,6 +8243,7 @@ impl DynamicAgentSpawner {
                     AgentStatus::Failed {
                         error: error.clone(),
                         finish_reason: Some("launch_failed".into()),
+                        partial_result: String::new(),
                     },
                     "failed",
                     Some("launch_failed"),
@@ -9369,16 +9472,21 @@ impl DynamicAgentSpawner {
             AgentStatus::Failed {
                 error,
                 finish_reason,
+                partial_result,
             } => (
                 SPAWN_STATUS_FAILED,
                 finish_reason.clone(),
-                None,
+                (!partial_result.is_empty()).then(|| partial_result.clone()),
                 Some(error.clone()),
             ),
-            AgentStatus::Cancelled { reason, .. } => (
+            AgentStatus::Cancelled {
+                reason,
+                partial_result,
+                ..
+            } => (
                 SPAWN_STATUS_CANCELLED,
                 Some(reason.clone()),
-                Some(reason.clone()),
+                (!partial_result.is_empty()).then(|| partial_result.clone()),
                 None,
             ),
             AgentStatus::Initializing
@@ -9435,6 +9543,7 @@ impl DynamicAgentSpawner {
                 AgentStatus::Failed {
                     error: error.to_string(),
                     finish_reason: finish_reason.map(str::to_string),
+                    partial_result: String::new(),
                 },
                 "failed",
                 finish_reason,
@@ -9472,19 +9581,21 @@ impl DynamicAgentSpawner {
             // Compete with deadline cancellation under the same handles ->
             // active lock order. Neither owner may remove half the lifecycle
             // pair and let the other overwrite a completed partial/result.
-            handles.remove(agent_id);
             let mut active_agents = self.active_agents.write().await;
             let Some(state) = active_agents.get_mut(agent_id) else {
+                handles.remove(agent_id);
                 return false;
             };
+            if run_result.is_some_and(|result| result.run_id != state.run_id) {
+                return false;
+            }
+            handles.remove(agent_id);
             if let Some(run_result) = run_result {
-                if run_result.run_id == state.run_id {
-                    state.applied_user_intents = run_result.applied_user_intents.clone();
-                }
-                state.committed_frontier =
-                    run_result.committed_frontier.clone().filter(|frontier| {
-                        frontier.run_id == state.run_id && run_result.run_id == state.run_id
-                    });
+                state.applied_user_intents = run_result.applied_user_intents.clone();
+                state.committed_frontier = run_result
+                    .committed_frontier
+                    .clone()
+                    .filter(|frontier| frontier.run_id == state.run_id);
                 state.metrics.turns_completed = run_result.turns_completed;
                 state.metrics.tool_calls = run_result.tool_calls;
                 state.metrics.prompt_tokens = run_result.prompt_tokens;
@@ -9781,8 +9892,13 @@ impl DynamicAgentSpawner {
                 .elapsed()
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or(0);
-            let metrics_completeness =
-                (status == "cancelled").then_some("unknown_after_forced_cancellation");
+            let metrics_completeness = Some(
+                if status == "cancelled" && state.metrics.coverage() == "unknown" {
+                    "unknown_after_forced_cancellation"
+                } else {
+                    state.metrics.coverage()
+                },
+            );
             astra_services::session_journal::JournalEvent::agent_terminated_with_metric_completeness(
                 Some(sid.as_str()),
                 &state.agent_id,
@@ -9802,7 +9918,9 @@ impl DynamicAgentSpawner {
         if let Some(metadata) = event.metadata.as_mut() {
             let output = match &state.status {
                 AgentStatus::Completed { result, .. } => Some(result),
-                AgentStatus::Interrupted { partial_result, .. } => Some(partial_result),
+                AgentStatus::Interrupted { partial_result, .. }
+                | AgentStatus::Failed { partial_result, .. }
+                | AgentStatus::Cancelled { partial_result, .. } => Some(partial_result),
                 _ => None,
             };
             if let Some(output) = output {
@@ -11013,6 +11131,7 @@ pub(crate) mod tests {
         child.status = AgentStatus::Failed {
             error: "durable failure".into(),
             finish_reason: None,
+            partial_result: String::new(),
         };
         parent.publish_direct_child(&child, false);
         assert!(!parent.has_pending_direct_children());
@@ -11032,6 +11151,7 @@ pub(crate) mod tests {
         child.status = AgentStatus::Failed {
             error: "durable failure".into(),
             finish_reason: None,
+            partial_result: String::new(),
         };
         parent.publish_direct_child(&child, true);
         assert!(!parent.has_pending_direct_children());
@@ -11105,8 +11225,9 @@ pub(crate) mod tests {
                 AgentStatus::Failed {
                     error: text.clone(),
                     finish_reason: Some(text.clone()),
+                    partial_result: String::new(),
                 },
-                json!(["failed", text, text]),
+                json!(["failed", text, text, ""]),
             ),
             (
                 AgentStatus::Waiting {
@@ -11124,8 +11245,9 @@ pub(crate) mod tests {
                 AgentStatus::Cancelled {
                     by_user: true,
                     reason: text.clone(),
+                    partial_result: String::new(),
                 },
-                json!(["cancelled", true, text]),
+                json!(["cancelled", true, text, ""]),
             ),
         ];
         for (status, previous_fields) in cases {
@@ -11628,6 +11750,7 @@ pub(crate) mod tests {
         child.status = AgentStatus::Cancelled {
             by_user: true,
             reason: "user cancelled".into(),
+            partial_result: String::new(),
         };
         spawner
             .publish_seized_agent_projection(&child, &child.agent_id, true)
@@ -11732,6 +11855,7 @@ pub(crate) mod tests {
                 child.status = AgentStatus::Failed {
                     error: "real child failure evidence".into(),
                     finish_reason: None,
+                    partial_result: String::new(),
                 };
                 spawner.publish_background_agent(&child);
             })
@@ -11747,7 +11871,7 @@ pub(crate) mod tests {
         );
         assert!(
             host.executed_volatile[1].iter().any(
-                |entry| entry.payload["children"][0]["result"] == "real child failure evidence"
+                |entry| entry.payload["children"][0]["error"] == "real child failure evidence"
             )
         );
         assert!(
@@ -11775,7 +11899,9 @@ pub(crate) mod tests {
         parent.register_direct_child(&child);
         let entered = Arc::new(tokio::sync::Notify::new());
         let token = Arc::new(tokio_util::sync::CancellationToken::new());
-        let mut host = MockHost::new(vec![text_result("Premature answer", 10, 5, None)]);
+        let mut partial_response = text_result("Premature answer", 10, 5, None);
+        partial_response.accum.model_item_id = Some("partial-before-cancel".into());
+        let mut host = MockHost::new(vec![partial_response]);
         host.direct_child_owner = Some(parent);
         host.child_wait_started = Some(entered.clone());
         let mut state = make_state();
@@ -11789,6 +11915,18 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(result.unwrap_err().kind, astra_core::ErrorKind::Cancelled);
+        assert_eq!(state.final_text, "Premature answer");
+        assert_eq!(
+            state.final_text_model_item_id.as_deref(),
+            Some("partial-before-cancel")
+        );
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message["role"] == "assistant"
+                    && message["content"] == "Premature answer")
+        );
         assert!(
             host.rendered_final_text
                 .iter()
@@ -11836,12 +11974,16 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(state.agentic_turn_budget.hard_turn_limit, hard_limit);
             assert!(state.interruption.is_some());
+            // The existing total allowance still permits the first reporting response;
+            // neither a child wait nor finalization may grant a second one.
+            let expected_partial = "Premature answer";
+            assert_eq!(state.final_text, expected_partial);
             assert!(
                 host.rendered_final_text
                     .iter()
-                    .all(|text| !text.contains("Premature"))
+                    .all(|text| text == expected_partial)
             );
-            assert!(state.llm_rounds_completed <= 1);
+            assert_eq!(state.llm_rounds_completed, 1);
         }
     }
 
@@ -11861,7 +12003,7 @@ pub(crate) mod tests {
         let result = parent.take_completed_direct_children().pop().unwrap();
         assert!(matches!(result.status, AgentStatus::Failed { .. }));
         assert!(
-            serde_json::to_value(result).unwrap()["result"]
+            serde_json::to_value(result).unwrap()["error"]
                 .as_str()
                 .unwrap()
                 .contains("executor panicked")
@@ -12561,7 +12703,10 @@ pub(crate) mod tests {
             finish_reason: Some("normal".to_string()),
         };
 
-        assert_eq!(reconciled_durable_agent_status(&current, &run), current);
+        assert_eq!(
+            reconciled_durable_agent_status(&current, None, &run),
+            current
+        );
     }
 
     #[test]
@@ -12582,7 +12727,7 @@ pub(crate) mod tests {
         };
 
         assert!(matches!(
-            reconciled_durable_agent_status(&current, &run),
+            reconciled_durable_agent_status(&current, None, &run),
             AgentStatus::Cancelled { .. }
         ));
     }
@@ -12979,9 +13124,11 @@ pub(crate) mod tests {
             host.rendered_final_text,
             vec!["Answer acknowledging recovered reviewer failure"]
         );
-        assert!(host.executed_volatile[1].iter().any(|entry| {
-            entry.payload["children"][0]["result"] == "recovered reviewer failed"
-        }));
+        assert!(
+            host.executed_volatile[1].iter().any(|entry| {
+                entry.payload["children"][0]["error"] == "recovered reviewer failed"
+            })
+        );
         assert!(!parent.has_pending_direct_children());
         spawner.reconcile_durable_agent_runs().await.unwrap();
         assert!(parent.take_completed_direct_children().is_empty());
@@ -14915,6 +15062,93 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn exact_incomplete_recovery_keeps_confirmed_applied_guidance_without_redelivery() {
+        for status in [astra_core::STATUS_FAILED, astra_core::STATUS_CANCELLED] {
+            let spawner = DynamicAgentSpawner::new(mock_router());
+            let parent = spawner.fanout_parent("root-run");
+            let mut root = durable_run("root-run", 0, astra_core::STATUS_RUNNING);
+            root.events.push(json!({
+                "type": "agent_spawned", "run_id": "child-run", "agent_id": "reviewer-1"
+            }));
+            let mut child = durable_run("child-run", 1, status);
+            bind_durable_child_identity(&mut child, "reviewer-1".into());
+            let intent = crate::turn::agentic_loop::host::AppliedUserIntent {
+                intent_id: "guidance-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 1,
+                content: "Preserve public API".into(),
+            };
+            child.events.push(json!({
+                "event_type": "text_done",
+                "data": {"full_text": "Retained findings", "applied_user_intents": [intent.clone()]}
+            }));
+            if status == astra_core::STATUS_CANCELLED {
+                child.events.push(json!({"event_type": "run_finished",
+                    "data": {"status": "cancelled", "cancellation_origin": "user"}}));
+            }
+            assert_eq!(
+                spawner
+                    .restore_durable_agent_runs(&[root.clone(), child.clone()])
+                    .await,
+                1
+            );
+            let delivered = parent.take_completed_direct_children();
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].applied_user_intents, vec![intent.clone()]);
+            let fingerprint = direct_child_result_fingerprint(
+                &delivered[0].status,
+                &delivered[0].applied_user_intents,
+            );
+            let text_done = child
+                .events
+                .iter_mut()
+                .find(|event| event["event_type"] == "text_done")
+                .unwrap();
+            assert!(
+                text_done["data"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("applied_user_intents")
+                    .is_some()
+            );
+            spawner
+                .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                    runs: vec![root.clone(), child.clone()],
+                }))
+                .await;
+            for _ in 0..2 {
+                spawner
+                    .reconcile_durable_agent_runs_for(std::slice::from_ref(&child.run_id))
+                    .await
+                    .unwrap();
+                let recovered = spawner.get_agent_state_any("reviewer-1").await.unwrap();
+                assert_eq!(recovered.applied_user_intents, vec![intent.clone()]);
+                assert_eq!(
+                    direct_child_result_fingerprint(
+                        &recovered.status,
+                        &recovered.applied_user_intents
+                    ),
+                    fingerprint
+                );
+                assert!(
+                    parent.take_completed_direct_children().is_empty(),
+                    "missing metadata must not redeliver a degraded completion"
+                );
+            }
+            let cold = DynamicAgentSpawner::new(mock_router());
+            let cold_parent = cold.fanout_parent("root-run");
+            assert_eq!(cold.restore_durable_agent_runs(&[root, child]).await, 1);
+            let cold_results = cold_parent.take_completed_direct_children();
+            assert_eq!(cold_results.len(), 1);
+            assert_eq!(
+                cold_results[0].notification(4096)["applied_user_intents_coverage"],
+                "unknown"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn durable_reconciliation_converges_remote_waiting_child_to_completion() {
         let spawner = DynamicAgentSpawner::new(mock_router());
         let mut root = durable_run("root-run", 0, astra_core::STATUS_RUNNING);
@@ -14956,7 +15190,7 @@ pub(crate) mod tests {
         }));
         spawner
             .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
-                runs: vec![completed],
+                runs: vec![completed.clone()],
             }))
             .await;
 
@@ -14976,6 +15210,27 @@ pub(crate) mod tests {
             .expect("completed fanout group");
         assert_eq!(group.status, AgentFanoutStatus::Finished);
         assert_eq!(group.slots[0].status, AgentFanoutSlotStatus::Completed);
+        completed.total_tool_calls = 17;
+        completed.total_prompt_tokens = 25;
+        completed.total_completion_tokens = 13;
+        spawner
+            .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                runs: vec![completed],
+            }))
+            .await;
+        assert_eq!(
+            spawner.reconcile_durable_agent_runs().await.unwrap(),
+            1,
+            "unchanged terminal status and cursor must not hide late accounting"
+        );
+        let refreshed = spawner.get_agent_state_any("reviewer-1").await.unwrap();
+        assert_eq!(refreshed.metrics.tool_calls, 17);
+        assert_eq!(refreshed.metrics.prompt_tokens, 25);
+        assert_eq!(
+            spawner.reconcile_durable_agent_runs().await.unwrap(),
+            0,
+            "a repeated read must not create another lifecycle revision"
+        );
     }
 
     #[tokio::test]
@@ -16463,13 +16718,28 @@ pub(crate) mod tests {
             AgentStatus::Cancelled {
                 by_user: true,
                 ref reason,
-            } if reason == "user cancelled ancestor run"
+             ..} if reason == "user cancelled ancestor run"
         ));
         assert_eq!(
             project_agent_status_to_fanout_slot(&user_cancelled).status,
             AgentFanoutSlotStatus::CancelledByUser,
             "the live terminal and fanout aggregate must share the typed user origin"
         );
+
+        let payload: serde_json::Value = serde_json::from_str(
+            &astra_turn_core::orchestration::agent_result_wire::render_wait_for_agent_status(
+                "a1",
+                &user_cancelled,
+            ),
+        )
+        .unwrap();
+        assert_eq!(payload["result"], "partial child evidence");
+        let failed = SpawnRunResult {
+            status: SPAWN_STATUS_FAILED.into(),
+            ..cancelled.clone()
+        };
+        assert!(matches!(spawn_run_result_to_agent_status(&failed),
+            AgentStatus::Failed { partial_result, .. } if partial_result == "partial child evidence"));
 
         let runtime_cancelled = SpawnRunResult {
             cancellation_origin: CancellationOrigin::Runtime,
@@ -16482,7 +16752,7 @@ pub(crate) mod tests {
             AgentStatus::Cancelled {
                 by_user: false,
                 ref reason,
-            } if reason == "fanout deadline"
+             ..} if reason == "fanout deadline"
         ));
         assert_eq!(
             project_agent_status_to_fanout_slot(&runtime_status).status,
@@ -18354,7 +18624,7 @@ pub(crate) mod tests {
             .expect("terminal child remains queryable");
         assert!(matches!(
             state.status,
-            AgentStatus::Cancelled { by_user: true, ref reason }
+            AgentStatus::Cancelled { by_user: true, ref reason , ..}
                 if reason == "user explicitly stopped agent"
         ));
         let group = spawner
@@ -21550,7 +21820,9 @@ pub(crate) mod tests {
             .await
             .expect("cancelled agent should remain queryable");
         match &archived.status {
-            AgentStatus::Cancelled { by_user, reason } => {
+            AgentStatus::Cancelled {
+                by_user, reason, ..
+            } => {
                 assert!(
                     *by_user,
                     "cancel_agent → wire output must report by_user=true so the LLM stops respawning"
@@ -22216,7 +22488,7 @@ pub(crate) mod tests {
                 AgentStatus::Cancelled {
                     by_user: true,
                     ref reason,
-                } if reason == DescendantCancellationReason::ancestor_cancelled(
+                 ..} if reason == DescendantCancellationReason::ancestor_cancelled(
                     CancellationOrigin::User,
                 ).as_str()
             ));
@@ -23317,6 +23589,7 @@ pub(crate) mod tests {
                     AgentStatus::Cancelled {
                         by_user: self.winner_by_user,
                         reason: "opposite durable cancellation winner".to_string(),
+                        partial_result: String::new(),
                     },
                 ))
             }
@@ -23685,7 +23958,7 @@ pub(crate) mod tests {
             .expect("durable Terminal must reach the parent completion owner");
         assert!(matches!(
             parent_result.status,
-            AgentStatus::Cancelled { by_user: true, ref reason }
+            AgentStatus::Cancelled { by_user: true, ref reason , ..}
                 if reason == "user stopped pending fanout"
         ));
         assert!(

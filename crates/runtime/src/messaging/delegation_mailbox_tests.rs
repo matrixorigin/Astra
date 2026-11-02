@@ -83,6 +83,7 @@ mod tests {
                     .await;
 
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id,
                         run_id,
@@ -98,6 +99,7 @@ mod tests {
                 })
             } else {
                 Ok(SubRunExecutionResult {
+                    cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                     result: AgentResult {
                         agent_id,
                         run_id,

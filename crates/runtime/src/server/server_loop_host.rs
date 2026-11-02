@@ -3972,6 +3972,18 @@ fn validate_handoff_tool_history(
             previous_round = Some(round);
         }
         let Some(reference) = &entry.completion else {
+            if entry.record.was_executed()
+                && crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
+                    &entry.record.name,
+                    entry
+                        .record
+                        .authoritative_args_full()
+                        .and_then(|args| serde_json::from_str::<Value>(args).ok())
+                        .as_ref(),
+                )
+            {
+                return Err("handoff side-effecting invocation has no execution reference");
+            }
             continue;
         };
         let identity = reference.identity();
@@ -9630,9 +9642,6 @@ impl ServerAgenticLoopHost {
                     // explicit limits, hard ceiling, and later evidence-based
                     // renewals remain unchanged.
                     if intent.requires_workspace_mutation() {
-                        crate::turn::agentic_loop::lifecycle::promote_fallback_budget_for_authoritative_mutation(
-                            state,
-                        );
                         state.task_profile.mutates_workspace = true;
                         state.task_profile.verification_required = true;
                     } else {
@@ -10054,20 +10063,6 @@ impl ServerAgenticLoopHost {
         state.turn_guard.set_task_profile(state.task_profile);
         if let Some(executor) = state.runtime_tool_executor.as_deref() {
             executor.set_workspace_mutation_intent(WorkspaceMutationIntent::ReadOnly);
-        }
-        if state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .is_some_and(|window| {
-                matches!(
-                    window.action,
-                    crate::turn::agentic_loop::host::CompletionAction::RequiredWorkspaceMutation
-                )
-            })
-        {
-            state.hooks.completion_settlement.completion_action_window = None;
         }
     }
 
@@ -24038,7 +24033,9 @@ mod tests {
 
         settlement.work_settlement_only = false;
         settlement.completion_action_window = Some(astra_turn_types::CompletionActionWindow {
-            action: astra_turn_types::CompletionAction::CompletionTaskAction,
+            action: astra_turn_types::CompletionAction::ExplicitVerification {
+                missing_labels: vec!["required check".into()],
+            },
             attempts_remaining: 1,
             mismatch_corrections_remaining: 1,
             consumed: false,
@@ -24321,7 +24318,7 @@ mod tests {
         // (1800 seconds). That is a ceiling, not the default for an omitted
         // timeout: admission must use the same command-specific default as the
         // workspace Edge executor, then reserve process settlement time.
-        assert_eq!(host.edge_execution_timeout_ms("bash", &bash), 5_000);
+        assert_eq!(host.edge_execution_timeout_ms("bash", &bash), 15_000);
         assert_eq!(
             host.edge_execution_timeout_ms("bash", &build),
             120_000,
@@ -24329,7 +24326,7 @@ mod tests {
         );
         assert_eq!(
             host.clamped_edge_execution_timeout_ms("bash", &bash),
-            Some(35_000)
+            Some(45_000)
         );
         assert_eq!(
             host.clamped_edge_execution_timeout_ms("write_file", &write_file),
@@ -24352,10 +24349,10 @@ mod tests {
         // The workspace Edge resolver gives this unrecognized first command
         // the existing 30-second fallback. Admission adds 30 seconds for
         // process settlement while preserving the final-response reserve.
-        assert_eq!(host.edge_execution_timeout_ms("bash", &args), 30_000);
+        assert_eq!(host.edge_execution_timeout_ms("bash", &args), 15_000);
         assert_eq!(
             host.clamped_edge_execution_timeout_ms("bash", &args),
-            Some(60_000)
+            Some(45_000)
         );
 
         let below_safe_budget = test_host_builder(
@@ -24364,7 +24361,7 @@ mod tests {
         )
         .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .with_execution_time_budget(Some(ExecutionTimeBudget {
-            remaining_seconds: 89,
+            remaining_seconds: 70,
         }))
         .build();
         assert_eq!(
@@ -24405,7 +24402,7 @@ mod tests {
 
         // A direct structured writer has no process group to reap. It keeps
         // the full 120-second callback budget plus its short receipt reserve.
-        // A short Bash command uses its actual five-second executor default
+        // A short Bash command uses its actual shared executor default
         // plus process settlement and also fits without consuming the model
         // convergence reserve.
         assert_eq!(
@@ -24414,7 +24411,7 @@ mod tests {
         );
         assert_eq!(
             host.clamped_edge_execution_timeout_ms("bash", &bash),
-            Some(35_000)
+            Some(45_000)
         );
     }
 
@@ -34070,26 +34067,31 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn capability_source_production_loop_tools_shared_binding() {
         assert_capability_source_production_loop(false, false, false);
     }
 
     #[test]
+    #[serial_test::serial]
     fn capability_source_production_loop_tools_distinct_bindings() {
         assert_capability_source_production_loop(false, true, false);
     }
 
     #[test]
+    #[serial_test::serial]
     fn capability_source_production_loop_skills_shared_binding() {
         assert_capability_source_production_loop(true, false, false);
     }
 
     #[test]
+    #[serial_test::serial]
     fn capability_source_production_loop_skills_distinct_bindings() {
         assert_capability_source_production_loop(true, true, false);
     }
 
     #[test]
+    #[serial_test::serial]
     fn capability_source_production_loop_large_schema() {
         assert_capability_source_production_loop(false, false, true);
     }
@@ -42397,16 +42399,22 @@ mod tests {
                 None,
                 None,
             );
-        assert!(state.agentic_turn_budget.extension_turns > 1);
+
         state.max_turns = state.agentic_turn_budget.initial_turns;
         let old_limit = state.max_turns;
         state.remaining_turns = 0;
-        let error =
+        let prepared =
             crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 2)
                 .await
-                .err()
-                .expect("repeated refusals exhaust the execution budget");
-        assert!(error.to_string().contains("Turn budget exhausted"));
+                .expect("exhaustion produces a truthful terminal");
+        assert!(matches!(
+            prepared,
+            crate::turn::agentic_loop::lifecycle::PreparedTurnIteration::Finished(_)
+        ));
+        assert_eq!(
+            state.interruption.as_ref().unwrap().kind,
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted
+        );
         assert_eq!(
             state.max_turns, old_limit,
             "rejected repetition cannot renew execution indefinitely"
@@ -42799,6 +42807,45 @@ mod tests {
     }
 
     #[test]
+    fn handoff_rejects_an_unbound_side_effect_without_any_named_verification_contract() {
+        use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
+        let mut history = vec![HistoricalToolCallContinuation {
+            record: ToolCallRecord {
+                name: "write_file".into(),
+                round: Some(0),
+                disposition: Some(ToolCallDisposition::Executed),
+                args_full: Some(json!({"path":"out", "content":"data"}).to_string()),
+                ..Default::default()
+            },
+            completion: None,
+        }];
+        assert!(
+            validate_handoff_tool_history(
+                &history,
+                "user",
+                "session",
+                "run",
+                Some("chain"),
+                Some(1)
+            )
+            .is_err()
+        );
+        history[0].record.disposition = Some(ToolCallDisposition::Rejected);
+        assert!(
+            validate_handoff_tool_history(
+                &history,
+                "user",
+                "session",
+                "run",
+                Some("chain"),
+                Some(1)
+            )
+            .is_ok(),
+            "a proven pre-dispatch rejection does not invent physical execution"
+        );
+    }
+
+    #[test]
     fn deferred_pending_receipt_closes_only_the_current_turn_effect_obligation() {
         let mut host = test_host_builder("u-defer-receipt", "s-defer-receipt").build();
         host.pending_work_establishment = Some(PendingWorkEstablishment {
@@ -42818,15 +42865,6 @@ mod tests {
         });
         state.task_profile.mutates_workspace = true;
         state.task_profile.verification_required = true;
-        state.hooks.completion_settlement.completion_action_window =
-            Some(crate::turn::agentic_loop::host::CompletionActionWindow {
-                action:
-                    crate::turn::agentic_loop::host::CompletionAction::RequiredWorkspaceMutation,
-                attempts_remaining: 1,
-                mismatch_corrections_remaining: 1,
-                consumed: false,
-                matched: false,
-            });
         state
             .stall
             .tool_call_records
@@ -43069,12 +43107,7 @@ mod tests {
                     Mutation::MustMutate
                 }
             );
-            if scope == Scope::Unknown {
-                assert_ne!(
-                    crate::turn::agentic_loop::execution_phase::pending_completion_action(&state).unwrap(),
-                    Some(crate::turn::agentic_loop::host::CompletionAction::RequiredWorkspaceMutation),
-                );
-            }
+            if scope == Scope::Unknown {}
         }
     }
 
@@ -43138,7 +43171,7 @@ mod tests {
     }
 
     #[test]
-    fn work_mutation_admission_reconciles_only_the_untouched_fallback_initial_slice() {
+    fn work_mutation_admission_does_not_expand_the_admitted_allowance() {
         let mut host = test_host_builder("u-work-budget", "s-work-budget").build();
         host.pending_work_admission = Some(
             astra_services::WorkAdmissionDecision::Required {
@@ -43172,8 +43205,8 @@ mod tests {
 
         host.flush_completed_work_admission_phase(&mut state);
 
-        assert_eq!(state.max_turns, 32);
-        assert_eq!(state.remaining_turns, 27);
+        assert_eq!(state.max_turns, 24);
+        assert_eq!(state.remaining_turns, 19);
         assert_eq!(state.agentic_turn_budget.hard_turn_limit, hard_limit);
         assert!(state.task_profile.mutates_workspace);
         assert!(state.task_profile.verification_required);
@@ -47624,9 +47657,19 @@ mod tests {
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .build();
         let mut state = create_test_state();
+        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
+            label: "required check".into(),
+            command: "git diff --stat".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        }];
         state.hooks.completion_settlement.completion_action_window =
             Some(crate::turn::agentic_loop::host::CompletionActionWindow {
-                action: crate::turn::agentic_loop::host::CompletionAction::PostMutationObservation,
+                action: crate::turn::agentic_loop::host::CompletionAction::ExplicitVerification {
+                    missing_labels: vec!["required check".into()],
+                },
                 attempts_remaining: 1,
                 mismatch_corrections_remaining: 1,
                 consumed: false,
@@ -47670,9 +47713,19 @@ mod tests {
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .build();
         let mut state = create_test_state();
+        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
+            label: "required check".into(),
+            command: "git diff --stat".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        }];
         state.hooks.completion_settlement.completion_action_window =
             Some(crate::turn::agentic_loop::host::CompletionActionWindow {
-                action: crate::turn::agentic_loop::host::CompletionAction::PostMutationObservation,
+                action: crate::turn::agentic_loop::host::CompletionAction::ExplicitVerification {
+                    missing_labels: vec!["required check".into()],
+                },
                 attempts_remaining: 1,
                 mismatch_corrections_remaining: 1,
                 consumed: false,
@@ -47707,7 +47760,7 @@ mod tests {
             std::slice::from_ref(&wrong),
         );
         assert!(common.completion_action_applied);
-        assert_eq!(state.max_turns, max_before + 1);
+        assert_eq!(state.max_turns, max_before);
         let window = state
             .hooks
             .completion_settlement
@@ -47752,7 +47805,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|window| window.consumed && window.matched)
         );
-        assert_eq!(state.max_turns, max_before + 1);
+        assert_eq!(state.max_turns, max_before);
     }
 
     #[test]
@@ -50379,9 +50432,19 @@ mod tests {
         let mut state = create_durable_execution_test_state(session_id);
         state.message = "finish the edit".to_string();
         state.user_intent = state.message.clone();
+        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
+            label: "required check".into(),
+            command: "cargo test".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        }];
         state.hooks.completion_settlement.completion_action_window =
             Some(crate::turn::agentic_loop::host::CompletionActionWindow {
-                action: crate::turn::agentic_loop::host::CompletionAction::PostMutationObservation,
+                action: crate::turn::agentic_loop::host::CompletionAction::ExplicitVerification {
+                    missing_labels: vec!["required check".into()],
+                },
                 attempts_remaining: 1,
                 mismatch_corrections_remaining: 0,
                 consumed: false,

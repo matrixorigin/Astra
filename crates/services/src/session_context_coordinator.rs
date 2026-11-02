@@ -5025,7 +5025,7 @@ where
 /// A physical workspace is intentionally absent from this proof: independent
 /// Sessions may share it, while each Session's own execution state remains
 /// fenced by its Session head, Run ownership, invocation custody and binding generation.
-async fn locked_execution_reuse_blocker(
+pub(crate) async fn locked_execution_reuse_blocker(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
 ) -> Result<Option<SessionExecutionBlocker>, SessionContextCoordinatorError> {

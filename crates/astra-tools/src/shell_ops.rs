@@ -183,12 +183,11 @@ pub(crate) fn classify_bash_command(command: &str) -> BashCommandClass {
     // Flatten all pipeline segments so `cargo fmt && cargo clippy` picks the
     // *slowest* class among its parts (Lint > Build). This matches user intent:
     // the chain is only as fast as its slowest step.
-    let mut worst = BashCommandClass::Unknown;
-    for segment in split_command_segments(command) {
-        let class = classify_single_segment(segment);
-        worst = max_class(worst, class);
-    }
-    worst
+    split_command_segments(command)
+        .into_iter()
+        .map(classify_single_segment)
+        .reduce(max_class)
+        .unwrap_or(BashCommandClass::Unknown)
 }
 
 /// Split on `&&`, `||`, `;`, and `|` — any control operator that sequences
@@ -197,7 +196,7 @@ pub(crate) fn classify_bash_command(command: &str) -> BashCommandClass {
 fn split_command_segments(command: &str) -> Vec<&str> {
     // Keep it simple: split on the common operators. `|` inside quoted args
     // (`grep 'a|b'`) would misclassify but wouldn't break: worst case a
-    // benign fragment gets classified as Unknown and is ignored.
+    // benign fragment gets a conservative Unknown timeout.
     command
         .split(';')
         .flat_map(|s| s.split("&&"))
@@ -375,11 +374,11 @@ fn is_env_name(s: &str) -> bool {
 }
 
 fn max_class(a: BashCommandClass, b: BashCommandClass) -> BashCommandClass {
-    // Order by worst-case duration: Package/Test > Lint > Build > Fast > Unknown.
-    // Unknown ranks below Fast so a classified segment always wins over noise.
+    // Order by worst-case duration: Package/Test > Lint > Build/Unknown > Fast.
+    // An unknown executable retains its own default even after a fast prefix.
     fn rank(c: BashCommandClass) -> u8 {
         match c {
-            BashCommandClass::Unknown => 0,
+            BashCommandClass::Unknown => 2,
             BashCommandClass::Fast => 1,
             BashCommandClass::Build => 2,
             BashCommandClass::Lint => 3,
@@ -396,33 +395,10 @@ pub(crate) fn default_bash_timeout_for(command: &str) -> f64 {
     classify_bash_command(command).default_timeout_secs()
 }
 
-/// Resolve the timeout used by the workspace Edge Bash executor when callers
-/// omit `timeout`. Server-side admission uses the same value so it reserves
-/// enough time to execute and settle the command without rejecting short
-/// commands against the generic server ceiling.
+/// Use the same compound-aware timeout default for local and remote Bash.
+/// Explicit invocation and run limits are applied by the caller.
 pub fn workspace_edge_bash_timeout_secs(command: &str) -> f64 {
-    let cmd_base = command.split_whitespace().next().unwrap_or("");
-    match cmd_base {
-        // Instant commands that perform no meaningful I/O.
-        "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "date" | "basename"
-        | "dirname" | "which" | "env" | "hostname" | "uname" | "id" | "tty" | "nproc" | "arch"
-        | "yes" => 5.0,
-        // Single-file and directory reads.
-        "cat" | "head" | "tail" | "wc" | "stat" | "file" | "ls" | "readlink" | "realpath"
-        | "md5sum" | "sha256sum" | "du" | "df" | "touch" | "mkdir" | "cp" | "mv" | "rm" | "ln"
-        | "chmod" | "chown" => 10.0,
-        // Search and traversal commands.
-        "grep" | "rg" | "find" | "fd" | "ag" | "awk" | "sed" | "sort" | "uniq" | "cut" | "tr"
-        | "diff" | "comm" | "xargs" | "tree" | "jq" | "yq" | "column" | "tee" => 15.0,
-        // Build, test, package, and container commands retain the established
-        // bounded 120-second Edge default; callers can explicitly request
-        // more when the run budget permits.
-        "cargo" | "make" | "go" | "mvn" | "gradle" | "pytest" | "pnpm" | "yarn" | "npm" | "pip"
-        | "uv" | "cmake" | "tox" | "bazel" | "ninja" | "docker" | "podman" | "docker-compose"
-        | "nerdctl" | "buildah" => 120.0,
-        // Network and unrecognized commands retain the bounded fallback.
-        _ => 30.0,
-    }
+    default_bash_timeout_for(command)
 }
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
@@ -4779,6 +4755,23 @@ mod tests {
     }
 
     #[test]
+    fn fast_prefix_never_shortens_an_unknown_executable() {
+        for command in [
+            "./custom-command",
+            "cd /workspace && ./custom-command",
+            "pwd; ./custom-command",
+            "echo 'a && b' && ./custom-command",
+        ] {
+            assert_eq!(
+                workspace_edge_bash_timeout_secs(command),
+                DEFAULT_BASH_TIMEOUT_SECS,
+                "{command}"
+            );
+        }
+        assert_eq!(workspace_edge_bash_timeout_secs("echo ready && pwd"), 15.0);
+    }
+
+    #[test]
     fn grep_compacts_single_line_json_matches_before_output_limit() {
         let long_json_line = format!("artifact.json:1:{}", "{\"key\":\"value\"}".repeat(200));
 
@@ -8058,6 +8051,27 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn workspace_timeout_uses_the_same_resolver_for_compound_commands() {
+        for command in [
+            "make check",
+            "cd /workspace && make check",
+            "FOO=1 cargo test",
+            "cargo test | tee /tmp/result",
+            "echo ready",
+        ] {
+            assert_eq!(
+                workspace_edge_bash_timeout_secs(command),
+                default_bash_timeout_for(command),
+                "{command}"
+            );
+        }
+        assert!(
+            workspace_edge_bash_timeout_secs("cd /workspace && make check")
+                >= workspace_edge_bash_timeout_secs("make check")
+        );
+    }
+
+    #[test]
     fn default_timeouts_are_sensible_and_monotonic() {
         use super::BashCommandClass::*;
         // Fast < Build < Lint <= Test, Package
@@ -8076,15 +8090,15 @@ printf 'probe.txt:1:needle\n'
 
     #[test]
     fn workspace_edge_timeout_preserves_executor_defaults_for_server_admission() {
-        assert_eq!(workspace_edge_bash_timeout_secs("echo hello"), 5.0);
-        assert_eq!(workspace_edge_bash_timeout_secs("ls -la"), 10.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("echo hello"), 15.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("ls -la"), 15.0);
         assert_eq!(workspace_edge_bash_timeout_secs("rg --files"), 15.0);
-        assert_eq!(workspace_edge_bash_timeout_secs("cargo test --lib"), 120.0);
-        assert_eq!(workspace_edge_bash_timeout_secs("./review.sh"), 30.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("cargo test --lib"), 600.0);
+        assert_eq!(workspace_edge_bash_timeout_secs("./review.sh"), 120.0);
         assert_eq!(
             workspace_edge_bash_timeout_secs("cd /tmp && git show HEAD:README.md"),
-            30.0,
-            "compound commands retain the executor's first-command fallback"
+            15.0,
+            "compound commands use the shared classifier rather than a first-word fallback"
         );
     }
 

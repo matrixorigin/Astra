@@ -1283,6 +1283,28 @@ impl SessionService for DatabaseSessionService {
             (Some(_), Some(_)) => unreachable!("validated above"),
         };
 
+        if status.as_deref() == Some(astra_core::STATUS_CANCELLED) {
+            let key = astra_turn_types::SessionKeyV1::owner_session(
+                "server",
+                &user_id,
+                &session_id,
+                astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+            );
+            // Recheck under the same Session/admission fence as this status
+            // write. A stale HTTP observation cannot cancel a newly admitted Run.
+            let blocker =
+                crate::session_context_coordinator::locked_execution_reuse_blocker(&mut tx, &key)
+                    .await
+                    .map_err(|error| internal_error(error.to_string()))?;
+            if blocker.is_some() {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "Session execution changed; repeat the cancellation command",
+                    "cancellation_recovery_required",
+                ));
+            }
+        }
+
         let mut update_query =
             QueryBuilder::<MySql>::new("UPDATE agent_sessions SET updated_at = NOW()");
         if let Some(title) = &title {

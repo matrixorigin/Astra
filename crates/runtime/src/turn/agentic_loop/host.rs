@@ -6413,6 +6413,7 @@ pub(crate) mod tests {
         pub(crate) handoff_accepted: bool,
         pub(crate) handoff_snapshots: Vec<astra_pipeline::step_protocol::HeavyCheckpoint>,
         turn_results: Vec<HostTurnResult>,
+        pub(crate) terminal_provider_error: Option<astra_core::ClassifiedError>,
         admitted_results_by_turn: Vec<Vec<EdgeToolExecResult>>,
         current_turn: usize,
         pub(crate) provider_call_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -6479,6 +6480,7 @@ pub(crate) mod tests {
                 handoff_accepted: false,
                 handoff_snapshots: Vec::new(),
                 turn_results,
+                terminal_provider_error: None,
                 admitted_results_by_turn,
                 current_turn: 0,
                 valid_tools: HashSet::new(),
@@ -6730,6 +6732,10 @@ pub(crate) mod tests {
             state: &mut AgenticLoopState,
         ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
             if self.turn_results.is_empty() {
+                if let Some(error) = self.terminal_provider_error.take() {
+                    self.current_turn += 1;
+                    return Err(error);
+                }
                 return Err(astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::BudgetExhausted,
                     "no more turns",
@@ -6962,6 +6968,23 @@ pub(crate) mod tests {
     }
 
     // ── Result builders ─────────────────────────────────────────────────────
+
+    pub(crate) fn failed_partial_host(kind: astra_core::ErrorKind, partial: &str) -> MockHost {
+        let mut first = edge_tool_result(
+            vec![make_edge_tool("read_file", "observed source")],
+            10,
+            5,
+            None,
+        );
+        first.accum.full_text = "Older provider answer".into();
+        first.accum.model_item_id = Some("provider-item-A".into());
+        let mut host = MockHost::new(vec![first]);
+        host.terminal_provider_error = Some(
+            astra_core::ClassifiedError::new(kind, "stream ended after partial output")
+                .with_details_json(serde_json::json!({"partial_full_text":partial}).to_string()),
+        );
+        host
+    }
 
     pub(crate) fn text_result(
         text: &str,
@@ -7406,21 +7429,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn verified_workspace_observation() -> EdgeToolExecResult {
-        let mut result = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "test -f src/lib.rs", "mode": "verify"}),
-            "workspace verified",
-        );
-        result.request_id = "req-bash-verify".into();
-        result
-            .tool_result_fields
-            .as_mut()
-            .expect("test edge result has owner metadata")
-            .extend(astra_tools::workspace_observation::explicit_workspace_verification_receipt());
-        result
-    }
-
     fn make_shell_task_output_observation(
         task_id: &str,
         mode: &str,
@@ -7786,23 +7794,56 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn budget_exhausted_returns_error() {
+    async fn exhausted_budget_closes_without_another_provider_request() {
         let mut host = MockHost::new(vec![]);
         let mut state = make_state();
         state.max_turns = 25;
         state.remaining_turns = 0;
-        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(25);
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
+            25,
+            std::num::NonZeroUsize::new(25),
+        );
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_err());
-        let err = outcome.unwrap_err();
-        assert!(
-            err.message.contains("budget"),
-            "should mention budget: {err}"
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+        assert_eq!(host.turn_count(), 0);
+        assert_eq!(state.max_turns, 25);
+        assert_eq!(state.remaining_turns, 0);
+        assert_eq!(
+            state.interruption.as_ref().unwrap().kind,
+            astra_turn_core::interruption::InterruptionKind::BudgetExhausted
         );
-        assert!(
-            err.message.contains("budget: 25"),
-            "should show max_turns as budget: {err}"
-        );
+        assert!(!state.final_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn useful_activity_never_renews_the_admitted_round_allowance() {
+        for tool in ["read_file", "write_file", "bash"] {
+            let mut host = MockHost::new(vec![
+                edge_tool_result(vec![make_edge_tool(tool, "useful result")], 10, 2, None),
+                text_result("Retained result and remaining gaps.", 10, 2, None),
+                text_result(
+                    "This response is outside the admitted allowance.",
+                    10,
+                    2,
+                    None,
+                ),
+            ])
+            .with_valid_tools(&[tool]);
+            let mut state = make_state();
+            state.agentic_turn_budget =
+                astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
+                    2,
+                    std::num::NonZeroUsize::new(2),
+                );
+            state.max_turns = 2;
+            state.remaining_turns = 2;
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok(), "{tool}: {outcome:?}");
+            assert_eq!(host.turn_count(), 2, "{tool}");
+            assert_eq!(state.max_turns, 2);
+            assert_eq!(state.final_text, "Retained result and remaining gaps.");
+            assert_eq!(state.stall.tool_call_records.len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -7982,10 +8023,11 @@ pub(crate) mod tests {
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 15,
             hard_turn_limit: std::num::NonZeroUsize::new(15),
-            extension_turns: 0,
         };
         state.max_turns = 15;
         state.remaining_turns = 0;
+        state.hooks.completion_settlement.latest_provider_text =
+            Some("partial progress summary".into());
         state.total_tool_calls = 3;
         state.total_prompt = 120;
         state.stall.tool_call_records = vec![
@@ -8001,6 +8043,11 @@ pub(crate) mod tests {
             Some(astra_turn_core::interruption::InterruptionKind::BudgetExhausted)
         );
         assert_eq!(state.final_text, "partial progress summary");
+        assert_eq!(
+            host.turn_count(),
+            0,
+            "exhaustion preserves recorded output without another inference"
+        );
         assert_eq!(host.rendered_final_text.last(), Some(&state.final_text));
     }
 
@@ -8452,56 +8499,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn stop_after_success_waits_for_bounded_post_mutation_observation() {
-        let write =
-            make_edge_tool_with_args("write_file", json!({"path": "src/output.txt"}), "written");
-        let read =
-            make_edge_tool_with_args("read_file", json!({"path": "src/output.txt"}), "verified");
-        let mut host = MockHost::new(vec![
-            edge_tool_result(vec![write], 0, 0, Some(50)),
-            edge_tool_result(vec![read], 0, 0, Some(30)),
-        ])
-        .with_stop_after_success_completion("write_file", Some("done"));
-        let mut state = make_state();
-        state.task_profile = structured_task_profile(
-            true,
-            false,
-            astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-        );
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.hooks.completion_settlement.completion_action_window = Some(CompletionActionWindow {
-            action: CompletionAction::RequiredWorkspaceMutation,
-            attempts_remaining: 1,
-            mismatch_corrections_remaining: 1,
-            consumed: false,
-            matched: false,
-        });
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert!(
-            outcome.is_ok(),
-            "expected bounded observation chain: {outcome:?}"
-        );
-        assert_eq!(host.current_turn, 2, "the write must not finalize the turn");
-        assert_eq!(state.final_text, "done");
-        assert_eq!(host.rendered_final_text, vec!["done".to_string()]);
-        assert!(state.interruption.is_none());
-        assert!(
-            state.stall.tool_call_records.iter().any(|record| {
-                record.name == "write_file" && record.was_executed() && record.ok
-            })
-        );
-        assert!(
-            state
-                .stall
-                .tool_call_records
-                .iter()
-                .any(|record| { record.name == "read_file" && record.was_executed() && record.ok })
-        );
-    }
-
-    #[tokio::test]
     async fn edge_completion_window_accepts_independent_verifier_batch() {
         let write =
             make_edge_tool_with_args("write_file", json!({"path": "src/output.txt"}), "written");
@@ -8552,13 +8549,6 @@ pub(crate) mod tests {
                 authoritative: true,
             },
         ];
-        state.hooks.completion_settlement.completion_action_window = Some(CompletionActionWindow {
-            action: CompletionAction::RequiredWorkspaceMutation,
-            attempts_remaining: 1,
-            mismatch_corrections_remaining: 1,
-            consumed: false,
-            matched: false,
-        });
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
@@ -8622,7 +8612,7 @@ pub(crate) mod tests {
             "done",
             "interruption={:?}; evidence={:?}; pending={:?}",
             state.interruption,
-            super::super::execution_phase::checked_completion_evidence(&state),
+            super::super::execution_phase::missing_explicit_verification_hooks(&state),
             super::super::execution_phase::pending_completion_action(&state)
         );
         assert_eq!(host.rendered_final_text, vec!["done".to_string()]);
@@ -8774,338 +8764,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn adaptive_budget_extends_complex_task_when_progress_is_real() {
-        let mut host = MockHost::new(vec![
-            edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "read_file",
-                    json!({"path": "src/lib.rs"}),
-                    "module contents",
-                )],
-                10,
-                5,
-                Some(20),
-            ),
-            edge_tool_result(
-                vec![
-                    make_edge_tool_with_args(
-                        "write_file",
-                        json!({"path": "src/lib.rs"}),
-                        "updated module contents",
-                    ),
-                    make_edge_tool_with_args(
-                        "read_file",
-                        json!({"path": "src/lib.rs"}),
-                        "verified module contents",
-                    ),
-                    make_edge_tool_with_args(
-                        "bash",
-                        json!({"command": "cargo test"}),
-                        "tests passed",
-                    ),
-                ],
-                10,
-                5,
-                Some(20),
-            ),
-            edge_tool_result(vec![verified_workspace_observation()], 10, 5, Some(20)),
-            text_result("completed after extension", 10, 5, Some(20)),
-        ])
-        .with_valid_tools(&["read_file", "write_file", "bash"]);
-        let mut state = make_state();
-        state.task_profile = structured_task_profile(
-            true,
-            false,
-            astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
-        );
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
-            initial_turns: 2,
-            hard_turn_limit: std::num::NonZeroUsize::new(4),
-            extension_turns: 2,
-        };
-        state.max_turns = 2;
-        state.remaining_turns = 2;
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "adaptive budget outcome: {outcome:?}");
-        assert_eq!(host.current_turn, 4);
-        assert_eq!(
-            state.max_turns, 5,
-            "verified post-mutation settlement gets one reserved boundary"
-        );
-        assert_eq!(state.final_text, "completed after extension");
-        assert!(
-            state.volatile_pending.iter().all(|inj| {
-                !inj.payload.to_string().contains("remaining_turns")
-                    && !inj.payload.to_string().contains("turn_budget")
-            }),
-            "non-terminal budget facts must remain runtime-internal; got {:?}",
-            state.volatile_pending
-        );
-    }
-
-    #[tokio::test]
-    async fn adaptive_budget_refuses_more_tools_but_accepts_a_text_summary_for_stalled_repetition()
-    {
-        let repeated =
-            make_edge_tool_with_args("read_file", json!({"path": "src/lib.rs"}), "same contents");
-        let mut host = MockHost::new(vec![
-            edge_tool_result(vec![repeated.clone()], 10, 5, Some(20)),
-            edge_tool_result(vec![repeated.clone()], 10, 5, Some(20)),
-            text_result("summarized without more repetitive reads", 10, 5, Some(20)),
-        ])
-        .with_valid_tools(&["read_file"]);
-        let mut state = make_state();
-        state.task_profile = structured_task_profile(
-            false,
-            true,
-            astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-        );
-        state.turn_intent = Some(TurnIntent::default().with_workspace_mutation(
-            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
-        ));
-        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
-            initial_turns: 2,
-            hard_turn_limit: std::num::NonZeroUsize::new(4),
-            extension_turns: 2,
-        };
-        state.max_turns = 2;
-        state.remaining_turns = 2;
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(host.current_turn, 3);
-        assert_eq!(state.final_text, "summarized without more repetitive reads");
-        assert!(state.interruption.is_none());
-    }
-
-    #[tokio::test]
-    async fn adaptive_budget_refuses_more_tools_but_accepts_a_text_summary_after_warning() {
-        let mut host = MockHost::new(vec![
-            edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "read_file",
-                    json!({"path": "src/lib.rs"}),
-                    "module contents",
-                )],
-                10,
-                5,
-                Some(20),
-            ),
-            edge_tool_result(
-                vec![
-                    make_edge_tool_with_args(
-                        "write_file",
-                        json!({"path": "src/lib.rs"}),
-                        "updated module contents",
-                    ),
-                    make_edge_tool_with_args(
-                        "read_file",
-                        json!({"path": "src/lib.rs"}),
-                        "verified module contents",
-                    ),
-                ],
-                10,
-                5,
-                Some(20),
-            ),
-            edge_tool_result(vec![verified_workspace_observation()], 10, 5, Some(20)),
-            text_result("summarized after warning", 10, 5, Some(20)),
-        ])
-        .with_valid_tools(&["read_file", "write_file", "bash"]);
-        let mut state = make_state();
-        state.task_profile = structured_task_profile(
-            true,
-            false,
-            astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
-        );
-        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
-            initial_turns: 2,
-            hard_turn_limit: std::num::NonZeroUsize::new(4),
-            extension_turns: 2,
-        };
-        state.max_turns = 2;
-        state.remaining_turns = 2;
-        state.stall.verdict_events.push(
-            astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent {
-                turn: 1,
-                severity: "warning".into(),
-                injections: vec!["stall detected".into()],
-                avoid_tools: vec!["write_file".into()],
-                health_avoidance_tools: vec![],
-                advisory_threshold_reached: false,
-                nudge_count: 1,
-                interaction_mode: "prompt".into(),
-                recent_error_pressure: 0,
-                recent_timeout_pressure: 0,
-                total_errors: 0,
-                health_avoidance_count: 0,
-                total_timeouts: 0,
-                timeout_dominant_tools: vec![],
-                total_cache_hits: 0,
-                flaky_count: 0,
-            },
-        );
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "adaptive budget outcome: {outcome:?}");
-        assert_eq!(host.current_turn, 4);
-        assert_eq!(state.final_text, "summarized after warning");
-        assert!(state.interruption.is_none());
-        assert!(
-            !state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
-    }
-
-    #[tokio::test]
-    async fn adaptive_budget_extends_exploratory_task_on_distinct_real_progress() {
-        let observed_read = |path: &str, output: &str| {
-            let mut result = make_edge_tool_with_args("read_file", json!({"path": path}), output);
-            let receipt =
-                astra_tools::workspace_observation::typed_workspace_observation_receipt_for(
-                    "read_file",
-                    &result.args,
-                    std::path::Path::new("/workspace"),
-                    false,
-                )
-                .expect("bound observer receipt");
-            result.tool_result_fields.as_mut().unwrap().extend(receipt);
-            result
-        };
-        let mut host = MockHost::new(vec![
-            edge_tool_result(
-                vec![observed_read("src/lib.rs", "module contents")],
-                10,
-                5,
-                Some(20),
-            ),
-            edge_tool_result(
-                vec![observed_read("src/main.rs", "entry point contents")],
-                10,
-                5,
-                Some(20),
-            ),
-            text_result("completed after exploratory extension", 10, 5, Some(20)),
-        ])
-        .with_valid_tools(&["read_file", "glob"]);
-        let mut state = make_state();
-        state.task_profile = structured_task_profile(
-            false,
-            true,
-            astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-        );
-        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
-            initial_turns: 2,
-            hard_turn_limit: std::num::NonZeroUsize::new(4),
-            extension_turns: 2,
-        };
-        state.max_turns = 2;
-        state.remaining_turns = 2;
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(host.current_turn, 3);
-        assert_eq!(state.max_turns, 4);
-        assert_eq!(state.final_text, "completed after exploratory extension");
-        assert!(
-            state.volatile_pending.iter().all(|inj| {
-                !inj.payload.to_string().contains("remaining_turns")
-                    && !inj.payload.to_string().contains("turn_budget")
-            }),
-            "non-terminal budget facts must remain runtime-internal; got {:?}",
-            state.volatile_pending
-        );
-    }
-
-    #[tokio::test]
-    async fn adaptive_budget_renews_with_headroom_and_real_progress() {
-        let mut host = MockHost::new(vec![
-            edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "read_file",
-                    json!({"path": "src/lib.rs"}),
-                    "module contents",
-                )],
-                10,
-                5,
-                Some(20),
-            ),
-            edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "write_file",
-                    json!({"path": "src/lib.rs"}),
-                    "updated module contents",
-                )],
-                10,
-                5,
-                Some(20),
-            ),
-            edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "read_file",
-                    json!({"path": "src/lib.rs"}),
-                    "verified module contents",
-                )],
-                10,
-                5,
-                Some(20),
-            ),
-            text_result("bounded final answer", 10, 5, Some(20)),
-        ])
-        .with_valid_tools(&["read_file", "write_file"]);
-        let mut state = make_state();
-        state.task_profile = structured_task_profile(
-            true,
-            false,
-            astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
-        );
-        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
-            initial_turns: 2,
-            hard_turn_limit: std::num::NonZeroUsize::new(4),
-            extension_turns: 2,
-        };
-        state.max_turns = 2;
-        state.remaining_turns = 2;
-        state.final_text = "changes look good".to_string();
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(host.current_turn, 4);
-        assert_eq!(
-            state.agentic_turn_budget.hard_turn_limit,
-            std::num::NonZeroUsize::new(4)
-        );
-        assert_eq!(
-            state.max_turns, 5,
-            "one text-only closing allowance is reserved at the hard boundary"
-        );
-        // Finalization clears transient settlement state; inspect the request.
-        assert!(host.executed_volatile.last().unwrap().iter().any(|entry| {
-            entry.payload["signal"] == "agentic_execution_slice_complete"
-                && entry.payload["mode"] == "text_only"
-                && entry.payload["execution_authority"] == "none"
-        }));
-        assert!(
-            !state.final_text.contains("changes look good"),
-            "budget exhaustion must overwrite stale success-shaped text"
-        );
-        assert_eq!(state.final_text, "bounded final answer");
-        assert!(state.interruption.is_none());
-        assert!(
-            !state
-                .messages
-                .iter()
-                .filter_map(|message| message.get("content").and_then(Value::as_str))
-                .any(|content| content.contains("Budget review"))
-        );
-    }
-
-    #[tokio::test]
     async fn replay_tool_churn_preserves_bounded_evidence_then_completes_with_synthesis() {
         let journal_dir = tempfile::tempdir().unwrap();
         let _journal = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
@@ -9168,8 +8826,12 @@ pub(crate) mod tests {
         state.turn_intent = Some(TurnIntent::default().with_workspace_mutation(
             astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
         ));
-        state.max_turns = 2;
-        state.remaining_turns = 2;
+        state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
+            3,
+            std::num::NonZeroUsize::new(3),
+        );
+        state.max_turns = 3;
+        state.remaining_turns = 3;
         state.final_text = "stale success from a previous turn".to_string();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -9200,7 +8862,7 @@ pub(crate) mod tests {
         assert_eq!(
             tool_contents.len(),
             2,
-            "adaptive renewal must preserve both completed evidence calls"
+            "reporting must preserve both completed evidence calls"
         );
         // After folding, each result stays inside the canonical read-result
         // presentation budget plus bounded compaction annotations, rather
@@ -10170,6 +9832,117 @@ pub(crate) mod tests {
             signals[0].signal_type,
             astra_core::feedback::SignalType::Interruption
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_retains_captured_partial_before_the_next_provider_boundary() {
+        for origin in [
+            crate::orchestration::CancellationOrigin::User,
+            crate::orchestration::CancellationOrigin::Runtime,
+            crate::orchestration::CancellationOrigin::Unverified,
+        ] {
+            for existing_final in [false, true] {
+                let mut host = MockHost::new(vec![text_result("must not execute", 10, 5, None)]);
+                let mut state = make_state();
+                state.cancellation.flag = Some(Arc::new(AtomicBool::new(true)));
+                state.cancellation.resolved_origin = Some(origin);
+                let collector = astra_turn_core::turn_trace_collector::TurnTraceCollector::new(
+                    "cancelled-turn",
+                    "test-session",
+                );
+                collector.record_tool_surface(
+                    &["read_file".into()],
+                    &[("read_file".into(), 17)],
+                    1,
+                    0,
+                );
+                state.telemetry.turn_trace_collector = Some(collector);
+                let hub = make_hub();
+                state.telemetry.observability_session =
+                    Some(hub.start_session("owner", "test-session"));
+                state.hooks.completion_settlement.text_only = true;
+                state.last_finish_reason = Some("tool_calls".into());
+                let mut partial = text_result("Available findings", 10, 5, None);
+                partial.accum.model_item_id = Some("cancelled-provider-item".into());
+                crate::turn::agentic_loop::execution_phase::capture_latest_provider_text(
+                    &mut state, &partial,
+                );
+                if existing_final {
+                    state.final_text = "Available findings".into();
+                    state.final_text_model_item_id = Some("cancelled-provider-item".into());
+                }
+                let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+                assert!(matches!(result, Ok(AgenticLoopOutcome::Cancelled)));
+                assert_eq!(host.current_turn, 0);
+                assert_eq!(state.final_text, "Available findings");
+                assert_eq!(
+                    state.final_text_model_item_id.as_deref(),
+                    Some("cancelled-provider-item")
+                );
+                assert!(
+                    state
+                        .messages
+                        .iter()
+                        .any(|message| message["role"] == "assistant"
+                            && message["content"] == "Available findings")
+                );
+                assert!(host.rendered_final_text.is_empty());
+                assert!(host.final_output_ready.is_empty());
+                assert!(state.telemetry.turn_trace_collector.is_none());
+                assert!(state.telemetry.pending_context_assembly_trace.is_some());
+                assert!(!state.hooks.completion_settlement.text_only);
+                assert!(state.last_finish_reason.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_failed_stream_keeps_the_last_useful_provider_partial() {
+        let mut host = failed_partial_host(astra_core::ErrorKind::Cancelled, " \n\t");
+        let mut state = make_state();
+        let error = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert_eq!(host.current_turn, 2);
+        assert_eq!(state.final_text, "Older provider answer");
+        assert_eq!(
+            state.final_text_model_item_id.as_deref(),
+            Some("provider-item-A")
+        );
+        assert!(host.rendered_final_text.is_empty());
+        assert!(host.final_output_ready.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_second_provider_stream_keeps_its_newer_partial_and_identity() {
+        for kind in [
+            astra_core::ErrorKind::Cancelled,
+            astra_core::ErrorKind::Network,
+            astra_core::ErrorKind::ProviderDeadline,
+        ] {
+            let mut host = failed_partial_host(kind, "Newer provider partial");
+            let mut state = make_state();
+            let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert_eq!(result.unwrap_err().kind, kind);
+            assert_eq!(host.current_turn, 2);
+            assert_eq!(state.final_text, "Newer provider partial");
+            assert!(state.final_text_model_item_id.is_some());
+            assert_ne!(
+                state.final_text_model_item_id.as_deref(),
+                Some("provider-item-A")
+            );
+            assert_eq!(state.final_text_model_item_id, state.current_model_item_id);
+            let last_assistant = state
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "assistant")
+                .unwrap();
+            assert_eq!(last_assistant["content"], "Newer provider partial");
+            assert!(host.rendered_final_text.is_empty());
+            assert!(host.final_output_ready.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -12658,12 +12431,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn budget_wrapup_repeat_preserves_candidate_as_interrupted_partial() {
-        // A provider may ignore an explicit no-tool choice twice by emitting
-        // tool-shaped content. The first violation gets one clean text-only
-        // retry. A second violation is an incomplete execution even when the
-        // response also contains useful text: preserve that candidate as a
-        // partial response, but never promote an unexecuted action to success.
+    async fn exhausted_reporting_preserves_unexecuted_tool_candidate_as_partial() {
+        // A tool-bearing final reporting response cannot execute outside its
+        // allowance. Preserve its useful text as partial, not successful work.
         let candidate = "Setup is verified; the end-to-end push remains unverified.";
         let ignored = || {
             tool_preamble_result(
@@ -12686,12 +12456,6 @@ pub(crate) mod tests {
                 1000,
                 Some(200),
             ),
-            edge_tool_result(
-                vec![make_edge_tool("read_file", "budget boundary")],
-                90_000,
-                2000,
-                Some(100),
-            ),
             ignored(),
         ])
         .with_valid_tools(&["bash", "read_file"])
@@ -12701,7 +12465,6 @@ pub(crate) mod tests {
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
             2,
             std::num::NonZeroUsize::new(2),
-            0,
         );
         state.max_turns = 2;
         state.remaining_turns = 2;
@@ -12714,19 +12477,19 @@ pub(crate) mod tests {
         assert!(outcome.is_ok());
         assert_eq!(
             state.interruption.as_ref().map(|record| record.kind),
-            Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete),
+            Some(astra_turn_core::interruption::InterruptionKind::BudgetExhausted),
             "a repeated tool request after lockout must remain resumably incomplete"
         );
         assert_eq!(state.final_text, candidate);
         assert!(!state.final_text.contains("Why stopped:"));
-        assert_eq!(host.terminal_tool_records.len(), 2);
-        assert_eq!(host.current_turn, 3);
+        assert_eq!(host.terminal_tool_records.len(), 1);
+        assert_eq!(host.current_turn, 2);
         assert_eq!(
             host.terminal_tool_records
                 .iter()
                 .map(|record| record.tool_call_id.as_deref())
                 .collect::<Vec<_>>(),
-            vec![Some("req-read_file"), Some("call-after-lockout")]
+            vec![Some("call-after-lockout")]
         );
         assert!(
             host.terminal_tool_records.iter().all(|record| {
@@ -12734,14 +12497,14 @@ pub(crate) mod tests {
                     == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
                     && !record.was_executed()
             }),
-            "both post-wrapup requests must be rejected before execution: {:?}",
+            "the post-wrapup request must be rejected before execution: {:?}",
             host.terminal_tool_records
         );
     }
 
     #[tokio::test]
     async fn round_slice_summary_completes_when_the_model_returns_text() {
-        // The extra RoundSlice boundary is a text-only deliverable boundary.
+        // The reserved RoundSlice boundary is a text-only deliverable boundary.
         // A compliant response closes the turn; the resource limit must not
         // be projected as a user-visible failure after synthesis succeeded.
         let mut host = MockHost::new(vec![
@@ -12767,12 +12530,11 @@ pub(crate) mod tests {
         ));
         state.max_turn_input_tokens = 0;
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
-            2,
-            std::num::NonZeroUsize::new(2),
-            0,
+            3,
+            std::num::NonZeroUsize::new(3),
         );
-        state.max_turns = 2;
-        state.remaining_turns = 2;
+        state.max_turns = 3;
+        state.remaining_turns = 3;
         state
             .messages
             .push(json!({"role": "user", "content": "complex task"}));
@@ -15016,6 +14778,11 @@ mod parallel_execution_tests {
                 .push(json!({"role": "user", "content": "test query"}));
             state.max_turns = turns;
             state.remaining_turns = turns;
+            state.agentic_turn_budget =
+                astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
+                    turns,
+                    std::num::NonZeroUsize::new(turns),
+                );
             state.harness = crate::turn::harness_adapter::HarnessSlot::new(
                 recording as Arc<dyn HarnessKernel>,
                 sink.clone() as Arc<dyn SnapshotSink>,

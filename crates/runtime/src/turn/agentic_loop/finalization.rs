@@ -525,11 +525,16 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         )
     {
         update_session_facts_from_turn(state);
-        // Cancellation before any output has no assistant answer to render.
-        // Fatal errors retain their existing partial/checkpoint error path.
-        if result.is_ok()
-            && (matches!(&result, Ok(AgenticLoopOutcome::Completed))
-                || !state.final_text.is_empty())
+        // An error must retain already-produced provider text for terminal
+        // persistence without entering the successful render/checkpoint path.
+        if result.is_err() || cancellation_exit {
+            ensure_terminal_text(state, true);
+            materialize_terminal_text_message(state);
+            if cancellation_exit {
+                settle_terminal_turn_state(state).await;
+            }
+        } else if matches!(&result, Ok(AgenticLoopOutcome::Completed))
+            || !state.final_text.is_empty()
         {
             finalize_and_render(host, state).await;
         }
@@ -639,7 +644,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     // below this boundary is durable/derived settlement and must never keep a
     // displayed answer looking live just because a database, workspace, or
     // checkpoint is slow.
-    ensure_terminal_text(state);
+    ensure_terminal_text(state, false);
     materialize_terminal_text_message(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text, state.final_text_model_item_id.as_deref());
@@ -650,6 +655,13 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
         state.final_output_ready_notified = true;
     }
 
+    settle_terminal_turn_state(state).await;
+
+    try_write_heavy_checkpoint(state);
+}
+
+/// Shared terminal cleanup does not publish a successful output or checkpoint.
+async fn settle_terminal_turn_state(state: &mut AgenticLoopState) {
     finalize_turn_trace(state).await;
 
     // Desired-state convergence authority is deliberately live-only. A
@@ -667,8 +679,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 
     reset_per_turn_advisory_state(state);
     update_working_memory_for_turn_settlement(state);
-
-    try_write_heavy_checkpoint(state);
 }
 
 fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
@@ -704,7 +714,7 @@ fn settlement_interruption_summary(
     interruption_state_summary(state, error_detail)
 }
 
-fn ensure_terminal_text(state: &mut AgenticLoopState) {
+fn ensure_terminal_text(state: &mut AgenticLoopState, terminal_error: bool) {
     let latest_provider_text = state
         .hooks
         .completion_settlement
@@ -742,7 +752,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     // envelope to text that may already have streamed. Apart from leaking
     // internal details, re-rendering that envelope on an append-only stream
     // duplicates the provider response.
-    if state.interruption.is_some() {
+    if terminal_error || state.interruption.is_some() {
         // Prefer the latest provider response, then the bounded settlement
         // candidate. A current runtime-owned Work settlement sentence is not
         // provider output and must not be promoted to partial assistant text.
@@ -978,7 +988,7 @@ mod tests {
                 state.final_text_streamed = true;
                 state.task_profile.exploratory_task = exploratory;
                 state.last_finish_reason = finish_reason.map(str::to_string);
-                ensure_terminal_text(&mut state);
+                ensure_terminal_text(&mut state, false);
                 let truncated = !exploratory && finish_reason == Some("length");
                 assert_eq!(
                     state.final_text,
@@ -1013,7 +1023,7 @@ mod tests {
                 ..Default::default()
             });
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         assert_eq!(state.final_text, "Done.");
         assert!(state.final_text_streamed);
@@ -1028,7 +1038,7 @@ mod tests {
             .hooks
             .completion_settlement
             .deferred_candidate_model_item_id = Some("accepted-A".into());
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
         assert_eq!(state.final_text, "accepted answer");
         assert_eq!(
             state.final_text_model_item_id.as_deref(),
@@ -1088,7 +1098,7 @@ mod tests {
         state.final_text = "The code style is consistent.".to_string();
         state.final_text_streamed = true;
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         assert_eq!(state.final_text, "The code style is consistent.");
         assert!(state.final_text_streamed);
@@ -1114,7 +1124,7 @@ mod tests {
             },
         ));
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         assert_eq!(state.final_text, "  The build passed its final check.\n");
         assert!(!state.final_text.contains("prompt budget"));
@@ -1131,9 +1141,19 @@ mod tests {
     #[test]
     fn unmet_completion_action_preserves_partial_answer_without_clearing_interruption() {
         let mut state = make_state();
+        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
+            label: "required check".into(),
+            command: "cargo test".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        }];
         state.hooks.completion_settlement.completion_action_window =
             Some(super::super::host::CompletionActionWindow {
-                action: super::super::host::CompletionAction::PostMutationObservation,
+                action: super::super::host::CompletionAction::ExplicitVerification {
+                    missing_labels: vec!["required check".into()],
+                },
                 attempts_remaining: 1,
                 mismatch_corrections_remaining: 0,
                 consumed: false,
@@ -1157,7 +1177,7 @@ mod tests {
             },
         ));
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         assert_eq!(state.final_text, "latest truthful handoff");
         assert_eq!(
@@ -1170,6 +1190,14 @@ mod tests {
     #[test]
     fn failed_matched_completion_action_preserves_answer_as_unverified_output() {
         let mut state = make_state();
+        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
+            label: "required check".into(),
+            command: "cargo test".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        }];
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
                 true,
@@ -1186,7 +1214,9 @@ mod tests {
             });
         state.hooks.completion_settlement.completion_action_window =
             Some(super::super::host::CompletionActionWindow {
-                action: super::super::host::CompletionAction::PostMutationObservation,
+                action: super::super::host::CompletionAction::ExplicitVerification {
+                    missing_labels: vec!["required check".into()],
+                },
                 attempts_remaining: 0,
                 mismatch_corrections_remaining: 0,
                 consumed: true,
@@ -1212,7 +1242,7 @@ mod tests {
             Ok(Some(_))
         ));
 
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
 
         // Provider prose is retained, not accepted as verification authority.
         assert_eq!(state.final_text, "Fixed and verified.");
@@ -1229,7 +1259,7 @@ mod tests {
             Some("The edit was made; the final summary is partial.".to_string());
         let pending = super::super::execution_phase::pending_completion_action(&state);
         assert!(matches!(pending, Ok(None)), "{pending:?}");
-        ensure_terminal_text(&mut state);
+        ensure_terminal_text(&mut state, false);
         assert_eq!(
             state.final_text,
             "The edit was made; the final summary is partial."
@@ -1907,7 +1937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_profile_marks_repeated_no_change_explanation_incomplete() {
+    async fn inferred_mutation_profile_does_not_force_unnecessary_edits() {
         let answer = "No workspace mutation was needed based on the evidence.";
         let mut host = MockHost::new(vec![
             text_result(answer, 10, 5, Some(42)),
@@ -1922,23 +1952,9 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         assert!(outcome.is_ok());
-        assert_eq!(
-            host.turn_count(),
-            3,
-            "one action correction is bounded; a repeated omission is terminal"
-        );
-        assert_eq!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete)
-        );
+        assert_eq!(host.turn_count(), 1);
+        assert!(state.interruption.is_none());
         assert_eq!(state.final_text, answer);
-        assert_eq!(
-            state
-                .interruption
-                .as_ref()
-                .and_then(|interruption| interruption.error_detail.as_deref()),
-            Some("typed completion action was not satisfied")
-        );
         assert_eq!(state.messages.len(), 1);
         assert!(astra_turn_types::model_item_id(&state.messages[0]).is_some());
         let mut provider_evidence = state.messages[0].clone();

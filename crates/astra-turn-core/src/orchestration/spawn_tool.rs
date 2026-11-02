@@ -406,13 +406,13 @@ impl Default for SpawnAgentInput {
     }
 }
 
-/// Resolve the effective initial execution slice given an explicit
+/// Resolve the proposed finite round allowance given an explicit
 /// `initial_turns`, an optional `complexity` hint, and the agent-type default.
 ///
-/// All inputs here are model-authored scheduling hints. The result is a
-/// renewable convergence checkpoint, never a hard execution boundary. Rules:
+/// Inputs are model-authored admission hints. The execution owner freezes the
+/// resolved allowance and applies inherited ceilings and deadlines. Rules:
 ///
-///  * an `initial_turns=Some(n)` hint sets the first slice when it is the only
+///  * an `initial_turns=Some(n)` hint sets the allowance when it is the only
 ///    constraint (with a minimum of 1);
 ///  * `complexity=Some("light")` → at most 10 turns;
 ///  * `complexity=Some("normal")` / None → default;

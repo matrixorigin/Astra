@@ -590,6 +590,92 @@ async fn session_continuation_restores_paused_primary_attempt_before_model_execu
 }
 
 #[tokio::test]
+async fn admission_freezes_default_wall_time_and_preserves_explicit_or_inherited_cutoffs() {
+    let service = test_service();
+    for requested in [None, Some(0), Some(900)] {
+        let mut request = test_request("admit without executing a model");
+        request.model = None;
+        request.resolved_model_selection = None;
+        request.admitted_model_execution = None;
+        request.execution_time_budget =
+            requested.map(
+                |remaining_seconds| astra_services::runs::ExecutionTimeBudget { remaining_seconds },
+            );
+        let admitted = service
+            .prepare_chat_request("user-1", request)
+            .await
+            .unwrap();
+        let expected = requested.unwrap_or(
+            *astra_core::RuntimeLimits::global()
+                .turn_timeout_s
+                .as_ref()
+                .unwrap(),
+        );
+        assert_eq!(
+            admitted.execution_time_budget.unwrap().remaining_seconds,
+            expected
+        );
+        let cutoff = admitted.admitted_execution_deadline.unwrap().snapshot();
+        // Re-enter admission with trusted time authority only; model admission
+        // is separately validated and cannot be replayed as client input.
+        let mut continuation = test_request("continue with original deadline");
+        continuation.model = None;
+        continuation.resolved_model_selection = None;
+        continuation.admitted_model_execution = None;
+        continuation.execution_time_budget = admitted.execution_time_budget;
+        continuation.admitted_execution_deadline = admitted.admitted_execution_deadline;
+        let repeated = service
+            .prepare_chat_request("user-1", continuation)
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated.admitted_execution_deadline.unwrap().snapshot(),
+            cutoff,
+            "a continuation must not re-anchor elapsed time"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn admission_uses_loaded_toml_timeout_with_environment_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.toml");
+    std::fs::write(&path, "[runtime]\nturn_timeout_s = 900\n").unwrap();
+    let _source = EnvVarGuard::remove("ASTRA_CONFIG_SOURCE");
+    let _path = EnvVarGuard::set("ASTRA_SERVER_CONFIG", path.to_str().unwrap());
+    let _timeout = EnvVarGuard::remove("ASTRA_TURN_TIMEOUT_S");
+    let config = astra_core::ServerConfig::load().unwrap();
+    assert_eq!(config.runtime.turn_timeout_s, Some(900));
+    for (override_value, expected) in [
+        (None, Some(900)),
+        (Some("60"), Some(60)),
+        (Some("invalid"), None),
+    ] {
+        let _override = override_value.map(|value| EnvVarGuard::set("ASTRA_TURN_TIMEOUT_S", value));
+        let service = test_service().with_runtime_config(&config.runtime);
+        let mut request = test_request("admit configured timeout");
+        request.model = None;
+        request.resolved_model_selection = None;
+        request.admitted_model_execution = None;
+        match (
+            service.prepare_chat_request("user-1", request).await,
+            expected,
+        ) {
+            (Ok(admitted), Some(expected)) => assert_eq!(
+                admitted.execution_time_budget.unwrap().remaining_seconds,
+                expected
+            ),
+            (Err((status, Json(error))), None) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(error.error_code.as_deref(), Some("runtime_timeout_invalid"));
+            }
+            (result, expected) => panic!("unexpected admission: {result:?}, expected {expected:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
     for mode in [
         RunStartPersistenceMode::Insert,
@@ -6506,7 +6592,7 @@ async fn server_pre_durable_fanout_receipt_converges_and_does_not_relabel_winner
         matches!(executor.persist_pre_durable_child_terminal(&upgraded, None).await.unwrap(),
         SpawnRunCancellationDurability::Superseded(crate::orchestration::AgentStatus::Cancelled {
             by_user: false, reason,
-        }) if reason == "deadline")
+            ..}) if reason == "deadline")
     );
     let parent = engine
         .load_run("user-a", "receipt-parent")
@@ -8214,7 +8300,6 @@ fn subrun_turn_budget_treats_explicit_spawn_budget_as_authoritative_ceiling() {
 
     assert_eq!(budget.initial_turns, 3);
     assert_eq!(budget.hard_turn_limit, std::num::NonZeroUsize::new(3));
-    assert!(budget.extension_turns > 0);
 }
 
 #[test]
@@ -8240,9 +8325,8 @@ fn subrun_explicit_ceiling_can_have_a_smaller_adaptive_initial_slice() {
     let budget = resolve_subrun_agentic_turn_budget(profile, None, Some(40), Some(10))
         .expect("valid test budget");
 
-    assert_eq!(budget.initial_turns, 10);
+    assert_eq!(budget.initial_turns, 40);
     assert_eq!(budget.hard_turn_limit, std::num::NonZeroUsize::new(40));
-    assert!(budget.extension_turns > 0);
 }
 
 #[test]
@@ -8257,8 +8341,7 @@ fn subrun_persona_default_is_a_renewable_initial_slice() {
         .expect("valid test budget");
 
     assert_eq!(budget.initial_turns, 12);
-    assert_eq!(budget.hard_turn_limit, None);
-    assert!(budget.extension_turns > 0);
+    assert_eq!(budget.hard_turn_limit, std::num::NonZeroUsize::new(12));
 }
 
 #[test]
@@ -8703,6 +8786,7 @@ fn activation_token_only_runtime_cancel_never_projects_user_origin() {
         crate::orchestration::AgentStatus::Cancelled {
             by_user: false,
             reason: "cancelled during durable activation".to_string(),
+            partial_result: String::new(),
         },
     );
     assert_eq!(result.status, STATUS_CANCELLED);
@@ -9839,6 +9923,15 @@ impl RunStateStore for FaultInjectedRunStateStore {
 
     async fn request_run_cancellation(&self, user_id: &str, run_id: &str) -> Result<bool, String> {
         self.inner.request_run_cancellation(user_id, run_id).await
+    }
+
+    async fn terminalize_orphaned_run_cancellation(
+        &self,
+        request: astra_services::runs::AtomicOrphanRunCancellationRequest<'_>,
+    ) -> Result<bool, String> {
+        self.inner
+            .terminalize_orphaned_run_cancellation(request)
+            .await
     }
 
     async fn request_session_cancellation(
@@ -20784,6 +20877,32 @@ fn finalize_run_events_cancellation_beats_completed_outcome() {
 }
 
 #[test]
+fn cancellation_terminal_preserves_partial_text_in_the_existing_event_batch() {
+    let svc = test_service();
+    let mut state = svc.build_initial_state(
+        "user",
+        &test_request("work"),
+        "session",
+        "run",
+        None,
+        None,
+        None,
+    );
+    state.final_text = "Completed the first operation; the next was cancelled.".into();
+    state.total_tool_calls = 7;
+    let (events, status, _) = AgenticRunLifecycleService::finalize_run_events(
+        Ok(AgenticLoopOutcome::Cancelled),
+        Vec::new(),
+        &state,
+    );
+    assert_eq!(status, RunStatus::Cancelled);
+    assert_eq!(events[0]["event_type"], "text_done");
+    assert_eq!(events[0]["data"]["partial"], true);
+    assert_eq!(events[0]["data"]["full_text"], state.final_text);
+    assert_eq!(events.last().unwrap()["event_type"], "run_finished");
+}
+
+#[test]
 fn finalize_run_events_lease_loss_never_fabricates_user_cancellation() {
     let svc = test_service();
     let request = test_request("ownership moved");
@@ -27488,6 +27607,54 @@ async fn cancel_run_persists_intent_and_signals_local_execution_before_terminal_
 }
 
 #[tokio::test]
+async fn execution_settlement_observation_does_not_request_cancellation() {
+    let svc = test_service();
+    let run_id = "observation-only";
+    svc.run_engine
+        .start_run(run_id, "user-1", "session-observation")
+        .await
+        .unwrap();
+    let (local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        run_id.into(),
+        "session-observation".into(),
+        "user-1".into(),
+    );
+    svc.runs.write().await.insert(run_id.into(), local);
+    let observed = ok(svc
+        .get_run_execution_settlement(run_id.into(), "user-1".into())
+        .await);
+    assert!(!observed.execution_settled);
+    assert_eq!(
+        svc.test_llm_cancel_token_is_cancelled(run_id).await,
+        Some(false)
+    );
+    let hidden = err(svc
+        .get_run_execution_settlement(run_id.into(), "other-user".into())
+        .await);
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND);
+    {
+        let mut runs = svc.runs.write().await;
+        runs.get_mut(run_id).unwrap().execution_live = false;
+    }
+    let recovery = err(svc
+        .get_run_execution_settlement(run_id.into(), "user-1".into())
+        .await);
+    assert_eq!(recovery.0, StatusCode::CONFLICT);
+    assert_eq!(
+        recovery.1.0.error_code.as_deref(),
+        Some("cancellation_recovery_required")
+    );
+    assert_eq!(
+        svc.run_engine
+            .check_control_status("user-1", run_id)
+            .await
+            .unwrap(),
+        None,
+        "a recovery observation must not publish cancellation intent"
+    );
+}
+
+#[tokio::test]
 async fn cancel_run_cancels_llm_token_for_inflight_wake() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
@@ -27970,6 +28137,40 @@ async fn cancel_session_runs_includes_nonblocking_paused_history() {
     assert!(cancelled.execution_settled);
 }
 
+#[tokio::test]
+async fn settlement_observation_requests_recovery_without_mutating_an_orphan() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("orphan-read", "user-1", "session-orphan-read")
+        .await
+        .unwrap();
+    let (status, Json(error)) = svc
+        .get_run_execution_settlement("orphan-read".into(), "user-1".into())
+        .await
+        .expect_err("an ownerless active run requires the cancellation command");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        error.error_code.as_deref(),
+        Some("cancellation_recovery_required")
+    );
+    let run = svc
+        .run_engine
+        .load_run("user-1", "orphan-read")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        run.status, STATUS_RUNNING,
+        "observation must not mutate the orphan"
+    );
+    let cancelled = ok(svc.cancel_run("orphan-read".into(), "user-1".into()).await);
+    assert!(cancelled.execution_settled);
+    let settled = ok(svc
+        .get_run_execution_settlement("orphan-read".into(), "user-1".into())
+        .await);
+    assert!(settled.execution_settled);
+}
+
 #[tokio::test(start_paused = true)]
 async fn cancel_session_runs_retry_keeps_terminal_local_execution_pending() {
     let svc = test_service();
@@ -28071,18 +28272,23 @@ async fn cancel_session_runs_waits_for_retained_terminal_target_to_stop() {
             .unwrap()
             .execution_live = false;
     });
-    let settled = ok(svc
+    let pending = ok(svc
         .cancel_session_runs("session-draining".into(), "user-1".into())
         .await);
-    stopped.await.unwrap();
-    assert!(settled.execution_settled);
-    assert_eq!(
-        settled.runs.len(),
-        1,
-        "the terminal target must survive rediscovery"
+    assert!(
+        !pending.execution_settled,
+        "the command does not wait or claim physical stop"
     );
-    assert_eq!(settled.runs[0].status, STATUS_COMPLETED);
-    assert!(settled.runs[0].execution_settled);
+    stopped.await.unwrap();
+    let settled = ok(svc
+        .get_session_execution_settlement("session-draining".into(), "user-1".into())
+        .await);
+    assert!(settled.execution_settled);
+    let run = ok(svc
+        .get_run_execution_settlement("draining".into(), "user-1".into())
+        .await);
+    assert_eq!(run.status, STATUS_COMPLETED);
+    assert!(run.execution_settled);
 }
 
 #[tokio::test(start_paused = true)]
@@ -28147,8 +28353,8 @@ async fn cancel_session_runs_propagates_all_intent_before_slow_convergence() {
         .await);
     assert!(!pending.execution_settled);
     assert!(
-        pending.runs.len() < targets.len(),
-        "convergence should yield to its budget"
+        pending.runs.iter().all(|run| !run.execution_settled),
+        "live owners remain pending while intent covers every target"
     );
     for run_id in targets {
         assert!(
@@ -28160,6 +28366,42 @@ async fn cancel_session_runs_propagates_all_intent_before_slow_convergence() {
             "tail target {run_id} was starved"
         );
     }
+    // Simulate all physical owners draining. Recovery must not restart the
+    // deliberately slow active-run pagination before it can settle an orphan.
+    for run in svc.runs.write().await.values_mut() {
+        run.execution_live = false;
+    }
+    let mut settled = false;
+    for _ in 0..110 {
+        match svc
+            .get_session_execution_settlement("wide-session".into(), "user-1".into())
+            .await
+        {
+            Ok(result) if result.execution_settled => {
+                let final_command = svc
+                    .cancel_session_runs("wide-session".into(), "user-1".into())
+                    .await
+                    .unwrap();
+                settled = final_command.execution_settled;
+                break;
+            }
+            Ok(_) => continue,
+            Err((status, Json(error))) => {
+                assert_eq!(status, StatusCode::CONFLICT);
+                assert_eq!(
+                    error.error_code.as_deref(),
+                    Some("cancellation_recovery_required")
+                );
+            }
+        }
+        svc.cancel_session_runs("wide-session".into(), "user-1".into())
+            .await
+            .unwrap();
+    }
+    assert!(
+        settled,
+        "slow paginated discovery must not starve exact orphan recovery"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -29179,11 +29421,6 @@ fn shared_child_assembly_preserves_restored_identity_budget_and_workspace_eviden
     assert_eq!(*state.turn_guard.task_profile(), state.task_profile);
     assert!(state.stall.tool_call_records.is_empty());
     assert_eq!(state.hooks.workspace_root_hint.as_deref(), Some("/app"));
-    assert_eq!(
-        crate::turn::agentic_loop::execution_phase::checked_completion_evidence(&state).unwrap(),
-        (None, false),
-        "assembling a recovered loop must preserve its unobserved mutation despite an empty local suffix"
-    );
 }
 
 #[test]
@@ -29295,8 +29532,8 @@ fn build_initial_state_applies_execution_budget_override() {
         hard_turn_limit: Some(9),
     });
     let state = svc.build_initial_state("test-user", &req, "s", "r", None, None, None);
-    assert_eq!(state.max_turns, 4);
-    assert_eq!(state.remaining_turns, 4);
+    assert_eq!(state.max_turns, 9);
+    assert_eq!(state.remaining_turns, 9);
     assert_eq!(
         state.agentic_turn_budget.hard_turn_limit,
         std::num::NonZeroUsize::new(9)
@@ -29304,7 +29541,7 @@ fn build_initial_state_applies_execution_budget_override() {
 }
 
 #[test]
-fn execution_time_budget_does_not_change_round_auto_expansion_policy() {
+fn execution_time_budget_does_not_change_the_fixed_round_allowance() {
     let svc = test_service();
     let mut baseline = test_request("go");
     baseline.execution_budget = Some(astra_services::runs::ExecutionBudget {
@@ -29323,12 +29560,9 @@ fn execution_time_budget_does_not_change_round_auto_expansion_policy() {
 
     assert_eq!(
         bounded_state.agentic_turn_budget, baseline_state.agentic_turn_budget,
-        "wall time is orthogonal to renewable round slices"
+        "wall time is orthogonal to the fixed round allowance"
     );
-    assert!(
-        bounded_state.agentic_turn_budget.extension_turns > 0,
-        "the existing round auto-expansion headroom must remain enabled"
-    );
+    assert_eq!(bounded_state.max_turns, baseline_state.max_turns);
 }
 
 #[test]
@@ -29973,8 +30207,8 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_request_budget() {
         )
         .expect("valid test execution configuration");
 
-    assert_eq!(state.max_turns, 8);
-    assert_eq!(state.remaining_turns, 8);
+    assert_eq!(state.max_turns, 12);
+    assert_eq!(state.remaining_turns, 12);
     assert_eq!(
         state.agentic_turn_budget.hard_turn_limit,
         std::num::NonZeroUsize::new(12)
@@ -33017,7 +33251,7 @@ async fn cancel_run_returns_durable_terminal_status_on_cache_miss() {
 }
 
 #[tokio::test]
-async fn cancellation_settled_prefers_matching_local_execution_fact_over_durable_lease() {
+async fn cancellation_settlement_requires_both_local_execution_and_durable_owner_to_stop() {
     let svc = test_service();
     let (mut local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
         "local-settlement".to_string(),
@@ -33031,9 +33265,14 @@ async fn cancellation_settled_prefers_matching_local_execution_fact_over_durable
         .insert("local-settlement".to_string(), local);
 
     assert!(
-        svc.cancellation_execution_is_settled("user-1", "local-settlement", true)
+        !svc.cancellation_execution_is_settled("user-1", "local-settlement", true)
             .await,
-        "a retired local executor is settled even while a durable lease is still visible"
+        "a stale local retirement cannot override a live remote owner"
+    );
+    assert!(
+        svc.cancellation_execution_is_settled("user-1", "local-settlement", false)
+            .await,
+        "after lease expiry the stopped executor permits exact orphan recovery"
     );
     svc.runs
         .write()
@@ -37640,4 +37879,316 @@ async fn db_resume_authority_retired_recovery_requires_continuation() {
             );
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_run_activity_pages_raw_ranges_and_isolates_owner_session_and_payloads() {
+    use crate::server::session::session_handlers::{RunActivityQuery, run_activity_handler};
+    use axum::extract::{Path, Query, State};
+    use axum::http::{HeaderMap, HeaderValue, Method};
+    let pool = setup_lifecycle_run_db_it().await;
+    let session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    let child = Uuid::new_v4().to_string();
+    let owner = "test-user";
+    crate::server::run::insert_active_run_session_fixture(&pool, owner, &session).await;
+    let lifecycle = db_backed_test_service(&pool, "activity-owner");
+    lifecycle
+        .run_engine
+        .start_run(&run, owner, &session)
+        .await
+        .unwrap();
+    lifecycle
+        .run_engine
+        .start_run_ext(
+            &child,
+            owner,
+            &session,
+            Some(&run),
+            None,
+            Some("worker"),
+            None,
+        )
+        .await
+        .unwrap();
+    // Exercise the real child→root work-surface projection, then cold-read its
+    // persisted envelopes. This is recorded presentation, not a full ledger.
+    let tool_event = agent_live_event_to_work_surface_sse(
+        &astra_turn_core::agent_live_event::AgentLiveEvent {
+            run_id: child.clone(),
+            agent_id: "worker".into(),
+            kind: astra_turn_core::agent_live_event::AgentLiveEventKind::ToolStarted {
+                name: "bash".into(),
+                description: "inspect workspace".into(),
+                tool_use_id: "kept".into(),
+            },
+        },
+        None,
+    );
+    // Only the oldest page has tool activity. A filtered SQL query would skip
+    // this contiguous-range boundary and conceal the cursor contract.
+    for index in 20..150_i64 {
+        let (kind, payload) = match index {
+            20 => ("agent_live_event", tool_event.to_string()),
+            21 => (
+                "agent_live_event",
+                json!({"run_id":child,"event_kind":"tool_completed","output":"x".repeat(40_000)})
+                    .to_string(),
+            ),
+            22 => ("durable_events_compacted", "{}".into()),
+            _ => ("text_delta", "{}".into()),
+        };
+        sqlx::query("INSERT INTO agent_run_events (id,run_id,event_idx,user_id,session_id,event_type,event_id,event_hash,payload_json) VALUES (?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&run).bind(index).bind(owner).bind(&session)
+            .bind(kind).bind(Uuid::new_v4().to_string()).bind("fixture-hash").bind(payload)
+            .execute(pool.get()).await.unwrap();
+    }
+    for (user, other_session, index) in [
+        ("other-owner", session.clone(), 23_i64),
+        (owner, Uuid::new_v4().to_string(), 150_i64),
+    ] {
+        sqlx::query("INSERT INTO agent_run_events (id,run_id,event_idx,user_id,session_id,event_type,event_id,event_hash,payload_json) VALUES (?,?,?,?,?,'tool_call_start',?,?,'{}')")
+            .bind(Uuid::new_v4().to_string()).bind(&run).bind(index).bind(user).bind(other_session)
+            .bind(Uuid::new_v4().to_string()).bind("fixture-hash").execute(pool.get()).await.unwrap();
+    }
+    let mut state = crate::app_state::AppState::new(
+        crate::app_state::ServiceInfo::default(),
+        Arc::new(crate::app_state::MatrixOneHealthChecker::new(
+            pool.settings().clone(),
+        )),
+    )
+    .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+    .with_session_service(Arc::new(
+        astra_services::DatabaseSessionService::new(pool.settings().clone())
+            .with_pool(pool.clone()),
+    ));
+    state.shared_pool = Some(pool.clone());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer synthetic-test"),
+    );
+    let mut before = None;
+    let mut pages = Vec::new();
+    for _ in 0..3 {
+        let query: RunActivityQuery =
+            serde_json::from_value(json!({"before_event_idx":before})).unwrap();
+        let page = run_activity_handler(
+            State(state.clone()),
+            Path((session.clone(), child.clone())),
+            Method::GET,
+            format!("/sessions/{session}/runs/{child}/activity")
+                .parse()
+                .unwrap(),
+            headers.clone(),
+            Query(query),
+        )
+        .await
+        .unwrap()
+        .0;
+        before = page.next_before_event_idx;
+        pages.push(page);
+    }
+    assert_eq!(pages[0].source_run_id, run);
+    assert!(pages[0].events.is_empty());
+    assert_eq!(pages[0].next_before_event_idx, Some(86));
+    assert_eq!(pages[1].events.len(), 1);
+    assert_eq!(pages[1].events[0].event_idx, 22);
+    assert_eq!(
+        pages[1].events[0].event.as_ref().unwrap()["type"],
+        "stream_gap"
+    );
+    assert_eq!(pages[1].next_before_event_idx, Some(22));
+    assert!(!pages[2].has_more);
+    assert_eq!(pages[2].events.len(), 2);
+    assert_eq!(
+        pages[2].events[0].event.as_ref().unwrap()["call_id"],
+        "kept"
+    );
+    assert!(
+        pages[2].events[1].event.is_none(),
+        "oversized payload is explicit unavailable evidence"
+    );
+    assert!(
+        pages
+            .iter()
+            .flat_map(|p| &p.events)
+            .all(|event| event.event_idx <= 22)
+    );
+    sqlx::query("DELETE FROM agent_run_events WHERE run_id = ?")
+        .bind(&run)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    cleanup_lifecycle_run_fixture(&pool, owner, &child).await;
+    cleanup_lifecycle_run_fixture(&pool, owner, &run).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, owner, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_final_session_cancel_rechecks_admission_after_the_old_idle_observation() {
+    use astra_services::{SessionService, SessionUpdateRequestData};
+    let pool = setup_lifecycle_run_db_it().await;
+    let user = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+    let cancelling = db_backed_test_service(&pool, "cancelling-server");
+    let admitting = db_backed_test_service(&pool, "admitting-server");
+    let sessions = astra_services::DatabaseSessionService::new(pool.settings().clone())
+        .with_pool(pool.clone());
+    let proof_ready = tokio::sync::Notify::new();
+    let admission_done = tokio::sync::Notify::new();
+    let cancel = async {
+        let old_proof = cancelling
+            .cancel_session_runs(session.clone(), user.clone())
+            .await
+            .unwrap();
+        assert!(old_proof.execution_settled);
+        proof_ready.notify_one();
+        admission_done.notified().await;
+        sessions
+            .update_session(
+                session.clone(),
+                user.clone(),
+                SessionUpdateRequestData {
+                    title: None,
+                    metadata: None,
+                    metadata_patch: None,
+                    status: Some(STATUS_CANCELLED.into()),
+                },
+            )
+            .await
+    };
+    let admit = async {
+        proof_ready.notified().await;
+        admitting
+            .run_engine
+            .start_run(&run, &user, &session)
+            .await
+            .unwrap();
+        admission_done.notify_one();
+    };
+    let (result, ()) = tokio::join!(cancel, admit);
+    let (status, Json(error)) =
+        result.expect_err("an admitted owner invalidates the earlier idle proof");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        error.error_code.as_deref(),
+        Some("cancellation_recovery_required")
+    );
+    assert_eq!(
+        sessions
+            .get_session(session.clone(), user.clone())
+            .await
+            .unwrap()
+            .status,
+        "active"
+    );
+    assert_eq!(
+        admitting
+            .run_engine
+            .load_run(&user, &run)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_RUNNING
+    );
+    cleanup_lifecycle_run_fixture(&pool, &user, &run).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_session_settlement_observation_is_bounded_while_the_session_fence_is_held() {
+    use astra_services::session_context_coordinator::SessionExecutionBlocker;
+    let pool = setup_lifecycle_run_db_it().await;
+    let user = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+    let service = db_backed_test_service(&pool, "settlement-observer");
+    let mut held = pool.get().begin().await.unwrap();
+    sqlx::query(
+        "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(&user)
+    .bind(&session)
+    .fetch_optional(&mut *held)
+    .await
+    .unwrap();
+    let pending = tokio::time::timeout(
+        Duration::from_secs(3),
+        service.get_session_execution_settlement(session.clone(), user.clone()),
+    )
+    .await
+    .expect("read-only settlement must not inherit a database lock timeout")
+    .unwrap();
+    assert!(!pending.execution_settled);
+    assert_eq!(
+        pending.execution_blocker,
+        Some(SessionExecutionBlocker::OwnerUnavailable)
+    );
+    held.rollback().await.unwrap();
+    let settled = service
+        .get_session_execution_settlement(session.clone(), user.clone())
+        .await
+        .unwrap();
+    assert!(
+        settled.execution_settled,
+        "a timed-out observation must not retain the Session fence"
+    );
+    crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_cancel_observation_does_not_promote_stale_local_retirement_over_remote_lease() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let user = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+    let service = db_backed_test_service(&pool, "old-owner");
+    service
+        .run_engine
+        .start_run(&run, &user, &session)
+        .await
+        .unwrap();
+    let (mut local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        run.clone(),
+        session.clone(),
+        user.clone(),
+    );
+    local.execution_live = false;
+    service.runs.write().await.insert(run.clone(), local);
+    // Existing resumed-run state on another pod; local retirement belongs to
+    // the old executor, not this newly leased durable generation.
+    sqlx::query("UPDATE agent_runs SET owner_pod_id = 'remote-owner', run_generation = run_generation + 1, owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    let accepted = service.cancel_run(run.clone(), user.clone()).await.unwrap();
+    assert!(!accepted.execution_settled);
+    for _ in 0..3 {
+        let observed = service
+            .get_run_execution_settlement(run.clone(), user.clone())
+            .await
+            .expect("a live remote owner must remain pending, not request orphan recovery");
+        assert!(!observed.execution_settled);
+    }
+    sqlx::query("UPDATE agent_runs SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
+        .bind(&user).bind(&run).execute(pool.get()).await.unwrap();
+    let (_, Json(error)) = service
+        .get_run_execution_settlement(run.clone(), user.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.error_code.as_deref(),
+        Some("cancellation_recovery_required")
+    );
+    let settled = service.cancel_run(run.clone(), user.clone()).await.unwrap();
+    assert!(settled.execution_settled);
+    cleanup_lifecycle_run_fixture(&pool, &user, &run).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
 }

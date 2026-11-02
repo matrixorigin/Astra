@@ -199,6 +199,14 @@ pub fn session_memory_finalize(id: &str) -> String {
     format!("/sessions/{}/memory/finalize", model_segment(id))
 }
 
+pub fn session_run_activity(session_id: &str, run_id: &str) -> String {
+    format!(
+        "/sessions/{}/runs/{}/activity",
+        model_segment(session_id),
+        model_segment(run_id)
+    )
+}
+
 pub fn session_close(id: &str) -> String {
     format!("/sessions/{id}/close")
 }
@@ -285,6 +293,11 @@ pub fn session_artifact_download(session_id: &str, artifact_id: &str) -> Option<
 }
 
 /// A safe path segment contains only alphanumeric, `-`, `_`, or `.` characters
+/// Read-only execution-settlement observation for an exact run.
+pub fn chat_run_cancel(run_id: &str) -> String {
+    format!("{}/cancel", chat_run(run_id))
+}
+
 /// and is non-empty. Rejects `/`, `..`, `?`, `#`, `%`, etc.
 fn is_safe_path_segment(s: &str) -> bool {
     !s.is_empty()

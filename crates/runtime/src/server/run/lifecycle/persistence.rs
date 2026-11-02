@@ -4442,6 +4442,82 @@ mod tests {
                 },
             ));
         }
+        if incomplete {
+            let original_interruption = state.interruption.take();
+            let kind = if case == TerminalCase::UserCancellation {
+                astra_core::ErrorKind::Cancelled
+            } else {
+                astra_core::ErrorKind::Network
+            };
+            let mut provider = crate::turn::agentic_loop::host::tests::failed_partial_host(
+                kind,
+                "committed answer 中文🙂",
+            );
+            state.current_run_id = Some(run_id.clone());
+            state.current_session_id = Some(session.clone());
+            state.owner_user_id = Some(user.clone());
+            state.permission_context = Some(
+                astra_turn_core::permission::types::PermissionSyncContext::shared_root(
+                    astra_turn_core::permission::types::PermissionMode::Auto,
+                ),
+            );
+            state.final_text.clear();
+            state.final_text_model_item_id = None;
+            state
+                .messages
+                .retain(|message| message["role"] != "assistant");
+            let failed = crate::turn::agentic_loop::host::run_agentic_loop_with_host(
+                &mut provider,
+                &mut state,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failed.kind, kind);
+            assert_eq!(state.final_text, "committed answer 中文🙂");
+            assert!(state.final_text_model_item_id.is_some());
+            assert_ne!(
+                state.final_text_model_item_id.as_deref(),
+                Some("provider-item-A")
+            );
+            assert!(provider.rendered_final_text.is_empty());
+            assert!(provider.final_output_ready.is_empty());
+            state.interruption = original_interruption;
+        }
+        if incomplete {
+            // Join the root finalization barrier to real canonical commit/replay:
+            // pending child evidence must block success without losing streamed text.
+            let child_owner =
+                crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                    &run_id,
+                    "pending-child",
+                );
+            child_owner.set_direct_child_for_test(
+                crate::orchestration::spawner::DirectChildCompletion {
+                    agent_id: "pending-child".into(),
+                    run_id: "pending-child-run".into(),
+                    parent_agent_id: "root-agent".into(),
+                    applied_user_intents: Vec::new(),
+                    status: crate::orchestration::AgentStatus::Running {
+                        activity: "working".into(),
+                    },
+                },
+            );
+            let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
+            host.direct_child_owner = Some(child_owner.clone());
+            state.current_run_id = Some(run_id.clone());
+            state.final_text_streamed = true;
+            state.hooks.completion_settlement.latest_provider_text = Some(state.final_text.clone());
+            state
+                .hooks
+                .completion_settlement
+                .latest_provider_text_model_item_id = state.final_text_model_item_id.clone();
+            crate::turn::agentic_loop::finalization::finalize_and_render(&mut host, &mut state)
+                .await;
+            assert_eq!(state.final_text, "committed answer 中文🙂");
+            assert_eq!(state.final_text_model_item_id, state.current_model_item_id);
+            assert!(state.interruption.is_some());
+            assert!(child_owner.has_pending_direct_children());
+        }
         let context = AgenticRunLifecycleService::prepare_canonical_turn_commit(
             Some(&admitted),
             &state.messages,
@@ -4532,6 +4608,12 @@ mod tests {
             user_message: &request.message,
             include_terminal_assistant: true,
         };
+        if case == TerminalCase::Completed {
+            store.append_events_batch(&user, &session, &run_id, &[
+                json!({"type":"agent_spawned","run_id":"recovery-child-a","agent_id":"worker-a"}),
+                json!({"type":"agent_spawned","run_id":"recovery-child-b","agent_id":"worker-b"}),
+            ]).await.unwrap();
+        }
         let result = persist_server_loop_canonical_terminal_settlement(
             &pool,
             append(),
@@ -4615,6 +4697,46 @@ mod tests {
                 physical, 0,
                 "completion has one C0/C1 owner, without mirrored event payloads or markers"
             );
+            // Cold exact child recovery must use the same C0/C1 owner; there
+            // are deliberately no physical terminal event payloads to read.
+            let fresh = DatabaseRunStateStore::new(pool.clone());
+            let recovered = fresh
+                .load_session_agent_recovery_for(&user, &session, std::slice::from_ref(&run_id))
+                .await
+                .unwrap();
+            let recovered = recovered
+                .runs
+                .iter()
+                .find(|run| run.run_id == run_id)
+                .unwrap();
+            if case == TerminalCase::Completed {
+                assert_eq!(
+                    recovered
+                        .events
+                        .iter()
+                        .filter(|event| durable_event_type(event) == Some("agent_spawned"))
+                        .count(),
+                    2,
+                    "canonical terminal merge retains every unindexed child admission"
+                );
+            }
+            let terminal_facts = |run: &astra_services::runs::DurableRunRecord| {
+                run.events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            durable_event_type(event),
+                            Some("text_done" | "run_error" | "run_finished")
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(terminal_facts(recovered), terminal_facts(&current));
+            assert_eq!(
+                crate::orchestration::spawner::durable_agent_status(recovered),
+                crate::orchestration::spawner::durable_agent_status(&current)
+            );
             let completion = current
                 .events
                 .iter()
@@ -4643,7 +4765,10 @@ mod tests {
                 .find(|event| durable_event_type(event) == Some("text_done"))
                 .unwrap();
             assert_eq!(text["data"]["full_text"], state.final_text);
-            assert_eq!(text["data"]["model_item_id"], "answer-model-item");
+            assert_eq!(
+                text["data"]["model_item_id"],
+                json!(state.final_text_model_item_id)
+            );
             let delta = store
                 .load_run_event_delta(&user, &run_id, text["index"].as_i64().unwrap())
                 .await

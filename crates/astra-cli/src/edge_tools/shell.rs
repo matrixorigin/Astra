@@ -164,6 +164,11 @@ fn attach_source_preimage_outcome(
 
 const ENVIRONMENT_BACKGROUND_TASK_AUTH: &str = "ASTRA_ALLOW_ENVIRONMENT_BACKGROUND_TASKS";
 
+pub(super) fn environment_background_authorized() -> bool {
+    astra_tools::schemas::managed_background_bash_supported()
+        && std::env::var(ENVIRONMENT_BACKGROUND_TASK_AUTH).as_deref() == Ok("1")
+}
+
 fn environment_background_requested(args: &Value) -> bool {
     args.get("run_in_background")
         .and_then(Value::as_bool)
@@ -4491,8 +4496,17 @@ impl ToolExecutor {
         };
         if descendants_terminated {
             outcome.output.push_str(
-                "\n\n⚠ Live descendant processes were terminated when this foreground bash call ended; they are not running now. This includes programs that daemonize themselves, even when the command contains no `&`. For a service needed by later calls, retry bash with run_in_background=true and an independent ready_check. Use foreground bash only for bounded child work that finishes before this call returns.",
+                "\n\nLive descendant processes were terminated when this foreground Bash call ended. They are not running now.",
             );
+            if environment_background_authorized() && !self.read_only_execution {
+                outcome.output.push_str(
+                    " For a service needed by later calls, use run_in_background=true with an independent ready_check.",
+                );
+            } else {
+                outcome.output.push_str(
+                    " Managed background services are unavailable. Keep bounded work and its dependent checks in the same foreground call.",
+                );
+            }
         }
         let fields = outcome
             .tool_result_fields
@@ -4710,10 +4724,15 @@ impl ToolExecutor {
         if self.read_only_execution {
             return read_only_shell_rejection();
         }
-        if std::env::var(ENVIRONMENT_BACKGROUND_TASK_AUTH).as_deref() != Ok("1") {
-            return bash_preparation_rejection(
-                "Error: environment-lifetime background tasks are not authorized by this execution environment; no process was started".to_string(),
+        if !environment_background_authorized() {
+            let mut outcome = super::ToolExecutionOutcome::ok(
+                "Managed background services are unavailable in this execution environment. No process was started. Run bounded work and its checks in one foreground call.".to_string(),
             );
+            mark_bash_capture_unavailable(&mut outcome);
+            let fields = outcome.tool_result_fields.get_or_insert_default();
+            astra_tools::execution_outcome::insert_not_executed_fact(fields);
+            fields.insert("side_effects_maybe".into(), Value::Bool(false));
+            return outcome;
         }
         let (command, _, workdir) =
             match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
@@ -7084,7 +7103,7 @@ mod tests {
                 10.0,
             ),
             (serde_json::json!({"command": "cargo test"}), 30_000, 30.0),
-            (serde_json::json!({"command": "echo hello"}), 120_000, 5.0),
+            (serde_json::json!({"command": "echo hello"}), 120_000, 15.0),
             (serde_json::json!({"command": "sleep 5"}), 100, 0.1),
         ] {
             let (_, timeout, _) = executor
@@ -7163,15 +7182,15 @@ mod tests {
     #[test]
     fn default_bash_timeout_quick_commands_stay_short() {
         for (cmd, expected) in [
-            ("echo hello", 5.0),
-            ("pwd", 5.0),
-            ("ls -la", 10.0),
-            ("cat file.txt", 10.0),
+            ("echo hello", 15.0),
+            ("pwd", 15.0),
+            ("ls -la", 15.0),
+            ("cat file.txt", 15.0),
             ("grep -rn pattern .", 15.0),
             ("find . -name '*.rs'", 15.0),
-            ("./my_custom_script.sh", 30.0),
-            ("curl https://example.com", 30.0),
-            ("", 30.0),
+            ("./my_custom_script.sh", 120.0),
+            ("curl https://example.com", 120.0),
+            ("", 120.0),
         ] {
             assert_eq!(
                 default_bash_timeout_secs(cmd),
@@ -7179,6 +7198,26 @@ mod tests {
                 "{cmd}: expected {expected}s"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compound_custom_command_retains_the_unknown_executable_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("custom-command");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nsleep 16\nprintf 'custom command finished'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executor = test_executor_in(dir.path());
+        let outcome = executor.execute_with_metadata("bash", &serde_json::json!({
+            "command": format!("cd {} && ./custom-command", super::shell_escape(dir.path().to_str().unwrap()))
+        })).await;
+        assert!(!outcome.is_error, "{}", outcome.output);
+        assert!(outcome.output.contains("custom command finished"));
     }
 
     #[tokio::test]
@@ -7276,7 +7315,7 @@ mod tests {
             !result.contains("timed out"),
             "should not timeout: {result}"
         );
-        assert!(result.contains("run_in_background=true"), "{result}");
+        assert!(result.contains("not running now"), "{result}");
     }
 
     #[cfg(target_os = "linux")]
@@ -7300,11 +7339,7 @@ mod tests {
             )
             .await;
         assert!(!outcome.is_error, "{}", outcome.output);
-        assert!(
-            outcome.output.contains("daemonize themselves"),
-            "{}",
-            outcome.output
-        );
+        assert!(outcome.output.contains("terminated"), "{}", outcome.output);
         let fields = outcome.tool_result_fields.expect("typed settlement fields");
         assert_eq!(fields["background_children_reaped"], true);
         assert_eq!(fields["descendant_persistence"], false);

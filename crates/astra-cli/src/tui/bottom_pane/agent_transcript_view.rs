@@ -237,6 +237,12 @@ pub(crate) enum AgentTranscriptUpdate {
         replace: bool,
         source: AgentTranscriptSource,
     },
+    ActivityLoaded {
+        agent_id: String,
+        run_id: String,
+        page: Result<astra_thin_client::protocol::RunActivityPage, String>,
+        replace: bool,
+    },
     Failed {
         agent_id: String,
         run_id: String,
@@ -275,6 +281,8 @@ pub(crate) struct AgentTranscriptView {
     loading: bool,
     error: Option<String>,
     source: Option<AgentTranscriptSource>,
+    activity: Option<astra_thin_client::protocol::RunActivityPage>,
+    activity_error: Option<String>,
     live: LiveTranscript,
     pending_transcript_commit: Option<PendingTranscriptCommit>,
     /// A terminal live event is emitted only after the local or server runner
@@ -337,6 +345,8 @@ impl AgentTranscriptView {
             error: None,
             source: None,
             live: LiveTranscript::default(),
+            activity: None,
+            activity_error: None,
             pending_transcript_commit: None,
             terminal_refresh_requested: false,
             local_root_live: None,
@@ -387,6 +397,8 @@ impl AgentTranscriptView {
             error: None,
             source: None,
             live: LiveTranscript::default(),
+            activity: None,
+            activity_error: None,
             pending_transcript_commit: None,
             terminal_refresh_requested: false,
             local_root_live: None,
@@ -634,7 +646,12 @@ impl AgentTranscriptView {
     }
 
     fn transcript_snapshot(&self) -> TranscriptSnapshot {
-        if self.items.is_empty() && self.live.is_empty() && self.local_root_live.is_none() {
+        if self.items.is_empty()
+            && self.live.is_empty()
+            && self.local_root_live.is_none()
+            && self.activity.is_none()
+            && self.activity_error.is_none()
+        {
             let message = if self.loading {
                 "Loading durable conversation…"
             } else if let Some(error) = self.error.as_deref() {
@@ -665,6 +682,40 @@ impl AgentTranscriptView {
         }
 
         let mut projected = durable_transcript_items(&self.items);
+        if let Some(activity) = &self.activity {
+            projected.push(TranscriptItem::rendered(
+                TranscriptItemId::from_widget_id(1 << 61),
+                vec![Line::from(
+                    "Recorded tool activity (partial coverage) · A older · R refresh",
+                )],
+                0,
+            ));
+            if activity.events.is_empty() {
+                projected.push(TranscriptItem::rendered(
+                    TranscriptItemId::from_widget_id((1 << 61) + 2),
+                    vec![Line::from("No recorded activity in this range. Live-only or dropped events may be unavailable.")], 0));
+            }
+            for entry in &activity.events {
+                let text = activity_event_text(entry.event.as_ref());
+                projected.push(TranscriptItem::rendered(
+                    TranscriptItemId::from_canonical(
+                        format!("activity:{}:{}", activity.source_run_id, entry.event_idx),
+                        "event",
+                    ),
+                    text.lines()
+                        .map(|line| Line::from(line.to_owned()))
+                        .collect(),
+                    0,
+                ));
+            }
+        }
+        if let Some(error) = &self.activity_error {
+            projected.push(TranscriptItem::rendered(
+                TranscriptItemId::from_widget_id((1 << 61) + 1),
+                vec![Line::from(error.clone())],
+                0,
+            ));
+        }
         self.append_live_projection(&mut projected);
         if let Some(live) = &self.local_root_live {
             projected.push(TranscriptItem::rendered(
@@ -695,13 +746,46 @@ impl AgentTranscriptView {
                     )
             })
             .collect::<std::collections::HashSet<_>>();
+        let activity_events = self
+            .activity
+            .as_ref()
+            .into_iter()
+            .flat_map(|page| &page.events)
+            .filter_map(|entry| entry.event.as_ref());
+        let mut requested = std::collections::HashSet::new();
+        let mut settled = std::collections::HashSet::new();
+        for event in activity_events {
+            let Some(id) = event
+                .get("call_id")
+                .or_else(|| event.get("tool_call_id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            match event.get("type").and_then(serde_json::Value::as_str) {
+                Some("tool_call_start") => {
+                    requested.insert(id);
+                }
+                Some("tool_call_end") => {
+                    settled.insert(id);
+                }
+                _ => {}
+            }
+        }
+        // An unpaired result cannot replace the richer live request/result.
+        let durable_tool_ids: std::collections::HashSet<_> = durable_tool_ids
+            .into_iter()
+            .chain(requested.intersection(&settled).copied())
+            .collect();
 
-        if self
-            .live
-            .items
-            .iter()
-            .any(|item| !matches!(item, LiveTranscriptItem::Notice { .. }))
-        {
+        if self.live.items.iter().any(|item| match item {
+            LiveTranscriptItem::Notice { .. } => false,
+            LiveTranscriptItem::Tool { tool_use_id, .. } => {
+                !durable_tool_ids.contains(tool_use_id.as_str())
+            }
+            _ => true,
+        }) {
             // A terminal edge does not promise that every streamed part is
             // persisted. Report loaded coverage, not a guessed storage state.
             projected.push(TranscriptItem::rendered(
@@ -1337,6 +1421,25 @@ impl BottomPaneView for AgentTranscriptView {
                 self.transcript.expand_current_item();
             }
             KeyCode::Char('r' | 'R') => self.request_load(None),
+            KeyCode::Char('a' | 'A') if !self.loading => {
+                if let (Some(session_id), Some(before)) = (
+                    self.session_id.clone(),
+                    self.activity
+                        .as_ref()
+                        .and_then(|page| page.next_before_event_idx),
+                ) {
+                    self.loading = true;
+                    self.pending_action = Some(ViewActionRequest {
+                        action: BottomPaneViewAction::LoadAgentActivity {
+                            agent_id: self.agent_id.clone(),
+                            session_id,
+                            run_id: self.run_id.clone(),
+                            before_event_idx: Some(before),
+                        },
+                        disposition: ViewActionDisposition::KeepOpen,
+                    });
+                }
+            }
             KeyCode::Char('o' | 'O') if self.has_more => self.request_load(self.next_before_seq),
             KeyCode::Char('s' | 'S') => self.request_export(),
             _ => self.transcript.handle_key(key),
@@ -1419,6 +1522,50 @@ impl BottomPaneView for AgentTranscriptView {
 
     fn refresh_agent_transcript(&mut self, update: AgentTranscriptUpdate) -> bool {
         match update {
+            AgentTranscriptUpdate::ActivityLoaded {
+                agent_id,
+                run_id,
+                page,
+                replace,
+            } if agent_id == self.agent_id && run_id == self.run_id => {
+                self.loading = false;
+                match page {
+                    Ok(mut page)
+                        if page.run_id == self.run_id
+                            && self.session_id.as_deref() == Some(page.session_id.as_str())
+                            && !page.source_run_id.is_empty()
+                            && self
+                                .activity
+                                .as_ref()
+                                .is_none_or(|old| old.source_run_id == page.source_run_id) =>
+                    {
+                        if !replace && let Some(old) = self.activity.take() {
+                            page.events.extend(old.events);
+                            page.events.sort_by_key(|entry| entry.event_idx);
+                            page.events.dedup_by_key(|entry| entry.event_idx);
+                        }
+                        // Retain a bounded inspection window. Paging older drops
+                        // the newest entries; R returns to the latest page.
+                        page.events.truncate(128);
+                        self.activity = Some(page);
+                        self.activity_error = None;
+                    }
+                    Ok(_) => {
+                        self.activity_error =
+                            Some("Activity identity mismatch; history was not replaced.".into())
+                    }
+                    Err(error) => {
+                        self.activity_error = Some(format!("Tool activity unavailable: {error}"))
+                    }
+                }
+                self.rebuild_transcript();
+                if self.root_refresh_pending {
+                    self.root_refresh_pending = false;
+                    self.request_load(None);
+                } else if self.export_pending {
+                    self.continue_export();
+                }
+            }
             AgentTranscriptUpdate::Loaded {
                 agent_id,
                 run_id,
@@ -1426,7 +1573,28 @@ impl BottomPaneView for AgentTranscriptView {
                 replace,
                 source,
             } if agent_id == self.agent_id && run_id == self.run_id => {
-                self.apply_page(page, replace, source)
+                self.apply_page(page, replace, source);
+                if replace
+                    && !self.loading
+                    && self.pending_action.is_none()
+                    && !self.export_pending
+                    && self.transcript_target
+                        == Some(
+                            crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
+                        )
+                    && let Some(session_id) = self.session_id.clone()
+                {
+                    self.loading = true;
+                    self.pending_action = Some(ViewActionRequest {
+                        action: BottomPaneViewAction::LoadAgentActivity {
+                            agent_id: self.agent_id.clone(),
+                            session_id,
+                            run_id: self.run_id.clone(),
+                            before_event_idx: None,
+                        },
+                        disposition: ViewActionDisposition::KeepOpen,
+                    });
+                }
             }
             AgentTranscriptUpdate::Failed {
                 agent_id,
@@ -1620,10 +1788,162 @@ impl BottomPaneView for AgentTranscriptView {
     }
 }
 
+/// Render evidence without inferring success from a missing result or status.
+fn activity_event_text(event: Option<&serde_json::Value>) -> String {
+    let Some(event) = event else {
+        return "Activity unavailable: the stored event was malformed or exceeded the display limit.".into();
+    };
+    let kind = event
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if matches!(kind, "stream_gap" | "durable_events_compacted") {
+        return "Recorded activity has a gap; some execution details are unavailable.".into();
+    }
+    let name = event
+        .get("tool")
+        .or_else(|| event.get("tool_name"))
+        .or_else(|| event.pointer("/tool_call/function/name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("tool");
+    let status = event
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(
+            || match event.get("success").and_then(serde_json::Value::as_bool) {
+                Some(true) => "succeeded",
+                Some(false) => "failed",
+                None if matches!(kind, "tool_call" | "tool_call_start") => "requested",
+                None => "outcome unknown",
+            },
+        );
+    let detail = event
+        .get("output")
+        .or_else(|| event.get("result"))
+        .or_else(|| event.get("error"))
+        .or_else(|| event.get("arguments"))
+        .or_else(|| event.pointer("/tool_call/function/arguments"));
+    let detail = detail
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_default();
+    format!("{name} · {status}\n{detail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn activity_projection_distinguishes_requests_unknown_outcomes_and_gaps() {
+        for (event, expected) in [
+            (
+                serde_json::json!({"type":"tool_call", "tool":"bash"}),
+                "bash · requested",
+            ),
+            (
+                serde_json::json!({"type":"tool_result", "tool":"bash"}),
+                "bash · outcome unknown",
+            ),
+            (
+                serde_json::json!({"type":"tool_result", "tool":"bash", "success":false}),
+                "bash · failed",
+            ),
+            (
+                serde_json::json!({"type":"stream_gap"}),
+                "Recorded activity has a gap",
+            ),
+        ] {
+            assert!(activity_event_text(Some(&event)).contains(expected));
+        }
+        assert!(activity_event_text(None).contains("unavailable"));
+    }
+
+    #[test]
+    fn recorded_activity_pages_are_bounded_deduplicated_and_identity_scoped() {
+        use astra_thin_client::protocol::{RunActivityEvent, RunActivityPage};
+        let mut view = AgentTranscriptView::loading(
+            "child".into(),
+            "Child".into(),
+            "session".into(),
+            "run".into(),
+            crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
+            "agents",
+            80,
+            24,
+        );
+        let page = |session: &str, first: i64, last: i64| RunActivityPage {
+            session_id: session.into(),
+            run_id: "run".into(),
+            source_run_id: "root".into(),
+            events: (first..=last)
+                .map(|event_idx| RunActivityEvent {
+                    event_idx,
+                    event: Some(serde_json::json!({"type":"tool_call_start","tool":"bash"})),
+                })
+                .collect(),
+            next_before_event_idx: Some(first),
+            has_more: true,
+        };
+        view.refresh_agent_transcript(AgentTranscriptUpdate::ActivityLoaded {
+            agent_id: "child".into(),
+            run_id: "run".into(),
+            page: Ok(page("session", 100, 163)),
+            replace: true,
+        });
+        view.refresh_agent_transcript(AgentTranscriptUpdate::ActivityLoaded {
+            agent_id: "child".into(),
+            run_id: "another-run".into(),
+            page: Ok(page("session", 0, 63)),
+            replace: true,
+        });
+        assert_eq!(view.activity.as_ref().unwrap().events[0].event_idx, 100);
+        view.refresh_agent_transcript(AgentTranscriptUpdate::ActivityLoaded {
+            agent_id: "child".into(),
+            run_id: "run".into(),
+            page: Ok(page("other-session", 0, 63)),
+            replace: true,
+        });
+        assert_eq!(view.activity.as_ref().unwrap().events[0].event_idx, 100);
+        assert!(
+            view.activity_error
+                .as_deref()
+                .unwrap()
+                .contains("identity mismatch")
+        );
+        for (first, last) in [(50, 113), (0, 63)] {
+            view.refresh_agent_transcript(AgentTranscriptUpdate::ActivityLoaded {
+                agent_id: "child".into(),
+                run_id: "run".into(),
+                page: Ok(page("session", first, last)),
+                replace: false,
+            });
+        }
+        let activity = view.activity.as_ref().unwrap();
+        assert_eq!(activity.events.len(), 128);
+        assert_eq!(activity.events.first().unwrap().event_idx, 0);
+        assert_eq!(activity.events.last().unwrap().event_idx, 127);
+        assert_eq!(activity.next_before_event_idx, Some(0));
+        assert!(view.activity_error.is_none());
+        view.refresh_agent_transcript(AgentTranscriptUpdate::ActivityLoaded {
+            agent_id: "child".into(),
+            run_id: "run".into(),
+            page: Err("connection lost".into()),
+            replace: true,
+        });
+        assert_eq!(view.activity.as_ref().unwrap().events.len(), 128);
+        assert!(
+            view.activity_error
+                .as_deref()
+                .unwrap()
+                .contains("connection lost")
+        );
+    }
 
     fn rendered(view: &AgentTranscriptView) -> String {
         let area = Rect::new(0, 0, 80, 20);
@@ -2091,7 +2411,11 @@ mod tests {
             "left first collapses the selected detail"
         );
         assert!(!rendered(&view).contains("Inspect state ownership"));
-        assert!(view.take_action_request().is_none());
+        assert!(
+            matches!(view.take_action_request(), Some(ViewActionRequest { action: BottomPaneViewAction::LoadAgentActivity {
+            run_id, session_id, before_event_idx: None, ..
+        }, .. }) if run_id == "run-child" && session_id == "session-1")
+        );
         view.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert!(

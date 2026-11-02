@@ -271,9 +271,7 @@ pub use user_intent::{
     mark_user_turn_semantics, user_turn_semantics,
 };
 pub use verification_frontier::{
-    BoundVerificationFrontier, BoundWorkspaceObservation, VerificationEvidence,
-    VerificationHandoff, VerificationUnavailable, WorkspaceMutationSource,
-    WorkspaceObservationProof,
+    BoundVerificationFrontier, VerificationEvidence, VerificationHandoff, VerificationUnavailable,
 };
 
 pub mod permission_control;

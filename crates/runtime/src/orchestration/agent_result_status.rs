@@ -137,6 +137,7 @@ pub fn project_agent_tool_budget_record(
             | AgentToolWireOutcomeKind::TimedOut
             | AgentToolWireOutcomeKind::Cancelled
             | AgentToolWireOutcomeKind::Running => {
+                partial_result = astra_turn_core::orchestration::agent_result_wire::agent_tool_partial_result_text(parsed);
                 incomplete_reason = agent_tool_incomplete_reason(parsed);
             }
             AgentToolWireOutcomeKind::NoChange => {}
@@ -318,6 +319,7 @@ mod tests {
             AgentStatus::Failed {
                 error: "boom".into(),
                 finish_reason: Some("failed".into()),
+                partial_result: String::new(),
             },
             AgentStatus::cancelled_anonymous(),
         ];
@@ -333,6 +335,7 @@ mod tests {
         let failed = AgentStatus::Failed {
             error: "boom".into(),
             finish_reason: Some("failed".into()),
+            partial_result: String::new(),
         };
         let failed_out = render_wait_for_agent_status("ag", &failed);
         let failed_json: serde_json::Value = serde_json::from_str(&failed_out).unwrap();

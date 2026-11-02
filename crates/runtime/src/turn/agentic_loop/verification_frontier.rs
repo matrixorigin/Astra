@@ -29,176 +29,10 @@ struct Evidence {
 }
 
 impl Evidence {
-    fn bind(&self) -> Option<astra_turn_types::VerificationEvidence> {
-        Some(astra_turn_types::VerificationEvidence {
-            ordinal: self.ordinal,
-            invocation: self.invocation.clone()?,
-        })
-    }
-
     fn restore(evidence: &astra_turn_types::VerificationEvidence) -> Self {
         Self {
             ordinal: evidence.ordinal,
             invocation: Some(evidence.invocation.clone()),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct MutationSource {
-    evidence: Evidence,
-    delivered_path: Option<std::path::PathBuf>,
-}
-
-impl MutationSource {
-    fn bind(&self) -> Option<astra_turn_types::WorkspaceMutationSource> {
-        Some(astra_turn_types::WorkspaceMutationSource {
-            evidence: self.evidence.bind()?,
-            delivered_path: self
-                .delivered_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-        })
-    }
-
-    fn restore(source: &astra_turn_types::WorkspaceMutationSource) -> Self {
-        Self {
-            evidence: Evidence::restore(&source.evidence),
-            delivered_path: source.delivered_path.as_ref().map(std::path::PathBuf::from),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct ObservationProof {
-    evidence: Evidence,
-    literal_source: Option<MutationSource>,
-}
-
-/// The workspace predicate has two distinct frontiers: an observation debt,
-/// and the latest positive writer that may justify executing a delivered file.
-/// A failed or opaque newer writer must erase that delivery even when it has
-/// no explicit path. This reducer replaces backward scans and prefix searches.
-#[derive(Clone, Default)]
-pub(super) struct WorkspaceObservationFacts {
-    barrier: Option<Evidence>,
-    proof: Option<ObservationProof>,
-    latest_source: Option<MutationSource>,
-}
-
-impl WorkspaceObservationFacts {
-    pub(super) fn observe(
-        &mut self,
-        record: &ToolCallRecord,
-        ordinal: u64,
-        verified_explicit_hook: bool,
-        root: Option<&str>,
-        parallel_mutating_peer: bool,
-    ) {
-        if !record.was_executed() {
-            return;
-        }
-        let args = super::lifecycle::extract_tool_args(record.authoritative_args_full());
-        let literal_command = (record.name == "bash")
-            .then(|| {
-                args.as_ref()
-                    .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
-                    .filter(|command| {
-                        super::lifecycle::bash_command_has_literal_script_artifact_observation_shape(command)
-                    })
-            })
-            .flatten();
-        let evidence = Evidence {
-            ordinal,
-            invocation: record
-                .execution_completion
-                .as_ref()
-                .and_then(|reference| reference.as_invocation())
-                .cloned(),
-        };
-        let full_scope =
-            super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record);
-        let literal_source = literal_command
-            .and_then(|command| {
-                super::lifecycle::bash_literal_script_artifact_observation_target(command, root)
-            })
-            .and_then(|target| {
-                self.latest_source
-                    .as_ref()
-                    .filter(|source| source.delivered_path.as_ref() == Some(&target))
-            })
-            .cloned();
-        let observes = !parallel_mutating_peer
-            && (verified_explicit_hook
-                || (record.ok
-                    && super::lifecycle::record_can_observe_bound_workspace(root, record)
-                    && (full_scope || literal_command.is_none() || literal_source.is_some())));
-        let barrier = !verified_explicit_hook && workspace_mutation_risk(record, root);
-        if barrier {
-            self.barrier = Some(evidence.clone());
-            // A compound invocation may itself supply the post-mutation receipt.
-            self.proof = None;
-        }
-        if observes && self.barrier.is_some() {
-            self.proof = Some(ObservationProof {
-                evidence: evidence.clone(),
-                literal_source: if verified_explicit_hook || full_scope {
-                    None
-                } else {
-                    literal_source
-                },
-            });
-        }
-        // Evaluate the observer against the PREVIOUS source, then replace the
-        // source. Successful explicit hooks can still be positive writers.
-        if super::execution_phase::tool_record_may_have_mutated_bound_workspace(root, record) {
-            let delivered_path = (record.ok
-                && super::lifecycle::record_has_typed_workspace_tool_receipt(record))
-            .then(|| super::lifecycle::record_explicit_path(record))
-            .flatten()
-            .and_then(|path| super::lifecycle::normalize_workspace_path(&path, root));
-            self.latest_source = Some(MutationSource {
-                evidence,
-                delivered_path,
-            });
-        }
-    }
-
-    pub(super) fn is_satisfied(&self) -> bool {
-        self.barrier.is_none() || self.proof.is_some()
-    }
-
-    fn bind(&self) -> Option<astra_turn_types::BoundWorkspaceObservation> {
-        Some(astra_turn_types::BoundWorkspaceObservation {
-            barrier: match &self.barrier {
-                None => None,
-                Some(evidence) => Some(evidence.bind()?),
-            },
-            proof: match &self.proof {
-                None => None,
-                Some(proof) => Some(astra_turn_types::WorkspaceObservationProof {
-                    evidence: proof.evidence.bind()?,
-                    literal_source: match &proof.literal_source {
-                        None => None,
-                        Some(source) => Some(source.bind()?),
-                    },
-                }),
-            },
-            latest_source: match &self.latest_source {
-                None => None,
-                Some(source) => Some(source.bind()?),
-            },
-        })
-    }
-
-    fn restore(snapshot: &astra_turn_types::BoundWorkspaceObservation) -> Self {
-        Self {
-            barrier: snapshot.barrier.as_ref().map(Evidence::restore),
-            proof: snapshot.proof.as_ref().map(|proof| ObservationProof {
-                evidence: Evidence::restore(&proof.evidence),
-                literal_source: proof.literal_source.as_ref().map(MutationSource::restore),
-            }),
-            latest_source: snapshot.latest_source.as_ref().map(MutationSource::restore),
         }
     }
 }
@@ -275,37 +109,6 @@ pub(crate) mod tests {
         command: &str,
     ) -> ToolCallRecord {
         executed_with_args(ledger, id, name, serde_json::json!({"command": command}))
-    }
-
-    #[test]
-    fn recovered_workspace_observation_cannot_cross_later_writer() {
-        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
-        let read = executed_with_args(
-            &mut ledger,
-            "read",
-            "list_dir",
-            serde_json::json!({"path": "/app"}),
-        );
-        let write = executed_with_args(
-            &mut ledger,
-            "write",
-            "write_file",
-            serde_json::json!({"path": "/app/artifact", "content": "changed"}),
-        );
-        let records = vec![read, write];
-        let mut frontier = VerificationFrontier::default();
-        frontier.advance(Some("/app"), &[], &records).unwrap();
-        assert!(
-            !frontier
-                .evaluate_workspace_observation(Some("/app"), &[], &records)
-                .unwrap()
-        );
-        let restored = restore_from_ledger(&frontier, &records, &ledger);
-        assert!(
-            !restored
-                .evaluate_workspace_observation(Some("/app"), &[], &[])
-                .unwrap()
-        );
     }
 
     fn executed_with_args(
@@ -452,36 +255,7 @@ pub(crate) mod tests {
             ),
             Err(VerificationRecoveryError::LedgerMismatch)
         ));
-        let mut changed_path = snapshot.clone();
-        let mut has_path = false;
-        for source in changed_path.workspace.latest_source.iter_mut().chain(
-            changed_path
-                .workspace
-                .proof
-                .iter_mut()
-                .filter_map(|proof| proof.literal_source.as_mut()),
-        ) {
-            if source.delivered_path.is_some() {
-                source.delivered_path = Some("/app/dir/../solution.py".into());
-                has_path = true;
-            }
-        }
-        if has_path {
-            changed_path.validate().unwrap();
-            assert!(matches!(
-                VerificationFrontier::restore(
-                    Some("/app"),
-                    &changed_path,
-                    "user",
-                    "session",
-                    "run",
-                    "chain",
-                    &[],
-                    &rows
-                ),
-                Err(VerificationRecoveryError::ScopeMismatch)
-            ));
-        }
+
         VerificationFrontier::restore(
             Some("/app"),
             &snapshot,
@@ -506,64 +280,6 @@ pub(crate) mod tests {
         let mut frontier = VerificationFrontier::default();
         frontier.advance(Some("/app"), &[], &records).unwrap();
         restore_from_ledger(&frontier, &records, &ledger)
-    }
-
-    #[test]
-    fn parallel_read_and_opaque_writer_never_prove_post_writer_observation() {
-        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
-        let writer = executed_with_args(
-            &mut ledger,
-            "writer",
-            "write_file",
-            serde_json::json!({"path": "/app/answer.txt", "content": "new"}),
-        );
-        let mut bash = executed_with_args(
-            &mut ledger,
-            "opaque",
-            "bash",
-            serde_json::json!({"command": "./verify.sh"}),
-        );
-        let mut read = executed_with_args(
-            &mut ledger,
-            "read",
-            "read_file",
-            serde_json::json!({"path": "/app/answer.txt"}),
-        );
-        bash.batch_id = Some("parallel-observation".into());
-        read.batch_id = bash.batch_id.clone();
-        bash.parallel = Some(true);
-        read.parallel = Some(true);
-        let later_read = executed_with_args(
-            &mut ledger,
-            "later-read",
-            "read_file",
-            serde_json::json!({"path": "/app/answer.txt"}),
-        );
-        for pair in [[bash.clone(), read.clone()], [read.clone(), bash.clone()]] {
-            let mut frontier = VerificationFrontier::default();
-            let mut records = [vec![writer.clone()], pair.to_vec()].concat();
-            frontier.advance(Some("/app"), &[], &records).unwrap();
-            assert!(
-                !frontier
-                    .evaluate_workspace_observation(Some("/app"), &[], &records)
-                    .unwrap(),
-                "batch ledger order cannot establish a happens-after relation"
-            );
-            records.push(later_read.clone());
-            frontier.advance(Some("/app"), &[], &records).unwrap();
-            assert!(
-                frontier
-                    .evaluate_workspace_observation(Some("/app"), &[], &records)
-                    .unwrap(),
-                "a separate later read may close the observation debt"
-            );
-            let restored = restore_from_ledger(&frontier, &records, &ledger);
-            assert!(
-                restored
-                    .evaluate_workspace_observation(Some("/app"), &[], &[])
-                    .unwrap()
-            );
-        }
     }
 
     #[test]
@@ -619,13 +335,6 @@ pub(crate) mod tests {
                 invalid.is_none(),
                 "{invalid:?}"
             );
-            if invalid.is_none() {
-                assert!(
-                    frontier
-                        .evaluate_workspace_observation(Some("/app"), &hooks, &records)
-                        .unwrap()
-                );
-            }
         }
     }
 
@@ -690,221 +399,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn workspace_literal_proof_keeps_exact_delivery_ancestry_across_recovery() {
-        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
-        let mut delivery = executed_with_args(
-            &mut ledger,
-            "delivery",
-            "write_file",
-            serde_json::json!({"path":"/app/solution.py"}),
-        );
-        let fields = astra_tools::workspace_observation::typed_workspace_tool_receipt();
-        delivery.workspace_mutation_observed = Some(true);
-        delivery.workspace_mutation_scope =
-            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-        delivery.workspace_mutation_receipt = fields
-            .get(astra_tools::workspace_observation::RECEIPT_FIELD)
-            .cloned();
-        let mut original = VerificationFrontier::default();
-        original
-            .advance(Some("/app"), &[], &[delivery.clone()])
-            .unwrap();
-        let mut restored = restore_from_ledger(&original, &[delivery], &ledger);
-        let script = executed_with_args(
-            &mut ledger,
-            "script",
-            "bash",
-            serde_json::json!({"command":"cd /app && python3 solution.py"}),
-        );
-        let mut suffix = vec![script];
-        restored.advance(Some("/app"), &[], &suffix).unwrap();
-        assert!(
-            restored
-                .evaluate_workspace_observation(Some("/app"), &[], &suffix)
-                .unwrap()
-        );
-        assert_eq!(
-            restored
-                .observation
-                .proof
-                .as_ref()
-                .unwrap()
-                .literal_source
-                .as_ref()
-                .unwrap()
-                .evidence
-                .invocation
-                .as_ref()
-                .unwrap()
-                .identity
-                .invocation_id,
-            "delivery"
-        );
-        let mut twice = restore_from_ledger(&restored, &suffix, &ledger);
-        assert!(
-            twice
-                .evaluate_workspace_observation(Some("/app"), &[], &[])
-                .unwrap()
-        );
-
-        let mut weak = executed_with_args(
-            &mut ledger,
-            "weak-writer",
-            "bash",
-            serde_json::json!({"command":"opaque-writer"}),
-        );
-        let fields = astra_tools::workspace_observation::changed_receipt_with_ownership(
-            astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP,
-        );
-        weak.workspace_mutation_observed = Some(true);
-        weak.workspace_mutation_scope =
-            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-        weak.workspace_mutation_receipt = fields
-            .get(astra_tools::workspace_observation::RECEIPT_FIELD)
-            .cloned();
-        suffix = vec![weak];
-        twice.advance(Some("/app"), &[], &suffix).unwrap();
-        let mut after_weak = restore_from_ledger(&twice, &suffix, &ledger);
-        assert!(
-            after_weak
-                .observation
-                .latest_source
-                .as_ref()
-                .unwrap()
-                .delivered_path
-                .is_none()
-        );
-        let old_script = vec![executed_with_args(
-            &mut ledger,
-            "old-script",
-            "bash",
-            serde_json::json!({"command":"cd /app && python3 solution.py"}),
-        )];
-        after_weak.advance(Some("/app"), &[], &old_script).unwrap();
-        assert!(
-            !after_weak
-                .evaluate_workspace_observation(Some("/app"), &[], &old_script)
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn workspace_evidence_roundtrip_preserves_barrier_and_weak_source_without_upgrading_it() {
-        for weak in [false, true] {
-            let mut ledger =
-                astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
-            let mut writer = if weak {
-                executed_with_args(
-                    &mut ledger,
-                    "writer",
-                    "bash",
-                    serde_json::json!({"command":"opaque-writer"}),
-                )
-            } else {
-                executed_with_args(
-                    &mut ledger,
-                    "writer",
-                    "write_file",
-                    serde_json::json!({"path":"/app/solution.py"}),
-                )
-            };
-            if weak {
-                let fields = astra_tools::workspace_observation::changed_receipt_with_ownership(
-                    astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP,
-                );
-                writer.workspace_mutation_observed = Some(true);
-                writer.workspace_mutation_scope =
-                    Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-                writer.workspace_mutation_receipt = fields
-                    .get(astra_tools::workspace_observation::RECEIPT_FIELD)
-                    .cloned();
-                assert!(
-                    super::super::execution_phase::record_has_weak_workspace_mutation_receipt(
-                        &writer
-                    )
-                );
-                assert!(
-                    !super::super::execution_phase::record_has_trusted_workspace_mutation_receipt(
-                        &writer
-                    )
-                );
-            }
-            let mut history = vec![writer.clone()];
-            let mut original = VerificationFrontier::default();
-            original.advance(Some("/app"), &[], &history).unwrap();
-            let mut restored = restore_from_ledger(&original, &history, &ledger);
-            assert!(
-                !restored
-                    .evaluate_workspace_observation(Some("/app"), &[], &[])
-                    .unwrap()
-            );
-            assert!(
-                restored
-                    .observation
-                    .latest_source
-                    .as_ref()
-                    .unwrap()
-                    .delivered_path
-                    .is_none()
-            );
-            let suffix = vec![executed_with_args(
-                &mut ledger,
-                "read",
-                "read_file",
-                serde_json::json!({"path":"/app/solution.py"}),
-            )];
-            restored.advance(Some("/app"), &[], &suffix).unwrap();
-            history.extend(suffix.clone());
-            original.advance(Some("/app"), &[], &history).unwrap();
-            assert!(
-                restored
-                    .evaluate_workspace_observation(Some("/app"), &[], &suffix)
-                    .unwrap()
-            );
-            assert_eq!(
-                restored.export(Some("/app"), &[], &suffix, Some("chain")),
-                original.export(Some("/app"), &[], &history, Some("chain"))
-            );
-            let twice = restore_from_ledger(&restored, &suffix, &ledger);
-            assert!(
-                twice
-                    .evaluate_workspace_observation(Some("/app"), &[], &[])
-                    .unwrap()
-            );
-            if weak {
-                assert!(
-                    !super::super::execution_phase::record_has_trusted_workspace_mutation_receipt(
-                        &writer
-                    )
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn authoritative_unchanged_bash_failure_does_not_create_workspace_barrier() {
-        let fields =
-            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
-                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-            );
-        let mut failed_probe = record("bash", false, "opaque-diagnostic-probe");
-        failed_probe.workspace_mutation_scope =
-            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-        failed_probe.workspace_mutation_receipt = fields
-            .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-            .cloned();
-
-        let history = vec![failed_probe];
-        let mut frontier = VerificationFrontier::default();
-        frontier.advance(Some("/app"), &[], &history).unwrap();
-        assert!(
-            frontier
-                .evaluate_workspace_observation(Some("/app"), &[], &history)
-                .unwrap()
-        );
-    }
-
     pub(crate) fn restored_read_only_prefix() -> VerificationFrontier {
         let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
         let records = vec![executed(&mut ledger, "read", "read_file", "")];
@@ -931,49 +425,6 @@ pub(crate) mod tests {
         suffix.push(executed(&mut ledger, "lost-read", "read_file", ""));
         frontier.advance(None, &[], &suffix).unwrap();
         frontier
-    }
-
-    #[test]
-    fn workspace_observation_root_change_rebuilds_only_complete_history() {
-        let records = vec![ToolCallRecord {
-            name: "write_file".into(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Executed),
-            runtime_args_full: Some(serde_json::json!({"path":"/tmp/owned/file"}).to_string()),
-            ..Default::default()
-        }];
-        let mut frontier = VerificationFrontier::default();
-        frontier.advance(Some("/app"), &[], &records).unwrap();
-        assert!(
-            frontier
-                .evaluate_workspace_observation(Some("/app"), &[], &records)
-                .unwrap()
-        );
-        assert!(
-            !frontier
-                .evaluate_workspace_observation(Some("/tmp/owned"), &[], &records)
-                .unwrap()
-        );
-        // A read-only view does not mutate the source cursor or root binding.
-        assert_eq!(frontier.cursor, 1);
-        assert_eq!(frontier.workspace_root.as_deref(), Some("/app"));
-        frontier.advance(Some("/tmp/owned"), &[], &records).unwrap();
-        assert!(
-            !frontier
-                .evaluate_workspace_observation(Some("/tmp/owned"), &[], &records)
-                .unwrap()
-        );
-        assert_eq!(frontier.processed_through, 1);
-
-        let restored = restored_prefix_with_missing_history(&[]);
-        assert_eq!(
-            restored.evaluate_workspace_observation(None, &[], &[]),
-            Err(VerificationRecoveryError::HistoryUnavailable)
-        );
-        assert_eq!(
-            restored.evaluate_workspace_observation(Some("/app"), &[], &[]),
-            Err(VerificationRecoveryError::HistoryUnavailable)
-        );
     }
 
     #[test]
@@ -1233,7 +684,11 @@ pub(crate) mod tests {
                 detail: VerificationUnavailable::MissingTurnChain
             }
         ));
-        let records = vec![record("read_file", true, ""), record("bash", true, "./a")];
+        let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+        let records = vec![
+            executed(&mut ledger, "read", "read_file", ""),
+            executed(&mut ledger, "verify", "bash", "./a"),
+        ];
         assert!(
             matches!(
                 frontier.export(None, &hooks, &records, Some("chain")),
@@ -1253,7 +708,7 @@ pub(crate) mod tests {
             matches!(
                 frontier.export(None, &[], &records, Some("chain")),
                 VerificationHandoff::Unavailable {
-                    detail: VerificationUnavailable::UnboundWorkspaceEvidence
+                    detail: VerificationUnavailable::InvalidEvidence
                 }
             ),
             "no explicit hooks cannot erase an unbound general workspace barrier"
@@ -1303,7 +758,6 @@ pub(crate) mod tests {
 pub(crate) struct VerificationFrontier {
     contract: Vec<StopHook>,
     workspace_root: Option<String>,
-    observation: WorkspaceObservationFacts,
     cursor: usize,
     processed_through: u64,
     mutation: Option<Evidence>,
@@ -1318,7 +772,6 @@ impl Default for VerificationFrontier {
         Self {
             contract: Vec::new(),
             workspace_root: None,
-            observation: WorkspaceObservationFacts::default(),
             cursor: 0,
             processed_through: 0,
             mutation: None,
@@ -1352,25 +805,9 @@ impl VerificationFrontier {
         {
             return Err(VerificationRecoveryError::ScopeMismatch);
         }
-        for source in snapshot.workspace.latest_source.iter().chain(
-            snapshot
-                .workspace
-                .proof
-                .iter()
-                .filter_map(|proof| proof.literal_source.as_ref()),
-        ) {
-            if let Some(path) = &source.delivered_path {
-                if super::lifecycle::normalize_workspace_path(path, workspace_root).as_deref()
-                    != Some(std::path::Path::new(path))
-                {
-                    return Err(VerificationRecoveryError::ScopeMismatch);
-                }
-            }
-        }
         Ok(Self {
             contract: snapshot.contract.clone(),
             workspace_root: snapshot.workspace_root.clone(),
-            observation: WorkspaceObservationFacts::restore(&snapshot.workspace),
             cursor,
             processed_through: snapshot.processed_through,
             mutation: snapshot.mutation.as_ref().map(Evidence::restore),
@@ -1587,9 +1024,18 @@ impl VerificationFrontier {
                 }
             }
         }
-        let Some(workspace) = view.observation.bind() else {
-            return unavailable(VerificationUnavailable::UnboundWorkspaceEvidence);
-        };
+        // Handoff custody is enforced independently from named verification.
+        // Never turn an unbound side-effecting invocation into an empty proof.
+        if records.iter().any(|record| {
+            record.was_executed()
+                && record.execution_completion.is_none()
+                && crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
+                    &record.name,
+                    super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
+                )
+        }) {
+            return unavailable(VerificationUnavailable::InvalidEvidence);
+        }
         let snapshot = BoundVerificationFrontier {
             canonical_turn_chain_id: chain.into(),
             contract: view.contract,
@@ -1597,7 +1043,6 @@ impl VerificationFrontier {
             mutation,
             proofs,
             workspace_root: view.workspace_root,
-            workspace,
         };
         if snapshot.validate().is_err() {
             return unavailable(VerificationUnavailable::InvalidEvidence);
@@ -1628,26 +1073,6 @@ impl VerificationFrontier {
         let mut view = self.clone();
         view.advance(workspace_root, hooks, records)?;
         Ok(view.missing())
-    }
-
-    pub(crate) fn evaluate_workspace_observation(
-        &self,
-        workspace_root: Option<&str>,
-        hooks: &[StopHook],
-        records: &[ToolCallRecord],
-    ) -> Result<bool, VerificationRecoveryError> {
-        if self.cursor == records.len()
-            && self.workspace_root.as_deref() == workspace_root
-            && self
-                .contract
-                .iter()
-                .eq(hooks.iter().filter(|hook| hook.authoritative))
-        {
-            return Ok(self.observation.is_satisfied());
-        }
-        let mut view = self.clone();
-        view.advance(workspace_root, hooks, records)?;
-        Ok(view.observation.is_satisfied())
     }
 
     pub(crate) fn advance(
@@ -1738,13 +1163,6 @@ impl VerificationFrontier {
                 self.mutation = Some(evidence);
                 self.proofs.fill(None);
             }
-            self.observation.observe(
-                record,
-                self.processed_through,
-                verified,
-                workspace_root,
-                parallel_mutating_peer,
-            );
         }
         self.cursor = records.len();
         tracing::trace!(

@@ -53,8 +53,8 @@ pub struct RoundLimits {
 pub struct RuntimeLimits {
     /// One authoritative parsing result for optional round constraints.
     pub round_limits: Result<RoundLimits, String>,
-    /// Per-turn hard timeout in seconds.
-    pub turn_timeout_s: f64,
+    /// Default agent-run wall-clock allowance; invalid configuration fails admission.
+    pub turn_timeout_s: Result<u64, String>,
     /// Combined tool output truncation limit (bytes).
     pub global_output_limit: usize,
     /// Per-tool output truncation limit (bytes).
@@ -75,7 +75,7 @@ impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             round_limits: Ok(RoundLimits::default()),
-            turn_timeout_s: DEFAULT_TURN_TIMEOUT_S as f64,
+            turn_timeout_s: Ok(DEFAULT_TURN_TIMEOUT_S),
             global_output_limit: DEFAULT_GLOBAL_OUTPUT_LIMIT,
             tool_output_limit: DEFAULT_TOOL_OUTPUT_LIMIT,
             max_tool_retries: DEFAULT_MAX_TOOL_RETRIES,
@@ -106,7 +106,10 @@ impl RuntimeLimits {
                     )?,
                 })
             })(),
-            turn_timeout_s: env_parse("ASTRA_TURN_TIMEOUT_S", cfg.turn_timeout_s() as f64),
+            turn_timeout_s: parse_turn_timeout(
+                std::env::var("ASTRA_TURN_TIMEOUT_S"),
+                cfg.turn_timeout_s(),
+            ),
             global_output_limit: env_parse("ASTRA_GLOBAL_OUTPUT_LIMIT", cfg.global_output_limit()),
             tool_output_limit: env_parse("ASTRA_TOOL_OUTPUT_LIMIT", cfg.tool_output_limit()),
             max_tool_retries: env_parse("ASTRA_MAX_TOOL_RETRIES", cfg.max_tool_retries()),
@@ -231,6 +234,25 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+fn parse_turn_timeout(
+    environment: Result<String, std::env::VarError>,
+    configured: u64,
+) -> Result<u64, String> {
+    let value = match environment {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| "ASTRA_TURN_TIMEOUT_S must be positive integer seconds".to_owned())?,
+        Err(std::env::VarError::NotPresent) => configured,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("ASTRA_TURN_TIMEOUT_S must be valid UTF-8".into());
+        }
+    };
+    if value == 0 || value > u64::MAX / 1000 {
+        return Err("ASTRA_TURN_TIMEOUT_S exceeds the supported positive deadline range".into());
+    }
+    Ok(value)
+}
+
 fn optional_round_limit(
     key: &str,
     configured: Option<usize>,
@@ -286,6 +308,29 @@ pub fn warn_default_credentials_once() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_agent_timeout_is_finite_and_invalid_overrides_do_not_silently_default() {
+        use std::env::VarError::NotPresent;
+        assert_eq!(parse_turn_timeout(Err(NotPresent), 300), Ok(300));
+        assert_eq!(parse_turn_timeout(Ok("900".into()), 300), Ok(900));
+        for value in [
+            "",
+            "0",
+            "-1",
+            "NaN",
+            "inf",
+            "0.5",
+            "bad",
+            "18446744073709551615",
+        ] {
+            assert!(
+                parse_turn_timeout(Ok(value.into()), 300).is_err(),
+                "{value}"
+            );
+        }
+        assert!(parse_turn_timeout(Err(NotPresent), 0).is_err());
+    }
 
     #[test]
     fn explicit_round_limit_parsing_preserves_absence_and_rejects_invalid_values() {
