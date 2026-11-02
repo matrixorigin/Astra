@@ -87,6 +87,18 @@ const PROVIDER_MATRIX: &[ProviderCase] = &[
         }),
     },
     ProviderCase {
+        label: "prefix-after-user-all-context",
+        provider: "openai",
+        model: "prefix-after-user-fixture",
+        is_marker_isolated: false,
+        cache_capability: Some(CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailAfterUser,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        }),
+    },
+    ProviderCase {
         label: "minimax",
         provider: "openai",
         model: "MiniMax-M2.7",

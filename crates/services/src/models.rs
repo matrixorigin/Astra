@@ -334,6 +334,7 @@ pub enum PromptCacheProtocolData {
 pub enum PromptCacheVolatilePlacementData {
     MarkerIsolated,
     TailSuffix,
+    TailAfterUser,
     AppendOnlyUserTail,
     CurrentUserOnly,
     Free,
@@ -393,6 +394,15 @@ impl Serialize for PromptCacheCapabilityData {
     {
         if matches!(
             self.volatile_placement,
+            PromptCacheVolatilePlacementData::TailAfterUser
+        ) && !matches!(self.protocol, PromptCacheProtocolData::OpenAiAutoPrefix)
+        {
+            return Err(serde::ser::Error::custom(
+                "tail_after_user requires openai_auto_prefix",
+            ));
+        }
+        if matches!(
+            self.volatile_placement,
             PromptCacheVolatilePlacementData::AppendOnlyUserTail
         ) && (!matches!(
             self.volatile_delivery,
@@ -436,6 +446,15 @@ impl<'de> Deserialize<'de> for PromptCacheCapabilityData {
         }
 
         let wire = WireCapability::deserialize(deserializer)?;
+        if matches!(
+            wire.volatile_placement,
+            PromptCacheVolatilePlacementData::TailAfterUser
+        ) && !matches!(wire.protocol, PromptCacheProtocolData::OpenAiAutoPrefix)
+        {
+            return Err(serde::de::Error::custom(
+                "tail_after_user requires openai_auto_prefix",
+            ));
+        }
         if let Some(schema_version) = wire.schema_version
             && schema_version != PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION
         {
@@ -8634,6 +8653,27 @@ mod tests {
             serde_json::from_value::<PromptCacheCapabilityData>(encoded).unwrap(),
             capability
         );
+    }
+
+    #[test]
+    fn tail_after_user_requires_prefix_protocol_and_preserves_all_delivery() {
+        let value = serde_json::json!({
+            "schema_version": 2,
+            "protocol": "openai_auto_prefix",
+            "volatile_placement": "tail_after_user",
+            "volatile_delivery": "all",
+            "reuse_scope": "conversation_turns"
+        });
+        let capability: PromptCacheCapabilityData = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(capability).unwrap(), value);
+        let mut invalid = value;
+        invalid["protocol"] = serde_json::json!("marker_explicit");
+        assert!(serde_json::from_value::<PromptCacheCapabilityData>(invalid).is_err());
+        let invalid_capability = PromptCacheCapabilityData {
+            protocol: PromptCacheProtocolData::MarkerExplicit,
+            ..capability
+        };
+        assert!(serde_json::to_value(invalid_capability).is_err());
     }
 
     #[test]

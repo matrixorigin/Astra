@@ -61,6 +61,11 @@
 #     reuse_scope: conversation_turns
 # Required runtime instructions remain visible with typed authority/lifetimes;
 # optional volatile advisories are omitted. No model-name heuristic enables it.
+# A prefix-caching OpenAI-compatible deployment verified to treat marked
+# runtime context after a human message as evidence may instead select
+# `volatile_placement: tail_after_user`. Keep `volatile_delivery: all` to
+# retain optional context. This can reuse a long human message on the next
+# turn; it changes message order and requires deployment-specific validation.
 # Reload with: astra admin model load .models.yaml --update-existing
 #
 # Thinking/reasoning checks use maintained adapter defaults where available.

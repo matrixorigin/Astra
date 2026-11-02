@@ -148,6 +148,9 @@ pub(crate) fn cache_capability_from_model_metadata(
         astra_services::PromptCacheVolatilePlacementData::TailSuffix => {
             astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
         }
+        astra_services::PromptCacheVolatilePlacementData::TailAfterUser => {
+            astra_turn_core::cache_placement::VolatilePlacement::TailAfterUser
+        }
         astra_services::PromptCacheVolatilePlacementData::AppendOnlyUserTail => {
             astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
         }
@@ -1216,6 +1219,7 @@ pub(crate) fn assemble_context_pipeline(
             (system, preamble)
         }
         VolatilePlacement::TailSuffix
+        | VolatilePlacement::TailAfterUser
         | VolatilePlacement::AppendOnlyUserTail
         | VolatilePlacement::Free => {
             let mut stable_text = String::new();

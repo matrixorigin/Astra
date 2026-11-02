@@ -843,7 +843,16 @@ pub(crate) fn insert_runtime_system_context(
         });
     let boundary = if matches!(
         placement,
+        astra_turn_core::cache_placement::VolatilePlacement::TailAfterUser
+    ) && messages
+        .last()
+        .is_some_and(astra_turn_types::is_human_user_message)
+    {
+        messages.len()
+    } else if matches!(
+        placement,
         astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
+            | astra_turn_core::cache_placement::VolatilePlacement::TailAfterUser
     ) {
         tail_suffix_boundary(messages)
     } else {
@@ -1779,6 +1788,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         || (matches!(
             cache_cap.volatile_placement,
             astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                | astra_turn_core::cache_placement::VolatilePlacement::TailAfterUser
         ) && !crate::turn::llm::client::llm_provider_protocol(provider)
             .preserves_appended_message_boundaries())
     {
@@ -4647,6 +4657,94 @@ mod tests {
 
     /// Regression lock: runtime context must keep system authority while the
     /// complete conversation history remains byte-for-byte unchanged.
+    #[test]
+    fn tail_after_user_rejects_transports_that_do_not_preserve_boundaries() {
+        use astra_turn_core::cache_placement::{
+            CacheCapability, CacheProtocol, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+        let capability = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailAfterUser,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        };
+        let result = assemble_llm_messages_with_cache_capability_output(
+            vec![json!({"role":"system", "content":"stable"})],
+            vec![runtime_system_context_message("context", false).unwrap()],
+            Vec::new(),
+            vec![json!({"role":"user", "content":"question"})],
+            &PostCompactAttachments::default(),
+            "sid",
+            "chatgpt",
+            "alias",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            Some(capability),
+            &cache_cfg(),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            AppendOnlyRuntimeAuthorityError::InvalidCacheCapability
+        );
+    }
+
+    #[test]
+    fn tail_after_user_keeps_long_human_input_in_the_reusable_prefix() {
+        use astra_turn_core::cache_placement::VolatilePlacement;
+
+        let user = json!({"role":"user", "content":"long user input".repeat(1000)});
+        let next_user = json!({"role":"user", "content":"What did I just ask?"});
+        let assistant = json!({"role":"assistant", "content":"I will help."});
+        let make_request = |history: Vec<Value>, placement| {
+            let mut messages = vec![json!({"role":"system", "content":"stable rules"})];
+            messages.extend(history);
+            let context = runtime_system_context_message("dynamic context", true).unwrap();
+            insert_runtime_system_context(&mut messages, vec![context], placement);
+            crate::turn::llm::client::consolidate_system_messages_for_provider(
+                &messages, "openai", None,
+            )
+        };
+        let first = make_request(vec![user.clone()], VolatilePlacement::TailAfterUser);
+        let second = make_request(
+            vec![user.clone(), assistant.clone(), next_user],
+            VolatilePlacement::TailAfterUser,
+        );
+        assert_eq!(&first[..2], &second[..2]);
+        assert_eq!(first[1], user);
+        assert_eq!(first.last().unwrap()["role"], "user");
+        assert!(message_text(first.last().unwrap()).contains("dynamic context"));
+        let previous_layout = make_request(vec![user.clone()], VolatilePlacement::TailSuffix);
+        assert_ne!(
+            previous_layout[1], user,
+            "the prior layout places context before the human input"
+        );
+    }
+
+    #[test]
+    fn tail_after_user_keeps_tool_pairs_and_never_appends_after_an_assistant_call() {
+        use astra_turn_core::cache_placement::VolatilePlacement;
+        let user = json!({"role":"user", "content":"read the file"});
+        let call = json!({"role":"assistant", "content":null, "tool_calls":[{"id":"c1", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]});
+        let result = json!({"role":"tool", "tool_call_id":"c1", "content":"file content"});
+        let context = || runtime_system_context_message("runtime evidence", true).unwrap();
+
+        let mut pending = vec![user.clone(), call.clone()];
+        insert_runtime_system_context(
+            &mut pending,
+            vec![context()],
+            VolatilePlacement::TailAfterUser,
+        );
+        assert_eq!(pending.last(), Some(&call));
+        let mut completed = vec![user, call.clone(), result.clone()];
+        insert_runtime_system_context(
+            &mut completed,
+            vec![context()],
+            VolatilePlacement::TailAfterUser,
+        );
+        assert_eq!(completed[1], call);
+        assert_eq!(completed[2], result);
+        assert!(message_text(completed.last().unwrap()).contains("runtime evidence"));
+    }
+
     #[test]
     fn current_agent_input_follows_older_tool_status_in_provider_request() {
         use astra_turn_core::cache_placement::VolatilePlacement;
