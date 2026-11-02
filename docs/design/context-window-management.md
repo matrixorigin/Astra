@@ -127,20 +127,27 @@ conservative whole-suffix protection.
 
 A stale/unrecognized projection, invalid tool pairing, non-reducing candidate,
 failed summary or cancelled in-flight operation cannot install a replacement.
-Request-local mechanical fallback and final wire budget enforcement remain
-available. The coordinator's first canonical admission authorizes working-set
+When semantic preparation projected authority, an unavailable or rejected
+summary restores the protected input and reports no selected compaction
+boundary. Conservative mechanical fallback and final wire budget enforcement
+remain available. If a provider projection has rehomed an active authority
+frame, final wire enforcement cannot infer the protected suffix from that
+frame-free history; an input that still exceeds the hard limit is rejected
+with the existing context-window error instead of trimming the suffix. The
+coordinator's first canonical admission authorizes working-set
 rewrites from an empty base; the initial Context commit remains Append, and
 provider WAL replacement still requires the existing exact rewrite proof.
 An empty WAL base alone grants no authority. Prior summary generations are
 consumed as evidence and replaced by the accepted summary, not accumulated.
 Resume uses the ordinary canonical continuation path without another inference.
 
-Only installed canonical savings reset the session's futile-summary counter.
-Request-local savings remain request telemetry and cannot conceal repeated
-rejection. Failed inference and rejected installation count toward the existing
-session breaker; after it opens no further summary inference is dispatched.
-Installation rejection logs identify the failed invariant and distinguish it
-from unavailable or cancelled inference.
+Only installed canonical savings count as canonical progress. Summary inference
+requires a valid rewrite permit, independently of the mechanical retry breaker.
+A run-local rejection key suppresses repeat inference for the same rejected
+history, model route and effective compaction budget. Changed input, route or
+budget, or a new execution, may try again. Unavailable or cancelled inference
+does not fill this key or consume the mechanical breaker. Installation rejection
+logs identify the failed invariant.
 
 Exact-output deduplication is distinct from deciding that an observation is
 obsolete. A repeated path, tool name or read argument does not prove equal

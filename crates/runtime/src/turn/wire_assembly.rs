@@ -20,7 +20,8 @@ use sha2::{Digest, Sha256};
 use crate::prompts::{CompactConfig, CompactionTier};
 use crate::turn::cloud::compaction::CompactResult;
 use crate::turn::cloud::memoria_compact::{
-    MemoriaCompactConfig, MemoriaCompactParams, MemoriaPort, compact_with_memoria,
+    MemoriaCompactConfig, MemoriaCompactParams, MemoriaPort, SummaryDispatchBudget,
+    compact_with_memoria_guarded,
 };
 use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadata};
 
@@ -1446,12 +1447,17 @@ impl<'a> MemoriaContext<'a> {
         messages: &[Value],
         system_messages: &[Value],
         visible_tools: &[Value],
-    ) -> CompactResult {
+        summary_guard: Option<&mut (dyn FnMut(SummaryDispatchBudget) -> bool + Send)>,
+    ) -> (
+        CompactResult,
+        Option<astra_turn_core::cloud_summary::CompactSummaryFailure>,
+    ) {
         self.compact_with_overrides(
             messages,
             system_messages,
             visible_tools,
             BudgetOverrides::default(),
+            summary_guard,
         )
         .await
     }
@@ -1465,7 +1471,11 @@ impl<'a> MemoriaContext<'a> {
         system_messages: &[Value],
         visible_tools: &[Value],
         overrides: BudgetOverrides,
-    ) -> CompactResult {
+        summary_guard: Option<&mut (dyn FnMut(SummaryDispatchBudget) -> bool + Send)>,
+    ) -> (
+        CompactResult,
+        Option<astra_turn_core::cloud_summary::CompactSummaryFailure>,
+    ) {
         let uses_derived_history_budget = overrides.budget_chars.is_none();
         let budget = self.context_budget();
         // `current_tokens` is a pressure signal for Memoria retrieval; the
@@ -1511,7 +1521,7 @@ impl<'a> MemoriaContext<'a> {
 
         let compact_config = CompactConfig::from_env();
 
-        let mut result = compact_with_memoria(
+        let (mut result, summary_failure) = compact_with_memoria_guarded(
             messages,
             Some(self.session_id),
             &memoria_config,
@@ -1519,6 +1529,7 @@ impl<'a> MemoriaContext<'a> {
             self.memoria_client,
             Some(&compact_config),
             self.summary_client,
+            summary_guard,
         )
         .await;
 
@@ -1563,7 +1574,7 @@ impl<'a> MemoriaContext<'a> {
             }
         }
 
-        result
+        (result, summary_failure)
     }
 }
 
@@ -3589,7 +3600,6 @@ mod tests {
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
             history_summary: None,
-            summary_attempted: false,
         };
 
         let observation = observe_context_compaction(
@@ -3640,7 +3650,6 @@ mod tests {
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
             history_summary: None,
-            summary_attempted: false,
         };
         assert!(
             observe_context_compaction(
@@ -3960,8 +3969,8 @@ mod tests {
             session_facts: None,
         };
 
-        let first = ctx.compact(&history, &system, &tools).await;
-        let second = ctx.compact(&first.messages, &system, &tools).await;
+        let first = ctx.compact(&history, &system, &tools, None).await.0;
+        let second = ctx.compact(&first.messages, &system, &tools, None).await.0;
         assert_eq!(
             second.messages, first.messages,
             "reapplying compaction to an already-bounded working set must converge"
@@ -4067,7 +4076,7 @@ mod tests {
             session_facts: None,
         };
 
-        let compacted = ctx.compact(&history, &system, &tools).await;
+        let compacted = ctx.compact(&history, &system, &tools, None).await.0;
         let tool_tokens = tools
             .iter()
             .map(crate::prompts::estimate_json_value_tokens)

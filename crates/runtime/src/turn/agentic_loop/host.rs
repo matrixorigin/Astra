@@ -3188,6 +3188,9 @@ pub fn runtime_volatile_injections_edge_profile_value(
 #[derive(Debug, Clone, Default)]
 pub struct CanonicalRewriteState {
     proof: Option<crate::turn::canonical_commit::CanonicalRewriteProof>,
+    // An in-memory guard against re-inferencing the same rejected candidate.
+    // It is deliberately not part of the persisted mechanical breaker.
+    pub(crate) rejected_summary_input: Option<[u8; 32]>,
 }
 
 const TOOL_LEDGER_LIVE_WINDOW: usize = 256;
@@ -4251,6 +4254,7 @@ impl AgenticLoopState {
         base_manifest_root: &str,
         base_compaction_generation: u64,
     ) {
+        self.canonical_rewrite_state.rejected_summary_input = None;
         self.canonical_rewrite_state.proof = Some(
             crate::turn::canonical_commit::CanonicalRewriteProof::from_materialized_admission(
                 admitted_prefix,
@@ -4261,6 +4265,7 @@ impl AgenticLoopState {
     }
 
     pub(crate) fn initialize_initial_canonical_rewrite_proof(&mut self) {
+        self.canonical_rewrite_state.rejected_summary_input = None;
         self.canonical_rewrite_state.proof =
             Some(crate::turn::canonical_commit::CanonicalRewriteProof::from_initial_admission());
     }
@@ -4274,17 +4279,6 @@ impl AgenticLoopState {
         &self,
     ) -> Option<&crate::turn::canonical_commit::CanonicalRewriteProof> {
         self.canonical_rewrite_state.proof.as_ref()
-    }
-
-    pub(crate) fn provider_canonical_replacement_authorization(
-        &self,
-        durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
-        predecessor_messages: &[Value],
-    ) -> Option<crate::turn::canonical_commit::ProviderWalReplacementAuthorization> {
-        self.canonical_rewrite_state
-            .proof
-            .as_ref()?
-            .provider_wal_replacement_authorization(durable_base, predecessor_messages)
     }
 
     pub(crate) fn recover_provider_canonical_replacement(
@@ -4320,11 +4314,7 @@ impl AgenticLoopState {
             return;
         };
         if let Some(proof) = self.canonical_rewrite_state.proof.as_mut() {
-            proof.finish(
-                permit,
-                &self.messages,
-                self.provider_canonical_wal_base.as_ref(),
-            );
+            proof.finish(permit, &self.messages);
         }
     }
 

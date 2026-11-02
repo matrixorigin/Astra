@@ -179,9 +179,17 @@ database lookup. Parent and child views apply the same identity contract.
 
 Agent activity reconciles by Run identity or an exact typed launch receipt,
 never by reusable profile or display name. A complete Server tree degrades absent
-live/provisional rows to unconfirmed observations; they do not count as live
-work. Absence never proves a terminal outcome, and a truncated tree cannot
-degrade omitted rows. Local runtime and journal facts keep their own authority.
+live/provisional rows to unconfirmed observations only when its local fetch
+started after their last observation; they then do not count as live work.
+An older response cannot overwrite newer live lifecycle evidence. Every
+successful fetch delivers its new boundary even when the backend revision is
+unchanged. Failures do not advance it, and session rebinding discards it.
+Matching live activity during a pending control operation also advances this
+boundary without clearing the control overlay. A failed fetch degrades old
+server confirmation, while newer live activity remains explicitly observed;
+neither a rejected control nor the failure itself proves fresh activity.
+Absence never proves a terminal outcome, and a truncated tree cannot degrade
+omitted rows. Local runtime and journal facts keep their own authority.
 
 A terminal notification racing an in-flight transcript read schedules one fresh
 read after that request settles, including after failure. It does not start an

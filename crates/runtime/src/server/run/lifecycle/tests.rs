@@ -2026,7 +2026,7 @@ fn compaction_commits_the_complete_replacement_projection() {
         json!({"role": "user", "content": "summary"}),
         json!({"role": "assistant", "content": "current"}),
     ];
-    proof.finish(permit, &compacted, None);
+    proof.finish(permit, &compacted);
     let (mode, packs) = canonical_commit_delta(&prior, true, &compacted, Some(&proof), false)
         .unwrap()
         .unwrap();
@@ -2217,7 +2217,7 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
                 now_secs: 10_000_000,
             },
         );
-        proof.finish(permit, &messages, None);
+        proof.finish(permit, &messages);
 
         assert!(outcome.total_tokens_freed > 0, "real compaction must run");
         assert_eq!(
@@ -2281,7 +2281,7 @@ fn unrelated_prefix_mutation_after_compaction_is_rejected() {
     let mut proof =
         CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
     let permit = proof.begin(&prior);
-    proof.finish(permit, &compacted, None);
+    proof.finish(permit, &compacted);
 
     let mutated = vec![json!({"role": "system", "content": "unrelated mutation"})];
     let error = canonical_commit_delta(&prior, true, &mutated, Some(&proof), false).unwrap_err();
@@ -2298,7 +2298,7 @@ fn compaction_cannot_authorize_an_already_mutated_prefix() {
     let mut proof =
         CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
     let permit = proof.begin(&mutated_before_compaction);
-    proof.finish(permit, &compacted, None);
+    proof.finish(permit, &compacted);
 
     let error = canonical_commit_delta(&prior, true, &compacted, Some(&proof), false).unwrap_err();
 

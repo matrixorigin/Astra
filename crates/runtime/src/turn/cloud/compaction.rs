@@ -1186,8 +1186,19 @@ pub struct CompactResult {
     /// may accept it with the bounded history through its canonical rewrite
     /// proof; until then it is only a request-local candidate.
     pub history_summary: Option<String>,
-    /// Whether summary inference actually ran, including an unsuccessful call.
-    pub summary_attempted: bool,
+}
+
+/// Only exact canonical history or its authority-frame-free projection may be
+/// summarized for a canonical rewrite.
+pub(crate) fn request_summary_source_matches(canonical: &[Value], source: &[Value]) -> bool {
+    source == canonical
+        || canonical
+            .iter()
+            .filter(|message| {
+                astra_turn_types::runtime_message_delivery(message)
+                    != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            })
+            .eq(source.iter())
 }
 
 /// Accept a successful request summary as the next canonical working set.
@@ -1211,7 +1222,7 @@ pub(crate) fn prepare_request_summary(
     };
     // The only admitted projection removes provider-specific authority frames.
     // Do not recognize arbitrary views by matching excerpts or message text.
-    if source != canonical && !canonical.iter().filter(|m| !is_frame(m)).eq(source.iter()) {
+    if !request_summary_source_matches(canonical, source) {
         return Err("source_mismatch");
     }
     if result
@@ -1299,7 +1310,6 @@ pub(crate) fn compact_tiered_impl(
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
             history_summary: None,
-            summary_attempted: false,
         };
     }
 
@@ -1323,7 +1333,6 @@ pub(crate) fn compact_tiered_impl(
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
             history_summary: None,
-            summary_attempted: false,
         };
     }
 
@@ -1464,7 +1473,6 @@ pub(crate) fn compact_tiered_impl(
         session_memory_context: None,
         retrieved_memory_entries: Vec::new(),
         history_summary: None,
-        summary_attempted: false,
     }
 }
 

@@ -1537,6 +1537,45 @@ pub async fn compact_with_memoria(
     compact_config: Option<&CompactConfig>,
     summary_client: Option<&dyn SummaryLlmClient>,
 ) -> CompactResult {
+    compact_with_memoria_guarded(
+        messages,
+        session_id,
+        config,
+        params,
+        client,
+        compact_config,
+        summary_client,
+        None,
+    )
+    .await
+    .0
+}
+
+/// The actual budget used for a candidate, after accounting for retrieved
+/// memory. A caller may use it to authorize a summary just before inference.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SummaryDispatchBudget {
+    pub budget_chars: usize,
+    pub adjusted_budget_chars: usize,
+    pub keep_chars: usize,
+    pub keep_recent_turns: usize,
+    pub summary_token_budget: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compact_with_memoria_guarded(
+    messages: &[Value],
+    session_id: Option<&str>,
+    config: &MemoriaCompactConfig,
+    params: &MemoriaCompactParams,
+    client: Option<&dyn MemoriaPort>,
+    compact_config: Option<&CompactConfig>,
+    summary_client: Option<&dyn SummaryLlmClient>,
+    summary_guard: Option<&mut (dyn FnMut(SummaryDispatchBudget) -> bool + Send)>,
+) -> (
+    CompactResult,
+    Option<astra_turn_core::cloud_summary::CompactSummaryFailure>,
+) {
     // Applicability is local state. Do not resolve credentials when this
     // compaction cannot retrieve memory; actual reads still recheck consent.
     let local_fallback = || {
@@ -1558,7 +1597,7 @@ pub async fn compact_with_memoria(
         _ => None,
     };
     let Some((client, sid)) = memory_source else {
-        return local_fallback();
+        return (local_fallback(), None);
     };
 
     // Step 1: Retrieve session context from Memoria (strict session scope).
@@ -1571,7 +1610,7 @@ pub async fn compact_with_memoria(
         Err(
             MemoriaOperationError::Disabled(_) | MemoriaOperationError::AuthorityUnavailable(_),
         ) => {
-            return local_fallback();
+            return (local_fallback(), None);
         }
         Err(e) => {
             eprintln!("[compact] Memoria retrieve failed: {e}");
@@ -1632,14 +1671,25 @@ pub async fn compact_with_memoria(
     // raw-message-derived `working` format.
     // Pressure alone is not history loss: do not summarize an intact or fully
     // protected working set merely because its tier is elevated.
+    let mut summary_failure = None;
     if let Some(cfg) = compact_config
         && let Some(s_client) = summary_client
         && will_summarize
         && result.boundary.is_some()
+        && summary_guard.is_none_or(|guard| {
+            guard(SummaryDispatchBudget {
+                budget_chars: params.budget_chars,
+                adjusted_budget_chars,
+                keep_chars: params.keep_chars,
+                keep_recent_turns: params.keep_recent_turns,
+                summary_token_budget,
+            })
+        })
     {
-        result.summary_attempted = true;
-        match astra_turn_core::cloud_summary::generate_compact_summary(messages, s_client).await {
-            Some(summary) => {
+        match astra_turn_core::cloud_summary::generate_compact_summary_outcome(messages, s_client)
+            .await
+        {
+            Ok(summary) => {
                 let summary = truncate_summary_for_budget(summary, cfg.summary_token_budget);
                 result.history_summary = Some(summary.clone());
 
@@ -1656,13 +1706,14 @@ pub async fn compact_with_memoria(
                     cfg.summary_token_budget
                 );
             }
-            None => {
-                eprintln!("[compact] LLM summary failed, using truncation only");
+            Err(failure) => {
+                summary_failure = Some(failure);
+                eprintln!("[compact] LLM summary unavailable or invalid");
             }
         }
     }
 
-    result
+    (result, summary_failure)
 }
 
 // ---------------------------------------------------------------------------

@@ -2033,6 +2033,76 @@ impl ResolvedTurnLlmConfig {
     }
 }
 
+/// Key only the inputs that can change semantic acceptance. It is computed
+/// only when the compactor is about to dispatch a needed summary and is kept
+/// in memory for this loop execution, never logged or persisted.
+fn rejected_summary_input_key(
+    canonical: &[Value],
+    source: &[Value],
+    fixed_context: &[Value],
+    visible_tools: &[Value],
+    tier: CompactionTier,
+    config: &ResolvedTurnLlmConfig,
+    budget: crate::turn::cloud::memoria_compact::SummaryDispatchBudget,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    // Endpoint identity helps distinguish routes without retaining userinfo,
+    // query strings, headers, or credentials in the key's input metadata.
+    let endpoint = |value: &str| {
+        reqwest::Url::parse(value).ok().map(|mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+    };
+    let canonical_root = astra_turn_types::canonical_conversation_root(canonical);
+    let source_root = if source == canonical {
+        canonical_root.clone()
+    } else {
+        astra_turn_types::canonical_conversation_root(source)
+    };
+    let tool_tokens = visible_tools
+        .iter()
+        .map(crate::prompts::estimate_json_value_tokens)
+        .sum();
+    let fixed_tokens =
+        crate::prompts::estimate_tokens_cache_aware_split(fixed_context, source, tool_tokens)
+            .cache_eligible_tokens;
+    let body_overrides = config.request_body_overrides.as_ref().map(|overrides| {
+        let encoded = serde_json::to_vec(overrides).expect("model body overrides serialize");
+        <[u8; 32]>::from(Sha256::digest(encoded))
+    });
+    let key = json!({
+        "domain": "astra-rejected-semantic-compaction-v1",
+        "canonical": canonical_root,
+        "source": source_root,
+        "provider": config.provider,
+        "model": config.model_name,
+        "wire_model": config.wire_model_name,
+        "body_overrides_digest": body_overrides,
+        "fixed_temperature": config.fixed_temperature,
+        "thinking_capability": format!("{:?}", config.thinking_capability),
+        "thinking_protocol": format!("{:?}", config.thinking_protocol),
+        "reasoning_efforts": config.supported_reasoning_efforts,
+        "endpoint": endpoint(&config.base_url),
+        "completion_endpoint": config.completions_url_override.as_deref().and_then(endpoint),
+        "context_window": config.context_window,
+        "completion_limit": config.max_completion_tokens,
+        "tier": format!("{tier:?}"),
+        "fixed_tokens": fixed_tokens,
+        "tool_tokens": tool_tokens,
+        "budget_chars": budget.budget_chars,
+        "adjusted_budget_chars": budget.adjusted_budget_chars,
+        "keep_chars": budget.keep_chars,
+        "keep_recent_turns": budget.keep_recent_turns,
+        "summary_token_budget": budget.summary_token_budget,
+    });
+    Sha256::digest(key.to_string().as_bytes()).into()
+}
+
 type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
 
 struct SummaryClientWorkAdmissionJudge {
@@ -3147,9 +3217,7 @@ fn resolve_llm_model_for_turn(
 fn build_handoff_continuation(
     durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
     predecessor_messages: &[Value],
-    replacement_authorization: Option<
-        &crate::turn::canonical_commit::ProviderWalReplacementAuthorization,
-    >,
+    rewrite_proof: Option<&crate::turn::canonical_commit::CanonicalRewriteProof>,
 ) -> Result<
     astra_turn_types::ProviderCanonicalTransitionV2,
     astra_turn_types::ProviderCanonicalTransitionError,
@@ -3159,19 +3227,18 @@ fn build_handoff_continuation(
             durable_base,
             predecessor_messages,
         );
-    let transition = if let Some(authorization) = replacement_authorization {
-        let transition =
-            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
-                None,
-                durable_base.clone(),
-                authorization.generation,
-                &durable_predecessor,
-                Vec::new(),
-            )?;
-        if transition.predecessor != authorization.durable_predecessor {
-            return Err(astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch);
-        }
-        transition
+    let generation = rewrite_proof
+        .map(|proof| proof.handoff_replacement_generation(durable_base, predecessor_messages))
+        .transpose()?
+        .flatten();
+    let transition = if let Some(generation) = generation {
+        astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+            None,
+            durable_base.clone(),
+            generation,
+            &durable_predecessor,
+            Vec::new(),
+        )?
     } else {
         astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
@@ -17412,20 +17479,17 @@ impl ServerAgenticLoopHost {
             tier,
             session_facts: None,
         };
-        let rewrite_permit = state
-            .begin_canonical_rewrite()
-            .filter(|permit| permit.is_valid());
         let has_frames = messages.iter().any(|message| {
             astra_turn_types::runtime_message_delivery(message)
                 == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
         });
         let can_summarize = compact_config.should_summarize(tier)
             && summary_client.is_some()
-            && self.memoria_client.is_some()
-            && !state.compaction_effectiveness.is_circuit_open();
+            && self.memoria_client.is_some();
         let mut projected;
         let mut fixed;
-        let (source, fixed_context) = if has_frames && can_summarize && rewrite_permit.is_some() {
+        let mut invalid_projection = false;
+        let (source, fixed_context) = if has_frames && can_summarize {
             projected = messages.to_vec();
             match crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut projected) {
                 Ok(authority) => {
@@ -17435,6 +17499,7 @@ impl ServerAgenticLoopHost {
                 }
                 Err(reason) => {
                     tracing::warn!(%reason, "request compaction cannot project runtime authority");
+                    invalid_projection = true;
                     (messages, system_messages)
                 }
             }
@@ -17442,79 +17507,135 @@ impl ServerAgenticLoopHost {
             (messages, system_messages)
         };
         let ctx = crate::turn::wire_assembly::MemoriaContext {
-            summary_client: can_summarize.then_some(summary_client).flatten(),
+            summary_client: (can_summarize && !invalid_projection)
+                .then_some(summary_client)
+                .flatten(),
             ..ctx
         };
-        let mut result = ctx.compact(source, fixed_context, visible_tools).await;
-        let attempted_summary = result.history_summary.is_some();
-        let prepared = attempted_summary.then(|| {
-            crate::turn::cloud::compaction::prepare_request_summary(
-                &state.messages,
+
+        // Preparing the projected candidate is harmless, but only the exact
+        // admitted history can authorize inference and canonical installation.
+        // The compactor calls this after retrieval and a real budget boundary,
+        // so ordinary/fitting requests do not hash the canonical prefix.
+        let proof = state.canonical_rewrite_proof().cloned();
+        let canonical = &state.messages;
+        let rejected_input = state.canonical_rewrite_state.rejected_summary_input;
+        let mut rewrite_permit = None;
+        let mut attempt_key = None;
+        let mut guard_invoked = false;
+        let mut authorize_summary = |budget| {
+            guard_invoked = true;
+            let Some(permit) = proof
+                .as_ref()
+                .map(|proof| proof.begin(canonical))
+                .filter(|permit| permit.is_valid())
+            else {
+                return false;
+            };
+            if !crate::turn::cloud::compaction::request_summary_source_matches(canonical, source) {
+                return false;
+            }
+            let key = rejected_summary_input_key(
+                canonical,
                 source,
-                &result,
+                fixed_context,
+                visible_tools,
+                tier,
+                llm_cfg,
+                budget,
+            );
+            if rejected_input == Some(key) {
+                return false;
+            }
+            rewrite_permit = Some(permit);
+            attempt_key = Some(key);
+            true
+        };
+        let (mut result, summary_failure) = ctx
+            .compact(
+                source,
+                fixed_context,
+                visible_tools,
+                Some(&mut authorize_summary),
             )
-        });
-        match (prepared, rewrite_permit) {
-            (Some(Ok(candidate)), Some(permit)) => {
-                let tokens_before = crate::prompts::estimate_tokens(&state.messages, 0, 0);
-                let tokens_after = crate::prompts::estimate_tokens(&candidate, 0, 0);
-                result.messages.retain(|message| {
-                    astra_turn_core::cloud::history_summary::history_summary_text(message).is_none()
-                        && astra_turn_types::runtime_message_delivery(message)
-                            != Some(
-                                astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext,
-                            )
-                });
-                result.messages.insert(0, candidate[0].clone());
-                result.history_summary = None;
-                if has_frames {
-                    result.messages.extend(candidate.iter().filter(|message| {
-                        astra_turn_types::runtime_message_delivery(message)
-                            == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
-                    }).cloned());
+            .await;
+        if let (Some(permit), Some(key)) = (rewrite_permit, attempt_key) {
+            // A different actual input starts a new rejection domain. An
+            // unavailable model response does not poison either breaker.
+            state.canonical_rewrite_state.rejected_summary_input = None;
+            let prepared = result.history_summary.as_ref().map(|_| {
+                crate::turn::cloud::compaction::prepare_request_summary(
+                    &state.messages,
+                    source,
+                    &result,
+                )
+                .and_then(|candidate| {
+                    let mut provider_messages = candidate.clone();
+                    if !has_frames {
+                        // Tail-suffix pipelines already rehomed authority into
+                        // the fixed preamble. Project the same accepted history
+                        // through the canonical owner, without injecting twice.
+                        crate::turn::wire_assembly::rehome_append_only_runtime_authority(
+                            &mut provider_messages,
+                        )
+                        .map_err(|_| "invalid_authority")?;
+                    }
+                    Ok((candidate, provider_messages))
+                })
+            });
+            match prepared {
+                Some(Ok((candidate, provider_messages))) => {
+                    let tokens_before = crate::prompts::estimate_tokens(&state.messages, 0, 0);
+                    let tokens_after = crate::prompts::estimate_tokens(&candidate, 0, 0);
+                    result.messages = provider_messages;
+                    result.history_summary = None;
+                    if let Some(boundary) = result.boundary.as_mut() {
+                        boundary.messages_after = result.messages.len();
+                    }
+                    state.messages = candidate;
+                    state.last_request_message_count = Some(state.messages.len());
+                    state.finish_canonical_rewrite(Some(permit));
+                    state
+                        .compaction_effectiveness
+                        .record_compaction(tokens_before.saturating_sub(tokens_after) as u64);
+                    return result;
                 }
-                if let Some(boundary) = result.boundary.as_mut() {
-                    boundary.messages_after = result.messages.len();
+                Some(Err(reason)) => {
+                    state.canonical_rewrite_state.rejected_summary_input = Some(key);
+                    tracing::warn!(reason, "request summary was rejected for canonical history");
                 }
-                state.messages = candidate;
-                state.last_request_message_count = Some(state.messages.len());
-                state.finish_canonical_rewrite(Some(permit));
-                state
-                    .compaction_effectiveness
-                    .record_compaction(tokens_before.saturating_sub(tokens_after) as u64);
-            }
-            (outcome, _) => {
-                if has_frames && source != messages {
-                    // A request-local fallback still needs the exact active
-                    // authority. It never gains canonical rewrite permission.
-                    result.messages.extend(
-                        messages
-                            .iter()
-                            .enumerate()
-                            .filter(|(index, _)| {
-                                astra_turn_types::append_only_runtime_authority_is_active(
-                                    messages, *index,
-                                )
-                            })
-                            .map(|(_, message)| message.clone()),
-                    );
-                }
-                let reason = match outcome {
-                    Some(Err(reason)) => Some(reason),
-                    Some(Ok(_)) => Some("no_rewrite_permit"),
-                    None if result.summary_attempted => Some("summary_unavailable"),
-                    None => None,
-                };
-                if let Some(reason) = reason {
-                    state.compaction_effectiveness.record_futile();
-                    tracing::warn!(
-                        reason,
-                        canonical_messages = state.messages.len(),
-                        request_messages = result.messages.len(),
-                        "request compaction did not update canonical history"
-                    );
+                None => {
+                    if summary_failure
+                        == Some(astra_turn_core::cloud_summary::CompactSummaryFailure::Invalid)
+                    {
+                        state.canonical_rewrite_state.rejected_summary_input = Some(key);
+                        tracing::warn!(
+                            reason = "invalid_summary",
+                            "request summary was rejected for canonical history"
+                        );
+                    } else {
+                        tracing::warn!("request summary inference was unavailable");
+                    }
                 }
             }
+        }
+        if guard_invoked
+            || (has_frames && can_summarize)
+            || invalid_projection
+            // Tail-suffix pipelines can rehome frames before this compactor.
+            // Only scan the canonical history if a mechanical boundary exists.
+            || (result.boundary.is_some()
+                && !has_frames
+                && astra_turn_types::active_append_only_authority_protected_suffix_start(
+                    &state.messages,
+                )
+                .is_some())
+        {
+            // A speculative projection cannot relax protected history unless
+            // its summary is accepted. Do not report an unselected boundary.
+            result.messages = messages.to_vec();
+            result.boundary = None;
+            result.history_summary = None;
         }
         result
     }
@@ -17601,7 +17722,20 @@ impl ServerAgenticLoopHost {
                 selected_output_tokens = requested_output_tokens.min(available_output_tokens);
                 break;
             }
+            // The request pipeline can rehome active canonical authority out
+            // of TailSuffix history. The generic mechanical compactor cannot
+            // see that protected suffix in this frame-free projection, so it
+            // must not trim it to satisfy a hard provider limit.
+            let projected_protected_authority = !history.iter().any(|message| {
+                astra_turn_types::runtime_message_delivery(message)
+                    == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            })
+                && astra_turn_types::active_append_only_authority_protected_suffix_start(
+                    &state.messages,
+                )
+                .is_some();
             if pass == 0
+                && !projected_protected_authority
                 && let Some(boundary) = crate::turn::wire_assembly::compact_history_for_wire_budget(
                     &mut history,
                     candidate_status,
@@ -18602,10 +18736,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 "execution profile contains non-persistable credentials".into(),
             ));
         }
-        let authorization =
-            state.provider_canonical_replacement_authorization(base, &state.messages);
-        let plan = build_handoff_continuation(base, &state.messages, authorization.as_ref())
-            .map_err(|error| classify(error.to_string()))?;
+        let plan =
+            build_handoff_continuation(base, &state.messages, state.canonical_rewrite_proof())
+                .map_err(|error| classify(error.to_string()))?;
         let durable = crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
             base,
             &heavy.messages,
@@ -35716,18 +35849,22 @@ mod tests {
             "role": "assistant",
             "content": format!("new summary {suffix_secret}")
         }));
-        proof.finish(permit, &rewritten, Some(&durable_base));
-        let authorization = proof
-            .provider_wal_replacement_authorization(&durable_base, &rewritten)
-            .expect("the admitted rewrite has exact replacement authority");
+        proof.finish(permit, &rewritten);
 
-        let plan =
-            build_handoff_continuation(&durable_base, &rewritten, Some(&authorization)).unwrap();
+        let plan = build_handoff_continuation(&durable_base, &rewritten, Some(&proof)).unwrap();
         assert_eq!(
             plan.recovery_mode,
             astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
         );
-        assert_eq!(plan.predecessor, authorization.durable_predecessor);
+        let expected_predecessor =
+            astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(
+                &crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+                    &durable_base,
+                    &rewritten,
+                ),
+            )
+            .unwrap();
+        assert_eq!(plan.predecessor, expected_predecessor);
         assert!(
             serde_json::to_string(&plan.recovery_messages)
                 .unwrap()
@@ -35741,11 +35878,69 @@ mod tests {
             "the not-yet-persisted suffix must be sanitized"
         );
 
-        let mut tampered = authorization;
-        tampered.durable_predecessor =
-            astra_turn_types::ProviderCanonicalHistoryIdentityV2::empty();
+        let mut continued = rewritten.clone();
+        continued.push(json!({
+            "role": "assistant",
+            "content": format!("later work {suffix_secret}")
+        }));
+        let continued_plan =
+            build_handoff_continuation(&durable_base, &continued, Some(&proof)).unwrap();
+        let mut recovered = durable.clone();
+        continued_plan.apply_to(&mut recovered).unwrap();
         assert_eq!(
-            build_handoff_continuation(&durable_base, &rewritten, Some(&tampered)).unwrap_err(),
+            recovered,
+            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+                &durable_base,
+                &continued,
+            )
+        );
+        assert!(
+            !serde_json::to_string(&continued_plan)
+                .unwrap()
+                .contains(suffix_secret)
+        );
+
+        // A validated restored prefix can be handed off again after appends.
+        let mut restored_proof =
+            crate::turn::canonical_commit::CanonicalRewriteProof::from_materialized_admission(
+                &durable,
+                &base_manifest_root,
+                3,
+            );
+        restored_proof
+            .recover_provider_wal_replacement(&durable_base, &continued_plan, &recovered)
+            .unwrap();
+        let mut later = recovered.clone();
+        later.push(json!({"role":"assistant", "content":"after resume"}));
+        assert_eq!(
+            restored_proof.handoff_replacement_generation(&durable_base, &later),
+            Ok(Some(4))
+        );
+        let second =
+            build_handoff_continuation(&durable_base, &later, Some(&restored_proof)).unwrap();
+        let mut recovered_again = durable.clone();
+        second.apply_to(&mut recovered_again).unwrap();
+        assert_eq!(
+            recovered_again,
+            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+                &durable_base,
+                &later,
+            )
+        );
+        assert_eq!(
+            build_handoff_continuation(&durable_base, &rewritten[..1], Some(&proof)).unwrap_err(),
+            astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch
+        );
+        let mut changed_prefix = continued.clone();
+        changed_prefix[1]["content"] = json!("different compaction candidate");
+        assert_eq!(
+            build_handoff_continuation(&durable_base, &changed_prefix, Some(&proof)).unwrap_err(),
+            astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch
+        );
+        let mut tampered_base = durable_base.clone();
+        tampered_base.canonical.root_hash = "0".repeat(64);
+        assert_eq!(
+            build_handoff_continuation(&tampered_base, &rewritten, Some(&proof)).unwrap_err(),
             astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch
         );
     }
@@ -37133,19 +37328,22 @@ mod tests {
                         // Provider-attempt WAL admission must accept the same rewrite
                         // proof before a later terminal canonical commit.
                         let durable_base = state.provider_canonical_wal_base.as_ref().unwrap();
-                        let authorization = state
-                            .provider_canonical_replacement_authorization(
-                                durable_base,
-                                &state.messages,
-                            )
-                            .unwrap();
                         let plan = build_handoff_continuation(
                             durable_base,
                             &state.messages,
-                            Some(&authorization),
+                            state.canonical_rewrite_proof(),
                         )
                         .unwrap();
                         assert!(plan.replacement_compaction_generation.is_some());
+                        let expected =
+                            astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(
+                                &crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+                                    durable_base,
+                                    &state.messages,
+                                ),
+                            )
+                            .unwrap();
+                        assert_eq!(plan.result, expected);
                         assert!(result.boundary.is_some());
                         assert_eq!(state.last_request_message_count, Some(state.messages.len()));
                         assert!(
@@ -37282,6 +37480,7 @@ mod tests {
             }));
             let mut other_state = create_test_state();
             other_state.messages = compaction_reuse_history("OTHER_OWNER_FACT", 9);
+            other_state.initialize_initial_canonical_rewrite_proof();
             let other_source = other_state.messages.clone();
             other
                 .compact_messages_via_memoria(
@@ -37341,7 +37540,7 @@ mod tests {
                     tier: pipeline.tier,
                     session_facts: None,
                 };
-                let result = ctx.compact(&pipeline.messages, &fixed, &[]).await;
+                let result = ctx.compact(&pipeline.messages, &fixed, &[], None).await.0;
                 assert!(result.history_summary.is_some());
                 // The old call chain used this result only for the provider
                 // wire. Match the new-path fixture's pipeline, budgets and tail.
@@ -37379,6 +37578,463 @@ mod tests {
                 "isolated summary failure",
             ))
         }
+    }
+
+    struct InvalidCompactionSummary {
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SummaryLlmClient for InvalidCompactionSummary {
+        async fn summarize(
+            &self,
+            _: astra_turn_types::InferencePurpose,
+            _: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
+        {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                text: "Not a structured summary".into(),
+                is_ptl_error: false,
+                model_used: "invalid-fixture".into(),
+                finish_reason: Some("stop".into()),
+                usage: Map::new(),
+                qualified_usage: None,
+                judgment_provenance: None,
+                execution: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn request_compaction_failed_projection_preserves_wire_and_recovers() {
+        let memory = Arc::new(CompactionMemoryFixture::default());
+        let mut host = test_host_builder("probe-owner", "probe-session")
+            .with_memoria_client(Some(memory.clone()))
+            .build();
+        host.test_compaction_client = Some(Box::new(InterruptedCompactionSummary {
+            started: Arc::new(tokio::sync::Notify::new()),
+            pending: false,
+        }));
+        let mut original = compaction_reuse_history(CONTINUITY_FACT, 0);
+        let control = original.pop().unwrap();
+        let human = original.pop().unwrap();
+        original.drain(..3);
+        original.insert(0, human);
+        original.insert(1, control);
+        let mut state = create_test_state();
+        state.messages = original.clone();
+        state.initialize_provider_canonical_wal_base(&[]);
+        state.initialize_initial_canonical_rewrite_proof();
+        let config = compaction_reuse_config(true);
+        for _ in 0..3 {
+            let result = host
+                .compact_messages_via_memoria(
+                    &mut state,
+                    &original,
+                    &[],
+                    &[],
+                    CompactionTier::AggressivePrune,
+                    &config,
+                )
+                .await;
+            assert_eq!(result.messages, original);
+            assert!(result.boundary.is_none());
+            assert!(result.history_summary.is_none());
+            assert_eq!(state.messages, original);
+            assert!(!state.compaction_effectiveness.is_circuit_open());
+            assert!(
+                state
+                    .canonical_rewrite_state
+                    .rejected_summary_input
+                    .is_none()
+            );
+            assert!(
+                crate::turn::wire_assembly::observe_context_compaction(
+                    "failed-summary",
+                    CompactionKind::WireAssembly,
+                    &original,
+                    &result,
+                    &[],
+                    &[],
+                    None,
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(memory.sessions.lock().unwrap().len(), 3);
+
+        // Tail-suffix assembly may already have rehomed the authority before
+        // this helper. With no summary route, that projection remains intact.
+        let mut tail_history = original.clone();
+        let tail_authority =
+            crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut tail_history)
+                .unwrap();
+        host.test_compaction_client = None;
+        let tail_result = host
+            .compact_messages_via_memoria(
+                &mut state,
+                &tail_history,
+                &tail_authority,
+                &[],
+                CompactionTier::AggressivePrune,
+                &compaction_reuse_config(false),
+            )
+            .await;
+        assert_eq!(tail_result.messages, tail_history);
+        assert!(tail_result.boundary.is_none());
+        assert_eq!(state.messages, original);
+
+        // A hard limit cannot cause final wire recomposition to prune the
+        // same protected suffix after TailSuffix rehomed its authority.
+        let mut over_budget_state = create_test_state();
+        over_budget_state.messages = original.clone();
+        let error = host
+            .assemble_llm_messages_with_final_budget(
+                Vec::new(),
+                tail_authority,
+                tail_result.messages,
+                &mut over_budget_state,
+                &compaction_reuse_config(false),
+                &PromptCacheConfig::default(),
+                &[],
+                1_000,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(over_budget_state.messages, original);
+
+        // Inspect the actual final wire assembly with a fitting model. The
+        // protected first-turn evidence and authority must both survive.
+        let mut fitting = compaction_reuse_config(true);
+        fitting.context_window = Some(1_000_000);
+        fitting.cache_capability = Some(append_only_test_cache_capability());
+        let mut wire_state = create_test_state();
+        wire_state.messages = original.clone();
+        let (wire, _, boundary) = host
+            .assemble_llm_messages_with_final_budget(
+                Vec::new(),
+                Vec::new(),
+                original.clone(),
+                &mut wire_state,
+                &fitting,
+                &PromptCacheConfig::default(),
+                &[],
+                1_000,
+            )
+            .unwrap();
+        assert!(boundary.is_none());
+        let wire_text = serde_json::to_string(&wire).unwrap();
+        assert!(wire_text.contains("EVIDENCE_0_10"));
+        assert!(wire_text.contains("CONTROL_0"));
+        astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
+
+        // Even a pre-existing mechanical circuit does not gate a healthy
+        // semantic route after transient failures.
+        for _ in 0..3 {
+            state.compaction_effectiveness.record_futile();
+        }
+        assert!(state.compaction_effectiveness.is_circuit_open());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+            requests: requests.clone(),
+        }));
+        host.compact_messages_via_memoria(
+            &mut state,
+            &original,
+            &[],
+            &[],
+            CompactionTier::AggressivePrune,
+            &config,
+        )
+        .await;
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_ne!(state.messages, original);
+        assert!(!state.compaction_effectiveness.is_circuit_open());
+    }
+
+    #[tokio::test]
+    async fn request_compaction_rejected_input_retries_only_after_change() {
+        let memory = Arc::new(CompactionMemoryFixture::default());
+        let mut host = test_host_builder("reject-owner", "reject-session")
+            .with_memoria_client(Some(memory))
+            .build();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        host.test_compaction_client = Some(Box::new(InvalidCompactionSummary {
+            requests: requests.clone(),
+        }));
+        let mut state = create_test_state();
+        state.messages = compaction_reuse_history(CONTINUITY_FACT, 0);
+        state.initialize_initial_canonical_rewrite_proof();
+        let mut config = compaction_reuse_config(true);
+
+        for _ in 0..5 {
+            let original = state.messages.clone();
+            let result = host
+                .compact_messages_via_memoria(
+                    &mut state,
+                    &original,
+                    &[],
+                    &[],
+                    CompactionTier::AggressivePrune,
+                    &config,
+                )
+                .await;
+            assert_eq!(result.messages, original);
+            assert!(result.boundary.is_none());
+            assert_eq!(state.messages, original);
+            assert!(!state.compaction_effectiveness.is_circuit_open());
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        config.model_name = "changed-model".into();
+        let original = state.messages.clone();
+        host.compact_messages_via_memoria(
+            &mut state,
+            &original,
+            &[],
+            &[],
+            CompactionTier::AggressivePrune,
+            &config,
+        )
+        .await;
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        config.context_window = Some(30_000);
+        host.compact_messages_via_memoria(
+            &mut state,
+            &original,
+            &[],
+            &[],
+            CompactionTier::AggressivePrune,
+            &config,
+        )
+        .await;
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        append_compaction_tool_pair(&mut state.messages, "new-input", "fresh evidence");
+        let changed = state.messages.clone();
+        host.compact_messages_via_memoria(
+            &mut state,
+            &changed,
+            &[],
+            &[],
+            CompactionTier::AggressivePrune,
+            &config,
+        )
+        .await;
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
+
+        let healthy = Arc::new(std::sync::Mutex::new(Vec::new()));
+        host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+            requests: healthy.clone(),
+        }));
+        config.model_name = "healthy-model".into();
+        host.compact_messages_via_memoria(
+            &mut state,
+            &changed,
+            &[],
+            &[],
+            CompactionTier::AggressivePrune,
+            &config,
+        )
+        .await;
+        assert_eq!(healthy.lock().unwrap().len(), 1);
+        assert!(
+            state
+                .canonical_rewrite_state
+                .rejected_summary_input
+                .is_none()
+        );
+        assert_ne!(state.messages, changed);
+    }
+
+    #[tokio::test]
+    async fn request_compaction_authorizes_only_actual_summary_dispatch() {
+        let memory = CompactionMemoryFixture::default();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let summary = ContinuitySummaryClient {
+            requests: requests.clone(),
+        };
+        let history = compaction_reuse_history(CONTINUITY_FACT, 0);
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checks_for_guard = checks.clone();
+        let mut guard = move |_| {
+            checks_for_guard.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        for (tier, window, has_memory, has_summary) in [
+            (CompactionTier::Normal, 32_000, true, true),
+            (CompactionTier::AggressivePrune, 32_000, false, true),
+            (CompactionTier::AggressivePrune, 32_000, true, false),
+            (CompactionTier::AggressivePrune, 1_000_000, true, true),
+        ] {
+            let context = crate::turn::wire_assembly::MemoriaContext {
+                session_id: "guard-session",
+                model_name: "guard-model",
+                context_window: Some(window),
+                memoria_client: has_memory.then_some(&memory),
+                summary_client: has_summary.then_some(&summary),
+                tier,
+                session_facts: None,
+            };
+            context.compact(&history, &[], &[], Some(&mut guard)).await;
+            assert_eq!(checks.load(Ordering::Relaxed), 0);
+        }
+        let context = crate::turn::wire_assembly::MemoriaContext {
+            session_id: "guard-session",
+            model_name: "guard-model",
+            context_window: Some(32_000),
+            memoria_client: Some(&memory),
+            summary_client: Some(&summary),
+            tier: CompactionTier::AggressivePrune,
+            session_facts: None,
+        };
+        context.compact(&history, &[], &[], Some(&mut guard)).await;
+        assert_eq!(checks.load(Ordering::Relaxed), 1);
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn request_compaction_rejected_summary_is_bounded_across_provider_turns() {
+        use crate::server::provider_test_support::{
+            ProviderObservationsFixture, loop_state, server_host_builder,
+        };
+        use astra_services::models::{
+            PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
+            PromptCacheVolatileDeliveryData, PromptCacheVolatilePlacementData,
+        };
+
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "protected provider requests",
+            |request| request.body["model"] == "compaction-fixture",
+            (0..5)
+                .map(|_| {
+                    ProviderResponse::OpenAi(json!({
+                        "model":"compaction-fixture",
+                        "choices":[{"index":0,"message":{"role":"assistant","content":"continue"},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":10,"completion_tokens":2}
+                    }))
+                })
+                .collect(),
+        )])
+        .await;
+        let observations = ProviderObservationsFixture::default();
+        let mut host = server_host_builder(
+            &gateway,
+            &observations,
+            "compaction-provider-journey",
+            "openai",
+            "compaction-fixture",
+            Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::OpenAiAutoPrefix,
+                volatile_placement: PromptCacheVolatilePlacementData::AppendOnlyUserTail,
+                volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
+                reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
+            }),
+        )
+        .with_memoria_client(Some(Arc::new(CompactionMemoryFixture::default())))
+        .build();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        host.test_compaction_client = Some(Box::new(InvalidCompactionSummary {
+            requests: requests.clone(),
+        }));
+        let mut state = loop_state("compaction-provider-journey", Vec::new(), CONTINUITY_FACT);
+        state.initialize_initial_canonical_rewrite_proof();
+        state.max_turn_input_tokens = 120_000;
+        state.messages.push(
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "ACTIVE_CONTROL",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        for round in 0..80 {
+            append_compaction_tool_pair(
+                &mut state.messages,
+                &format!("journey-{round}"),
+                &format!("EVIDENCE_{round}: {}", "observed file content ".repeat(240)),
+            );
+        }
+        host.prepare_model_selection(&mut state).await.unwrap();
+        let mut canonical_roots = Vec::new();
+        let mut attempts = Vec::new();
+        for _ in 0..3 {
+            canonical_roots.push(astra_turn_types::canonical_conversation_root(
+                &state.messages,
+            ));
+            let result = host.execute_turn(&mut state).await.unwrap();
+            assert_eq!(result.accum.full_text, "continue");
+            state.commit_volatile_attempt_lease();
+            attempts.push(requests.load(Ordering::Relaxed));
+        }
+        assert!(attempts[0] > 0);
+        assert_eq!(canonical_roots[1], canonical_roots[2]);
+        assert_eq!(attempts[1], attempts[2]);
+        assert!(!state.compaction_effectiveness.is_circuit_open());
+
+        // New actual input leaves the rejected-input domain. A healthy
+        // summary is then installed and reused by the next provider round.
+        append_compaction_tool_pair(&mut state.messages, "new-input", "fresh evidence");
+        let before_accept = state.messages.clone();
+        let healthy = Arc::new(std::sync::Mutex::new(Vec::new()));
+        host.test_compaction_client = Some(Box::new(ContinuitySummaryClient {
+            requests: healthy.clone(),
+        }));
+        for _ in 0..2 {
+            let result = host.execute_turn(&mut state).await.unwrap();
+            assert_eq!(result.accum.full_text, "continue");
+            state.commit_volatile_attempt_lease();
+        }
+        assert_eq!(healthy.lock().unwrap().len(), 1);
+        assert!(state.messages.len() < before_accept.len());
+        assert!(state.messages.iter().any(|message| {
+            astra_turn_core::cloud::history_summary::history_summary_text(message)
+                .is_some_and(|summary| summary.contains(CONTINUITY_FACT))
+        }));
+        astra_turn_types::validate_canonical_tool_pairing(&state.messages).unwrap();
+        let durable_base = state.provider_canonical_wal_base.as_ref().unwrap();
+        let transition = build_handoff_continuation(
+            durable_base,
+            &state.messages,
+            state.canonical_rewrite_proof(),
+        )
+        .unwrap();
+        assert_eq!(transition.replacement_compaction_generation, Some(1));
+        let mut recovered = Vec::new();
+        transition.apply_to(&mut recovered).unwrap();
+        assert!(recovered.iter().any(|message| {
+            astra_turn_core::cloud::history_summary::history_summary_text(message)
+                .is_some_and(|summary| summary.contains(CONTINUITY_FACT))
+        }));
+        let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
+            &[],
+            false,
+            &state.messages,
+            state.canonical_rewrite_proof(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+
+        let wire_requests = gateway.requests.lock().await;
+        assert_eq!(wire_requests.len(), 5);
+        for request in &wire_requests[..3] {
+            let messages = request.body["messages"].to_string();
+            assert!(messages.contains("EVIDENCE_10"));
+            assert!(messages.contains("ACTIVE_CONTROL"));
+        }
+        for request in &wire_requests[3..] {
+            let messages = request.body["messages"].to_string();
+            assert!(messages.contains("Conversation compacted"));
+            assert!(messages.contains(CONTINUITY_FACT));
+            assert!(messages.contains("ACTIVE_CONTROL"));
+        }
+        drop(wire_requests);
+        observations.assert_quiescent();
+        gateway.assert_complete();
     }
 
     #[tokio::test]
@@ -37447,23 +38103,10 @@ mod tests {
             assert!(next.replacement_compaction_generation.is_none());
             assert_eq!(state.messages, original);
             assert_eq!(state.last_request_message_count, Some(original.len()));
-            assert_eq!(requests.lock().unwrap().len(), 1);
-            assert!(result.boundary.is_some());
-            assert!(result.messages.len() < original.len());
-            assert!(
-                result
-                    .history_summary
-                    .as_deref()
-                    .unwrap()
-                    .contains(CONTINUITY_FACT)
-            );
-            assert!(
-                crate::turn::cloud::compaction::prepare_request_summary(
-                    &original, &original, &result,
-                )
-                .is_ok(),
-                "the fixture must offer a useful candidate that lacks rewrite authority",
-            );
+            assert_eq!(requests.lock().unwrap().len(), 0);
+            assert!(result.boundary.is_none());
+            assert_eq!(result.messages, original);
+            assert!(result.history_summary.is_none());
             let mut terminal = state.messages.clone();
             terminal.push(
                 json!({"role":"assistant", "content":"completed with request-local context"}),
@@ -37509,12 +38152,8 @@ mod tests {
                 );
                 assert_eq!(state.messages, original);
             }
-            assert!(state.compaction_effectiveness.is_circuit_open());
-            assert_eq!(
-                requests.lock().unwrap().len(),
-                crate::turn::compaction_replay::MAX_CONSECUTIVE_FUTILE_ATTEMPTS as usize,
-                "request-only savings must not permit endless summary inference",
-            );
+            assert!(!state.compaction_effectiveness.is_circuit_open());
+            assert_eq!(requests.lock().unwrap().len(), 0);
         }
     }
 
@@ -37555,10 +38194,8 @@ mod tests {
                 drop(call);
             } else {
                 let result = call.await;
-                assert!(
-                    result.boundary.is_some(),
-                    "mechanical fallback remains available"
-                );
+                assert!(result.boundary.is_none());
+                assert_eq!(result.messages, original);
                 assert!(result.history_summary.is_none());
             }
             assert_eq!(state.messages, original);
