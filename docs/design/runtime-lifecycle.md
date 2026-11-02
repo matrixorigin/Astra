@@ -140,7 +140,8 @@ exact-argument identity, so failures remain debts without copying credentials
 into recovery state. An ordinary unscannable command is unknown activity: it
 neither creates nor discharges a validation obligation. Explicit verify-mode
 requests retain their exact receipt contract regardless of shell syntax.
-Mutation freshness and executor custody remain independent of classification. Only an exact retry can resolve a named validation debt;
+Mutation freshness and executor custody remain independent of classification.
+Executor-reported bound changes and partial writes override lexical scratch paths. Only an exact retry can resolve a named validation debt;
 an unproven success still needs a separate eligible validation. An explicit
 verify receipt proves workspace freshness under the executor-owned lease,
 successful exit and unchanged fingerprint contract. This declared custom verifier path is

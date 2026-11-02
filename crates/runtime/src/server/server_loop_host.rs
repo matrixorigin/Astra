@@ -47585,6 +47585,89 @@ mod tests {
     }
 
     #[test]
+    fn work_validation_receipt_overrides_scratch_command_shape() {
+        let command = "printf snapshot > /tmp/work-validation-observation.txt";
+        assert!(
+            crate::turn::agentic_loop::lifecycle::bash_mutation_is_proven_external_scratch(
+                command,
+                Some("/workspace"),
+            )
+        );
+        for (changed, partial) in [(true, false), (true, true), (false, false)] {
+            let mut activity = validation_record(command, true);
+            activity.runtime_args_full = activity.args_full.clone();
+            activity.workspace_mutation_observed = Some(changed);
+            activity.workspace_mutation_partial = Some(partial);
+            activity.workspace_mutation_scope =
+                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+            let mut fields = if changed {
+                astra_tools::workspace_observation::changed_receipt_with_ownership(
+                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+                )
+            } else {
+                astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
+                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
+                )
+            };
+            activity.workspace_mutation_receipt = fields.remove(if changed {
+                astra_tools::workspace_observation::RECEIPT_FIELD
+            } else {
+                astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD
+            });
+            let mut state = create_test_state();
+            state.hooks.workspace_root_hint = Some("/workspace".into());
+            state.stall.tool_call_records =
+                vec![validation_record("cargo check", true), activity.clone()];
+            assert_eq!(
+                current_work_validation_state(&state),
+                if changed || partial {
+                    WorkValidationState::Stale
+                } else {
+                    WorkValidationState::Passed
+                }
+            );
+            if changed || partial {
+                let mut host = test_host_builder("receipt-user", "receipt-session")
+                    .with_edge_tools(sample_edge_tools())
+                    .with_execution_binding_snapshot(edge_runtime_snapshot())
+                    .with_work_item_attempt_bound(true)
+                    .build();
+                let delivered = json!({"id":"settle-receipt", "type":"function", "function": {
+                    "name":"settle_work_item", "arguments": r#"{"outcome":"delivered","summary":"done"}"#
+                }});
+                assert!(
+                    host.admit_terminal_tool_calls_with_completion(
+                        &mut state,
+                        std::slice::from_ref(&delivered),
+                        Some("tool_calls"),
+                    )
+                    .is_empty()
+                );
+                let admission =
+                    AgenticLoopHost::admit_tool_calls(&mut host, &[delivered], Some("tool_calls"));
+                let rejection: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
+                assert_eq!(rejection["error_kind"], "unresolved_work_validation");
+                assert_eq!(rejection["validation_state"], "stale");
+            }
+            state.stall.tool_call_records = vec![activity];
+            assert_eq!(
+                current_work_validation_state(&state),
+                WorkValidationState::None
+            );
+        }
+        let mut scratch_only = create_test_state();
+        scratch_only.hooks.workspace_root_hint = Some("/workspace".into());
+        scratch_only.stall.tool_call_records = vec![
+            validation_record("cargo check", true),
+            validation_record(command, true),
+        ];
+        assert_eq!(
+            current_work_validation_state(&scratch_only),
+            WorkValidationState::Passed
+        );
+    }
+
+    #[test]
     fn mutation_after_validation_requires_a_new_validation_receipt() {
         let mut state = create_test_state();
         state

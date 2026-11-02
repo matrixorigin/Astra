@@ -1272,6 +1272,18 @@ pub(super) fn record_is_proven_external_scratch_mutation(
     workspace_root: Option<&str>,
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
+    // Executor facts outrank a lexical scratch target (for example, a target
+    // may resolve into the workspace). A shape cannot erase an observed change.
+    if record_has_live_workspace_mutation_receipt(record)
+        || record_has_trusted_workspace_mutation_receipt(record)
+        || record.workspace_mutation_partial == Some(true)
+        || record
+            .workspace_mutation_partial_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty())
+    {
+        return false;
+    }
     let args = super::lifecycle::extract_tool_args(record.authoritative_args_full());
     if !crate::turn::tool_side_effects::tool_call_may_mutate_workspace(&record.name, args.as_ref())
     {
