@@ -922,6 +922,21 @@ pub(crate) fn status_hint(status: u16) -> Option<&'static str> {
 /// Error-code-aware hint. Human-readable detail is presentation and must not
 /// be parsed to recover a failure category.
 pub(crate) fn status_hint_for(status: u16, error_code: Option<&str>) -> Option<&'static str> {
+    if status == 503 {
+        match error_code {
+            Some("chatgpt_subscription_disabled") => {
+                return Some(
+                    "ChatGPT connections are disabled by this Server. Use /model add with an API key, or ask the Server operator to check its configuration. Retrying alone will not enable it.",
+                );
+            }
+            Some("chatgpt_subscription_unconfigured") => {
+                return Some(
+                    "The Server's ChatGPT configuration needs repair. Ask the Server operator to check its configuration and restart it. An API key model remains an alternative.",
+                );
+            }
+            _ => {}
+        }
+    }
     if status == 403 {
         match error_code {
             Some("memory_self_hosted_access_disabled") => {
@@ -981,7 +996,7 @@ pub(crate) fn format_error_with_context(status: u16, message: &str) -> String {
 pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
     match e {
         astra_thin_client::ThinClientError::Api { status, body } => {
-            format_error_with_context(status.as_u16(), &body)
+            read_api_error(status.as_u16(), &body)
         }
         astra_thin_client::ThinClientError::Http(error) => {
             if error.is_timeout() {
@@ -1637,6 +1652,31 @@ mod tests {
         assert!(err.contains("500"), "got: {err}");
         assert!(err.contains("Server error"), "got: {err}");
         assert!(!err.contains("Database pool timeout"), "got: {err}");
+    }
+
+    #[test]
+    fn thin_client_preserves_coded_chatgpt_failure_without_temporary_retry_advice() {
+        for code in [
+            "chatgpt_subscription_disabled",
+            "chatgpt_subscription_unconfigured",
+        ] {
+            let body = serde_json::json!({
+                "detail": "ChatGPT unavailable on this Server",
+                "error_code": code,
+                "request_id": "original-request-id",
+            })
+            .to_string();
+            let error = super::map_thin_err(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                body,
+            });
+            assert!(error.contains(code));
+            assert!(error.contains("request_id: original-request-id"));
+            assert!(error.contains("Server operator"));
+            assert!(!error.contains("try again shortly"));
+            assert!(!error.contains('{'));
+        }
+        assert!(read_api_error(503, "upstream unavailable").contains("try again shortly"));
     }
 
     #[test]

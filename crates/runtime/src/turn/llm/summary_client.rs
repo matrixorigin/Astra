@@ -458,6 +458,7 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            subscription: None,
             admitted_at: std::time::Instant::now(),
             price_snapshot: None,
             offering_id: "summary-offering".to_string(),
@@ -485,6 +486,7 @@ mod tests {
 
     fn summary_route(execution: &astra_services::AdmittedModelExecution) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            subscription: execution.subscription.clone(),
             model_name: execution.model_name.clone(),
             wire_model_name: None,
             api_key: execution.api_key.clone(),
@@ -632,6 +634,7 @@ mod tests {
         thinking_capability: Option<astra_services::models::ThinkingCapability>,
     ) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            subscription: None,
             model_name: "test-model".to_string(),
             wire_model_name: None,
             api_key: String::new(),
@@ -1358,5 +1361,84 @@ mod tests {
             astra_core::ErrorKind::ContractViolation
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(dead_code)]
+    mod fixture {
+        use astra_services as services;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../services/tests/common/chatgpt_fixture.rs"
+        ));
+    }
+
+    // A ChatGPT subscription summary is encoded by the Responses codec; the
+    // captured request body must carry the client's output budget.
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database; no live provider"]
+    async fn summary_budget_is_encoded_as_max_output_tokens_on_the_responses_wire() {
+        use astra_services::chatgpt::ChatgptConfig;
+        use astra_services::{
+            DatabaseModelService, FernetTokenEncryptor, ModelService, UserModelCreateRequestData,
+        };
+
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        crate::isolated_database::require_isolated_database(&settings.database);
+        settings.db_pool_max_connections = 4;
+        settings.db_pool_min_connections = 0;
+        astra_services::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let provider = fixture::ProviderFixture::start().await;
+        let key = Arc::new(FernetTokenEncryptor::new("summary-responses-budget-key").unwrap());
+        let service = DatabaseModelService::new(settings, key)
+            .with_pool(pool.clone())
+            .with_chatgpt_config(ChatgptConfig::for_test(&provider.base));
+        let owner = format!("summary-{}", uuid::Uuid::new_v4());
+        fixture::ensure_owner(pool.get(), &owner).await;
+        let connection = provider.connect(&service, &owner).await;
+        let model = service
+            .create_user_model(
+                owner.clone(),
+                UserModelCreateRequestData {
+                    connection_id: Some(connection),
+                    name: "summary".into(),
+                    provider: "chatgpt".into(),
+                    model: "fixture-model".into(),
+                    base_url: None,
+                    // Subscription contract: a ChatGPT connection with no API
+                    // key and no custom endpoint (mutually exclusive).
+                    api_key: String::new(),
+                    context_window: 128000,
+                    is_default: true,
+                },
+            )
+            .await
+            .unwrap();
+        let admitted = service
+            .admit_model_offering(owner, model.model_id)
+            .await
+            .unwrap();
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "Summarize the fixture conversation."
+        })];
+        let client = RuntimeSummaryClient::new(summary_route(&admitted), 777, summary_authority());
+        // Model creation/admission already probed the fixture /responses wire
+        // ("Reply briefly with OK."); isolate the summary call itself.
+        let probed_requests = provider.state.requests.lock().unwrap().len();
+        let response = client
+            .summarize(InferencePurpose::Introspection, &messages)
+            .await
+            .unwrap();
+        assert_eq!(response.text, "OK");
+        let requests = provider.state.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), probed_requests + 1, "{requests:?}");
+        assert_eq!(
+            requests[probed_requests]["max_output_tokens"],
+            serde_json::json!(777),
+            "the summary output budget must reach the Responses request body: {requests:?}"
+        );
     }
 }

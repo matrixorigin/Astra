@@ -1,0 +1,996 @@
+//! The Responses wire codec shared by subscription probes and runtime calls.
+//! It owns no conversation, tool execution, credential, or retry lifecycle.
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
+
+pub const CONTINUATION_KEY: &str = "_astra_responses";
+const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
+
+/// Retain only scoped, replayable assistant protocol state at canonical
+/// persistence boundaries. This metadata grants no tool execution authority.
+pub fn validated_continuation(message: &Value) -> Option<Value> {
+    if message["role"] != "assistant" {
+        return None;
+    }
+    let saved = message.get(CONTINUATION_KEY)?;
+    let connection = saved["connection_id"].as_str()?;
+    uuid::Uuid::parse_str(connection).ok()?;
+    let model = saved["model"].as_str()?;
+    if model.is_empty() || model.len() > 255 || model.chars().any(char::is_control) {
+        return None;
+    }
+    let raw = saved["items"].as_array()?;
+    if raw.is_empty() || raw.len() > 4096 {
+        return None;
+    }
+    let items = raw
+        .iter()
+        .map(replay_item)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    for item in &items {
+        match item["type"].as_str()? {
+            "message" => {
+                if item["role"] != "assistant" {
+                    return None;
+                }
+                for part in item["content"].as_array()? {
+                    match part["type"].as_str()? {
+                        "output_text" => {
+                            part["text"].as_str()?;
+                        }
+                        "refusal" => {
+                            part["refusal"].as_str()?;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            "function_call" => {
+                let id = item["call_id"].as_str()?;
+                let name = item["name"].as_str()?;
+                if id.is_empty()
+                    || id.len() > 512
+                    || name.is_empty()
+                    || name.len() > 128
+                    || item.get("namespace").is_some_and(|value| value != "astra")
+                {
+                    return None;
+                }
+            }
+            "reasoning" => {}
+            _ => return None,
+        }
+    }
+    Some(
+        ResponseOutput {
+            items,
+            ..Default::default()
+        }
+        .continuation(connection, model),
+    )
+}
+
+/// Stable protocol errors and their HTTP equivalents, including SSE failures.
+/// Unknown upstream prose/codes never become public error details.
+pub fn provider_error(code: &str) -> Option<(&'static str, u16)> {
+    match code {
+        "subscription_sharing_user_not_eligible" => {
+            Some(("subscription_sharing_user_not_eligible", 403))
+        }
+        "subscription_sharing_usage_limit_exceeded" => {
+            Some(("subscription_sharing_usage_limit_exceeded", 429))
+        }
+        "subscription_sharing_usage_unavailable" => {
+            Some(("subscription_sharing_usage_unavailable", 503))
+        }
+        "context_length_exceeded" | "context_window_exceeded" | "input_too_long" => {
+            Some(("context_length_exceeded", 400))
+        }
+        _ => None,
+    }
+}
+
+/// Failure to assemble a Responses stream. `Provider` keeps the upstream
+/// terminal-event code untouched so each caller maps it to its own public
+/// vocabulary; `Codec` carries machine-owned literals only. Neither variant
+/// may be echoed into user-facing details.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResponsesStreamError {
+    Provider(Option<String>),
+    Codec(&'static str),
+}
+impl ResponsesStreamError {
+    /// Canonical (code, HTTP status) for recognized provider failures.
+    pub fn mapped(&self) -> Option<(&'static str, u16)> {
+        match self {
+            ResponsesStreamError::Provider(Some(code)) => provider_error(code),
+            _ => None,
+        }
+    }
+}
+
+fn replay_item(item: &Value) -> Result<Value, String> {
+    if item
+        .get("status")
+        .is_some_and(|status| !status.is_null() && status != "completed")
+    {
+        return Err("Provider continuation item is unfinished".into());
+    }
+    let keys: &[&str] = match item["type"].as_str() {
+        Some("message") => {
+            if item.get("role").is_some_and(|role| role != "assistant") {
+                return Err("Provider continuation cannot introduce instructions".into());
+            }
+            &["id", "type", "role", "status", "phase", "content"]
+        }
+        Some("reasoning") => &["id", "type", "status", "summary", "encrypted_content"],
+        Some("function_call") => &[
+            "id",
+            "type",
+            "status",
+            "namespace",
+            "name",
+            "arguments",
+            "call_id",
+        ],
+        _ => return Err("Unsupported provider continuation item".into()),
+    };
+    let mut object = Map::new();
+    for key in keys {
+        // Optional null metadata is unexpressed; omit it on replay rather
+        // than turning a valid output null into an invalid input control.
+        if let Some(value) = item.get(*key).filter(|value| !value.is_null()) {
+            object.insert((*key).into(), value.clone());
+        }
+    }
+    if item["type"] == "reasoning"
+        && object.get("encrypted_content").is_none()
+        && let Some(encoded) = item.get(ENCODED_REASONING).and_then(Value::as_str)
+    {
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|_| "Invalid encrypted reasoning encoding")?;
+        let value = String::from_utf8(bytes).map_err(|_| "Invalid encrypted reasoning encoding")?;
+        object.insert("encrypted_content".into(), json!(value));
+    }
+    Ok(Value::Object(object))
+}
+
+pub fn request(
+    model: &str,
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    connection: &str,
+    no_tools: bool,
+    max_output_tokens: Option<usize>,
+) -> Result<Value, String> {
+    let mut input = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or("Message role is missing")?;
+        if role == "assistant"
+            && let Some(saved) = message.get(CONTINUATION_KEY)
+            && saved["connection_id"] == connection
+            && saved["model"] == model
+        {
+            let items = saved["items"]
+                .as_array()
+                .ok_or("Invalid Responses continuation")?;
+            for item in items {
+                let mut replay = replay_item(item)?;
+                if replay["type"] == "function_call" {
+                    let call = message
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .and_then(|calls| calls.iter().find(|call| call["id"] == replay["call_id"]))
+                        .ok_or("Continuation tool call has no canonical assistant call")?;
+                    replay["arguments"] = json!(
+                        call["function"]["arguments"]
+                            .as_str()
+                            .ok_or("Invalid canonical tool arguments")?
+                    );
+                }
+                input.push(replay);
+            }
+            continue;
+        }
+        if role == "tool" {
+            let id = message["tool_call_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("Tool result has no call identity")?;
+            let content = message.get("content").unwrap_or(&Value::Null);
+            let output = content
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| content.to_string());
+            input.push(json!({"type":"function_call_output","call_id":id,"output":output}));
+            continue;
+        }
+        let role = match role {
+            "system" | "developer" => "developer",
+            "user" => "user",
+            "assistant" => "assistant",
+            _ => return Err("Unsupported Responses message role".into()),
+        };
+        let content = match message.get("content") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => {
+                let mut text = String::new();
+                for part in parts {
+                    if !matches!(
+                        part["type"].as_str(),
+                        Some("text" | "input_text" | "output_text")
+                    ) {
+                        return Err("ChatGPT subscription v1 supports text inputs only".into());
+                    }
+                    text.push_str(part["text"].as_str().ok_or("Invalid text message part")?);
+                }
+                text
+            }
+            _ => return Err("Unsupported message content".into()),
+        };
+        if !content.is_empty() {
+            let mut item = if role == "assistant" {
+                json!({"role":"assistant","content":content})
+            } else {
+                json!({"role":role,"content":[{"type":"input_text","text":content}]})
+            };
+            if role == "assistant"
+                && let Some(phase) = message
+                    .get("phase")
+                    .filter(|v| matches!(v.as_str(), Some("commentary" | "final_answer")))
+            {
+                item["phase"] = phase.clone();
+            }
+            input.push(item);
+        }
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let id = call["id"]
+                    .as_str()
+                    .ok_or("Assistant tool call has no identity")?;
+                let name = call["function"]["name"]
+                    .as_str()
+                    .ok_or("Assistant tool call has no name")?;
+                let arguments = call["function"]["arguments"]
+                    .as_str()
+                    .ok_or("Assistant tool arguments are invalid")?;
+                input.push(json!({"type":"function_call","call_id":id,"name":name,"namespace":"astra","arguments":arguments}));
+            }
+        }
+    }
+    let mut body = json!({"model":model,"input":input,"store":false,"stream":true});
+    if let Some(limit) = max_output_tokens.filter(|limit| *limit > 0) {
+        body["max_output_tokens"] = json!(limit);
+    }
+    if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+        let mut definitions = Vec::new();
+        for tool in tools {
+            if tool["type"] != "function" {
+                return Err("Unsupported Responses hosted tool".into());
+            }
+            let function = tool.get("function").unwrap_or(tool);
+            let mut function = function
+                .as_object()
+                .cloned()
+                .ok_or("Invalid function schema")?;
+            function.retain(|key, _| matches!(key.as_str(), "name" | "description" | "parameters"));
+            function.insert("type".into(), json!("function"));
+            function.insert("strict".into(), json!(false));
+            definitions.push(Value::Object(function));
+        }
+        body["tools"] = json!([{"type":"namespace","name":"astra","description":"Tools admitted by Astra","tools":definitions}]);
+    }
+    body["tool_choice"] = json!(if no_tools { "none" } else { "auto" });
+    Ok(body)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ResponseOutput {
+    pub text: String,
+    pub reasoning: String,
+    pub tool_calls: Vec<Value>,
+    pub usage: Map<String, Value>,
+    pub response_id: Option<String>,
+    pub items: Vec<Value>,
+    /// Terminal finish evidence owned by the provider: `Some("length")` only
+    /// when the response ended incomplete with reason `max_output_tokens`.
+    /// Ordinary completions leave this `None`; callers own the default
+    /// stop/tool_calls distinction.
+    pub finish_reason: Option<String>,
+}
+impl ResponseOutput {
+    pub fn continuation(&self, connection: &str, model: &str) -> Value {
+        let mut items = self.items.clone();
+        for item in &mut items {
+            if item["type"] == "reasoning" {
+                // This is already provider-encrypted, opaque state. Encoding
+                // prevents credential-shaped ciphertext from being corrupted
+                // by the canonical history's generic text redaction.
+                if let Some(value) = item
+                    .as_object_mut()
+                    .and_then(|object| object.remove("encrypted_content"))
+                    && let Some(value) = value.as_str()
+                {
+                    item[ENCODED_REASONING] = json!(STANDARD.encode(value));
+                }
+            } else if item["type"] == "function_call" {
+                // Canonical tool arguments own normalization/redaction. Replay
+                // hydrates them from the assistant frame instead of retaining
+                // a second raw copy in private metadata.
+                if let Some(object) = item.as_object_mut() {
+                    object.remove("arguments");
+                }
+            }
+        }
+        json!({"connection_id":connection,"model":model,"items":items})
+    }
+}
+
+#[derive(Default)]
+pub struct ResponseAccumulator {
+    pub output: ResponseOutput,
+    items: BTreeMap<u64, Value>,
+    text_ranges: BTreeMap<(u64, u64), Vec<std::ops::Range<usize>>>,
+    range_count: usize,
+    unindexed_text: bool,
+    tracking_overflow: bool,
+    completed: bool,
+}
+impl ResponseAccumulator {
+    /// Returns a text/reasoning delta for the existing presentation owner.
+    pub fn observe(
+        &mut self,
+        event: &Value,
+    ) -> Result<Option<(String, bool)>, ResponsesStreamError> {
+        let kind = event["type"].as_str().ok_or(ResponsesStreamError::Codec(
+            "Responses event type is missing",
+        ))?;
+        if self.completed {
+            if kind == "response.completed" {
+                return Err(ResponsesStreamError::Codec(
+                    "Duplicate Responses completion",
+                ));
+            }
+            return Ok(None);
+        }
+        // Successful and failed terminal events both own response identity and
+        // measured usage. Preserve that evidence before validating completion.
+        let response = &event["response"];
+        if let Some(id) = response["id"].as_str() {
+            self.output.response_id = Some(id.to_owned());
+        }
+        if let Some(usage) = response["usage"].as_object() {
+            self.output.usage = usage.clone();
+            for (source, target) in [
+                ("input_tokens", "prompt_tokens"),
+                ("output_tokens", "completion_tokens"),
+                ("input_tokens_details", "prompt_tokens_details"),
+                ("output_tokens_details", "completion_tokens_details"),
+            ] {
+                if let Some(value) = usage.get(source) {
+                    self.output.usage.insert(target.into(), value.clone());
+                }
+            }
+        }
+        match kind {
+            "response.output_text.delta" => {
+                let delta = event["delta"]
+                    .as_str()
+                    .ok_or(ResponsesStreamError::Codec("Invalid Responses text delta"))?;
+                // Store observations once; ranges preserve their item/part ownership.
+                if self.output.text.len().saturating_add(delta.len()) > 16 * 1024 * 1024 {
+                    return Err(ResponsesStreamError::Codec("Responses text limit exceeded"));
+                }
+                if !delta.is_empty() && !self.tracking_overflow {
+                    match (
+                        event["output_index"].as_u64(),
+                        event["content_index"].as_u64(),
+                    ) {
+                        (Some(item), Some(part)) => {
+                            let key = (item, part);
+                            if self.text_ranges.len() >= 4096
+                                && !self.text_ranges.contains_key(&key)
+                            {
+                                self.tracking_overflow = true;
+                            } else {
+                                let ranges = self.text_ranges.entry(key).or_default();
+                                let start = self.output.text.len();
+                                let end = start + delta.len();
+                                if let Some(last) =
+                                    ranges.last_mut().filter(|last| last.end == start)
+                                {
+                                    last.end = end;
+                                } else if self.range_count >= 65536 {
+                                    self.tracking_overflow = true;
+                                } else {
+                                    ranges.push(start..end);
+                                    self.range_count += 1;
+                                }
+                            }
+                            if self.tracking_overflow {
+                                self.text_ranges.clear();
+                            }
+                        }
+                        _ => self.unindexed_text = true,
+                    }
+                }
+                self.output.text.push_str(delta);
+                return Ok(Some((delta.into(), false)));
+            }
+            "response.reasoning_summary_text.delta" => {
+                let delta = event["delta"].as_str().ok_or(ResponsesStreamError::Codec(
+                    "Invalid Responses reasoning summary",
+                ))?;
+                self.output.reasoning.push_str(delta);
+                return Ok(Some((delta.into(), true)));
+            }
+            "response.output_item.done" => {
+                let index = event["output_index"]
+                    .as_u64()
+                    .ok_or(ResponsesStreamError::Codec("Responses item index missing"))?;
+                if self.items.len() >= 4096 && !self.items.contains_key(&index) {
+                    return Err(ResponsesStreamError::Codec(
+                        "Too many Responses output items",
+                    ));
+                }
+                self.items.insert(index, event["item"].clone());
+            }
+            "response.completed" => {
+                let response = &event["response"];
+                if response["status"] != "completed" {
+                    return Err(ResponsesStreamError::Codec(
+                        "Responses terminal status is not completed",
+                    ));
+                }
+                self.accept_terminal_output(response)?;
+                self.completed = true;
+            }
+            "response.incomplete" => {
+                let response = &event["response"];
+                let reason = response
+                    .pointer("/incomplete_details/reason")
+                    .and_then(Value::as_str);
+                // Only a provider-declared max_output_tokens truncation is a
+                // terminal budget hit: finish `length`, preserving terminal
+                // output and usage. Every other or unknown incomplete reason
+                // stays an error; it is never mislabeled length and never
+                // silently served as success.
+                if response["status"].as_str() == Some("incomplete")
+                    && reason == Some("max_output_tokens")
+                {
+                    self.observe_truncated_output(response)?;
+                    self.output.finish_reason = Some("length".into());
+                    self.completed = true;
+                } else {
+                    let code = event
+                        .pointer("/response/error/code")
+                        .or_else(|| event.get("code"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| reason.map(str::to_owned));
+                    return Err(ResponsesStreamError::Provider(code));
+                }
+            }
+            // Terminal upstream failures keep the raw provider code verbatim
+            // (structured field only, never prose). Callers own the mapping.
+            "error" | "response.failed" => {
+                let code = event
+                    .pointer("/response/error/code")
+                    .or_else(|| event.get("code"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                return Err(ResponsesStreamError::Provider(code));
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+    /// A typed budget terminal preserves observations, never execution or replay authority.
+    fn observe_truncated_output(&mut self, response: &Value) -> Result<(), ResponsesStreamError> {
+        let terminal = match response.get("output") {
+            Some(Value::Array(items)) if !items.is_empty() => Some(items),
+            None | Some(Value::Array(_)) => None,
+            _ => {
+                return Err(ResponsesStreamError::Codec(
+                    "Invalid Responses terminal output",
+                ));
+            }
+        };
+        if terminal.is_none() && self.tracking_overflow {
+            return Err(ResponsesStreamError::Codec(
+                "Responses partial text tracking limit exceeded",
+            ));
+        }
+        let mut text = String::new();
+        let mut append = |part: &str| -> Result<(), ResponsesStreamError> {
+            if text.len().saturating_add(part.len()) > 16 * 1024 * 1024 {
+                return Err(ResponsesStreamError::Codec("Responses text limit exceeded"));
+            }
+            text.push_str(part);
+            Ok(())
+        };
+        let mut parts = BTreeMap::new();
+        let items: Vec<(u64, &Value)> = match terminal {
+            Some(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| (i as u64, item))
+                .collect(),
+            None => self.items.iter().map(|(i, item)| (*i, item)).collect(),
+        };
+        for (index, item) in items {
+            match item["type"].as_str() {
+                Some("message") => {
+                    if item["role"] != "assistant" {
+                        return Err(ResponsesStreamError::Codec("Invalid partial message role"));
+                    }
+                    let content = item["content"]
+                        .as_array()
+                        .ok_or(ResponsesStreamError::Codec(
+                            "Invalid partial message content",
+                        ))?;
+                    for (part, value) in content.iter().enumerate() {
+                        let text = match value["type"].as_str() {
+                            Some("output_text") => value["text"].as_str(),
+                            Some("refusal") => value["refusal"].as_str(),
+                            _ => None,
+                        }
+                        .ok_or(ResponsesStreamError::Codec("Invalid partial message part"))?;
+                        if terminal.is_some() {
+                            append(text)?;
+                        } else if !text.is_empty() {
+                            if parts.len() >= 4096 {
+                                return Err(ResponsesStreamError::Codec(
+                                    "Too many Responses text parts",
+                                ));
+                            }
+                            parts.insert((index, part as u64), text);
+                        }
+                    }
+                }
+                Some("reasoning" | "function_call") => {}
+                _ => {
+                    return Err(ResponsesStreamError::Codec(
+                        "Unsupported partial output item",
+                    ));
+                }
+            }
+        }
+        if terminal.is_none() && (!parts.is_empty() || !self.text_ranges.is_empty()) {
+            if self.unindexed_text {
+                return Err(ResponsesStreamError::Codec(
+                    "Ambiguous Responses partial text ownership",
+                ));
+            }
+            let keys: std::collections::BTreeSet<_> = parts
+                .keys()
+                .chain(self.text_ranges.keys())
+                .copied()
+                .collect();
+            for key in keys {
+                if let Some(part) = parts.get(&key) {
+                    append(part)?;
+                } else if let Some(ranges) = self.text_ranges.get(&key) {
+                    for range in ranges {
+                        append(&self.output.text[range.clone()])?;
+                    }
+                }
+            }
+        }
+        if !text.is_empty() {
+            self.output.text = text;
+        }
+        self.output.items.clear();
+        self.output.tool_calls.clear();
+        Ok(())
+    }
+
+    /// Assemble replayable terminal output for a completed response.
+    /// Subscription streams can leave terminal output empty after delivering
+    /// complete output_item.done events. Only those finished items are
+    /// eligible; text deltas alone cannot replay.
+    fn accept_terminal_output(&mut self, response: &Value) -> Result<(), ResponsesStreamError> {
+        let items = if let Some(items) = response["output"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+        {
+            items.clone()
+        } else {
+            self.items.values().cloned().collect()
+        };
+        self.output.items = items
+            .iter()
+            .map(replay_item)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                ResponsesStreamError::Codec("Responses terminal output item is invalid")
+            })?;
+        if self.output.items.is_empty() {
+            return Err(ResponsesStreamError::Codec(
+                "Responses terminal output is missing",
+            ));
+        }
+        let mut text = String::new();
+        let mut call_ids = std::collections::HashSet::new();
+        for item in &self.output.items {
+            match item["type"].as_str() {
+                Some("message") => {
+                    if let Some(parts) = item["content"].as_array() {
+                        for part in parts {
+                            if let Some(value) =
+                                part["text"].as_str().or_else(|| part["refusal"].as_str())
+                            {
+                                text.push_str(value);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let id = item["call_id"].as_str().filter(|s| !s.is_empty()).ok_or(
+                        ResponsesStreamError::Codec("Responses tool call identity missing"),
+                    )?;
+                    if !call_ids.insert(id) {
+                        return Err(ResponsesStreamError::Codec(
+                            "Duplicate Responses tool call identity",
+                        ));
+                    }
+                    if item
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| n != "astra")
+                    {
+                        return Err(ResponsesStreamError::Codec(
+                            "Responses tool namespace was not admitted",
+                        ));
+                    }
+                    let name = item["name"]
+                        .as_str()
+                        .ok_or(ResponsesStreamError::Codec("Responses tool name missing"))?;
+                    let arguments =
+                        item["arguments"]
+                            .as_str()
+                            .ok_or(ResponsesStreamError::Codec(
+                                "Responses tool arguments missing",
+                            ))?;
+                    self.output.tool_calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
+                }
+                Some("reasoning") => {}
+                _ => {
+                    return Err(ResponsesStreamError::Codec(
+                        "Unsupported Responses output item",
+                    ));
+                }
+            }
+        }
+        if !text.is_empty() {
+            self.output.text = text;
+        }
+        Ok(())
+    }
+    pub fn finish(self) -> Result<ResponseOutput, ResponsesStreamError> {
+        if !self.completed {
+            return Err(ResponsesStreamError::Codec(
+                "Responses stream ended without response.completed",
+            ));
+        }
+        Ok(self.output)
+    }
+    pub fn completed(&self) -> bool {
+        self.completed
+    }
+}
+
+/// Batch decoder used for bounded connectivity probes. Runtime streaming uses
+/// the same event accumulator with the canonical incremental SSE reader.
+pub fn decode_sse(text: &str) -> Result<ResponseOutput, ResponsesStreamError> {
+    let mut output = ResponseAccumulator::default();
+    let text = text.replace("\r\n", "\n");
+    for block in text.split("\n\n") {
+        let data = block
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event = serde_json::from_str(&data)
+            .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE JSON"))?;
+        output.observe(&event)?;
+    }
+    output.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn completion(items: Value) -> Value {
+        json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":items,
+            "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}})
+    }
+    fn sse(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|event| format!("data: {event}\r\n\r\n"))
+            .collect()
+    }
+    #[test]
+    fn maps_authority_and_admitted_functions_to_subscription_wire() {
+        let body=request("model-from-catalog",&[json!({"role":"system","content":"policy"}),json!({"role":"user","content":"question"})],
+            Some(&[json!({"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}})]),"connection",false,None).unwrap();
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][1]["content"][0]["text"], "question");
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(body["tools"][0]["tools"][0]["name"], "read_file");
+        assert_eq!(body["tools"][0]["tools"][0]["strict"], false);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        for key in [
+            "messages",
+            "temperature",
+            "max_output_tokens",
+            "previous_response_id",
+        ] {
+            assert!(body.get(key).is_none());
+        }
+    }
+    #[test]
+    fn completed_tool_and_encrypted_reasoning_survive_stateless_continuation() {
+        let items = json!([
+            {"type":"reasoning","id":"rs-1","summary":[],"encrypted_content":"opaque-state"},
+            {"type":"function_call","id":"fc-1","namespace":"astra","name":"read_file","call_id":"call-1","arguments":"{\"path\":\"a\"}"}
+        ]);
+        let output = decode_sse(&sse(&[completion(items.clone())])).unwrap();
+        assert_eq!(output.tool_calls[0]["id"], "call-1");
+        assert_eq!(output.usage["prompt_tokens"], 12);
+        assert_eq!(output.usage["prompt_tokens_details"]["cached_tokens"], 4);
+        let mut assistant =
+            json!({"role":"assistant","content":"","tool_calls":output.tool_calls.clone()});
+        assistant[CONTINUATION_KEY] = output.continuation("connection", "model");
+        assert!(
+            assistant[CONTINUATION_KEY]["items"][1]
+                .get("arguments")
+                .is_none()
+        );
+        let mut messages = [
+            assistant,
+            json!({"role":"tool","tool_call_id":"call-1","content":"file contents"}),
+        ];
+        let body = request("model", &messages, None, "connection", false, None).unwrap();
+        assert_eq!(body["input"][0], items[0]);
+        assert_eq!(body["input"][1], items[1]);
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["input"][2]["call_id"], "call-1");
+        let switched = request(
+            "model",
+            &messages,
+            None,
+            "different-connection",
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(!switched.to_string().contains("opaque-state"));
+        assert_eq!(switched["input"][0]["type"], "function_call");
+        messages[0]["tool_calls"][0]["function"]["arguments"] =
+            json!("canonical-normalized-arguments");
+        let body = request("model", &messages, None, "connection", false, None).unwrap();
+        assert_eq!(
+            body["input"][1]["arguments"],
+            "canonical-normalized-arguments"
+        );
+    }
+    #[test]
+    fn presentation_deltas_are_not_duplicated_by_final_items() {
+        let value=decode_sse(&sse(&[
+            json!({"type":"response.output_text.delta","delta":"Hello"}),
+            completion(json!([{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Hello"}]}])),
+        ])).unwrap();
+        assert_eq!(value.text, "Hello");
+        assert_eq!(value.items[0]["phase"], "final_answer");
+    }
+    #[test]
+    fn completed_stream_uses_finished_items_when_terminal_output_is_empty() {
+        let item = json!({"type":"message","id":"message-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK"}]});
+        let done = json!({"type":"response.output_item.done","output_index":0,"item":item});
+        let output = decode_sse(&sse(&[done.clone(), completion(json!([]))])).unwrap();
+        assert_eq!(output.text, "OK");
+        assert_eq!(output.items, vec![item]);
+        assert_eq!(output.usage["prompt_tokens"], 12);
+        // Finished items alone, or text deltas plus an empty completion, do
+        // not establish a completed, replayable response.
+        assert!(decode_sse(&sse(&[done])).is_err());
+        assert!(
+            decode_sse(&sse(&[
+                json!({"type":"response.output_text.delta","delta":"OK"}),
+                completion(json!([])),
+            ]))
+            .is_err()
+        );
+    }
+    #[test]
+    fn incomplete_and_failed_streams_never_become_success() {
+        assert!(
+            decode_sse(&sse(&[
+                json!({"type":"response.output_text.delta","delta":"partial"})
+            ]))
+            .is_err()
+        );
+        assert!(decode_sse("data: [DONE]\n\n").is_err());
+        assert!(
+            decode_sse(&sse(&[
+                json!({"type":"response.output_text.delta","delta":"partial"}),
+                completion(json!([]))
+            ]))
+            .is_err()
+        );
+        for kind in ["response.failed", "response.incomplete"] {
+            let error = (kind == "response.failed").then(|| json!({"code":"subscription_sharing_usage_limit_exceeded","message":"private-provider-text"}));
+            let value = json!({"type":kind,"response":{"id":"failed-response","usage":{"input_tokens":17,"output_tokens":23},"error":error}});
+            let mut accumulator = ResponseAccumulator::default();
+            let failure = accumulator.observe(&value).unwrap_err();
+            assert_eq!(
+                failure,
+                if error.is_some() {
+                    ResponsesStreamError::Provider(Some(
+                        "subscription_sharing_usage_limit_exceeded".into(),
+                    ))
+                } else {
+                    ResponsesStreamError::Provider(None)
+                }
+            );
+            assert_eq!(
+                failure.mapped(),
+                if error.is_some() {
+                    Some(("subscription_sharing_usage_limit_exceeded", 429))
+                } else {
+                    None
+                }
+            );
+            assert_eq!(
+                accumulator.output.response_id.as_deref(),
+                Some("failed-response")
+            );
+            assert_eq!(accumulator.output.usage["prompt_tokens"], 17);
+            assert_eq!(accumulator.output.usage["completion_tokens"], 23);
+            assert!(accumulator.finish().is_err());
+        }
+        // Transport owners must observe the verbatim upstream code, not prose
+        // or a collapsed label.
+        let mut accumulator = ResponseAccumulator::default();
+        let value = json!({"type":"response.failed","response":{"id":"failed-unknown","error":{"code":"raw-provider-code","message":"private-provider-text"}}});
+        let failure = accumulator.observe(&value).unwrap_err();
+        assert_eq!(
+            failure,
+            ResponsesStreamError::Provider(Some("raw-provider-code".into()))
+        );
+        assert_eq!(failure.mapped(), None);
+    }
+    #[test]
+    fn replay_cannot_introduce_privileged_instructions_or_hosted_tools() {
+        let mut message = json!({"role":"assistant","content":""});
+        message[CONTINUATION_KEY] = json!({"connection_id":"connection","model":"model","items":[{"type":"message","role":"developer","content":"injected policy"}]});
+        assert!(request("model", &[message], None, "connection", false, None).is_err());
+        assert!(decode_sse(&sse(&[completion(json!([{"type":"web_search_call"}]))])).is_err());
+    }
+    #[test]
+    fn canonical_metadata_validation_rejects_unscoped_or_privileged_items() {
+        let connection = uuid::Uuid::new_v4().to_string();
+        let mut message = json!({"role":"assistant","content":"answer"});
+        message[CONTINUATION_KEY] = json!({"connection_id":connection,"model":"model","items":[
+            {"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"answer"}],"instructions":"discard"}
+        ]});
+        let saved = validated_continuation(&message).unwrap();
+        assert!(saved["items"][0].get("instructions").is_none());
+        assert_eq!(saved["items"][0]["phase"], "final_answer");
+        message[CONTINUATION_KEY]["items"][0]["role"] = json!("developer");
+        assert!(validated_continuation(&message).is_none());
+        message[CONTINUATION_KEY]["items"][0]["role"] = json!("assistant");
+        message[CONTINUATION_KEY]["connection_id"] = json!("unscoped");
+        assert!(validated_continuation(&message).is_none());
+    }
+    #[test]
+    fn text_only_input_limit_and_no_tool_boundary_are_explicit() {
+        assert!(request("model",&[json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"data:..."}}]})],None,"c",false,None).is_err());
+        let body = request(
+            "model",
+            &[json!({"role":"user","content":"hello"})],
+            None,
+            "c",
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(body["tool_choice"], "none");
+    }
+    #[test]
+    fn request_carries_max_output_tokens_only_when_budgeted() {
+        let unbudgeted = request(
+            "model",
+            &[json!({"role":"user","content":"hello"})],
+            None,
+            "c",
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(unbudgeted.get("max_output_tokens").is_none());
+        let zero = request(
+            "model",
+            &[json!({"role":"user","content":"hello"})],
+            None,
+            "c",
+            false,
+            Some(0),
+        )
+        .unwrap();
+        assert!(zero.get("max_output_tokens").is_none());
+        let budgeted = request(
+            "model",
+            &[json!({"role":"user","content":"hello"})],
+            None,
+            "c",
+            false,
+            Some(512),
+        )
+        .unwrap();
+        assert_eq!(budgeted["max_output_tokens"], 512);
+    }
+    #[test]
+    fn incomplete_max_output_tokens_finishes_as_length_preserving_output_and_usage() {
+        let item = json!({"type":"message","id":"message-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"partial answer"}]});
+        let done = json!({"type":"response.output_item.done","output_index":0,"item":item});
+        let incomplete = json!({"type":"response.incomplete","response":{"id":"resp-9","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":512}}});
+        let output = decode_sse(&sse(&[done.clone(), incomplete.clone()])).unwrap();
+        assert_eq!(output.text, "partial answer");
+        assert!(output.items.is_empty());
+        assert!(output.tool_calls.is_empty());
+        assert_eq!(output.finish_reason.as_deref(), Some("length"));
+        assert_eq!(output.response_id.as_deref(), Some("resp-9"));
+        assert_eq!(output.usage["output_tokens"], 512);
+        assert_eq!(output.usage["completion_tokens"], 512);
+        // A truncation completing the accumulator ends the stream like a
+        // completion: later events are ignored, and a duplicate completed
+        // stays a protocol error.
+        let mut accumulator = ResponseAccumulator::default();
+        accumulator.observe(&done).unwrap();
+        accumulator.observe(&incomplete).unwrap();
+        assert!(accumulator.completed());
+        accumulator
+            .observe(&json!({"type":"response.output_text.delta","delta":"late"}))
+            .unwrap();
+        assert!(accumulator.finish().is_ok());
+    }
+    #[test]
+    fn incomplete_other_or_unknown_reasons_stay_errors() {
+        for details in [
+            json!({"reason":"content_filter"}),
+            json!({"reason":"unknown_future_reason"}),
+            json!(null),
+        ] {
+            let event = json!({"type":"response.incomplete","response":{"id":"resp-x","status":"incomplete","incomplete_details":details,"usage":{"input_tokens":1,"output_tokens":2}}});
+            assert!(decode_sse(&sse(&[event])).is_err(), "{details}");
+        }
+        // A max_output_tokens claim without the incomplete status is not
+        // truncation evidence.
+        let forged = json!({"type":"response.incomplete","response":{"id":"resp-y","status":"failed","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"output_tokens":2}}});
+        assert!(decode_sse(&sse(&[forged])).is_err());
+        // Unknown reasons preserve structured evidence, never become length.
+        let mut accumulator = ResponseAccumulator::default();
+        let failure = accumulator
+            .observe(&json!({"type":"response.incomplete","response":{"id":"resp-z","status":"incomplete","incomplete_details":{"reason":"content_filter"}}}))
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            ResponsesStreamError::Provider(Some("content_filter".into()))
+        );
+        assert!(accumulator.finish().is_err());
+    }
+}

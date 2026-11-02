@@ -199,6 +199,7 @@ impl ModelService for Catalog {
             .unwrap()
             .values()
             .map(|model| ModelListItem {
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 offering_id: model.offering_id.clone(),
                 access_id: if self.separate_billing.load(Ordering::SeqCst) {

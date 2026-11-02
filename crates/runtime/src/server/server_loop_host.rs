@@ -232,27 +232,10 @@ fn provider_result_has_valid_tool_call(result: &LlmCallResult) -> bool {
     })
 }
 
-/// A provider can finish a well-formed stream after emitting only private
-/// reasoning.  That is not a settled assistant response: no text has become
-/// visible and no tool has been selected.  Preserve this distinction even on
-/// ordinary (non-convergence) calls so the loop can take its single safe
-/// capability-aware recovery rather than presenting an empty completion as
-/// success.
-///
-/// A selected tool deliberately does *not* qualify here, including one that
-/// will later be rejected by admission.  Replaying after a model selected a
-/// side-effect carrier would be unsafe; that path retains its normal typed
-/// tool-admission handling.
+/// Mandatory provider convergence requires visible text or a selected tool.
+/// Ordinary completed responses are classified by the loop's completion owner.
 pub(crate) fn reject_provider_completion_without_delivery(
     result: &LlmCallResult,
-) -> Result<(), astra_core::ClassifiedError> {
-    reject_provider_completion_without_delivery_with_usage(result, None, None)
-}
-
-fn reject_provider_completion_without_delivery_with_usage(
-    result: &LlmCallResult,
-    aggregate_usage: Option<crate::turn::token_usage::TokenUsage>,
-    qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
 ) -> Result<(), astra_core::ClassifiedError> {
     if crate::turn::llm::client::text_has_actionable_content(&result.full_text)
         || !result.tool_calls.is_empty()
@@ -278,13 +261,6 @@ fn reject_provider_completion_without_delivery_with_usage(
             "provider_response": {"transport_success": true},
             "last_request_usage": &result.usage,
             "last_request_input_tokens": result.usage_presence.measured_input_tokens,
-            "qualified_usage": qualified_usage.map(|usage| usage.to_json()),
-            "usage": aggregate_usage.map(|usage| json!({
-                "input_tokens": usage.input_tokens,
-                "cached_input_tokens": usage.cached_input_tokens,
-                "cache_creation_tokens": usage.cache_creation_tokens,
-                "output_tokens": usage.output_tokens,
-            })),
         })
         .to_string(),
     ))
@@ -1986,6 +1962,7 @@ fn record_full_llm_response_event(
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
     /// `None` → send `model_name`. See `ResolvedActiveLlmModel::upstream_model_name`.
@@ -2016,6 +1993,7 @@ struct ResolvedTurnLlmConfig {
 impl ResolvedTurnLlmConfig {
     fn execution_route(&self) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            subscription: self.subscription.clone(),
             model_name: self.model_name.clone(),
             wire_model_name: self.wire_model_name.clone(),
             api_key: self.api_key.clone(),
@@ -3121,6 +3099,7 @@ fn resolve_llm_model_for_turn(
         return Err("model override does not match the Offering admitted for this run".to_string());
     }
     Ok(ResolvedTurnLlmConfig {
+        subscription: execution.subscription.clone(),
         model_name: execution.model_name.clone(),
         wire_model_name: execution.wire_model_name.clone(),
         api_key: execution.api_key.clone(),
@@ -20638,6 +20617,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             let mut attempt_first_stream_update_ms: Option<u64> = None;
             let mut attempt_first_visible_text_ms: Option<u64> = None;
+            state.pending_provider_continuation=None;
             let r = {
                 let mut attempt_text = String::new();
                 let mut attempt_reasoning = String::new();
@@ -21409,21 +21389,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ));
         }
 
-        // A transport success is not an assistant success.  Judge delivery
-        // only after any bounded output-cap continuation has been merged:
-        // a visible first segment is already externally observable and must
-        // never be replayed merely because its suffix was empty.  Conversely,
-        // a logical response with no text and no selected tool is safe for
-        // exactly one thinking-off convergence recovery.
-        if let Err(error) = reject_provider_completion_without_delivery_with_usage(
-            &result,
-            physical_attempt_usage_reported.then_some(physical_attempt_usage),
-            qualified_attempt_usage,
-        ) {
-            self.emit_progress_event(logical_request_usage_event(physical_attempt_usage, &result, qualified_attempt_usage));
-            return Err(error);
-        }
-
+        // A complete response, including one without an action, belongs to
+        // the loop's completion owner. It waits for runtime dependencies before
+        // applying its bounded textless-response recovery. Transport failures
+        // and mandatory provider-convergence checks remain settled above.
         crate::turn::agentic_loop::execution_phase::record_observed_child_reads(
             self, state, &llm_messages, turn_started,
         );
@@ -21813,6 +21782,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             first_visible_text_turn_ms,
             turn_started.elapsed().as_millis() as u64,
         ));
+        state.pending_provider_continuation=result.provider_continuation.clone();
         let mut accum = Self::result_to_accum_with_usage(&result, Some(physical_attempt_usage));
         accum.model_item_id = state.current_model_item_id.clone();
         accum.qualified_usage = qualified_attempt_usage;
@@ -28596,6 +28566,7 @@ mod tests {
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
+            subscription: None,
             model_name: "gpt-4o-mini".to_string(),
             wire_model_name: None,
             api_key: String::new(),
@@ -34624,6 +34595,7 @@ mod tests {
     #[test]
     fn result_to_accum_converts_correctly() {
         let result = LlmCallResult {
+            provider_continuation: None,
             judgment_provenance: None,
             response_id: None,
             full_text: "Hello world".to_string(),
@@ -34788,15 +34760,15 @@ mod tests {
                 output_tokens: 8,
                 ..Default::default()
             });
-            let rejected = reject_provider_completion_without_delivery_with_usage(
+            let rejected = attach_transport_success_usage(
+                reject_provider_completion_without_delivery(&result).unwrap_err(),
                 &result,
                 aggregate,
                 Some(
                     astra_turn_types::CanonicalTokenUsage::new(Some(220), None, None, Some(8))
                         .unwrap(),
                 ),
-            )
-            .unwrap_err();
+            );
             let attached = attach_transport_success_usage(
                 astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::ProviderDeadline,
@@ -41664,6 +41636,7 @@ mod tests {
         > {
             *self.reads.lock().unwrap() += 1;
             Ok(vec![astra_services::ModelListItem {
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 offering_id: "offer-a".into(),
                 access_id: "self-hosted".into(),
@@ -51308,6 +51281,7 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new(
             OwnedLlmExecutionRoute {
+                subscription: None,
                 model_name: "gpt-4o-mini".to_string(),
                 wire_model_name: None,
                 api_key: String::new(),

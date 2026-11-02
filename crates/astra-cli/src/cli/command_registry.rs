@@ -180,6 +180,8 @@ impl CommandMeta {
 // ── Subcommand completion arrays ────────────────────────────────────────────
 
 const MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("add", "Add a personal API key or ChatGPT model"),
+    ("manage", "Manage personal models and connections"),
     ("info", "Show details for the current model"),
     ("list", "Open the picker to choose a model"),
     ("clear", "Clear the active model selection"),
@@ -188,6 +190,8 @@ const MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
 // The picker is the default `/model` action, so its `list` alias is accepted
 // but does not need a second completion row.
 const TUI_MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("add", "Add a personal API key or ChatGPT model"),
+    ("manage", "Manage personal models and connections"),
     ("info", "Show details for the current model"),
     ("clear", "Clear the active model selection"),
 ];
@@ -418,12 +422,12 @@ pub static COMMANDS: &[CommandMeta] = &[
     .primary(),
     CommandMeta::new(
         "/model",
-        "Choose, inspect, or switch the active model",
+        "Choose, add, or manage models",
         CommandGroup::Common,
     )
     .with_subcommands(MODEL_SUBCOMMANDS)
     .with_tui_subcommands(TUI_MODEL_SUBCOMMANDS)
-    .with_arg_hint("[info | clear | <name>]")
+    .with_arg_hint("[add | manage | info | clear | <name>]")
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
     CommandMeta::new(
@@ -930,7 +934,7 @@ mod tests {
                 .iter()
                 .map(|(name, _)| *name)
                 .collect::<Vec<_>>(),
-            vec!["info", "clear"]
+            vec!["add", "manage", "info", "clear"]
         );
 
         let work = resolve_command_meta("/work").expect("work command registered");
@@ -997,7 +1001,10 @@ mod tests {
     #[test]
     fn get_arg_hint_from_registry() {
         // Commands with arg_hint defined in registry
-        assert_eq!(get_arg_hint("/model"), Some("[info | clear | <name>]"));
+        assert_eq!(
+            get_arg_hint("/model"),
+            Some("[add | manage | info | clear | <name>]")
+        );
         assert_eq!(get_arg_hint("/resume"), Some("[session_id]"));
 
         // Commands with subcommands should also have arg hints

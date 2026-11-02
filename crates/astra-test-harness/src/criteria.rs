@@ -1212,12 +1212,16 @@ pub(crate) fn execution_contract_proof(
                     detail,
                     child_reason: Some(failure.reason),
                 }),
-                None => Ok((
-                    false,
-                    serde_json::json!({
+                None => {
+                    let mut diagnostic = serde_json::json!({
                         "kind":"child_adoption", "status":"contradicted", "reason":failure.reason
-                    }),
-                )),
+                    });
+                    if let Some(mutation) = failure.mutation {
+                        diagnostic["mutation"] =
+                            serde_json::to_value(mutation).expect("closed diagnostic");
+                    }
+                    Ok((false, diagnostic))
+                }
             },
         };
     }

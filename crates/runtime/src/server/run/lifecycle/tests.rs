@@ -1225,15 +1225,10 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         engine
             .recover_session_continuation_for_test(&owner, &old_run)
             .await;
-        assert_eq!(
-            engine
-                .load_run(&owner, &old_run)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            STATUS_PAUSED
-        );
+        let recovered = engine.load_run(&owner, &old_run).await.unwrap().unwrap();
+        assert_eq!(recovered.status, STATUS_PAUSED);
+        assert!(recovered.owner_pod_id.is_none());
+        assert!(recovered.owner_lease_expires_at.is_none());
     } else {
         assert!(
             attempts
@@ -1251,14 +1246,14 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
             .execute(pool.get())
             .await
             .expect("pause old run");
+        assert!(
+            engine
+                .store()
+                .release_owner_lease(&owner, &session, &old_run, old_authority.owner_generation)
+                .await
+                .expect("stop the old execution before continuation")
+        );
     }
-    assert!(
-        engine
-            .store()
-            .release_owner_lease(&owner, &session, &old_run, old_authority.owner_generation)
-            .await
-            .expect("stop the old execution before continuation")
-    );
     if through_new_turn {
         exercise_primary_continuation_entry(
             &pool,
@@ -3003,6 +2998,7 @@ impl astra_services::ModelService for ActiveTestModelService {
     ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         *self.catalog_requests.lock().unwrap() += 1;
         Ok(vec![astra_services::ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "model-test-model".to_string(),
             access_id: "self-hosted".to_string(),
@@ -9718,6 +9714,18 @@ impl FaultInjectedRunStateStore {
 
 #[async_trait]
 impl RunStateStore for FaultInjectedRunStateStore {
+    async fn settle_recovered_run(
+        &self,
+        claimed_run: &DurableRunRecord,
+        status: &str,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        self.inner
+            .settle_recovered_run(claimed_run, status, error_message, events)
+            .await
+    }
+
     async fn apply_run_user_intents(
         &self,
         request: astra_services::runs::AtomicRunUserIntentApplyRequest<'_>,
@@ -12992,7 +13000,7 @@ async fn seed_lifecycle_run_for_pause_resume_it(
     user_id: &str,
     run_id: &str,
     session_id: &str,
-) {
+) -> crate::server::run::engine::RunOwnerLeaseHeartbeat {
     crate::server::run::insert_active_run_session_fixture(pool, user_id, session_id).await;
     svc.run_engine
         .start_run(run_id, user_id, session_id)
@@ -13003,7 +13011,25 @@ async fn seed_lifecycle_run_for_pause_resume_it(
         session_id.to_string(),
         user_id.to_string(),
     );
+    let ExecutionAuthorityConfirmation::Confirmed(authority) = svc
+        .run_engine
+        .confirm_execution_authority(user_id, session_id, run_id, 0, &run_state.llm_cancel_token)
+        .await
+        .unwrap()
+    else {
+        panic!("fixture executor authority");
+    };
+    let heartbeat = svc.run_engine.start_owner_lease_heartbeat(
+        user_id.into(),
+        session_id.into(),
+        run_id.into(),
+        0,
+        authority,
+        Arc::new(AtomicBool::new(false)),
+        run_state.llm_cancel_token.clone(),
+    );
     svc.runs.write().await.insert(run_id.to_string(), run_state);
+    heartbeat.expect("DB fixture heartbeat")
 }
 
 fn test_request(message: &str) -> ChatRequestData {
@@ -30965,7 +30991,8 @@ async fn db_explain_publication_failure_survives_database_outage() {
     let user = "explain-outage-user";
     let session = format!("explain-outage-{}", Uuid::new_v4());
     let run = Uuid::new_v4().to_string();
-    seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
+    let _heartbeat =
+        seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
     assert!(
         svc.run_engine
             .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
@@ -31085,7 +31112,8 @@ async fn db_explain_publication_is_discoverable_and_readable() {
     let session = format!("explain-it-{}", Uuid::new_v4());
     let run = Uuid::new_v4().to_string();
     let svc = db_backed_test_service(&pool, "explain-publication-it");
-    seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
+    let _heartbeat =
+        seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
     svc.run_engine
         .append_event(
             user,
@@ -31548,7 +31576,8 @@ async fn db_pause_resume_cannot_publish_buffered_success_as_completed() {
     let run_id = format!("pause-it-{}", Uuid::new_v4());
     let session_id = format!("sess-it-{}", Uuid::new_v4());
     cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
-    seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user_id, &run_id, &session_id).await;
+    let _heartbeat =
+        seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user_id, &run_id, &session_id).await;
 
     svc.run_engine
         .append_event(
@@ -32244,7 +32273,9 @@ async fn db_resume_does_not_promote_cancelled_or_interrupted_terminal_markers() 
         let run_id = format!("resume-{suffix}-{}", Uuid::new_v4());
         let session_id = format!("sess-{suffix}-{}", Uuid::new_v4());
         cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
-        seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user_id, &run_id, &session_id).await;
+        let _heartbeat =
+            seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user_id, &run_id, &session_id)
+                .await;
 
         ok(svc.pause_run(run_id.clone(), user_id.to_string()).await);
         svc.run_engine
@@ -37410,4 +37441,149 @@ async fn db_conversation_bounds_owned_roots_and_preserves_current_and_raw_cursor
         .execute(pool.get())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "review QA: isolated MatrixOne database"]
+async fn db_resume_authority_retired_recovery_requires_continuation() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let session_id = format!("resume-authority-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, "user-1", &session_id).await;
+    collaborator_db_fixture::seed_execution_binding(&pool, "user-1", &session_id).await;
+    for takeover in [false, true] {
+        let store =
+            Arc::new(DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("recovery-pod"));
+        let svc = db_backed_test_service(&pool, "recovery-pod");
+        let engine = &svc.run_engine;
+        let id = format!("resume-run-{takeover}-{}", Uuid::new_v4());
+        let run_id = id.as_str();
+        engine
+            .start_run(run_id, "user-1", &session_id)
+            .await
+            .unwrap();
+        let (mut local, _, pause_flag, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+            run_id.into(),
+            session_id.clone(),
+            "user-1".into(),
+        );
+        let execution_cancel = local.llm_cancel_token.clone();
+        let ExecutionAuthorityConfirmation::Confirmed(authority) = engine
+            .confirm_execution_authority("user-1", &session_id, run_id, 0, &execution_cancel)
+            .await
+            .unwrap()
+        else {
+            panic!("fresh executor authority");
+        };
+        let _heartbeat = engine.start_owner_lease_heartbeat(
+            "user-1".into(),
+            session_id.clone(),
+            run_id.into(),
+            0,
+            authority,
+            Arc::new(AtomicBool::new(false)),
+            execution_cancel,
+        );
+        local.status = RunStatus::Paused;
+        local.waiting_for = None;
+        local.execution_live = true;
+        pause_flag.store(true, Ordering::SeqCst);
+        svc.runs.write().await.insert(run_id.into(), local);
+        let claim = if takeover {
+            Some(
+                store
+                    .claim_recoverable_active_runs(1)
+                    .await
+                    .unwrap()
+                    .remove(0),
+            )
+        } else {
+            None
+        };
+        assert!(
+            engine
+                .persist_status_if_current(RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: &session_id,
+                    run_id,
+                    status: STATUS_PAUSED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &[STATUS_RUNNING],
+                })
+                .await
+                .unwrap()
+        );
+        if let Some(claim) = claim {
+            assert!(
+                store
+                    .release_settled_recovery_lease(&claim.run)
+                    .await
+                    .unwrap()
+            );
+            assert!(matches!(
+                store
+                    .update_run_status_with_event_if_current_unless_session_blocked(
+                        astra_services::runs::GuardedRunStatusTransitionRequest {
+                            user_id: "user-1",
+                            run_id,
+                            expected_session_id: &session_id,
+                            expected_statuses: &[STATUS_PAUSED],
+                            status: STATUS_RUNNING,
+                            waiting_for: None,
+                            error_message: None,
+                            expected_run_generation: Some(claim.run.run_generation),
+                            event: json!({"event_type":"run_resumed","data":{}}),
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                astra_services::runs::GuardedRunStatusTransition::StatusConflict
+            ));
+        }
+        let result = ok(svc.resume_run(run_id.into(), "user-1".into()).await);
+        let durable = engine.load_run("user-1", run_id).await.unwrap().unwrap();
+        eprintln!(
+            "takeover={takeover} disposition={:?} status={} owner={:?} generation={}",
+            result.disposition, durable.status, durable.owner_pod_id, durable.run_generation
+        );
+        if takeover {
+            assert_eq!(
+                result.disposition,
+                RunMutationDisposition::SessionContinuationRequired,
+                "a retired recovery claim has no live executor; stale local liveness cannot resume it"
+            );
+            assert_ne!(durable.status, STATUS_RUNNING);
+            assert!(
+                durable
+                    .events
+                    .iter()
+                    .all(|event| event["event_type"] != "run_resumed")
+            );
+            assert!(durable.owner_pod_id.is_none());
+        } else {
+            assert_eq!(result.disposition, RunMutationDisposition::Applied);
+            assert_eq!(durable.status, STATUS_RUNNING);
+            assert!(durable.owner_pod_id.is_some());
+            assert!(
+                engine
+                    .persist_status_if_current(RunStatusCasRequest {
+                        user_id: "user-1",
+                        expected_session_id: &session_id,
+                        run_id,
+                        status: STATUS_COMPLETED,
+                        waiting_for: None,
+                        error_message: None,
+                        expected_statuses: &[STATUS_RUNNING]
+                    })
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .release_owner_lease("user-1", &session_id, run_id, durable.run_generation)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
 }

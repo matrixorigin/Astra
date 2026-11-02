@@ -7,6 +7,7 @@ use ratatui::{buffer::Buffer, layout::Rect};
 /// with localisation, or be supplied by a remote source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ViewResult {
+    ModelSetup(crate::tui::model_setup::Action),
     Login {
         username: String,
         password: String,

@@ -360,6 +360,7 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
                 self.assertEqual(call["args"][call["args"].index("--profile") + 1], "strict-online-ci")
                 if package == "astra-services":
                     self.assertEqual(call["test_database"], call["database"])
+                    self.assertEqual(call["args"][call["args"].index("--features") + 1], "e2e-hooks")
                 split.append(call)
         self.assertEqual([row["args"] for row in split], [row["args"] for row in combined])
         self.assertEqual(len({row["database"] for row in split}), len(SHARDS))

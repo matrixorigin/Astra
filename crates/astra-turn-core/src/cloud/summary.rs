@@ -235,7 +235,11 @@ pub async fn generate_compact_summary(
             )
             .await
         {
-            Ok(resp) if !resp.is_ptl_error => return validated_structured_summary(&resp.text),
+            Ok(resp) if !resp.is_ptl_error => {
+                return (resp.finish_reason.as_deref() != Some("length"))
+                    .then(|| validated_structured_summary(&resp.text))
+                    .flatten();
+            }
             Ok(resp) if resp.is_ptl_error => {
                 if attempt >= MAX_PTL_RETRIES {
                     eprintln!(
@@ -392,7 +396,11 @@ pub async fn generate_inline_summary(
             )
             .await
         {
-            Ok(resp) if !resp.is_ptl_error => return validated_structured_summary(&resp.text),
+            Ok(resp) if !resp.is_ptl_error => {
+                return (resp.finish_reason.as_deref() != Some("length"))
+                    .then(|| validated_structured_summary(&resp.text))
+                    .flatten();
+            }
             Ok(resp) if resp.is_ptl_error => {
                 if attempt >= MAX_PTL_RETRIES {
                     eprintln!(
@@ -884,6 +892,36 @@ mod tests {
         for response in ["", "plain text", "### Primary Request\nOnly one section"] {
             let client = MockSummaryClient::success(response);
             assert!(generate_compact_summary(&messages, &client).await.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn structured_summary_requires_nontruncated_completion() {
+        let history = make_messages(2);
+        for finish in [None, Some("stop"), Some("length")] {
+            for inline in [false, true] {
+                let mut client = MockSummaryClient::success(valid_summary());
+                client.responses[0].as_mut().unwrap().finish_reason = finish.map(str::to_owned);
+                let result = if inline {
+                    generate_inline_summary(
+                        &[],
+                        &history,
+                        InlineSummaryHistoryProjection::Semantic,
+                        &client,
+                    )
+                    .await
+                } else {
+                    generate_compact_summary(&history, &client).await
+                };
+                assert_eq!(
+                    result.is_some(),
+                    finish != Some("length"),
+                    "inline={inline} finish={finish:?}"
+                );
+                assert_eq!(
+                    client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+            }
         }
     }
 }

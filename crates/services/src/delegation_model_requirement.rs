@@ -604,6 +604,7 @@ mod tests {
 
     fn offered(name: &str, provider: &str, id: &str) -> ModelListItem {
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: id.into(),
             access_id: "test-access".into(),

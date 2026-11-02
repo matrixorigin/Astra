@@ -2278,6 +2278,7 @@ mod tests {
         use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page};
         let items = (0..20)
             .map(|i| ModelListItem {
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 offering_id: format!("offering-{i:02}"),
                 name: format!("model-{i:02}"),

@@ -3912,6 +3912,7 @@ mod tests {
         use astra_services::models::{ModelAccessKind, ModelExecutionPlacement, ModelListItem};
         use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page};
         let item = ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: "fixture-offering".into(),
             name: "fixture-model".into(),

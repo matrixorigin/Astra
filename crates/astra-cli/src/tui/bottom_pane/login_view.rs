@@ -1,15 +1,8 @@
-//! `/login` and `/register` form as a first-class TUI view.
-
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
-use unicode_width::UnicodeWidthStr;
-
+//! Existing authentication forms use the shared field editor.
+use super::form_view::{FieldKind, FieldSpec, FormView};
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion, ViewResult};
-
+use crossterm::event::KeyEvent;
+use ratatui::{buffer::Buffer, layout::Rect};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginMode {
     Login,
@@ -54,217 +47,71 @@ impl LoginMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FieldSpec {
-    label: &'static str,
-    kind: FieldKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FieldKind {
-    Plain,
-    Secret,
-}
-
-pub(crate) struct LoginView {
-    mode: LoginMode,
-    values: Vec<String>,
-    focus: usize,
-    error: Option<String>,
-    submitted: Option<ViewResult>,
-    cancelled: bool,
-}
-
+pub(crate) struct LoginView(FormView);
 impl LoginView {
     pub fn new(mode: LoginMode) -> Self {
-        Self {
-            mode,
-            values: mode.fields().iter().map(|_| String::new()).collect(),
-            focus: 0,
-            error: None,
-            submitted: None,
-            cancelled: false,
-        }
-    }
-
-    fn fields(&self) -> &'static [FieldSpec] {
-        self.mode.fields()
-    }
-
-    fn submit(&mut self) {
-        for (index, value) in self.values.iter().enumerate() {
-            if value.trim().is_empty() {
-                self.error = Some(format!(
-                    "{} cannot be empty",
-                    self.fields()[index].label.trim()
-                ));
-                self.focus = index;
-                return;
-            }
-        }
-        self.submitted = Some(match self.mode {
-            LoginMode::Login => ViewResult::Login {
-                username: self.values[0].clone(),
-                password: self.values[1].clone(),
+        Self(FormView::new(
+            mode.title(),
+            mode.fields().to_vec(),
+            move |values| {
+                Ok(match mode {
+                    LoginMode::Login => ViewResult::Login {
+                        username: values[0].clone(),
+                        password: values[1].clone(),
+                    },
+                    LoginMode::Register => ViewResult::Register {
+                        username: values[0].clone(),
+                        email: values[1].clone(),
+                        password: values[2].clone(),
+                    },
+                })
             },
-            LoginMode::Register => ViewResult::Register {
-                username: self.values[0].clone(),
-                email: self.values[1].clone(),
-                password: self.values[2].clone(),
-            },
-        });
-    }
-
-    fn hint_text(&self) -> &'static str {
-        "  Tab / ↑↓ switch field · Enter submit · Esc cancel"
-    }
-
-    fn rendered_value(&self, index: usize) -> String {
-        match self.fields()[index].kind {
-            FieldKind::Plain => self.values[index].clone(),
-            FieldKind::Secret => "•".repeat(self.values[index].chars().count()),
-        }
+        ))
     }
 }
-
+impl std::ops::Deref for LoginView {
+    type Target = FormView;
+    fn deref(&self) -> &FormView {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for LoginView {
+    fn deref_mut(&mut self) -> &mut FormView {
+        &mut self.0
+    }
+}
 impl BottomPaneView for LoginView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let theme = crate::tui::theme::current();
-        let outer = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.dim))
-            .title(Line::from(Span::styled(
-                self.mode.title(),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        let inner = outer.inner(area);
-        outer.render(area, buf);
-
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::default());
-        for (index, field) in self.fields().iter().enumerate() {
-            let focused = index == self.focus;
-            let caret = if focused { "▸" } else { " " };
-            let value = self.rendered_value(index);
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {caret} "), Style::default().fg(theme.accent)),
-                Span::styled(field.label, Style::default().fg(theme.fg)),
-                Span::raw("  "),
-                Span::styled(
-                    value,
-                    Style::default().fg(theme.fg).add_modifier(if focused {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-                ),
-            ]));
-        }
-        if let Some(error) = &self.error {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                format!("  {error}"),
-                Style::default().fg(theme.error),
-            )));
-        }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            self.hint_text(),
-            Style::default().fg(theme.dim),
-        )));
-
-        Paragraph::new(lines).render(inner, buf);
+        self.0.render(area, buf);
     }
-
-    fn desired_height(&self, _width: u16) -> u16 {
-        let error_rows = u16::from(self.error.is_some()) * 2;
-        self.fields().len() as u16 + 5 + error_rows
+    fn desired_height(&self, width: u16) -> u16 {
+        self.0.desired_height(width)
     }
-
+    fn handle_paste(&mut self, text: &str) -> bool {
+        self.0.handle_paste(text)
+    }
     fn handle_key(&mut self, key: KeyEvent) {
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                self.cancelled = true;
-            }
-            (KeyCode::Tab | KeyCode::Down, _) => {
-                self.focus = (self.focus + 1).min(self.fields().len().saturating_sub(1));
-                self.error = None;
-            }
-            (KeyCode::BackTab | KeyCode::Up, _) => {
-                self.focus = self.focus.saturating_sub(1);
-                self.error = None;
-            }
-            (KeyCode::Enter, _) => self.submit(),
-            (KeyCode::Backspace, _) => {
-                self.values[self.focus].pop();
-                self.error = None;
-            }
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.values[self.focus].clear();
-                self.error = None;
-            }
-            (KeyCode::Char(c), modifiers)
-                if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
-            {
-                self.values[self.focus].push(c);
-                self.error = None;
-            }
-            _ => {}
-        }
+        self.0.handle_key(key);
     }
-
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if self.cancelled || self.submitted.is_some() {
-            return None;
-        }
-        let x = 6
-            + self.fields()[self.focus].label.width() as u16
-            + 2
-            + self.rendered_value(self.focus).width() as u16;
-        let y = 2 + self.focus as u16;
-        Some((area.x.saturating_add(x), area.y.saturating_add(y)))
+        self.0.cursor_pos(area)
     }
-
     fn on_ctrl_c(&mut self) -> CancellationEvent {
-        self.cancelled = true;
-        CancellationEvent::Consumed
+        self.0.on_ctrl_c()
     }
-
     fn is_complete(&self) -> bool {
-        self.cancelled || self.submitted.is_some()
+        self.0.is_complete()
     }
-
     fn completion(&self) -> Option<ViewCompletion> {
-        if self.cancelled {
-            return Some(ViewCompletion {
-                result: None,
-                reopen: None,
-            });
-        }
-        self.submitted.clone().map(|result| ViewCompletion {
-            result: Some(result),
-            reopen: None,
-        })
+        self.0.completion()
     }
-
     fn prefer_esc_to_handle_key_event(&self) -> bool {
         true
     }
-
-    fn hint_keys(&self) -> Option<String> {
-        None
-    }
-
     fn reserve_status_footer(&self) -> bool {
         false
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::super::view::BottomPaneView;
@@ -427,5 +274,26 @@ mod tests {
                 password: "pw".into(),
             }
         );
+    }
+    #[test]
+    fn pasted_login_password_is_consumed_by_the_form_not_the_chat_draft() {
+        use crate::tui::bottom_pane::{BottomPane, BottomPaneAction};
+        let mut pane = BottomPane::new();
+        pane.replace_composer_text("unsent conversation");
+        pane.push_view(Box::new(LoginView::new(LoginMode::Login)));
+        pane.handle_paste("alice");
+        pane.handle_key(k(KeyCode::Tab));
+        pane.handle_paste("synthetic-private-password");
+        pane.handle_paste("invalid\ncontrol-input");
+        let BottomPaneAction::ViewCompleted {
+            result: Some(super::super::view::ViewResult::Login { username, password }),
+            ..
+        } = pane.handle_key(k(KeyCode::Enter))
+        else {
+            panic!("login form did not submit");
+        };
+        assert_eq!(username, "alice");
+        assert_eq!(password, "synthetic-private-password");
+        assert_eq!(pane.composer.text(), "unsent conversation");
     }
 }

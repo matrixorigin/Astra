@@ -95,6 +95,7 @@ impl ExternalCatalogModel {
             .unwrap_or_else(|| self.name.trim())
             .to_string();
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: self.id,
             access_id: "this-device".to_string(),

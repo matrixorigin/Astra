@@ -36,8 +36,9 @@ exists, it offers an explicit update, a separate installation with independent
 containers, data, logs, and ports, or a no-change exit. It then tests the
 embedding endpoint, credentials, model, and dimension, reuses or repairs
 services, and verifies a memory round trip. Administrator/model setup is
-optional: the recommended path launches `astra admin setup`, while skipping it
-finishes the stack and prints a resumable command. The summary distinguishes
+optional: the recommended personal path opens `astra` for `/register` or `/login`
+and `/model`. Deployment/shared model administration remains an explicit separate
+choice; skipping setup finishes the stack and prints a resumable TUI command. The summary distinguishes
 `Stack ready` from `Chat ready`. Startup failures offer repair/retry,
 stop-and-preserve, and leave-for-inspection choices. API keys are hidden and
 the local `.env` is owner-only. The API address is saved before the optional
@@ -57,8 +58,9 @@ MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
 Mock embeddings replace only semantic-memory embedding calls. They do not
-provide the agent's LLM; `astra admin setup` still needs a hosted model or an
-OpenAI-compatible local endpoint. Because model inference is server-side, a
+provide the agent's LLM. Use `/model` in the TUI to configure your own API key or
+ChatGPT account, or select an authorized deployment model. Shared deployment
+models can still be configured through `astra admin setup`. Because model inference is server-side, a
 model running on the Docker host is reached as
 `http://host.docker.internal:<port>`, not `localhost`.
 
@@ -147,6 +149,20 @@ visibility behavior:
 ```bash
 make test-runtime-profiles
 ```
+
+## Personal accounts and models
+
+`make stack-env` prepares the existing encryption key; ChatGPT connections need
+no extra enabling or installation configuration. Repeat runs retain existing
+values and explicit operator overrides. Retain the encryption key when upgrading
+or restoring; it also supplies the default ChatGPT installation identity. Retain
+`ASTRA_CHATGPT_HOST_ID` too if explicitly configured.
+Start `astra`, register or sign in, then use `/model` to configure your own source.
+An administrator's personal connection is still personal; `astra admin model ...`
+is the separate path for deployment-shared models. MOI/UC deployments retain their
+existing managed model and billing policy.
+
+See [personal setup and local Web boundaries](../../docs/reference/cli-commands.md#chatgpt-subscription-models).
 
 ## Admin Accounts
 

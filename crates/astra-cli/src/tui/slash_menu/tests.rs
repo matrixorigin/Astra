@@ -17,6 +17,24 @@ fn items() -> Vec<SlashItem> {
     ]
 }
 
+#[test]
+fn model_setup_commands_are_visible_and_filterable_from_the_registry() {
+    let meta = crate::cli::command_registry::resolve_command_meta("/model").unwrap();
+    let items = vec![SlashItem {
+        subcommands: meta.visible_tui_subcommands(),
+        ..SlashItem::simple(meta.name, meta.description)
+    }];
+    assert!(is_open_for("/model ", &items));
+    let mut menu = SlashMenu::new(items);
+    menu.set_filter("/model ");
+    for command in ["/model add", "/model manage"] {
+        assert!(menu.matches().iter().any(|item| item.name == command));
+        menu.set_filter(command);
+        assert_eq!(menu.selected_item().unwrap().name, command);
+        menu.set_filter("/model ");
+    }
+}
+
 // ─── Open/close predicate ─────────────────────────────────────────
 
 #[test]

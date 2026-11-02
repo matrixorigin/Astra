@@ -136,6 +136,7 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub edge_tool_round: &'a [E],
     pub reasoning_content: &'a str,
     pub reasoning_signature: &'a str,
+    pub provider_continuation: Option<&'a Value>,
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
@@ -198,6 +199,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     edge_tool_round: &'a [E],
     reasoning_content: &str,
     reasoning_signature: &str,
+    provider_continuation: Option<&Value>,
     pre_resolved_results: &[HeadlessPreResolvedToolResult],
     messages: &mut Vec<Value>,
     tool_results: &mut Vec<Value>,
@@ -210,12 +212,16 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
 
     let force_reasoning = !reasoning_content.is_empty()
         || astra_turn_core::edge_ledger::history_has_reasoning(messages);
-    let opening = begin_headless_tool_round_opening_ext(
+    let mut opening = begin_headless_tool_round_opening_ext(
         physical_tool_calls,
         reasoning_content,
         reasoning_signature,
         force_reasoning,
     );
+    if let Some(continuation) = provider_continuation {
+        opening.assistant_message[astra_core::model_wire::responses::CONTINUATION_KEY] =
+            continuation.clone();
+    }
     messages.push(opening.assistant_message);
 
     let mut pre_resolved_ids = HashSet::new();
@@ -305,6 +311,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         edge_tool_round,
         reasoning_content,
         reasoning_signature,
+        provider_continuation,
         messages,
         tool_results,
         valid_tool_names,
@@ -421,6 +428,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         edge_tool_round,
         reasoning_content,
         reasoning_signature,
+        provider_continuation,
         pre_resolved_results,
         messages,
         tool_results,
@@ -754,6 +762,7 @@ mod tests {
         let mut tool_results = Vec::new();
         let mut step_recorder = StepRecorder::new("test-user", "test-session", "source-budget");
 
+        let continuation = serde_json::json!({"connection_id":"fixture-connection","model":"fixture-model","items":[{"type":"reasoning","encrypted_content":"opaque-state"}]});
         let _prepared = prepare_headless_tool_round(
             None,
             &tool_calls,
@@ -761,6 +770,7 @@ mod tests {
             &edge_tool_round,
             "",
             "",
+            Some(&continuation),
             &pre_resolved,
             &mut messages,
             &mut tool_results,
@@ -769,6 +779,10 @@ mod tests {
         )
         .await;
 
+        assert_eq!(
+            messages[0][astra_core::model_wire::responses::CONTINUATION_KEY],
+            continuation
+        );
         assert_eq!(messages[1]["content"], skill_content);
         assert!(
             messages[1]["content"]

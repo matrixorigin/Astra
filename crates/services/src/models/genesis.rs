@@ -261,6 +261,7 @@ impl DatabaseModelService {
                     return Err(unavailable());
                 }
                 items.push(ModelListItem {
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     offering_id: offering_id(&provider.settings.issuer, subject, &model.id),
                     access_id: "genesis".into(),
@@ -324,6 +325,7 @@ impl DatabaseModelService {
             })?;
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
         Ok(AdmittedModelExecution {
+            subscription: None,
             admitted_at: std::time::Instant::now(),
             price_snapshot: None,
             offering_id: item.offering_id.clone(),

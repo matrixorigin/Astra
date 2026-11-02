@@ -47,7 +47,6 @@ grep -q 'config set api_url' "$script"
 grep -q 'Current installation status' "$script"
 grep -q 'Finish the stack and configure chat later' "$script"
 grep -q 'Chat configuration is present; provider connectivity was not rechecked' "$script"
-grep -q 'Chat is not ready: configure an administrator and an active model' "$script"
 grep -q 'admin_model_state' "$script"
 grep -q 'print_stack_inspect_commands' "$script"
 grep -q 'stack_env_write.sh' "$script"
@@ -69,6 +68,32 @@ grep -q 'non-numeric vector' "$embedding_probe"
 
 fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/astra-interactive-setup.XXXXXX")"
 trap 'rm -rf "$fixture_dir"' EXIT
+# Exercise the completion choices, rather than requiring obsolete admin-only
+# wording after personal onboarding made administrator setup optional.
+finish_function="$(sed -n '/^finish_infrastructure_only() {$/,/^}$/p' "$script")"
+for completion_state in new personal managed; do
+    completion_output="$(
+        eval "$finish_function"
+        ASTRA_API_URL=http://127.0.0.1:17001
+        cli_api_prefix=""
+        cli=astra
+        admin_state=ready
+        active_model_count=0
+        if [[ "$completion_state" == new ]]; then
+            admin_state='not configured'
+        elif [[ "$completion_state" == managed ]]; then
+            active_model_count=2
+        fi
+        finish_infrastructure_only
+    )"
+    grep -Fq 'use /register or /login, then /model' <<< "$completion_output"
+    case "$completion_state" in
+        new) grep -Fq 'No administrator account is required for personal models.' <<< "$completion_output" ;;
+        personal) grep -Fq 'use /model to configure your personal model. Administrator setup is optional.' <<< "$completion_output" ;;
+        managed) grep -Fq 'Chat configuration is present; provider connectivity was not rechecked' <<< "$completion_output" ;;
+    esac
+done
+
 fixture="$fixture_dir/stack.env"
 generated_env="$fixture_dir/generated.env"
 make --no-print-directory -C "$repo_root" stack-env STACK_ENV="$generated_env" >/dev/null

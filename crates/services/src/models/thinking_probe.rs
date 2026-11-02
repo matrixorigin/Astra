@@ -10,17 +10,28 @@ pub(crate) struct ThinkingProbeSnapshot {
     capability: Option<ThinkingCapability>,
     error: Option<String>,
     observed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supported_efforts: Option<Vec<String>>,
 }
 
 impl ThinkingProbeSnapshot {
+    fn is_current(&self, identity: &str, protocol: ThinkingProtocol) -> bool {
+        self.revision == ThinkingProtocol::REVISION
+            && self.identity == identity
+            && self.protocol == protocol
+            && (protocol != ThinkingProtocol::ResponsesReasoning
+                || self
+                    .supported_efforts
+                    .as_ref()
+                    .is_some_and(|efforts| !efforts.is_empty()))
+    }
+
     pub(super) fn result(
         &self,
         identity: &str,
         protocol: ThinkingProtocol,
     ) -> Option<ThinkingProbeResult> {
-        (self.revision == ThinkingProtocol::REVISION
-            && self.identity == identity
-            && self.protocol == protocol)
+        self.is_current(identity, protocol)
             .then(|| ThinkingProbeResult {
                 capability: self.capability.unwrap_or(ThinkingCapability::None),
                 error: self.error.clone(),
@@ -38,7 +49,30 @@ impl ThinkingProbeSnapshot {
             capability: result.error.is_none().then_some(result.capability),
             error: result.error.clone(),
             observed_at: chrono::Utc::now().to_rfc3339(),
+            supported_efforts: None,
         }
+    }
+
+    /// A provider catalog declaration is capability evidence, not a behavioral
+    /// probe. Bind it to the same configuration-owned storage as observations.
+    pub(super) fn declared(
+        identity: String,
+        protocol: ThinkingProtocol,
+        efforts: Vec<String>,
+    ) -> Option<Self> {
+        if efforts.is_empty() {
+            return None;
+        }
+        let mut snapshot = Self::new(
+            identity,
+            protocol,
+            &ThinkingProbeResult {
+                capability: ThinkingCapability::EffortOnly,
+                error: None,
+            },
+        );
+        snapshot.supported_efforts = Some(efforts);
+        Some(snapshot)
     }
 
     /// An inconclusive check is not a negative capability observation. Keep
@@ -57,9 +91,7 @@ impl ThinkingProbeSnapshot {
         identity: &str,
         protocol: ThinkingProtocol,
     ) -> Option<ThinkingCapability> {
-        (self.revision == ThinkingProtocol::REVISION
-            && self.identity == identity
-            && self.protocol == protocol)
+        self.is_current(identity, protocol)
             .then_some(self.capability)
             .flatten()
     }
@@ -86,6 +118,16 @@ pub(super) fn cached_capability(
 ) -> Option<ThinkingCapability> {
     raw.and_then(|raw| serde_json::from_str::<ThinkingProbeSnapshot>(raw).ok())
         .and_then(|snapshot| snapshot.capability(identity, protocol))
+}
+
+pub(super) fn cached_efforts(
+    raw: Option<&str>,
+    identity: &str,
+    protocol: ThinkingProtocol,
+) -> Option<Vec<String>> {
+    let snapshot: ThinkingProbeSnapshot = serde_json::from_str(raw?).ok()?;
+    snapshot.capability(identity, protocol)?;
+    snapshot.supported_efforts
 }
 
 /// Binary controls require two-sided observation. Native/effort protocols
@@ -286,6 +328,34 @@ pub(super) fn parse_response(bytes: &[u8], streaming: bool) -> Result<Value, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_reasoning_is_bound_to_model_configuration() {
+        let protocol = ThinkingProtocol::ResponsesReasoning;
+        assert!(ThinkingProbeSnapshot::declared("identity".into(), protocol, vec![]).is_none());
+        let snapshot = ThinkingProbeSnapshot::declared(
+            "identity".into(),
+            protocol,
+            vec!["high".into(), "xhigh".into()],
+        )
+        .unwrap();
+        let raw = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            cached_efforts(Some(&raw), "identity", protocol),
+            Some(vec!["high".into(), "xhigh".into()])
+        );
+        assert_eq!(
+            cached_capability(Some(&raw), "identity", protocol),
+            Some(ThinkingCapability::EffortOnly)
+        );
+        assert!(cached_efforts(Some(&raw), "changed-connection", protocol).is_none());
+        assert!(
+            cached_efforts(Some(&raw), "identity", ThinkingProtocol::ReasoningEffort).is_none()
+        );
+        let mut invalid: Value = serde_json::from_str(&raw).unwrap();
+        invalid.as_object_mut().unwrap().remove("supported_efforts");
+        assert!(cached_capability(Some(&invalid.to_string()), "identity", protocol).is_none());
+    }
 
     #[test]
     fn optional_finish_metadata_does_not_reject_valid_gateway_output() {

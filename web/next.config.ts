@@ -14,6 +14,7 @@ const nextConfig: NextConfig = {
   distDir: process.env.ASTRA_NEXT_DIST_DIR ?? '.next',
   outputFileTracingRoot: path.join(process.cwd(), '..'),
   reactStrictMode: true,
+  logging: { incomingRequests: { ignore: [/^\/auth\/callback(?:[?\s]|$)/] } },
 };
 
 export default nextConfig;

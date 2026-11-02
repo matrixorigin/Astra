@@ -265,7 +265,10 @@ fn durable_execution_fields_are_live(
     owner_lease_fields_are_live(owner_pod_id, owner_lease_expires_at)
 }
 
-fn owner_lease_fields_are_live(owner_pod_id: Option<&str>, expires_at: Option<&str>) -> bool {
+pub(super) fn owner_lease_fields_are_live(
+    owner_pod_id: Option<&str>,
+    expires_at: Option<&str>,
+) -> bool {
     if owner_pod_id.is_none_or(|owner| owner.trim().is_empty()) {
         return false;
     }

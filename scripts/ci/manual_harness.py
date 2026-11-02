@@ -222,6 +222,8 @@ def safe_diagnostic(value, depth):
               "judge": {"threshold", "assessment", "failure"}, "unavailable": set(), "composite": {"checks"},
               "child_adoption": {"status", "reason"}}
     fields["cache_scope"] = {"scope", "observations", "post_cold_cache_read_tokens", "executions", "executions_omitted"}
+    if kind == "child_adoption" and "mutation" in value:
+        fields[kind] = fields[kind] | {"mutation"}
     if kind not in fields or set(value) != {"kind"} | fields[kind]:
         raise ValueError("unexpected diagnostic payload")
     if kind == "cache_scope":
@@ -279,6 +281,16 @@ def safe_diagnostic(value, depth):
         elif (not isinstance(reason, str) or status not in allowed
               or reason not in allowed[status]):
             raise ValueError("invalid child proof diagnostic")
+        if "mutation" in value:
+            mutation = value["mutation"]
+            intents = {"unknown", "read_only", "may_mutate", "must_mutate"}
+            personas = {"omitted", "explore", "code_review", "task", "general_purpose", "custom", "unavailable"}
+            if (status != "contradicted" or reason != "mutation_mismatch"
+                or not isinstance(mutation, dict) or set(mutation) != {"expected", "actual", "requested_persona"}
+                or not isinstance(mutation["expected"], str) or mutation["expected"] not in intents
+                or (mutation["actual"] is not None and (not isinstance(mutation["actual"], str) or mutation["actual"] not in intents))
+                or not isinstance(mutation["requested_persona"], str) or mutation["requested_persona"] not in personas):
+                raise ValueError("invalid mutation observation")
     elif kind == "judge":
         if value["assessment"] not in ("graded", "accepted", "rejected", "unavailable", "unreported"):
             raise ValueError("invalid judge assessment")
@@ -499,6 +511,8 @@ def check_lines(items, prefix):
             reason = "Canonical execution evidence unavailable or incomplete; cannot verify this contract"
         elif kind == "child_adoption":
             reason = f"Child adoption verification {diagnostic['status']}: {diagnostic['reason']}"
+            if "mutation" in diagnostic:
+                reason += "; mutation observations (not causal attribution)=" + json.dumps(diagnostic["mutation"], sort_keys=True)
         elif kind == "proof":
             reason = f"Canonical child identity/result adoption proven={diagnostic['proven']}"
         elif kind == "composite":

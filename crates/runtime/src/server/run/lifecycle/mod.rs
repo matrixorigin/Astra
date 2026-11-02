@@ -7468,6 +7468,32 @@ impl AgenticRunLifecycleService {
         durable_run_owner_lease_is_live(durable)
     }
 
+    async fn resume_execution_is_live(&self, durable: &DurableRunRecord) -> bool {
+        if self.run_engine.owner_lease_duration().is_none() {
+            return self.run_execution_is_live(durable).await;
+        }
+        if durable.owner_pod_id.as_deref() != self.run_engine.execution_owner_pod_id() {
+            return durable_run_owner_lease_is_live(durable);
+        }
+        let runs = self.runs.read().await;
+        match runs
+            .get(&durable.run_id)
+            .filter(|run| run.user_id == durable.user_id && run.session_id == durable.session_id)
+        {
+            Some(run) => {
+                run.execution_live
+                    && self.run_engine.local_execution_is_current(
+                        &durable.user_id,
+                        &durable.session_id,
+                        &durable.run_id,
+                        durable.run_generation,
+                        &run.llm_cancel_token,
+                    )
+            }
+            None => durable_run_owner_lease_is_live(durable),
+        }
+    }
+
     async fn reconcile_orphaned_execution_for_session_continuation(
         &self,
         durable: &DurableRunRecord,
@@ -17433,7 +17459,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             return Err(Self::run_state_conflict("resume", &durable.status));
         };
 
-        if !self.run_execution_is_live(&durable).await {
+        if !self.resume_execution_is_live(&durable).await {
             if self.resume_execution_handoff(&durable).await? {
                 return Ok(RunMutationRecord::applied(
                     run_id,
@@ -17441,6 +17467,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     durable.status,
                 ));
             }
+            if self.run_engine.owner_lease_duration().is_some()
+                && run_state::owner_lease_fields_are_live(
+                    durable.owner_pod_id.as_deref(),
+                    durable.owner_lease_expires_at.as_deref(),
+                )
+            {
+                return Err(Self::run_state_conflict("resume", &durable.status));
+            }
+            if self
+                .run_engine
+                .load_run_control(&user_id, &run_id)
+                .await
+                .map_err(|error| Self::durable_persist_error("resume authority", error))?
+                .is_some_and(|control| control.cancellation_requested)
+            {
+                return Err(Self::run_state_conflict("resume", &durable.status));
+            }
+
             self.reconcile_orphaned_execution_for_session_continuation(&durable, "resume")
                 .await?;
             if self
@@ -17484,6 +17528,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         }
 
+        let resumed_local_token = self
+            .runs
+            .read()
+            .await
+            .get(&run_id)
+            .filter(|run| run.user_id == user_id && run.session_id == durable.session_id)
+            .map(|run| run.llm_cancel_token.clone());
         let resume_event = json!({"event_type": "run_resumed", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
         let transition = self
@@ -17521,7 +17572,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         {
             let mut runs = self.runs.write().await;
-            if let Some(run) = runs.get_mut(&run_id) {
+            if (self.run_engine.owner_lease_duration().is_none()
+                || durable.owner_pod_id.as_deref() == self.run_engine.execution_owner_pod_id())
+                && let Some(run) = runs.get_mut(&run_id)
+                && resumed_local_token
+                    .as_ref()
+                    .is_some_and(|token| Arc::ptr_eq(token, &run.llm_cancel_token))
+            {
                 run.pause_flag.store(false, Ordering::SeqCst);
                 run.status = running_status;
                 run.waiting_for = None;
@@ -18147,6 +18204,9 @@ pub(crate) fn safe_model_offering_error(
         astra_services::ModelOfferingResolutionError::Backend(_) => {
             "The authorized model catalog is temporarily unavailable."
         }
+        astra_services::ModelOfferingResolutionError::CredentialUnavailable { .. } => {
+            "Reconnect or inspect the selected model connection."
+        }
     }
 }
 
@@ -18165,6 +18225,9 @@ pub(crate) fn safe_model_offering_error_with_code(
             "model_offering_unavailable"
         }
         astra_services::ModelOfferingResolutionError::Backend(_) => "model_catalog_unavailable",
+        astra_services::ModelOfferingResolutionError::CredentialUnavailable { .. } => {
+            "model_connection_reauthentication_required"
+        }
     };
     format!("[{code}] {}", safe_model_offering_error(error))
 }
@@ -19928,6 +19991,9 @@ fn native_stage_reasoning_arguments(
         } => "high",
         ThinkingConfig::Adaptive {
             effort: ThinkingEffort::Max,
+        } => "xhigh",
+        ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::XHigh,
         } => "xhigh",
         ThinkingConfig::On {} | ThinkingConfig::Enabled { .. } => {
             return Err("selected native stage does not support this reasoning control".into());

@@ -3628,6 +3628,7 @@ impl ToolLedgerReceiptAccumulator {
 }
 
 pub struct AgenticLoopState {
+    pub(crate) pending_provider_continuation: Option<Value>,
     /// Selected once for this execution; model changes resolve against this input.
     pub admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
     /// Fixed for this execution, including cooperative owner handoff.
@@ -4031,6 +4032,7 @@ impl AgenticLoopState {
             ),
         );
         Self {
+            pending_provider_continuation: None,
             admitted_tool_policy,
             evaluation_thresholds,
             messages: Vec::new(),

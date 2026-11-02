@@ -92,6 +92,7 @@ pub async fn create_user_model_handler(
         .create_user_model(
             user.user_id,
             UserModelCreateRequestData {
+                connection_id: request.connection_id,
                 name: request.name,
                 provider: request.provider,
                 model: request.model,
@@ -319,9 +320,24 @@ async fn effective_model_catalog(
         .await?;
         catalog.items.retain(|item| !active_only || item.is_active);
         catalog.items = model_catalog_for_purpose(catalog.items, query.purpose);
-        let declared = astra_services::models::server_model_access_declarations(
+        // The seek cursor contract orders lexicographically by (provider,
+        // name, offering_id); paginating the service's natural list order
+        // would silently drop every Offering that sorts before the cursor.
+        catalog.items.sort_by(|left, right| {
+            (
+                left.provider.as_str(),
+                left.name.as_str(),
+                left.offering_id.as_str(),
+            )
+                .cmp(&(
+                    right.provider.as_str(),
+                    right.name.as_str(),
+                    right.offering_id.as_str(),
+                ))
+        });
+        let declared = astra_services::models::server_model_access_declarations_for_models(
             catalog.allows_deployment,
-            catalog.items.iter().map(|item| item.access_kind),
+            &catalog.items,
         );
         let catalog_revision = model_catalog_revision(&catalog.items);
         let default_catalog = catalog
@@ -677,6 +693,7 @@ mod tests {
 
     fn edge_item(id: &str, name: &str) -> ModelListItem {
         ModelListItem {
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             offering_id: id.to_string(),
             access_id: "this-device".to_string(),

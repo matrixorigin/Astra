@@ -917,6 +917,13 @@ is retained and classified as verification unavailable. Each snapshot's two
 Server reads are not transactional and do not enter model usage; unrelated
 cases and normal conversations do not pay this observation cost.
 
+A child mutation-intent mismatch includes closed diagnostic observations:
+expected/actual intent and the requested persona category from a uniquely joined,
+owner-validated spawn receipt. Conflicting or missing evidence is reported as
+unavailable rather than guessed; custom profile names and raw arguments are never
+published. These observations do not prove the effective persona, actual file
+writes, or later child-result custody checks; the original failure verdict stands.
+
 `execution_tool_count` and `execution_tool_sequence` use the existing authorized
 session trace, scoped to the current invocation's Run IDs and start time. They
 reconcile complete `llm_round` tool records with the canonical run tree;

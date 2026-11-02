@@ -867,7 +867,7 @@ pub(crate) async fn complete_session_startup(
         eprintln!(
             "  {}  {}",
             theme::icon_warn(),
-            "No LLM model configured on server. Run: astra admin model add".yellow()
+            "No usable model is configured. Use /model to add your API key or connect ChatGPT; sign in with /login or /register first if needed.".yellow()
         );
         eprintln!();
     }

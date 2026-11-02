@@ -405,7 +405,10 @@ fn finish_direct_child_barrier_incomplete(state: &mut AgenticLoopState, reason: 
     state.hooks.completion_settlement.latest_provider_text = None;
     state.hooks.completion_settlement.deferred_candidate_text = None;
     state.final_text_model_item_id = None;
-    state.final_text = "Outstanding agent work or an unanswered agent question prevented this run from completing. Progress is preserved, but the request is incomplete.".into();
+    // Lifecycle failure copy belongs to the typed interruption, never to
+    // assistant output. In particular, keep an existing provider failure as
+    // the authoritative cause when its child work is still outstanding.
+    state.final_text.clear();
     state.final_text_streamed = false;
     if state.interruption.is_none() {
         state.interruption = Some(InterruptionRecord::new(
@@ -3291,7 +3294,12 @@ pub(crate) fn fanout_nonterminal_receipt_superseded(
     })
 }
 
-fn should_retry_textless_response(state: &AgenticLoopState, turn_result: &HostTurnResult) -> bool {
+/// A completed provider turn delivered no text and selected no tool. That is
+/// not a deliverable answer even when the transport reported success.
+fn provider_turn_without_actionable_output(
+    state: &AgenticLoopState,
+    turn_result: &HostTurnResult,
+) -> bool {
     turn_result.accum.tool_calls.is_empty()
         && turn_result.accum.full_text.trim().is_empty()
         && state.final_text.trim().is_empty()
@@ -3301,10 +3309,39 @@ fn should_retry_textless_response(state: &AgenticLoopState, turn_result: &HostTu
             .deferred_candidate_text
             .as_deref()
             .is_none_or(|text| text.trim().is_empty())
+}
+
+fn should_retry_textless_response(state: &AgenticLoopState, turn_result: &HostTurnResult) -> bool {
+    provider_turn_without_actionable_output(state, turn_result)
         && state.interruption.is_none()
         && state.remaining_turns > 0
         && state.hooks.completion_settlement.textless_response_retries
             < MAX_TEXTLESS_RESPONSE_RETRIES
+}
+
+/// A repeated textless completion is the exhausted side of the same bound the
+/// recovery request consumed. Record the typed interruption here so the
+/// provider cause and its intervention guidance reach run finalization
+/// instead of a generic settlement notice invented later.
+fn record_exhausted_textless_completion(state: &mut AgenticLoopState) -> bool {
+    if state.interruption.is_some()
+        || state.hooks.completion_settlement.textless_response_retries
+            < MAX_TEXTLESS_RESPONSE_RETRIES
+    {
+        return false;
+    }
+    state.interruption = Some(InterruptionRecord::new(
+        InterruptionKind::EmptyCompletion,
+        exhausted_provider_recovery_action(state),
+        interruption_state_summary(
+            state,
+            Some(
+                "provider ended without user-visible text after the bounded textless recovery"
+                    .into(),
+            ),
+        ),
+    ));
+    true
 }
 
 fn begin_textless_response_retry(state: &mut AgenticLoopState) {
@@ -5314,6 +5351,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
     };
     let ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
+    // Ingest already materializes successful text-only replies. Attach protocol
+    // state before the canonical transcript owner records those new messages.
+    if state.final_text_model_item_id.is_some()
+        && state.final_text_model_item_id == state.current_model_item_id
+        && let Some(continuation) = state.pending_provider_continuation.as_ref()
+    {
+        for message in &mut state.messages[transcript_append_start..] {
+            if astra_turn_types::model_item_id(message) == state.final_text_model_item_id.as_deref()
+            {
+                message[astra_core::model_wire::responses::CONTINUATION_KEY] = continuation.clone();
+            }
+        }
+    }
     // Apply weak/partial quarantine on the same boundary as newly ingested
     // records, and checkpoint the first transition immediately.
     if let Some(records) = state.stall.tool_call_records.get(tool_record_floor..) {
@@ -6086,6 +6136,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state,
                 terminal_completion_disposition,
             );
+
+            // The bounded textless recovery is the only automatic response to
+            // a provider turn that delivered neither text nor a tool. Once it
+            // has been spent, settle through the same typed interruption path
+            // as an exhausted provider recovery.
+            if provider_turn_without_actionable_output(state, &turn_result) {
+                record_exhausted_textless_completion(state);
+            }
 
             // A completion guard may discover the exhausted side of its
             // bounded recovery window while this response is being settled
@@ -8298,7 +8356,62 @@ mod tests {
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
     #[tokio::test]
-    async fn semantic_child_message_wakes_parent_without_completing_child() {
+    async fn child_finalization_keeps_interruption_out_of_assistant_output() {
+        for original_kind in [None, Some(InterruptionKind::EmptyCompletion)] {
+            let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                "parent-run",
+                "child-agent",
+            );
+            owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+                applied_user_intents: Vec::new(),
+                agent_id: "child-agent".into(),
+                run_id: "child-run".into(),
+                parent_agent_id: "parent-agent".into(),
+                status: crate::orchestration::AgentStatus::Running {
+                    activity: "working".into(),
+                },
+            });
+            let mut host = MockHost::new(vec![]);
+            host.direct_child_owner = Some(Arc::clone(&owner));
+            let mut state = make_state();
+            state.current_run_id = Some("parent-run".into());
+            state.final_text = "tentative answer without child evidence".into();
+            if let Some(kind) = original_kind {
+                state.interruption = Some(InterruptionRecord::new(
+                    kind,
+                    exhausted_provider_recovery_action(&state),
+                    interruption_state_summary(
+                        &state,
+                        Some("provider returned no usable output".into()),
+                    ),
+                ));
+            }
+            let original = state.interruption.clone();
+            super::super::finalization::finalize_and_render(&mut host, &mut state).await;
+            assert!(
+                state.final_text.is_empty(),
+                "runtime notices are not assistant answers"
+            );
+            let interruption = state.interruption.as_ref().unwrap();
+            assert_eq!(
+                interruption.kind,
+                original_kind.unwrap_or(InterruptionKind::ExecutionIncomplete)
+            );
+            if let Some(original) = original {
+                assert_eq!(interruption, &original);
+            }
+            assert!(owner.has_pending_direct_children());
+            assert!(
+                !state
+                    .messages
+                    .iter()
+                    .any(|message| message["role"] == "assistant")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_child_message_can_yield_empty_response_until_child_completes() {
         use astra_messaging::in_process::InProcessTransport;
         use astra_messaging::router::AgentMailboxRouter;
         use astra_messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget};
@@ -8327,7 +8440,7 @@ mod tests {
         let wait_started = Arc::new(tokio::sync::Notify::new());
         let mut host = MockHost::new(vec![
             text_result("provisional", 10, 2, Some(10)),
-            text_result("still working", 10, 2, Some(10)),
+            text_result("", 10, 0, Some(10)),
             text_result("synthesized", 10, 2, Some(10)),
         ]);
         host.direct_child_owner = Some(Arc::clone(&owner));

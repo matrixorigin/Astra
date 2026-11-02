@@ -2013,6 +2013,7 @@ mod tests {
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2100,6 +2101,7 @@ mod tests {
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2217,6 +2219,7 @@ mod tests {
             let original_event_count = step_recorder.events().len();
 
             let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+                provider_continuation: None,
                 turn_index: 0,
                 session_turn: 1,
                 quiet: true,
@@ -2321,6 +2324,7 @@ mod tests {
         )];
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2463,6 +2467,7 @@ mod tests {
         ];
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2593,6 +2598,7 @@ mod tests {
         let permission_context = PermissionSyncContext::shared_root(PermissionMode::Auto);
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2702,6 +2708,7 @@ mod tests {
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2841,6 +2848,7 @@ mod tests {
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2982,6 +2990,7 @@ mod tests {
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -3077,6 +3086,7 @@ mod tests {
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+            provider_continuation: None,
             turn_index: 0,
             session_turn: 1,
             quiet: true,

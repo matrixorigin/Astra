@@ -38,6 +38,108 @@ without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
+## Implemented ChatGPT subscription connection boundary
+
+The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
+backbone, invocation/provider-attempt ledger, tool execution, cancellation,
+canonical history and checkpoint paths as API-key models. `chatgpt` selects
+the shared Responses codec; it does not create another session state machine.
+The supported deployment and CLI/API contracts are documented in
+[configuration](../reference/configuration.md#chatgpt-subscription-connections),
+[CLI commands](../reference/cli-commands.md#chatgpt-subscription-models), and
+[API reference](../reference/api-reference.md#personal-subscription-connections).
+
+`user_llm_connections` owns one encrypted renewable credential per Astra owner,
+issued client registration and provider subject. Multiple personal model rows
+reference it. A row has exactly one source: API-key ciphertext or connection ID;
+admission rejects malformed combinations. `user_llm_authorizations` owns
+short-lived, owner-bound OAuth attempts, encrypted PKCE verifiers and keyed
+state/nonce digests. Starting an attempt locks the existing Astra account row
+and atomically checks and inserts against an eight-unexpired-pending limit
+shared across service instances; cancellation and expiry release capacity. ID tokens are verified and discarded; only renewable
+credentials are stored encrypted. Credentials never enter serializable routes, catalogs,
+checkpoints or public errors. The CLI relays only the browser callback and uses
+a loopback listener; Server never reads local CLI/Codex credentials.
+
+Valid-token cache hits run concurrently without cold-path admission. At most 64
+cold credential producers pin connection-local rejection and invalidation
+evidence through row reads and refresh settlement; other cold callers wait
+within their existing caller deadlines. Cache and guard storage remain bounded.
+Unpinned eviction cannot invalidate another connection or drop an active
+producer's evidence. A detached refresh retains its producer pin after waiter
+cancellation. Database generation fences remain authoritative across replicas.
+Refresh rotation shares one connection-owned
+task per generation and a database compare-and-set lease plus the rejected
+credential version. Cancelling an inference or its last waiter does not cancel
+the bounded rotation or its credential commit. Discovery/JWKS metadata is cached
+and prepared before taking the lease; the full rotation operation has a
+25-second budget within its 30-second lease: up to 20 seconds for the claim/exchange/persistence and five seconds reserved for fenced failure settlement. Interrupted SQL uses the shared cancellation-safe checkout or transaction owner. Pre-dispatch failures and rejected
+rate-limited refreshes release the lease and preserve credentials. A lost/expired refresh
+outcome requires reauthentication instead of reusing a potentially consumed
+refresh token. A delayed 401 for an older version reuses a committed winner. Connection generations fence reauthorization
+and disconnect against old execution bindings. Disconnect clears ciphertext,
+disables dependent models and cancels local requests; each connection-service instance batches active owner/connection keys in one
+monitor: up to 256 keys per query and four concurrent batches on a two-second
+cadence, with one two-second cycle deadline including queued work. Failed or
+missing observations cancel only the matching entry identities; idle monitors
+stop. Monitor identity reservation and normal handoff use the existing registry;
+task launch happens after unlocking, and destructor cleanup only fails closed.
+Model admission deduplicates connection IDs into one bounded lookup.
+Each request performs a
+fresh fence before accepting completion. The monitor stops with its last request.
+Interrupted delivered requests settle as delivery-unknown through the existing
+attempt owner. A disabled selected default cannot silently choose deployment
+credentials. OAuth identity is never Astra identity or login-session authority.
+
+Model creation, activation and default selection lock and revalidate the probed
+connection generation within their database transaction, before changing model
+rows. Disconnect and reauthorization lock the connection before its authorization
+attempts and dependent models. A stale successful probe cannot re-enable models after disconnect.
+Retry backoff uses the shared provider deadline/cancellation owner and consumes
+the original inference budget.
+Catalog reads and connectivity probes share version-aware 401 recovery. Failed
+and incomplete Responses retain provider identity and usage for settlement.
+Streaming protocols share the physical-attempt runner for sending, retries,
+deadlines, error-body reads and settlement. The Responses adapter owns wire
+decoding and its connection fences, including cancellation during a stream.
+
+Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
+before wire encoding, including direct auxiliary calls. Requests send full
+history with `store:false` and `stream:true`.
+Astra functions occupy the `astra` namespace. Completed provider output items,
+including encrypted reasoning and message phase, live in private canonical
+assistant-message metadata before tool execution/final checkpoint. Opaque
+provider-encrypted reasoning is base64 encoded for storage so generic text
+redaction cannot corrupt ciphertext. Function arguments come from the canonical
+assistant tool calls; private metadata retains no second raw argument copy. Resume
+replays them only for the same connection and model; other protocols remove
+that metadata at the existing internal-marker projection boundary. No
+`previous_response_id` thread store or parallel history projection exists.
+Subscription reasoning controls come from `supported_reasoning_levels` in the
+connection's upstream catalog, intersected with the Responses wire protocol's
+supported controls. Creation and explicit checks retain the declared
+effort inventory in the existing configuration-bound model capability snapshot;
+model discovery, exact admission and delegation consume that same inventory.
+Inference performs no catalog fetch. The shared `responses_reasoning` adapter
+emits `reasoning.effort`; Model default omits the field. Unsupported effort,
+binary suppression and token-budget requests fail before provider dispatch.
+
+Only completed responses authorize tool dispatch and replayable provider state.
+A typed `max_output_tokens` truncation retains partial text, response identity,
+usage and `length` even without output items. Empty-terminal text fallback
+merges completed parts and partial deltas by output/content index, retaining
+streamed tails without duplicating done text. Ambiguous unindexed mixed text
+fails with streamed deltas, response identity and usage retained rather than
+guessing ownership; done-only text is not recovered on that error path. It creates neither executable
+calls nor continuation metadata, including when individual function items look
+complete. The existing output-cap owner handles continuation or interruption;
+other incomplete reasons remain failures. Explicitly unfinished saved items
+cannot be replayed. Connectivity probes and summary acceptance reject truncated
+results even when their partial text is nonempty or structurally complete.
+When a completed subscription response has an empty output array, the shared
+codec uses its fully received `response.output_item.done` items. Text deltas
+alone cannot establish a replayable response or authorize tools.
+
 ## Ownership
 
 Opt-in Auto chat routing uses the existing authenticated Offering admission
@@ -149,10 +251,11 @@ the same purpose throughout a drain, as well as checking revision and total.
 #### Catalog response compatibility
 
 The executable support baseline is published CLI and Edge **0.2.12**. The two
-HTTP catalog endpoints retain that release's complete response field set,
-including `thinking_protocol` and `pricing`. A missing
-`x-astra-model-catalog-version` header and explicit `2` select the same format;
-current thin-client and TypeScript SDK requests send `2` on every page.
+HTTP catalog endpoints retain that release's complete response field set as
+the frozen format version 2, including `thinking_protocol` and `pricing`. A
+missing `x-astra-model-catalog-version` header and explicit `2` select the
+same frozen format; current thin-client and TypeScript SDK requests negotiate
+the current format `3` on every page.
 Unknown, repeated, or malformed versions (including `1`) return
 `400 model_catalog_version_unsupported`. The response identifies its format
 in the same header and is not cached.
@@ -187,7 +290,18 @@ is not permission to extend v2 responses: the published 0.2.12 decoder is
 strict, and an independent frozen fixture protects its complete response
 shape. New response fields, type changes, or enum/state values require a new
 explicitly negotiated format while unversioned responses retain the 0.2.12
-contract. Future clients may continue requesting v2 when its semantics suffice;
+contract. Format version 3 is the current production projection: it adds
+`supported_reasoning_efforts` and newer `thinking_protocol` values such as
+`responses_reasoning`. Version 2 remains frozen. An Offering whose thinking
+protocol the frozen 0.2.12 enum cannot name stays listed in v2 — Model
+Access and selection keep working — but its thinking controls are
+conservatively hidden: `thinking_protocol` and `thinking_capability` are
+`null` (unknown/unexpressed), never disguised as a differently meaning
+published protocol, and `supported_reasoning_efforts` is absent. For v2
+clients such an Offering therefore runs only the provider default thinking
+mode; the complete thinking options require explicitly negotiated v3. Every
+other model's existing v2 metadata is unchanged. Future clients may continue
+requesting v2 when its semantics suffice;
 requesting a newer format from an older Server is an explicit compatibility
 failure. A generic HTTP 400 must not trigger automatic downgrade. Any future
 negotiation strategy must recognize the version-specific machine code and

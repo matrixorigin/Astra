@@ -57,11 +57,16 @@ pub const WORK_API_MAJOR: &str = "1";
 pub const AGENT_INTERACTION_API_MAJOR_HEADER: &str = "x-astra-agent-interaction-api-major";
 pub const AGENT_INTERACTION_API_MAJOR: &str = "3";
 
-/// Read-only model catalog response format. Unversioned clients retain the
-/// published 0.2.12 field set, including protocol-aware controls and pricing.
-/// This is not an execution or authorization capability.
+/// Read-only model catalog response format. Unversioned clients and explicit
+/// `2` retain the published 0.2.12 field set, including protocol-aware
+/// controls and pricing; `3` is the current production projection. This is
+/// not an execution or authorization capability.
 pub const MODEL_CATALOG_VERSION_HEADER: &str = "x-astra-model-catalog-version";
-pub const MODEL_CATALOG_VERSION: &str = "2";
+/// Frozen published 0.2.12 catalog format, also served to unversioned
+/// requests.
+pub const MODEL_CATALOG_VERSION_V2: &str = "2";
+/// Current catalog response format requested by supported clients.
+pub const MODEL_CATALOG_VERSION: &str = "3";
 
 /// Versioned, server-issued lifecycle update for the compact live Work board.
 ///

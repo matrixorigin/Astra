@@ -772,25 +772,26 @@ pub async fn bind_server_workspace(
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
     root: &std::path::Path,
 ) {
+    let owner = state
+        .owner_user_id
+        .clone()
+        .unwrap_or_else(|| "provider-fixture-user".into());
     let session = state.current_session_id.clone().expect("fixture session");
     let run = state.current_run_id.clone().expect("fixture run");
     let engine = crate::server::run::engine::RunEngine::new(Arc::new(
         astra_services::runs::InMemoryRunStateStore::new(),
     ));
     let authority = engine
-        .start_run(&run, "provider-fixture-user", &session)
+        .start_run(&run, &owner, &session)
         .await
         .expect("admit fixture run");
     state.current_run_owner_generation = Some(authority.owner_generation);
-    state.owner_user_id = Some("provider-fixture-user".into());
+    state.owner_user_id = Some(owner.clone());
     state.permission_context = Some(crate::orchestration::PermissionSyncContext::shared_root(
         crate::orchestration::PermissionMode::Auto,
     ));
-    state.step_recorder = astra_pipeline::step_recorder::StepRecorder::new(
-        "provider-fixture-user",
-        &session,
-        "provider-fixture-task",
-    );
+    state.step_recorder =
+        astra_pipeline::step_recorder::StepRecorder::new(&owner, &session, "provider-fixture-task");
     let ledger =
         crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
             engine,
@@ -798,7 +799,7 @@ pub async fn bind_server_workspace(
         .expect("process-local tool ledger");
     let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
         root.into(),
-        "provider-fixture-user".into(),
+        owner,
         session,
         None,
         None,

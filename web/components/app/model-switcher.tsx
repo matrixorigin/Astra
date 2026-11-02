@@ -1,7 +1,8 @@
 'use client';
 
 import { Check, ChevronDown, Circle } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { PersonalModels } from '@/components/app/personal-models';
 import { Popover } from '@/components/ui/popover';
 import { listModels, type ModelCatalogResponse } from '@/lib/api/models';
 import type { ModelSummary } from '@/lib/api/types';
@@ -92,16 +93,21 @@ export function ModelSwitcher({
   thinking: boolean;
   onThinkingChange: (value: boolean) => void;
 }) {
+  const currentValue = useRef(value);
+  currentValue.current = value;
+  const catalogRead = useRef(0);
+  const [manage, setManage] = useState(false);
   const [catalogState, setCatalogState] = useState<CatalogLoadState>({
     kind: 'loading',
   });
 
   const loadCatalog = useCallback(() => {
+    const version = ++catalogRead.current;
     setCatalogState({ kind: 'loading' });
     listModels()
-      .then((catalog) => setCatalogState({ kind: 'loaded', catalog }))
+      .then((catalog) => { if (version === catalogRead.current) setCatalogState({ kind: 'loaded', catalog }); })
       .catch(() => {
-        setCatalogState({ kind: 'error' });
+        if (version === catalogRead.current) setCatalogState({ kind: 'error' });
       });
   }, []);
 
@@ -219,6 +225,16 @@ export function ModelSwitcher({
           })}
         </div>
 
+        {(manage || (catalog && !catalog.accesses.some((access) => access.kind === 'astra_cloud'))) ? <>
+          <button type="button" className="px-3 py-2 text-left text-sm" onClick={() => { if (manage) loadCatalog(); setManage(!manage); }}>Add or manage my models</button>
+          {manage ? <PersonalModels onChanged={(id, refreshed) => {
+            if (refreshed === null) { loadCatalog(); return; }
+            ++catalogRead.current;
+            if (!refreshed) { setCatalogState({ kind: 'loading' }); return; }
+            setCatalogState({ kind: 'loaded', catalog: refreshed });
+            if (!refreshed.items.some((model) => model.id === currentValue.current) && id && refreshed.items.some((model) => model.id === id)) onChange(id);
+          }} /> : null}
+        </> : null}
         <div className="border-t border-border" />
         <button
           type="button"

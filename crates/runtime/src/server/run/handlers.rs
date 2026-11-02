@@ -1518,16 +1518,30 @@ mod tests {
                         std::time::Duration::from_secs(1),
                     )
                     .await;
-                    let expected_kind = error_kind
-                        .or_else(|| error_code.and_then(astra_core::ErrorKind::parse_tag))
-                        .unwrap_or(astra_core::ErrorKind::ContractViolation);
-                    let preserve = expected_kind != astra_core::ErrorKind::ContractViolation;
+                    // A terminal-only legacy failure has no classification and
+                    // reports Unknown without granting authoritative closure.
+                    // An unclassified run_error remains a protocol violation;
+                    // it must not acquire authority from a later terminal.
+                    let classified_kind = error_kind
+                        .or_else(|| error_code.and_then(astra_core::ErrorKind::parse_tag));
+                    let expected_kind = classified_kind.unwrap_or(if terminal_only {
+                        astra_core::ErrorKind::Unknown
+                    } else {
+                        astra_core::ErrorKind::ContractViolation
+                    });
+                    let preserve = classified_kind
+                        .is_some_and(|kind| kind != astra_core::ErrorKind::ContractViolation);
                     let expected_text = if preserve {
                         "  observed partial bytes\n"
                     } else {
                         ""
                     };
-                    assert_eq!(abort, Some(expected_kind));
+                    assert_eq!(
+                        abort,
+                        Some(expected_kind),
+                        "code={error_code:?}, kind={error_kind:?}, terminal_only={terminal_only}, error={:?}",
+                        result.accum.error_message
+                    );
                     assert_eq!(result.accum.has_authoritative_failed_terminal(), preserve);
                     assert_eq!(result.accum.full_text, expected_text);
                     if preserve {

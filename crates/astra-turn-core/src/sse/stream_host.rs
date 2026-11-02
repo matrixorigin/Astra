@@ -299,15 +299,16 @@ impl DurableTerminalProbe {
 }
 
 /// Convert a durable terminal authored by the root run into the exact local
-/// abort kind.  A legacy/malformed failed terminal without classification is a
-/// protocol failure, not evidence of provider overload.
+/// abort kind. A valid failed terminal can carry a domain interruption without
+/// an ErrorKind; preserve that missing classification rather than inventing a
+/// protocol violation or provider overload.
 fn durable_terminal_abort_kind(terminal: &DurableRunTerminal) -> Option<astra_core::ErrorKind> {
     match terminal.status {
         DurableRunTerminalStatus::Cancelled => Some(astra_core::ErrorKind::Cancelled),
         DurableRunTerminalStatus::Failed => Some(
             terminal
                 .error_kind
-                .unwrap_or(astra_core::ErrorKind::ContractViolation),
+                .unwrap_or(astra_core::ErrorKind::Unknown),
         ),
         DurableRunTerminalStatus::Completed
         | DurableRunTerminalStatus::Delegated
@@ -1309,17 +1310,18 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     // A validated root failure retains observed output. Local transport and
     // protocol failures still tombstone it; all aborts discard executable work.
     if abort.is_some() {
+        let root_terminal_matches_abort = accum
+            .run_terminal
+            .as_ref()
+            .and_then(durable_terminal_abort_kind)
+            == abort;
         let interrupted_terminal = abort_message.is_none()
-            && abort == Some(astra_core::ErrorKind::ContractViolation)
+            && root_terminal_matches_abort
             && accum.has_authoritative_interrupted_terminal();
         let preserve_failed_output = interrupted_terminal
             || (abort_message.is_none()
                 && accum.has_authoritative_failed_terminal()
-                && accum
-                    .run_terminal
-                    .as_ref()
-                    .and_then(|terminal| terminal.error_kind)
-                    == abort);
+                && root_terminal_matches_abort);
         accum.stream_complete = false;
         if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
             abort = accum.error_kind;
@@ -3048,10 +3050,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(abort, Some(astra_core::ErrorKind::ContractViolation));
+        assert_eq!(abort, Some(astra_core::ErrorKind::Unknown));
         assert_eq!(
             result.accum.error_kind,
-            Some(astra_core::ErrorKind::ContractViolation)
+            Some(astra_core::ErrorKind::Unknown)
         );
         assert_ne!(abort, Some(astra_core::ErrorKind::ServerError));
     }

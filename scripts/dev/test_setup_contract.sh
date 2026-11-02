@@ -15,7 +15,7 @@ trap 'rm -rf "$test_root"' EXIT
 # stack configuration. Individual precedence cases set their own overrides.
 for key in ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET \
     MEMORIA_MASTER_KEY MEMORIA_EMBEDDING_PROVIDER MEMORIA_EMBEDDING_API_KEY \
-    MEMORIA_EMBEDDING_BASE_URL; do
+    MEMORIA_EMBEDDING_BASE_URL ASTRA_UC_ISSUER ASTRA_CHATGPT_SUBSCRIPTION_ENABLED ASTRA_CHATGPT_HOST_ID; do
     unset "$key"
 done
 
@@ -77,6 +77,9 @@ chmod +x "$test_root/scripts/dev/init.sh"
 
 "$test_root/scripts/dev/init.sh" >/dev/null
 first_snapshot="$(snapshot_secrets "$test_root/.env")"
+[[ -z "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED)" ]]
+[[ -z "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)" ]]
+
 [[ "$(read_env_value "$test_root/.env" MEMORIA_SELF_HOSTED_MASTER_ACCESS)" == 1 ]]
 set_env_value "$test_root/.env" MEMORIA_SELF_HOSTED_MASTER_ACCESS 0
 init_output="$("$test_root/scripts/dev/init.sh")"
@@ -94,6 +97,10 @@ done <<< "$first_snapshot"
 
 "$test_root/scripts/dev/init.sh" >/dev/null
 second_snapshot="$(snapshot_secrets "$test_root/.env")"
+set_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED 0
+"$test_root/scripts/dev/init.sh" >/dev/null
+[[ "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED)" == 0 ]]
+
 if [[ "$first_snapshot" != "$second_snapshot" ]]; then
     echo "setup contract failed: init overwrote an existing secret" >&2
     exit 1
@@ -283,5 +290,12 @@ MEMORIA_EMBEDDING_BASE_URL=http://embeddings.internal/v1 \
 [[ "$(env_http_host_from_bind 192.0.2.10)" == "192.0.2.10" ]]
 [[ "$(env_http_host_from_bind ::)" == "[::1]" ]]
 [[ "$(env_http_host_from_bind 2001:db8::10)" == "[2001:db8::10]" ]]
+
+# ChatGPT derives its installation identity at Server construction. Setup must
+# not add an opt-in flag or rewrite explicit operator configuration.
+set_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID urn:uuid:00000000-0000-4000-8000-000000000001
+"$test_root/scripts/dev/init.sh" >/dev/null
+[[ "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_SUBSCRIPTION_ENABLED)" == 0 ]]
+[[ "$(read_env_value "$test_root/.env" ASTRA_CHATGPT_HOST_ID)" == urn:uuid:00000000-0000-4000-8000-000000000001 ]]
 
 echo "setup contracts: ok"
