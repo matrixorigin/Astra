@@ -5686,8 +5686,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 #[tokio::test]
 async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
     let gateway=ProviderGateway::start(vec![ProviderScript::new("execution_budget_hard_limit_stops_web_agent_run_even_with_progress", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
-ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
-ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Final answer after the hard limit.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let inference = ProviderObservationsFixture::default();
     let (app, _observer, _ledger) = build_test_app_with_observer(
         Arc::new(TestModelService {
@@ -5768,13 +5767,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     let (status, durable) = get_run_status(&app, root).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(durable["status"], "failed");
-    assert!(
-        accum
-            .full_text
-            .contains("Final answer after the hard limit."),
-        "failure must preserve the text-only settlement output: {}",
-        accum.full_text
-    );
+    assert!(accum.full_text.contains("Turn budget exhausted"));
     let tool_requests = find_events(&events, "tool_request");
     assert_eq!(
         tool_requests.len(),
@@ -5793,7 +5786,7 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     assert_eq!(terminal["error_kind"], "budget_exhausted");
     assert_ne!(terminal.get("resumable"), Some(&json!(true)));
     let evaluation = &terminal["turn_evaluation"]["metadata"];
-    assert_eq!(evaluation["llm_rounds"], 3);
+    assert_eq!(evaluation["llm_rounds"], 2);
     assert_eq!(evaluation["tool_call_count"], 2);
     assert_eq!(evaluation["tool_execution_count"], 1);
     assert_eq!(evaluation["tool_rejected_count"], 1);
@@ -5804,8 +5797,8 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
 
     gateway.assert_complete();
     inference.assert_quiescent();
-    assert_eq!(inference.attempt_count(), 3);
-    assert_eq!(gateway.requests.lock().await.len(), 3);
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]

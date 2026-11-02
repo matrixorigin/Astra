@@ -872,7 +872,7 @@ async fn assert_one_shot_sigint(
             async move {
                 assert_eq!(run, "sigint-run", "cancel only the observed exact run");
                 cancels.fetch_add(1, Ordering::SeqCst);
-                axum::Json(serde_json::json!({"execution_settled": settled}))
+                axum::Json(serde_json::json!({"run_id": run, "execution_settled": settled}))
             }
         }));
     use futures_util::StreamExt as _;
@@ -1182,7 +1182,7 @@ async fn one_shot_sigint_keeps_identity_failure_when_event_writer_also_fails() {
                         started.notify_one();
                         release.notified().await;
                     }
-                    axum::Json(serde_json::json!({"execution_settled": true}))
+                    axum::Json(serde_json::json!({"run_id": run, "execution_settled": true}))
                 }
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

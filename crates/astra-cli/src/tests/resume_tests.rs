@@ -467,7 +467,7 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
         }
         for round in 0..2 {
             let mut ui = TestUi::default();
-            let outcome = handle_chat_input_with_ui(
+            let outcome = Box::pin(handle_chat_input_with_ui(
                 ChatInput::Conversation("write then undo only this turn".into()),
                 Some("test-token"),
                 session_runtime::AccessMiss::NotLoggedIn,
@@ -480,7 +480,7 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
                     explain_analyze_terminal_degraded: None,
                 },
                 &mut ui,
-            )
+            ))
             .await
             .unwrap();
             assert!(

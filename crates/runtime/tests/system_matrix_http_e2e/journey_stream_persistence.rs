@@ -844,13 +844,16 @@ async fn assert_concurrent_fanout_stream(
     );
     assert!(
         results.iter().all(|result| {
-            let payload = result["result"].as_str().unwrap();
             if case.terminal == OnlineFanoutTerminal::Completed {
-                payload == case.child_provenance
+                result["result"].as_str() == Some(case.child_provenance.as_str())
             } else if case.terminal == OnlineFanoutTerminal::EmptyCompletion {
-                payload.contains("empty_completion")
+                result["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("empty_completion"))
             } else {
-                payload.contains("[invalid_request] LLM request rejected: 400")
+                result["error"].as_str().is_some_and(|error| {
+                    error.contains("[invalid_request] LLM request rejected: 400")
+                })
             }
         }),
         "{}: every fixed slot must retain its own payload provenance: {aggregate}",
@@ -3263,10 +3266,9 @@ native_child_script(child_model.clone(),"Run three reviews and preserve every fa
             .collect::<std::collections::HashSet<_>>()
     );
     assert!(
-        children.iter().all(|child| child["result"]
+        children.iter().all(|child| child["error"]
             .as_str()
-            .unwrap()
-            .contains("[invalid_request] LLM request rejected: 400")),
+            .is_some_and(|error| error.contains("[invalid_request] LLM request rejected: 400"))),
         "failure provenance was lost: {children:?}"
     );
 
