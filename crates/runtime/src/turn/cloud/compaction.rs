@@ -1188,6 +1188,19 @@ pub struct CompactResult {
     pub history_summary: Option<String>,
 }
 
+/// Only exact canonical history or its authority-frame-free projection may be
+/// summarized for a canonical rewrite.
+pub(crate) fn request_summary_source_matches(canonical: &[Value], source: &[Value]) -> bool {
+    source == canonical
+        || canonical
+            .iter()
+            .filter(|message| {
+                astra_turn_types::runtime_message_delivery(message)
+                    != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            })
+            .eq(source.iter())
+}
+
 /// Accept a successful request summary as the next canonical working set.
 /// The caller still owns the rewrite proof and durable commit. No cache or
 /// second transcript is needed: future pressure estimates use this history.
@@ -1195,21 +1208,42 @@ pub(crate) fn prepare_request_summary(
     canonical: &[Value],
     source: &[Value],
     result: &CompactResult,
-) -> Option<Vec<Value>> {
+) -> Result<Vec<Value>, &'static str> {
     use astra_turn_core::cloud::history_summary::{history_summary_message, history_summary_text};
 
-    result.boundary.as_ref()?;
+    result.boundary.as_ref().ok_or("no_boundary")?;
     let summary = astra_turn_core::cloud::compact_prompt::validated_structured_summary(
-        result.history_summary.as_deref()?,
-    )?;
+        result.history_summary.as_deref().ok_or("no_summary")?,
+    )
+    .ok_or("invalid_summary")?;
     let is_frame = |message: &&Value| {
         astra_turn_types::runtime_message_delivery(message)
             == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
     };
+    // The only admitted projection removes provider-specific authority frames.
+    // Do not recognize arbitrary views by matching excerpts or message text.
+    if !request_summary_source_matches(canonical, source) {
+        return Err("source_mismatch");
+    }
+    if result
+        .messages
+        .iter()
+        .filter(is_frame)
+        .any(|frame| !canonical.contains(frame))
+    {
+        return Err("changed_authority");
+    }
     let mut candidate = result.messages.clone();
-    // Each new summary consumed the previous summaries as evidence (#1024).
-    // Replace those generations instead of accumulating another summary lane.
-    candidate.retain(|message| history_summary_text(message).is_none());
+    candidate.retain(|message| history_summary_text(message).is_none() && !is_frame(&message));
+    if candidate
+        .iter()
+        .rfind(|m| astra_turn_types::is_human_user_message(m))
+        != canonical
+            .iter()
+            .rfind(|m| astra_turn_types::is_human_user_message(m))
+    {
+        return Err("human_anchor_changed");
+    }
     candidate.insert(
         0,
         history_summary_message(format!(
@@ -1220,43 +1254,27 @@ pub(crate) fn prepare_request_summary(
     if crate::prompts::estimate_tokens(&candidate, 0, 0)
         >= crate::prompts::estimate_tokens(source, 0, 0)
     {
-        return None;
+        return Err("no_request_reduction");
     }
-    if source != canonical {
-        // The shared pipeline delegates history optimization to Memoria. Its
-        // only history projection is removal of validated append-only frames
-        // when switching provider placement. Never promote any other view to
-        // canonical history, or guess message identity from content/role.
-        if !canonical.iter().filter(|m| !is_frame(m)).eq(source.iter()) {
-            return None;
-        }
-        if let Some(start) =
-            astra_turn_types::active_append_only_authority_protected_suffix_start(canonical)
-        {
-            let suffix = &canonical[start..];
-            let projected_len = suffix.iter().filter(|m| !is_frame(m)).count();
-            let retained_start = candidate.len().checked_sub(projected_len)?;
-            if !candidate[retained_start..]
-                .iter()
-                .eq(suffix.iter().filter(|m| !is_frame(m)))
-            {
-                return None;
-            }
-            candidate.truncate(retained_start);
-            candidate.extend_from_slice(suffix);
+    // Authority governs the current human request, not every completed tool
+    // round since that request. Carry exact active frames after the compacted
+    // history. Retire expired frames so removing their consuming assistant
+    // messages cannot accidentally reactivate them.
+    for (index, message) in canonical.iter().enumerate() {
+        if astra_turn_types::append_only_runtime_authority_is_active(canonical, index) {
+            astra_turn_types::parse_append_only_runtime_authority_frame(message)
+                .map_err(|_| "invalid_authority")?;
+            candidate.push(message.clone());
         }
     }
-    if let Some(start) =
-        astra_turn_types::active_append_only_authority_protected_suffix_start(canonical)
-        && !candidate.ends_with(&canonical[start..])
+    astra_turn_types::validate_canonical_tool_pairing(&candidate)
+        .map_err(|_| "invalid_tool_pairing")?;
+    if crate::prompts::estimate_tokens(&candidate, 0, 0)
+        >= crate::prompts::estimate_tokens(canonical, 0, 0)
     {
-        return None;
+        return Err("no_canonical_reduction");
     }
-    astra_turn_types::validate_canonical_tool_pairing(&candidate).ok()?;
-    (source == canonical
-        || crate::prompts::estimate_tokens(&candidate, 0, 0)
-            < crate::prompts::estimate_tokens(canonical, 0, 0))
-    .then_some(candidate)
+    Ok(candidate)
 }
 
 /// Test entrypoint for the same tier-aware budget pass used by Memoria.
@@ -1513,31 +1531,82 @@ mod tests {
 
         let mut stale_source = source.clone();
         stale_source[0]["content"] = json!("different task");
-        assert!(prepare_request_summary(&canonical, &stale_source, &result).is_none());
+        assert!(prepare_request_summary(&canonical, &stale_source, &result).is_err());
         let mut lost_anchor = result.clone();
         lost_anchor.messages.pop();
-        assert!(prepare_request_summary(&canonical, &source, &lost_anchor).is_none());
+        assert!(prepare_request_summary(&canonical, &source, &lost_anchor).is_err());
         let mut no_summary = result.clone();
         no_summary.history_summary = None;
-        assert!(prepare_request_summary(&canonical, &source, &no_summary).is_none());
+        assert!(prepare_request_summary(&canonical, &source, &no_summary).is_err());
         no_summary.history_summary = Some("summary truncated before the required sections".into());
-        assert!(prepare_request_summary(&canonical, &source, &no_summary).is_none());
+        assert!(prepare_request_summary(&canonical, &source, &no_summary).is_err());
         let mut no_op = result.clone();
         no_op.boundary = None;
-        assert!(prepare_request_summary(&canonical, &source, &no_op).is_none());
+        assert!(prepare_request_summary(&canonical, &source, &no_op).is_err());
         let mut no_savings = result.clone();
         no_savings.history_summary = Some(format!("{summary}{}", "summary overhead ".repeat(3000)));
-        assert!(prepare_request_summary(&canonical, &source, &no_savings).is_none());
+        assert!(prepare_request_summary(&canonical, &source, &no_savings).is_err());
         let mut orphan = result.clone();
         orphan.messages.insert(
             0,
             json!({"role":"tool","tool_call_id":"missing","content":"orphan"}),
         );
-        assert!(prepare_request_summary(&canonical, &source, &orphan).is_none());
+        assert!(prepare_request_summary(&canonical, &source, &orphan).is_err());
         let mut lost_control = result;
         lost_control.messages.push(authority);
         lost_control.messages.last_mut().unwrap()["content"] = json!("changed control");
-        assert!(prepare_request_summary(&canonical, &canonical, &lost_control).is_none());
+        assert!(prepare_request_summary(&canonical, &canonical, &lost_control).is_err());
+    }
+
+    #[test]
+    fn request_summary_acceptance_does_not_reactivate_consumed_authority() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        let frame = |kind, lifetime| {
+            required_append_only_runtime_authority_message("runtime instruction", kind, lifetime)
+                .unwrap()
+                .unwrap()
+        };
+        let active = frame(
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        );
+        let consumed = frame(
+            RuntimeAuthorityKind::OutputCapContinuation,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let human = json!({"role":"user", "content":"current request"});
+        let mut canonical = vec![
+            human.clone(),
+            active.clone(),
+            consumed.clone(),
+            json!({"role":"assistant", "content":"completed evidence ".repeat(4000)}),
+        ];
+        for index in 0..8 {
+            let id = format!("read-{index}");
+            canonical.push(json!({"role":"assistant", "content":null, "tool_calls":[{
+                "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+            }]}));
+            canonical.push(tool_with_id(&id, &"completed tool evidence ".repeat(1000)));
+        }
+        let mut source = canonical.clone();
+        crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut source).unwrap();
+        let mut result =
+            compact_tiered_impl(&source, 2000, 100, CompactionTier::AggressivePrune, 1);
+        assert!(result.boundary.is_some());
+        // An admissible semantic rewrite retains the real human request while
+        // replacing the assistant that consumed the one-decision instruction.
+        result.messages = vec![human.clone()];
+        result.history_summary = Some("### Primary Request\nContinue\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress".into());
+        let accepted = prepare_request_summary(&canonical, &source, &result).unwrap();
+        assert!(accepted.contains(&human));
+        assert!(!accepted.contains(&consumed));
+        assert_eq!(accepted.last(), Some(&active));
+        assert!(astra_turn_types::append_only_runtime_authority_is_active(
+            &accepted,
+            accepted.len() - 1
+        ));
     }
 
     fn tool(content: &str) -> Value {

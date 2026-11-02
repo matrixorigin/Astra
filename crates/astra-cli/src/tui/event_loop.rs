@@ -15121,6 +15121,7 @@ mod tests {
         root.depth = 0;
         crate::tui::server_agent_observer::ServerAgentProjection {
             sequence: 1,
+            fetch_started_at: Some(std::time::Instant::now()),
             truth_state: crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
             snapshot: Some(astra_thin_client::SessionRunTreeSnapshot {
                 schema_version: astra_server_types::SESSION_RUN_TREE_SCHEMA_VERSION,
@@ -15194,6 +15195,7 @@ mod tests {
                 if mismatch == "terminal" {
                     let mut completed = projection.clone();
                     completed.sequence += 1;
+                    completed.fetch_started_at = Some(std::time::Instant::now());
                     let node = completed
                         .snapshot
                         .as_mut()

@@ -38,6 +38,8 @@ impl Default for ServerAgentTruthState {
 #[derive(Debug, Clone)]
 pub(crate) struct ServerAgentProjection {
     pub sequence: u64,
+    /// Local start of the successful fetch; never a server wall clock.
+    pub fetch_started_at: Option<Instant>,
     pub truth_state: ServerAgentTruthState,
     pub snapshot: Option<SessionRunTreeSnapshot>,
 }
@@ -46,6 +48,7 @@ impl ServerAgentProjection {
     fn unbound() -> Self {
         Self {
             sequence: 0,
+            fetch_started_at: None,
             truth_state: ServerAgentTruthState::Unbound,
             snapshot: None,
         }
@@ -125,6 +128,7 @@ impl ServerAgentObserver {
                 ServerAgentTruthState::Loading
             };
             state.projection.snapshot = None;
+            state.projection.fetch_started_at = None;
         }
         self.abort_fetch();
     }
@@ -207,11 +211,16 @@ impl ServerAgentObserver {
             }
         };
         let inner = Arc::clone(&self.inner);
+        let fetch_started_at = Instant::now();
         let handle = runtime.spawn(async move {
             let result = match AssertUnwindSafe(fetch).catch_unwind().await {
                 Ok(result) => result,
                 Err(_) => Err(SnapshotFetchError::ObserverTaskPanicked),
             };
+            let result = result.map(|mut success| {
+                success.fetch_started_at = fetch_started_at;
+                success
+            });
             apply_fetch_result(&inner, binding_generation, &session_id, result);
         });
         let mut current = match self.fetch_task.lock() {
@@ -305,6 +314,7 @@ impl SnapshotFetchError {
 }
 
 struct SnapshotFetchSuccess {
+    fetch_started_at: Instant,
     snapshot: SessionRunTreeSnapshot,
     access_token: String,
 }
@@ -315,6 +325,7 @@ async fn fetch_snapshot(
     session_id: &str,
     access_token: Option<String>,
 ) -> Result<SnapshotFetchSuccess, SnapshotFetchError> {
+    let fetch_started_at = Instant::now();
     let token = match access_token {
         Some(token) => token,
         None => crate::cli::session::session_runtime::fresh_access_token(api, profile)
@@ -329,6 +340,7 @@ async fn fetch_snapshot(
     .map_err(|_| SnapshotFetchError::Timeout)?
     .map_err(SnapshotFetchError::Transport)?;
     Ok(SnapshotFetchSuccess {
+        fetch_started_at,
         snapshot: validate_snapshot(snapshot, session_id)?,
         access_token: token,
     })
@@ -366,20 +378,14 @@ fn apply_fetch_result(
     match result {
         Ok(success) => {
             let snapshot = success.snapshot;
-            let changed = state.projection.truth_state != ServerAgentTruthState::Confirmed
-                || state
-                    .projection
-                    .snapshot
-                    .as_ref()
-                    .map(|current| current.snapshot_revision.as_str())
-                    != Some(snapshot.snapshot_revision.as_str());
             state.consecutive_failures = 0;
             state.access_token = Some(success.access_token);
             state.projection.truth_state = ServerAgentTruthState::Confirmed;
             state.projection.snapshot = Some(snapshot);
-            if changed {
-                state.projection.sequence = state.projection.sequence.wrapping_add(1);
-            }
+            // A same-revision reread can now cover live observations made
+            // after the preceding fetch began. Deliver that new boundary too.
+            state.projection.fetch_started_at = Some(success.fetch_started_at);
+            state.projection.sequence = state.projection.sequence.wrapping_add(1);
         }
         Err(error) => {
             if error.invalidates_access_token() {
@@ -503,6 +509,81 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn delayed_observer_response_preserves_new_live_then_same_revision_reconciles_it() {
+        use crate::tui::chat_widget::{AppEvent, ChatWidget, WireEvent};
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        let observer = observer("session-1");
+        let mut widget = ChatWidget::new("");
+        let mut page = snapshot("session-1", "unchanged");
+        page.runs.clear();
+        let first = page.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        observer.spawn_fetch(0, "session-1".into(), async move {
+            released.await.unwrap();
+            Ok(SnapshotFetchSuccess {
+                fetch_started_at: Instant::now(),
+                snapshot: first,
+                access_token: "token".into(),
+            })
+        });
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "live-run".into(),
+            agent_id: "live-agent".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: None,
+                text: "working".into(),
+            },
+        })));
+        release.send(()).unwrap();
+        let task = observer.fetch_task.lock().unwrap().take().unwrap();
+        task.await.unwrap();
+        let older = observer.projection();
+        widget.reconcile_server_agent_projection(&older);
+        assert!(
+            widget.agent_monitor_snapshot(0).rows[0]
+                .state
+                .is_actionable_active()
+        );
+        observer.spawn_fetch(0, "session-1".into(), async move {
+            Ok(SnapshotFetchSuccess {
+                fetch_started_at: Instant::now(),
+                snapshot: page,
+                access_token: "token".into(),
+            })
+        });
+        let task = observer.fetch_task.lock().unwrap().take().unwrap();
+        task.await.unwrap();
+        let newer = observer.projection();
+        assert!(newer.sequence > older.sequence);
+        widget.reconcile_server_agent_projection(&newer);
+        let rows = widget.agent_monitor_snapshot(0);
+        assert!(!rows.rows[0].state.is_actionable_active());
+        assert!(!rows.rows[0].state.status.is_terminal());
+    }
+
+    #[test]
+    fn unchanged_snapshot_revision_delivers_each_successful_fetch_boundary() {
+        let observer = observer("session-1");
+        for _ in 0..2 {
+            let before = observer.projection();
+            let started = Instant::now();
+            apply_fetch_result(
+                &observer.inner,
+                0,
+                "session-1",
+                Ok(SnapshotFetchSuccess {
+                    fetch_started_at: started,
+                    snapshot: snapshot("session-1", "same-revision"),
+                    access_token: "token".into(),
+                }),
+            );
+            let after = observer.projection();
+            assert!(after.sequence > before.sequence);
+            assert_eq!(after.fetch_started_at, Some(started));
+        }
+    }
+
     #[test]
     fn failure_degrades_confirmed_snapshot_without_erasing_it() {
         let observer = observer("session-1");
@@ -511,6 +592,7 @@ mod tests {
             0,
             "session-1",
             Ok(SnapshotFetchSuccess {
+                fetch_started_at: Instant::now(),
                 snapshot: snapshot("session-1", "revision-1"),
                 access_token: "token".into(),
             }),
@@ -600,6 +682,7 @@ mod tests {
             0,
             "session-a",
             Ok(SnapshotFetchSuccess {
+                fetch_started_at: Instant::now(),
                 snapshot: snapshot("session-a", "late-a"),
                 access_token: "token".into(),
             }),
@@ -636,6 +719,7 @@ mod tests {
             0,
             "session-1",
             Ok(SnapshotFetchSuccess {
+                fetch_started_at: Instant::now(),
                 snapshot: snapshot("session-1", "revision-1"),
                 access_token: "cached-token".into(),
             }),

@@ -333,6 +333,9 @@ impl AgentRunProjection {
             && let Some(pending) = self.pending_control
         {
             if state.status == pending.from.status {
+                if state.source == AgentProjectionSource::LiveStream {
+                    self.state_observed_at = std::time::Instant::now();
+                }
                 // A poll that still reports the pre-request state is older
                 // than the pending local control operation. Keep the overlay
                 // until an authoritative transition or rejection arrives.
@@ -340,6 +343,11 @@ impl AgentRunProjection {
             }
         }
         if !should_accept_agent_state(self.state, state) {
+            if state.source == AgentProjectionSource::LiveStream
+                && state.status == self.state.status
+            {
+                self.state_observed_at = std::time::Instant::now();
+            }
             return false;
         }
         if state.source != AgentProjectionSource::LocalIntent {
@@ -642,11 +650,12 @@ fn should_accept_agent_state(current: AgentRunState, incoming: AgentRunState) ->
     let current_rank = current.source_rank();
     let incoming_rank = incoming.source_rank();
 
-    // A fresh owning source can temporarily take over a stale projection even
-    // when the durable server normally has the higher authority rank.
+    // Fresh evidence can recover a stale projection. A matching live event
+    // proves activity, while preserving the distinction from owner confirmation.
     if current.confidence == AgentProjectionConfidence::Stale
-        && incoming.confidence == AgentProjectionConfidence::Confirmed
         && current.status == incoming.status
+        && (incoming.confidence == AgentProjectionConfidence::Confirmed
+            || (current.status.is_active() && incoming.source == AgentProjectionSource::LiveStream))
     {
         return true;
     }
@@ -1237,10 +1246,17 @@ fn merge_agent_projections(target: &mut AgentRunProjection, source: AgentRunProj
         .durable_event_high_watermark
         .max(source_durable_event_high_watermark);
 
+    let observed_at = if target.state.status == source_state.status {
+        target.state_observed_at.max(source_state_observed_at)
+    } else {
+        source_state_observed_at
+    };
     if accept_lifecycle {
         target.state = source_state;
-        target.state_observed_at = source_state_observed_at;
+        target.state_observed_at = observed_at;
         target.terminal_at = source_terminal_at;
+    } else if target.state.status == source_state.status {
+        target.state_observed_at = target.state_observed_at.max(source_state_observed_at);
     }
     if accept_content {
         target.attention_summary = source_attention_summary;
@@ -2254,7 +2270,19 @@ impl ChatWidget {
             ServerAgentTruthState::Stale => {
                 for projection in self.agent_runs.runs.values_mut() {
                     if projection.state.source == AgentProjectionSource::DurableServer {
-                        projection.mark_stale_if_active();
+                        if projection.state.confidence == AgentProjectionConfidence::Confirmed
+                            && projection.state.status.is_active()
+                            && server
+                                .fetch_started_at
+                                .is_some_and(|started| projection.state_observed_at > started)
+                        {
+                            // A failed poll cannot invalidate newer live activity.
+                            // It also cannot confirm that activity on the server.
+                            projection.state = AgentRunState::observed(projection.state.status);
+                            projection.sync_detail_status();
+                        } else {
+                            projection.mark_stale_if_active();
+                        }
                     }
                 }
             }
@@ -2292,6 +2320,19 @@ impl ChatWidget {
                             .key_for_run_id(&node.run_id)
                             .map(str::to_owned)
                             .unwrap_or_else(|| node.run_id.clone());
+                        // A response can arrive after a newer live lifecycle
+                        // observation, even when the backend page is complete.
+                        let lifecycle_fenced =
+                            self.agent_runs.get(&run_key).is_some_and(|projection| {
+                                matches!(
+                                    projection.state.source,
+                                    AgentProjectionSource::LiveStream
+                                        | AgentProjectionSource::LocalIntent
+                                        | AgentProjectionSource::DurableServer
+                                ) && !server
+                                    .fetch_started_at
+                                    .is_some_and(|started| projection.state_observed_at < started)
+                            });
                         if self
                             .agent_runs
                             .get(&run_key)
@@ -2323,19 +2364,30 @@ impl ChatWidget {
                                     AgentRunLabelKind::RoutingFallback,
                                 )
                             });
-                        let accepted =
+                        let accepted = if lifecycle_fenced {
+                            if let Some(projection) = self.agent_runs.get_mut(&run_key) {
+                                projection.set_label(label, label_kind);
+                            }
+                            false
+                        } else {
                             self.agent_runs
-                                .ensure(run_key.clone(), label, label_kind, state);
+                                .ensure(run_key.clone(), label, label_kind, state)
+                        };
                         let Some(projection) = self.agent_runs.get_mut(&run_key) else {
                             continue;
                         };
-                        projection.set_controls(
-                            AgentProjectionSource::DurableServer,
-                            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
-                                run_id: node.run_id.clone(),
-                            },
-                            node.available_actions.clone(),
-                        );
+                        if accepted && let Some(started) = server.fetch_started_at {
+                            projection.state_observed_at = started;
+                        }
+                        if !lifecycle_fenced {
+                            projection.set_controls(
+                                AgentProjectionSource::DurableServer,
+                                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                                    run_id: node.run_id.clone(),
+                                },
+                                node.available_actions.clone(),
+                            );
+                        }
                         projection.set_transcript_target(
                             AgentProjectionSource::DurableServer,
                             crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
@@ -2344,12 +2396,6 @@ impl ChatWidget {
                             AgentProjectionSource::DurableServer,
                             node.runtime.clone(),
                         );
-                        if !accepted
-                            && projection.durable_event_high_watermark
-                                == Some(node.run_event_high_watermark)
-                        {
-                            continue;
-                        }
                         projection.durable_event_high_watermark =
                             Some(node.run_event_high_watermark);
                         projection.set_runtime_metadata(
@@ -2367,7 +2413,7 @@ impl ChatWidget {
                         projection.reported_tool_calls = node.total_tool_calls as usize;
                         if let Some(started_at) = parse_run_timestamp(&node.created_at) {
                             align_projection_start_time(projection, started_at);
-                            if status.is_terminal() {
+                            if !lifecycle_fenced && status.is_terminal() {
                                 align_projection_end_time(
                                     projection,
                                     started_at,
@@ -2375,7 +2421,9 @@ impl ChatWidget {
                                 );
                             }
                         }
-                        apply_server_agent_detail(projection, node, status);
+                        if !lifecycle_fenced {
+                            apply_server_agent_detail(projection, node, status);
+                        }
                     }
 
                     if !snapshot.truncated {
@@ -2386,10 +2434,24 @@ impl ChatWidget {
                                     .run_id
                                     .as_deref()
                                     .is_some_and(|run_id| present.contains(run_id));
-                            if projection.state.source == AgentProjectionSource::DurableServer
-                                && !present_by_canonical_identity
+                            if !present_by_canonical_identity
+                                && server
+                                    .fetch_started_at
+                                    .is_some_and(|started| projection.state_observed_at < started)
                             {
-                                projection.mark_stale_if_active();
+                                match projection.state.source {
+                                    AgentProjectionSource::DurableServer => {
+                                        projection.mark_stale_if_active();
+                                    }
+                                    // An absent live/provisional row is not proof
+                                    // of termination. It also cannot keep claiming
+                                    // active work against a complete server view.
+                                    AgentProjectionSource::LiveStream
+                                    | AgentProjectionSource::LocalIntent => {
+                                        projection.mark_unconfirmed_if_active();
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -5547,6 +5609,7 @@ mod tests {
     ) -> crate::tui::server_agent_observer::ServerAgentProjection {
         crate::tui::server_agent_observer::ServerAgentProjection {
             sequence: 1,
+            fetch_started_at: Some(std::time::Instant::now()),
             truth_state,
             snapshot: Some(astra_thin_client::SessionRunTreeSnapshot {
                 schema_version: astra_thin_client::SESSION_RUN_TREE_SCHEMA_VERSION,
@@ -10268,6 +10331,7 @@ mod tests {
         let mut widget = fresh();
         let loading = ServerAgentProjection {
             sequence: 0,
+            fetch_started_at: None,
             truth_state: ServerAgentTruthState::Loading,
             snapshot: None,
         };
@@ -10280,6 +10344,7 @@ mod tests {
 
         let unavailable = ServerAgentProjection {
             sequence: 1,
+            fetch_started_at: Some(std::time::Instant::now()),
             truth_state: ServerAgentTruthState::Unavailable,
             snapshot: None,
         };
@@ -10307,6 +10372,7 @@ mod tests {
         child.available_actions = vec![SessionRunAction::Resume, SessionRunAction::Cancel];
         let projection = crate::tui::server_agent_observer::ServerAgentProjection {
             sequence: 1,
+            fetch_started_at: Some(std::time::Instant::now()),
             truth_state: crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
             snapshot: Some(SessionRunTreeSnapshot {
                 schema_version: astra_thin_client::SESSION_RUN_TREE_SCHEMA_VERSION,
@@ -10458,6 +10524,273 @@ mod tests {
             rows[0].state.confidence,
             AgentProjectionConfidence::Confirmed
         );
+    }
+
+    #[test]
+    fn durable_terminal_does_not_bind_an_unbound_row_by_reusable_profile() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        let mut widget = fresh();
+        widget.on_agent_control_started(
+            "spawn".into(),
+            "Review".into(),
+            "spawn-review".into(),
+            Some("reviewer".into()),
+            None,
+            None,
+        );
+        let completed = server_run_node("run-1", SessionRunLifecycleStatus::Completed, 3);
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![completed.clone()],
+            false,
+        ));
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].agent_id, "reviewer");
+        assert!(rows[0].run_id.is_none());
+        assert_eq!(
+            rows[0].state.confidence,
+            AgentProjectionConfidence::Unconfirmed
+        );
+        assert!(!rows.iter().any(|row| row.state.is_actionable_active()));
+        assert_eq!(
+            widget.agent_run_state("run-1").unwrap().status,
+            AgentRunStatus::Completed
+        );
+
+        // A reused profile is a new execution, never a rewrite of the old row.
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![
+                completed,
+                server_run_node("run-2", SessionRunLifecycleStatus::Running, 1),
+            ],
+            false,
+        ));
+        assert_eq!(
+            widget.agent_run_state("run-1").unwrap().status,
+            AgentRunStatus::Completed
+        );
+        assert_eq!(
+            widget.agent_run_state("run-2").unwrap().status,
+            AgentRunStatus::Running
+        );
+    }
+
+    #[test]
+    fn snapshot_fetch_boundary_preserves_newer_live_and_allows_later_omission() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        let mut widget = fresh();
+        let old = server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            Vec::new(),
+            false,
+        );
+        widget.on_agent_live_event(AgentLiveEvent {
+            run_id: "new-run".into(),
+            agent_id: "child@new-run".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: None,
+                text: "working".into(),
+            },
+        });
+        widget.reconcile_server_agent_projection(&old);
+        assert!(
+            widget
+                .agent_run_state("child@new-run")
+                .unwrap()
+                .is_actionable_active()
+        );
+        // Identical backend revision, but this query began after the live event.
+        let mut later = old.clone();
+        later.fetch_started_at = Some(std::time::Instant::now());
+        widget.reconcile_server_agent_projection(&later);
+        let state = widget.agent_run_state("child@new-run").unwrap();
+        assert!(!state.is_actionable_active());
+        assert!(!state.status.is_terminal());
+    }
+
+    #[test]
+    fn live_observation_fences_old_present_node_even_when_server_already_confirmed() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        let mut widget = fresh();
+        let confirmed = server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "run-live",
+                SessionRunLifecycleStatus::Running,
+                1,
+            )],
+            false,
+        );
+        widget.reconcile_server_agent_projection(&confirmed);
+        let old = server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "run-live",
+                SessionRunLifecycleStatus::Paused,
+                2,
+            )],
+            false,
+        );
+        widget.on_agent_live_event(AgentLiveEvent {
+            run_id: "run-live".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: None,
+                text: "still working".into(),
+            },
+        });
+        widget.reconcile_server_agent_projection(&old);
+        assert_eq!(
+            widget.agent_run_state("run-live").unwrap().status,
+            AgentRunStatus::Running
+        );
+        let mut later = old;
+        later.fetch_started_at = Some(std::time::Instant::now());
+        widget.reconcile_server_agent_projection(&later);
+        assert_eq!(
+            widget.agent_run_state("run-live").unwrap().status,
+            AgentRunStatus::Paused
+        );
+    }
+
+    #[test]
+    fn live_activity_during_pending_control_fences_an_older_response() {
+        use astra_thin_client::{SessionRunAction, SessionRunLifecycleStatus};
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        let mut widget = fresh();
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "child",
+                SessionRunLifecycleStatus::Running,
+                1,
+            )],
+            false,
+        ));
+        let child = widget.agent_runs.get_mut("child").unwrap();
+        child.available_actions = vec![SessionRunAction::Pause];
+        assert!(child.begin_control(SessionRunAction::Pause).is_some());
+        let mut response = server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "child",
+                SessionRunLifecycleStatus::Paused,
+                2,
+            )],
+            false,
+        );
+        widget.on_agent_live_event(AgentLiveEvent {
+            run_id: "child".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: None,
+                text: "finishing current operation".into(),
+            },
+        });
+        widget.reconcile_server_agent_projection(&response);
+        let child = widget.agent_runs.get("child").unwrap();
+        assert_eq!(child.state.status, AgentRunStatus::Pausing);
+        assert!(child.pending_control.is_some());
+        response.fetch_started_at = Some(std::time::Instant::now());
+        widget.reconcile_server_agent_projection(&response);
+        let child = widget.agent_runs.get("child").unwrap();
+        assert_eq!(child.state.status, AgentRunStatus::Paused);
+        assert!(child.pending_control.is_none());
+    }
+
+    #[test]
+    fn failed_poll_preserves_live_evidence_without_reviving_rejected_controls() {
+        use crate::tui::server_agent_observer::ServerAgentTruthState;
+        use astra_thin_client::{SessionRunAction, SessionRunLifecycleStatus};
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+
+        for (live_before_failure, rejected_control) in
+            [(false, false), (true, false), (false, true)]
+        {
+            let mut widget = fresh();
+            let mut response = server_agent_projection(
+                ServerAgentTruthState::Confirmed,
+                vec![server_run_node(
+                    "child",
+                    SessionRunLifecycleStatus::Running,
+                    1,
+                )],
+                false,
+            );
+            widget.reconcile_server_agent_projection(&response);
+            let live = || AgentLiveEvent {
+                run_id: "child".into(),
+                agent_id: "reviewer".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: "still working".into(),
+                },
+            };
+            if live_before_failure {
+                widget.on_agent_live_event(live());
+            }
+            if rejected_control {
+                let child = widget.agent_runs.get_mut("child").unwrap();
+                child.available_actions = vec![SessionRunAction::Pause];
+                assert!(child.begin_control(SessionRunAction::Pause).is_some());
+                assert!(child.reject_control());
+            }
+            response.truth_state = ServerAgentTruthState::Stale;
+            widget.reconcile_server_agent_projection(&response);
+            let state = widget.agent_run_state("child").unwrap();
+            assert_eq!(state.is_actionable_active(), live_before_failure);
+            assert_eq!(
+                state.confidence,
+                if live_before_failure {
+                    AgentProjectionConfidence::Observed
+                } else {
+                    AgentProjectionConfidence::Stale
+                }
+            );
+            widget.on_agent_live_event(live());
+            let state = widget.agent_run_state("child").unwrap();
+            assert!(state.is_actionable_active());
+            assert_eq!(state.confidence, AgentProjectionConfidence::Observed);
+            assert_eq!(state.source, AgentProjectionSource::LiveStream);
+        }
+    }
+
+    #[test]
+    fn complete_server_snapshot_stops_provisional_rows_claiming_live_work() {
+        for truncated in [false, true] {
+            let mut widget = fresh();
+            widget.on_agent_control_started(
+                "spawn".into(),
+                "Review".into(),
+                "spawn-review".into(),
+                None,
+                None,
+                None,
+            );
+            let key = provisional_agent_key("spawn-review");
+            widget.reconcile_server_agent_projection(&server_agent_projection(
+                crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+                vec![server_run_node(
+                    "run-1",
+                    astra_thin_client::SessionRunLifecycleStatus::Completed,
+                    3,
+                )],
+                truncated,
+            ));
+            let state = widget.agent_run_state(&key).unwrap();
+            assert_eq!(state.is_actionable_active(), truncated);
+            assert!(
+                !state.status.is_terminal(),
+                "absence cannot invent an outcome"
+            );
+            if !truncated {
+                assert_eq!(state.confidence, AgentProjectionConfidence::Unconfirmed);
+            }
+        }
     }
 
     #[test]
@@ -11330,6 +11663,30 @@ mod tests {
     }
 
     #[test]
+    fn stronger_same_status_merge_preserves_the_newest_activity_boundary() {
+        let mut durable = AgentRunProjection::new(
+            "child".into(),
+            "reviewer".into(),
+            AgentRunLabelKind::BindingName,
+            AgentRunState::confirmed_server(AgentRunStatus::Running),
+        );
+        let mut live = AgentRunProjection::new(
+            "child".into(),
+            "reviewer".into(),
+            AgentRunLabelKind::BindingName,
+            AgentRunState::observed(AgentRunStatus::Running),
+        );
+        durable.state_observed_at = live.state_observed_at - std::time::Duration::from_millis(1);
+        let latest = live.state_observed_at;
+        merge_agent_projections(&mut live, durable);
+        assert_eq!(
+            live.state,
+            AgentRunState::confirmed_server(AgentRunStatus::Running)
+        );
+        assert_eq!(live.state_observed_at, latest);
+    }
+
+    #[test]
     fn sparse_runtime_facts_merge_per_field_without_erasing_local_evidence() {
         let mut projection = AgentRunProjection::new(
             "agent".into(),
@@ -11709,5 +12066,96 @@ mod tests {
         assert!(registry.contains_key("latest"));
         assert!(registry.contains_key("parent"));
         assert!(!registry.contains_key("evict"));
+    }
+
+    #[test]
+    fn review_live_chunks_do_not_starve_durable_progress_updates() {
+        use crate::tui::server_agent_observer::ServerAgentTruthState;
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        let mut widget = fresh();
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "child",
+                SessionRunLifecycleStatus::Running,
+                1,
+            )],
+            false,
+        ));
+        for progress in 3..6 {
+            let mut node = server_run_node("child", SessionRunLifecycleStatus::Running, progress);
+            node.total_tool_calls = progress as u32;
+            node.agent_name = Some(format!("Reviewer {progress}"));
+            let response =
+                server_agent_projection(ServerAgentTruthState::Confirmed, vec![node], false);
+            widget.on_agent_live_event(AgentLiveEvent {
+                run_id: "child".into(),
+                agent_id: "reviewer".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: "streaming".into(),
+                },
+            });
+            widget.reconcile_server_agent_projection(&response);
+            let row = widget.agent_runs.get("child").unwrap();
+            assert_eq!(row.state.status, AgentRunStatus::Running);
+            assert_eq!(row.detail.description, format!("Reviewer {progress}"));
+            assert_eq!(
+                row.reported_tool_calls, progress as usize,
+                "a newer live text chunk must not discard independent durable tool progress"
+            );
+        }
+        // A stale durable page never overwrites newer counters.
+        let mut stale = server_run_node("child", SessionRunLifecycleStatus::Running, 4);
+        stale.total_tool_calls = 99;
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            ServerAgentTruthState::Confirmed,
+            vec![stale],
+            false,
+        ));
+        assert_eq!(
+            widget.agent_runs.get("child").unwrap().reported_tool_calls,
+            5
+        );
+        // Child membership may advance without changing the parent's watermark.
+        let mut child = server_run_node("grandchild", SessionRunLifecycleStatus::Running, 1);
+        child.parent_run_id = Some("child".into());
+        child.depth = 2;
+        let response = server_agent_projection(
+            ServerAgentTruthState::Confirmed,
+            vec![
+                server_run_node("child", SessionRunLifecycleStatus::Running, 5),
+                child,
+            ],
+            false,
+        );
+        widget
+            .agent_runs
+            .get_mut("child")
+            .unwrap()
+            .set_state(AgentRunState::observed(AgentRunStatus::Waiting));
+        widget.reconcile_server_agent_projection(&response);
+        let row = widget.agent_runs.get("child").unwrap();
+        assert_eq!(row.state.status, AgentRunStatus::Waiting);
+        assert_eq!(row.reported_child_agents, 1);
+        // A newer local cancellation keeps its overlay while progress refreshes.
+        let row = widget.agent_runs.get_mut("child").unwrap();
+        assert!(
+            row.begin_control(astra_thin_client::SessionRunAction::Cancel)
+                .is_some()
+        );
+        let mut terminal = server_run_node("child", SessionRunLifecycleStatus::Completed, 6);
+        terminal.total_tool_calls = 6;
+        let mut response =
+            server_agent_projection(ServerAgentTruthState::Confirmed, vec![terminal], false);
+        response.fetch_started_at =
+            Some(row.state_observed_at - std::time::Duration::from_millis(1));
+        widget.reconcile_server_agent_projection(&response);
+        let row = widget.agent_runs.get("child").unwrap();
+        assert_eq!(row.state.status, AgentRunStatus::Cancelling);
+        assert!(row.pending_control.is_some());
+        assert_eq!(row.reported_tool_calls, 6);
+        assert!(row.detail.completed_at.is_none());
     }
 }

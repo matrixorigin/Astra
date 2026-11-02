@@ -285,7 +285,7 @@ pub(crate) struct AgentTranscriptView {
     /// the view must not erase output based on equal text.
     terminal_refresh_requested: bool,
     local_root_live: Option<super::root_transcript_view::LocalLiveItem>,
-    root_refresh_pending: bool,
+    history_refresh_pending: bool,
     /// The transcript projection is built for the same viewport that opened
     /// it. A delegated run is a first-class conversation, not a compact task
     /// detail panel with a different layout budget than another run.
@@ -340,7 +340,7 @@ impl AgentTranscriptView {
             pending_transcript_commit: None,
             terminal_refresh_requested: false,
             local_root_live: None,
-            root_refresh_pending: false,
+            history_refresh_pending: false,
             viewport_width,
             completed: false,
             reopen: Some(reopen.into()),
@@ -390,7 +390,7 @@ impl AgentTranscriptView {
             pending_transcript_commit: None,
             terminal_refresh_requested: false,
             local_root_live: None,
-            root_refresh_pending: false,
+            history_refresh_pending: false,
             viewport_width,
             completed: false,
             reopen: Some(reopen.into()),
@@ -561,8 +561,8 @@ impl AgentTranscriptView {
             self.request_load(None);
         }
         self.rebuild_transcript();
-        if self.root_refresh_pending {
-            self.root_refresh_pending = false;
+        if self.history_refresh_pending {
+            self.history_refresh_pending = false;
             self.request_load(None);
         } else if self.export_pending {
             self.continue_export();
@@ -940,10 +940,13 @@ impl AgentTranscriptView {
                 if !self.terminal_refresh_requested
                     && self.session_id.is_some()
                     && self.transcript_target.is_some()
-                    && !self.loading
                 {
                     self.terminal_refresh_requested = true;
-                    self.request_load(None);
+                    if self.loading {
+                        self.history_refresh_pending = true;
+                    } else {
+                        self.request_load(None);
+                    }
                 }
             }
         }
@@ -1387,7 +1390,7 @@ impl BottomPaneView for AgentTranscriptView {
                 } else if !self.terminal_refresh_requested {
                     self.terminal_refresh_requested = true;
                     if self.loading {
-                        self.root_refresh_pending = true;
+                        self.history_refresh_pending = true;
                     } else {
                         self.request_load(None);
                     }
@@ -1398,7 +1401,7 @@ impl BottomPaneView for AgentTranscriptView {
                 if !self.terminal_refresh_requested {
                     self.terminal_refresh_requested = true;
                     if self.loading {
-                        self.root_refresh_pending = true;
+                        self.history_refresh_pending = true;
                     } else {
                         self.request_load(None);
                     }
@@ -1456,8 +1459,8 @@ impl BottomPaneView for AgentTranscriptView {
                 self.transcript
                     .set_activity_status(Some(status.to_string()));
                 self.rebuild_transcript();
-                if self.root_refresh_pending {
-                    self.root_refresh_pending = false;
+                if self.history_refresh_pending {
+                    self.history_refresh_pending = false;
                     self.request_load(None);
                 }
             }
@@ -1542,6 +1545,9 @@ impl BottomPaneView for AgentTranscriptView {
         gap: &astra_turn_core::agent_live_event::AgentLiveGap,
     ) -> bool {
         if gap.run_id.trim().is_empty() {
+            return false;
+        }
+        if self.run_id.trim().is_empty() && gap.agent_id != self.agent_id {
             return false;
         }
         if self.run_id.trim().is_empty() {
@@ -1662,7 +1668,7 @@ mod tests {
             assert!(!view.refresh_root_transcript_live(Some(("other-session", "root")), None));
             assert!(!view.refresh_root_transcript_live(Some(("session-1", "other-root")), None));
             assert!(view.refresh_root_transcript_live(Some(("session-1", "root")), None));
-            assert!(view.root_refresh_pending);
+            assert!(view.history_refresh_pending);
             assert!(view.take_action_request().is_none());
             let update = if initial_read_fails {
                 AgentTranscriptUpdate::Failed {
@@ -2419,6 +2425,85 @@ mod tests {
         assert!(reconciled.contains("new resumed fragment"), "{reconciled}");
         assert!(reconciled.contains("old live fragment"), "{reconciled}");
         assert!(view.pending_transcript_commit.is_none());
+    }
+
+    #[test]
+    fn child_terminal_racing_history_read_refreshes_once_after_success_or_failure() {
+        for failed in [false, true] {
+            let mut view = loading_view(80, 24);
+            assert!(view.loading);
+            assert!(view.apply_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                    duration_ms: 1,
+                    reason: None,
+                },
+            }));
+            assert!(view.take_action_request().is_none());
+            let update = if failed {
+                AgentTranscriptUpdate::Failed {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    message: "old read failed".into(),
+                }
+            } else {
+                AgentTranscriptUpdate::Loaded {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    page: page(),
+                    replace: true,
+                    source: AgentTranscriptSource::DurableServer,
+                }
+            };
+            assert!(view.refresh_agent_transcript(update));
+            assert!(
+                matches!(view.take_action_request(), Some(ViewActionRequest {
+                action: BottomPaneViewAction::LoadAgentTranscript { run_id, before_seq: None, .. }, ..
+            }) if run_id == "run-child")
+            );
+            assert!(view.take_action_request().is_none());
+            view.refresh_agent_transcript(AgentTranscriptUpdate::Failed {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                message: "terminal read failed".into(),
+            });
+            assert!(
+                view.take_action_request().is_none(),
+                "a failed repair read must not spin"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbound_transcript_rejects_another_agents_gap() {
+        let mut view = AgentTranscriptView::live_unbound(
+            "agent-1".into(),
+            "Reviewer".into(),
+            String::new(),
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer),
+            "agents",
+            80,
+            24,
+        );
+        assert!(
+            !view.refresh_agent_live_gap(&astra_turn_core::agent_live_event::AgentLiveGap {
+                agent_id: "other-agent".into(),
+                run_id: "other-run".into(),
+                dropped_event_count: 3,
+            })
+        );
+        assert!(view.run_id.is_empty());
+        assert!(view.live.is_empty());
+        assert!(
+            view.refresh_agent_live_gap(&astra_turn_core::agent_live_event::AgentLiveGap {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                dropped_event_count: 1,
+            })
+        );
+        assert_eq!(view.run_id, "run-child");
     }
 
     #[test]

@@ -190,7 +190,7 @@ pub trait SummaryLlmClient: Send + Sync {
 /// Generate a compact summary for `messages` using the provided LLM client.
 ///
 /// Returns `Some(summary_text)` on success, or `None` if all retries are
-/// exhausted (callers should fall back to truncation).
+/// exhausted (the caller selects the fallback).
 ///
 /// PTL retry behaviour:
 /// 1. Render messages into compaction prompt
@@ -201,6 +201,24 @@ pub async fn generate_compact_summary(
     messages: &[Value],
     client: &dyn SummaryLlmClient,
 ) -> Option<String> {
+    generate_compact_summary_outcome(messages, client)
+        .await
+        .ok()
+}
+
+/// Distinguishes an unusable model response from a transient failure. Both
+/// preserve the original history, but only a rejected response is evidence
+/// that retrying unchanged input may repeat the same unproductive work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactSummaryFailure {
+    Invalid,
+    Unavailable,
+}
+
+pub async fn generate_compact_summary_outcome(
+    messages: &[Value],
+    client: &dyn SummaryLlmClient,
+) -> Result<String, CompactSummaryFailure> {
     // Carry prior summaries through every retry, including summaries restored
     // mid-history. Stable instructions and runtime authority are not evidence.
     let system_msgs = messages
@@ -235,14 +253,17 @@ pub async fn generate_compact_summary(
             )
             .await
         {
-            Ok(resp) if !resp.is_ptl_error => return validated_structured_summary(&resp.text),
+            Ok(resp) if !resp.is_ptl_error => {
+                return validated_structured_summary(&resp.text)
+                    .ok_or(CompactSummaryFailure::Invalid);
+            }
             Ok(resp) if resp.is_ptl_error => {
                 if attempt >= MAX_PTL_RETRIES {
                     eprintln!(
-                        "[compact_summary] PTL retries exhausted after {} attempts, falling back to truncation",
+                        "[compact_summary] PTL retries exhausted after {} attempts",
                         attempt
                     );
-                    return None;
+                    return Err(CompactSummaryFailure::Unavailable);
                 }
                 // Drop the oldest round and retry
                 let rounds_before = rounds.len();
@@ -250,7 +271,7 @@ pub async fn generate_compact_summary(
                 if new_rounds.len() == rounds_before {
                     // Can't drop any more rounds
                     eprintln!("[compact_summary] cannot drop more rounds, giving up");
-                    return None;
+                    return Err(CompactSummaryFailure::Unavailable);
                 }
                 eprintln!(
                     "[compact_summary] PTL error, dropping oldest round (attempt {}, {} → {} rounds)",
@@ -263,13 +284,13 @@ pub async fn generate_compact_summary(
             }
             Ok(_) => unreachable!(),
             Err(e) => {
-                eprintln!("[compact_summary] LLM error: {e}, falling back to truncation");
-                return None;
+                eprintln!("[compact_summary] LLM error: {e}");
+                return Err(CompactSummaryFailure::Unavailable);
             }
         }
     }
 
-    None
+    Err(CompactSummaryFailure::Unavailable)
 }
 
 /// Build the messages array for the summary LLM call.
@@ -633,6 +654,26 @@ mod tests {
         let msgs = make_messages(2);
         let result = generate_compact_summary(&msgs, &client).await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn compact_summary_outcome_distinguishes_invalid_from_unavailable() {
+        let messages = make_messages(2);
+        let invalid = MockSummaryClient::success("missing required sections");
+        assert_eq!(
+            generate_compact_summary_outcome(&messages, &invalid).await,
+            Err(CompactSummaryFailure::Invalid)
+        );
+        let network = MockSummaryClient::error("connection refused");
+        assert_eq!(
+            generate_compact_summary_outcome(&messages, &network).await,
+            Err(CompactSummaryFailure::Unavailable)
+        );
+        assert!(
+            generate_compact_summary(&messages, &invalid)
+                .await
+                .is_none()
+        );
     }
 
     #[test]

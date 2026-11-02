@@ -4714,9 +4714,17 @@ pub(crate) fn record_context_compactions<H: AgenticLoopHost>(
         };
         state.context_compression_triggered = true;
         state.compact_tier_applied = state.compact_tier_applied.max(observation.tier);
-        state
-            .compaction_effectiveness
-            .record_compaction(observation.tokens_saved);
+        // Wire savings describe one provider request. Its canonical owner
+        // records installation separately; request-only savings must not reset
+        // the session's futile-summary breaker.
+        if !matches!(
+            observation.kind,
+            CompactionKind::WireAssembly | CompactionKind::WireContextRetry
+        ) {
+            state
+                .compaction_effectiveness
+                .record_compaction(observation.tokens_saved);
+        }
         if observation.effectiveness
             == astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Insufficient
         {
@@ -18822,8 +18830,14 @@ mod tests {
         ];
 
         let mut host = MockHost::new(Vec::new());
+        state.compaction_effectiveness.record_futile();
         record_context_compactions(&mut host, &mut state, &observations);
 
+        assert_eq!(
+            state.compaction_effectiveness.consecutive_futile_attempts, 1,
+            "request-local savings must not reset canonical futility"
+        );
+        assert_eq!(state.compaction_effectiveness.attempt_count, 0);
         assert!(state.context_compression_triggered);
         let compactions: Vec<_> = state
             .step_recorder

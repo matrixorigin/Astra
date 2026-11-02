@@ -11,7 +11,6 @@ pub(crate) struct CanonicalRewriteProof {
     authorized_prefix_len: usize,
     authorized_prefix_root: String,
     rewritten: bool,
-    pending_provider_wal_predecessor: Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
     valid: bool,
 }
 
@@ -24,12 +23,6 @@ impl CanonicalRewritePermit {
     pub(crate) fn is_valid(&self) -> bool {
         self.valid
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ProviderWalReplacementAuthorization {
-    pub(crate) generation: u64,
-    pub(crate) durable_predecessor: astra_turn_types::ProviderCanonicalHistoryIdentityV2,
 }
 
 /// Produce the durable provider snapshot without rewriting bytes that were
@@ -78,9 +71,16 @@ impl CanonicalRewriteProof {
             authorized_prefix_len: admitted_prefix.len(),
             authorized_prefix_root: admitted_root,
             rewritten: false,
-            pending_provider_wal_predecessor: None,
             valid: true,
         }
+    }
+
+    /// A coordinator-admitted first turn has no immutable manifest prefix.
+    /// Its working history may shrink, while the WAL still verifies each
+    /// replacement. The empty manifest marker is never used for a Replace
+    /// Context commit: initial commits remain Append from an empty base.
+    pub(crate) fn from_initial_admission() -> Self {
+        Self::from_materialized_admission(&[], "", 0)
     }
 
     pub(crate) fn begin(&self, messages: &[Value]) -> CanonicalRewritePermit {
@@ -92,33 +92,14 @@ impl CanonicalRewriteProof {
         CanonicalRewritePermit { valid }
     }
 
-    pub(crate) fn finish(
-        &mut self,
-        permit: CanonicalRewritePermit,
-        messages: &[Value],
-        durable_base: Option<&astra_turn_types::ProviderCanonicalWalBaseV2>,
-    ) {
+    pub(crate) fn finish(&mut self, permit: CanonicalRewritePermit, messages: &[Value]) {
         if !permit.valid {
             self.valid = false;
-            self.pending_provider_wal_predecessor = None;
             return;
         }
         self.authorized_prefix_len = messages.len();
         self.authorized_prefix_root = astra_turn_types::canonical_conversation_root(messages);
         self.rewritten = true;
-        let Some(durable_base) = durable_base else {
-            self.pending_provider_wal_predecessor = None;
-            return;
-        };
-        let durable_messages = sanitize_provider_canonical_wal_snapshot(durable_base, messages);
-        match astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(&durable_messages)
-        {
-            Ok(identity) => self.pending_provider_wal_predecessor = Some(identity),
-            Err(_) => {
-                self.pending_provider_wal_predecessor = None;
-                self.valid = false;
-            }
-        }
     }
 
     fn authorizes(&self, messages: &[Value]) -> bool {
@@ -139,23 +120,27 @@ impl CanonicalRewriteProof {
         &self.base_manifest_root
     }
 
-    pub(crate) fn provider_wal_replacement_authorization(
+    /// Authorize a self-contained execution handoff, including after a prior
+    /// handoff was restored. This proves the admitted canonical prefix; it
+    /// does not grant an independent provider-attempt authorization.
+    pub(crate) fn handoff_replacement_generation(
         &self,
         durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
         messages: &[Value],
-    ) -> Option<ProviderWalReplacementAuthorization> {
-        let base_count = usize::try_from(durable_base.canonical.message_count).ok()?;
-        let durable_predecessor = self.pending_provider_wal_predecessor.as_ref()?;
+    ) -> Result<Option<u64>, astra_turn_types::ProviderCanonicalTransitionError> {
+        if !self.rewritten {
+            return Ok(None);
+        }
+        let base_count = usize::try_from(durable_base.canonical.message_count).map_err(|_| {
+            astra_turn_types::ProviderCanonicalTransitionError::MessageCountOverflow
+        })?;
         if base_count != self.base_prefix_len
             || durable_base.canonical.root_hash != self.base_prefix_root
             || !self.authorizes(messages)
         {
-            return None;
+            return Err(astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch);
         }
-        Some(ProviderWalReplacementAuthorization {
-            generation: self.base_compaction_generation.saturating_add(1),
-            durable_predecessor: durable_predecessor.clone(),
-        })
+        Ok(Some(self.base_compaction_generation.saturating_add(1)))
     }
 
     pub(crate) fn recover_provider_wal_replacement(
@@ -191,7 +176,6 @@ impl CanonicalRewriteProof {
         self.authorized_prefix_root =
             astra_turn_types::canonical_conversation_root(&recovered_messages[..result_count]);
         self.rewritten = true;
-        self.pending_provider_wal_predecessor = None;
         self.valid = true;
         Ok(())
     }
@@ -314,6 +298,53 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn initial_admission_compaction_preserves_append_commit_and_wal_recovery() {
+        let original = vec![
+            json!({"role":"user", "content":"work"}),
+            json!({"role":"assistant", "content":"large evidence"}),
+        ];
+        let rewritten = vec![
+            json!({"role":"user", "content":"work"}),
+            json!({"role":"assistant", "content":"summary"}),
+        ];
+        let base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[]).unwrap();
+        let mut proof = CanonicalRewriteProof::from_initial_admission();
+        let permit = proof.begin(&original);
+        assert!(permit.is_valid());
+        proof.finish(permit, &rewritten);
+        let generation = proof
+            .handoff_replacement_generation(&base, &rewritten)
+            .unwrap()
+            .unwrap();
+        let transition =
+            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+                None,
+                base.clone(),
+                generation,
+                &rewritten,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut recovered = Vec::new();
+        transition.apply_to(&mut recovered).unwrap();
+        let mut resumed = CanonicalRewriteProof::from_initial_admission();
+        resumed
+            .recover_provider_wal_replacement(&base, &transition, &recovered)
+            .unwrap();
+        assert!(resumed.begin(&recovered).is_valid());
+        let (mode, _) = canonical_commit_delta(&[], false, &recovered, Some(&resumed), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+        assert_eq!(
+            resumed
+                .handoff_replacement_generation(&base, &recovered)
+                .unwrap(),
+            Some(generation)
+        );
+    }
+
     fn authority() -> Value {
         let content = astra_turn_types::render_append_only_runtime_authority_frame(
             "continue",
@@ -397,15 +428,16 @@ mod tests {
         source.push(json!({"role": "user", "content": "current"}));
         let permit = live.begin(&source);
         let rewritten = vec![json!({"role": "user", "content": "typed summary"})];
-        live.finish(permit, &rewritten, Some(&wal_base));
-        let authorization = live
-            .provider_wal_replacement_authorization(&wal_base, &rewritten)
+        live.finish(permit, &rewritten);
+        let generation = live
+            .handoff_replacement_generation(&wal_base, &rewritten)
+            .unwrap()
             .unwrap();
         let transition =
             astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
                 None,
                 wal_base.clone(),
-                authorization.generation,
+                generation,
                 &rewritten,
                 vec![authority()],
             )
@@ -421,9 +453,9 @@ mod tests {
         let mut completed = recovered.clone();
         completed.push(json!({"role": "assistant", "content": "done"}));
         assert_eq!(
-            restored_proof.provider_wal_replacement_authorization(&wal_base, &completed),
-            None,
-            "crash recovery must not reissue consumed replacement authority"
+            restored_proof.handoff_replacement_generation(&wal_base, &completed),
+            Ok(Some(8)),
+            "the validated recovered prefix can continue into another handoff"
         );
         let (mode, _) =
             canonical_commit_delta(&durable, true, &completed, Some(&restored_proof), false)
@@ -433,10 +465,10 @@ mod tests {
 
         let second_permit = restored_proof.begin(&completed);
         let second_rewrite = vec![json!({"role": "user", "content": "summary two"})];
-        restored_proof.finish(second_permit, &second_rewrite, Some(&wal_base));
-        let second_authorization = restored_proof
-            .provider_wal_replacement_authorization(&wal_base, &second_rewrite)
-            .unwrap();
-        assert_eq!(second_authorization.generation, 8);
+        restored_proof.finish(second_permit, &second_rewrite);
+        assert_eq!(
+            restored_proof.handoff_replacement_generation(&wal_base, &second_rewrite),
+            Ok(Some(8))
+        );
     }
 }
