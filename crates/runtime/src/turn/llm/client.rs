@@ -6671,9 +6671,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 made_progress = true;
             }
         }
-        if yield_state.is_terminal() && !usage.is_empty() {
-            break;
-        }
 
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
             continue;
@@ -6695,9 +6692,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .and_then(|c| c.get("delta"))
             .and_then(Value::as_object)
         else {
-            if yield_state.is_terminal() && !usage.is_empty() {
-                break;
-            }
             continue;
         };
 
@@ -6876,9 +6870,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     });
                 }
             }
-        }
-        if yield_state.is_terminal() && !usage.is_empty() {
-            break;
         }
     }
 
@@ -12046,6 +12037,8 @@ mod tests {
             yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n"));
             tokio::time::sleep(Duration::from_millis(300)).await;
             yield Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n"));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            yield Ok(Bytes::from(format!("data: {}\n\n", json!({"usage":{"prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":3}}}))));
             std::future::pending::<()>().await;
         });
         let started = TokioInstant::now();
@@ -12061,9 +12054,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.full_text, "done");
-        assert_eq!(result.usage["input_tokens"], 10);
+        assert_eq!(result.usage["input_tokens"], 3);
+        assert_eq!(result.usage["cached_input_tokens"], 4);
+        assert_eq!(result.usage["cache_creation_tokens"], 3);
         assert_eq!(result.usage["output_tokens"], 3);
-        assert_eq!(started.elapsed(), Duration::from_millis(300));
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
     }
 
     #[tokio::test]
@@ -12162,6 +12157,7 @@ mod tests {
                 vec![
                     json!({"prompt_tokens": 100}),
                     json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens_details": {"cache_write_tokens": 0}}),
                     json!({"completion_tokens": 5, "prompt_tokens": null}),
                 ],
                 70,
@@ -12171,6 +12167,7 @@ mod tests {
             (
                 vec![
                     json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens_details": {"cache_write_tokens": 0}}),
                     json!({"prompt_tokens": 100}),
                     json!({"completion_tokens": 5}),
                 ],
@@ -12180,7 +12177,7 @@ mod tests {
             ),
         ] {
             let mut frames = vec![Ok(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n",
             ))];
             for usage in updates {
                 frames.push(Ok(Bytes::from(format!(
@@ -12294,7 +12291,7 @@ mod tests {
         for repaired in [false, true] {
             let mut frames = vec![Ok(Bytes::from(format!(
                 "data: {}\n\n",
-                json!({"usage":{"prompt_tokens":50,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80}}})
+                json!({"usage":{"prompt_tokens":50,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":0}}})
             )))];
             if repaired {
                 frames.push(Ok(Bytes::from(format!(

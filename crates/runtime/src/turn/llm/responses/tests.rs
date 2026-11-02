@@ -705,7 +705,22 @@ fn truncated_multi_item_text_reaches_runtime_without_provider_replay() {
     );
     assert_eq!(value.full_text, "prefix partial tail");
     assert_eq!(value.finish_reason.as_deref(), Some("length"));
-    assert_eq!(value.usage["completion_tokens"], 34);
+    assert_eq!(value.usage["output_tokens"], 34);
     assert!(value.tool_calls.is_empty());
     assert!(value.provider_continuation.is_none());
+}
+
+#[test]
+fn response_result_couples_normalized_values_and_presence() {
+    let output = ResponseOutput {
+        usage: json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":30}}).as_object().unwrap().clone(),
+        ..Default::default()
+    };
+    let actual = result(output, "connection", "wire-model", "display-model");
+    assert_eq!(actual.usage["input_tokens"], 30);
+    assert_eq!(actual.usage["cached_input_tokens"], 40);
+    assert_eq!(actual.usage["cache_creation_tokens"], 30);
+    assert!(
+        actual.usage_presence.fresh_input_tokens && actual.usage_presence.cache_creation_tokens
+    );
 }

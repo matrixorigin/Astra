@@ -22860,42 +22860,43 @@ fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
 fn normalize_usage_to_canonical(
     raw: &serde_json::Map<String, Value>,
 ) -> serde_json::Map<String, Value> {
-    // Anthropic and canonical shapes both use `input_tokens`/`output_tokens`.
-    // Provider-specific cache keys are the deterministic discriminator and
-    // must be handled before completing a canonical-like map.
-    let looks_anthropic = raw.contains_key("cache_read_input_tokens")
-        || raw.contains_key("cache_creation_input_tokens");
-    // Anthropic dialect (Messages API, deepseek `/anthropic` endpoint, …):
-    // `input_tokens`/`output_tokens` plus separate `cache_read_input_tokens`
-    // and `cache_creation_input_tokens`. Must be checked BEFORE the generic
-    // `input_tokens` canonical fast-path above would match, otherwise the
-    // cache fields would leak through verbatim.
-    if looks_anthropic {
-        if let Some(canonical) = crate::turn::token_usage::extract_usage(
-            crate::turn::token_usage::UsageDialect::AnthropicMessages,
-            raw,
-        ) {
-            return canonical.to_json_map();
-        }
-    }
-    // Canonical or canonical-like shape. Complete missing cache buckets with
-    // zeros and recompute `total_tokens` so error artifacts never surface a
-    // partial token schema.
-    if raw.contains_key("input_tokens")
-        || raw.contains_key("cached_input_tokens")
-        || raw.contains_key("cache_creation_tokens")
-        || raw.contains_key("output_tokens")
+    use crate::turn::token_usage::{UsageDialect, parse_usage};
+    // OpenAI-shaped proxies can also echo the top-level cache aliases.
+    let dialect = if raw.contains_key("prompt_tokens")
+        || raw.contains_key("completion_tokens")
+        || raw.contains_key("prompt_tokens_details")
+        || raw.contains_key("prompt_cache_hit_tokens")
+        || raw.contains_key("prompt_cache_miss_tokens")
     {
-        return crate::turn::token_usage::TokenUsage::from_partial_json_map(raw).to_json_map();
+        Some(UsageDialect::OpenAi)
+    } else if raw.contains_key("cache_read_input_tokens")
+        || raw.contains_key("cache_creation_input_tokens")
+    {
+        Some(UsageDialect::AnthropicMessages)
+    } else {
+        None
+    };
+    if let Some(dialect) = dialect {
+        return parse_usage(dialect, raw)
+            .map(|(usage, presence)| usage.to_qualified_json_map(presence))
+            .unwrap_or_default();
     }
-    // Detect OpenAI dialect (prompt_tokens / completion_tokens / …).
-    if raw.contains_key("prompt_tokens") || raw.contains_key("completion_tokens") {
-        if let Some(canonical) = crate::turn::token_usage::extract_usage(
-            crate::turn::token_usage::UsageDialect::OpenAi,
-            raw,
-        ) {
-            return canonical.to_json_map();
-        }
+    if [
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_tokens",
+        "output_tokens",
+    ]
+    .iter()
+    .any(|key| raw.contains_key(*key))
+    {
+        // Recompute derived totals, preserving unknown lanes rather than inventing zeros.
+        let mut lanes = raw.clone();
+        lanes.remove("total_tokens");
+        return astra_turn_types::CanonicalTokenUsage::from_json(&Value::Object(lanes))
+            .ok()
+            .and_then(|usage| usage.to_json().as_object().cloned())
+            .unwrap_or_default();
     }
     raw.clone()
 }
@@ -32800,6 +32801,20 @@ mod tests {
     /// persistence with no runtime error. This test pins both anchors.
 
     #[test]
+    fn error_capture_retains_cache_write_partition_and_unknown_lanes() {
+        let full = json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":30}});
+        let actual = normalize_usage_to_canonical(full.as_object().unwrap());
+        assert_eq!(actual["input_tokens"], 30);
+        assert_eq!(actual["cache_creation_tokens"], 30);
+        let partial = json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40}});
+        let actual = normalize_usage_to_canonical(partial.as_object().unwrap());
+        assert_eq!(actual["cached_input_tokens"], 40);
+        assert!(
+            !actual.contains_key("input_tokens") && !actual.contains_key("cache_creation_tokens")
+        );
+    }
+
+    #[test]
     fn llm_capture_error_response_includes_partial_details() {
         let error = astra_core::ClassifiedError::new(
             astra_core::ErrorKind::StreamTransport,
@@ -32815,15 +32830,15 @@ mod tests {
         let response = llm_capture_error_response(&error);
         assert_eq!(response["partial_full_text"].as_str(), Some("half answer"));
         assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(10));
-        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(0));
-        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(0));
+        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), None);
+        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), None);
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(4));
-        assert_eq!(response["usage"]["total_tokens"].as_i64(), Some(14));
+        assert_eq!(response["usage"]["total_tokens"].as_i64(), None);
         assert_eq!(response["kind"].as_str(), Some("stream_transport"));
     }
 
     #[test]
-    fn llm_capture_error_response_completes_canonical_like_usage() {
+    fn llm_capture_error_response_preserves_unknown_canonical_lanes() {
         let error =
             astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
                 .with_details_json(
@@ -32834,15 +32849,10 @@ mod tests {
                 );
         let response = llm_capture_error_response(&error);
         assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(8));
-        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(0));
-        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(0));
+        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), None);
+        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), None);
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(3));
-        assert_eq!(response["usage"]["total_tokens"].as_i64(), Some(11));
-        assert_eq!(
-            response["usage"].as_object().expect("usage object").len(),
-            5,
-            "canonical-like error usage must be completed to the exact canonical schema"
-        );
+        assert_eq!(response["usage"]["total_tokens"].as_i64(), None);
     }
 
     #[test]
@@ -34693,7 +34703,7 @@ mod tests {
         let raw = json!({
             "prompt_tokens": 100_000,
             "completion_tokens": 20,
-            "prompt_tokens_details": {"cached_tokens": 90_000}
+            "prompt_tokens_details": {"cached_tokens": 90_000, "cache_write_tokens": 0}
         });
         let (tokens, presence) = crate::turn::token_usage::parse_usage(
             crate::turn::token_usage::UsageDialect::OpenAi,
@@ -34708,7 +34718,7 @@ mod tests {
         };
         let accum = ServerAgenticLoopHost::result_to_accum_with_usage(&result, None);
         assert_eq!(accum.measured_request_input_tokens(), Some(100_000));
-        // Inclusive total + explicit read bucket prove the zero write bucket,
+        // The explicitly reported zero write bucket closes the partition,
         // so the full physical request usage is known, not partial.
         assert_eq!(
             accum.current_request_usage,

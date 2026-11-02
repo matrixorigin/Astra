@@ -436,6 +436,10 @@ fn parse_openai_usage(
         details.and_then(|d| d.get("cache_creation_input_tokens")),
         &mut input_invalid,
     );
+    let cache_write = decode_count(
+        details.and_then(|d| d.get("cache_write_tokens")),
+        &mut input_invalid,
+    );
     let native_partition = hit.is_some() || miss.is_some();
     let mut alias_conflict = false;
     {
@@ -446,55 +450,49 @@ fn parse_openai_usage(
             (hit, top_read),
             (nested_read, top_read),
             (nested_write, top_write),
+            (cache_write, nested_write),
+            (cache_write, top_write),
         ] {
             alias_conflict |= matches!((left, right), (Some(left), Some(right)) if left != right);
         }
     }
     input_invalid |= same_frame_aliases && alias_conflict;
-    let inclusive = native_partition || nested_read.is_some() || nested_write.is_some();
+    let inclusive = native_partition
+        || nested_read.is_some()
+        || nested_write.is_some()
+        || cache_write.is_some();
     let cached = hit.or(nested_read).or(top_read);
-    let creation = nested_write.or(top_write).or_else(|| {
-        // A zero write bucket is provable — never guessed — when the reported
-        // input fields already exhaust the OpenAI-compatible input partition
-        // {fresh, read, creation} without a write lane:
-        //  - a native hit/miss pair is the provider's own complete disjoint
-        //    input partition (DeepSeek-style billing has no write bucket); a
-        //    reported inclusive total can only corroborate it, and a mismatch
-        //    is already a partition conflict that clears these lanes below.
-        //  - an inclusive prompt total explained by an explicit nested cache
-        //    read leaves the derived fresh bucket as the exact remainder.
-        // Top-level-only proxy lanes keep the write bucket unknown: their
-        // `prompt_tokens` may be fresh-exclusive, so the partition cannot
-        // close without the write lane.
-        if hit.is_some() && miss.is_some() {
-            return Some(0);
-        }
-        if !native_partition
-            && let Some(read) = nested_read
-            && let Some(total) = prompt
-            && total >= read
-        {
-            return Some(0);
-        }
-        None
-    });
+    // Only an explicit native hit/miss pair proves a complete two-bucket partition.
+    // A total and a read count alone cannot distinguish fresh input from writes.
+    let creation = cache_write
+        .or(nested_write)
+        .or(top_write)
+        .or_else(|| (hit.is_some() && miss.is_some()).then_some(0));
     let cache_total = cached.unwrap_or(0).checked_add(creation.unwrap_or(0));
     let fresh = if native_partition {
         miss.or_else(|| prompt.and_then(|p| cache_total.and_then(|cache| p.checked_sub(cache))))
     } else if inclusive {
-        prompt.and_then(|p| cache_total.and_then(|cache| p.checked_sub(cache)))
+        prompt.and_then(|p| {
+            cached
+                .zip(creation)
+                .and_then(|(read, write)| read.checked_add(write))
+                .and_then(|cache| p.checked_sub(cache))
+        })
     } else {
         prompt
     };
-    let partition_conflict = prompt.is_some_and(|p| {
-        (inclusive && cache_total.is_none_or(|cache| cache > p))
-            || miss.is_some_and(|miss| miss > p)
-            || (native_partition
-                && hit.is_some()
-                && miss.is_some()
-                && miss.and_then(|miss| cache_total.and_then(|cache| miss.checked_add(cache)))
-                    != Some(p))
-    });
+    let partition_conflict = (hit.is_some()
+        && miss.is_some()
+        && creation.is_some_and(|write| write != 0))
+        || prompt.is_some_and(|p| {
+            (inclusive && cache_total.is_none_or(|cache| cache > p))
+                || miss.is_some_and(|miss| miss > p)
+                || (native_partition
+                    && hit.is_some()
+                    && miss.is_some()
+                    && miss.and_then(|miss| cache_total.and_then(|cache| miss.checked_add(cache)))
+                        != Some(p))
+        });
     let mut usage = TokenUsage {
         input_tokens: fresh.unwrap_or(0),
         cached_input_tokens: cached.unwrap_or(0),
@@ -524,7 +522,11 @@ fn parse_openai_usage(
         input_invalid,
         output_invalid,
     };
-    if !presence.any() && !input_invalid && !output_invalid {
+    if !presence.any()
+        && presence.measured_input_tokens.is_none()
+        && !input_invalid
+        && !output_invalid
+    {
         return None;
     }
     usage.quarantine(&mut presence);
@@ -599,7 +601,58 @@ fn parse_disjoint_usage(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn inclusive_prompt_measurement_and_zero_creation_proof() {
+    fn cache_write_alias_rejects_invalid_and_conflicting_evidence() {
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!("bad"),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(31),
+        ] {
+            let raw = serde_json::json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40,"cache_creation_input_tokens":30,"cache_write_tokens":value}});
+            let (_, presence) =
+                super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+            assert!(presence.input_invalid);
+            assert!(!presence.cache_creation_tokens && !presence.fresh_input_tokens);
+            assert!(presence.output_tokens);
+        }
+        let raw = serde_json::json!({"prompt_cache_hit_tokens":40,"prompt_cache_miss_tokens":60,"prompt_tokens_details":{"cache_write_tokens":30}});
+        let (_, presence) =
+            super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+        assert!(!presence.cache_creation_tokens && !presence.fresh_input_tokens);
+    }
+
+    #[test]
+    fn openai_cache_write_alias_and_unknown_partition() {
+        for field in ["cache_write_tokens", "cache_creation_input_tokens"] {
+            let mut raw = serde_json::json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40}});
+            raw["prompt_tokens_details"][field] = serde_json::json!(30);
+            let (usage, presence) =
+                super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.cached_input_tokens,
+                    usage.cache_creation_tokens
+                ),
+                (30, 40, 30)
+            );
+            assert!(presence.fresh_input_tokens && presence.cache_creation_tokens);
+        }
+        for write in [None, Some(serde_json::Value::Null)] {
+            let mut raw = serde_json::json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40}});
+            if let Some(write) = write {
+                raw["prompt_tokens_details"]["cache_write_tokens"] = write;
+            }
+            let (usage, presence) =
+                super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+            assert_eq!(usage.cached_input_tokens, 40);
+            assert_eq!(presence.measured_input_tokens, Some(100));
+            assert!(!presence.fresh_input_tokens && !presence.cache_creation_tokens);
+        }
+    }
+
+    #[test]
+    fn inclusive_prompt_measurement_keeps_unknown_creation() {
         let partial = serde_json::json!({
             "prompt_tokens": 100_000,
             "completion_tokens": 20,
@@ -608,9 +661,8 @@ mod tests {
         let (_, presence) =
             super::parse_usage(super::UsageDialect::OpenAi, partial.as_object().unwrap()).unwrap();
         assert_eq!(presence.measured_input_tokens, Some(100_000));
-        // An inclusive total fully explained by the explicit read bucket
-        // proves a zero write bucket; billing is complete, not unknown.
-        assert!(presence.cache_creation_tokens);
+        assert!(!presence.cache_creation_tokens);
+        assert!(!presence.fresh_input_tokens);
 
         for invalid in [
             serde_json::json!({"prompt_tokens": -1, "completion_tokens": 20}),
@@ -904,7 +956,7 @@ mod tests {
     #[test]
     fn only_same_frame_alias_conflicts_are_irreversible() {
         let conflicting = obj(
-            json!({"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80},"cache_read_input_tokens":30}),
+            json!({"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":0},"cache_read_input_tokens":30}),
         );
         let (usage, presence) = parse_usage(UsageDialect::OpenAi, &conflicting).unwrap();
         assert!(presence.input_invalid);
@@ -917,7 +969,8 @@ mod tests {
             obj(json!({"prompt_tokens":100,"completion_tokens":7,"cache_read_input_tokens":30}));
         let (_, previous) =
             update_openai_usage(&mut accumulated, &first, Default::default()).unwrap();
-        let second = obj(json!({"prompt_tokens_details":{"cached_tokens":80}}));
+        let second =
+            obj(json!({"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":0}}));
         let (usage, presence) = update_openai_usage(&mut accumulated, &second, previous).unwrap();
         assert!(!presence.input_invalid);
         assert_eq!(
@@ -1349,7 +1402,7 @@ mod tests {
         let u = obj(json!({
             "prompt_tokens": 1000,
             "completion_tokens": 50,
-            "prompt_tokens_details": {"cached_tokens": 100}
+            "prompt_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 0}
         }));
         let t = extract_usage(UsageDialect::OpenAi, &u).unwrap();
         assert_eq!(t.input_tokens, 900);
@@ -1411,7 +1464,7 @@ mod tests {
         // double-counting the inclusive total.
         for raw in [
             json!({"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}),
-            json!({"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":800}}),
+            json!({"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":0}}),
         ] {
             let (usage, presence) = parse_usage(UsageDialect::OpenAi, &obj(raw)).unwrap();
             assert!(presence.cache_creation_tokens);
@@ -1482,7 +1535,7 @@ mod tests {
         let reported = obj(json!({
             "prompt_tokens": 18,
             "completion_tokens": 0,
-            "prompt_tokens_details": {"cached_tokens": 0}
+            "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}
         }));
         let presence = extract_usage_presence(UsageDialect::OpenAi, &reported);
         assert!(presence.fresh_input_tokens);
@@ -1564,7 +1617,7 @@ mod tests {
         let u = obj(json!({
             "prompt_tokens": 1000,
             "completion_tokens": 20,
-            "prompt_tokens_details": {"cached_tokens": 300},
+            "prompt_tokens_details": {"cached_tokens": 300, "cache_write_tokens": 0},
             "cache_read_input_tokens": 300
         }));
         let t = extract_usage(UsageDialect::OpenAi, &u).unwrap();
