@@ -22890,12 +22890,20 @@ fn normalize_usage_to_canonical(
     .iter()
     .any(|key| raw.contains_key(*key))
     {
-        // Recompute derived totals, preserving unknown lanes rather than inventing zeros.
-        let mut lanes = raw.clone();
-        lanes.remove("total_tokens");
-        return astra_turn_types::CanonicalTokenUsage::from_json(&Value::Object(lanes))
-            .ok()
-            .and_then(|usage| usage.to_json().as_object().cloned())
+        // Reuse disjoint parsing to quarantine each invalid side independently.
+        let mut lanes = serde_json::Map::new();
+        for (from, to) in [
+            ("input_tokens", "input_tokens"),
+            ("cached_input_tokens", "cache_read_input_tokens"),
+            ("cache_creation_tokens", "cache_creation_input_tokens"),
+            ("output_tokens", "output_tokens"),
+        ] {
+            if let Some(value) = raw.get(from) {
+                lanes.insert(to.into(), value.clone());
+            }
+        }
+        return parse_usage(UsageDialect::AnthropicMessages, &lanes)
+            .map(|(usage, presence)| usage.to_qualified_json_map(presence))
             .unwrap_or_default();
     }
     raw.clone()
@@ -32802,6 +32810,10 @@ mod tests {
 
     #[test]
     fn error_capture_retains_cache_write_partition_and_unknown_lanes() {
+        let invalid = json!({"input_tokens":-1,"output_tokens":7});
+        let actual = normalize_usage_to_canonical(invalid.as_object().unwrap());
+        assert_eq!(actual["output_tokens"], 7);
+        assert!(!actual.contains_key("input_tokens"));
         let full = json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":30}});
         let actual = normalize_usage_to_canonical(full.as_object().unwrap());
         assert_eq!(actual["input_tokens"], 30);
@@ -32871,7 +32883,7 @@ mod tests {
                     .to_string(),
                 );
         let response = llm_capture_error_response(&error);
-        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(17));
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), None);
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(3));
         assert!(
             response["usage"].get("prompt_tokens").is_none(),

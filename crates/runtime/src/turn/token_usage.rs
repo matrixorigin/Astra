@@ -17,9 +17,10 @@
 //! # Per-provider quirks (all normalized here)
 //!
 //! - **OpenAI-compatible**: `usage.prompt_tokens` INCLUDES cached tokens; we
-//!   subtract `prompt_tokens_details.cached_tokens` so `input_tokens` reflects
-//!   only fresh input. Cache creation is rarely surfaced; when present as
-//!   `prompt_tokens_details.cache_creation_input_tokens` we subtract too.
+//!   derive fresh input only when cache-read and cache-write evidence closes
+//!   the partition. An inclusive total remains a context measurement when
+//!   billing lanes are unknown. Both supported nested write aliases normalize
+//!   through the same checked partition.
 //! - **DeepSeek native OpenAI-compatible**: top-level
 //!   `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` are already the
 //!   cached/fresh partition of inclusive `prompt_tokens`.
@@ -468,31 +469,38 @@ fn parse_openai_usage(
         .or(nested_write)
         .or(top_write)
         .or_else(|| (hit.is_some() && miss.is_some()).then_some(0));
-    let cache_total = cached.unwrap_or(0).checked_add(creation.unwrap_or(0));
-    let fresh = if native_partition {
-        miss.or_else(|| prompt.and_then(|p| cache_total.and_then(|cache| p.checked_sub(cache))))
-    } else if inclusive {
-        prompt.and_then(|p| {
+    let derived_fresh = || {
+        prompt.and_then(|total| {
             cached
                 .zip(creation)
                 .and_then(|(read, write)| read.checked_add(write))
-                .and_then(|cache| p.checked_sub(cache))
+                .and_then(|cache| total.checked_sub(cache))
         })
-    } else {
-        prompt
     };
-    let partition_conflict = (hit.is_some()
-        && miss.is_some()
-        && creation.is_some_and(|write| write != 0))
-        || prompt.is_some_and(|p| {
-            (inclusive && cache_total.is_none_or(|cache| cache > p))
-                || miss.is_some_and(|miss| miss > p)
-                || (native_partition
-                    && hit.is_some()
-                    && miss.is_some()
-                    && miss.and_then(|miss| cache_total.and_then(|cache| miss.checked_add(cache)))
-                        != Some(p))
-        });
+    let fresh = if native_partition {
+        miss.or_else(derived_fresh)
+    } else if inclusive {
+        derived_fresh()
+    } else if top_read.is_some() || top_write.is_some() {
+        // Explicit top-level proxy cache lanes select the disjoint dialect.
+        prompt
+    } else {
+        None
+    };
+    let known_sum = [fresh, cached, creation]
+        .into_iter()
+        .flatten()
+        .try_fold(0_u64, u64::checked_add);
+    let partition_conflict =
+        (hit.is_some() && miss.is_some() && creation.is_some_and(|write| write != 0))
+            || prompt.is_some_and(|total| {
+                inclusive
+                    && (known_sum.is_none_or(|sum| sum > total)
+                        || (fresh.is_some()
+                            && cached.is_some()
+                            && creation.is_some()
+                            && known_sum != Some(total)))
+            });
     let mut usage = TokenUsage {
         input_tokens: fresh.unwrap_or(0),
         cached_input_tokens: cached.unwrap_or(0),
@@ -513,6 +521,14 @@ fn parse_openai_usage(
         prompt
     }
     .filter(|_| !input_invalid && !partition_conflict && !alias_conflict);
+    if prompt.zip(output).is_some_and(|(input, output)| {
+        input
+            .checked_add(output)
+            .is_none_or(|sum| i64::try_from(sum).is_err())
+    }) {
+        input_invalid = true;
+        output_invalid = true;
+    }
     let mut presence = TokenUsagePresence {
         fresh_input_tokens: fresh.is_some(),
         cache_read_tokens: cached.is_some(),
@@ -600,6 +616,24 @@ fn parse_disjoint_usage(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn measured_totals_do_not_complete_unknown_partitions() {
+        for raw in [
+            serde_json::json!({"prompt_tokens":100,"completion_tokens":7}),
+            serde_json::json!({"prompt_tokens":100,"completion_tokens":7,"prompt_cache_hit_tokens":40}),
+        ] {
+            let (_, p) =
+                super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+            assert_eq!(p.measured_input_tokens, Some(100));
+            assert!(!p.fresh_input_tokens && !p.cache_creation_tokens);
+        }
+        let raw = serde_json::json!({"prompt_tokens":100,"completion_tokens":7,"prompt_cache_miss_tokens":80,"prompt_tokens_details":{"cached_tokens":10,"cache_write_tokens":30}});
+        let (_, p) =
+            super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+        assert!(!p.fresh_input_tokens && !p.cache_read_tokens && !p.cache_creation_tokens);
+        assert!(p.output_tokens);
+    }
+
     #[test]
     fn cache_write_alias_rejects_invalid_and_conflicting_evidence() {
         for value in [
@@ -1147,6 +1181,12 @@ mod tests {
             assert!(!presence.fresh_input_tokens);
             assert!(presence.output_tokens);
             raw.insert(input.into(), serde_json::json!(0));
+            if dialect == UsageDialect::OpenAi {
+                raw.insert(
+                    "prompt_tokens_details".into(),
+                    serde_json::json!({"cached_tokens":0,"cache_write_tokens":0}),
+                );
+            }
             assert!(extract_usage_presence(dialect, &raw).fresh_input_tokens);
         }
     }
@@ -1369,14 +1409,12 @@ mod tests {
     // ── OpenAI extractor ───────────────────────────────────────────────────
 
     #[test]
-    fn openai_plain_without_cache() {
-        let u = obj(json!({"prompt_tokens": 100, "completion_tokens": 50}));
-        let t = extract_usage(UsageDialect::OpenAi, &u).unwrap();
-        assert_eq!(t.input_tokens, 100);
-        assert_eq!(t.cached_input_tokens, 0);
-        assert_eq!(t.cache_creation_tokens, 0);
-        assert_eq!(t.output_tokens, 50);
-        assert_eq!(t.total_tokens(), 150);
+    fn openai_plain_total_preserves_measurement_without_inventing_fresh() {
+        let u = obj(json!({"prompt_tokens":100,"completion_tokens":50}));
+        let (usage, presence) = parse_usage(UsageDialect::OpenAi, &u).unwrap();
+        assert_eq!(presence.measured_input_tokens, Some(100));
+        assert!(!presence.fresh_input_tokens);
+        assert_eq!(usage.output_tokens, 50);
     }
 
     #[test]
@@ -1479,16 +1517,13 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_native_missing_miss_derives_fresh_from_prompt_total() {
-        let u = obj(json!({
-            "prompt_tokens": 1000,
-            "completion_tokens": 50,
-            "prompt_cache_hit_tokens": 800
-        }));
-        let t = extract_usage(UsageDialect::OpenAi, &u).unwrap();
-        assert_eq!(t.input_tokens, 200);
-        assert_eq!(t.cached_input_tokens, 800);
-        assert_eq!(t.total_tokens(), 1050);
+    fn deepseek_missing_miss_keeps_fresh_unknown() {
+        let u =
+            obj(json!({"prompt_tokens":1000,"completion_tokens":50,"prompt_cache_hit_tokens":800}));
+        let (usage, presence) = parse_usage(UsageDialect::OpenAi, &u).unwrap();
+        assert_eq!(presence.measured_input_tokens, Some(1000));
+        assert_eq!(usage.cached_input_tokens, 800);
+        assert!(!presence.fresh_input_tokens && !presence.cache_creation_tokens);
     }
 
     #[test]
@@ -1544,13 +1579,13 @@ mod tests {
             "an explicitly reported zero is present"
         );
         assert!(presence.cache_read_tokens);
-        // An inclusive total with an explicit read bucket proves a zero write
-        // bucket; a reported zero read is presence, not an unknown lane.
+        // Explicit read/write zeros are evidence; absent lanes remain unknown.
         assert!(presence.cache_creation_tokens);
 
         let partial = obj(json!({"prompt_tokens": 18}));
         let presence = extract_usage_presence(UsageDialect::OpenAi, &partial);
-        assert!(presence.fresh_input_tokens);
+        assert_eq!(presence.measured_input_tokens, Some(18));
+        assert!(!presence.fresh_input_tokens);
         assert!(!presence.output_tokens, "an absent lane is unavailable");
     }
 

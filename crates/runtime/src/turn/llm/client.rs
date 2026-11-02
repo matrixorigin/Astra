@@ -6672,6 +6672,12 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             }
         }
 
+        // The terminal frame owns its delta; subsequent frames may only
+        // refine usage until DONE/EOF or the fixed terminal deadline.
+        if yield_state.is_terminal() {
+            continue;
+        }
+
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
             continue;
         };
@@ -10691,13 +10697,12 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
         let r = parse_nonstream_response_for_provider(&v, "openai", "test-model");
+        assert_eq!(r.usage_presence.measured_input_tokens, Some(10));
+        assert!(!r.usage_presence.fresh_input_tokens);
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.reasoning, "think");
         assert_eq!(r.tool_calls.len(), 1);
-        assert_eq!(
-            r.usage.get("input_tokens").and_then(Value::as_u64),
-            Some(10)
-        );
+        assert_eq!(r.usage.get("input_tokens").and_then(Value::as_u64), None);
         assert_eq!(
             r.usage.get("output_tokens").and_then(Value::as_u64),
             Some(5)
@@ -12122,12 +12127,11 @@ mod tests {
         )
         .await
         .expect("collect");
+        assert_eq!(res.usage_presence.measured_input_tokens, Some(3));
+        assert!(!res.usage_presence.fresh_input_tokens);
         assert_eq!(res.full_text, "Hi there");
         assert_eq!(res.reasoning, "R");
-        assert_eq!(
-            res.usage.get("input_tokens").and_then(Value::as_u64),
-            Some(3)
-        );
+        assert_eq!(res.usage.get("input_tokens").and_then(Value::as_u64), None);
         assert_eq!(
             res.usage.get("output_tokens").and_then(Value::as_u64),
             Some(4)
@@ -12149,7 +12153,7 @@ mod tests {
                     json!({"prompt_tokens": 100}),
                     json!({"completion_tokens": 5}),
                 ],
-                100,
+                0,
                 0,
                 false,
             ),
@@ -12185,6 +12189,7 @@ mod tests {
                     json!({"usage": usage})
                 ))));
             }
+            frames.push(Ok(Bytes::from(format!("data: {}\n\n", json!({"choices":[{"delta":{"content":"late text","tool_calls":[{"index":0,"id":"late-call","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"length"}]})))));
             frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
             let result = collect_llm_stream(
                 stream::iter(frames),
@@ -12197,6 +12202,9 @@ mod tests {
             )
             .await
             .expect("partial usage chunks must converge");
+            assert_eq!(result.full_text, "Hello");
+            assert!(result.tool_calls.is_empty());
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
             let terminal = provider_attempt_terminal_from_result(&result);
             assert_eq!(terminal.usage.input.fresh_input_tokens, expected_fresh);
             assert_eq!(terminal.usage.input.cache_read_tokens, expected_cached);
@@ -12209,7 +12217,7 @@ mod tests {
                     astra_services::InferenceUsageStatus::ProviderPartial
                 }
             );
-            assert!(result.usage_presence.fresh_input_tokens);
+            assert_eq!(result.usage_presence.fresh_input_tokens, expected_fresh > 0);
             assert!(result.usage_presence.output_tokens);
             assert_eq!(result.usage_presence.cache_read_tokens, expected_cached > 0);
             assert_eq!(

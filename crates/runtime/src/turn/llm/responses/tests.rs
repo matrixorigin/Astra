@@ -150,7 +150,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
             .is_some()
     );
     assert!(partial.provider_continuation.is_none());
-    assert_eq!(partial.usage["completion_tokens"], 5);
+    assert_eq!(partial.usage["output_tokens"], 5);
     assert_eq!(limited_attempts.finished.lock().unwrap().len(), 1);
     // Run the same typed terminal through the real Server host and tool
     // executor. The provider's one continuation also exhausts its output cap.
@@ -239,7 +239,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
         .await
         .unwrap();
     assert_eq!(first.tool_calls[0]["id"], "call-1");
-    assert_eq!(first.usage["prompt_tokens"], 20);
+    assert_eq!(first.usage_presence.measured_input_tokens, Some(20));
     let mut calls = first.tool_calls;
     calls[0]["id"] = json!("internal-call");
     calls[0][astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] = json!("call-1");
