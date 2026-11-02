@@ -12148,7 +12148,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_llm_stream_preserves_usage_lanes_across_partial_chunks() {
-        for (updates, expected_fresh, expected_cached) in [
+        for (updates, expected_fresh, expected_cached, expected_creation_known) in [
             (
                 vec![
                     json!({"prompt_tokens": 100}),
@@ -12156,6 +12156,7 @@ mod tests {
                 ],
                 100,
                 0,
+                false,
             ),
             (
                 vec![
@@ -12165,6 +12166,7 @@ mod tests {
                 ],
                 70,
                 30,
+                true,
             ),
             (
                 vec![
@@ -12174,6 +12176,7 @@ mod tests {
                 ],
                 70,
                 30,
+                true,
             ),
         ] {
             let mut frames = vec![Ok(Bytes::from(
@@ -12203,12 +12206,19 @@ mod tests {
             assert_eq!(terminal.usage.output_tokens, 5);
             assert_eq!(
                 terminal.usage_status,
-                astra_services::InferenceUsageStatus::ProviderPartial
+                if expected_creation_known {
+                    astra_services::InferenceUsageStatus::ProviderExact
+                } else {
+                    astra_services::InferenceUsageStatus::ProviderPartial
+                }
             );
             assert!(result.usage_presence.fresh_input_tokens);
             assert!(result.usage_presence.output_tokens);
             assert_eq!(result.usage_presence.cache_read_tokens, expected_cached > 0);
-            assert!(!result.usage_presence.cache_creation_tokens);
+            assert_eq!(
+                result.usage_presence.cache_creation_tokens,
+                expected_creation_known
+            );
         }
     }
 

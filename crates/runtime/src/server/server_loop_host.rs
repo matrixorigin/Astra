@@ -34664,6 +34664,32 @@ mod tests {
 
     #[test]
     fn partial_openai_cache_usage_preserves_measured_request_input() {
+        // A hit-only native payload cannot prove the write bucket, so the
+        // request usage stays partial while the measured input survives.
+        let raw = json!({
+            "prompt_tokens": 100_000,
+            "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 90_000
+        });
+        let (tokens, presence) = crate::turn::token_usage::parse_usage(
+            crate::turn::token_usage::UsageDialect::OpenAi,
+            raw.as_object().unwrap(),
+        )
+        .unwrap();
+        let result = LlmCallResult {
+            full_text: "done".into(),
+            usage: tokens.to_qualified_json_map(presence),
+            usage_presence: presence,
+            ..Default::default()
+        };
+        let accum = ServerAgenticLoopHost::result_to_accum_with_usage(&result, None);
+        assert_eq!(accum.current_request_input_tokens, Some(100_000));
+        assert_eq!(accum.measured_request_input_tokens(), Some(100_000));
+        assert_eq!(accum.current_request_usage, None);
+    }
+
+    #[test]
+    fn openai_nested_cache_usage_promotes_to_complete_request_usage() {
         let raw = json!({
             "prompt_tokens": 100_000,
             "completion_tokens": 20,
@@ -34681,9 +34707,18 @@ mod tests {
             ..Default::default()
         };
         let accum = ServerAgenticLoopHost::result_to_accum_with_usage(&result, None);
-        assert_eq!(accum.current_request_input_tokens, Some(100_000));
         assert_eq!(accum.measured_request_input_tokens(), Some(100_000));
-        assert_eq!(accum.current_request_usage, None);
+        // Inclusive total + explicit read bucket prove the zero write bucket,
+        // so the full physical request usage is known, not partial.
+        assert_eq!(
+            accum.current_request_usage,
+            Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 10_000,
+                cache_read_tokens: 90_000,
+                cache_creation_tokens: 0,
+                output_tokens: 20,
+            })
+        );
     }
 
     #[test]

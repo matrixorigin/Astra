@@ -454,14 +454,29 @@ fn parse_openai_usage(
     let inclusive = native_partition || nested_read.is_some() || nested_write.is_some();
     let cached = hit.or(nested_read).or(top_read);
     let creation = nested_write.or(top_write).or_else(|| {
-        // Explicit fresh/read buckets exhausting the inclusive total prove a
-        // zero creation bucket. Never use a derived fresh value for this proof.
-        match (prompt, hit, miss) {
-            (Some(total), Some(read), Some(fresh)) if read.checked_add(fresh) == Some(total) => {
-                Some(0)
-            }
-            _ => None,
+        // A zero write bucket is provable — never guessed — when the reported
+        // input fields already exhaust the OpenAI-compatible input partition
+        // {fresh, read, creation} without a write lane:
+        //  - a native hit/miss pair is the provider's own complete disjoint
+        //    input partition (DeepSeek-style billing has no write bucket); a
+        //    reported inclusive total can only corroborate it, and a mismatch
+        //    is already a partition conflict that clears these lanes below.
+        //  - an inclusive prompt total explained by an explicit nested cache
+        //    read leaves the derived fresh bucket as the exact remainder.
+        // Top-level-only proxy lanes keep the write bucket unknown: their
+        // `prompt_tokens` may be fresh-exclusive, so the partition cannot
+        // close without the write lane.
+        if hit.is_some() && miss.is_some() {
+            return Some(0);
         }
+        if !native_partition
+            && let Some(read) = nested_read
+            && let Some(total) = prompt
+            && total >= read
+        {
+            return Some(0);
+        }
+        None
     });
     let cache_total = cached.unwrap_or(0).checked_add(creation.unwrap_or(0));
     let fresh = if native_partition {
@@ -584,7 +599,7 @@ fn parse_disjoint_usage(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn inclusive_prompt_measurement_is_independent_of_cache_billing_completeness() {
+    fn inclusive_prompt_measurement_and_zero_creation_proof() {
         let partial = serde_json::json!({
             "prompt_tokens": 100_000,
             "completion_tokens": 20,
@@ -593,7 +608,9 @@ mod tests {
         let (_, presence) =
             super::parse_usage(super::UsageDialect::OpenAi, partial.as_object().unwrap()).unwrap();
         assert_eq!(presence.measured_input_tokens, Some(100_000));
-        assert!(!presence.cache_creation_tokens);
+        // An inclusive total fully explained by the explicit read bucket
+        // proves a zero write bucket; billing is complete, not unknown.
+        assert!(presence.cache_creation_tokens);
 
         for invalid in [
             serde_json::json!({"prompt_tokens": -1, "completion_tokens": 20}),
@@ -604,6 +621,42 @@ mod tests {
                     .unwrap();
             assert_eq!(presence.measured_input_tokens, None);
         }
+    }
+
+    #[test]
+    fn openai_native_hit_miss_without_total_proves_zero_creation() {
+        let (usage, presence) = super::parse_usage(
+            super::UsageDialect::OpenAi,
+            &obj(json!({
+                "prompt_cache_hit_tokens": 90_000,
+                "prompt_cache_miss_tokens": 10_000,
+                "completion_tokens": 20
+            })),
+        )
+        .unwrap();
+        assert_eq!(usage.input_tokens, 10_000);
+        assert_eq!(usage.cached_input_tokens, 90_000);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert!(presence.fresh_input_tokens);
+        assert!(presence.cache_read_tokens);
+        assert!(presence.cache_creation_tokens);
+        assert!(presence.output_tokens);
+    }
+
+    #[test]
+    fn openai_top_level_read_lane_without_write_lane_keeps_creation_unknown() {
+        let (_, presence) = super::parse_usage(
+            super::UsageDialect::OpenAi,
+            &obj(json!({
+                "prompt_tokens": 100,
+                "cache_read_input_tokens": 40,
+                "completion_tokens": 5
+            })),
+        )
+        .unwrap();
+        // Top-level proxy lanes may report a fresh-exclusive `prompt_tokens`;
+        // without the write lane the creation bucket stays unknown.
+        assert!(!presence.cache_creation_tokens);
     }
 
     #[test]
@@ -1341,8 +1394,6 @@ mod tests {
         for raw in [
             json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800}),
             json!({"prompt_tokens":1000,"prompt_cache_miss_tokens":200}),
-            json!({"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}),
-            json!({"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":800}}),
             json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":201}),
             json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200,"cache_creation_input_tokens":"invalid"}),
             json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200,"cache_creation_input_tokens":1}),
@@ -1354,6 +1405,22 @@ mod tests {
                 !usage
                     .to_qualified_json_map(presence)
                     .contains_key("cache_creation_tokens")
+            );
+        }
+        // A complete explicit partition proves the zero write bucket without
+        // double-counting the inclusive total.
+        for raw in [
+            json!({"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}),
+            json!({"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":800}}),
+        ] {
+            let (usage, presence) = parse_usage(UsageDialect::OpenAi, &obj(raw)).unwrap();
+            assert!(presence.cache_creation_tokens);
+            assert_eq!(usage.cache_creation_tokens, 0);
+            assert_eq!(usage.cached_input_tokens, 800);
+            assert_eq!(usage.input_tokens, 200);
+            assert_eq!(
+                usage.to_qualified_json_map(presence)["cache_creation_tokens"],
+                0
             );
         }
     }
@@ -1424,7 +1491,9 @@ mod tests {
             "an explicitly reported zero is present"
         );
         assert!(presence.cache_read_tokens);
-        assert!(!presence.cache_creation_tokens);
+        // An inclusive total with an explicit read bucket proves a zero write
+        // bucket; a reported zero read is presence, not an unknown lane.
+        assert!(presence.cache_creation_tokens);
 
         let partial = obj(json!({"prompt_tokens": 18}));
         let presence = extract_usage_presence(UsageDialect::OpenAi, &partial);

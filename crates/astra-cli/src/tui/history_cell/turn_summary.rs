@@ -395,6 +395,146 @@ mod tests {
         }
     }
 
+    #[test]
+    fn accounted_usage_fallback_still_renders_turn_tokens_and_cache_rate() {
+        use crate::cli::stream::streaming_types::UsageAttribution;
+        use crate::cli::turn::turn_reporting::project_turn_usage;
+        use crate::tui::app_event::TuiAppEvent;
+        use crate::tui::chat_widget::{ChatWidget, TurnContext, translate};
+        // No provider-attempt Explain facts reached this topology, but the
+        // runtime still accounted the turn. The footer must report this turn's
+        // tokens and cache rate instead of only the session total.
+        let attribution = UsageAttribution::default();
+        let accounted = astra_turn_types::CanonicalTokenUsage::new(
+            Some(10_000),
+            Some(90_000),
+            Some(0),
+            Some(20),
+        )
+        .unwrap();
+        let projected = project_turn_usage(&attribution, true, Some(accounted));
+        let ctx = TurnContext {
+            tokens_in: projected.fresh_input_tokens,
+            tokens_out: projected.output_tokens,
+            cache_read_tokens: projected.cache_read_tokens,
+            cache_creation_tokens: projected.cache_creation_tokens,
+            input_usage_complete: projected.input_complete,
+            usage_partial: !projected.complete,
+            cumulative_tokens: Some(145_000),
+            ..Default::default()
+        };
+        let mut widget = ChatWidget::new("accounted-usage");
+        widget.handle_event(translate(TuiAppEvent::TurnComplete, ctx).unwrap());
+        let cell = widget
+            .history()
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<TurnSummaryCell>())
+            .unwrap();
+        let out = render(cell, 120);
+        assert!(out.contains("100.0k tokens"), "{out}");
+        assert!(out.contains("90% cached"), "{out}");
+        assert!(out.contains("145.0k overall"), "{out}");
+    }
+
+    #[test]
+    fn turn_footer_e2e_survives_missing_explain_attribution() {
+        use crate::cli::stream::streaming_types::UsageAttribution;
+        use crate::cli::turn::turn_entry::TurnUsage;
+        use crate::cli::turn::turn_reporting::project_turn_usage;
+        use crate::tui::app_event::TuiAppEvent;
+        use crate::tui::chat_widget::{ChatWidget, TurnContext, translate};
+        // Production wiring, end to end: the server accounted this turn but
+        // delivered no provider-attempt Explain facts — the exact shape that
+        // dropped both the tokens and cache segments from the footer.
+        let mut result = crate::tests::stub_stream_result("done");
+        result.usage_attribution = UsageAttribution::default();
+        result.qualified_usage = astra_turn_types::CanonicalTokenUsage::new(
+            Some(10_000),
+            Some(90_000),
+            Some(0),
+            Some(20),
+        )
+        .ok();
+        // Raw counters exist, but the footer must not need them.
+        result.prompt_tokens = 100_020;
+        result.completion_tokens = 20;
+        result.cache_read_tokens = 90_000;
+        let usage = TurnUsage::from_stream_result(&result).expect("turn usage");
+        let projected = project_turn_usage(
+            &usage.usage_attribution,
+            usage.usage_observed,
+            usage.qualified_usage,
+        );
+        let ctx = TurnContext {
+            elapsed_ms: Some(20_000),
+            ttft_ms: Some(2_200),
+            tools: 3,
+            tokens_in: projected.fresh_input_tokens,
+            tokens_out: projected.output_tokens,
+            cache_read_tokens: projected.cache_read_tokens,
+            cache_creation_tokens: projected.cache_creation_tokens,
+            input_usage_complete: projected.input_complete,
+            usage_partial: !projected.complete,
+            cumulative_tokens: Some(145_000),
+            ..Default::default()
+        };
+        let mut widget = ChatWidget::new("footer-e2e");
+        widget.handle_event(translate(TuiAppEvent::TurnComplete, ctx).unwrap());
+        let cell = widget
+            .history()
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<TurnSummaryCell>())
+            .unwrap();
+        let out = render(cell, 120);
+        assert!(out.contains("100.0k tokens"), "{out}");
+        assert!(out.contains("90% cached"), "{out}");
+        assert!(out.contains("3 tools"), "{out}");
+        assert!(out.contains("145.0k overall"), "{out}");
+    }
+
+    #[test]
+    fn turn_footer_e2e_unknown_write_lane_stays_a_lower_bound() {
+        use crate::cli::stream::streaming_types::UsageAttribution;
+        use crate::cli::turn::turn_entry::TurnUsage;
+        use crate::cli::turn::turn_reporting::project_turn_usage;
+        use crate::tui::app_event::TuiAppEvent;
+        use crate::tui::chat_widget::{ChatWidget, TurnContext, translate};
+        let mut result = crate::tests::stub_stream_result("done");
+        result.usage_attribution = UsageAttribution::default();
+        result.qualified_usage =
+            astra_turn_types::CanonicalTokenUsage::new(Some(10_000), Some(90_000), None, Some(20))
+                .ok();
+        result.prompt_tokens = 100_000;
+        result.completion_tokens = 20;
+        result.cache_read_tokens = 90_000;
+        let usage = TurnUsage::from_stream_result(&result).expect("turn usage");
+        let projected = project_turn_usage(
+            &usage.usage_attribution,
+            usage.usage_observed,
+            usage.qualified_usage,
+        );
+        let ctx = TurnContext {
+            tokens_in: projected.fresh_input_tokens,
+            tokens_out: projected.output_tokens,
+            cache_read_tokens: projected.cache_read_tokens,
+            cache_creation_tokens: projected.cache_creation_tokens,
+            input_usage_complete: projected.input_complete,
+            usage_partial: projected.observed && !projected.complete,
+            ..Default::default()
+        };
+        let mut widget = ChatWidget::new("footer-e2e-partial");
+        widget.handle_event(translate(TuiAppEvent::TurnComplete, ctx).unwrap());
+        let cell = widget
+            .history()
+            .iter()
+            .find_map(|cell| cell.as_any_ref().downcast_ref::<TurnSummaryCell>())
+            .unwrap();
+        let out = render(cell, 120);
+        assert!(out.contains("≥100.0k tokens"), "{out}");
+        assert!(out.contains("≥90.0k cached"), "{out}");
+        assert!(!out.contains('%'), "{out}");
+    }
+
     fn mk_full() -> TurnSummaryCell {
         TurnSummaryCell {
             elapsed_ms: Some(16_600),
