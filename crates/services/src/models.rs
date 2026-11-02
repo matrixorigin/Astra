@@ -6398,7 +6398,7 @@ impl From<ModelListItemResponse> for ModelListItemResponseV2 {
         // require an explicitly negotiated newer catalog format.
         let representable = item
             .thinking_protocol
-            .map_or(true, thinking_protocol_is_catalog_v2_representable);
+            .is_none_or(thinking_protocol_is_catalog_v2_representable);
         Self {
             thinking_protocol: if representable {
                 item.thinking_protocol

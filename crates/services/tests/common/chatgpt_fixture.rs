@@ -44,6 +44,7 @@ pub struct ProviderState {
     pub responses_calls: AtomicUsize,
     pub hold_responses: AtomicBool,
     pub truncate: AtomicBool,
+    pub output_limit: AtomicBool,
     pub unterminated: AtomicBool,
     pub discovery_calls: AtomicUsize,
     pub jwks_calls: AtomicUsize,
@@ -92,6 +93,7 @@ impl ProviderFixture {
             responses_calls: AtomicUsize::new(0),
             hold_responses: AtomicBool::new(false),
             truncate: AtomicBool::new(false),
+            output_limit: AtomicBool::new(false),
             unterminated: AtomicBool::new(false),
             discovery_calls: AtomicUsize::new(0),
             jwks_calls: AtomicUsize::new(0),
@@ -408,7 +410,7 @@ async fn responses(
     } else {
         None
     };
-    let output = if let Some((name, arguments)) = action {
+    let mut output = if let Some((name, arguments)) = action {
         let index = state.responses_calls.load(Ordering::SeqCst);
         json!([{"type":"reasoning","id":format!("reasoning-{index}"),"encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]},
             {"type":"function_call","id":format!("function-{index}"),"namespace":"astra","name":name,"call_id":format!("call-{index}"),"arguments":arguments.to_string(),"status":"completed"}])
@@ -423,6 +425,13 @@ async fn responses(
     } else {
         json!([{"type":"message","id":"message-1","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":if continued {"Continued successfully"} else {"OK"},"annotations":[]}]}])
     };
+    let limited = state.output_limit.load(Ordering::SeqCst);
+    if limited {
+        for item in output.as_array_mut().unwrap() {
+            item["status"] = json!("incomplete");
+        }
+        output.as_array_mut().unwrap().push(json!({"type":"message","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"<invoke name=\"write_file\"><parameter name=\"path\">side-effects.txt</parameter><parameter name=\"content\">executed</parameter></invoke>"}]}));
+    }
     // Subscription streams deliver completed items separately and may omit
     // them from the terminal response's output array.
     let mut events = String::new();
@@ -430,8 +439,13 @@ async fn responses(
         let done = json!({"type":"response.output_item.done","output_index":index,"item":item});
         events.push_str(&format!("data: {done}\n\n"));
     }
-    let event = json!({"type":"response.completed","response":{"id":"response-fixture","status":"completed","model":body["model"],"output":[],
+    let mut event = json!({"type":"response.completed","response":{"id":"response-fixture","status":"completed","model":body["model"],"output":[],
         "usage":{"input_tokens":20,"output_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":2}}}});
+    if limited {
+        event["type"] = json!("response.incomplete");
+        event["response"]["status"] = json!("incomplete");
+        event["response"]["incomplete_details"] = json!({"reason":"max_output_tokens"});
+    }
     (
         StatusCode::OK,
         content,

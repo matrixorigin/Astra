@@ -596,6 +596,17 @@ async fn subscription_connection_ownership_refresh_models_and_disconnect() {
         failed.1.0.error_code.as_deref(),
         Some("subscription_sharing_usage_limit_exceeded")
     );
+    provider.state.output_limit.store(true, Ordering::SeqCst);
+    let partial = service
+        .probe(&owner, &connection, "fixture-model")
+        .await
+        .unwrap_err();
+    provider.state.output_limit.store(false, Ordering::SeqCst);
+    assert_eq!(partial.0, axum::http::StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        partial.1.0.error_code.as_deref(),
+        Some("chatgpt_model_check_failed")
+    );
     provider.state.truncate.store(true, Ordering::SeqCst);
     let failed = service
         .probe(&owner, &connection, "fixture-model")
@@ -1847,6 +1858,7 @@ async fn duplicate_rejection_with_rotated_row_completes_bounded(caller_count: us
     // row-read witnesses, forcing another SQL read and another record — the
     // livelock this regression test bounds.
     let fence_reads_before = binding.fence_reads_for_test();
+    let credential_reads_before = service.credential_row_reads_for_test();
     let callers: Vec<_> = (0..caller_count)
         .map(|_| {
             let service = service.clone();
@@ -1869,15 +1881,16 @@ async fn duplicate_rejection_with_rotated_row_completes_bounded(caller_count: us
         assert_eq!(lease.version(), rotated_version);
         assert!(!lease.bearer().is_empty());
     }
-    // Direct DB-read observation: `fence_reads` (existing e2e-hooks fixture)
-    // counts the `ensure_current` row read each acquire performs. Every
-    // caller must fence exactly once; a witness-severing duplicate record
-    // would force extra reads, so the delta is exactly the caller count.
+    // The revocation fence is separate from credential discovery. Observe both:
+    // each acquire fences once, while cold reads may be avoided by warm winners.
     assert_eq!(
         binding.fence_reads_for_test() - fence_reads_before,
-        caller_count,
-        "each concurrent caller must perform exactly one fence DB read; \
-         additional reads mean a duplicate record severed row-read witnesses"
+        caller_count
+    );
+    let credential_reads = service.credential_row_reads_for_test() - credential_reads_before;
+    assert!(
+        (1..=caller_count).contains(&credential_reads),
+        "no credential read retry is needed for a committed rotated row: {credential_reads}"
     );
     assert_eq!(
         provider.state.refresh_calls.load(Ordering::SeqCst),
@@ -1889,4 +1902,92 @@ async fn duplicate_rejection_with_rotated_row_completes_bounded(caller_count: us
         Some(rotated_version)
     );
     provider.stop().await;
+}
+
+// Each account has an independently rotated row. More than the plaintext
+// cache capacity must not let one account's old 401 invalidate another's read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn cross_connection_rejections_preserve_bounded_progress() {
+    cross_connection_rejections(100).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn thousand_connections_reuse_rotated_credentials_without_read_amplification() {
+    cross_connection_rejections(1000).await;
+}
+
+async fn cross_connection_rejections(count: usize) {
+    let settings = common::require_db_it_env();
+    isolated_database::require_isolated_database(&settings.database);
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    settings.db_pool_max_connections = 1;
+    settings.db_pool_min_connections = 1;
+    let shared = astra_core::SharedPool::new(&settings).await.unwrap();
+    let pool = shared.get().clone();
+    let key = Arc::new(FernetTokenEncryptor::new("cross-connection-rejection-regression").unwrap());
+    let config = ChatgptConfig::for_test("http://127.0.0.1:1");
+    let host = config.host_id.clone();
+    let service = Arc::new(ChatgptConnections::new(
+        Some(shared),
+        key.clone(),
+        Ok(config),
+    ));
+    let owner = uuid::Uuid::new_v4().to_string();
+    let expires = chrono::Utc::now().timestamp() + 3600;
+    let encrypted = key.encrypt(&json!({"access_token":"rotated-fixture-token","refresh_token":null,"scopes":["chatgpt.tokens.use.direct"],"expires_at":expires}).to_string()).unwrap();
+    let ids: Vec<_> = (0..count)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect();
+    let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO user_llm_connections (connection_id,user_id,provider,label,client_id,subject,host_id,status,credentials_encrypted,token_expires_at,credential_version) ",
+    );
+    insert.push_values(&ids, |mut row, id| {
+        row.push_bind(id)
+            .push_bind(&owner)
+            .push_bind("chatgpt")
+            .push_bind("Fixture account")
+            .push_bind("fixture-client")
+            .push_bind(id)
+            .push_bind(&host)
+            .push_bind("connected")
+            .push_bind(&encrypted)
+            .push_bind(expires)
+            .push_bind(2_i64);
+    });
+    insert.build().execute(&pool).await.unwrap();
+    let mut bindings = Vec::with_capacity(count);
+    for id in ids {
+        bindings.push(service.binding(&owner, &id).await.unwrap());
+    }
+    let before = service.credential_row_reads_for_test();
+    let started = std::time::Instant::now();
+    let mut pending = tokio::task::JoinSet::new();
+    for binding in bindings {
+        pending.spawn(async move { binding.acquire(Some(1)).await });
+    }
+    let completed = tokio::time::timeout(
+        std::time::Duration::from_secs(if count == 100 { 4 } else { 15 }),
+        async {
+            let mut completed = 0;
+            while let Some(lease) = pending.join_next().await {
+                assert_eq!(lease.unwrap().unwrap().version(), 2);
+                completed += 1;
+            }
+            completed
+        },
+    )
+    .await
+    .expect("independent accounts must not invalidate each other's reads");
+    assert_eq!(completed, count);
+    assert_eq!(
+        service.credential_row_reads_for_test() - before,
+        count,
+        "each cold connection reads its committed replacement exactly once"
+    );
+    eprintln!(
+        "{count} independent connections completed in {:?} with {count} credential reads",
+        started.elapsed()
+    );
 }

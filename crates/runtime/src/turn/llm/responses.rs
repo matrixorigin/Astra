@@ -140,7 +140,8 @@ fn result(
     model: &str,
     display_model: &str,
 ) -> LlmCallResult {
-    let continuation = output.continuation(connection, model);
+    let continuation = (output.finish_reason.as_deref() != Some("length"))
+        .then(|| output.continuation(connection, model));
     let presence = crate::turn::token_usage::extract_usage_presence(
         crate::turn::token_usage::UsageDialect::OpenAi,
         &output.usage,
@@ -153,7 +154,7 @@ fn result(
         }
     });
     LlmCallResult {
-        provider_continuation: Some(continuation),
+        provider_continuation: continuation,
         response_id: output.response_id,
         full_text: output.text,
         reasoning: output.reasoning,

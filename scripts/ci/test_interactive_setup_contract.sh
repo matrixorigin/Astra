@@ -79,10 +79,11 @@ for completion_state in new personal managed; do
         cli=astra
         admin_state=ready
         active_model_count=0
-        case "$completion_state" in
-            new) admin_state='not configured' ;;
-            managed) active_model_count=2 ;;
-        esac
+        if [[ "$completion_state" == new ]]; then
+            admin_state='not configured'
+        elif [[ "$completion_state" == managed ]]; then
+            active_model_count=2
+        fi
         finish_infrastructure_only
     )"
     grep -Fq 'use /register or /login, then /model' <<< "$completion_output"

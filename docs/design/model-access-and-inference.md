@@ -59,7 +59,14 @@ credentials are stored encrypted. Credentials never enter serializable routes, c
 checkpoints or public errors. The CLI relays only the browser callback and uses
 a loopback listener; Server never reads local CLI/Codex credentials.
 
-Valid-token reads run concurrently. Refresh rotation shares one connection-owned
+Valid-token cache hits run concurrently without cold-path admission. At most 64
+cold credential producers pin connection-local rejection and invalidation
+evidence through row reads and refresh settlement; other cold callers wait
+within their existing caller deadlines. Cache and guard storage remain bounded.
+Unpinned eviction cannot invalidate another connection or drop an active
+producer's evidence. A detached refresh retains its producer pin after waiter
+cancellation. Database generation fences remain authoritative across replicas.
+Refresh rotation shares one connection-owned
 task per generation and a database compare-and-set lease plus the rejected
 credential version. Cancelling an inference or its last waiter does not cancel
 the bounded rotation or its credential commit. Discovery/JWKS metadata is cached
@@ -109,7 +116,14 @@ Inference performs no catalog fetch. The shared `responses_reasoning` adapter
 emits `reasoning.effort`; Model default omits the field. Unsupported effort,
 binary suppression and token-budget requests fail before provider dispatch.
 
-Only completed streams authorize tool dispatch; partial/truncated streams fail.
+Only completed responses authorize tool dispatch and replayable provider state.
+A typed `max_output_tokens` truncation retains partial text, response identity,
+usage and `length` even without output items. It creates neither executable
+calls nor continuation metadata, including when individual function items look
+complete. The existing output-cap owner handles continuation or interruption;
+other incomplete reasons remain failures. Explicitly unfinished saved items
+cannot be replayed. Connectivity probes and summary acceptance reject truncated
+results even when their partial text is nonempty or structurally complete.
 When a completed subscription response has an empty output array, the shared
 codec uses its fully received `response.output_item.done` items. Text deltas
 alone cannot establish a replayable response or authorize tools.

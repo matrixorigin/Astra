@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{MySqlPool, query};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -356,70 +356,114 @@ struct CachedAccessToken {
     generation: i64,
     expires_at: i64,
 }
-/// Verdict for a settled refresh flight. The flight produced its token
-/// without holding the cache lock, so a waiter's rejection check and its
-/// final store do not run atomically: only a token the cache accepted may be
-/// served, and a refused store must be re-adjudicated against the fresher
-/// evidence instead of returning the unexamined plaintext.
-enum SettledFlight {
-    /// The store accepted the token: serve it.
-    Serve(String, i64),
-    /// The store refused the token because fresher evidence landed meanwhile
-    /// (a concurrent 401 for the settled version, an invalidation severing
-    /// the flight witness, or a newer entry). `rejected` is true when the
-    /// settled version is now at or below the recorded 401 floor, so the
-    /// caller must carry that evidence and rotate past it.
-    Retry { rejected: bool },
+/// Result of adjudicating a row or refresh result while its guard is pinned.
+enum CacheVerdict {
+    Serve(String, i64, i64),
+    /// The observed row needs a refresh; carry the effective rejection floor.
+    Refresh(Option<i64>),
+    /// The observed row predates a concurrent rejection of this version.
+    Retry(i64),
+    Invalidated,
 }
-/// Rejection evidence that must outlive any cache entry. Entries are evicted
-/// by rejection, expiry, capacity and disconnect, so the entry alone cannot
-/// prove a version is still servable; this guard state can.
+
 #[derive(Default)]
 struct ConnectionGuard {
-    /// Highest (generation, credential version) the provider already answered
-    /// 401 for, compared lexicographically: versions are monotonic within a
-    /// generation and may restart when a reconnect recreates the registration,
-    /// so nothing at or below the floor may be served or cached again, even
-    /// after the entry that carried the rejection was evicted.
-    rejected_floor: (i64, i64),
+    rejected_floor: Option<(i64, i64)>,
+    invalidated_through: Option<i64>,
+    pins: usize,
 }
+
 #[derive(Default)]
 struct TokenCache {
     entries: HashMap<ConnectionKey, CachedAccessToken>,
     guards: HashMap<ConnectionKey, ConnectionGuard>,
-    /// Invalidation clock, bumped by every local invalidation (disconnect,
-    /// re-auth, reconnect) and every recorded provider 401. It is global and
-    /// monotonic on purpose: a per-connection epoch living in the evictable
-    /// guard map would reset on capacity eviction and let a paused reader's
-    /// store witness alias the recreated state (epoch ABA), resurrecting
-    /// plaintext behind a disconnect. This clock never resets or repeats, so
-    /// no eviction can revive a stale witness. Collateral store refusals on
-    /// unrelated connections are safe: the reader loops and re-evaluates
-    /// against fresher evidence instead of caching.
-    epoch: u64,
 }
+
 impl TokenCache {
-    fn guard_mut(&mut self, key: ConnectionKey) -> &mut ConnectionGuard {
-        if !self.guards.contains_key(&key) {
-            while self.guards.len() >= MAX_CACHED_TOKENS {
-                let Some(victim) = self.guards.keys().next().cloned() else {
-                    break;
-                };
-                self.guards.remove(&victim);
-                // The victim's floor evidence is gone; its cached entry must
-                // not outlive it or it could be served without the floor.
-                self.entries.remove(&victim);
+    /// Record a 401 if its guard is resident. If it is not, prevent another
+    /// hot lookup from serving this generation while the caller waits for a
+    /// producer slot. An entry from a newer generation is left alone.
+    fn note_rejected_version(
+        &mut self,
+        key: &ConnectionKey,
+        generation: i64,
+        version: i64,
+    ) -> bool {
+        let Some(guard) = self.guards.get_mut(key) else {
+            if self
+                .entries
+                .get(key)
+                .is_some_and(|entry| entry.generation <= generation)
+            {
+                self.entries.remove(key);
             }
+            return false;
+        };
+        let rejected = (generation, version);
+        let floor = guard
+            .rejected_floor
+            .map_or(rejected, |old| old.max(rejected));
+        guard.rejected_floor = Some(floor);
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| (entry.generation, entry.version) <= floor)
+        {
+            self.entries.remove(key);
         }
-        self.guards.entry(key).or_default()
+        true
     }
-    /// Witness for `store_cached_token`: the current invalidation clock.
-    fn witness(&self) -> u64 {
-        self.epoch
+
+    /// Merge caller and connection evidence without carrying an old
+    /// generation's rejection into a newer generation.
+    fn rejection_floor(
+        &self,
+        key: &ConnectionKey,
+        generation: i64,
+        rejected_version: Option<i64>,
+    ) -> ApiResult<Option<i64>> {
+        let Some(guard) = self.guards.get(key) else {
+            return Ok(rejected_version);
+        };
+        if guard
+            .invalidated_through
+            .is_some_and(|invalidated| generation <= invalidated)
+        {
+            return Err(reauth());
+        }
+        match guard.rejected_floor {
+            Some((rejected_generation, _)) if rejected_generation > generation => Err(reauth()),
+            Some((rejected_generation, version)) if rejected_generation == generation => Ok(Some(
+                rejected_version.map_or(version, |old| old.max(version)),
+            )),
+            _ => Ok(rejected_version),
+        }
     }
-    /// Sever every outstanding store witness.
-    fn bump_epoch(&mut self) {
-        self.epoch += 1;
+}
+
+/// One cold producer owns one permit and one guard pin. The Arc is shared
+/// with its detached refresh worker; only the last owner releases the pin.
+struct CachePin {
+    service: Weak<ChatgptConnections>,
+    key: ConnectionKey,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for CachePin {
+    fn drop(&mut self) {
+        if let Some(service) = self.service.upgrade() {
+            let mut cache = service.tokens.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = cache
+                .guards
+                .get_mut(&self.key)
+                .expect("a pinned token guard cannot be evicted");
+            guard.pins = guard
+                .pins
+                .checked_sub(1)
+                .expect("token guard pin underflow");
+        }
+        // The permit field is dropped after this method, so another producer
+        // cannot acquire it before the guard becomes evictable.
     }
 }
 struct SigningKeys {
@@ -433,10 +477,13 @@ pub struct ChatgptConnections {
     active: Mutex<HashMap<ConnectionKey, ActiveConnection>>,
     refreshes: Mutex<HashMap<RefreshKey, RefreshWaiter>>,
     tokens: Mutex<TokenCache>,
+    token_producers: Arc<tokio::sync::Semaphore>,
     signing_keys: tokio::sync::Mutex<Option<SigningKeys>>,
     inference_client: OnceLock<reqwest::Client>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     fence_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    credential_row_reads: std::sync::atomic::AtomicUsize,
 }
 impl std::fmt::Debug for ChatgptConnections {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -645,10 +692,13 @@ impl ChatgptConnections {
             active: Mutex::new(HashMap::new()),
             refreshes: Mutex::new(HashMap::new()),
             tokens: Mutex::new(TokenCache::default()),
+            token_producers: Arc::new(tokio::sync::Semaphore::new(MAX_CACHED_TOKENS)),
             signing_keys: tokio::sync::Mutex::new(None),
             inference_client: OnceLock::new(),
             #[cfg(any(test, feature = "e2e-hooks"))]
             fence_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            credential_row_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     fn config(&self) -> ApiResult<&ChatgptConfig> {
@@ -897,6 +947,7 @@ impl ChatgptConnections {
         id: &str,
         generation: i64,
         rejected_version: Option<i64>,
+        pin: &Arc<CachePin>,
     ) -> RefreshWaiter {
         let mut refreshes = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
         let key = (owner.to_owned(), id.to_owned(), generation);
@@ -908,12 +959,13 @@ impl ChatgptConnections {
         let (result, waiter) = tokio::sync::watch::channel(None);
         refreshes.insert(key.clone(), waiter.clone());
         let service = self.clone();
+        let pin = Arc::clone(pin);
         // Rotation belongs to the connection, not an inference's cancellation
         // or deadline. Always finish its bounded exchange and persistence even
         // if every waiter goes away; disconnect still fences its database CAS.
         tokio::spawn(async move {
             let outcome = service
-                .refresh_access_token(&key.0, &key.1, generation, rejected_version)
+                .refresh_access_token(&key.0, &key.1, generation, rejected_version, &pin)
                 .await;
             service
                 .refreshes
@@ -921,6 +973,7 @@ impl ChatgptConnections {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
             result.send_replace(Some(outcome));
+            drop(pin);
         });
         waiter
     }
@@ -1181,10 +1234,12 @@ impl ChatgptConnections {
             for attempt in 0..2 {
                 let connection_id = existing.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
                 let mut tx = CancellationSafeTransaction::begin(&pool).await.map_err(internal_error)?;
-                if existing.is_some() {
-                    let registration: Option<(String,String)> = sqlx::query_as("SELECT client_id,subject FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
+                let replaced_generation = if existing.is_some() {
+                    let registration: Option<(String,String,i64)> = sqlx::query_as("SELECT client_id,subject,generation FROM user_llm_connections WHERE user_id=? AND connection_id=? FOR UPDATE")
                         .bind(owner).bind(&connection_id).fetch_optional(&mut *tx).await.map_err(internal_error)?;
-                    if registration.as_ref() != Some(&(client_id.to_owned(), identity.sub.clone())) { return Err(reauth()); }
+                    let Some((registered_client, registered_subject, old_generation)) = registration else { return Err(reauth()); };
+                    if registered_client != client_id || registered_subject != identity.sub { return Err(reauth()); }
+                    Some(old_generation)
                 } else {
                     let inserted = query("INSERT INTO user_llm_connections (connection_id,user_id,provider,label,client_id,subject,email,host_id,status,credentials_encrypted,token_expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
                         .bind(&connection_id).bind(owner).bind(PROVIDER).bind(&row.label).bind(client_id).bind(&identity.sub).bind(&identity.email)
@@ -1197,7 +1252,8 @@ impl ChatgptConnections {
                         if existing.is_none() { return Err(internal_error(error)); }
                         continue;
                     }
-                }
+                    None
+                };
                 let pending: String = sqlx::query_scalar("SELECT status FROM user_llm_authorizations WHERE user_id=? AND authorization_id=? FOR UPDATE")
                     .bind(owner).bind(id).fetch_one(&mut *tx).await.map_err(internal_error)?;
                 if pending!="exchanging" { return Err(fail(StatusCode::CONFLICT,"oauth_attempt_cancelled","Authorization was cancelled before linking completed")); }
@@ -1213,11 +1269,8 @@ impl ChatgptConnections {
                 query("UPDATE user_llm_authorizations SET status='completed',verifier_encrypted=NULL,callback_digest=?,completed_connection_id=? WHERE user_id=? AND authorization_id=? AND status='exchanging'")
                     .bind(&callback_digest).bind(&connection_id).bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
                 tx.commit().await.map_err(internal_error)?;
-                if existing.is_some() {
-                    // Reconnect replaced the stored credentials: sever every
-                    // store witness taken before this commit so paused readers
-                    // cannot re-insert tokens from the replaced registration.
-                    self.bump_cache_epoch();
+                if let Some(old_generation) = replaced_generation {
+                    self.invalidate_local_connection(owner, &connection_id, old_generation);
                 }
                 return Ok(json!({"connection":self.view(owner,&connection_id).await?}));
             }
@@ -1289,208 +1342,178 @@ impl ChatgptConnections {
             .map_err(|_| internal_error("Stored subscription credentials are invalid"))
     }
 
-    /// Serve a still-valid token without re-reading or re-decrypting the
-    /// stored credentials. The per-request fence read in `ensure_current`
-    /// still gates revocation and reconnects. A version at or below the
-    /// rejected floor is evicted outright: the provider already answered 401
-    /// for it, so no later independent request may be sent out with it again.
+    /// A warm lookup and a 401 record share the cache lock. A missing guard
+    /// makes the caller take the cold path before it can serve the old entry.
     fn cached_access_token(
         &self,
         owner: &str,
         id: &str,
         generation: i64,
         rejected_version: Option<i64>,
-    ) -> Option<(String, i64)> {
+    ) -> ApiResult<Option<(String, i64)>> {
         let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
         let key = (owner.to_owned(), id.to_owned());
-        let rejected = rejected_version
-            .map(|version| (generation, version))
-            .unwrap_or((0, 0))
-            .max(
-                cache
-                    .guards
-                    .get(&key)
-                    .map_or((0, 0), |guard| guard.rejected_floor),
-            );
-        let cached = cache.entries.get(&key)?;
-        if (cached.generation, cached.version) <= rejected {
-            cache.entries.remove(&key);
-            return None;
+        if let Some(version) = rejected_version
+            && !cache.note_rejected_version(&key, generation, version)
+        {
+            return Ok(None);
         }
-        if cached.generation == generation && cached.expires_at > unix_now() + 60 {
-            return Some((cached.token.clone(), cached.version));
-        }
-        // Expired entries are useless and older generations can never be
-        // served again; reclaim both eagerly. A newer-generation entry belongs
-        // to a reconnect this stale caller must not observe or drop.
-        if cached.expires_at <= unix_now() + 60 || cached.generation < generation {
-            cache.entries.remove(&key);
-        }
-        None
-    }
-
-    /// Snapshot the invalidation clock before producing credential evidence
-    /// (a credential-row read or a refresh flight). `store_cached_token`
-    /// refuses any store whose snapshot was overtaken by an invalidation.
-    fn cache_witness(&self) -> u64 {
-        self.tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .witness()
-    }
-
-    /// Record a provider 401 for `version` before touching cache or database
-    /// state, so the evidence survives entry eviction and paused readers. The
-    /// clock bump also severs store witnesses taken before the rejection: the
-    /// floor itself can be capacity-evicted, the clock cannot.
-    fn note_rejected_version(&self, owner: &str, id: &str, generation: i64, version: i64) {
-        let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (owner.to_owned(), id.to_owned());
-        let floor = {
-            let guard = cache.guard_mut(key.clone());
-            if (generation, version) <= guard.rejected_floor {
-                // Recording is idempotent: the floor already covers this
-                // version, so the first record severed every earlier witness
-                // and evicted every covered entry. Re-bumping the clock would
-                // only sever witnesses of concurrent requests holding a valid
-                // rotated token, which then re-read and re-record the same
-                // rejection and sever this caller in turn — under a single
-                // connection pool two such requests can starve each other
-                // indefinitely despite a usable new token.
-                return;
-            }
-            guard.rejected_floor = (generation, version);
-            guard.rejected_floor
+        let floor = cache.rejection_floor(&key, generation, rejected_version)?;
+        let Some(cached) = cache.entries.get(&key) else {
+            return Ok(None);
         };
-        cache.bump_epoch();
-        if cache
-            .entries
-            .get(&key)
-            .is_some_and(|entry| (entry.generation, entry.version) <= floor)
-        {
-            cache.entries.remove(&key);
+        if cached.generation > generation {
+            return Err(reauth());
         }
+        if cached.generation == generation
+            && cached.expires_at > unix_now() + 60
+            && floor.is_none_or(|version| cached.version > version)
+        {
+            return Ok(Some((cached.token.clone(), cached.version)));
+        }
+        cache.entries.remove(&key);
+        Ok(None)
     }
 
-    /// True when (generation, version) is at or below the recorded 401 floor
-    /// and must be neither served nor cached, even if its row read started
-    /// before the rejection was recorded.
-    fn version_is_rejected(&self, owner: &str, id: &str, generation: i64, version: i64) -> bool {
-        self.tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .guards
-            .get(&(owner.to_owned(), id.to_owned()))
-            .is_some_and(|guard| (generation, version) <= guard.rejected_floor)
-    }
-
-    /// Sever every in-flight store witness. Called after the committing
-    /// transaction of a reconnect; disconnect and re-auth use
-    /// `invalidate_local_connection`, which also evicts entries and cancels
-    /// fenced leases.
-    fn bump_cache_epoch(&self) {
-        self.tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .bump_epoch();
-    }
-
-    /// Insert a token, keeping the cache bounded and monotonic: a concurrent
-    /// expired or otherwise stale read must never overwrite a newer entry
-    /// left by a completed refresh or reconnect. `epoch` must be a
-    /// `cache_witness` snapshot taken before the credential evidence was
-    /// produced (row read or refresh flight); a mismatch means a disconnect,
-    /// re-auth, reconnect or recorded 401 landed in between, so re-inserting
-    /// this plaintext could resurrect it behind the invalidation. The clock
-    /// is global and never resets, so guard capacity eviction cannot alias a
-    /// stale witness back into validity. Versions at or below the rejected
-    /// floor already answered 401 and are never cached again. Returns whether
-    /// the token was stored.
-    fn store_cached_token(
-        &self,
+    /// Admit one cold producer. A held permit guarantees that at most 63
+    /// other distinct guards can be pinned, leaving a victim if the guard
+    /// table is full. The permit is retained by the pin, including while a
+    /// detached refresh worker is still running.
+    async fn pin_token_guard(
+        self: &Arc<Self>,
         owner: &str,
         id: &str,
         generation: i64,
-        token: &str,
-        version: i64,
-        expires_at: i64,
-        epoch: u64,
-    ) -> bool {
-        let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        rejected_version: Option<i64>,
+    ) -> ApiResult<Arc<CachePin>> {
+        let permit = self
+            .token_producers
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| unavailable())?;
         let key = (owner.to_owned(), id.to_owned());
-        if cache.witness() != epoch
-            || cache
-                .guards
-                .get(&key)
-                .is_some_and(|guard| (generation, version) <= guard.rejected_floor)
-        {
-            return false;
-        }
-        if let Some(existing) = cache.entries.get(&key)
-            && (existing.generation, existing.version) > (generation, version)
-        {
-            return false;
-        }
-        if !cache.entries.contains_key(&key) {
-            let cutoff = unix_now() + 60;
-            cache.entries.retain(|_, entry| entry.expires_at > cutoff);
-            while cache.entries.len() >= MAX_CACHED_TOKENS {
-                let Some(oldest) = cache
-                    .entries
+        let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if !cache.guards.contains_key(&key) {
+            if cache.guards.len() >= MAX_CACHED_TOKENS {
+                let victim = cache
+                    .guards
                     .iter()
-                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .find(|(_, guard)| guard.pins == 0)
                     .map(|(key, _)| key.clone())
-                else {
-                    break;
-                };
-                cache.entries.remove(&oldest);
+                    .ok_or_else(unavailable)?;
+                let guard = cache.guards.remove(&victim).ok_or_else(unavailable)?;
+                let invalid_entry = guard.invalidated_through.is_some_and(|generation| {
+                    cache
+                        .entries
+                        .get(&victim)
+                        .is_some_and(|entry| entry.generation <= generation)
+                });
+                if guard.rejected_floor.is_some() || invalid_entry {
+                    cache.entries.remove(&victim);
+                }
+            }
+            cache.guards.insert(key.clone(), ConnectionGuard::default());
+        }
+        if let Some(version) = rejected_version {
+            cache.note_rejected_version(&key, generation, version);
+        }
+        cache.rejection_floor(&key, generation, rejected_version)?;
+        cache.guards.get_mut(&key).expect("guard was inserted").pins += 1;
+        drop(cache);
+        Ok(Arc::new(CachePin {
+            service: Arc::downgrade(self),
+            key,
+            _permit: permit,
+        }))
+    }
+
+    /// Adjudicate a row or flight result under the same lock that records
+    /// 401s and lifecycle invalidation. A pin prevents guard eviction until
+    /// after this decision, including when a refresh has lost all waiters.
+    fn adjudicate_candidate(
+        &self,
+        pin: &CachePin,
+        generation: i64,
+        rejected_version: Option<i64>,
+        observed_version: i64,
+        candidate: Option<(String, i64, i64)>,
+    ) -> CacheVerdict {
+        let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if cache
+            .guards
+            .get(&pin.key)
+            .is_none_or(|guard| guard.pins == 0)
+        {
+            return CacheVerdict::Invalidated;
+        }
+        let floor = match cache.rejection_floor(&pin.key, generation, rejected_version) {
+            Ok(floor) => floor,
+            Err(_) => return CacheVerdict::Invalidated,
+        };
+        let now = unix_now();
+        let cutoff = now + 60;
+        if let Some(cached) = cache.entries.get(&pin.key) {
+            if cached.generation > generation {
+                return CacheVerdict::Invalidated;
+            }
+            if cached.generation < generation
+                || cached.expires_at <= cutoff
+                || floor.is_some_and(|version| cached.version <= version)
+            {
+                cache.entries.remove(&pin.key);
+            } else if cached.version > observed_version {
+                return CacheVerdict::Serve(
+                    cached.token.clone(),
+                    cached.version,
+                    cached.expires_at,
+                );
             }
         }
-        cache.entries.insert(
-            key,
-            CachedAccessToken {
-                token: token.to_owned(),
-                version,
-                generation,
-                expires_at,
-            },
-        );
-        true
-    }
-
-    /// Adjudicate a settled refresh flight for serving. The flight produced
-    /// its token without holding the cache lock, so between a waiter's
-    /// rejection check and this store a concurrent caller may have recorded
-    /// a 401 for the settled version, an invalidation may have severed the
-    /// flight witness, or a newer entry may have landed. The store's refusal
-    /// is the authoritative evidence that something changed: serve only a
-    /// token the cache accepted, and report whether the settled version was
-    /// refused as provider-invalid so the caller rotates past the floor
-    /// instead of looping on stale evidence.
-    fn adjudicate_settled_flight(
-        &self,
-        owner: &str,
-        id: &str,
-        generation: i64,
-        token: &str,
-        version: i64,
-        expires_at: i64,
-        flight_epoch: u64,
-    ) -> SettledFlight {
-        if self.store_cached_token(
-            owner,
-            id,
-            generation,
-            token,
-            version,
-            expires_at,
-            flight_epoch,
-        ) {
-            return SettledFlight::Serve(token.to_owned(), version);
+        if let Some(rejected) = floor.filter(|version| observed_version < *version) {
+            // This row or flight settled before a newer version was rejected.
+            // Re-read the committed row rather than rotating an older token.
+            return CacheVerdict::Retry(rejected);
         }
-        SettledFlight::Retry {
-            rejected: self.version_is_rejected(owner, id, generation, version),
+        let Some((token, version, expires_at)) = candidate else {
+            return CacheVerdict::Refresh(floor);
+        };
+        if version != observed_version {
+            return CacheVerdict::Invalidated;
         }
+        if floor.is_some_and(|rejected| version <= rejected) || expires_at <= now {
+            return CacheVerdict::Refresh(floor);
+        }
+        if expires_at > cutoff {
+            if !cache.entries.contains_key(&pin.key) {
+                cache.entries.retain(|_, entry| entry.expires_at > cutoff);
+                while cache.entries.len() >= MAX_CACHED_TOKENS {
+                    let Some(oldest) = cache
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.expires_at)
+                        .map(|(key, _)| key.clone())
+                    else {
+                        break;
+                    };
+                    cache.entries.remove(&oldest);
+                }
+            }
+            cache.entries.insert(
+                pin.key.clone(),
+                CachedAccessToken {
+                    token: token.clone(),
+                    version,
+                    generation,
+                    expires_at,
+                },
+            );
+        } else {
+            // A newly rotated short-lived token can serve this request, but
+            // must not leave an older token available through the hot path.
+            cache.entries.remove(&pin.key);
+        }
+        CacheVerdict::Serve(token, version, expires_at)
     }
 
     /// Drop every local trace of a connection whose database credentials were
@@ -1516,10 +1539,20 @@ impl ChatgptConnections {
         }
         let mut cache = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
         let key = (owner.to_owned(), id.to_owned());
-        cache.entries.remove(&key);
-        // Row reads and refresh flights holding a pre-invalidation clock
-        // witness must fail their store instead of resurrecting plaintext.
-        cache.bump_epoch();
+        if let Some(guard) = cache.guards.get_mut(&key) {
+            guard.invalidated_through = Some(
+                guard
+                    .invalidated_through
+                    .map_or(generation, |old| old.max(generation)),
+            );
+        }
+        if cache
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.generation <= generation)
+        {
+            cache.entries.remove(&key);
+        }
     }
 
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -1530,6 +1563,12 @@ impl ChatgptConnections {
             .entries
             .get(&(owner.to_owned(), id.to_owned()))
             .map(|entry| entry.version)
+    }
+
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn credential_row_reads_for_test(&self) -> usize {
+        self.credential_row_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Test-only cross-instance expiry signal: rewriting the database row
@@ -1551,42 +1590,42 @@ impl ChatgptConnections {
         generation: i64,
         mut rejected_version: Option<i64>,
     ) -> ApiResult<(String, i64)> {
+        if let Some(cached) = self.cached_access_token(owner, id, generation, rejected_version)? {
+            return Ok(cached);
+        }
+        let pin = self
+            .pin_token_guard(owner, id, generation, rejected_version)
+            .await?;
+        let mut stale_row = None;
         loop {
-            // Record the rejection before any cache or row use so the
-            // evidence survives cache eviction and readers paused before it.
-            if let Some(rejected) = rejected_version {
-                self.note_rejected_version(owner, id, generation, rejected);
-            }
-            if let Some(cached) = self.cached_access_token(owner, id, generation, rejected_version)
+            // Another producer may have populated the cache while admission
+            // was pending. Duplicate rejection records are idempotent.
+            if let Some(cached) =
+                self.cached_access_token(owner, id, generation, rejected_version)?
             {
                 return Ok(cached);
             }
-            // Witness the invalidation epoch before the row read: a reader
-            // paused across a disconnect/re-auth must not re-insert the
-            // plaintext it decrypted from pre-invalidation credentials.
-            let epoch = self.cache_witness();
             let row = self.credential_row(owner, id, generation).await?;
-            let mut usable = self.usable_access_token(&row, rejected_version)?;
-            if usable.as_ref().is_some_and(|(_, version, _)| {
-                self.version_is_rejected(owner, id, generation, *version)
-            }) {
-                // This row read started before or beside a 401 for its
-                // version; serve nothing and refresh past the rejected floor.
-                usable = None;
-            }
-            if let Some((token, version, expires_at)) = usable {
-                // A failed store means fresher evidence (an invalidation, a
-                // rejection floor, or a newer entry) landed meanwhile; loop
-                // to re-evaluate against it instead of serving stale state.
-                if self
-                    .store_cached_token(owner, id, generation, &token, version, expires_at, epoch)
-                {
-                    return Ok((token, version));
+            let observed = row.credential_version;
+            let candidate = self.usable_access_token(&row, rejected_version)?;
+            match self.adjudicate_candidate(&pin, generation, rejected_version, observed, candidate)
+            {
+                CacheVerdict::Serve(token, version, _) => return Ok((token, version)),
+                CacheVerdict::Invalidated => return Err(reauth()),
+                CacheVerdict::Retry(rejected) => {
+                    if stale_row == Some((observed, rejected)) {
+                        return Err(unavailable());
+                    }
+                    stale_row = Some((observed, rejected));
+                    rejected_version = Some(rejected);
+                    continue;
                 }
-                continue;
+                CacheVerdict::Refresh(floor) => {
+                    stale_row = None;
+                    rejected_version = floor;
+                }
             }
-            let flight_epoch = self.cache_witness();
-            let mut refresh = self.refresh(owner, id, generation, rejected_version);
+            let mut refresh = self.refresh(owner, id, generation, rejected_version, &pin);
             let (token, version, expires_at) = loop {
                 if let Some(result) = refresh.borrow_and_update().clone() {
                     break result?;
@@ -1599,48 +1638,19 @@ impl ChatgptConnections {
                     )
                 })?;
             };
-            // The flight settled, but a concurrent caller may already have
-            // drawn a 401 for the settled version while the exchange was in
-            // flight. Check the current rejection evidence on this return
-            // path: never issue or cache provider-invalid plaintext; record
-            // the rejection and rotate past the floor instead.
-            if rejected_version != Some(version)
-                && self.version_is_rejected(owner, id, generation, version)
-            {
-                rejected_version = Some(version);
-                continue;
-            }
-            // A caller rejecting the next version may have joined an older
-            // flight that only reused it. That caller must refresh that version.
-            if rejected_version != Some(version) {
-                // Replace the rejected or expired entry so later independent
-                // requests reuse the fresh token instead of re-living the
-                // 401. The rejection check above and this store do not hold
-                // the cache lock across each other: a concurrent 401 for the
-                // settled version, an invalidation severing the flight
-                // witness, or a newer entry can land in between and make the
-                // store refuse the token. Never serve a token the cache
-                // refused; re-adjudicate against the fresher evidence
-                // instead of returning the unexamined plaintext.
-                match self.adjudicate_settled_flight(
-                    owner,
-                    id,
-                    generation,
-                    &token,
-                    version,
-                    expires_at,
-                    flight_epoch,
-                ) {
-                    SettledFlight::Serve(token, version) => return Ok((token, version)),
-                    // The settled version was rejected meanwhile: carry the
-                    // evidence so the next flight rotates past the floor.
-                    SettledFlight::Retry { rejected: true } => {
-                        rejected_version = Some(version);
-                    }
-                    // An invalidation or a newer entry overtook the flight:
-                    // loop to re-evaluate against the fresher state.
-                    SettledFlight::Retry { rejected: false } => {}
-                }
+            // A 401 or disconnect can arrive after the worker's decision but
+            // before this waiter receives the result, so adjudicate again.
+            match self.adjudicate_candidate(
+                &pin,
+                generation,
+                rejected_version,
+                version,
+                Some((token, version, expires_at)),
+            ) {
+                CacheVerdict::Serve(token, version, _) => return Ok((token, version)),
+                CacheVerdict::Invalidated => return Err(reauth()),
+                CacheVerdict::Retry(rejected) => rejected_version = Some(rejected),
+                CacheVerdict::Refresh(floor) => rejected_version = floor,
             }
         }
     }
@@ -1656,6 +1666,9 @@ impl ChatgptConnections {
         let mut connection = CancellationSafePoolConnection::acquire(&pool)
             .await
             .map_err(internal_error)?;
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        self.credential_row_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let row = sqlx::query_as::<_, CredentialRow>(
             "SELECT * FROM user_llm_connections WHERE user_id=? AND connection_id=?",
         )
@@ -1675,7 +1688,9 @@ impl ChatgptConnections {
         row: &CredentialRow,
         rejected_version: Option<i64>,
     ) -> ApiResult<Option<(String, i64, i64)>> {
-        if rejected_version != Some(row.credential_version)
+        // This prefilter avoids decryption of a caller-rejected row. The
+        // pinned guard is still authoritative when the candidate is served.
+        if rejected_version.is_none_or(|version| row.credential_version > version)
             && row.refresh_owner.is_none()
             && row
                 .token_expires_at
@@ -1704,35 +1719,39 @@ impl ChatgptConnections {
         owner: &str,
         id: &str,
         generation: i64,
-        rejected_version: Option<i64>,
+        mut rejected_version: Option<i64>,
+        pin: &CachePin,
     ) -> ApiResult<(String, i64, i64)> {
         let config = self.enabled()?;
         let pool = self.pool()?;
         let mut metadata_ready = false;
         let mut deadline = tokio::time::Instant::now() + Duration::from_secs(35);
         let mut wait = Duration::from_millis(100);
+        let mut stale_row = None;
         loop {
-            // Witness the invalidation epoch before the row read so a racing
-            // disconnect/re-auth cannot find plaintext re-inserted behind it.
-            let epoch = self.cache_witness();
             let row = tokio::time::timeout_at(deadline, self.credential_row(owner, id, generation))
                 .await
                 .map_err(|_| unavailable())??;
-            let mut usable = self.usable_access_token(&row, rejected_version)?;
-            if usable.as_ref().is_some_and(|(_, version, _)| {
-                self.version_is_rejected(owner, id, generation, *version)
-            }) {
-                // This row read started before or beside a 401 for its
-                // version; rotate past the rejected floor instead of serving it.
-                usable = None;
-            }
-            if let Some((token, version, expires_at)) = usable {
-                // A cross-instance refresh may have landed between reads;
-                // replace the local entry so waiters stop bypassing it.
-                self.store_cached_token(owner, id, generation, &token, version, expires_at, epoch);
-                return Ok((token, version, expires_at));
-            }
             let version = row.credential_version;
+            let candidate = self.usable_access_token(&row, rejected_version)?;
+            match self.adjudicate_candidate(pin, generation, rejected_version, version, candidate) {
+                CacheVerdict::Serve(token, version, expires_at) => {
+                    return Ok((token, version, expires_at));
+                }
+                CacheVerdict::Invalidated => return Err(reauth()),
+                CacheVerdict::Retry(rejected) => {
+                    if stale_row == Some((version, rejected)) {
+                        return Err(unavailable());
+                    }
+                    stale_row = Some((version, rejected));
+                    rejected_version = Some(rejected);
+                    continue;
+                }
+                CacheVerdict::Refresh(floor) => {
+                    stale_row = None;
+                    rejected_version = floor;
+                }
+            }
             let encrypted = row.credentials_encrypted.as_deref().ok_or_else(reauth)?;
             if let Some(refresh_owner) = row.refresh_owner.as_deref() {
                 if row.refresh_until.is_none_or(|until| until < unix_now()) {
@@ -1854,15 +1873,24 @@ impl ChatgptConnections {
                     .map_err(|_| unavailable())??;
                 }
             }
-            // A waiter may have drawn a 401 for the settled version while this
-            // leader was still returning. Check the current rejection evidence
-            // on this return path too: never issue provider-invalid plaintext;
-            // loop to rotate past the recorded floor.
             match refresh_result {
-                Ok((_, settled, _)) if self.version_is_rejected(owner, id, generation, settled) => {
-                    continue;
+                Ok((token, version, expires_at)) => {
+                    match self.adjudicate_candidate(
+                        pin,
+                        generation,
+                        rejected_version,
+                        version,
+                        Some((token, version, expires_at)),
+                    ) {
+                        CacheVerdict::Serve(token, version, expires_at) => {
+                            return Ok((token, version, expires_at));
+                        }
+                        CacheVerdict::Invalidated => return Err(reauth()),
+                        CacheVerdict::Retry(rejected) => rejected_version = Some(rejected),
+                        CacheVerdict::Refresh(floor) => rejected_version = floor,
+                    }
                 }
-                result => return result,
+                Err(error) => return Err(error),
             }
         }
     }
@@ -2044,12 +2072,12 @@ impl ChatgptConnections {
             .map_err(|_| internal_error("Invalid subscription response encoding"))?;
         let output = astra_core::model_wire::responses::decode_sse(text)
             .map_err(|reason| model_check_failure(&reason))?;
-        if output.text.trim().is_empty() {
-            tracing::warn!("ChatGPT subscription model check returned no text");
+        if output.finish_reason.as_deref() == Some("length") || output.text.trim().is_empty() {
+            tracing::warn!("ChatGPT subscription model check did not complete with usable text");
             return Err(fail(
                 StatusCode::BAD_GATEWAY,
                 "chatgpt_model_check_failed",
-                "Subscription model check returned no text",
+                "Subscription model check did not complete with usable text",
             ));
         }
         Ok((binding, efforts))
@@ -2064,6 +2092,7 @@ impl ChatgptConnections {
             .bind(owner).bind(id).execute(&mut *tx).await.map_err(internal_error)?;
         if status == "disconnected" && encrypted.is_none() {
             tx.commit().await.map_err(internal_error)?;
+            self.invalidate_local_connection(owner, id, generation);
             return Ok(
                 json!({"connection_id":id,"status":"disconnected","remote_revocation_confirmed":confirmed==Some(1)}),
             );

@@ -103,7 +103,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
     let service = DatabaseModelService::new(settings.clone(), key.clone())
         .with_pool(pool.clone())
         .with_chatgpt_config(config.clone());
-    let replica = DatabaseModelService::new(settings, key)
+    let replica = DatabaseModelService::new(settings.clone(), key.clone())
         .with_pool(pool)
         .with_chatgpt_config(config);
     let owner = format!("runtime-{}", uuid::Uuid::new_v4());
@@ -135,6 +135,103 @@ async fn responses_transport_recovery_and_credential_fencing() {
         json!({"role":"system","content":"Use the admitted tool."}),
         json!({"role":"user","content":"Read the fixture"}),
     ];
+    // A terminal budget hit may contain a function item with valid JSON, but
+    // neither that item nor its private protocol state can authorize execution.
+    provider.state.output_limit.store(true, Ordering::SeqCst);
+    let limited_attempts = Attempts::default();
+    let partial = infer(&admitted, &messages, &tools, &limited_attempts)
+        .await
+        .unwrap();
+    assert_eq!(partial.finish_reason.as_deref(), Some("length"));
+    assert!(partial.tool_calls.is_empty());
+    assert!(
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&partial.full_text)
+            .is_some()
+    );
+    assert!(partial.provider_continuation.is_none());
+    assert_eq!(partial.usage["completion_tokens"], 5);
+    assert_eq!(limited_attempts.finished.lock().unwrap().len(), 1);
+    // Run the same typed terminal through the real Server host and tool
+    // executor. The provider's one continuation also exhausts its output cap.
+    use crate::server::provider_test_support::{
+        ProviderObservationsFixture, bind_server_workspace, loop_state,
+    };
+    use crate::server::tool_transport::{
+        ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+    };
+    use crate::turn::agentic_loop::finalization::run_agentic_loop_with_host;
+    let workspace = tempfile::TempDir::new().unwrap();
+    let session = format!("capped-{}", uuid::Uuid::new_v4());
+    let ledger = ProviderObservationsFixture::default();
+    let mut host = crate::server::server_loop_host::ServerAgenticLoopHostBuilder::new(
+        settings,
+        key,
+        owner.clone(),
+        session.clone(),
+    )
+    .with_provider_observations(ledger.clone())
+    .with_model_service(Some(Arc::new(service.clone())))
+    .with_admitted_model_execution(Some(admitted.clone()))
+    .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
+    .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
+    .with_static_tool_catalog_admissible(true)
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    ))
+    .build();
+    let mut state = loop_state(&session, Vec::new(), "Write the requested file.");
+    state.thinking = ThinkingConfig::ModelDefault;
+    state.owner_user_id = Some(owner.clone());
+    bind_server_workspace(&mut state, workspace.path()).await;
+    state.skills.request_constraints.allowed_tools =
+        Some(["write_file".to_owned()].into_iter().collect());
+    provider.state.scripted.store(true, Ordering::SeqCst);
+    *provider.state.script.lock().unwrap() = vec![
+        (
+            "write_file".into(),
+            json!({"path":"side-effects.txt","content":"executed"})
+        );
+        2
+    ];
+    provider.state.requests.lock().unwrap().clear();
+    run_agentic_loop_with_host(&mut host, &mut state)
+        .await
+        .unwrap();
+    let interruption = state.interruption.as_ref().expect("exhausted output cap");
+    assert_eq!(
+        interruption.kind,
+        astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
+    );
+    assert_eq!(
+        interruption.resume_action,
+        astra_turn_core::interruption::ResumeAction::ContinueImmediately
+    );
+    assert_eq!(state.total_tool_calls, 0);
+    assert!(state.stall.tool_call_records.is_empty());
+    assert!(!workspace.path().join("side-effects.txt").exists());
+    assert!(state.pending_provider_continuation.is_none());
+    assert!(state.messages.iter().all(|message| {
+        message.get("tool_calls").is_none()
+            && message
+                .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                .is_none()
+    }));
+    let requests = provider.state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]["tools"].to_string().contains("write_file"));
+    assert!(requests[1]["input"].as_array().unwrap().iter().all(|item| {
+        !matches!(
+            item["type"].as_str(),
+            Some("function_call" | "function_call_output" | "reasoning")
+        )
+    }));
+    assert!(provider.state.script.lock().unwrap().is_empty());
+    assert_eq!(ledger.attempt_count(), 2);
+    ledger.assert_quiescent();
+    provider.state.scripted.store(false, Ordering::SeqCst);
+    provider.state.output_limit.store(false, Ordering::SeqCst);
+    provider.state.requests.lock().unwrap().clear();
     provider.state.unterminated.store(true, Ordering::SeqCst);
     let attempts = Attempts::default();
     let first = infer(&admitted, &messages, &tools, &attempts)

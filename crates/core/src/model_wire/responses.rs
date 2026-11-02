@@ -112,6 +112,12 @@ impl ResponsesStreamError {
 }
 
 fn replay_item(item: &Value) -> Result<Value, String> {
+    if item
+        .get("status")
+        .is_some_and(|status| !status.is_null() && status != "completed")
+    {
+        return Err("Provider continuation item is unfinished".into());
+    }
     let keys: &[&str] = match item["type"].as_str() {
         Some("message") => {
             if item.get("role").is_some_and(|role| role != "assistant") {
@@ -133,7 +139,9 @@ fn replay_item(item: &Value) -> Result<Value, String> {
     };
     let mut object = Map::new();
     for key in keys {
-        if let Some(value) = item.get(*key) {
+        // Optional null metadata is unexpressed; omit it on replay rather
+        // than turning a valid output null into an invalid input control.
+        if let Some(value) = item.get(*key).filter(|value| !value.is_null()) {
             object.insert((*key).into(), value.clone());
         }
     }
@@ -416,7 +424,7 @@ impl ResponseAccumulator {
                 if response["status"].as_str() == Some("incomplete")
                     && reason == Some("max_output_tokens")
                 {
-                    self.accept_terminal_output(response)?;
+                    self.observe_truncated_output(response)?;
                     self.output.finish_reason = Some("length".into());
                     self.completed = true;
                 } else {
@@ -443,8 +451,56 @@ impl ResponseAccumulator {
         }
         Ok(None)
     }
-    /// Assemble replayable terminal output for a successful terminal event
-    /// (completed, or incomplete by max_output_tokens truncation).
+    /// A typed budget terminal preserves observations, never execution or replay authority.
+    fn observe_truncated_output(&mut self, response: &Value) -> Result<(), ResponsesStreamError> {
+        let items: Vec<&Value> = match response.get("output") {
+            Some(Value::Array(items)) if !items.is_empty() => items.iter().collect(),
+            None | Some(Value::Array(_)) => self.items.values().collect(),
+            _ => {
+                return Err(ResponsesStreamError::Codec(
+                    "Invalid Responses terminal output",
+                ));
+            }
+        };
+        let mut text = String::new();
+        for item in items {
+            match item["type"].as_str() {
+                Some("message") => {
+                    if item["role"] != "assistant" {
+                        return Err(ResponsesStreamError::Codec("Invalid partial message role"));
+                    }
+                    let parts = item["content"]
+                        .as_array()
+                        .ok_or(ResponsesStreamError::Codec(
+                            "Invalid partial message content",
+                        ))?;
+                    for part in parts {
+                        let value = match part["type"].as_str() {
+                            Some("output_text") => part["text"].as_str(),
+                            Some("refusal") => part["refusal"].as_str(),
+                            _ => None,
+                        }
+                        .ok_or(ResponsesStreamError::Codec("Invalid partial message part"))?;
+                        text.push_str(value);
+                    }
+                }
+                Some("reasoning" | "function_call") => {}
+                _ => {
+                    return Err(ResponsesStreamError::Codec(
+                        "Unsupported partial output item",
+                    ));
+                }
+            }
+        }
+        if !text.is_empty() {
+            self.output.text = text;
+        }
+        self.output.items.clear();
+        self.output.tool_calls.clear();
+        Ok(())
+    }
+
+    /// Assemble replayable terminal output for a completed response.
     /// Subscription streams can leave terminal output empty after delivering
     /// complete output_item.done events. Only those finished items are
     /// eligible; text deltas alone cannot replay.
@@ -802,7 +858,8 @@ mod tests {
         let incomplete = json!({"type":"response.incomplete","response":{"id":"resp-9","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":512}}});
         let output = decode_sse(&sse(&[done.clone(), incomplete.clone()])).unwrap();
         assert_eq!(output.text, "partial answer");
-        assert_eq!(output.items, vec![item]);
+        assert!(output.items.is_empty());
+        assert!(output.tool_calls.is_empty());
         assert_eq!(output.finish_reason.as_deref(), Some("length"));
         assert_eq!(output.response_id.as_deref(), Some("resp-9"));
         assert_eq!(output.usage["output_tokens"], 512);
