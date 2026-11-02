@@ -14862,7 +14862,9 @@ impl AgenticRunLifecycleService {
                     }
                 }
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                    run.execution_live = false;
+                    run.settle_execution_projection(
+                        owner_terminal_committed.then_some(persisted_status),
+                    );
                 }
 
                 // Keep the owner lease through terminal CAS/event repair, then
