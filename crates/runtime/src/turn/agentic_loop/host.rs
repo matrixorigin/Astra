@@ -4260,6 +4260,11 @@ impl AgenticLoopState {
         );
     }
 
+    pub(crate) fn initialize_initial_canonical_rewrite_proof(&mut self) {
+        self.canonical_rewrite_state.proof =
+            Some(crate::turn::canonical_commit::CanonicalRewriteProof::from_initial_admission());
+    }
+
     pub(crate) fn initialize_provider_canonical_wal_base(&mut self, durable_prefix: &[Value]) {
         self.provider_canonical_wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(durable_prefix).ok();

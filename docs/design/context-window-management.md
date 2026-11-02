@@ -117,16 +117,30 @@ memory costs; reserving a hypothetical next summary cannot create that pressure.
 
 Acceptance requires a valid admitted canonical rewrite permit and input matching
 either the exact canonical source or the shared pipeline's validated
-provider-placement projection. If that projection re-homed append-only
-authority, its active human-anchored suffix must survive unchanged and is restored
-in canonical history. A stale/unrecognized projection, invalid tool pairing,
-non-reducing candidate, failed summary or cancelled in-flight operation cannot
-install a replacement. Request-local mechanical fallback and final wire budget
-enforcement remain available. On the first canonical turn without an admitted
-rewrite proof, a successful summary stays request-local and preserves the
-existing provider WAL prefix. Prior summary generations are consumed as evidence
-and replaced by the accepted summary, not accumulated. Resume uses the ordinary
-canonical continuation path and retains that summary without another inference.
+provider-placement projection. Semantic summary preparation re-homes runtime
+authority into the fixed budget, so a long human turn can compress its completed
+tool rounds. The actual current human message remains unchanged. Exact active
+authority frames return after the retained conversation in their original
+relative order; consumed frames are retired so removal of their consuming
+assistant messages cannot reactivate them. Mechanical compaction keeps its
+conservative whole-suffix protection.
+
+A stale/unrecognized projection, invalid tool pairing, non-reducing candidate,
+failed summary or cancelled in-flight operation cannot install a replacement.
+Request-local mechanical fallback and final wire budget enforcement remain
+available. The coordinator's first canonical admission authorizes working-set
+rewrites from an empty base; the initial Context commit remains Append, and
+provider WAL replacement still requires the existing exact rewrite proof.
+An empty WAL base alone grants no authority. Prior summary generations are
+consumed as evidence and replaced by the accepted summary, not accumulated.
+Resume uses the ordinary canonical continuation path without another inference.
+
+Only installed canonical savings reset the session's futile-summary counter.
+Request-local savings remain request telemetry and cannot conceal repeated
+rejection. Failed inference and rejected installation count toward the existing
+session breaker; after it opens no further summary inference is dispatched.
+Installation rejection logs identify the failed invariant and distinguish it
+from unavailable or cancelled inference.
 
 Exact-output deduplication is distinct from deciding that an observation is
 obsolete. A repeated path, tool name or read argument does not prove equal

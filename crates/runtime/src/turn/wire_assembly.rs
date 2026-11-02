@@ -3589,6 +3589,7 @@ mod tests {
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
             history_summary: None,
+            summary_attempted: false,
         };
 
         let observation = observe_context_compaction(
@@ -3639,6 +3640,7 @@ mod tests {
             session_memory_context: None,
             retrieved_memory_entries: Vec::new(),
             history_summary: None,
+            summary_attempted: false,
         };
         assert!(
             observe_context_compaction(

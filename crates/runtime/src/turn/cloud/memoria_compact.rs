@@ -1637,6 +1637,7 @@ pub async fn compact_with_memoria(
         && will_summarize
         && result.boundary.is_some()
     {
+        result.summary_attempted = true;
         match astra_turn_core::cloud_summary::generate_compact_summary(messages, s_client).await {
             Some(summary) => {
                 let summary = truncate_summary_for_budget(summary, cfg.summary_token_budget);

@@ -593,6 +593,8 @@ impl AgenticRunLifecycleService {
                 &cursor.canonical_root_hash,
                 cursor.compaction_generation,
             );
+        } else if canonical.prior_messages.is_empty() {
+            state.initialize_initial_canonical_rewrite_proof();
         }
         host.restore_handoff_continuation(&mut state, &handoff, &canonical.prior_messages)
             .await

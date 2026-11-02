@@ -2386,10 +2386,20 @@ impl ChatWidget {
                                     .run_id
                                     .as_deref()
                                     .is_some_and(|run_id| present.contains(run_id));
-                            if projection.state.source == AgentProjectionSource::DurableServer
-                                && !present_by_canonical_identity
-                            {
-                                projection.mark_stale_if_active();
+                            if !present_by_canonical_identity {
+                                match projection.state.source {
+                                    AgentProjectionSource::DurableServer => {
+                                        projection.mark_stale_if_active();
+                                    }
+                                    // An absent live/provisional row is not proof
+                                    // of termination. It also cannot keep claiming
+                                    // active work against a complete server view.
+                                    AgentProjectionSource::LiveStream
+                                    | AgentProjectionSource::LocalIntent => {
+                                        projection.mark_unconfirmed_if_active();
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -10458,6 +10468,92 @@ mod tests {
             rows[0].state.confidence,
             AgentProjectionConfidence::Confirmed
         );
+    }
+
+    #[test]
+    fn durable_terminal_does_not_bind_an_unbound_row_by_reusable_profile() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        let mut widget = fresh();
+        widget.on_agent_control_started(
+            "spawn".into(),
+            "Review".into(),
+            "spawn-review".into(),
+            Some("reviewer".into()),
+            None,
+            None,
+        );
+        let completed = server_run_node("run-1", SessionRunLifecycleStatus::Completed, 3);
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![completed.clone()],
+            false,
+        ));
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].agent_id, "reviewer");
+        assert!(rows[0].run_id.is_none());
+        assert_eq!(
+            rows[0].state.confidence,
+            AgentProjectionConfidence::Unconfirmed
+        );
+        assert!(!rows.iter().any(|row| row.state.is_actionable_active()));
+        assert_eq!(
+            widget.agent_run_state("run-1").unwrap().status,
+            AgentRunStatus::Completed
+        );
+
+        // A reused profile is a new execution, never a rewrite of the old row.
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![
+                completed,
+                server_run_node("run-2", SessionRunLifecycleStatus::Running, 1),
+            ],
+            false,
+        ));
+        assert_eq!(
+            widget.agent_run_state("run-1").unwrap().status,
+            AgentRunStatus::Completed
+        );
+        assert_eq!(
+            widget.agent_run_state("run-2").unwrap().status,
+            AgentRunStatus::Running
+        );
+    }
+
+    #[test]
+    fn complete_server_snapshot_stops_provisional_rows_claiming_live_work() {
+        for truncated in [false, true] {
+            let mut widget = fresh();
+            widget.on_agent_control_started(
+                "spawn".into(),
+                "Review".into(),
+                "spawn-review".into(),
+                None,
+                None,
+                None,
+            );
+            let key = provisional_agent_key("spawn-review");
+            widget.reconcile_server_agent_projection(&server_agent_projection(
+                crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+                vec![server_run_node(
+                    "run-1",
+                    astra_thin_client::SessionRunLifecycleStatus::Completed,
+                    3,
+                )],
+                truncated,
+            ));
+            let state = widget.agent_run_state(&key).unwrap();
+            assert_eq!(state.is_actionable_active(), truncated);
+            assert!(
+                !state.status.is_terminal(),
+                "absence cannot invent an outcome"
+            );
+            if !truncated {
+                assert_eq!(state.confidence, AgentProjectionConfidence::Unconfirmed);
+            }
+        }
     }
 
     #[test]

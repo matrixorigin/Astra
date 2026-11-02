@@ -177,6 +177,17 @@ permission to reconcile by text, completion status, or the latest commit cursor.
 This reconciliation uses the existing transcript page; it requires no extra
 database lookup. Parent and child views apply the same identity contract.
 
+Agent activity reconciles by Run identity or an exact typed launch receipt,
+never by reusable profile or display name. A complete Server tree degrades absent
+live/provisional rows to unconfirmed observations; they do not count as live
+work. Absence never proves a terminal outcome, and a truncated tree cannot
+degrade omitted rows. Local runtime and journal facts keep their own authority.
+
+A terminal notification racing an in-flight transcript read schedules one fresh
+read after that request settles, including after failure. It does not start an
+automatic retry loop. An unbound transcript accepts a live gap only for its own
+agent; once bound, the exact Run identity fences all updates.
+
 Tool terminal projections preserve execution facts independently of display
 previews. `executed` describes this call: `false` means no execution, `true`
 means execution occurred, and explicit `null` means execution cannot be

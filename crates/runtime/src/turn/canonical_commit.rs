@@ -83,6 +83,14 @@ impl CanonicalRewriteProof {
         }
     }
 
+    /// A coordinator-admitted first turn has no immutable manifest prefix.
+    /// Its working history may shrink, while the WAL still verifies each
+    /// replacement. The empty manifest marker is never used for a Replace
+    /// Context commit: initial commits remain Append from an empty base.
+    pub(crate) fn from_initial_admission() -> Self {
+        Self::from_materialized_admission(&[], "", 0)
+    }
+
     pub(crate) fn begin(&self, messages: &[Value]) -> CanonicalRewritePermit {
         let valid = self.valid
             && messages.len() >= self.authorized_prefix_len
@@ -313,6 +321,51 @@ fn is_structured_tool_result(message: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn initial_admission_compaction_preserves_append_commit_and_wal_recovery() {
+        let original = vec![
+            json!({"role":"user", "content":"work"}),
+            json!({"role":"assistant", "content":"large evidence"}),
+        ];
+        let rewritten = vec![
+            json!({"role":"user", "content":"work"}),
+            json!({"role":"assistant", "content":"summary"}),
+        ];
+        let base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[]).unwrap();
+        let mut proof = CanonicalRewriteProof::from_initial_admission();
+        let permit = proof.begin(&original);
+        assert!(permit.is_valid());
+        proof.finish(permit, &rewritten, Some(&base));
+        let authorization = proof
+            .provider_wal_replacement_authorization(&base, &rewritten)
+            .unwrap();
+        let transition =
+            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+                None,
+                base.clone(),
+                authorization.generation,
+                &rewritten,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut recovered = Vec::new();
+        transition.apply_to(&mut recovered).unwrap();
+        let mut resumed = CanonicalRewriteProof::from_initial_admission();
+        resumed
+            .recover_provider_wal_replacement(&base, &transition, &recovered)
+            .unwrap();
+        assert!(resumed.begin(&recovered).is_valid());
+        let (mode, _) = canonical_commit_delta(&[], false, &recovered, Some(&resumed), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+        assert!(
+            resumed
+                .provider_wal_replacement_authorization(&base, &recovered)
+                .is_none()
+        );
+    }
 
     fn authority() -> Value {
         let content = astra_turn_types::render_append_only_runtime_authority_frame(

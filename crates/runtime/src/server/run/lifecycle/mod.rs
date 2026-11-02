@@ -15573,6 +15573,9 @@ impl AgenticRunLifecycleService {
             )?;
             if let Some(admission) = canonical_turn.as_ref() {
                 state.initialize_provider_canonical_wal_base(&admission.prior_messages);
+                if !admission.had_canonical_head && admission.prior_messages.is_empty() {
+                    state.initialize_initial_canonical_rewrite_proof();
+                }
             }
             if let Some(admission) = canonical_turn.as_ref()
                 && admission.had_canonical_head
