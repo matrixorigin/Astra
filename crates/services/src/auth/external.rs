@@ -563,7 +563,7 @@ impl HttpExternalProviderClient {
         Arc::new(Self)
     }
 
-    async fn post_action<T, R>(
+    pub(super) async fn post_action<T, R>(
         &self,
         provider: &ExternalAuthProviderConfig,
         action: &'static str,
