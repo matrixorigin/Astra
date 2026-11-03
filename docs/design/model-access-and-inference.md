@@ -1058,6 +1058,18 @@ enum InferenceStreamEvent {
 
 Provider adapters translate the canonical contract to OpenAI, Anthropic, Bedrock, local, or other supported protocols. Adapter differences do not leak into agent state-machine behavior.
 
+The OpenAI-compatible usage normalizer also accepts the documented
+[OpenCode usage extension](https://dev.opencode.ai/v2/docs/console/api/inference#cost).
+`opencode.tokens.input`, `cache_read`, and `output` are disjoint fresh input,
+cached input, and output evidence. Output already includes reasoning. The checked
+sum of `cache_write_5m` and `cache_write_1h` is cache-creation evidence only when
+both counts are reported; a missing lifetime is unknown, not zero. Mirrored
+generic and OpenCode fields must agree, and a complete input partition must
+match the inclusive prompt total. The existing streaming collector retains
+partial cumulative samples and rejects invalid or contradictory raw evidence.
+This extends usage normalization, not the model invocation protocol or billing
+authority; it does not introduce another run lifecycle.
+
 OpenAI-compatible response decoding accepts string `reasoning_content` and
 `reasoning` fields in both streamed deltas and non-streaming assistant messages.
 The first nonempty string in that order is used once; mirrored fields are not

@@ -12405,6 +12405,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_opencode_usage_reaches_provider_accounting() {
+        let frame = json!({
+            "choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],
+            "usage":{
+                "prompt_tokens":17774, "completion_tokens":1051,
+                "prompt_tokens_details":{"cached_tokens":9600},
+                "opencode":{"tokens":{
+                    "input":8174,"output":1051,"reasoning":537,
+                    "cache_read":9600,"cache_write_5m":0,"cache_write_1h":0
+                }}
+            }
+        });
+        let result = collect_llm_stream(
+            stream::iter(vec![Ok(Bytes::from(format!(
+                "data: {frame}\n\ndata: [DONE]\n\n"
+            )))]),
+            "opencode-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .expect("OpenCode stream completes");
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(result.usage["input_tokens"], 8174);
+        assert_eq!(result.usage["cache_creation_tokens"], 0);
+        let terminal = provider_attempt_terminal_from_result(&result);
+        assert_eq!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::ProviderExact
+        );
+        assert_eq!(terminal.usage.input.fresh_input_tokens, 8174);
+        assert_eq!(terminal.usage.input.cache_read_tokens, 9600);
+        assert_eq!(terminal.usage.output_tokens, 1051);
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_preserves_usage_lanes_across_partial_chunks() {
         for (updates, expected_fresh, expected_cached, expected_creation_known) in [
             (
