@@ -42425,7 +42425,9 @@ mod tests {
 
         state.max_turns = state.agentic_turn_budget.initial_turns;
         let old_limit = state.max_turns;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(old_limit);
         state.remaining_turns = 0;
+        state.charged_iterations = u64::try_from(old_limit).unwrap();
         let prepared =
             crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 2)
                 .await
@@ -42440,7 +42442,7 @@ mod tests {
         );
         assert_eq!(
             state.max_turns, old_limit,
-            "rejected repetition cannot renew execution indefinitely"
+            "rejected repetition cannot extend an explicit execution limit"
         );
     }
 
