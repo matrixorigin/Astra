@@ -383,8 +383,10 @@ prior capability may remain available while diagnostics record the latest error.
 
 For an administrator-managed API-key model that requires the OpenAI Responses
 API, set `inference_protocol: openai_responses` in its YAML entry and reload it
-with `astra admin model load .models.yaml --update-existing`. The Responses
-adapter currently accepts text inputs and does not accept fixed temperature or
+with `astra admin model load .models.yaml --update-existing`. Set
+`thinking_protocol: responses_reasoning`, or omit `thinking_protocol` to use
+that default. Replace any existing `thinking_protocol: reasoning_effort`, which
+is incompatible with Responses. The Responses adapter currently accepts text inputs and does not accept fixed temperature or
 arbitrary request-body overrides. Other model entries retain their existing
 transport. This option applies to administrator-managed models.
 For selectable reasoning levels, declare only verified values in
