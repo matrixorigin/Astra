@@ -590,8 +590,11 @@ async fn session_continuation_restores_paused_primary_attempt_before_model_execu
 }
 
 #[tokio::test]
-async fn admission_freezes_default_wall_time_and_preserves_explicit_or_inherited_cutoffs() {
-    let service = test_service();
+#[serial_test::serial]
+async fn admission_keeps_absent_wall_limits_and_preserves_explicit_or_inherited_cutoffs() {
+    let _timeout = EnvVarGuard::remove("ASTRA_TURN_TIMEOUT_S");
+    let service =
+        test_service().with_runtime_config(&astra_core::config::ServerRuntimeConfig::default());
     for requested in [None, Some(0), Some(900)] {
         let mut request = test_request("admit without executing a model");
         request.model = None;
@@ -605,17 +608,15 @@ async fn admission_freezes_default_wall_time_and_preserves_explicit_or_inherited
             .prepare_chat_request("user-1", request)
             .await
             .unwrap();
-        let expected = requested.unwrap_or(
-            *astra_core::RuntimeLimits::global()
-                .turn_timeout_s
-                .as_ref()
-                .unwrap(),
-        );
         assert_eq!(
-            admitted.execution_time_budget.unwrap().remaining_seconds,
-            expected
+            admitted
+                .execution_time_budget
+                .map(|budget| budget.remaining_seconds),
+            requested
         );
-        let cutoff = admitted.admitted_execution_deadline.unwrap().snapshot();
+        let cutoff = admitted
+            .admitted_execution_deadline
+            .map(|deadline| deadline.snapshot());
         // Re-enter admission with trusted time authority only; model admission
         // is separately validated and cannot be replayed as client input.
         let mut continuation = test_request("continue with original deadline");
@@ -629,7 +630,9 @@ async fn admission_freezes_default_wall_time_and_preserves_explicit_or_inherited
             .await
             .unwrap();
         assert_eq!(
-            repeated.admitted_execution_deadline.unwrap().snapshot(),
+            repeated
+                .admitted_execution_deadline
+                .map(|deadline| deadline.snapshot()),
             cutoff,
             "a continuation must not re-anchor elapsed time"
         );
@@ -8306,7 +8309,7 @@ fn subrun_turn_budget_treats_explicit_spawn_budget_as_authoritative_ceiling() {
 }
 
 #[test]
-fn subrun_turn_budget_respects_spawn_budget_above_profile_hard_limit() {
+fn subrun_turn_budget_respects_explicit_limit_above_the_profile_slice() {
     let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
         "answer this small question",
     );
@@ -8328,7 +8331,7 @@ fn subrun_explicit_ceiling_can_have_a_smaller_adaptive_initial_slice() {
     let budget = resolve_subrun_agentic_turn_budget(profile, None, Some(40), Some(10))
         .expect("valid test budget");
 
-    assert_eq!(budget.initial_turns, 40);
+    assert_eq!(budget.initial_turns, 10);
     assert_eq!(budget.hard_turn_limit, std::num::NonZeroUsize::new(40));
 }
 
@@ -8344,7 +8347,7 @@ fn subrun_persona_default_is_a_renewable_initial_slice() {
         .expect("valid test budget");
 
     assert_eq!(budget.initial_turns, 12);
-    assert_eq!(budget.hard_turn_limit, std::num::NonZeroUsize::new(12));
+    assert_eq!(budget.hard_turn_limit, None);
 }
 
 #[test]
@@ -29535,8 +29538,8 @@ fn build_initial_state_applies_execution_budget_override() {
         hard_turn_limit: Some(9),
     });
     let state = svc.build_initial_state("test-user", &req, "s", "r", None, None, None);
-    assert_eq!(state.max_turns, 9);
-    assert_eq!(state.remaining_turns, 9);
+    assert_eq!(state.max_turns, 4);
+    assert_eq!(state.remaining_turns, 4);
     assert_eq!(
         state.agentic_turn_budget.hard_turn_limit,
         std::num::NonZeroUsize::new(9)
@@ -30210,8 +30213,8 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_request_budget() {
         )
         .expect("valid test execution configuration");
 
-    assert_eq!(state.max_turns, 12);
-    assert_eq!(state.remaining_turns, 12);
+    assert_eq!(state.max_turns, 8);
+    assert_eq!(state.remaining_turns, 8);
     assert_eq!(
         state.agentic_turn_budget.hard_turn_limit,
         std::num::NonZeroUsize::new(12)

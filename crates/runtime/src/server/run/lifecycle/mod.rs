@@ -5580,7 +5580,7 @@ impl RunExecutionCapacity {
 }
 
 pub struct AgenticRunLifecycleService {
-    default_execution_timeout_s: Result<u64, String>,
+    default_execution_timeout_s: Result<Option<u64>, String>,
     /// Process-local run handles (run_id -> state) for live cancellation, pause,
     /// and active SSE fanout. Durable state is the user-visible authority.
     runs: Arc<RwLock<HashMap<String, RunState>>>,
@@ -9629,9 +9629,10 @@ impl AgenticRunLifecycleService {
                         "runtime_timeout_invalid",
                     )
                 })?;
-                request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
-                    remaining_seconds: *seconds,
-                });
+                request.execution_time_budget =
+                    seconds.map(|seconds| astra_services::runs::ExecutionTimeBudget {
+                        remaining_seconds: seconds,
+                    });
             }
             let now_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

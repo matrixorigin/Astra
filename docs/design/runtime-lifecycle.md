@@ -461,12 +461,28 @@ An `authority_lost` receipt still fails closed.
 
 ### Bounded continuation and completion
 
-Root and child admission resolve one finite round allowance from the task
-profile, explicit caller limit and administrator ceiling. The admitted limit
-includes final reporting and explicit Work settlement. Activity, successful
-mutations, retry, reconnect and recovery never refill that allowance. Children
-also retain the parent's original execution deadline; restoring a remaining
-duration cannot create a new clock window.
+Task profiles and persona hints size internal execution slices for roots and
+children; they do not limit the lifetime of the user's task. The shared loop
+renews the existing iteration boundary before a slice can trigger final
+reporting or child cancellation. Cumulative charged iterations are preserved
+in checkpoints. Waiting for input does not charge model iterations, and a
+restored input wait can cross a slice boundary without cancelling its children.
+
+Explicit caller limits and administrator configuration can impose a total round
+or wall-clock limit. Admission intersects round ceilings and freezes the effective
+limits, including final reporting and explicit Work settlement; slice renewal,
+activity, retry, reconnect and recovery cannot expand them. An omitted total time
+limit stays absent. Children retain the parent's original execution deadline
+when present; restoring a remaining
+duration cannot create a new clock window. Per-operation timeouts, cancellation,
+capacity admission and execution-health checks remain independent.
+
+The existing infrastructure circuit breaker retains its independent absolute
+round ceiling (1000 by default) as a final runaway-execution backstop. Slice
+renewal and recovery do not reset its observations. Reaching that ceiling stops
+before another provider call, cancels unfinished children through the canonical
+runtime cancellation owner, and checkpoints an incomplete result. Repetition
+advice alone never establishes that a legitimate long investigation has stalled.
 
 Ordinary conversation does not acquire a runtime requirement to mutate a
 workspace, execute a matching completion action or perform a post-mutation
@@ -475,7 +491,7 @@ caller-declared verification hooks and canonical Work validation keep their
 own contracts. No prose, generic successful tool or inferred task profile can
 settle an unknown external effect, pending child or newer Work owner.
 
-The runtime reserves reporting/settlement space inside the admitted allowance.
+The runtime reserves reporting/settlement space inside an explicit allowance.
 When it cannot fit, it preserves partial text and tool facts and closes with a
 truthful incomplete result. Useful output is not erased to narrate an internal
 completion obligation. Old execution snapshots containing the retired renewal

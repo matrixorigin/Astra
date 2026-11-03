@@ -967,7 +967,7 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     astra_turn_types::is_runtime_owned_message(message)
 }
 
-/// Give the model a bounded execution horizon while there is still enough
+/// Give the model an explicit round limit while there is still enough
 /// authority to change course. The runtime already records this fact in
 /// telemetry, but telemetry is not model context. Keeping the reminder in the
 /// volatile tail preserves the stable prompt-cache prefix.
@@ -976,12 +976,11 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
 /// authority and it does not infer anything from the task text. Settlement
 /// windows carry their own stricter typed instruction and therefore suppress
 /// this reminder at the call site.
-pub fn execution_slice_guidance(
+pub fn execution_round_limit_guidance(
     remaining_after_current: usize,
-    slice_round_limit: usize,
-    may_receive_adaptive_renewal: bool,
+    hard_round_limit: usize,
 ) -> String {
-    if slice_round_limit == 0 {
+    if hard_round_limit == 0 {
         return String::new();
     }
 
@@ -996,23 +995,21 @@ pub fn execution_slice_guidance(
     // whole budget on every round. A quarter-slice reminder is useful for
     // small caller budgets; the cap avoids eight-plus rounds of repeated
     // guidance on large runs.
-    let reminder_threshold = slice_round_limit.div_ceil(4).clamp(2, 8);
+    let reminder_threshold = hard_round_limit.div_ceil(4).clamp(2, 8);
     if available_boundaries > reminder_threshold {
         return String::new();
     }
 
-    let instruction = if may_receive_adaptive_renewal {
-        "This is an adaptive capacity checkpoint, not a task-completion boundary. Renewal is not evidence of progress or unfinished work and does not expand the user request. Continue only for an unmet authorized objective; if the requested work is complete, return the result now. Base completion claims on actual execution evidence, not the requested outcome, and explicitly label unresolved gaps."
-    } else if available_boundaries == 1 {
+    let instruction = if available_boundaries == 1 {
         "This is the final model boundary. Do not call any tool or begin another check. Return the best truthful result from retained evidence now, explicitly labeling unresolved gaps."
     } else if available_boundaries == 2 {
-        "The current execution slice is nearly complete. Make at most one smallest decisive acceptance check only when essential, then use the final boundary for truthful settlement; do not begin a broad new investigation."
+        "The configured round limit is nearly reached. Make at most one smallest decisive acceptance check only when essential, then use the final boundary for truthful settlement; do not begin a broad new investigation."
     } else {
-        "The current execution slice is approaching review. Close the active objective: combine compatible work, prefer decisive acceptance evidence, and do not assume another slice will be granted."
+        "The configured round limit is approaching. Close the active objective: combine compatible work, prefer decisive acceptance evidence, and do not assume additional rounds will be granted."
     };
     format!(
-        "<execution-slice>\n{{\"available_model_boundaries_including_current\":{available_boundaries},\"slice_round_limit\":{slice_round_limit},\"authority\":\"advisory_only\",\"instruction\":{}}}\n</execution-slice>",
-        serde_json::to_string(instruction).expect("static execution-slice instruction serializes")
+        "<execution-round-limit>\n{{\"available_model_boundaries_including_current\":{available_boundaries},\"hard_round_limit\":{hard_round_limit},\"authority\":\"advisory_only\",\"instruction\":{}}}\n</execution-round-limit>",
+        serde_json::to_string(instruction).expect("static execution-limit instruction serializes")
     )
 }
 
@@ -1729,38 +1726,24 @@ mod tests {
     }
 
     #[test]
-    fn execution_slice_guidance_is_bounded_and_advisory() {
-        assert!(execution_slice_guidance(8, 40, false).is_empty());
+    fn explicit_round_limit_guidance_is_bounded_and_advisory() {
+        assert!(execution_round_limit_guidance(8, 40).is_empty());
 
-        let approaching = execution_slice_guidance(7, 40, false);
-        assert!(approaching.contains("<execution-slice>"));
+        let approaching = execution_round_limit_guidance(7, 40);
+        assert!(approaching.contains("<execution-round-limit>"));
         assert!(approaching.contains("\"available_model_boundaries_including_current\":8"));
         assert!(approaching.contains("\"authority\":\"advisory_only\""));
         assert!(approaching.contains("decisive acceptance evidence"));
 
-        let critical = execution_slice_guidance(1, 40, false);
+        let critical = execution_round_limit_guidance(1, 40);
         assert!(critical.contains("at most one smallest decisive acceptance check"));
         assert!(critical.contains("final boundary for truthful settlement"));
 
-        let final_boundary = execution_slice_guidance(0, 40, false);
+        let final_boundary = execution_round_limit_guidance(0, 40);
         assert!(final_boundary.contains("\"available_model_boundaries_including_current\":1"));
         assert!(final_boundary.contains("Do not call any tool"));
         assert!(final_boundary.contains("Return the best truthful result"));
-        assert!(execution_slice_guidance(0, 0, false).is_empty());
-
-        let renewable_checkpoint = execution_slice_guidance(0, 40, true);
-        assert!(renewable_checkpoint.contains("adaptive capacity checkpoint"));
-        assert!(renewable_checkpoint.contains("not evidence of progress or unfinished work"));
-        assert!(renewable_checkpoint.contains("does not expand the user request"));
-        assert!(renewable_checkpoint.contains("actual execution evidence"));
-        assert!(!renewable_checkpoint.contains("recent typed progress supports it"));
-        assert!(!renewable_checkpoint.contains("Do not call any tool"));
-        for remaining in [1, 7] {
-            let renewable = execution_slice_guidance(remaining, 40, true);
-            assert!(renewable.contains("not evidence of progress or unfinished work"));
-            assert!(!renewable.contains("final boundary for truthful settlement"));
-            assert!(!renewable.contains("Close the active objective"));
-        }
+        assert!(execution_round_limit_guidance(0, 0).is_empty());
     }
 
     #[test]
