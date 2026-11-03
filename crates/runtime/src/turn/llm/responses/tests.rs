@@ -266,6 +266,39 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         Err(error) => error,
     };
     assert!(error.message.contains("Start a new turn"));
+    for tool_result in [
+        json!({"role":"user", "tool_call_id":"call-1", "content":"tool result"}),
+        json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":"call-1", "content":"tool result"}]}),
+    ] {
+        messages.push(tool_result);
+        assert!(matches!(
+            prepare_streaming_call(
+                call(&messages, &tools, &other_scope, &base, &thinking),
+                RuntimeToolChoice::Auto,
+            ),
+            Err(error) if error.message.contains("Start a new turn")
+        ));
+        messages.pop();
+    }
+    messages.push(json!({"role":"user", "content":"a new human turn"}));
+    let prepared = prepare_streaming_call(
+        call(&messages, &tools, &other_scope, &base, &thinking),
+        RuntimeToolChoice::Auto,
+    )
+    .unwrap();
+    let resumed_body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+    let resumed_input = resumed_body["input"].as_array().unwrap();
+    assert!(
+        resumed_input
+            .iter()
+            .any(|item| item["type"] == "function_call" && item["call_id"] == "call-1")
+    );
+    assert!(
+        resumed_input
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call-1")
+    );
+    assert!(!resumed_body.to_string().contains("ciphertext"));
     let off = ThinkingConfig::Off;
     let mut explicit_temperature = call(&messages, &tools, &scope, &base, &thinking);
     explicit_temperature.temperature = Some(0.0);
