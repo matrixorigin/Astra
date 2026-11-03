@@ -68,6 +68,8 @@ pub(crate) async fn cancel_exact_run_until_settled_with_deadline(
     let mut last_error = None;
     // At most one reactive refresh/repost after a 401 across the whole loop.
     let mut reactive_refresh_used = false;
+    let mut cancellation_accepted = false;
+    let mut poll_delay = std::time::Duration::from_millis(100);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -92,22 +94,40 @@ pub(crate) async fn cancel_exact_run_until_settled_with_deadline(
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("cancellation timed out for run {run_id}"));
         }
-        match tokio::time::timeout_at(deadline, api.cancel_run(Some(&attempt_token), run_id)).await
-        {
-            Ok(Ok(response))
-                if response
+        let request = async {
+            if cancellation_accepted {
+                api.get_run_execution_settlement(Some(&attempt_token), run_id)
+                    .await
+            } else {
+                api.cancel_run(Some(&attempt_token), run_id).await
+            }
+        };
+        match tokio::time::timeout_at(deadline, request).await {
+            Ok(Ok(response)) => {
+                if response.get("run_id").and_then(serde_json::Value::as_str) != Some(run_id) {
+                    return Err(
+                        "cancellation response did not confirm the exact run identity".into(),
+                    );
+                }
+                match response
                     .get("execution_settled")
                     .and_then(serde_json::Value::as_bool)
-                    == Some(true) =>
-            {
-                return Ok(());
-            }
-            Ok(Ok(_)) => {
-                // The server accepted the cancellation but execution is not
-                // settled yet; keep polling within the same deadline.
+                {
+                    Some(true) => return Ok(()),
+                    Some(false) => cancellation_accepted = true,
+                    None => {
+                        return Err(
+                            "cancellation response has no execution-settlement proof".into()
+                        );
+                    }
+                }
                 last_error = None;
             }
             Ok(Err(error)) => match &error {
+                _ if cancellation_accepted && error.cancellation_recovery_required() => {
+                    cancellation_accepted = false;
+                    last_error = Some(error.to_string());
+                }
                 astra_thin_client::ThinClientError::Api { status, .. }
                     if *status == reqwest::StatusCode::UNAUTHORIZED =>
                 {
@@ -159,7 +179,8 @@ pub(crate) async fn cancel_exact_run_until_settled_with_deadline(
             }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(25))).await;
+        tokio::time::sleep(remaining.min(poll_delay)).await;
+        poll_delay = (poll_delay * 2).min(std::time::Duration::from_secs(1));
     }
 }
 
@@ -437,6 +458,68 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn accepted_cancellation_observes_settlement_without_reposting() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/chat/runs/exact"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id":"exact", "status":"cancellation_requested", "execution_settled":false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/exact/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id":"exact", "status":"cancelled", "execution_settled":true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        cancel_exact_run_until_settled(&api, "token", "exact")
+            .await
+            .expect("settled");
+    }
+
+    #[tokio::test]
+    async fn expired_owner_observation_reissues_only_the_exact_cancel_command() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let commands = Arc::new(AtomicUsize::new(0));
+        let observed = commands.clone();
+        Mock::given(method("DELETE")).and(path("/chat/runs/exact"))
+            .respond_with(move |_: &wiremock::Request| {
+                let settled = observed.fetch_add(1, Ordering::SeqCst) > 0;
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id":"exact", "status":if settled { "cancelled" } else { "cancellation_requested" },
+                    "execution_settled":settled
+                }))
+            }).expect(2).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/exact/cancel"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error_code":"cancellation_recovery_required"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        cancel_exact_run_until_settled(&api, "token", "exact")
+            .await
+            .unwrap();
+        assert_eq!(commands.load(Ordering::SeqCst), 2);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn captured_owner_cancel_refreshes_once_and_requires_execution_settlement() {
         use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
         use crate::cli::session::session_runtime::capture_admitted_auth_owner;
@@ -455,8 +538,10 @@ mod tests {
             (403, false, 0, 0, 1000),
             // A terminal status alone does not release execution ownership.
             (200, false, 0, 0, 80),
-            // Credential resolution and HTTP share one absolute deadline.
-            (200, true, 240, 400, 400),
+            // The response fits a fresh HTTP budget but not the remaining
+            // absolute budget after refresh. Restarting the deadline would
+            // wrongly return success, without relying on scheduler jitter.
+            (200, true, 240, 300, 400),
         ] {
             // The slow case must refresh before the first DELETE. A 401
             // refresh followed by a new loop iteration would recompute the
@@ -496,7 +581,7 @@ mod tests {
                     ResponseTemplate::new(second_status)
                         .set_delay(std::time::Duration::from_millis(cancel_delay))
                         .set_body_json(
-                            serde_json::json!({"status":"cancelled", "execution_settled":settles}),
+                            serde_json::json!({"run_id":"exact-owner-run", "status":"cancelled", "execution_settled":settles}),
                         ),
                 )
                 .mount(&server)
@@ -515,13 +600,17 @@ mod tests {
             )
             .await;
             assert_eq!(result.is_ok(), settles && cancel_delay == 0);
+            let requests = server.received_requests().await.unwrap();
             if cancel_delay > 0 {
-                assert!(
-                    start.elapsed() < std::time::Duration::from_millis(550),
-                    "refresh must not restart the cancellation deadline"
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.method.as_str() == "DELETE")
+                        .count(),
+                    1,
+                    "the refresh completed and the HTTP phase exercised the remaining absolute budget"
                 );
             }
-            let requests = server.received_requests().await.unwrap();
             assert!(
                 requests.iter().all(|r| r.url.path() == "/auth/refresh"
                     || r.url.path() == "/chat/runs/exact-owner-run")

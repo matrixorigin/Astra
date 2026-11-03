@@ -890,8 +890,9 @@ mod tests {
                 let acknowledgement = acknowledgement.clone();
                 move |_: &wiremock::Request| {
                     acknowledgement.notify_one();
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"execution_settled": true}))
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"run_id":"run-owned", "execution_settled": true}),
+                    )
                 }
             })
             .expect(1)
@@ -930,7 +931,7 @@ mod tests {
         Mock::given(method("DELETE"))
             .and(path("/chat/runs/run-owned"))
             .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
-                "execution_settled": false
+                "run_id": "run-owned", "execution_settled": false
             })))
             .mount(&server)
             .await;

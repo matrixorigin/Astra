@@ -556,6 +556,36 @@ pub(crate) async fn stream_run_handler(
     }
 }
 
+pub(crate) async fn get_run_execution_settlement_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<CancelRunResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/cancel",
+                &Bytes::new(),
+            ),
+        )
+        .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
+    let observed = state
+        .execution
+        .run_lifecycle_service
+        .get_run_execution_settlement(run_id, principal.user.user_id)
+        .await
+        .map_err(normalize_cancel_run_error)?;
+    Ok(Json(CancelRunResponse::from(observed)))
+}
+
 pub(crate) async fn cancel_run_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -954,6 +984,7 @@ mod tests {
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -989,6 +1020,21 @@ mod tests {
         assert_eq!(
             descriptor.body_digest.as_deref(),
             Some("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chat/runs/run-provider-cancel/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "settlement observation must use request-aware authentication too"
         );
     }
 

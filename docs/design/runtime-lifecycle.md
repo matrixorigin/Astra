@@ -135,9 +135,13 @@ or without scratch preparation. Plain output and static printf formats using
 literal text, `%s` and `%%` remain neutral; variable-writing or dynamic formats
 do not. Go checks use the complete invocation as identity, including any
 fallible prefix reader or output stage. A recognizable unsafe check retains only
-attempt identity. Sensitive or unscannable invocations reuse the existing opaque
+attempt identity. Recognized validators with sensitive arguments reuse the existing opaque
 exact-argument identity, so failures remain debts without copying credentials
-into recovery state. Only an exact retry can resolve a named validation debt;
+into recovery state. An ordinary unscannable command is unknown activity: it
+neither creates nor discharges a validation obligation. Explicit verify-mode
+requests retain their exact receipt contract regardless of shell syntax.
+Mutation freshness and executor custody remain independent of classification.
+Executor-reported bound changes and partial writes override lexical scratch paths. Only an exact retry can resolve a named validation debt;
 an unproven success still needs a separate eligible validation. An explicit
 verify receipt proves workspace freshness under the executor-owned lease,
 successful exit and unchanged fingerprint contract. This declared custom verifier path is
@@ -148,11 +152,7 @@ fingerprint cannot clear it. That receipt does not certify which tests ran or
 clear named Work validation debts. A failed custom invocation without an
 authoritative unchanged fingerprint also makes earlier named proof stale. Go
 semantic inference owns inferred observations and named Work validation
-independently; a freshness receipt never overrides an existing named debt. A
-completed custom-verifier failure at a bounded observation may receive one
-retry: active Work binds the exact verifier, while ordinary completion may use
-a different typed observation. Unsettled, partial or changed execution cannot
-authorize this retry. These are invocation receipts under the
+independently; a freshness receipt never overrides an existing named debt. These are invocation receipts under the
 existing trusted executor environment, not a guarantee about inherited tool
 configuration or test counts. Executors enable pipefail for pipelines; commands
 that may disable that setting cannot use the final pipeline stage's success as
@@ -160,15 +160,10 @@ validation evidence. An unchanged Bash fingerprint prevents a false mutation
 barrier but is not, by itself, evidence that any workspace observation or
 requested validation occurred.
 
-A matched post-mutation observer rejected for an unavailable capability may
-use the existing single alternative-observer attempt only when the executor
-explicitly reports no execution and no possible side effects. The journal
-retains that pre-dispatch capability rejection; it is never execution or
-verification success. Missing facts, partial effects and unsettled processes
-do not grant this recovery, and required validation debts remain independent.
-If the alternative is also rejected as unavailable, completion retains the
-successful tool results and reports a capability blocker through the existing
-incomplete terminal and intervention guidance instead of claiming validation.
+A pre-dispatch capability rejection remains a rejection with no execution or
+verification success. It does not create a separate observation/retry state.
+Explicit verification and Work recovery use their existing contracts within
+the admitted round allowance.
 
 An incomplete execution remains a terminal failed Run with preserved partial
 output. Its owner-stamped terminal carries the existing sanitized interruption
@@ -466,31 +461,26 @@ An `authority_lost` receipt still fails closed.
 
 ### Bounded continuation and completion
 
-An execution slice is a capacity checkpoint, not a task-completion boundary.
-Task profiles choose the initial slice and renewal step, not an implicit
-terminal cutoff or a fixed number of renewals. Root and child runs resolve the
-same optional hard boundary from administrator configuration and any explicit
-caller limit. Without either limit, there is no built-in total-round cutoff;
-execution continues in renewable slices, including across long tasks. With a
-limit, renewal cannot exceed it. A bounded closing allowance is
-separate from ordinary execution capacity and cannot reopen exploration.
+Root and child admission resolve one finite round allowance from the task
+profile, explicit caller limit and administrator ceiling. The admitted limit
+includes final reporting and explicit Work settlement. Activity, successful
+mutations, retry, reconnect and recovery never refill that allowance. Children
+also retain the parent's original execution deadline; restoring a remaining
+duration cannot create a new clock window.
 
-Fresh executor-confirmed workspace changes, new authoritative observations, or
-recovery of a failed operation can justify another bounded slice, including
-during an implementation task. A successful edit need not be followed by full
-validation before another edit is allowed.
+Ordinary conversation does not acquire a runtime requirement to mutate a
+workspace, execute a matching completion action or perform a post-mutation
+observation. The model reports the work and its verification limits. Explicit
+caller-declared verification hooks and canonical Work validation keep their
+own contracts. No prose, generic successful tool or inferred task profile can
+settle an unknown external effect, pending child or newer Work owner.
 
-Missing progress receipts do not establish a stall: capabilities have different
-evidence coverage. In the absence of an authoritative stop condition, another
-bounded slice is allowed without a separate progress-credit ledger or mandatory
-reflection call. Explicit hard limits, cancellation, workspace quarantine,
-and explicit execution limits remain authoritative. Historical guard verdicts remain
-audit and recovery advice, not sticky execution vetoes. Continuation
-does not make unexecuted requests successful or grant them completion evidence.
-Model-facing capacity reminders must not imply that renewal proves progress,
-unfinished work, or authorization for additional scope. The requested outcome
-is not evidence of what actually executed; completion claims must use observed
-results even when they differ from the request.
+The runtime reserves reporting/settlement space inside the admitted allowance.
+When it cannot fit, it preserves partial text and tool facts and closes with a
+truthful incomplete result. Useful output is not erased to narrate an internal
+completion obligation. Old execution snapshots containing the retired renewal
+protocol are unsupported; no history migration or compatibility decoder is
+provided.
 
 Repeated tool signatures establish a repeated request pattern, not unchanged
 results or lack of progress. Signature-only advice must preserve legitimate
@@ -531,9 +521,8 @@ contents or that earlier results remain in context. Explicit debugger pauses
 retain their separate control semantics; benchmark profiles need no exception
 to the observation-only rule.
 
-Progress does not discharge completion obligations. Required validation must
-still apply to the final mutation state; a renewed slice must not be reported
-as successful completion or bypass provider and permission boundaries.
+Progress does not discharge explicit verification or canonical Work obligations.
+Their validation remains bound to the actual final state and provider authority.
 
 ### Execution failures and task resolution
 
@@ -895,25 +884,35 @@ unknown outcomes keep the current cleanup deadline and quarantine protection.
 ### Session cancellation convergence
 
 `POST /sessions/{id}/cancel` accepts cancellation through the canonical Run
-control path and spends a bounded interval converging its execution. Its JSON
+control path and reports the current execution-settlement observation. Its JSON
 retains the Session fields and adds required `execution_settled` and `runs`
 fields. Each run entry contains `run_id`, its observed `status`, and
 `execution_settled`. HTTP 202 with `status: "cancellation_requested"` and
 `execution_settled: false` is pending, including when the run list is empty.
 Only HTTP 200 with `status: "cancelled"` and `execution_settled: true` reports
 convergence. Pending responses do not write a cancelled Session projection.
-Clients may repeat the same owner-scoped endpoint; a deadline, missing proof,
-or storage failure must not become cancellation success.
+After acceptance, clients use `GET /sessions/{id}/cancel` to observe settlement.
+The exact-run equivalents are `DELETE /chat/runs/{id}` and read-only
+`GET /chat/runs/{id}/cancel`. Observation uses the same owner-scoped settlement
+proof, not the ordinary display status. Clients use bounded backoff within one
+absolute deadline. An acknowledged mutation is retried only when the read
+returns the typed `cancellation_recovery_required` conflict, asking the
+canonical command to reconcile retained authority. Once a Session read proves
+physical settlement, one final POST commits the durable cancelled Session
+projection. GET remains read-only throughout. A deadline, missing proof
+or storage failure cannot become cancellation success.
 Pending responses may include `execution_blocker`, the typed result of the
 latest canonical idle proof. Missing proof is not an inferred blocker or
 success. The database Run store publishes all currently active Runs' existing
 cancellation markers in one owner/Session-scoped atomic write, with a bounded,
 cancellation-safe database attempt. An ambiguous acknowledgement fails closed;
 retry is idempotent. This precedes settlement discovery, so slow pages cannot
-starve later intent. The subsequent one-second settlement budget is cooperative:
-checks occur between completed operations, never by dropping an in-flight SQL
-transaction. An individual operation can exceed that budget; CLI callers enforce
-their own hard deadline.
+starve later intent. The command bounds best-effort convergence to one second after publishing
+intent. If discovery reaches that bound, it performs one separately bounded
+read of the exact owner/idle proof; read-only observations never repeat broad
+history discovery. The Server does not
+repeat cancellation writes or hold an HTTP request in a polling loop. Storage
+and remote settlement can remain pending; callers retain their absolute deadline.
 
 Active-run enumeration is insufficient: terminal runs can retain live
 executors, owner leases, tool invocations or canonical turn authority. Retries
@@ -1114,7 +1113,7 @@ request identities.
 
 Execution-slice guidance is assembled through the canonical context pipeline.
 The retired journal-based resource policy did not control execution capacity;
-adaptive renewal and settlement retain their existing owners. Runtime config
+admitted resource limits and canonical settlement retain their existing owners. Runtime config
 and handoff facts reject the retired `budget_policy` field, and pending context
 rejects the retired `self_status` kind. Provider output ending with `length`
 still receives the terminal truncation marker outside exploratory tasks.

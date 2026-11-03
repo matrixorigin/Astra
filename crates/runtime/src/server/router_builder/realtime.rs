@@ -206,7 +206,8 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/chat/runs/{run_id}/cancel",
-            post(crate::server::run::handlers::cancel_run_handler),
+            post(crate::server::run::handlers::cancel_run_handler)
+                .get(crate::server::run::handlers::get_run_execution_settlement_handler),
         )
         .route(
             "/chat/runs/{run_id}/permission-mode",

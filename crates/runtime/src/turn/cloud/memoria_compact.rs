@@ -655,6 +655,14 @@ impl MemoriaPort for UserScopedMemoriaPort {
         Ok(Some(transport))
     }
 
+    async fn resolve_observer_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        match self.transport(true).await {
+            Ok(transport) => Ok(Some(transport)),
+            Err(MemoriaOperationError::Disabled(_)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     async fn retrieve_for_prompt(
         &self,
         query: &str,

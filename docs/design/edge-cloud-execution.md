@@ -108,6 +108,19 @@ precondition for admission; failed installation must not fall through to a chat
 request whose Edge registration was withdrawn during cleanup. The existing
 invocation-time permission and account/attachment boundaries remain authoritative.
 
+### Shell capability and timeout projection
+
+The selected CLI executor advertises managed background Bash only when its
+platform supports it and `ASTRA_ALLOW_ENVIRONMENT_BACKGROUND_TASKS=1` authorizes
+it. Execution rechecks authorization before spawning, and reports a structured
+non-retryable capability rejection with no-execution evidence when unavailable.
+Cleanup guidance uses that same decision and otherwise recommends bounded
+foreground work. Server configuration cannot grant a remote Edge capability.
+
+CLI execution and Server admission use the shared compound-aware Bash timeout
+resolver. A `cd ... && make ...` command receives the same build allowance as
+direct `make`; explicit command timeouts remain bounded by run/policy limits.
+
 ## Offline and degraded behavior
 
 CLI SSE consumption executes only typed, admitted Server tool requests.

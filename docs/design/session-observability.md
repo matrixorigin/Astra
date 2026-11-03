@@ -243,6 +243,37 @@ or result compaction. The journal retains `runtime_advisory_artifact` beside
 the bounded guidance preview; full guidance remains in that verified artifact,
 not in every future prompt or journal row.
 
+## On-demand child tool activity
+
+Ctrl+G reads tool activity from existing `agent_run_events` through
+`GET /sessions/{session_id}/runs/{run_id}/activity`. It displays this section
+separately from canonical conversation items; C1 `item_seq` and C3 `event_idx`
+are independent cursor domains and do not establish a shared chronological order.
+`A` loads older activity; `R` refreshes the conversation and latest activity.
+
+The authorized child's immutable root is the C3 source. The API checks both
+Run scopes and pages the root stream, selecting only tool presentation events
+whose embedded Run identity exactly matches the child. The page's
+`source_run_id` identifies the index domain. This is always partial coverage:
+the optional live sink may drop events, and its gap notification is live-only.
+An empty page does not prove that no tool ran; a reported completion is not an
+invocation-ledger proof.
+
+The owner/session/run index serves a contiguous descending slice of at most
+65 raw rows, including non-tool facts. The first 64 scanned rows determine the
+next exclusive `before_event_idx`, even when filtering yields no tool events.
+Rows are displayed in ascending index order. Each payload is bounded to 32 KiB;
+oversized or malformed tool facts remain explicit unavailable entries. Gaps and
+compaction observations remain visible. Missing result status is unknown, never
+an inferred success. Existing immutable `(user_id, run_id, event_idx)` identifies
+a fact; `event_id` alone is not a uniqueness guarantee.
+
+Opening or paging this section adds a bounded indexed read, with no trace copies,
+new tables, execution-time writes or recurring whole-tree poll. Authentication
+and owned-session checks retain their existing boundaries. Partial and cancelled
+runs remain inspectable from the same facts; this projection cannot authorize
+replaying their operations.
+
 ## Resume and reconnect
 
 On reconnect, the client should rebuild from:
@@ -401,3 +432,18 @@ observation recovers through the existing bounded GET retry owner. This includes
 reconciliation after a pending cancellation is rejected, not only an HTTP error.
 The handoff preserves the budget and cursor, never replays the turn, and leaves
 paused/terminal outcomes to their existing lifecycle semantics.
+
+Failed and cancelled child outcomes retain available assistant output separately
+from the failure or cancellation reason. A user cancellation keeps its origin
+and no-respawn instruction even when it includes partial text; partial text is
+never a successful result. The existing terminal journal carries this text in
+its redacted `full_text` field. A cancelled Run emits its retained partial
+`text_done` in the same generation-fenced terminal event batch, without another
+per-tool write. Explicit result reads may refresh incomplete terminal evidence;
+preview staging continues to read the existing parent-owned result without SQL.
+Late same-run counters can update an archived terminal even when its status and
+event frontier are unchanged. Accounting coverage follows actual provenance:
+observed counters are `partial`, and absent accounting is `unknown`. The
+current child result wrappers can contain fallback counters, so even a terminal
+zero does not certify that no resources were used. No additional provenance
+state is inferred from those wrappers.

@@ -44,6 +44,16 @@ pub enum ThinClientError {
 }
 
 impl ThinClientError {
+    /// A read-only cancellation observation found an expired execution owner.
+    /// Recovery must use the existing mutation command, never a hidden GET write.
+    pub fn cancellation_recovery_required(&self) -> bool {
+        matches!(self, Self::Api { status, body }
+            if *status == reqwest::StatusCode::CONFLICT
+                && serde_json::from_str::<serde_json::Value>(body).ok()
+                    .and_then(|value| value.get("error_code").and_then(serde_json::Value::as_str).map(str::to_owned))
+                    .as_deref() == Some("cancellation_recovery_required"))
+    }
+
     /// Returns true if this error is a transport-level failure (connection reset,
     /// timeout, DNS failure) that may succeed on retry.
     pub fn is_transport(&self) -> bool {

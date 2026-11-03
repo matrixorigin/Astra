@@ -132,7 +132,12 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/sessions/{session_id}/cancel",
-            post(session::session_handlers::cancel_session_handler),
+            post(session::session_handlers::cancel_session_handler)
+                .get(session::session_handlers::get_session_execution_settlement_handler),
+        )
+        .route(
+            "/sessions/{session_id}/runs/{run_id}/activity",
+            get(session::session_handlers::run_activity_handler),
         )
         .route(
             "/sessions/{session_id}/activity",

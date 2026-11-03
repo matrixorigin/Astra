@@ -969,6 +969,7 @@ impl Default for SkillSearchSettings {
 #[derive(Clone, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
+    pub runtime: ServerRuntimeConfig,
     pub jwt: JwtSettings,
     pub api: ApiSettings,
     pub memoria: MemoriaSettings,
@@ -1056,6 +1057,7 @@ impl AppSettings {
             }
         };
         let mut settings = Self::from_lookup(lookup)?;
+        settings.runtime = sc.runtime.clone();
         settings.disabled_tool_offers = sc.deployment.disabled_tool_offers.clone();
         settings.provider_capabilities = sc.deployment.provider_capabilities.clone();
         settings.provider_allowed_tools = sc.deployment.provider_allowed_tools.clone();
@@ -1153,6 +1155,7 @@ impl AppSettings {
                 "dev-runtime-root-secret-change-me",
             )?,
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
+            runtime: ServerRuntimeConfig::default(),
             provider_request_auth: Vec::new(),
             edge_token_auth: EdgeTokenAuthConfig::default(),
             external_providers: Vec::new(),

@@ -603,6 +603,23 @@ pub fn agent_tool_completed_result_text(parsed: &Value) -> Option<String> {
     }
 }
 
+/// Retained text from an incomplete terminal is never a completed result.
+pub fn agent_tool_partial_result_text(parsed: &Value) -> Option<String> {
+    match decode_agent_tool_result(parsed) {
+        Some(DecodedAgentToolResult::ChildResult(
+            AgentToolResultStatusKind::Interrupted
+            | AgentToolResultStatusKind::Failed
+            | AgentToolResultStatusKind::Cancelled
+            | AgentToolResultStatusKind::TimedOut,
+        )) => parsed
+            .get("result")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
 pub fn agent_tool_result_output_summary(
     parsed: Option<&Value>,
     raw_output: Option<&str>,
@@ -782,7 +799,7 @@ pub fn render_wait_timeout_outcome(
 ) -> String {
     render_child_agent_result(match live_status {
         Some(status) if !status.is_terminal() => {
-            let mut body = wait_for_agent_status_body(agent_id, status);
+            let mut body = project_wait_for_agent_status(agent_id, status, None);
             body["waited_secs"] = json!(timeout.as_secs());
             body["observation_timed_out"] = json!(true);
             body
@@ -799,15 +816,32 @@ pub fn render_wait_timeout_outcome(
 }
 
 pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> String {
-    render_child_agent_result(wait_for_agent_status_body(agent_id, status))
+    render_child_agent_result(project_wait_for_agent_status(agent_id, status, None))
 }
 
-fn wait_for_agent_status_body(agent_id: &str, status: &AgentStatus) -> Value {
+/// One result projection for waits and bounded direct-child delivery.
+pub fn project_wait_for_agent_status(
+    agent_id: &str,
+    status: &AgentStatus,
+    inline_result: Option<&str>,
+) -> Value {
+    fn detail(text: &str, bounded: bool) -> &str {
+        if bounded {
+            &text[..text.floor_char_boundary(1024)]
+        } else {
+            text
+        }
+    }
+    let bounded = inline_result.is_some();
     match status {
         AgentStatus::Completed {
             result,
             finish_reason,
-        } => completed_agent_result_body(agent_id, result, finish_reason.as_deref()),
+        } => completed_agent_result_body(
+            agent_id,
+            inline_result.unwrap_or(result),
+            finish_reason.as_deref(),
+        ),
         AgentStatus::Interrupted {
             partial_result,
             finish_reason,
@@ -816,8 +850,8 @@ fn wait_for_agent_status_body(agent_id: &str, status: &AgentStatus) -> Value {
             json!({
                 "status": AgentToolResultStatusKind::Interrupted.as_str(),
                 "agent_id": agent_id,
-                "result": partial_result,
-                "finish_reason": reason,
+                "result": inline_result.unwrap_or(partial_result),
+                "finish_reason": detail(reason, bounded),
                 "incomplete": true,
                 "hint": "The child agent stopped before fully finishing. Treat this as incomplete and either continue it or report the interruption explicitly.",
             })
@@ -825,6 +859,7 @@ fn wait_for_agent_status_body(agent_id: &str, status: &AgentStatus) -> Value {
         AgentStatus::Failed {
             error,
             finish_reason,
+            partial_result,
         } => {
             let reason = finish_reason
                 .as_deref()
@@ -832,8 +867,10 @@ fn wait_for_agent_status_body(agent_id: &str, status: &AgentStatus) -> Value {
             json!({
                 "status": AgentToolResultStatusKind::Failed.as_str(),
                 "agent_id": agent_id,
-                "error": error,
-                "finish_reason": reason,
+                "error": detail(error, bounded),
+                "result": inline_result.unwrap_or(partial_result),
+                "incomplete": true,
+                "finish_reason": detail(reason, bounded),
             })
         }
         AgentStatus::Waiting { reason } => json!({
@@ -853,16 +890,22 @@ fn wait_for_agent_status_body(agent_id: &str, status: &AgentStatus) -> Value {
             "resumable": true,
             "hint": "The child agent has a committed execution pause. Preserve its run and resume it when the blocker is resolved; do not fabricate completion.",
         }),
-        AgentStatus::Cancelled { by_user, reason } => {
+        AgentStatus::Cancelled {
+            by_user,
+            reason,
+            partial_result,
+        } => {
             let mut payload = json!({
                 "status": AgentToolResultStatusKind::Cancelled.as_str(),
                 "agent_id": agent_id,
                 "reason": if reason.is_empty() {
                     "cancelled".to_string()
                 } else {
-                    reason.clone()
+                    detail(reason, bounded).to_owned()
                 },
                 "cancelled_by_user": *by_user,
+                "result": inline_result.unwrap_or(partial_result),
+                "incomplete": true,
             });
             if *by_user {
                 // Make it explicit so the LLM doesn't dutifully respawn
@@ -1028,6 +1071,46 @@ fn one_line_preview(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_and_cancelled_results_keep_partial_text_without_success_or_retry_authority() {
+        for status in [
+            AgentStatus::Failed {
+                error: "provider disconnected".into(),
+                finish_reason: Some("provider_error".into()),
+                partial_result: "retained evidence".into(),
+            },
+            AgentStatus::cancelled_by_user("stop").with_partial_result("retained evidence"),
+        ] {
+            let payload: Value =
+                serde_json::from_str(&render_wait_for_agent_status("child", &status)).unwrap();
+            assert_eq!(
+                agent_tool_partial_result_text(&payload).as_deref(),
+                Some("retained evidence")
+            );
+            assert!(agent_tool_completed_result_text(&payload).is_none());
+            assert_eq!(payload["incomplete"], true);
+            if matches!(status, AgentStatus::Cancelled { .. }) {
+                assert_eq!(payload["cancelled_by_user"], true);
+                assert!(
+                    payload["instruction"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Do NOT respawn")
+                );
+            } else {
+                assert_eq!(payload["error"], "provider disconnected");
+            }
+            let preview = project_wait_for_agent_status("child", &status, Some("bounded"));
+            assert_eq!(preview["result"], "bounded");
+        }
+        let empty: Value = serde_json::from_str(&render_wait_for_agent_status(
+            "child",
+            &AgentStatus::cancelled_anonymous(),
+        ))
+        .unwrap();
+        assert!(agent_tool_partial_result_text(&empty).is_none());
+    }
 
     fn child(mut value: Value) -> Value {
         value["result_family"] = json!(AgentToolResultFamily::ChildResult);

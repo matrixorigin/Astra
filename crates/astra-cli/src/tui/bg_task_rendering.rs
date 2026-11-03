@@ -255,14 +255,23 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
         AgentStatus::Failed {
             error,
             finish_reason,
+            ..
         } => (
             BackgroundTaskStatus::Failed,
-            Some(error.clone()).filter(|error| !error.trim().is_empty()),
+            agent
+                .status
+                .retained_output()
+                .map(str::to_owned)
+                .or_else(|| Some(error.clone()).filter(|error| !error.trim().is_empty())),
             finish_reason.clone().or_else(|| Some(error.clone())),
         ),
         AgentStatus::Cancelled { reason, .. } => (
             BackgroundTaskStatus::Cancelled,
-            Some(reason.clone()).filter(|reason| !reason.trim().is_empty()),
+            agent
+                .status
+                .retained_output()
+                .map(str::to_owned)
+                .or_else(|| Some(reason.clone()).filter(|reason| !reason.trim().is_empty())),
             Some(if reason.trim().is_empty() {
                 "cancelled".to_string()
             } else {

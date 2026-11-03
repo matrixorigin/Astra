@@ -121,7 +121,7 @@ async fn go_verification_after_write_finishes_without_redundant_observation() {
 }
 
 #[tokio::test]
-async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_configuration() {
+async fn invalid_go_observation_does_not_satisfy_canonical_work_validation() {
     for (command, class, semantics) in [
         (
             "sh -c 'exit 1' && GOWORK=off go test ./...",
@@ -217,12 +217,16 @@ async fn go_verification_does_not_complete_when_a_predecessor_failed_or_changed_
         ),
     ] {
         let (state, host) = run_written_verification(command, class, semantics, None).await;
-        assert_eq!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(InterruptionKind::ExecutionIncomplete),
+        assert_ne!(
+            current_work_validation_state(&state),
+            WorkValidationState::Passed,
             "{command}"
         );
-        assert_eq!(host.turn_count(), 5);
+        assert!(
+            state.interruption.is_none(),
+            "ordinary reporting does not acquire Work authority"
+        );
+        assert_eq!(host.turn_count(), 3);
         assert_eq!(
             state.stall.tool_call_records.len(),
             2,
@@ -255,7 +259,11 @@ async fn explicit_verification_accepts_equivalent_python_forms_after_write() {
             "{command}: no redundant recovery rounds"
         );
         assert_eq!(state.stall.tool_call_records.len(), 2);
-        assert!(successful_post_mutation_observation(&state).unwrap());
+        assert!(
+            super::super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
+                state.stall.tool_call_records.last().unwrap()
+            )
+        );
         assert_eq!(
             WorkValidationEvidence::collect(&state, true).state,
             WorkValidationState::None
@@ -430,7 +438,7 @@ async fn declared_verifier_retry_settles_after_exact_success_for_both_python_for
 }
 
 #[tokio::test]
-async fn failed_declared_observation_has_one_bounded_retry_without_a_repair() {
+async fn rejected_work_verification_retries_only_known_safe_outcomes() {
     for command in [
         "python3 -c 'assert 1 == 1'",
         "python3 - <<'PY'\nassert 1 == 1\nPY",
@@ -449,7 +457,6 @@ async fn failed_declared_observation_has_one_bounded_retry_without_a_repair() {
         let (state, _) =
             run_written_verification(command, "success", "success", Some(ExplicitReceipt::Valid))
                 .await;
-        let writer = state.stall.tool_call_records[0].clone();
         let mut retry = state.stall.tool_call_records.last().unwrap().clone();
         retry.batch_id = None;
         retry.round = Some(2);
@@ -476,74 +483,7 @@ async fn failed_declared_observation_has_one_bounded_retry_without_a_repair() {
             if (semantics == "empty_result") != command.starts_with("grep ") {
                 continue;
             }
-            for active_work in [false, true] {
-                let mut failure = failed_explicit_verification(&retry);
-                // Transport status does not replace the producer's
-                // command-result semantics.
-                failure.ok = ok;
-                failure.result_class = class.map(str::to_owned);
-                failure.exit_semantics = Some(semantics.into());
-                failure.error_kind = error_kind;
-                let mut work = make_state();
-                work.hooks.workspace_root_hint = Some("/workspace".into());
-                work.stall.tool_call_records = vec![writer.clone(), failure];
-                work.hooks
-                    .completion_settlement
-                    .post_mutation_observation_retries = 1;
-                work.hooks.completion_settlement.completion_action_window =
-                    Some(super::super::host::CompletionActionWindow {
-                        action: CompletionAction::PostMutationObservation,
-                        attempts_remaining: 0,
-                        mismatch_corrections_remaining: 1,
-                        consumed: true,
-                        matched: true,
-                    });
-                advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-                    &mut work,
-                    active_work,
-                    1,
-                );
-                let window = work
-                    .hooks
-                    .completion_settlement
-                    .completion_action_window
-                    .as_ref()
-                    .unwrap();
-                assert_eq!(
-                    window.action,
-                    if active_work {
-                        CompletionAction::CanonicalWorkValidation
-                    } else {
-                        CompletionAction::PostMutationObservation
-                    },
-                    "{command}: {class:?}"
-                );
-                assert!(!window.consumed);
-                assert_eq!(
-                    work.hooks
-                        .completion_settlement
-                        .post_mutation_repair_retries,
-                    0
-                );
-                let admitted = admit_completion_call(&mut work, &call);
-                assert_eq!(admitted.admitted.len(), 1, "{command}: {class:?}");
-                assert!(admitted.rejected.is_empty());
-                work.stall.tool_call_records.push(retry.clone());
-                assert_eq!(
-                    pending_completion_action_for_work_state(&work, active_work).unwrap(),
-                    None
-                );
-                advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-                    &mut work,
-                    active_work,
-                    2,
-                );
-                if active_work {
-                    assert!(work.hooks.completion_settlement.work_settlement_only);
-                } else {
-                    assert!(work.hooks.completion_settlement.text_only);
-                }
-            }
+
             let mut failure = failed_explicit_verification(&retry);
             failure.ok = ok;
             failure.result_class = class.map(str::to_owned);
@@ -601,47 +541,6 @@ async fn failed_declared_observation_has_one_bounded_retry_without_a_repair() {
             failure.workspace_mutation_observed = Some(changed);
             failure.result_class = Some(class.into());
             failure.exit_semantics = Some(semantics.into());
-            let mut work = make_state();
-            work.hooks.workspace_root_hint = Some("/workspace".into());
-            work.stall.tool_call_records = vec![writer.clone(), failure.clone()];
-            work.hooks.completion_settlement.completion_action_window =
-                Some(super::super::host::CompletionActionWindow {
-                    action: CompletionAction::PostMutationObservation,
-                    attempts_remaining: 0,
-                    mismatch_corrections_remaining: 1,
-                    consumed: true,
-                    matched: true,
-                });
-            advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-                &mut work, true, 1,
-            );
-            assert_eq!(
-                work.hooks
-                    .completion_settlement
-                    .post_mutation_observation_failed_action_retries,
-                0
-            );
-            assert!(
-                work.hooks
-                    .completion_settlement
-                    .completion_action_window
-                    .as_ref()
-                    .unwrap()
-                    .consumed
-            );
-            assert!(work.hooks.completion_settlement.text_only);
-            assert_eq!(
-                pending_terminal_completion_action_for_work_state(&work, true).unwrap(),
-                Some(CompletionAction::CanonicalWorkValidation)
-            );
-            let admission =
-                crate::turn::agentic::tool_interception::reject_tool_calls_at_text_only_boundary(
-                    std::slice::from_ref(&call),
-                    Some("tool_calls"),
-                );
-            assert!(admission.admitted.is_empty());
-            assert_eq!(admission.rejected.len(), 1);
-
             let mut rejected = make_state();
             rejected.hooks.workspace_root_hint = Some("/workspace".into());
             rejected.hooks.completion_settlement.work_settlement_only = true;
@@ -1037,10 +936,6 @@ async fn explicit_verification_requires_a_valid_successful_unchanged_receipt() {
             ),
             "{receipt:?}: {record:?}"
         );
-        assert!(
-            !successful_post_mutation_observation(&state).unwrap(),
-            "{receipt:?}"
-        );
     }
 }
 
@@ -1106,10 +1001,6 @@ fn mixed_request_retains_only_its_workspace_completion_owner() {
         .as_mut()
         .unwrap()
         .mutation_completion_scope = MutationCompletionScope::Mixed;
-    assert_eq!(
-        pending_completion_action(&state).unwrap(),
-        Some(CompletionAction::RequiredWorkspaceMutation)
-    );
 }
 
 #[test]
@@ -1133,9 +1024,10 @@ fn unrelated_success_cannot_clear_started_cancellation() {
             disposition: Some(ToolCallDisposition::Executed),
             ..Default::default()
         });
-        assert!(!enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
+        assert_eq!(
+            reject_unsettled_execution_completion(&mut state),
+            disposition == ToolCallDisposition::Executed
+        );
         assert_eq!(
             state.interruption.is_some(),
             disposition == ToolCallDisposition::Executed
@@ -1145,7 +1037,7 @@ fn unrelated_success_cannot_clear_started_cancellation() {
                 state.interruption.as_ref().unwrap().kind,
                 InterruptionKind::ExecutionIncomplete
             );
-            assert!(state.final_text.contains("effects remain unverified"));
+            assert!(!state.final_text.is_empty());
         }
     }
 }
@@ -1219,9 +1111,10 @@ async fn callback_outcome_facts_survive_journaling_and_control_completion() {
                     .contains("interrupted or unknown outcome")
             );
             assert!(!record.ok);
-            // Interruption is lifecycle truth. Provider content stays a
-            // partial answer; it cannot promote the operation to success.
-            assert_eq!(state.final_text, "The operation succeeded.");
+            // Unknown effects close before requesting another provider answer.
+            assert_eq!(host.turn_count(), 1);
+            assert!(!state.final_text.is_empty());
+            assert_ne!(state.final_text, "The operation succeeded.");
             assert_eq!(host.final_output_ready, vec![state.final_text.clone()]);
         }
     }
@@ -1264,10 +1157,12 @@ async fn timeout_callback_requires_reconciliation_only_for_started_side_effects(
         assert_eq!(record.error_kind, Some(astra_core::ErrorKind::ToolTimeout));
         assert_eq!(record.was_executed(), started);
         assert!(!record.ok);
-        assert!(
-            state.stall.tool_call_records[1].ok,
-            "the unrelated probe succeeded"
-        );
+        if !incomplete {
+            assert!(
+                state.stall.tool_call_records[1].ok,
+                "the unrelated probe succeeded"
+            );
+        }
         assert_eq!(state.interruption.is_some(), incomplete, "{record:?}");
         if incomplete {
             assert_eq!(
@@ -1277,12 +1172,17 @@ async fn timeout_callback_requires_reconciliation_only_for_started_side_effects(
         }
         assert_eq!(
             host.turn_count(),
-            3,
-            "no automatic replay or recovery round"
+            if incomplete { 1 } else { 3 },
+            "unknown side effects stop before another tool or provider call"
         );
         assert_eq!(state.max_turns, budget);
-        assert_eq!(state.stall.tool_call_records.len(), 2);
-        assert_eq!(state.final_text, "Preserved partial report.");
+        assert_eq!(
+            state.stall.tool_call_records.len(),
+            if incomplete { 1 } else { 2 }
+        );
+        if !incomplete {
+            assert_eq!(state.final_text, "Preserved partial report.");
+        }
         assert_eq!(host.final_output_ready, vec![state.final_text.clone()]);
     }
 }

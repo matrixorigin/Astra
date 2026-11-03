@@ -1930,7 +1930,7 @@ fn agent_parameters_schema() -> Value {
             "name": {"type": "string", "description": "Action label when accepted by the selected action."},
             "input": {"type": "object", "description": "Optional run_chain template input."},
             "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
-            "initial_turns": {"type": "integer", "minimum": 1, "description": "Optional first execution slice; renewable while progress continues. This is not a hard limit. When complexity is also present, the smaller initial slice wins."},
+            "initial_turns": {"type": "integer", "minimum": 1, "description": "Optional admitted round allowance; it never renews automatically. When complexity is also present, the smaller allowance wins."},
             "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first internal child request output-token ceiling. Current provider-owned native execution cannot honor this limit and rejects it before launch; omit it for that execution, or report that a required limit is unsupported.", "x-astra-discovery-summary": "Internal; native:no caps."},
             "inherit_prefix": {
                 "type": ["object", "null"],
@@ -2566,7 +2566,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Preserve user constraints and exact output in each brief. Keep parent-only reporting outside: use runtime model/status receipts, not child self-report. Inherits provider bindings; use only exposed tools. Never paste files, diffs, or prior tool output.", "x-astra-discovery-summary": "Preserve exact child output; parent uses model/status receipts."},
                                     "agent_type": delegation_agent_type_schema(),
-                                    "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
+                                    "initial_turns": {"type": "integer", "minimum": 1, "description": "Admitted round allowance; no automatic renewal."},
                                     "max_output_tokens": {"type": "integer", "minimum": 1, "description": "First internal child request output-token ceiling; current provider-owned native execution rejects this limit before launch.", "x-astra-discovery-summary": "Internal; native:no caps."},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                     "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
@@ -2585,7 +2585,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "additionalProperties": false,
                             "properties": {
                                 "agent_type": delegation_agent_type_schema(),
-                                "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
+                                "initial_turns": {"type": "integer", "minimum": 1, "description": "Admitted round allowance; no automatic renewal."},
                                 "max_output_tokens": {"type": "integer", "minimum": 1, "description": "First internal child request output-token ceiling; current provider-owned native execution rejects this limit before launch.", "x-astra-discovery-summary": "Internal; native:no caps."},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                 "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},

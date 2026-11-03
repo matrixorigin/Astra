@@ -6,78 +6,171 @@ use astra_services::SessionContextCoordinator;
 use astra_services::runs::CancelSessionRecord;
 use astra_services::session_context_coordinator::SessionExecutionBlocker;
 
-const SESSION_CANCEL_CONVERGENCE_BUDGET: Duration = Duration::from_secs(1);
-const SESSION_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 impl AgenticRunLifecycleService {
     pub(super) async fn converge_session_cancellation(
         &self,
         session_id: &str,
         user_id: &str,
+        request: bool,
     ) -> Result<CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        let mut observed = BTreeMap::new();
-        // Publish all intent in one bounded durable operation before doing any
-        // settlement work. A slow/large discovery page cannot starve the tail.
+        if !request {
+            return match tokio::time::timeout(
+                Duration::from_secs(1),
+                self.observe_session_cancellation(session_id, user_id),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(CancelSessionRecord {
+                    runs: Vec::new(),
+                    execution_settled: false,
+                    execution_blocker: Some(SessionExecutionBlocker::OwnerUnavailable),
+                }),
+            };
+        }
         self.run_engine
             .request_session_cancellation(user_id, session_id)
             .await
             .map_err(|error| Self::durable_persist_error("cancel session intent", error))?;
-        let deadline = tokio::time::Instant::now() + SESSION_CANCEL_CONVERGENCE_BUDGET;
-        let mut execution_blocker;
-        let execution_settled = 'convergence: {
-            loop {
-                let mut candidates = self
-                    .session_cancellation_candidates(session_id, user_id)
-                    .await?;
-                // Retain exact targets across iterations: terminal transitions
-                // remove them from active discovery before execution retires.
-                candidates.extend(observed.keys().cloned());
-                let mut all_observed = true;
-                for run_id in candidates {
-                    if tokio::time::Instant::now() >= deadline && !observed.is_empty() {
-                        all_observed = false;
-                        break;
-                    }
-                    let result = self
-                        .cancel_session_target(session_id, user_id, &run_id)
-                        .await?;
-                    if durable_run_status_is_terminal(&result.status)
-                        && let Some(pool) = self.shared_pool.as_ref()
-                    {
-                        astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(
-                            pool.clone(),
-                        )
-                        .reconcile_terminal_run(user_id, session_id, &run_id)
-                        .await
-                        .map_err(|error| {
-                            Self::durable_persist_error(
-                                "cancel tool reconciliation",
-                                error.to_string(),
-                            )
-                        })?;
-                    }
-                    observed.insert(run_id, result);
-                }
-                execution_blocker = self
-                    .session_cancellation_blocker(session_id, user_id)
-                    .await?;
-                if all_observed
-                    && observed.values().all(|run| run.execution_settled)
-                    && execution_blocker.is_none()
-                {
-                    break 'convergence true;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    break 'convergence false;
-                }
-                tokio::time::sleep(SESSION_CANCEL_POLL_INTERVAL).await;
+        let help = async {
+            let mut observed = Vec::new();
+            // The exact blocker is acted on before unrelated discovery. A slow
+            // scan cannot consume its recovery opportunity on every request.
+            if let Some((run_id, _)) = self
+                .session_cancellation_primary_target(session_id, user_id)
+                .await?
+            {
+                observed.push(
+                    self.command_session_cancellation_target(session_id, user_id, &run_id)
+                        .await?,
+                );
             }
+            for run_id in self
+                .session_cancellation_candidates(session_id, user_id)
+                .await?
+            {
+                if observed.iter().any(|run| run.run_id == run_id) {
+                    continue;
+                }
+                observed.push(
+                    self.command_session_cancellation_target(session_id, user_id, &run_id)
+                        .await?,
+                );
+            }
+            let execution_blocker = self
+                .session_cancellation_blocker(session_id, user_id)
+                .await?;
+            Ok(CancelSessionRecord {
+                execution_settled: observed.iter().all(|run| run.execution_settled)
+                    && execution_blocker.is_none(),
+                runs: observed,
+                execution_blocker,
+            })
         };
+        match tokio::time::timeout(Duration::from_secs(1), help).await {
+            Ok(result) => result,
+            // Observe independently of the interrupted best-effort discovery.
+            // In particular, a now-idle Session must not remain pending solely
+            // because its history scan is slow. The status writer rechecks the
+            // proof under its own Session transaction before publishing success.
+            Err(_) => match tokio::time::timeout(
+                Duration::from_secs(1),
+                self.observe_session_cancellation(session_id, user_id),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(CancelSessionRecord {
+                    runs: Vec::new(),
+                    execution_settled: false,
+                    execution_blocker: Some(SessionExecutionBlocker::OwnerUnavailable),
+                }),
+            },
+        }
+    }
+
+    async fn session_cancellation_primary_target(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<Option<(String, bool)>, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(run) = self
+            .run_engine
+            .find_blocking_session_run(user_id, session_id)
+            .await
+            .map_err(|error| Self::durable_persist_error("cancel blocking owner", error))?
+        {
+            return Ok(Some((run.run_id, false)));
+        }
+        if let Some(pool) = self.shared_pool.as_ref() {
+            let prepared: Option<String> = sqlx::query_scalar(
+                "SELECT run_id FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ? AND state = 'prepared' LIMIT 1")
+                .bind(user_id).bind(session_id).fetch_optional(pool.get()).await
+                .map_err(|error| Self::durable_persist_error("observe terminal custody", error.to_string()))?;
+            return Ok(prepared.map(|run_id| (run_id, true)));
+        }
+        Ok(None)
+    }
+
+    async fn observe_session_cancellation(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        let mut observed = Vec::new();
+        if let Some((run_id, prepared)) = self
+            .session_cancellation_primary_target(session_id, user_id)
+            .await?
+        {
+            if prepared {
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "Cancellation requires terminal tool reconciliation; repeat the cancellation command",
+                    "cancellation_recovery_required",
+                ));
+            }
+            let run = self
+                .get_run_execution_settlement(run_id, user_id.to_owned())
+                .await?;
+            if !run.execution_settled {
+                return Ok(CancelSessionRecord {
+                    runs: vec![run],
+                    execution_settled: false,
+                    execution_blocker: Some(SessionExecutionBlocker::ActiveRun),
+                });
+            }
+            observed.push(run);
+        }
+        let execution_blocker = self
+            .session_cancellation_blocker(session_id, user_id)
+            .await?;
         Ok(CancelSessionRecord {
-            runs: observed.into_values().collect(),
-            execution_settled,
+            runs: observed,
+            execution_settled: execution_blocker.is_none(),
             execution_blocker,
         })
+    }
+
+    async fn command_session_cancellation_target(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let result = self
+            .cancel_session_target(session_id, user_id, run_id)
+            .await?;
+        if durable_run_status_is_terminal(&result.status)
+            && let Some(pool) = self.shared_pool.as_ref()
+        {
+            astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(pool.clone())
+                .reconcile_terminal_run(user_id, session_id, run_id)
+                .await
+                .map_err(|error| {
+                    Self::durable_persist_error("cancel tool reconciliation", error.to_string())
+                })?;
+        }
+        Ok(result)
     }
 
     async fn cancel_session_target(
@@ -111,19 +204,6 @@ impl AgenticRunLifecycleService {
         user_id: &str,
     ) -> Result<BTreeSet<String>, (StatusCode, Json<ErrorResponse>)> {
         let mut candidates = BTreeSet::new();
-        let mut cursor = None;
-        loop {
-            let page = self
-                .run_engine
-                .list_active_session_runs_cursor(user_id, session_id, 100, cursor)
-                .await
-                .map_err(|error| Self::durable_persist_error("cancel session discovery", error))?;
-            candidates.extend(page.runs.into_iter().map(|run| run.run_id));
-            let Some(next) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next);
-        }
         candidates.extend(
             self.runs
                 .read()
@@ -141,10 +221,11 @@ impl AgenticRunLifecycleService {
             // and blocking Runs or ledger owners even on a fresh request to another pod.
             let ids: Vec<String> = sqlx::query_scalar(
                 "SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ?
-                   AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL)
+                   AND (status IN ('running', 'waiting', 'paused')
                         OR (owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)))
                  UNION SELECT run_id FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?
                    AND state IN ('prepared', 'dispatched', 'outcome_unknown')
+                 LIMIT 100
 ",
             ).bind(user_id).bind(session_id).bind(user_id).bind(session_id)
                 .fetch_all(pool.get()).await
@@ -167,6 +248,13 @@ impl AgenticRunLifecycleService {
                     .into_iter()
                     .filter(|run| run.session_id == session_id)
                 {
+                    if matches!(
+                        run.status.as_str(),
+                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                    ) {
+                        candidates.insert(run.run_id);
+                        continue;
+                    }
                     if let Some(control) = self
                         .run_engine
                         .load_run_control(user_id, &run.run_id)

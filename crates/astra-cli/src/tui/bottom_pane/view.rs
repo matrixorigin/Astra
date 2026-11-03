@@ -169,6 +169,12 @@ pub(crate) enum BottomPaneViewAction {
         target: crate::tui::event_loop::SessionContinuationTarget,
         content: String,
     },
+    LoadAgentActivity {
+        agent_id: String,
+        session_id: String,
+        run_id: String,
+        before_event_idx: Option<i64>,
+    },
     LoadAgentTranscript {
         agent_id: String,
         session_id: String,

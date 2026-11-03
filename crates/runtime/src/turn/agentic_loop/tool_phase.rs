@@ -977,23 +977,9 @@ fn transition_work_settlement_to_next_task_execution(state: &mut AgenticLoopStat
         return;
     }
 
-    let budget = state.agentic_turn_budget;
-    let additional_turns = budget
-        .hard_turn_limit
-        .map_or(budget.extension_turns, |limit| {
-            budget
-                .extension_turns
-                .min(limit.get().saturating_sub(state.max_turns))
-        });
-    if additional_turns == 0 {
+    if state.remaining_turns <= 1 {
         return;
     }
-    let Some(max_turns) = state.max_turns.checked_add(additional_turns) else {
-        return;
-    };
-    let Some(remaining_turns) = state.remaining_turns.checked_add(additional_turns) else {
-        return;
-    };
 
     state.hooks.completion_settlement.work_settlement_only = false;
     state.hooks.completion_settlement.text_only = false;
@@ -1002,9 +988,6 @@ fn transition_work_settlement_to_next_task_execution(state: &mut AgenticLoopStat
         .completion_settlement
         .preserve_final_synthesis_wire_surface = false;
     state.budget_wrapup_ignored_rounds = 0;
-
-    state.max_turns = max_turns;
-    state.remaining_turns = remaining_turns;
 }
 
 /// Close the typed Work settlement boundary before asking the provider to
@@ -2490,10 +2473,16 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
         }
 
+        if super::execution_phase::reject_unsettled_execution_completion(state) {
+            state.step_recorder.end_turn(false);
+            try_write_heavy_checkpoint(state);
+            return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
+        }
+
         let current_completion =
             host.stop_after_successful_tool_round(&round_tool_calls, &new_tool_results);
         if let Some(completion) = current_completion {
-            if super::execution_phase::completion_action_window_requires_followup(state) {
+            if super::execution_phase::tool_terminal_requires_followup(state) {
                 tracing::debug!(
                     target: "astra_runtime::agentic_loop_tool_phase",
                     tool_name = completion.tool_name,
@@ -2531,7 +2520,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         // consume the retained terminal template only after the next action has
         // settled the typed obligation; the following host round may legitimately
         // return no descriptor at all.
-        if !super::execution_phase::completion_action_window_requires_followup(state)
+        if !super::execution_phase::tool_terminal_requires_followup(state)
             && let Some(completion) = state
                 .hooks
                 .completion_settlement
@@ -3796,15 +3785,14 @@ mod tests {
     }
 
     #[test]
-    fn nonterminal_work_settlement_reopens_a_bounded_execution_slice() {
+    fn nonterminal_work_settlement_continues_with_only_the_remaining_admitted_allowance() {
         let mut state = make_state();
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
             24,
             std::num::NonZeroUsize::new(72),
-            12,
         );
         state.max_turns = 26;
-        state.remaining_turns = 0;
+        state.remaining_turns = 5;
         state.hooks.completion_settlement.work_settlement_only = true;
         state.budget_wrapup_ignored_rounds = 1;
 
@@ -3812,8 +3800,8 @@ mod tests {
 
         assert!(!state.hooks.completion_settlement.work_settlement_only);
         assert!(!state.hooks.completion_settlement.text_only);
-        assert_eq!(state.max_turns, 38);
-        assert_eq!(state.remaining_turns, 12);
+        assert_eq!(state.max_turns, 26);
+        assert_eq!(state.remaining_turns, 5);
         assert_eq!(state.budget_wrapup_ignored_rounds, 0);
     }
 
@@ -3823,7 +3811,6 @@ mod tests {
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
             24,
             std::num::NonZeroUsize::new(30),
-            12,
         );
         state.max_turns = 28;
         state.remaining_turns = 0;
@@ -3831,8 +3818,8 @@ mod tests {
 
         transition_work_settlement_to_next_task_execution(&mut state);
 
-        assert_eq!(state.max_turns, 30);
-        assert_eq!(state.remaining_turns, 2);
+        assert_eq!(state.max_turns, 28);
+        assert_eq!(state.remaining_turns, 0);
     }
 
     #[test]
@@ -3841,7 +3828,6 @@ mod tests {
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
             24,
             std::num::NonZeroUsize::new(30),
-            12,
         );
         state.max_turns = 30;
         state.remaining_turns = 0;

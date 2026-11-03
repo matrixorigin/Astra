@@ -6234,6 +6234,42 @@ fn initial_agent_transcript_update(
     }
 }
 
+fn dispatch_agent_activity_load(
+    agent_id: String,
+    session_id: String,
+    run_id: String,
+    before_event_idx: Option<i64>,
+    backends: ViewActionBackends,
+) {
+    tokio::spawn(async move {
+        let page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let token = crate::cli::session::session_runtime::fresh_access_token(
+                &backends.api,
+                backends.profile.as_deref(),
+            )
+            .await
+            .ok_or_else(|| "Authentication unavailable".to_string())?;
+            backends
+                .api
+                .get_run_activity(&token, &session_id, &run_id, before_event_idx)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("Activity request timed out".into()));
+        let update = bottom_pane::agent_transcript_view::AgentTranscriptUpdate::ActivityLoaded {
+            agent_id,
+            run_id,
+            page,
+            replace: before_event_idx.is_none(),
+        };
+        let _ = backends
+            .agent_workbench_tx
+            .send(AgentWorkbenchOutcome::TranscriptUpdate(update))
+            .await;
+    });
+}
+
 fn dispatch_agent_transcript_load(
     agent_id: String,
     session_id: String,
@@ -7127,6 +7163,15 @@ async fn dispatch_bottom_pane_view_action(
                     ),
                 ));
             }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::LoadAgentActivity {
+            agent_id,
+            session_id,
+            run_id,
+            before_event_idx,
+        } => {
+            dispatch_agent_activity_load(agent_id, session_id, run_id, before_event_idx, backends);
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::LoadAgentTranscript {
@@ -18421,6 +18466,7 @@ mod tests {
             AgentStatus::Failed {
                 error: "review failed".into(),
                 finish_reason: Some("failed".into()),
+                partial_result: String::new(),
             },
         );
         let row = background_task_row_for_local_agent(&failed)

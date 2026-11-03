@@ -11554,6 +11554,7 @@ mod tests {
                 AgentStatus::Cancelled {
                     by_user: true,
                     reason: "user stopped".into(),
+                    partial_result: String::new(),
                 },
             )]),
             &[],

@@ -146,6 +146,20 @@ pub trait RunLifecycleService: Send + Sync {
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Read cancellation settlement without submitting another cancellation.
+    async fn get_run_execution_settlement(
+        &self,
+        _run_id: String,
+        _user_id: String,
+    ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse::new(
+                "Execution settlement observation is unavailable",
+            )),
+        ))
+    }
+
     /// Read the exact Work scope for one run without scanning a bounded
     /// session listing. This is used at cross-surface interaction boundaries.
     async fn get_run_work_scope(
@@ -237,6 +251,17 @@ pub trait RunLifecycleService: Send + Sync {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Session run cancellation not supported",
+        ))
+    }
+
+    async fn get_session_execution_settlement(
+        &self,
+        _session_id: String,
+        _user_id: String,
+    ) -> Result<CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Session execution observation is unavailable",
         ))
     }
 
@@ -432,9 +457,8 @@ pub struct ExecutionBudget {
 /// Request-local upper bound on total wall-clock execution, including final
 /// synthesis. Admission freezes ordinary-work and total cutoffs within it.
 ///
-/// This is intentionally independent from [`ExecutionBudget`]: round limits
-/// may auto-expand as the runtime makes progress, while elapsed wall time must
-/// never be replenished. A missing value means unbounded wall-clock execution.
+/// This is intentionally independent from [`ExecutionBudget`]: round allowance
+/// and elapsed wall time are admitted separately and neither may be replenished. A missing value means unbounded wall-clock execution.
 /// Servers must treat this client-provided value as an
 /// upper bound and monotonically decrease it at later model boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -12225,6 +12249,8 @@ impl DatabaseRunStateStore {
                 run.events = events.into_iter().map(|(_, event)| event).collect();
             }
         }
+        self.hydrate_canonical_recovery_terminals(&mut page.runs)
+            .await?;
         Ok(())
     }
 

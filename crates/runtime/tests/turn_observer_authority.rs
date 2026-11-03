@@ -21,6 +21,7 @@ struct AuthorityPort {
     bound_owner: Option<String>,
     allowed: Result<bool, String>,
     transport_error: Option<String>,
+    transport_missing: bool,
     master: bool,
     calls: Arc<Mutex<Vec<String>>>,
 }
@@ -54,6 +55,9 @@ impl MemoriaPort for AuthorityPort {
         self.calls.lock().unwrap().push("resolve-write".into());
         if let Some(error) = &self.transport_error {
             return Err(error.clone());
+        }
+        if self.transport_missing {
+            return Ok(None);
         }
         Ok(Some(MemoriaToolTransport {
             base_url: self.base_url.clone(),
@@ -126,6 +130,7 @@ fn port(base_url: String) -> AuthorityPort {
         bound_owner: None,
         allowed: Ok(true),
         transport_error: None,
+        transport_missing: false,
         master: false,
         calls: Arc::default(),
     }
@@ -232,6 +237,20 @@ async fn observer_fails_closed_on_authority_error_or_revocation_after_admission(
 }
 
 #[tokio::test]
+async fn observer_rejects_an_admitted_port_without_transport() {
+    let (url, requests, server) = backend(StatusCode::NO_CONTENT).await;
+    let mut authority = port(url);
+    authority.transport_missing = true;
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(authority)));
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap_err(),
+        "Memoria observer requires an authorized HTTP transport"
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
 async fn observer_rejects_rebinding_another_owner() {
     let (url, requests, server) = backend(StatusCode::NO_CONTENT).await;
     let mut authority = port(url);
@@ -325,9 +344,11 @@ async fn owner_auth_rejects_legacy_missing_duplicate_and_invalid_owner_headers()
 
 #[tokio::test]
 async fn observer_connection_error_is_classified_without_url_or_credential() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    // Keep the port reserved without listening. Dropping a listener here lets
+    // another concurrently running test claim the address before the request.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let endpoint = format!("http://{}", socket.local_addr().unwrap());
     let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(endpoint))));
     assert_eq!(
         worker.run(request("astra-a")).await.unwrap_err(),

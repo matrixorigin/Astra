@@ -100,10 +100,14 @@ pub(crate) use shell::shell_escape;
 mod code_analysis;
 
 pub fn all_tool_schemas() -> Vec<Value> {
+    tool_schemas_with_background(shell::environment_background_authorized())
+}
+
+fn tool_schemas_with_background(authorized: bool) -> Vec<Value> {
     let mut schemas = full_tool_schemas();
-    // The projector checks the same platform capability as the executor, so
-    // unsupported arguments are never advertised.
-    astra_tools::schemas::enable_managed_background_bash_schema(&mut schemas);
+    if authorized {
+        astra_tools::schemas::enable_managed_background_bash_schema(&mut schemas);
+    }
     schemas
 }
 
@@ -7659,7 +7663,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn cli_edge_bash_exposes_managed_background_contract() {
-        let schemas = super::local_tool_schemas();
+        let schemas = super::tool_schemas_with_background(true);
         let bash = schemas
             .iter()
             .find(|schema| {
@@ -7678,10 +7682,9 @@ pub(crate) mod tests {
         assert!(properties.contains_key("background_ttl"));
     }
 
-    #[cfg(not(unix))]
     #[test]
     fn cli_edge_bash_hides_unsupported_managed_background_contract() {
-        let schemas = super::local_tool_schemas();
+        let schemas = super::tool_schemas_with_background(false);
         let bash = schemas
             .iter()
             .find(|schema| {

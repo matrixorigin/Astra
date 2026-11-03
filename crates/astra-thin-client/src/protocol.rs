@@ -197,6 +197,25 @@ pub struct SessionTranscriptToolResult {
     pub duration_ms: Option<u64>,
 }
 
+/// A separate C3 cursor domain; indices are never C1 transcript item sequences.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunActivityPage {
+    pub session_id: String,
+    pub run_id: String,
+    /// Immutable root C3 source; event indices belong to this run.
+    pub source_run_id: String,
+    pub events: Vec<RunActivityEvent>,
+    pub next_before_event_idx: Option<i64>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunActivityEvent {
+    pub event_idx: i64,
+    /// Missing/oversized evidence is explicit, never reconstructed as success.
+    pub event: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionTranscriptPage {
     pub session_id: String,

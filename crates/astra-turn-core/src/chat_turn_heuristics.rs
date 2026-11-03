@@ -29,13 +29,12 @@ pub fn action_command_window(work_remaining: Duration, settlement_grace: Duratio
     work_remaining.saturating_sub(settlement_grace)
 }
 
-// Profiles select a useful initial slice and renewal step. The resolver uses
-// caller/administrator limits for the hard boundary, not these profile caps.
-// Renewal checks authoritative stop conditions, not availability of receipts.
-const STANDARD_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(24, None, 12);
-const COMPLEX_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(32, None, 16);
-const STANDARD_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(32, None, 16);
-const COMPLEX_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(40, None, 20);
+// Admission resolves one finite allowance. Activity, retry and recovery do
+// not grant additional rounds.
+const STANDARD_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(24, None);
+const COMPLEX_ANALYSIS_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(32, None);
+const STANDARD_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(32, None);
+const COMPLEX_IMPLEMENTATION_TURN_BUDGET: AgenticTurnBudget = AgenticTurnBudget::new(40, None);
 // Exploration changes stall sensitivity, not the amount of work a user has
 // authorized. Keep the same resource boundary for the same complexity.
 const STANDARD_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget = STANDARD_ANALYSIS_TURN_BUDGET;
@@ -57,19 +56,13 @@ pub struct AgenticTurnBudget {
     pub initial_turns: usize,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub hard_turn_limit: Option<NonZeroUsize>,
-    pub extension_turns: usize,
 }
 
 impl AgenticTurnBudget {
-    pub const fn new(
-        initial_turns: usize,
-        hard_turn_limit: Option<NonZeroUsize>,
-        extension_turns: usize,
-    ) -> Self {
+    pub const fn new(initial_turns: usize, hard_turn_limit: Option<NonZeroUsize>) -> Self {
         Self {
             initial_turns,
             hard_turn_limit,
-            extension_turns,
         }
     }
 }
@@ -181,32 +174,24 @@ pub fn resolve_agentic_turn_budget(
     runtime_ceiling: Option<NonZeroUsize>,
     override_budget: Option<AgenticTurnBudgetOverride>,
 ) -> AgenticTurnBudget {
-    let requested_hard = override_budget.and_then(|value| value.hard_turn_limit);
-    let hard_turn_limit = match (runtime_ceiling, requested_hard) {
-        (Some(runtime), Some(requested)) => Some(runtime.min(requested)),
-        (runtime, requested) => runtime.or(requested),
-    };
-    let requested_initial = override_budget
-        .and_then(|value| value.initial_turns)
+    let requested = override_budget
+        .and_then(|value| {
+            value
+                .hard_turn_limit
+                .map(NonZeroUsize::get)
+                .or(value.initial_turns)
+        })
         .unwrap_or(profile.agentic_turn_budget.initial_turns)
         .max(1);
-    let initial_turns = hard_turn_limit.map_or(requested_initial, |limit| {
-        requested_initial.min(limit.get())
-    });
+    let initial_turns = runtime_ceiling.map_or(requested, |limit| requested.min(limit.get()));
     AgenticTurnBudget {
         initial_turns,
-        hard_turn_limit,
-        extension_turns: profile.agentic_turn_budget.extension_turns.max(1),
+        hard_turn_limit: NonZeroUsize::new(initial_turns),
     }
 }
 
-/// Resolve the adaptive execution slices for an isolated child while keeping
-/// one deterministic, administrator-owned runaway boundary.
-///
-/// Children use the same task profile as a root run. The process runtime
-/// ceiling is explicit here so progress can extend the initial slice but can
-/// never renew beyond that ceiling. Cost/token totals are observability, not a
-/// second hidden execution policy.
+/// Resolve a child's finite allowance using the same owner as root runs.
+/// A runtime ceiling may reduce this allowance; progress never renews it.
 #[must_use]
 pub fn resolve_isolated_agentic_turn_budget(
     profile: TaskExecutionProfile,
@@ -215,15 +200,8 @@ pub fn resolve_isolated_agentic_turn_budget(
     resolve_isolated_agentic_turn_budget_with_initial_slice(profile, runtime_ceiling, None)
 }
 
-/// Resolve an isolated child's adaptive budget with an optional initial-slice
-/// hint.
-///
-/// Agent personas use the hint to choose the first convergence checkpoint; it
-/// is not a semantic hard stop. Only a caller-owned explicit numeric limit is
-/// allowed to become a hard boundary, and that is handled by
-/// [`resolve_agentic_turn_budget`] at the execution owner. This distinction
-/// prevents a read-only persona default from silently truncating a productive
-/// child run while retaining one administrator-owned runaway ceiling.
+/// A persona hint selects the allowance when no explicit caller limit exists.
+/// This is an admission input, not a renewable scheduling slice.
 #[must_use]
 pub fn resolve_isolated_agentic_turn_budget_with_initial_slice(
     profile: TaskExecutionProfile,
@@ -243,9 +221,8 @@ pub fn resolve_isolated_agentic_turn_budget_with_initial_slice(
 /// Resolve the one shared child-run budget protocol used by local and server
 /// executors.
 ///
-/// `initial_slice` is always a scheduling checkpoint. `explicit_hard_limit`
-/// is present only when the caller supplied a numeric max-turns constraint;
-/// persona defaults and qualitative complexity must pass `None`.
+/// An explicit caller limit takes precedence over the persona's allowance.
+/// Runtime ceilings apply to both. Neither allowance can expand after admission.
 #[must_use]
 pub fn resolve_spawned_agentic_turn_budget(
     profile: TaskExecutionProfile,
@@ -329,7 +306,7 @@ mod tests {
     fn execution_profile_checkpoint_requires_complete_budget_facts() {
         for hard_turn_limit in [None, NonZeroUsize::new(73)] {
             let profile = TaskExecutionProfile {
-                agentic_turn_budget: AgenticTurnBudget::new(17, hard_turn_limit, 11),
+                agentic_turn_budget: AgenticTurnBudget::new(17, hard_turn_limit),
                 ..TaskExecutionProfile::default()
             };
             let wire = serde_json::to_value(profile).unwrap();
@@ -337,7 +314,7 @@ mod tests {
                 serde_json::from_value::<TaskExecutionProfile>(wire.clone()).unwrap(),
                 profile
             );
-            for field in ["initial_turns", "hard_turn_limit", "extension_turns"] {
+            for field in ["initial_turns", "hard_turn_limit"] {
                 let mut incomplete = wire.clone();
                 incomplete["agentic_turn_budget"]
                     .as_object_mut()
@@ -408,28 +385,33 @@ mod tests {
                     hard_turn_limit: requested.and_then(NonZeroUsize::new),
                 }),
             );
-            assert_eq!(budget.hard_turn_limit, expected.and_then(NonZeroUsize::new));
+            assert_eq!(
+                budget.hard_turn_limit,
+                NonZeroUsize::new(expected.map_or(60, |limit| limit.min(60)))
+            );
             assert_eq!(
                 budget.initial_turns,
                 expected.map_or(60, |limit| limit.min(60))
             );
-            assert_eq!(budget.extension_turns, 12);
         }
     }
 
     #[test]
-    fn root_and_child_share_uncapped_slices_and_explicit_boundaries() {
+    fn root_and_child_resolve_one_fixed_allowance() {
         let profile = TaskExecutionProfile::default();
         for ceiling in [None, NonZeroUsize::new(12), NonZeroUsize::new(300)] {
             let root = resolve_agentic_turn_budget(profile, ceiling, None);
             let child = resolve_isolated_agentic_turn_budget(profile, ceiling);
             assert_eq!(root, child);
-            assert_eq!(root.hard_turn_limit, ceiling);
+            assert_eq!(
+                root.hard_turn_limit,
+                NonZeroUsize::new(ceiling.map_or(24, |limit| limit.get().min(24)))
+            );
         }
         let persona =
             resolve_isolated_agentic_turn_budget_with_initial_slice(profile, None, Some(25));
         assert_eq!(persona.initial_turns, 25);
-        assert_eq!(persona.hard_turn_limit, None);
+        assert_eq!(persona.hard_turn_limit, NonZeroUsize::new(25));
         let child = resolve_spawned_agentic_turn_budget(
             profile,
             NonZeroUsize::new(50),

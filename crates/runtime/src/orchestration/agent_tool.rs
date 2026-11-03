@@ -613,6 +613,7 @@ pub async fn handle_agent_list_action(args: &Value, ctx: Option<&AgentToolContex
                 "terminal": state.status.is_terminal(),
                 "revision": state.work_revision,
                 "tool_calls": state.metrics.tool_calls,
+                "metrics_completeness": state.metrics.coverage(),
                 "result_available": state.status.is_terminal(),
             })
         })
@@ -3406,6 +3407,10 @@ async fn enrich_collected_agent_result(
             );
         }
         object.insert("tool_calls".into(), json!(state.metrics.tool_calls));
+        object.insert(
+            "metrics_completeness".into(),
+            json!(state.metrics.coverage()),
+        );
         if let Some(identity) = state.prepared_execution {
             object.insert("prepared_execution".into(), json!(identity));
         }
@@ -3429,6 +3434,18 @@ async fn enrich_collected_agent_result(
             ),
         );
     }
+    object.insert(
+        "applied_user_intents_coverage".into(),
+        json!(if object
+            .get("applied_user_intents")
+            .and_then(Value::as_array)
+            .is_some_and(|intents| !intents.is_empty())
+        {
+            "partial"
+        } else {
+            "unknown"
+        }),
+    );
     serde_json::to_string(&value).unwrap_or(rendered)
 }
 
@@ -3464,17 +3481,32 @@ async fn handle_agent_get_result_action_inner(
     // Preview staging must not turn a known terminal result into a durable
     // reconciliation request. The current parent owner is the read authority;
     // unrelated runs cannot use this retained payload.
-    let retained = ctx.spawner.retained_child_result(&ctx.run_id, agent_id);
-    if retained.is_none()
-        && reconcile_durable
-        && let Err(error) = reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await
-    {
-        tracing::warn!(
-            target: "fanout",
-            %agent_id,
-            %error,
-            "durable child reconciliation failed; returning the last confirmed observation"
-        );
+    let mut retained = ctx.spawner.retained_child_result(&ctx.run_id, agent_id);
+    let needs_terminal_evidence = retained.as_ref().is_some_and(|child| {
+        matches!(
+            child.status,
+            AgentStatus::Failed { .. } | AgentStatus::Cancelled { .. }
+        )
+    });
+    if reconcile_durable {
+        let refresh = if needs_terminal_evidence {
+            let child = retained.as_ref().expect("known terminal child");
+            ctx.spawner
+                .reconcile_durable_agent_runs_for(std::slice::from_ref(&child.run_id))
+                .await
+        } else if retained.is_none() {
+            reconcile_durable_agent_runs_for_tool(ctx.spawner.as_ref()).await
+        } else {
+            Ok(0)
+        };
+        if let Err(error) = refresh {
+            tracing::warn!(target: "fanout", %agent_id, %error,
+                "durable child reconciliation failed; returning the last confirmed observation");
+        }
+    }
+
+    if needs_terminal_evidence && reconcile_durable {
+        retained = ctx.spawner.retained_child_result(&ctx.run_id, agent_id);
     }
 
     let timeout = AGENT_RESULT_OBSERVE_GRACE;
@@ -5118,7 +5150,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn handle_spawn_agent_tool_treats_model_turn_hint_as_renewable() {
+    async fn handle_spawn_agent_tool_freezes_model_turn_hint_at_admission() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -5139,7 +5171,7 @@ pub(crate) mod tests {
             Some(10),
             "the child loop must preserve the model-suggested initial slice"
         );
-        assert_eq!(executor.take_captured_hard_turn_limit(), Some(None));
+        assert_eq!(executor.take_captured_hard_turn_limit(), Some(Some(10)));
     }
 
     #[tokio::test]
@@ -5185,7 +5217,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn persona_default_turn_budget_is_not_a_hard_limit() {
+    async fn persona_default_turn_budget_is_finite() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -5203,7 +5235,7 @@ pub(crate) mod tests {
         let completed = collect_spawn_receipt(&result, &ctx).await;
         assert_eq!(completed["status"], "completed", "{completed}");
         assert_eq!(executor.take_captured_max_turns(), Some(12));
-        assert_eq!(executor.take_captured_hard_turn_limit(), Some(None));
+        assert_eq!(executor.take_captured_hard_turn_limit(), Some(Some(12)));
     }
 
     #[tokio::test]
@@ -6899,7 +6931,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn deep_code_review_fanout_keeps_persona_budget_as_a_renewable_slice() {
+    async fn deep_code_review_fanout_freezes_persona_allowance() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -6929,8 +6961,8 @@ pub(crate) mod tests {
         assert_eq!(executor.take_captured_max_turns(), Some(24));
         assert_eq!(
             executor.take_captured_hard_turn_limit(),
-            Some(None),
-            "an implicit deep code-review persona budget must not terminate the child at 24 turns"
+            Some(Some(24)),
+            "the deep code-review allowance must not renew past its admitted 24 turns"
         );
     }
 

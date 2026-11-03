@@ -5580,6 +5580,7 @@ impl RunExecutionCapacity {
 }
 
 pub struct AgenticRunLifecycleService {
+    default_execution_timeout_s: Result<u64, String>,
     /// Process-local run handles (run_id -> state) for live cancellation, pause,
     /// and active SSE fanout. Durable state is the user-visible authority.
     runs: Arc<RwLock<HashMap<String, RunState>>>,
@@ -5685,26 +5686,21 @@ pub struct AgenticRunLifecycleService {
 }
 
 impl AgenticRunLifecycleService {
-    /// A process-local execution record is authoritative for this process even
-    /// after its durable lease has been released. Only fall back to the
-    /// durable lease when this process has no matching record at all.
+    /// A live executor or durable owner lease independently prevents settlement.
+    /// A stopped local cache entry cannot retire a newer remote owner.
     async fn cancellation_execution_is_settled(
         &self,
         user_id: &str,
         run_id: &str,
         durable_owner_lease_live: bool,
     ) -> bool {
-        match self
-            .runs
-            .read()
-            .await
-            .get(run_id)
-            .filter(|run| run.user_id == user_id)
-            .map(|run| run.execution_live)
-        {
-            Some(execution_live) => !execution_live,
-            None => !durable_owner_lease_live,
-        }
+        !durable_owner_lease_live
+            && !self
+                .runs
+                .read()
+                .await
+                .get(run_id)
+                .is_some_and(|run| run.user_id == user_id && run.execution_live)
     }
 
     pub fn new(
@@ -5735,6 +5731,7 @@ impl AgenticRunLifecycleService {
             .map(|id| ServerWorkspaceProvisioner::from_env(id.to_owned()));
         let admission_limits = canonical_session_admission_limits();
         Self {
+            default_execution_timeout_s: astra_core::RuntimeLimits::global().turn_timeout_s.clone(),
             runs: Arc::new(RwLock::new(HashMap::new())),
             matrixone,
             encryptor,
@@ -5961,6 +5958,12 @@ impl AgenticRunLifecycleService {
             delta,
         )
         .map(Some)
+    }
+
+    pub fn with_runtime_config(mut self, config: &astra_core::ServerRuntimeConfig) -> Self {
+        self.default_execution_timeout_s =
+            astra_core::RuntimeLimits::from_config_with_env(config).turn_timeout_s;
+        self
     }
 
     pub fn with_memory_extraction_service(
@@ -7914,6 +7917,13 @@ impl AgenticRunLifecycleService {
                 Err(error) if error.kind == astra_core::ErrorKind::Cancelled
             )
         {
+            if !loop_state.final_text.is_empty() {
+                events.push(json!({"event_type":"text_done", "data": {
+                    "full_text":loop_state.final_text,
+                    "model_item_id":loop_state.final_text_model_item_id,
+                    "partial":true,
+                }}));
+            }
             let mut data = usage;
             data["cancelled"] = Value::Bool(true);
             events.push(json!({
@@ -9602,7 +9612,27 @@ impl AgenticRunLifecycleService {
                 "model_identity_invalid",
             )?;
         }
+        if request.admitted_execution_deadline.is_some() && request.execution_time_budget.is_none()
+        {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "admitted execution deadline requires its original time budget",
+                "execution_time_budget_invalid",
+            ));
+        }
         if request.admitted_execution_deadline.is_none() {
+            if request.execution_time_budget.is_none() {
+                let seconds = self.default_execution_timeout_s.as_ref().map_err(|error| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        error.clone(),
+                        "runtime_timeout_invalid",
+                    )
+                })?;
+                request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: *seconds,
+                });
+            }
             let now_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| {
@@ -16304,6 +16334,56 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         Ok(status)
     }
 
+    async fn get_run_execution_settlement(
+        &self,
+        run_id: String,
+        user_id: String,
+    ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let control = self
+            .run_engine
+            .load_run_control(&user_id, &run_id)
+            .await
+            .map_err(|error| {
+                Self::durable_persist_error("execution settlement observation", error)
+            })?;
+        let Some(control) = control else {
+            let locally_admitted = self
+                .runs
+                .read()
+                .await
+                .get(&run_id)
+                .is_some_and(|run| run.user_id == user_id && run.execution_live);
+            return if locally_admitted {
+                Ok(CancelRunRecord {
+                    run_id,
+                    status: "cancellation_requested".into(),
+                    execution_settled: false,
+                })
+            } else {
+                Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+            };
+        };
+        let status = Self::run_status_from_durable(&control.status)?;
+        let execution_stopped = self
+            .cancellation_execution_is_settled(&user_id, &run_id, control.owner_lease_live)
+            .await;
+        if !status.is_terminal() && execution_stopped {
+            // A read cannot seize an expired owner. Ask the caller to reissue
+            // the existing exact-generation cancellation command instead.
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "Cancellation requires owner recovery; repeat the cancellation command",
+                "cancellation_recovery_required",
+            ));
+        }
+        let execution_settled = status.is_terminal() && execution_stopped;
+        Ok(CancelRunRecord {
+            run_id,
+            status: control.status,
+            execution_settled,
+        })
+    }
+
     async fn get_run_interaction_projection(
         &self,
         run_id: String,
@@ -17333,7 +17413,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         session_id: String,
         user_id: String,
     ) -> Result<astra_services::runs::CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.converge_session_cancellation(&session_id, &user_id)
+        self.converge_session_cancellation(&session_id, &user_id, true)
+            .await
+    }
+
+    async fn get_session_execution_settlement(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<astra_services::runs::CancelSessionRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.converge_session_cancellation(&session_id, &user_id, false)
             .await
     }
 
@@ -20919,6 +21008,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
                         crate::orchestration::AgentStatus::Cancelled {
                             by_user: false,
                             reason,
+                            partial_result: String::new(),
                         }
                     }
                     DurableCancellationOrigin::Unverified => {
@@ -23458,6 +23548,7 @@ async fn settle_subrun_activation_cancellation(
                         crate::orchestration::AgentStatus::Cancelled {
                             by_user: false,
                             reason: "cancelled during durable activation".to_string(),
+                            partial_result: String::new(),
                         }
                     },
                 ),
@@ -23542,6 +23633,11 @@ async fn settle_subrun_activation_cancellation(
         );
     }
     crate::server::delegation::engine::SubRunExecutionResult {
+        cancellation_origin: if user_terminal_winner {
+            CancellationOrigin::User
+        } else {
+            CancellationOrigin::Unverified
+        },
         result,
         committed_frontier,
         applied_user_intents,
@@ -25112,7 +25208,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
                 status: projected_status.to_string(),
-                output: None,
+                output: (!loop_state.final_text.is_empty()).then_some(loop_state.final_text),
                 error: Some(err),
                 prompt_tokens,
                 completion_tokens: loop_state.total_completion,
@@ -25138,7 +25234,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
                 status: projected_status.to_string(),
-                output: None,
+                output: (!loop_state.final_text.is_empty()).then_some(loop_state.final_text),
                 error: Some(err.to_string()),
                 prompt_tokens,
                 completion_tokens: loop_state.total_completion,
@@ -25187,6 +25283,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             }
             drop(owner_lease_heartbeat.take());
             execution_result.map(|result| crate::server::delegation::engine::SubRunExecutionResult {
+                cancellation_origin: crate::orchestration::CancellationOrigin::Unverified,
                 result,
                 committed_frontier,
                 applied_user_intents,

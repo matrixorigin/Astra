@@ -397,6 +397,19 @@ pub trait MemoriaPort: Send + Sync {
         Ok(None)
     }
 
+    /// Resolve observer write authority at dispatch. Implementations may
+    /// combine admission and transport resolution when the same fresh check
+    /// enforces both; the default preserves separate checks for custom ports.
+    async fn resolve_observer_transport(&self) -> Result<Option<MemoriaToolTransport>, String> {
+        if !self.admits_operation(true).await? {
+            return Ok(None);
+        }
+        self.resolve_tool_transport(true)
+            .await?
+            .map(Some)
+            .ok_or_else(|| "Memoria observer requires an authorized HTTP transport".to_string())
+    }
+
     async fn retrieve_for_prompt(
         &self,
         query: &str,
