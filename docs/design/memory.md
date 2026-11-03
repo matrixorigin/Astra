@@ -255,3 +255,42 @@ that prohibits tools must not create Work through automatic admission. Ordinary
 conversation-only acknowledgment needs no lookup or storage caveat. The compact
 resident memory surface supports remember/recall; select the full memory contract
 and use its invocation carrier for operations such as forget or update.
+
+## MOI request identity bridge
+
+With UC built-in memory explicitly enabled, MOI HMAC and MOI edge-token
+principals resolve their IAM subject through the configured `moi` external
+provider callback using action `resolve_memory_identity`. The pinned service
+credential is required. Its response binds `external_subject`, `issuer` and
+`uc_subject`; the issuer must exactly equal the configured UC issuer. Every
+operation repeats identity resolution and the existing live UC account-status
+check. The existing UC built-in policy, bounded owner derivation and owner-scoped
+Memoria transport apply; a provider request signature is not itself the grant.
+This is account-scoped personal memory and grants no workspace resource access.
+The same UC account uses the same personal-memory owner across MOI workspaces
+and native UC login; this bridge does not provide workspace-isolated memory.
+
+The bridge does not provision local password users, rename run/session owners,
+copy historical memories or alter native UC, local-account and scoped-key login
+paths. A missing mapping, unavailable callback, mismatched identity or revoked UC
+account never falls back to the deployment master under the request owner.
+The existing observer, explicit memory tools and session-end maintenance use
+this same resolver. Observer acceptance proves that an observation was accepted,
+not that memory was recalled or injected into a subsequent conversation.
+This change does not wire automatic prompt recall: the retained memory-prefetch
+helpers have no production caller. Verify cross-session recall with an explicit
+memory-tool invocation and verify account isolation separately.
+Resolver integration does not expand HTTP authentication: request-bound HMAC
+authentication is not accepted by the memory proxy or close/finalize routes,
+which use `current_user`; MOI edge-token authentication remains available there.
+The MOI caller must also invoke close/finalize to trigger that maintenance.
+The MOI callback must be deployed before enabling this path in Astra.
+Compare its effective issuer with Astra's configured issuer byte for byte before
+deployment, including any trailing slash. A normal observer authority resolution
+performs one MOI identity request and one UC account-status request; fetching an
+uncached UC service token can add another request.
+The callback's explicit identity denial is HTTP 403 with error code
+`moi_memory_identity_denied`; the resolver returns `Denied` for that exact pair.
+Service-authentication failures, unclassified 403 responses, dependency failures
+and malformed payloads remain authority errors. A denied account must not be
+reported as a backend outage, nor may an outage be converted into consent denial.
