@@ -3236,6 +3236,142 @@ mod tests {
         wait_for_observer_in_flight(0).await;
     }
 
+    #[derive(Clone)]
+    struct SlowCallbackMemoryPort {
+        client: reqwest::Client,
+        callback: String,
+    }
+
+    #[async_trait::async_trait]
+    impl astra_memoria::MemoriaPort for SlowCallbackMemoryPort {
+        fn bind_owner(&self, _: &str) -> Result<Arc<dyn astra_memoria::MemoriaPort>, String> {
+            Ok(Arc::new(self.clone()))
+        }
+
+        async fn resolve_observer_transport(
+            &self,
+        ) -> Result<Option<astra_memoria::MemoriaToolTransport>, String> {
+            self.client
+                .post(&self.callback)
+                .send()
+                .await
+                .map_err(|_| "callback unavailable")?;
+            Err("unexpected callback response".into())
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: usize,
+            _: bool,
+        ) -> Result<Vec<astra_memoria::MemoriaMemory>, astra_memoria::MemoriaOperationError>
+        {
+            panic!("observer authority lookup must not retrieve memory")
+        }
+
+        async fn store(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<String, String> {
+            panic!("observer authority timeout must not write memory")
+        }
+
+        async fn purge_working(&self, _: &str) -> Result<u64, String> {
+            panic!("observer authority timeout must not purge memory")
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(history_work)]
+    async fn server_loop_observer_slow_authority_releases_all_slots_for_other_users() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let callbacks = started.clone();
+        let app = axum::Router::new().route(
+            "/identity",
+            axum::routing::post(move || {
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<axum::http::StatusCode>()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let callback = format!("http://{}/identity", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let worker = Arc::new(crate::DatabaseTurnObserverWorker::new(Some(Arc::new(
+            SlowCallbackMemoryPort {
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap(),
+                callback,
+            },
+        ))));
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        let state = observer_test_state();
+        for i in 0..DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY {
+            fire_server_loop_observer(
+                worker.clone(),
+                &format!("user-{i}"),
+                &format!("session-{i}"),
+                &state,
+                Some(registry.clone()),
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) != DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all four callbacks must be in flight together");
+        let healthy = Arc::new(CaptureObserverWorker::new(false));
+        assert!(
+            fire_server_loop_observer(
+                healthy.clone(),
+                "healthy-user",
+                "healthy-session",
+                &state,
+                Some(registry.clone()),
+            )
+            .await
+            .is_err(),
+            "existing saturation policy must remain visible"
+        );
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while TURN_OBSERVER_ASYNC_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("authority deadlines must cancel slow requests and release all permits");
+        assert!(
+            registry
+                .render_prometheus()
+                .contains("astra_turn_observer_runs_total{mode=\"async\",outcome=\"error\"} 4"),
+            "authority timeouts must be errors, not access denials or successes"
+        );
+        fire_server_loop_observer(
+            healthy.clone(),
+            "healthy-user",
+            "healthy-session",
+            &state,
+            Some(registry),
+        )
+        .await
+        .expect("another user must be admitted after the authority deadlines");
+        wait_for_observer_calls(healthy.as_ref(), 1).await;
+        wait_for_observer_in_flight(0).await;
+        server.abort();
+    }
+
     #[tokio::test]
     #[serial_test::serial(history_work)]
     async fn server_loop_observer_metrics_stay_low_cardinality() {

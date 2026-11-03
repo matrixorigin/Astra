@@ -8,6 +8,11 @@ use astra_services::observation_capture::DurableCaptureOutcome;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 use sqlx::Acquire;
 
+// Includes all fresh authority dependencies (MOI mapping, UC service token and
+// account status). Dropping the timed-out future releases an observer slot;
+// the backend send retains its independent 30-second request timeout.
+const OBSERVER_AUTHORITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Clone, Debug)]
 pub(crate) struct NoopTurnObserverWorker;
 
@@ -297,7 +302,13 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         let queue_reservation = reserve_memory_extraction_payload(&payload);
         // Resolve fresh write authority after preparation, just as memory tools
         // do. A denied/revoked grant never falls back to deployment credentials.
-        let Some(transport) = port.resolve_observer_transport().await? else {
+        let transport = tokio::time::timeout(
+            OBSERVER_AUTHORITY_TIMEOUT,
+            port.resolve_observer_transport(),
+        )
+        .await
+        .map_err(|_| "memoria observer authority lookup timed out".to_string())??;
+        let Some(transport) = transport else {
             return Ok(TurnObserverOutcome::AccessDisabled);
         };
         let response = client

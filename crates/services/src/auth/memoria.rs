@@ -253,6 +253,7 @@ pub struct MemoriaCredentialResolver {
     encryptor: FernetTokenEncryptor,
     uc_provider: Option<super::uc::UcNativeProvider>,
     external_providers: Vec<super::ExternalAuthProviderConfig>,
+    external_client: std::sync::Arc<dyn super::ExternalProviderClient>,
 }
 
 // One statement snapshot; never cached or reused as an operation grant.
@@ -353,7 +354,7 @@ impl MemoriaCredentialResolver {
             (1, Some(subject)) if !subject.is_empty() => subject,
             _ => return Err("UC memory identity is ambiguous".into()),
         };
-        Self::uc_builtin_credential(&self.provider, uc, subject)
+        Self::uc_builtin_credential(&self.provider, uc, subject, MemoryAccess::ReadWrite)
             .await
             .map(Some)
     }
@@ -362,7 +363,11 @@ impl MemoriaCredentialResolver {
         memoria: &MemoriaProvider,
         uc: &super::uc::UcNativeProvider,
         subject: &str,
+        access: MemoryAccess,
     ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
+        if access == MemoryAccess::None {
+            return Ok(MemoriaCredentialResolution::Denied);
+        }
         if memoria.web_url.is_some() {
             return Err("UC built-in memory cannot use a Memoria login website".into());
         }
@@ -377,7 +382,7 @@ impl MemoriaCredentialResolver {
             key: key.clone(),
             owner: uc.memory_owner(subject),
             generation: format!("uc:{}", uc.settings.issuer),
-            access: MemoryAccess::ReadWrite,
+            access,
             owner_scoped_master: true,
             connection_generation: None,
         }))
@@ -394,6 +399,7 @@ impl MemoriaCredentialResolver {
             encryptor,
             uc_provider: None,
             external_providers: Vec::new(),
+            external_client: super::HttpExternalProviderClient::shared(),
         }
     }
     fn token_id(&self, user: &str) -> String {
@@ -436,6 +442,7 @@ impl MemoriaCredentialResolver {
         memoria: &MemoriaProvider,
         uc: Option<&super::uc::UcNativeProvider>,
         external_providers: &[super::ExternalAuthProviderConfig],
+        external_client: &dyn super::ExternalProviderClient,
         subject: &str,
     ) -> Result<MemoriaCredentialResolution<MemoriaCredential>, String> {
         let Some(uc) = uc.filter(|uc| uc.settings.builtin_memory) else {
@@ -449,19 +456,8 @@ impl MemoriaCredentialResolver {
             .find(|p| p.id == "moi")
             .filter(|p| !p.auth_key.is_empty())
             .ok_or("MOI memory identity service is not configured")?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Identity {
-            external_subject: String,
-            issuer: String,
-            uc_subject: String,
-        }
-        let identity: Identity = match super::external::HttpExternalProviderClient
-            .post_action(
-                provider,
-                "resolve_memory_identity",
-                serde_json::json!({"external_subject": subject}),
-            )
+        let identity = match external_client
+            .resolve_memory_identity(provider, subject)
             .await
         {
             Ok(identity) => identity,
@@ -482,7 +478,7 @@ impl MemoriaCredentialResolver {
         {
             return Err("MOI memory identity mismatch".into());
         }
-        Self::uc_builtin_credential(memoria, uc, &identity.uc_subject).await
+        Self::uc_builtin_credential(memoria, uc, &identity.uc_subject, identity.memory_access).await
     }
 
     /// Resolve both the current credential and whether an absent credential
@@ -499,6 +495,7 @@ impl MemoriaCredentialResolver {
                 &self.provider,
                 self.uc_provider.as_ref(),
                 &self.external_providers,
+                self.external_client.as_ref(),
                 subject,
             )
             .await;
@@ -684,6 +681,7 @@ impl DatabaseAuthService {
         );
         resolver.uc_provider = self.uc_provider.clone();
         resolver.external_providers = self.ext_providers.clone();
+        resolver.external_client = self.external_client.clone();
         Some(resolver)
     }
     pub(super) async fn memoria_owner(
@@ -1248,12 +1246,13 @@ mod moi_memory_tests {
                         8 => StatusCode::UNAUTHORIZED,
                         _ => StatusCode::OK,
                     };
-                    let body = match mode {
+                    let mut body = match mode {
                         6 | 10 => serde_json::json!({"error":{"code":"moi_memory_identity_denied","message":"identity access denied"}}),
                         7 => serde_json::json!({"code":403,"message":"unclassified upstream rejection"}),
                         8 => serde_json::json!({"code":401,"message":"invalid service credential"}),
                         9 => serde_json::json!({"code":0,"data":null}),
                         _ => serde_json::json!({"code":0,"data":{
+                            "memory_access": match mode { 17 => "read_only", 18 => "none", 19 => "invalid", _ => "read_write" },
                             "external_subject": if mode == 3 { "another-user" } else { "iam-1" },
                             "issuer": match mode {
                                 2 => "https://wrong.example/realm".to_string(),
@@ -1270,6 +1269,9 @@ mod moi_memory_tests {
                             }
                         }}),
                     };
+                    if mode == 20 {
+                        body["data"].as_object_mut().unwrap().remove("memory_access");
+                    }
                     (status, Json(body))
                 }
             }))
@@ -1307,6 +1309,7 @@ mod moi_memory_tests {
             web_url: None,
         })
         .unwrap();
+        let client = super::super::HttpExternalProviderClient::default();
         let providers = vec![super::super::ExternalAuthProviderConfig {
             id: "moi".into(),
             display_name: "MOI".into(),
@@ -1321,6 +1324,7 @@ mod moi_memory_tests {
                 &memoria,
                 Some(&uc),
                 &providers,
+                &client,
                 moi_request_subject(id).unwrap(),
             )
             .await
@@ -1338,6 +1342,7 @@ mod moi_memory_tests {
                 &memoria,
                 Some(&uc),
                 &providers,
+                &client,
                 "iam-1",
             )
             .await
@@ -1347,12 +1352,44 @@ mod moi_memory_tests {
         };
         assert_eq!(other.owner, uc.memory_owner("uc-2"));
         assert_ne!(other.owner, uc.memory_owner("uc-1"));
+        mode.store(17, Ordering::SeqCst);
+        let MemoriaCredentialResolution::Scoped(read_only) =
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected an explicit read-only grant")
+        };
+        assert_eq!(read_only.access, MemoryAccess::ReadOnly);
+        assert_eq!(read_only.owner, uc.memory_owner("uc-1"));
+        mode.store(18, Ordering::SeqCst);
+        status_called.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+            )
+            .await
+            .unwrap(),
+            MemoriaCredentialResolution::Denied
+        ));
+        assert!(!status_called.load(Ordering::SeqCst));
         mode.store(1, Ordering::SeqCst);
         assert!(matches!(
             MemoriaCredentialResolver::resolve_moi_builtin(
                 &memoria,
                 Some(&uc),
                 &providers,
+                &client,
                 "iam-1"
             )
             .await
@@ -1368,6 +1405,7 @@ mod moi_memory_tests {
                 &memoria,
                 Some(&uc),
                 &providers,
+                &client,
                 "iam-1"
             )
             .await
@@ -1378,7 +1416,7 @@ mod moi_memory_tests {
             !status_called.load(Ordering::SeqCst),
             "explicit MOI denial must stop before UC access"
         );
-        for invalid in [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+        for invalid in [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20] {
             mode.store(invalid, Ordering::SeqCst);
             status_called.store(false, Ordering::SeqCst);
             assert!(
@@ -1386,6 +1424,7 @@ mod moi_memory_tests {
                     &memoria,
                     Some(&uc),
                     &providers,
+                    &client,
                     "iam-1"
                 )
                 .await
@@ -1400,22 +1439,36 @@ mod moi_memory_tests {
             }
         }
         assert!(
-            MemoriaCredentialResolver::resolve_moi_builtin(&memoria, Some(&uc), &[], "iam-1")
-                .await
-                .is_err(),
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &[],
+                &client,
+                "iam-1"
+            )
+            .await
+            .is_err(),
             "missing MOI provider configuration must not grant fallback access"
         );
         assert!(matches!(
-            MemoriaCredentialResolver::resolve_moi_builtin(&memoria, None, &providers, "iam-1")
-                .await
-                .unwrap(),
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria, None, &providers, &client, "iam-1"
+            )
+            .await
+            .unwrap(),
             MemoriaCredentialResolution::Denied
         ));
         uc.settings.builtin_memory = false;
         assert!(matches!(
-            MemoriaCredentialResolver::resolve_moi_builtin(&memoria, Some(&uc), &[], "iam-1")
-                .await
-                .unwrap(),
+            MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &[],
+                &client,
+                "iam-1"
+            )
+            .await
+            .unwrap(),
             MemoriaCredentialResolution::Denied
         ));
         server.abort();
