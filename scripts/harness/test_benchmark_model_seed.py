@@ -51,6 +51,14 @@ class _Opener:
 
 
 class BenchmarkModelSeedTests(unittest.TestCase):
+    def test_responses_reasoning_inventory_is_forwarded(self):
+        entry = {"name": "selected", "provider": "openai", "api_key": "test-key",
+                 "base_url": "https://api.openai.com/v1", "context_window": 128000,
+                 "inference_protocol": "openai_responses", "supported_reasoning_efforts": ["high", "max"]}
+        payload = seed.model_create_payload(entry, "selected")
+        self.assertEqual(payload["quirks"]["inference_protocol"], "openai_responses")
+        self.assertEqual(payload["quirks"]["supported_reasoning_efforts"], ["high", "max"])
+
     def test_catalog_selection_requires_exact_server_admission(self):
         catalog = {"items": [{"name": "selected", "offering_id": "offer-selected",
                               "is_active": True, "thinking_capability": "both"}],
@@ -141,6 +149,7 @@ class BenchmarkModelSeedTests(unittest.TestCase):
   input_modalities: [text, image]
   output_modalities: [text]
   fixed_temperature: 0.7
+  inference_protocol: openai_compatible
   request_headers: {X-Provider-Option: enabled}
   wire_model_name: upstream-selected
   pricing_currency: USD
@@ -195,6 +204,7 @@ class BenchmarkModelSeedTests(unittest.TestCase):
         self.assertEqual(payload["input_modalities"], ["text", "image"])
         self.assertEqual(payload["output_modalities"], ["text"])
         self.assertEqual(payload["quirks"]["fixed_temperature"], 0.7)
+        self.assertEqual(payload["quirks"]["inference_protocol"], "openai_compatible")
         self.assertEqual(payload["quirks"]["request_headers"], {"X-Provider-Option": "enabled"})
         self.assertEqual(payload["quirks"]["wire_model_name"], "upstream-selected")
         self.assertEqual(payload["quirks"]["request_body_overrides"], {

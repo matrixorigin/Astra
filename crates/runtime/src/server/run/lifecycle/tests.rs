@@ -2966,6 +2966,9 @@ fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedMo
     astra_services::ResolvedModelOffering {
         offering_id: "model-test-model".to_string(),
         model: astra_services::ResolvedActiveLlmModel {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: "test-model".to_string(),
             wire_model_name: None,

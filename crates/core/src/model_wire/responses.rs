@@ -5,6 +5,8 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 pub const CONTINUATION_KEY: &str = "_astra_responses";
+pub const CONTINUATION_SCOPE_CHANGED: &str =
+    "Model configuration changed during tool continuation; start a new turn";
 const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
 
 /// Retain only scoped, replayable assistant protocol state at canonical
@@ -15,7 +17,13 @@ pub fn validated_continuation(message: &Value) -> Option<Value> {
     }
     let saved = message.get(CONTINUATION_KEY)?;
     let connection = saved["connection_id"].as_str()?;
-    uuid::Uuid::parse_str(connection).ok()?;
+    if uuid::Uuid::parse_str(connection).is_err()
+        && !connection.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return None;
+    }
     let model = saved["model"].as_str()?;
     if model.is_empty() || model.len() > 255 || model.chars().any(char::is_control) {
         return None;
@@ -167,11 +175,25 @@ pub fn request(
     max_output_tokens: Option<usize>,
 ) -> Result<Value, String> {
     let mut input = Vec::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .ok_or("Message role is missing")?;
+        if role == "assistant"
+            && let Some(saved) = message.get(CONTINUATION_KEY)
+            && (saved["connection_id"] != connection || saved["model"] != model)
+            && message["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty())
+            && !messages[index + 1..]
+                .iter()
+                .any(|next| next["role"] == "user")
+        {
+            return Err(
+                "Model configuration changed during tool continuation; start a new turn".into(),
+            );
+        }
         if role == "assistant"
             && let Some(saved) = message.get(CONTINUATION_KEY)
             && saved["connection_id"] == connection
@@ -693,19 +715,28 @@ pub fn decode_sse(text: &str) -> Result<ResponseOutput, ResponsesStreamError> {
     let mut output = ResponseAccumulator::default();
     let text = text.replace("\r\n", "\n");
     for block in text.split("\n\n") {
-        let data = block
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let event = serde_json::from_str(&data)
-            .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE JSON"))?;
-        output.observe(&event)?;
+        observe_sse_block(&mut output, block)?;
     }
     output.finish()
+}
+
+/// Decode one complete SSE event using the same Responses validation as batch decoding.
+pub fn observe_sse_block(
+    output: &mut ResponseAccumulator,
+    block: &str,
+) -> Result<(), ResponsesStreamError> {
+    let data = block
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(());
+    }
+    let event = serde_json::from_str(&data)
+        .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE JSON"))?;
+    output.observe(&event)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -768,9 +799,22 @@ mod tests {
         assert_eq!(body["input"][1], items[1]);
         assert_eq!(body["input"][2]["type"], "function_call_output");
         assert_eq!(body["input"][2]["call_id"], "call-1");
+        assert!(
+            request(
+                "model",
+                &messages,
+                None,
+                "different-connection",
+                false,
+                None
+            )
+            .is_err()
+        );
+        let mut completed = messages.to_vec();
+        completed.push(json!({"role":"user", "content":"new turn"}));
         let switched = request(
             "model",
-            &messages,
+            &completed,
             None,
             "different-connection",
             false,
@@ -894,6 +938,13 @@ mod tests {
         assert!(validated_continuation(&message).is_none());
         message[CONTINUATION_KEY]["items"][0]["role"] = json!("assistant");
         message[CONTINUATION_KEY]["connection_id"] = json!("unscoped");
+        assert!(validated_continuation(&message).is_none());
+        message[CONTINUATION_KEY]["connection_id"] = json!(format!("sha256:{}", "a".repeat(64)));
+        assert!(validated_continuation(&message).is_some());
+        let other = format!("sha256:{}", "b".repeat(64));
+        let projected = request("model", &[message.clone()], None, &other, false, None).unwrap();
+        assert!(!projected.to_string().contains("final_answer"));
+        message[CONTINUATION_KEY]["connection_id"] = json!(format!("sha256:{}", "z".repeat(64)));
         assert!(validated_continuation(&message).is_none());
     }
     #[test]

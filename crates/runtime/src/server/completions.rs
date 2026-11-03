@@ -218,6 +218,8 @@ pub(super) async fn completions_handler(
     // Use the same provider capacity policy as agent turns. This gate runs
     // before durable admission and provider I/O, so a rejected request cannot
     // reserve lifecycle state or consume provider capacity.
+    let requested_temperature = request.temperature;
+    let default_temperature = request.temperature_or_default();
     let mut messages = request.messages;
     crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
     let admission_estimated_tokens = completion_admission_estimated_tokens(&messages, max_tokens);
@@ -264,7 +266,13 @@ pub(super) async fn completions_handler(
                 cache_capability: None,
                 route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
                 max_output_tokens: Some(max_tokens as usize),
-                temperature: Some(request.temperature),
+                temperature: if admitted.inference_protocol
+                    == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+                {
+                    requested_temperature
+                } else {
+                    Some(default_temperature)
+                },
                 thinking: &thinking,
             },
             provider_timeout,
@@ -312,13 +320,15 @@ fn provider_request_http_error(
 ) -> (StatusCode, Json<ErrorResponse>) {
     let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
     let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
-    let (status, code) = if error.kind == astra_core::ErrorKind::PaymentRequired {
-        (
+    let (status, code) = match error.kind {
+        astra_core::ErrorKind::PaymentRequired => (
             StatusCode::PAYMENT_REQUIRED,
             "model_provider_payment_required",
-        )
-    } else {
-        (StatusCode::BAD_GATEWAY, "model_provider_request_failed")
+        ),
+        astra_core::ErrorKind::InvalidRequest => {
+            (StatusCode::BAD_REQUEST, "model_provider_request_invalid")
+        }
+        _ => (StatusCode::BAD_GATEWAY, "model_provider_request_failed"),
     };
     crate::error_response_coded_with_metadata(
         status,
@@ -433,6 +443,22 @@ mod tests {
                 assert_eq!(body.metadata, Some(json!({"error_kind":kind})));
             }
         }
+        assert_eq!(
+            provider_request_http_error(ClassifiedError::new(
+                ErrorKind::InvalidRequest,
+                "unsupported settings"
+            ))
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            provider_request_http_error(ClassifiedError::new(
+                ErrorKind::PaymentRequired,
+                "payment required"
+            ))
+            .0,
+            StatusCode::PAYMENT_REQUIRED
+        );
     }
 
     #[test]
@@ -537,6 +563,9 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
+                    inference_protocol: None,
+                    response_scope: None,
+                    supported_reasoning_efforts: None,
                     price_snapshot: None,
                     model_name: "catalog-display-model".into(),
                     wire_model_name: Some("provider-wire-model".into()),
@@ -602,7 +631,7 @@ mod tests {
             }),
             messages: vec![json!({"role": "user", "content": "extract"})],
             max_tokens: 64,
-            temperature: 0.0,
+            temperature: Some(0.0),
             timeout_ms: 120_000,
         }
     }
@@ -653,7 +682,8 @@ mod tests {
             astra_turn_types::InferencePurpose::VerificationJudge
         );
         assert_eq!(req.max_tokens, 512);
-        assert!((req.temperature - 0.1).abs() < f64::EPSILON);
+        assert_eq!(req.temperature, None);
+        assert!((req.temperature_or_default() - 0.1).abs() < f64::EPSILON);
         assert!(req.model_selection.is_none());
     }
 

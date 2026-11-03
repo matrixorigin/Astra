@@ -117,6 +117,9 @@ impl ModelService for StaticTestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                inference_protocol: None,
+                response_scope: None,
+                supported_reasoning_efforts: None,
                 price_snapshot: None,
                 model_name: self.model_name.clone(),
                 wire_model_name: None,

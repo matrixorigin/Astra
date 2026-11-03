@@ -29,6 +29,9 @@ pub(crate) fn genesis_execution() -> AdmittedModelExecution {
     let mut execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
         offering_id: OFFERING_ID.into(),
         model: ResolvedActiveLlmModel {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: MODEL_NAME.into(),
             wire_model_name: Some("genesis-wire-model".into()),

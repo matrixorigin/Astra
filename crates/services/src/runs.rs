@@ -41809,6 +41809,8 @@ mod tests {
             requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 admitted_at: std::time::Instant::now(),
                 price_snapshot: None,

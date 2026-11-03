@@ -143,6 +143,9 @@ mod tests {
     }
     fn client(base_url: String, api_key: String) -> DirectMemoryInferenceClient {
         DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url,
@@ -435,7 +438,7 @@ mod tests {
                 invocation_scope: &scope,
                 messages: &messages,
                 max_output_tokens: 50,
-                temperature: 0.0,
+                preferred_temperature: 0.0,
                 deadline: std::time::Duration::from_millis(50),
             })
             .await
@@ -554,7 +557,7 @@ mod tests {
                 invocation_scope: &scope,
                 messages: &m,
                 max_output_tokens: 50,
-                temperature: 0.0,
+                preferred_temperature: 0.0,
                 deadline: std::time::Duration::from_secs(3),
             })
             .await

@@ -196,45 +196,7 @@ use super::super::model_cooldown::rate_limit_cooldown;
 
 // ── Global HTTP Client ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LlmProviderProtocol {
-    OpenAiResponses,
-    OpenAiCompatible,
-    AnthropicMessages,
-    BedrockConverse,
-    TypeSafeSystemOne,
-}
-
-impl LlmProviderProtocol {
-    #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenAiResponses => "openai_responses",
-            Self::OpenAiCompatible => "openai_compatible",
-            Self::AnthropicMessages => "anthropic_messages",
-            Self::BedrockConverse => "bedrock_converse",
-            Self::TypeSafeSystemOne => "typesafe_systemone",
-        }
-    }
-
-    /// Whether the concrete request builder preserves each appended provider
-    /// message as a distinct wire item. Append-only caching is invalid for
-    /// transports that merge adjacent roles and thereby rewrite the old tail.
-    #[must_use]
-    pub(crate) fn preserves_appended_message_boundaries(self) -> bool {
-        matches!(self, Self::OpenAiCompatible)
-    }
-}
-
-pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
-    match provider {
-        "chatgpt" => LlmProviderProtocol::OpenAiResponses,
-        "anthropic" => LlmProviderProtocol::AnthropicMessages,
-        "bedrock" => LlmProviderProtocol::BedrockConverse,
-        "typesafe" => LlmProviderProtocol::TypeSafeSystemOne,
-        _ => LlmProviderProtocol::OpenAiCompatible,
-    }
-}
+pub(crate) use astra_core::model_wire::{LlmProviderProtocol, llm_provider_protocol};
 
 /// Immutable identity of the exact serialized provider payload.
 ///
@@ -1108,6 +1070,8 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub inference_protocol: Option<LlmProviderProtocol>,
+    pub response_scope: Option<&'a str>,
     pub subscription: Option<&'a astra_services::chatgpt::ExecutionCredential>,
     pub fixed_temperature: Option<f64>,
     pub supported_reasoning_efforts: Option<&'a [String]>,
@@ -1130,6 +1094,8 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            inference_protocol: execution.inference_protocol,
+            response_scope: execution.response_scope.as_deref(),
             subscription: execution.subscription.as_ref(),
             fixed_temperature: execution.fixed_temperature,
             supported_reasoning_efforts: execution.supported_reasoning_efforts.as_deref(),
@@ -1155,6 +1121,8 @@ impl<'a> LlmExecutionRoute<'a> {
 /// credentials, endpoint URLs, and header values from `Debug`.
 #[derive(Clone)]
 pub(crate) struct OwnedLlmExecutionRoute {
+    pub inference_protocol: Option<LlmProviderProtocol>,
+    pub response_scope: Option<String>,
     pub subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     pub model_name: String,
     pub wire_model_name: Option<String>,
@@ -1178,6 +1146,8 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            inference_protocol: self.inference_protocol,
+            response_scope: self.response_scope.as_deref(),
             subscription: self.subscription.as_ref(),
             fixed_temperature: self.fixed_temperature,
             supported_reasoning_efforts: self.supported_reasoning_efforts.as_deref(),
@@ -4122,7 +4092,20 @@ pub(crate) fn consolidate_system_messages_for_provider(
     provider: &str,
     explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
-    let protocol = llm_provider_protocol(provider);
+    consolidate_system_messages_for_protocol(
+        messages,
+        provider,
+        explicit_cache_capability,
+        llm_provider_protocol(provider),
+    )
+}
+
+pub(crate) fn consolidate_system_messages_for_protocol(
+    messages: &[Value],
+    provider: &str,
+    explicit_cache_capability: Option<CacheCapability>,
+    protocol: LlmProviderProtocol,
+) -> Vec<Value> {
     let cache_cap = CacheCapability::from_explicit_or_provider(explicit_cache_capability, provider);
     let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages);
     let allow_suffix_dependent_history_repair = !matches!(
@@ -5123,7 +5106,23 @@ pub(crate) fn prepare_streaming_call(
     tool_choice: RuntimeToolChoice,
 ) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
     let preparation_started = Instant::now();
-    if call.route.provider == astra_services::chatgpt::PROVIDER {
+    let default_protocol = llm_provider_protocol(call.route.provider);
+    if call.route.inference_protocol.is_some_and(|protocol| {
+        protocol != default_protocol
+            && !(protocol == LlmProviderProtocol::OpenAiResponses
+                && default_protocol == LlmProviderProtocol::OpenAiCompatible)
+    }) {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "The selected inference protocol is incompatible with this provider",
+        ));
+    }
+    if call
+        .route
+        .inference_protocol
+        .unwrap_or_else(|| llm_provider_protocol(call.route.provider))
+        == LlmProviderProtocol::OpenAiResponses
+    {
         return responses::prepare(call, tool_choice, preparation_started);
     }
     if call.route.provider == "typesafe" {
@@ -5335,6 +5334,7 @@ async fn call_prepared_llm_with_total_budget(
         ..
     } = prepared;
     let LlmExecutionRoute {
+        inference_protocol: _,
         model_name,
         api_key,
         base_url: _,
@@ -5899,7 +5899,11 @@ async fn call_prepared_llm_with_total_budget(
                     }
                 }
             }
-            let stream_result = if let Some(lease) = &lease {
+            let stream_result = if route
+                .inference_protocol
+                .unwrap_or_else(|| llm_provider_protocol(provider))
+                == LlmProviderProtocol::OpenAiResponses
+            {
                 responses::collect(
                     response,
                     route,
@@ -5908,7 +5912,7 @@ async fn call_prepared_llm_with_total_budget(
                     stream_callback.as_deref_mut(),
                     started,
                     stream_budget,
-                    lease,
+                    lease.as_ref(),
                     attempt_observer.zip(observed_attempt),
                 )
                 .await
@@ -6128,6 +6132,16 @@ async fn call_prepared_llm_with_total_budget(
             .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                value.strip_prefix("req_").is_some_and(|suffix| {
+                    (8..=96).contains(&suffix.len())
+                        && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            })
+            .map(str::to_owned);
 
         let remaining = total_budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -6138,7 +6152,18 @@ async fn call_prepared_llm_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let body = read_provider_error_body(response, subscription.map(|_| 1024 * 1024));
+        let is_responses = route
+            .inference_protocol
+            .unwrap_or_else(|| llm_provider_protocol(provider))
+            == LlmProviderProtocol::OpenAiResponses;
+        let compatible_bad_request = status == 400
+            && llm_provider_protocol(provider) == LlmProviderProtocol::OpenAiCompatible
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none();
+        let body = read_provider_error_body(
+            response,
+            (is_responses || compatible_bad_request).then_some(1024 * 1024),
+        );
         tokio::pin!(body);
         let body_result = tokio::select! {
             biased;
@@ -6201,7 +6226,16 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
-        let structured_error = if let Some(lease) = &lease {
+        let structured_error = if status == 402
+            && subscription.is_none()
+            && !uses_moi_model_gateway_error_contract(header_overrides)
+            && model_gateway_error_contract.is_none()
+        {
+            Some(ProviderHttpRejection {
+                classified: payment_required_error(&text),
+                retryable: false,
+            })
+        } else if let Some(lease) = &lease {
             let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let code = astra_services::chatgpt::provider_error_code(status, &body);
             let refresh = status == 401 && !auth_retried;
@@ -6216,6 +6250,57 @@ async fn call_prepared_llm_with_total_budget(
                         json!({"source":"chatgpt","code":code,"http_status":status}).to_string(),
                     ),
                 retryable: refresh || status >= 500,
+            })
+        } else if (is_responses && !is_rate_limit_status(status) && !is_overload_status(status))
+            || compatible_bad_request
+        {
+            let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            let code = body
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .and_then(astra_core::model_wire::responses::provider_error)
+                .map(|(code, _)| code)
+                .unwrap_or("invalid_request");
+            let parameter = body
+                .pointer("/error/param")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    matches!(
+                        *value,
+                        "model"
+                            | "input"
+                            | "tools"
+                            | "tool_choice"
+                            | "reasoning"
+                            | "reasoning.effort"
+                            | "reasoning_effort"
+                            | "temperature"
+                            | "top_p"
+                            | "max_tokens"
+                            | "max_completion_tokens"
+                            | "max_output_tokens"
+                    )
+                });
+            let message = parameter.map_or_else(
+                || format!("Model provider rejected the request (HTTP {status})"),
+                |parameter| {
+                    format!("Model provider rejected parameter {parameter} (HTTP {status})")
+                },
+            );
+            Some(ProviderHttpRejection {
+                classified: astra_core::ClassifiedError::new(
+                    if status == 400 && astra_core::is_llm_context_window_error(&text) {
+                        astra_core::ErrorKind::ContextWindow
+                    } else {
+                        provider_http_error_kind(status, code)
+                    },
+                    message,
+                )
+                .with_details_json(
+                    json!({"source": if is_responses {"responses"} else {"openai_compatible"},"http_status":status,"code":code,"parameter":parameter,"request_id":request_id})
+                        .to_string(),
+                ),
+                retryable: status >= 500,
             })
         } else {
             moi_model_gateway_error(
@@ -6240,15 +6325,6 @@ async fn call_prepared_llm_with_total_budget(
         // A negotiated gateway route must retain its versioned error boundary;
         // do not reinterpret a missing/mismatched contract as a provider error.
         // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
-        if status == 402
-            && !uses_moi_model_gateway_error_contract(header_overrides)
-            && model_gateway_error_contract.is_none()
-        {
-            let error = payment_required_error(&text);
-            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
-            return Err(error);
-        }
-
         // Auth responses can echo arbitrary credentials; do not log the body.
         if status == 401 || status == 403 {
             tracing::warn!(
@@ -6267,7 +6343,7 @@ async fn call_prepared_llm_with_total_budget(
         // leaking secrets that providers may echo back. Retain body for 5xx
         // (helpful for diagnosing transient backend failures) and the 400
         // context-window check below (which still needs to inspect text).
-        last_err = if (400..500).contains(&status) {
+        last_err = if is_responses || (400..500).contains(&status) {
             format!("LLM request rejected: {status}")
         } else {
             format!("LLM error {status}: {text}")
@@ -7809,7 +7885,12 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    if call.route.provider == astra_services::chatgpt::PROVIDER {
+    if call
+        .route
+        .inference_protocol
+        .unwrap_or_else(|| llm_provider_protocol(call.route.provider))
+        == LlmProviderProtocol::OpenAiResponses
+    {
         let prepared = prepare_streaming_call(call, tool_choice)?;
         return call_prepared_llm_and_collect_with_stream_callback(
             prepared,
@@ -7847,7 +7928,9 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         temperature
     };
     let LlmExecutionRoute {
+        inference_protocol: _,
         subscription: _,
+        response_scope: _,
         fixed_temperature: _,
         supported_reasoning_efforts: _,
         thinking_protocol,
@@ -8728,6 +8811,8 @@ mod tests {
                     overrides["reasoning_effort"] = json!("medium");
                 }
                 let route = OwnedLlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     model_name: "local-alias".into(),
                     wire_model_name: Some("upstream-fixture".into()),
@@ -8809,6 +8894,8 @@ mod tests {
         for streaming in [false, true] {
             for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
                 let route = OwnedLlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     model_name: "fixture".into(),
                     wire_model_name: None,
@@ -8907,6 +8994,8 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
@@ -8988,6 +9077,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9164,6 +9255,8 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
             subscription: None,
             fixed_temperature: None,
             supported_reasoning_efforts: None,
@@ -9413,6 +9506,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9460,6 +9555,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9528,6 +9625,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9628,6 +9727,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -9822,6 +9923,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9884,6 +9987,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -9963,6 +10068,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10033,6 +10140,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10100,6 +10209,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10174,6 +10285,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10240,6 +10353,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10285,6 +10400,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10336,6 +10453,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10404,6 +10523,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10497,6 +10618,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -10571,6 +10694,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -13131,6 +13256,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -13193,6 +13320,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -13544,6 +13673,8 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
@@ -14142,6 +14273,8 @@ mod tests {
                     tools,
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -15895,6 +16028,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -15960,6 +16095,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16013,6 +16150,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -16059,6 +16198,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16102,6 +16243,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16150,6 +16293,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,
@@ -16226,6 +16371,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16259,6 +16406,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16313,6 +16462,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16381,6 +16532,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16431,6 +16584,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16485,6 +16640,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16533,6 +16690,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16581,6 +16740,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16703,6 +16864,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16749,6 +16912,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
@@ -16894,6 +17059,8 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        inference_protocol: None,
+                        response_scope: None,
                         subscription: None,
                         fixed_temperature: None,
                         supported_reasoning_efforts: None,

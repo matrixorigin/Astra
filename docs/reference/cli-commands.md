@@ -381,6 +381,16 @@ the observation and diagnostics. An `effort_only` result allows effort selection
 not thinking Off. An inconclusive check establishes no new capability. A matching
 prior capability may remain available while diagnostics record the latest error.
 
+For an administrator-managed API-key model that requires the OpenAI Responses
+API, set `inference_protocol: openai_responses` in its YAML entry and reload it
+with `astra admin model load .models.yaml --update-existing`. The Responses
+adapter currently accepts text inputs and does not accept fixed temperature or
+arbitrary request-body overrides. Other model entries retain their existing
+transport. This option applies to administrator-managed models.
+For selectable reasoning levels, declare only verified values in
+`supported_reasoning_efforts`, for example `[high, max]`. Without a declaration,
+the model check makes only the successfully observed effort selectable.
+
 Explicit CLI model selectors such as `'<name>(thinking:low)'`,
 `'<name>(thinking:medium)'` and `'<name>(thinking:high)'` select depth. A plain
 `<name>` retains the provider default. The declaration alone does not force Low
@@ -413,3 +423,6 @@ Ctrl+R also restores the latest conversation with its slash escape, so editing
 and resending `/exit` text keeps it a message. The transcript shows the original
 conversation text, without the composer escape.
 Unknown or ambiguous single-slash actions still report a command error.
+
+Older clients that always send a completion temperature must be upgraded before
+using an API-key Responses Offering.

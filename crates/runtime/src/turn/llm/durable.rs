@@ -4750,6 +4750,8 @@ mod tests {
         persistence: Arc<dyn InferenceLedgerPersistence>,
     ) -> DurableInferenceLedger {
         let execution = astra_services::AdmittedModelExecution {
+            inference_protocol: None,
+            response_scope: None,
             subscription: None,
             admitted_at: std::time::Instant::now(),
             price_snapshot: None,
@@ -5020,6 +5022,8 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: crate::turn::llm::client::LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,

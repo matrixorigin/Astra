@@ -1962,6 +1962,8 @@ fn record_full_llm_response_event(
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    response_scope: Option<String>,
     subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
@@ -1993,6 +1995,8 @@ struct ResolvedTurnLlmConfig {
 impl ResolvedTurnLlmConfig {
     fn execution_route(&self) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            inference_protocol: self.inference_protocol,
+            response_scope: self.response_scope.clone(),
             subscription: self.subscription.clone(),
             model_name: self.model_name.clone(),
             wire_model_name: self.wire_model_name.clone(),
@@ -3222,6 +3226,8 @@ fn resolve_llm_model_for_turn(
         return Err("model override does not match the Offering admitted for this run".to_string());
     }
     Ok(ResolvedTurnLlmConfig {
+        inference_protocol: execution.inference_protocol,
+        response_scope: execution.response_scope.clone(),
         subscription: execution.subscription.clone(),
         model_name: execution.model_name.clone(),
         wire_model_name: execution.wire_model_name.clone(),
@@ -5308,12 +5314,14 @@ fn split_canonical_and_provider_budget_messages(
     canonical_messages: Vec<Value>,
     provider: &str,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
 ) -> (Vec<Value>, Vec<Value>) {
     let provider_budget_messages =
-        crate::turn::llm::client::consolidate_system_messages_for_provider(
+        crate::turn::llm::client::consolidate_system_messages_for_protocol(
             &canonical_messages,
             provider,
             cache_capability,
+            protocol.unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(provider)),
         );
     (canonical_messages, provider_budget_messages)
 }
@@ -17612,10 +17620,13 @@ impl ServerAgenticLoopHost {
             .inspect_err(|_| {
                 state.restore_volatile_attempt_lease();
             })?;
-            let wire_messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
+            let wire_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
                 &candidate.messages,
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
+                llm_cfg.inference_protocol.unwrap_or_else(|| {
+                    astra_core::model_wire::llm_provider_protocol(&llm_cfg.provider)
+                }),
             );
             let candidate_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
                 &wire_messages,
@@ -20293,6 +20304,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 llm_messages,
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
+                llm_cfg.inference_protocol,
             );
         let final_wire_budget_status =
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
@@ -28861,6 +28873,8 @@ mod tests {
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
+            inference_protocol: None,
+            response_scope: None,
             subscription: None,
             model_name: "gpt-4o-mini".to_string(),
             wire_model_name: None,
@@ -49193,10 +49207,27 @@ mod tests {
         assert!(resolved.request_timeout.is_none());
     }
 
+    #[test]
+    fn admitted_responses_protocol_reaches_turn_and_auxiliary_route() {
+        let mut offering = admitted_test_offering();
+        offering.model.inference_protocol =
+            Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses);
+        offering.model.response_scope = Some("credential-generation".into());
+        let execution = astra_services::AdmittedModelExecution::from_offering(offering).unwrap();
+        let turn = resolve_llm_model_for_turn(None, Some(&execution)).unwrap();
+        let route = turn.execution_route();
+        assert_eq!(route.inference_protocol, execution.inference_protocol);
+        assert_eq!(route.response_scope, execution.response_scope);
+        assert!(route.response_scope.unwrap().starts_with("sha256:"));
+    }
+
     pub(super) fn admitted_test_offering() -> astra_services::ResolvedModelOffering {
         astra_services::ResolvedModelOffering {
             offering_id: "offer-primary".to_string(),
             model: astra_services::ResolvedActiveLlmModel {
+                inference_protocol: None,
+                response_scope: None,
+                supported_reasoning_efforts: None,
                 price_snapshot: None,
                 model_name: "catalog-model".to_string(),
                 wire_model_name: Some("upstream-model".to_string()),
@@ -51807,6 +51838,8 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new(
             OwnedLlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 model_name: "gpt-4o-mini".to_string(),
                 wire_model_name: None,

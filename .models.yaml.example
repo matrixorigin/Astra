@@ -78,6 +78,10 @@
 # deployments can report effort_only: Low/Medium/High control depth, not Off.
 # A plain model selection preserves the provider default; no global Low override
 # is installed by this declaration. Do not copy it to unverified deployments.
+# For an API-key model verified to use Responses, configure its entry with:
+#   inference_protocol: openai_responses
+#   supported_reasoning_efforts: [high, max] # only values verified for this model
+# Without an effort declaration, only a successfully probed level is selectable.
 # Other supported declarations are enable_thinking, thinking_object and moonshot;
 # binary controls require observable reasoning-on and reasoning-off behavior.
 #

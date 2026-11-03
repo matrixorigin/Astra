@@ -20,6 +20,7 @@ impl ThinkingProbeSnapshot {
             && self.identity == identity
             && self.protocol == protocol
             && (protocol != ThinkingProtocol::ResponsesReasoning
+                || (self.error.is_some() && self.capability.is_none())
                 || self
                     .supported_efforts
                     .as_ref()
@@ -75,13 +76,23 @@ impl ThinkingProbeSnapshot {
         Some(snapshot)
     }
 
+    pub(super) fn with_observed_effort(mut self, effort: &str) -> Self {
+        if self.protocol == ThinkingProtocol::ResponsesReasoning && self.error.is_none() {
+            self.supported_efforts = Some(vec![effort.to_string()]);
+        }
+        self
+    }
+
     /// An inconclusive check is not a negative capability observation. Keep
     /// prior knowledge only for exactly the same configuration and protocol.
     pub(super) fn with_previous(mut self, raw: Option<&str>) -> Self {
         if self.error.is_some()
-            && let Some(capability) = cached_capability(raw, &self.identity, self.protocol)
+            && let Some(previous) = raw.and_then(|raw| serde_json::from_str::<Self>(raw).ok())
+            && previous.is_current(&self.identity, self.protocol)
+            && previous.capability.is_some()
         {
-            self.capability = Some(capability);
+            self.capability = previous.capability;
+            self.supported_efforts = previous.supported_efforts;
         }
         self
     }
@@ -355,6 +366,53 @@ mod tests {
         let mut invalid: Value = serde_json::from_str(&raw).unwrap();
         invalid.as_object_mut().unwrap().remove("supported_efforts");
         assert!(cached_capability(Some(&invalid.to_string()), "identity", protocol).is_none());
+        let observed = ThinkingProbeSnapshot::new(
+            "identity".into(),
+            protocol,
+            &ThinkingProbeResult {
+                capability: ThinkingCapability::EffortOnly,
+                error: None,
+            },
+        )
+        .with_observed_effort("high");
+        let raw = serde_json::to_string(&observed).unwrap();
+        assert_eq!(
+            cached_capability(Some(&raw), "identity", protocol),
+            Some(ThinkingCapability::EffortOnly)
+        );
+        assert_eq!(
+            cached_efforts(Some(&raw), "identity", protocol),
+            Some(vec!["high".into()])
+        );
+        let failed = ThinkingProbeSnapshot::new(
+            "identity".into(),
+            protocol,
+            &ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some("provider unavailable".into()),
+            },
+        );
+        assert_eq!(
+            failed
+                .result("identity", protocol)
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("provider unavailable")
+        );
+        let retained = failed.with_previous(Some(&raw));
+        assert_eq!(
+            retained.capability("identity", protocol),
+            Some(ThinkingCapability::EffortOnly)
+        );
+        assert_eq!(
+            retained
+                .result("identity", protocol)
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("provider unavailable")
+        );
     }
 
     #[test]

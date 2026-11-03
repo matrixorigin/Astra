@@ -319,6 +319,8 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: super::super::client::LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     model_name: "fixture-model",
                     api_key: "fixture-key",
@@ -585,6 +587,8 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
                 subscription: None,
                 model_name: "fixture-model",
                 api_key: "fixture-key",

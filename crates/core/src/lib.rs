@@ -1701,3 +1701,6 @@ mod tests {
 }
 pub mod trace_types;
 pub use trace_types::*;
+
+/// Shared incremental SSE event framing.
+pub mod sse_blocks;

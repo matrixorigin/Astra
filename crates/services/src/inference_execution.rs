@@ -86,6 +86,7 @@ pub struct InferenceProviderAttemptPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceProviderWireIdentity {
     protocol: String,
+    exact_protocol: String,
     provider_wire_hash: String,
     provider_wire_bytes: u64,
     composition: ModelRequestWireComposition,
@@ -192,7 +193,12 @@ impl InferenceProviderWireIdentity {
         provider_wire_hash: impl Into<String>,
         provider_wire_bytes: u64,
     ) -> ServiceResult<Self> {
-        let protocol = protocol.into();
+        let exact_protocol = protocol.into();
+        let protocol = if exact_protocol == "openai_responses" {
+            "openai_compatible".to_string()
+        } else {
+            exact_protocol.clone()
+        };
         if !matches!(
             protocol.as_str(),
             "openai_compatible" | "anthropic_messages" | "bedrock_converse" | "typesafe_systemone"
@@ -218,6 +224,7 @@ impl InferenceProviderWireIdentity {
         }
         Ok(Self {
             protocol,
+            exact_protocol,
             provider_wire_hash,
             provider_wire_bytes,
             composition: ModelRequestWireComposition::default(),
@@ -679,7 +686,7 @@ fn model_request_accepted_event(
             offering_id: input.offering_id.clone(),
             inference_purpose: input.purpose.as_str().to_string(),
             operation_id: input.scope.operation_id().to_string(),
-            provider_protocol: attempt.wire.protocol.clone(),
+            provider_protocol: attempt.wire.exact_protocol.clone(),
             provider_wire_hash: attempt.wire.provider_wire_hash.clone(),
             provider_wire_bytes: attempt.wire.provider_wire_bytes,
         },
@@ -7095,6 +7102,21 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(wire.provider_wire_bytes(), 4_096);
+        let responses = InferenceProviderWireIdentity::new(
+            "openai_responses",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            4_096,
+        )
+        .unwrap();
+        assert_eq!(responses.protocol(), "openai_compatible");
+        let attempt = plan_inference_provider_attempt_with_context(
+            &invocation,
+            0,
+            responses,
+            ModelRequestContextSeed::server_default(),
+        );
+        let (_, _, event) = model_request_accepted_event(&attempt).unwrap();
+        assert_eq!(event.identity.provider_protocol, "openai_responses");
     }
 
     #[test]

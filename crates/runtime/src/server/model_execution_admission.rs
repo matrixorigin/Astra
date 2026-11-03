@@ -612,6 +612,9 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
+                    inference_protocol: None,
+                    response_scope: None,
+                    supported_reasoning_efforts: None,
                     price_snapshot: None,
                     model_name: "server-model".into(),
                     wire_model_name: Some("wire-model".into()),
@@ -1062,6 +1065,11 @@ pub(crate) fn model_execution_contract_root(execution: &AdmittedModelExecution) 
         "endpoint": execution.completions_url_override.as_deref().unwrap_or(&execution.base_url),
         "headers": execution.header_overrides.iter().filter(|(key, _)| !matches!(key.to_ascii_lowercase().as_str(), "authorization" | "x-api-key" | "api-key")).collect::<std::collections::BTreeMap<_, _>>(),
     });
+    if let Some(protocol) = execution.inference_protocol.filter(|protocol| {
+        *protocol != astra_core::model_wire::llm_provider_protocol(&execution.provider)
+    }) {
+        contract["inference_protocol"] = serde_json::json!(protocol);
+    }
     if let Some(efforts) = &execution.supported_reasoning_efforts {
         contract["supported_reasoning_efforts"] = serde_json::json!(efforts);
     }
