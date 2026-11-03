@@ -1201,6 +1201,27 @@ fn response_scope(offering_id: &str, identity: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(input))
 }
 
+/// Bind replay to the actual route and credential, independently of probe and
+/// capability configuration. Header ordering and an empty map do not change it.
+fn response_connection_identity(
+    provider: &str,
+    base_url: &str,
+    model: &str,
+    encrypted: &str,
+    request_headers: Option<&Map<String, Value>>,
+) -> String {
+    let headers: BTreeMap<_, _> = request_headers.into_iter().flatten().collect();
+    let input = serde_json::to_vec(&(
+        provider,
+        base_url.trim_end_matches('/'),
+        model,
+        encrypted,
+        headers,
+    ))
+    .expect("model route identity serializes");
+    format!("{:x}", Sha256::digest(input))
+}
+
 impl AdmittedModelExecution {
     /// Whether refreshed admission still refers to the same selected model.
     ///
@@ -1879,6 +1900,17 @@ fn build_resolved_active_llm_from_row(
         .supported_reasoning_efforts
         .clone()
         .or_else(|| cached_efforts(snapshot.as_deref(), &identity, thinking_protocol));
+    let response_identity = (quirks.inference_protocol
+        == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses))
+    .then(|| {
+        response_connection_identity(
+            &provider,
+            &base_url,
+            quirks.wire_model_name.as_deref().unwrap_or(&model_name),
+            &encrypted,
+            quirks.request_headers.as_ref(),
+        )
+    });
     let wire_model_name = quirks.wire_model_name;
     let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
@@ -1915,9 +1947,7 @@ fn build_resolved_active_llm_from_row(
 
     Ok(ResolvedActiveLlmModel {
         inference_protocol: quirks.inference_protocol,
-        response_scope: (quirks.inference_protocol
-            == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses))
-        .then_some(identity),
+        response_scope: response_identity,
         supported_reasoning_efforts,
         price_snapshot: row
             .try_get::<Option<String>, _>("pricing_json")
@@ -7663,6 +7693,37 @@ mod tests {
             "volatile_delivery":"required_only", "reuse_scope":"conversation_turns"
         })).unwrap());
         assert!(validate_inference_config("openai", &invalid).is_ok());
+    }
+
+    #[test]
+    fn responses_identity_tracks_route_and_credential() {
+        let identity = response_connection_identity;
+        let expected = identity("openai", "https://example.test/v1", "model", "key-a", None);
+        assert_eq!(
+            expected,
+            identity(
+                "openai",
+                "https://example.test/v1/",
+                "model",
+                "key-a",
+                Some(&Map::new()),
+            )
+        );
+        for changed in [
+            identity("other", "https://example.test/v1", "model", "key-a", None),
+            identity("openai", "https://other.test/v1", "model", "key-a", None),
+            identity("openai", "https://example.test/v1", "other", "key-a", None),
+            identity("openai", "https://example.test/v1", "model", "key-b", None),
+            identity(
+                "openai",
+                "https://example.test/v1",
+                "model",
+                "key-a",
+                Some(serde_json::json!({"x-tenant":"other"}).as_object().unwrap()),
+            ),
+        ] {
+            assert_ne!(expected, changed);
+        }
     }
 
     #[test]

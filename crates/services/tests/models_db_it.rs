@@ -100,6 +100,126 @@ async fn complete_quirks_replacement_corrects_noncanonical_stored_controls() {
 #[tokio::test]
 #[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn responses_continuation_survives_probe_updates_but_fences_route_changes() {
+    use astra_core::model_wire::{
+        LlmProviderProtocol,
+        responses::{CONTINUATION_KEY, CONTINUATION_SCOPE_CHANGED, ResponseOutput, request},
+    };
+    use astra_services::{AdmittedModelExecution, models::QuirksData};
+    use serde_json::json;
+
+    async fn admitted(service: &DatabaseModelService, id: &str) -> AdmittedModelExecution {
+        service
+            .admit_model_offering("responses-scope-test-user".into(), id.to_string())
+            .await
+            .unwrap()
+    }
+
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let name = format!("responses_scope_{}", Uuid::new_v4().simple());
+    let id = seed_model(&pool, &name).await;
+    let encryptor = Arc::new(FernetTokenEncryptor::new("responses-scope-db-it-key").unwrap());
+    let mut quirks = QuirksData {
+        inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+        ..Default::default()
+    };
+    sqlx::query("UPDATE infra_llm_models SET provider = 'openai', api_key_encrypted = ?, quirks = ? WHERE model_id = ?")
+        .bind(encryptor.encrypt("first-key").unwrap())
+        .bind(serde_json::to_string(&quirks).unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = DatabaseModelService::new(settings, encryptor.clone()).with_pool(shared_pool);
+    let original = admitted(&service, &id).await;
+    let scope = original.response_scope.as_deref().unwrap();
+    let output = ResponseOutput {
+        items: vec![
+            json!({"type":"function_call", "id":"fc-1", "namespace":"astra", "name":"lookup", "call_id":"call-1", "arguments":"{}"}),
+        ],
+        ..Default::default()
+    };
+    let mut assistant = json!({"role":"assistant", "content":"", "tool_calls":[{"id":"call-1", "type":"function", "function":{"name":"lookup", "arguments":"{}"}}]});
+    assistant[CONTINUATION_KEY] = output.continuation(scope, original.upstream_model_name());
+    let messages = [
+        json!({"role":"user", "content":"look up"}),
+        assistant,
+        json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}),
+    ];
+    let replay = |execution: &AdmittedModelExecution| {
+        request(
+            execution.upstream_model_name(),
+            &messages,
+            None,
+            execution.response_scope.as_deref().unwrap(),
+            false,
+            None,
+        )
+    };
+    assert!(replay(&original).is_ok());
+
+    quirks.probe_endpoint = Some("/health".into());
+    quirks.probe_headers = Some(json!({"User-Agent":"probe"}).as_object().unwrap().clone());
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    service.update_model(name.clone(), update).await.unwrap();
+    let refreshed = admitted(&service, &id).await;
+    assert!(original.has_same_execution_identity(&refreshed));
+    assert_eq!(refreshed.response_scope.as_deref(), Some(scope));
+    assert!(replay(&refreshed).is_ok());
+
+    quirks.supported_reasoning_efforts = Some(vec!["high".into()]);
+    quirks.request_headers = Some(Default::default());
+    quirks.prompt_cache_capability = Some(serde_json::from_value(json!({
+        "schema_version":2, "protocol":"strict_history_match", "volatile_placement":"append_only_user_tail",
+        "volatile_delivery":"all", "reuse_scope":"conversation_turns"
+    })).unwrap());
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    update.base_url = Some("http://127.0.0.1:1/".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    assert_eq!(
+        admitted(&service, &id).await.response_scope.as_deref(),
+        Some(scope)
+    );
+
+    quirks.request_headers = Some(json!({"x-tenant":"other"}).as_object().unwrap().clone());
+    let mut update = model_patch();
+    update.quirks = Some(quirks);
+    service.update_model(name.clone(), update).await.unwrap();
+    let changed_route = admitted(&service, &id).await;
+    assert_ne!(changed_route.response_scope.as_deref(), Some(scope));
+    assert_eq!(
+        replay(&changed_route).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+
+    sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+        .bind(encryptor.encrypt("second-key").unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rotated = admitted(&service, &id).await;
+    assert_ne!(rotated.response_scope, changed_route.response_scope);
+    assert_eq!(replay(&rotated).unwrap_err(), CONTINUATION_SCOPE_CHANGED);
+    let mut update = model_patch();
+    update.base_url = Some("http://127.0.0.1:2".into());
+    service.update_model(name, update).await.unwrap();
+    let moved = admitted(&service, &id).await;
+    assert_ne!(moved.response_scope, rotated.response_scope);
+    assert_eq!(replay(&moved).unwrap_err(), CONTINUATION_SCOPE_CHANGED);
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn configured_catalog_price_matches_full_and_paginated_reads() {
     let (shared_pool, settings) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get().clone();

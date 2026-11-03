@@ -48,7 +48,8 @@ Administrator-managed API-key Offerings can explicitly select the same Responses
 wire protocol. Protocol selection is independent of credential ownership: API
 keys use their admitted endpoint and headers, while subscriptions retain their
 connection fencing and refresh rules. API-key continuation state is scoped to
-the Offering and configuration-bound credential generation. Model checks use
+the Offering, provider route, request headers, and credential generation;
+probe-only and unrelated capability changes do not invalidate it. Model checks use
 the selected wire protocol; the ordinary provider default remains unchanged.
 Explicit request temperatures are not silently discarded. Internal memory
 judgments express a deterministic sampling preference; when Responses sampling
