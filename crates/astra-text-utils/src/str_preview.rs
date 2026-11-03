@@ -120,6 +120,32 @@ mod tests {
     }
 
     #[test]
+    fn zero_budget_never_emits_an_ellipsis() {
+        for text in ["hello", "数据—flow", "hello\nworld"] {
+            assert_eq!(truncate_line(text, 0), "");
+        }
+        for path in ["/a/b/file.txt", "/a/b/", "文件/路径/", ""] {
+            assert_eq!(shorten_path(path, 0), "");
+        }
+    }
+
+    #[test]
+    fn previews_respect_every_small_unicode_budget() {
+        for text in ["hello world", "数据—flow", "hello\nworld", ""] {
+            for budget in 0..=10 {
+                let preview = truncate_line(text, budget);
+                assert!(preview.chars().count() <= budget, "truncate_line over budget {budget}: {preview}");
+            }
+        }
+        for path in ["/a/b/file.txt", "/a/b/", "数据/路径/", "", "filename.txt"] {
+            for budget in 0..=10 {
+                let preview = shorten_path(path, budget);
+                assert!(preview.chars().count() <= budget, "shorten_path over budget {budget}: {preview}");
+            }
+        }
+    }
+
+    #[test]
     fn github_repo_display_prefers_owner_repo_pair() {
         assert_eq!(
             github_repo_display(Some("matrixorigin"), Some("astra")).as_deref(),
