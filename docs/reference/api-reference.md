@@ -79,6 +79,14 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 ## Personal subscription connections
 
+`POST /me/models` also accepts an optional `inference_protocol` for API-key
+models. Set it to `openai_responses` when the provider requires Responses, or
+`openai_compatible` for Chat Completions. Omission uses the provider's default.
+`PUT /me/models/{id}` can change the selection; a successful change checks the
+selected endpoint and invalidates the old thinking observation. Key rotation and
+model checks continue using the configured protocol. The selected value is
+returned in the personal model record; it is independent of provider credentials.
+
 The connection-list response includes `management_available`, the authenticated
 principal's personal-management capability. It is independent of whether any
 model already exists and is false for the managed UC model path. The same

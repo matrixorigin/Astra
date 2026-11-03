@@ -321,7 +321,12 @@ pub fn sanitize_canonical_continuation_messages_with_state(
 }
 
 fn canonical_provider_continuation(message: &Value) -> Option<Value> {
-    let mut saved = astra_core::model_wire::responses::validated_continuation(message)?;
+    message.get(astra_core::model_wire::responses::CONTINUATION_KEY)?;
+    let Some(mut saved) = astra_core::model_wire::responses::validated_continuation(message) else {
+        // Preserve only the fact that replay evidence was invalid, never its
+        // untrusted content. The active turn must not silently resume without it.
+        return Some(json!({"invalid":true}));
+    };
     // Provider-encrypted state and IDs are opaque protocol fields. Free text
     // follows the existing credential-redaction boundary before persistence.
     for item in saved["items"].as_array_mut()? {
@@ -389,12 +394,11 @@ fn consecutive_tool_block_end(messages: &[Value], mut index: usize) -> usize {
 }
 
 fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[Value]) {
-    let Some(calls) = assistant.get("tool_calls").and_then(Value::as_array) else {
-        if let Some(projected) = canonical_text_message(assistant, "assistant", false) {
-            out.push(projected);
-        }
-        return;
-    };
+    let calls = assistant
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
 
     let mut results_by_id = std::collections::HashMap::<&str, &Value>::new();
     for tool in tools {
@@ -423,11 +427,14 @@ fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[
     }
 
     if matched_calls.is_empty() {
-        if let Some(mut projected) = canonical_text_message(assistant, "assistant", false) {
-            projected
-                .as_object_mut()
-                .expect("canonical text message is an object")
-                .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+        if let Some(saved) = canonical_provider_continuation(assistant) {
+            let content = extract_text_content(assistant)
+                .and_then(|text| prompt_facing_content_for_role("assistant", &text))
+                .unwrap_or_default();
+            let mut projected = json!({"role":"assistant", "content":content, "tool_calls":[]});
+            projected[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
+            out.push(projected);
+        } else if let Some(projected) = canonical_text_message(assistant, "assistant", false) {
             out.push(projected);
         }
         return;
@@ -443,12 +450,9 @@ fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[
     if let Some(reasoning) = assistant.get("reasoning_content") {
         projected.insert("reasoning_content".to_string(), reasoning.clone());
     }
-    // A pruned/incomplete call group cannot replay the complete provider turn.
-    if projected["tool_calls"]
-        .as_array()
-        .is_some_and(|matched| matched.len() == calls.len())
-        && let Some(saved) = canonical_provider_continuation(assistant)
-    {
+    // Keep protocol evidence even for an interrupted group. The codec checks
+    // it against canonical pairs before replaying any part of that group.
+    if let Some(saved) = canonical_provider_continuation(assistant) {
         projected.insert(
             astra_core::model_wire::responses::CONTINUATION_KEY.into(),
             saved,
@@ -650,6 +654,9 @@ fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
 }
 
 fn contains_tool_call_frame(msg: &Value) -> bool {
+    if astra_core::model_wire::responses::has_tool_continuation(msg) {
+        return true;
+    }
     if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
         return !tool_calls.is_empty();
     }
@@ -810,8 +817,9 @@ mod tests {
         invalid[1][CONTINUATION_KEY]["connection_id"] = json!("invalid");
         let sanitized =
             super::sanitize_canonical_continuation_messages_with_turn_semantics(invalid)
-                .expect("invalid provider state is dropped");
-        assert_eq!(sanitized.len(), 2);
+                .expect("invalid provider state is safely marked");
+        assert_eq!(sanitized.len(), 3);
+        assert_eq!(sanitized[1][CONTINUATION_KEY], json!({"invalid":true}));
 
         let mut orphan = json!({"role":"assistant", "content":""});
         orphan[CONTINUATION_KEY] = ResponseOutput {
@@ -824,14 +832,19 @@ mod tests {
             orphan,
         ])
         .unwrap();
-        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized.len(), 2);
+        assert!(sanitized[1].get(CONTINUATION_KEY).is_some());
+        assert!(request("model", &sanitized, None, &connection, false, None).is_err());
     }
 
     #[test]
-    fn canonical_history_drops_provider_state_from_incomplete_tool_groups() {
+    fn canonical_history_preserves_provider_state_from_interrupted_tool_groups() {
         use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput};
         let output = ResponseOutput {
-            items: vec![json!({"type":"function_call","call_id":"c1","name":"read_file"})],
+            items: vec![
+                json!({"type":"function_call","call_id":"c1","name":"read_file"}),
+                json!({"type":"function_call","call_id":"c2","name":"read_file"}),
+            ],
             ..Default::default()
         };
         for matched in [0, 1, 2] {
@@ -848,7 +861,17 @@ mod tests {
             let canonical =
                 super::sanitize_canonical_continuation_messages_with_turn_semantics(messages)
                     .unwrap();
-            assert_eq!(canonical[1].get(CONTINUATION_KEY).is_some(), matched == 2);
+            let restored =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(canonical)
+                    .unwrap();
+            assert!(restored[1].get(CONTINUATION_KEY).is_some());
+            let connection = restored[1][CONTINUATION_KEY]["connection_id"]
+                .as_str()
+                .unwrap();
+            let replay = astra_core::model_wire::responses::request(
+                "model", &restored, None, connection, false, None,
+            );
+            assert_eq!(replay.is_ok(), matched == 2, "{matched} recorded results");
         }
     }
 

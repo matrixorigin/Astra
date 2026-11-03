@@ -1629,6 +1629,7 @@ mod tests {
             .create_user_model(
                 owner.clone(),
                 UserModelCreateRequestData {
+                    inference_protocol: None,
                     connection_id: Some(connection),
                     name: "summary".into(),
                     provider: "chatgpt".into(),

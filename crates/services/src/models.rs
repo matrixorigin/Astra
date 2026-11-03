@@ -332,14 +332,34 @@ fn offering_thinking_protocol(
     model: &str,
 ) -> ThinkingProtocol {
     quirks.thinking_protocol.unwrap_or_else(|| {
-        if quirks.inference_protocol
-            == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
-        {
-            ThinkingProtocol::ResponsesReasoning
-        } else {
-            canonical_thinking_protocol(provider, base, model)
-        }
+        model_thinking_protocol(quirks.inference_protocol, provider, base, model)
     })
+}
+
+fn model_thinking_protocol(
+    inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    provider: &str,
+    base: &str,
+    model: &str,
+) -> ThinkingProtocol {
+    if inference_protocol.unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(provider))
+        == astra_core::model_wire::LlmProviderProtocol::OpenAiResponses
+    {
+        ThinkingProtocol::ResponsesReasoning
+    } else {
+        canonical_thinking_protocol(provider, base, model)
+    }
+}
+
+fn user_model_inference_protocol(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<Option<astra_core::model_wire::LlmProviderProtocol>, String> {
+    row.try_get::<Option<String>, _>("inference_protocol")
+        .map_err(|error| error.to_string())?
+        .map(|value| {
+            serde_json::from_value(Value::String(value)).map_err(|error| error.to_string())
+        })
+        .transpose()
 }
 
 fn declared_reasoning_capability(quirks: &QuirksData) -> Option<ThinkingCapability> {
@@ -1218,10 +1238,8 @@ pub struct AdmittedModelExecution {
 }
 
 fn response_scope(
-    offering_id: &str,
-    model: &ResolvedActiveLlmModel,
+    model: &AdmittedModelExecution,
     key: &ResponseScopeKey,
-    header_overrides: &HashMap<String, String>,
 ) -> Result<String, String> {
     // Build, but never send, a request so URL-embedded credentials use the
     // same normalization and Basic authentication rules as the transport.
@@ -1253,16 +1271,18 @@ fn response_scope(
         .iter()
         .map(reqwest::header::HeaderValue::as_bytes)
         .collect();
-    let authorization = header_overrides
+    let authorization = model
+        .header_overrides
         .get("authorization")
         .cloned()
         .unwrap_or_else(|| format!("Bearer {}", model.api_key));
-    let headers: BTreeMap<_, _> = header_overrides
+    let headers: BTreeMap<_, _> = model
+        .header_overrides
         .iter()
         .filter(|(name, _)| *name != "authorization" && !name.starts_with("__astra_"))
         .collect();
     let input = serde_json::to_vec(&(
-        offering_id,
+        &model.offering_id,
         &model.provider,
         endpoint.to_string(),
         url_authorization,
@@ -1317,22 +1337,10 @@ impl AdmittedModelExecution {
 
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
-        let response_scope = offering
-            .model
-            .response_scope_key
-            .as_ref()
-            .map(|key| {
-                response_scope(
-                    &offering.offering_id,
-                    &offering.model,
-                    key,
-                    &header_overrides,
-                )
-            })
-            .transpose()?;
-        Ok(Self {
+        let scope_key = offering.model.response_scope_key.clone();
+        let mut execution = Self {
             inference_protocol: offering.model.inference_protocol,
-            response_scope,
+            response_scope: None,
             subscription: None,
             admitted_at: Instant::now(),
             price_snapshot: offering.model.price_snapshot,
@@ -1359,7 +1367,12 @@ impl AdmittedModelExecution {
             header_overrides,
             completions_url_override: None,
             request_timeout_ms: None,
-        })
+        };
+        execution.response_scope = scope_key
+            .as_ref()
+            .map(|key| response_scope(&execution, key))
+            .transpose()?;
+        Ok(execution)
     }
 
     pub fn from_endpoint(
@@ -2484,7 +2497,7 @@ async fn revalidate_admitted_model_executions_with_access(
         .map_err(ModelOfferingResolutionError::Backend)?,
     };
     let mut query = QueryBuilder::<sqlx::MySql>::new(
-        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url, connection_id,
+        "SELECT model_id, model_alias, model_name, provider, inference_protocol, api_key_encrypted, base_url, connection_id,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 NULL AS configuration_updated_at, NULL AS quirks_json, NULL AS pricing_json,
                 NULL AS tags_json, CAST(NULL AS INT) AS max_completion_tokens, 1 AS personal
@@ -2498,7 +2511,7 @@ async fn revalidate_admitted_model_executions_with_access(
         }
     }
     query.push(") UNION ALL
-         SELECT model_id, model_name AS model_alias, model_name, provider, api_key_encrypted, base_url, CAST(NULL AS CHAR(64)) AS connection_id,
+         SELECT model_id, model_name AS model_alias, model_name, provider, CAST(NULL AS CHAR(32)) AS inference_protocol, api_key_encrypted, base_url, CAST(NULL AS CHAR(64)) AS connection_id,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 CAST(updated_at AS CHAR) AS configuration_updated_at,
                 CAST(quirks AS CHAR) AS quirks_json, CAST(pricing AS CHAR) AS pricing_json,
@@ -2550,7 +2563,7 @@ async fn revalidate_admitted_model_executions_with_access(
         }
         let result = (|| {
             let execution = if let Some(row) = personal.get(offering_id) {
-                admitted_user_model_from_row(row, offering_id, encryptor)?
+                admitted_user_model_from_row(row, user_id, offering_id, encryptor)?
             } else {
                 let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
                 let row = deployment.get(offering_id).ok_or_else(|| {
@@ -2643,6 +2656,7 @@ async fn revalidate_admitted_model_executions_with_access(
 
 fn admitted_user_model_from_row(
     row: &sqlx::mysql::MySqlRow,
+    user_id: &str,
     offering_id: &str,
     encryptor: &FernetTokenEncryptor,
 ) -> Result<AdmittedModelExecution, ModelOfferingResolutionError> {
@@ -2700,7 +2714,17 @@ fn admitted_user_model_from_row(
     let upstream: String = row
         .try_get("model_name")
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-    let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
+    let inference_protocol =
+        user_model_inference_protocol(row).map_err(ModelOfferingResolutionError::Backend)?;
+    validate_inference_config(
+        &provider,
+        &QuirksData {
+            inference_protocol,
+            ..Default::default()
+        },
+    )
+    .map_err(ModelOfferingResolutionError::Backend)?;
+    let protocol = model_thinking_protocol(inference_protocol, &provider, &base_url, &upstream);
     let snapshot: Option<String> = row
         .try_get("thinking_probe_json")
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
@@ -2714,8 +2738,8 @@ fn admitted_user_model_from_row(
     let thinking_protocol = Some(protocol);
     let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
     let supported_efforts = cached_efforts(snapshot.as_deref(), &identity, protocol);
-    Ok(AdmittedModelExecution {
-        inference_protocol: None,
+    let mut execution = AdmittedModelExecution {
+        inference_protocol,
         response_scope: None,
         subscription: None,
         admitted_at: std::time::Instant::now(),
@@ -2743,7 +2767,17 @@ fn admitted_user_model_from_row(
         header_overrides: HashMap::new(),
         completions_url_override: None,
         request_timeout_ms: None,
-    })
+    };
+    if connection.is_none()
+        && inference_protocol == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+    {
+        let owner =
+            serde_json::to_string(&(user_id, offering_id)).expect("model identity serializes");
+        let key = ResponseScopeKey::for_model(encryptor, &owner);
+        execution.response_scope =
+            Some(response_scope(&execution, &key).map_err(ModelOfferingResolutionError::Backend)?);
+    }
+    Ok(execution)
 }
 
 /// Shared eligibility gate for catalog and execution, including resumed runs.
@@ -3273,6 +3307,7 @@ pub struct UserModelRecord {
     pub model_id: String,
     pub name: String,
     pub provider: String,
+    pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub model: String,
     pub base_url: String,
     pub context_window: i32,
@@ -3288,6 +3323,7 @@ pub struct UserModelCreateRequestData {
     pub connection_id: Option<String>,
     pub name: String,
     pub provider: String,
+    pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub model: String,
     pub base_url: Option<String>,
     pub api_key: String,
@@ -3311,6 +3347,7 @@ impl std::fmt::Debug for UserModelCreateRequestData {
 #[derive(Clone, Default, PartialEq)]
 pub struct UserModelUpdateRequestData {
     pub api_key: Option<String>,
+    pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub context_window: Option<i32>,
     pub is_default: Option<bool>,
     pub is_active: Option<bool>,
@@ -3767,6 +3804,9 @@ impl DatabaseModelService {
         if request.provider != crate::chatgpt::PROVIDER
             || !request.api_key.is_empty()
             || request.base_url.is_some()
+            || request.inference_protocol.is_some_and(|protocol| {
+                protocol != astra_core::model_wire::LlmProviderProtocol::OpenAiResponses
+            })
         {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
@@ -4020,6 +4060,7 @@ impl DatabaseModelService {
         let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
         let raw: Option<String> = row.try_get("thinking_probe_json").map_err(internal_error)?;
         let connection: Option<String> = row.try_get("connection_id").map_err(internal_error)?;
+        let inference_protocol = user_model_inference_protocol(row).map_err(internal_error)?;
         let thinking_probe = raw
             .as_deref()
             .and_then(|value| serde_json::from_str::<ThinkingProbeSnapshot>(value).ok())
@@ -4032,7 +4073,7 @@ impl DatabaseModelService {
                         encrypted.as_deref().unwrap_or(""),
                         connection.as_deref().unwrap_or(""),
                     ),
-                    canonical_thinking_protocol(&provider, &base, &model),
+                    model_thinking_protocol(inference_protocol, &provider, &base, &model),
                 )
             });
         Ok(UserModelRecord {
@@ -4040,6 +4081,7 @@ impl DatabaseModelService {
             model_id: row.try_get("model_id").map_err(internal_error)?,
             name: row.try_get("model_alias").map_err(internal_error)?,
             provider,
+            inference_protocol,
             model,
             base_url: base,
             context_window,
@@ -4135,8 +4177,12 @@ impl DatabaseModelService {
                     continue;
                 }
                 let record = Self::user_model_record_from_row(&row)?;
-                let protocol =
-                    canonical_thinking_protocol(&record.provider, &record.base_url, &record.model);
+                let protocol = model_thinking_protocol(
+                    record.inference_protocol,
+                    &record.provider,
+                    &record.base_url,
+                    &record.model,
+                );
                 let thinking_capability = record
                     .thinking_probe
                     .filter(|result| {
@@ -4260,7 +4306,7 @@ const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name > ?) \
      OR (provider = ? AND model_name = ? AND model_id > ?))";
 const MODEL_LIST_ORDER_SQL: &str = " ORDER BY provider ASC, model_name ASC, model_id ASC LIMIT ?";
-const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, base_url, \
+const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, inference_protocol, base_url, \
     api_key_encrypted, connection_id, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, \
     context_window, is_default, is_active, \
     CAST(created_at AS CHAR) AS created_at_text, CAST(updated_at AS CHAR) AS updated_at_text";
@@ -4535,6 +4581,14 @@ impl ModelService for DatabaseModelService {
         let name = validate_user_model_identifier("name", &request.name)?;
         let model = validate_user_model_identifier("model", &request.model)?;
         let provider = request.provider.trim().to_ascii_lowercase();
+        validate_inference_config(
+            &provider,
+            &QuirksData {
+                inference_protocol: request.inference_protocol,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         let base_url = user_byok_base_url(&provider, request.base_url.as_deref())?;
         validate_context_window_value(request.context_window, "context_window")
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
@@ -4565,13 +4619,14 @@ impl ModelService for DatabaseModelService {
             .encryptor
             .encrypt(&request.api_key)
             .map_err(internal_error)?;
-        let connectivity = validate_connectivity(
+        let connectivity = validate_connectivity_for_protocol(
             &provider,
             &model,
             &request.api_key,
             Some(&base_url),
             None,
             None,
+            request.inference_protocol,
         )
         .await;
         if let Some(reason) = connectivity {
@@ -4592,17 +4647,19 @@ impl ModelService for DatabaseModelService {
             .await
             .map_err(internal_error)?;
         }
-        query(
+        query(astra_core::matrixone_statement_with_null_shape(
             "INSERT INTO user_llm_models \
-             (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+             (model_id, user_id, model_alias, model_name, provider, inference_protocol, api_key_encrypted, base_url, \
               context_window, is_default, is_active, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
-        )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
+             [request.inference_protocol.is_some()],
+        ))
         .bind(&model_id)
         .bind(&user_id)
         .bind(&name)
         .bind(&model)
         .bind(&provider)
+        .bind(request.inference_protocol.map(|protocol| protocol.as_str()))
         .bind(&encrypted_key)
         .bind(&base_url)
         .bind(request.context_window)
@@ -4650,6 +4707,7 @@ impl ModelService for DatabaseModelService {
         request: UserModelUpdateRequestData,
     ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
         if request.api_key.is_none()
+            && request.inference_protocol.is_none()
             && request.context_window.is_none()
             && request.is_default.is_none()
             && request.is_active.is_none()
@@ -4677,9 +4735,25 @@ impl ModelService for DatabaseModelService {
         let provider: String = existing.try_get("provider").map_err(internal_error)?;
         let model: String = existing.try_get("model_name").map_err(internal_error)?;
         let base_url: String = existing.try_get("base_url").map_err(internal_error)?;
+        let previous_protocol = user_model_inference_protocol(&existing).map_err(internal_error)?;
+        let inference_protocol = request.inference_protocol.or(previous_protocol);
+        validate_inference_config(
+            &provider,
+            &QuirksData {
+                inference_protocol,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        let protocol_changed =
+            provider != crate::chatgpt::PROVIDER && inference_protocol != previous_protocol;
+        let previous_key: Option<String> = existing
+            .try_get("api_key_encrypted")
+            .map_err(internal_error)?;
         let pool = self.get_pool().await.map_err(internal_error)?;
         if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER
             && (request.api_key.is_some()
+                || protocol_changed
                 || request.is_active == Some(true)
                 || request.is_default == Some(true))
         {
@@ -4708,17 +4782,42 @@ impl ModelService for DatabaseModelService {
                 );
             }
         }
-        let encrypted_key = if let Some(api_key) = request.api_key.as_deref() {
-            validate_user_model_api_key(api_key)?;
-            if let Some(reason) =
-                validate_connectivity(&provider, &model, api_key, Some(&base_url), None, None).await
+        let encrypted_key = if request.api_key.is_some() || protocol_changed {
+            let api_key = match request.api_key.as_deref() {
+                Some(key) => {
+                    validate_user_model_api_key(key)?;
+                    key.to_owned()
+                }
+                None => self
+                    .encryptor
+                    .decrypt(
+                        previous_key
+                            .as_deref()
+                            .ok_or_else(|| internal_error("Model credential unavailable"))?,
+                    )
+                    .map_err(internal_error)?,
+            };
+            if let Some(reason) = validate_connectivity_for_protocol(
+                &provider,
+                &model,
+                &api_key,
+                Some(&base_url),
+                None,
+                None,
+                inference_protocol,
+            )
+            .await
             {
                 return Err(error_response(
                     StatusCode::BAD_REQUEST,
                     format!("Model credential or endpoint check failed: {reason}"),
                 ));
             }
-            Some(self.encryptor.encrypt(api_key).map_err(internal_error)?)
+            Some(if request.api_key.is_some() {
+                self.encryptor.encrypt(&api_key).map_err(internal_error)?
+            } else {
+                previous_key.clone().expect("existing credential validated")
+            })
         } else {
             None
         };
@@ -4742,13 +4841,22 @@ impl ModelService for DatabaseModelService {
             .map_err(internal_error)?;
         }
         if let Some(encrypted_key) = encrypted_key {
-            query("UPDATE user_llm_models SET api_key_encrypted = ?, thinking_probe_json = NULL, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
+            let updated = query(astra_core::matrixone_statement_with_null_shape("UPDATE user_llm_models SET api_key_encrypted = ?, inference_protocol = ?, thinking_probe_json = NULL, updated_at = NOW(6) WHERE user_id = ? AND model_id = ? AND api_key_encrypted <=> ? AND inference_protocol <=> ?", [inference_protocol.is_some(), previous_key.is_some(), previous_protocol.is_some()]))
                 .bind(encrypted_key)
+                .bind(inference_protocol.map(|protocol| protocol.as_str()))
                 .bind(&user_id)
                 .bind(&model_id)
+                .bind(&previous_key)
+                .bind(previous_protocol.map(|protocol| protocol.as_str()))
                 .execute(&mut *tx)
                 .await
                 .map_err(internal_error)?;
+            if updated.rows_affected() == 0 {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "Model changed during check; try again",
+                ));
+            }
         }
         if let Some(context_window) = request.context_window {
             query("UPDATE user_llm_models SET context_window = ?, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
@@ -4843,28 +4951,37 @@ impl ModelService for DatabaseModelService {
         let provider: String = row.try_get("provider").map_err(internal_error)?;
         let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;
         let base_url: String = row.try_get("base_url").map_err(internal_error)?;
+        let inference_protocol = user_model_inference_protocol(&row).map_err(internal_error)?;
         if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
             crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
                 .await
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
-        if let Some(reason) =
-            validate_connectivity(&provider, &model, &api_key, Some(&base_url), None, None).await
-        {
-            return Err(error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Model credential or endpoint check failed: {reason}"),
-            ));
-        }
-        let protocol = canonical_thinking_protocol(&provider, &base_url, &model);
-        let result = probe_thinking_behavior_with_protocol(
+        if let Some(reason) = validate_connectivity_for_protocol(
             &provider,
             &model,
             &api_key,
             Some(&base_url),
             None,
             None,
+            inference_protocol,
+        )
+        .await
+        {
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Model credential or endpoint check failed: {reason}"),
+            ));
+        }
+        let protocol = model_thinking_protocol(inference_protocol, &provider, &base_url, &model);
+        let result = probe_thinking_behavior_with_protocol(
+            &provider,
+            &model,
+            &api_key,
+            Some(&base_url),
+            None,
+            Some("high"),
             Some(protocol),
         )
         .await;
@@ -4873,6 +4990,7 @@ impl ModelService for DatabaseModelService {
             protocol,
             &result,
         )
+        .with_observed_effort("high")
         .with_previous(
             row.try_get::<Option<String>, _>("thinking_probe_json")
                 .map_err(internal_error)?
@@ -4881,9 +4999,13 @@ impl ModelService for DatabaseModelService {
         let json = serde_json::to_string(&snapshot).map_err(internal_error)?;
         // A check must never publish an observation for a concurrently rotated
         // credential or changed endpoint. No network I/O is held in a DB txn.
-        let updated = query("UPDATE user_llm_models SET thinking_probe_json = ?, updated_at = NOW(6) WHERE user_id = ? AND model_id = ? AND provider = ? AND base_url = ? AND model_name = ? AND api_key_encrypted = ? AND CAST(thinking_probe_json AS CHAR) <=> ?")
+        let previous_snapshot = row
+            .try_get::<Option<String>, _>("thinking_probe_json")
+            .map_err(internal_error)?;
+        let updated = query(astra_core::matrixone_statement_with_null_shape("UPDATE user_llm_models SET thinking_probe_json = ?, updated_at = NOW(6) WHERE user_id = ? AND model_id = ? AND provider = ? AND base_url = ? AND model_name = ? AND api_key_encrypted = ? AND inference_protocol <=> ? AND CAST(thinking_probe_json AS CHAR) <=> ?", [inference_protocol.is_some(), previous_snapshot.is_some()]))
             .bind(json).bind(&user_id).bind(&model_id).bind(&provider).bind(&base_url).bind(&model).bind(&encrypted)
-            .bind(row.try_get::<Option<String>, _>("thinking_probe_json").map_err(internal_error)?)
+            .bind(inference_protocol.map(|protocol| protocol.as_str()))
+            .bind(previous_snapshot)
             .execute(&pool).await.map_err(internal_error)?;
         if updated.rows_affected() == 0 {
             return Err(error_response(
@@ -6074,7 +6196,7 @@ async fn validate_connectivity_for_protocol(
         let endpoint = probe_endpoint.unwrap_or("/responses");
         return probe_responses(
             &client,
-            &format!("{}{}", base.trim_end_matches('/'), endpoint),
+            &astra_core::model_wire::endpoint_url(base, endpoint),
             model_name,
             api_key,
             probe_headers,
@@ -6173,7 +6295,7 @@ async fn validate_connectivity_for_protocol(
             }
         };
         let endpoint = probe_endpoint.unwrap_or("/chat/completions");
-        let probe = format!("{}{}", url, endpoint);
+        let probe = astra_core::model_wire::endpoint_url(&url, endpoint);
         let mut req = client
             .post(&probe)
             .header("authorization", format!("Bearer {}", api_key))
@@ -6370,7 +6492,7 @@ async fn probe_thinking_behavior_with_protocol_inner(
         &client,
         provider,
         model_name,
-        &format!("{}/chat/completions", url.trim_end_matches('/')),
+        &astra_core::model_wire::endpoint_url(url, "chat/completions"),
         api_key,
         protocol,
     )
@@ -6666,6 +6788,7 @@ pub struct UserModelCreateRequest {
     pub connection_id: Option<String>,
     pub name: String,
     pub provider: String,
+    pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub model: String,
     pub base_url: Option<String>,
     #[serde(default)]
@@ -6691,6 +6814,7 @@ impl std::fmt::Debug for UserModelCreateRequest {
 #[serde(deny_unknown_fields)]
 pub struct UserModelUpdateRequest {
     pub api_key: Option<String>,
+    pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub context_window: Option<i32>,
     pub is_default: Option<bool>,
     pub is_active: Option<bool>,
@@ -10897,6 +11021,7 @@ mod tests {
     fn user_model_requests_redact_credentials_in_debug_output() {
         let create = UserModelCreateRequestData {
             connection_id: None,
+            inference_protocol: None,
             name: "deepseek".into(),
             provider: "deepseek".into(),
             model: "deepseek-chat".into(),

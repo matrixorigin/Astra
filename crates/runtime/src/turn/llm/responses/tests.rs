@@ -223,8 +223,46 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         assert!(!continuation_text.contains(secret));
     }
     messages.push(json!({"role":"assistant","content":"","tool_calls":first.tool_calls,astra_core::model_wire::responses::CONTINUATION_KEY:continuation}));
+    let mut interrupted = messages.clone();
+    interrupted.push(snapshot("runtime context is not a new human turn"));
+    let mut interrupted_call = call(&interrupted, &tools, &scope, &base, &thinking);
+    interrupted_call.route = LlmExecutionRoute::from_admitted(&second_execution);
+    let failure = call_llm_and_collect_with_stream_callback(
+        interrupted_call,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        failure
+            .details_json
+            .unwrap()
+            .contains("responses_continuation_incomplete")
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "incomplete evidence must fail before provider dispatch"
+    );
     messages.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
     messages.push(snapshot("updated optional observation"));
+    let mut switched = call(&messages, &tools, &scope, &base, &thinking);
+    switched.route = LlmExecutionRoute::from_admitted(&second_execution);
+    switched.route.inference_protocol = Some(LlmProviderProtocol::OpenAiCompatible);
+    let failure = match prepare_streaming_call(switched, RuntimeToolChoice::Auto) {
+        Err(failure) => failure,
+        Ok(_) => panic!("a different protocol cannot continue the active tool round"),
+    };
+    assert!(
+        failure
+            .details_json
+            .unwrap()
+            .contains("responses_continuation_scope_changed")
+    );
     let mut second_call = call(&messages, &tools, &scope, &base, &thinking);
     second_call.route = LlmExecutionRoute::from_admitted(&second_execution);
     let second = call_llm_and_collect_with_stream_callback(
@@ -454,7 +492,7 @@ async fn infer_with_budget(
             cache_capability: None,
             route: LlmExecutionRoute::from_admitted(execution),
             max_output_tokens: Some(1024),
-            temperature: Some(0.7),
+            temperature: execution.subscription.as_ref().map(|_| 0.7),
             thinking,
         },
         LlmCancel::None,
@@ -464,6 +502,137 @@ async fn infer_with_budget(
         Some(budget),
     )
     .await
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated MatrixOne database and loopback BYOK provider override"]
+async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
+    use astra_services::UserModelUpdateRequestData;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
+    let settings = astra_core::MatrixOneSettings::from_env();
+    crate::isolated_database::require_isolated_database(&settings.database);
+    assert_eq!(
+        std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref(),
+        Ok("1")
+    );
+    let base = std::env::var("ASTRA_BYOK_DEEPSEEK_BASE_URL").unwrap();
+    let url = reqwest::Url::parse(&base).unwrap();
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().route("/responses", post(
+        |State(requests): State<Arc<Mutex<Vec<Value>>>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+            if headers.get("authorization").is_none_or(|value| value != "Bearer test-key" && value != "Bearer new-key")
+                || body["model"] != "fixture-model" || body["store"] != false || body["stream"] != true {
+                return (StatusCode::BAD_REQUEST, "invalid request").into_response();
+            }
+            let probe = body["input"].to_string().contains("Calculate 17 * 23");
+            let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
+            requests.lock().unwrap().push(body);
+            let output = if probe || continued {
+                json!([{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}])
+            } else {
+                json!([{"type":"reasoning","id":"reason","summary":[],"encrypted_content":"opaque"},
+                    {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            };
+            let event = json!({"type":"response.completed","response":{"id":"fixture","status":"completed","output":output}});
+            ([("content-type", "text/event-stream")], format!("data: {event}\n\n")).into_response()
+        }
+    )).with_state(requests.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", url.port().unwrap()))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    astra_services::storage::ensure_core_schema(&settings, "mysql")
+        .await
+        .unwrap();
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let key = Arc::new(FernetTokenEncryptor::new("byok-responses-fixture-key").unwrap());
+    let service = DatabaseModelService::new(settings, key).with_pool(pool);
+    let owner = format!("byok-{}", uuid::Uuid::new_v4());
+    let model = service
+        .create_user_model(
+            owner.clone(),
+            UserModelCreateRequestData {
+                connection_id: None,
+                name: "fixture".into(),
+                provider: "deepseek".into(),
+                inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                model: "fixture-model".into(),
+                base_url: None,
+                api_key: "test-key".into(),
+                context_window: 128000,
+                is_default: false,
+            },
+        )
+        .await
+        .unwrap();
+    let admitted = service
+        .admit_model_offering(owner.clone(), model.model_id.clone())
+        .await
+        .unwrap();
+    let tools = vec![
+        json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}),
+    ];
+    let attempts = Attempts::default();
+    let mut history = vec![json!({"role":"user","content":"look up"})];
+    let first = infer(&admitted, &history, &tools, &attempts).await.unwrap();
+    history.push(
+        json!({"role":"assistant","content":"","tool_calls":first.tool_calls,
+        astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}),
+    );
+    history.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
+    assert_eq!(
+        infer(&admitted, &history, &tools, &attempts)
+            .await
+            .unwrap()
+            .full_text,
+        "done"
+    );
+    service
+        .update_user_model(
+            owner.clone(),
+            model.model_id.clone(),
+            UserModelUpdateRequestData {
+                api_key: Some("new-key".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let rotated = service
+        .admit_model_offering(owner.clone(), model.model_id.clone())
+        .await
+        .unwrap();
+    let before = requests.lock().unwrap().len();
+    let failure = infer(&rotated, &history, &tools, &attempts)
+        .await
+        .unwrap_err();
+    assert!(
+        failure
+            .details_json
+            .unwrap()
+            .contains("responses_continuation_scope_changed")
+    );
+    assert_eq!(requests.lock().unwrap().len(), before);
+    history.push(json!({"role":"user","content":"continue with the new model"}));
+    assert_eq!(
+        infer(&rotated, &history, &tools, &attempts)
+            .await
+            .unwrap()
+            .full_text,
+        "done"
+    );
+    service
+        .delete_user_model(owner, model.model_id)
+        .await
+        .unwrap();
+    server.abort();
 }
 
 #[tokio::test]
@@ -493,6 +662,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
         .create_user_model(
             owner.clone(),
             UserModelCreateRequestData {
+                inference_protocol: None,
                 name: "coding".into(),
                 provider: "chatgpt".into(),
                 model: "fixture-model".into(),

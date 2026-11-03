@@ -2346,7 +2346,7 @@ pub(crate) fn llm_request_url_for_provider(
         }
         LlmProviderProtocol::BedrockConverse => bedrock_converse_url(base, model_name, streaming),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
-            format!("{base}/chat/completions")
+            astra_core::model_wire::endpoint_url(base_url, "chat/completions")
         }
     }
 }
@@ -5139,6 +5139,18 @@ pub(crate) fn prepare_streaming_call(
         == LlmProviderProtocol::OpenAiResponses
     {
         return responses::prepare(call, tool_choice, preparation_started);
+    }
+    if call
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(astra_core::model_wire::responses::has_tool_continuation)
+    {
+        return Err(responses::error(
+            astra_core::ErrorKind::InvalidRequest,
+            "responses_continuation_scope_changed",
+        ));
     }
     if call.route.provider == "typesafe" {
         return Err(astra_core::ClassifiedError::new(
@@ -17205,6 +17217,14 @@ mod tests {
         assert_eq!(
             llm_completions_url("https://api.openai.com/v1/", None, "openai"),
             "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn completions_url_keeps_route_query_after_the_endpoint_path() {
+        assert_eq!(
+            llm_completions_url("https://gateway.example/v1?tenant=one", None, "openai"),
+            "https://gateway.example/v1/chat/completions?tenant=one"
         );
     }
 

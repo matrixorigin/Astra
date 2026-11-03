@@ -44,7 +44,7 @@ The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
 backbone, invocation/provider-attempt ledger, tool execution, cancellation,
 canonical history and checkpoint paths as API-key models. `chatgpt` selects
 the shared Responses codec; it does not create another session state machine.
-Administrator-managed API-key Offerings can explicitly select the same Responses
+Administrator-managed and personal API-key Offerings can explicitly select the same Responses
 wire protocol. Protocol selection is independent of credential ownership: API
 keys use their admitted endpoint and headers, while subscriptions retain their
 connection fencing and refresh rules. API-key continuation state is scoped to
@@ -53,6 +53,13 @@ header names are case-insensitive, and invalid or duplicate configured headers
 are rejected at configuration and execution admission. Probe-only and unrelated
 capability changes do not invalidate it. Model checks use
 the selected wire protocol; the ordinary provider default remains unchanged.
+Personal model configuration stores the protocol separately from the optional
+thinking observation. Credential rotation and concurrent checks are fenced by
+the existing model row. A Responses tool group retains its scoped provider
+evidence across canonical projection; incomplete or inconsistent evidence
+stops the current continuation before provider dispatch. A later human turn can
+continue with the completed canonical tool pairs. No separate continuation
+table or per-request database lookup is introduced.
 Explicit request temperatures are not silently discarded. Internal memory
 judgments express a deterministic sampling preference; when Responses sampling
 support is not established they use the provider default and the admitted

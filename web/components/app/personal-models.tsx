@@ -152,7 +152,8 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string, ca
         const form = event.currentTarget;
         const data = new FormData(form);
         void mutation('create', { provider, name: data.get('name'), model: data.get('model'), api_key: data.get('api_key'),
-          context_window: Number(data.get('context_window')), base_url: provider === 'openai-compatible' ? data.get('base_url') : undefined }, true);
+          context_window: Number(data.get('context_window')), base_url: provider === 'openai-compatible' ? data.get('base_url') : undefined,
+          inference_protocol: data.get('inference_protocol') || undefined }, true);
         (form.elements.namedItem('api_key') as HTMLInputElement).value = '';
       }}>
         <h3 className="font-medium">Use my API key</h3>
@@ -164,6 +165,9 @@ export function PersonalModels({ onChanged }: { onChanged: (modelId?: string, ca
         <input aria-label="API key" name="api_key" type="password" autoComplete="off" placeholder="API key" required disabled={busy} />
         <input aria-label="Context tokens" name="context_window" type="number" min="1" defaultValue="128000" required disabled={busy} />
         {provider === 'openai-compatible' ? <input aria-label="API base URL" name="base_url" type="url" placeholder="HTTPS API base URL" required disabled={busy} /> : null}
+        {provider !== 'anthropic' ? <select aria-label="API format" name="inference_protocol" defaultValue="" disabled={busy}>
+          <option value="">Chat Completions</option><option value="openai_responses">Responses</option>
+        </select> : null}
         <button type="submit" disabled={busy}>Check and add personal model</button>
       </form>
       <div className="space-y-2">

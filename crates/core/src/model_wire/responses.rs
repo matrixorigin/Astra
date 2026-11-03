@@ -2,21 +2,33 @@
 //! It owns no conversation, tool execution, credential, or retry lifecycle.
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const CONTINUATION_KEY: &str = "_astra_responses";
 pub const CONTINUATION_SCOPE_CHANGED: &str =
     "Model configuration changed during tool continuation; start a new turn";
+pub const CONTINUATION_INCOMPLETE: &str = "Tool continuation is incomplete; start a new turn";
 const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
+const MAX_CONTINUATION_ITEMS: usize = 4096;
+
+/// Whether a saved Responses item belongs to a tool round.
+pub fn has_tool_continuation(message: &Value) -> bool {
+    message["role"] == "assistant"
+        && message.get(CONTINUATION_KEY).is_some_and(|saved| {
+            saved["invalid"] == true
+                || message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty())
+                || saved["items"].as_array().is_some_and(|items| {
+                    items.len() > MAX_CONTINUATION_ITEMS
+                        || items.iter().any(|item| item["type"] == "function_call")
+                })
+        })
+}
 
 /// Construct the same endpoint for Responses requests and their route identity.
 pub fn endpoint_url(base_url: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse(base_url) else {
-        return base_url.to_owned();
-    };
-    let path = format!("{}/responses", url.path().trim_end_matches('/'));
-    url.set_path(&path);
-    url.into()
+    super::endpoint_url(base_url, "responses")
 }
 
 /// Retain only scoped, replayable assistant protocol state at canonical
@@ -39,7 +51,7 @@ pub fn validated_continuation(message: &Value) -> Option<Value> {
         return None;
     }
     let raw = saved["items"].as_array()?;
-    if raw.is_empty() || raw.len() > 4096 {
+    if raw.is_empty() || raw.len() > MAX_CONTINUATION_ITEMS {
         return None;
     }
     let items = raw
@@ -176,6 +188,130 @@ fn replay_item(item: &Value) -> Result<Value, String> {
     Ok(Value::Object(object))
 }
 
+fn continuation_calls<'a>(
+    message: &'a Value,
+    saved: &'a Value,
+    following: &[Value],
+    provider_id: impl Fn(&'a Value) -> Option<&'a str>,
+    validate_items: bool,
+) -> Result<HashMap<&'a str, &'a Value>, String> {
+    let items = saved["items"].as_array().ok_or(CONTINUATION_INCOMPLETE)?;
+    if items.is_empty()
+        || items.len() > MAX_CONTINUATION_ITEMS
+        || message["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| calls.len() > MAX_CONTINUATION_ITEMS)
+    {
+        return Err(CONTINUATION_INCOMPLETE.into());
+    }
+    let mut calls = HashMap::new();
+    let mut pending = HashSet::new();
+    for call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = call["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or(CONTINUATION_INCOMPLETE)?;
+        let wire_id = provider_id(call).unwrap_or(id);
+        if !pending.insert(id) || calls.insert(wire_id, call).is_some() {
+            return Err(CONTINUATION_INCOMPLETE.into());
+        }
+    }
+    let mut seen = HashSet::new();
+    for item in items {
+        if validate_items {
+            replay_item(item)?;
+        }
+        if item["type"] != "function_call" {
+            continue;
+        }
+        if item
+            .get("namespace")
+            .is_some_and(|namespace| !namespace.is_null() && namespace != "astra")
+        {
+            return Err(CONTINUATION_INCOMPLETE.into());
+        }
+        let id = item["call_id"].as_str().ok_or(CONTINUATION_INCOMPLETE)?;
+        let call = calls.get(id).ok_or(CONTINUATION_INCOMPLETE)?;
+        if !seen.insert(id)
+            || item["name"] != call["function"]["name"]
+            || call["function"]["arguments"].as_str().is_none()
+        {
+            return Err(CONTINUATION_INCOMPLETE.into());
+        }
+    }
+    if seen.len() != calls.len() {
+        return Err(CONTINUATION_INCOMPLETE.into());
+    }
+    for result in following
+        .iter()
+        .take_while(|message| message["role"] == "tool")
+    {
+        let id = result["tool_call_id"]
+            .as_str()
+            .ok_or(CONTINUATION_INCOMPLETE)?;
+        if !pending.remove(id) {
+            return Err(CONTINUATION_INCOMPLETE.into());
+        }
+    }
+    if !pending.is_empty() {
+        return Err(CONTINUATION_INCOMPLETE.into());
+    }
+    Ok(calls)
+}
+
+/// Validate the current human turn before runtime context is projected to user messages.
+pub fn validate_active_continuations<'a>(
+    messages: &'a [Value],
+    model: &str,
+    connection: &str,
+    provider_id: impl Fn(&'a Value) -> Option<&'a str>,
+) -> Result<(), String> {
+    for (index, message) in messages.iter().enumerate() {
+        let Some(saved) = message
+            .get(CONTINUATION_KEY)
+            .filter(|_| message["role"] == "assistant")
+        else {
+            continue;
+        };
+        if saved["invalid"] == true {
+            return Err(CONTINUATION_INCOMPLETE.into());
+        }
+        let has_calls = has_tool_continuation(message);
+        if saved["connection_id"] != connection || saved["model"] != model {
+            if has_calls {
+                return Err(CONTINUATION_SCOPE_CHANGED.into());
+            }
+        } else {
+            continuation_calls(message, saved, &messages[index + 1..], &provider_id, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn replay_continuation(
+    message: &Value,
+    saved: &Value,
+    following: &[Value],
+) -> Result<Vec<Value>, String> {
+    let calls = continuation_calls(message, saved, following, |_| None, false)?;
+    let items = saved["items"].as_array().ok_or(CONTINUATION_INCOMPLETE)?;
+    let mut replayed = Vec::with_capacity(items.len());
+    for item in items {
+        let mut replay = replay_item(item)?;
+        if replay["type"] == "function_call" {
+            let id = replay["call_id"].as_str().ok_or(CONTINUATION_INCOMPLETE)?;
+            replay["arguments"] = calls[id]["function"]["arguments"].clone();
+        }
+        replayed.push(replay);
+    }
+    Ok(replayed)
+}
+
 pub fn request(
     model: &str,
     messages: &[Value],
@@ -196,9 +332,7 @@ pub fn request(
         if role == "assistant"
             && let Some(saved) = message.get(CONTINUATION_KEY)
             && (saved["connection_id"] != connection || saved["model"] != model)
-            && message["tool_calls"]
-                .as_array()
-                .is_some_and(|calls| !calls.is_empty())
+            && has_tool_continuation(message)
             && !last_user
                 .get_or_insert_with(|| {
                     messages
@@ -214,26 +348,24 @@ pub fn request(
             && saved["connection_id"] == connection
             && saved["model"] == model
         {
-            let items = saved["items"]
-                .as_array()
-                .ok_or("Invalid Responses continuation")?;
-            for item in items {
-                let mut replay = replay_item(item)?;
-                if replay["type"] == "function_call" {
-                    let call = message
-                        .get("tool_calls")
-                        .and_then(Value::as_array)
-                        .and_then(|calls| calls.iter().find(|call| call["id"] == replay["call_id"]))
-                        .ok_or("Continuation tool call has no canonical assistant call")?;
-                    replay["arguments"] = json!(
-                        call["function"]["arguments"]
-                            .as_str()
-                            .ok_or("Invalid canonical tool arguments")?
-                    );
+            match replay_continuation(message, saved, &messages[index + 1..]) {
+                Ok(items) => {
+                    input.extend(items);
+                    continue;
                 }
-                input.push(replay);
+                Err(error)
+                    if !last_user
+                        .get_or_insert_with(|| {
+                            messages
+                                .iter()
+                                .rposition(|message| message["role"] == "user")
+                        })
+                        .is_some_and(|user_index| user_index > index) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => {} // A later human turn can use validated canonical pairs.
             }
-            continue;
         }
         if role == "tool" {
             let id = message["tool_call_id"]
@@ -873,6 +1005,87 @@ mod tests {
         assert_eq!(
             body["input"][1]["arguments"],
             "canonical-normalized-arguments"
+        );
+    }
+
+    #[test]
+    fn continuation_requires_bijective_calls_and_completed_results() {
+        let mut assistant = json!({"role":"assistant","content":"", "tool_calls":[
+            {"id":"c1","function":{"name":"read_file","arguments":"{}"}},
+            {"id":"c2","function":{"name":"read_file","arguments":"{}"}}
+        ]});
+        assistant[CONTINUATION_KEY] = json!({"connection_id":"scope","model":"model","items":[
+            {"type":"reasoning","encrypted_content":"opaque","summary":[]},
+            {"type":"function_call","name":"read_file","call_id":"c1"},
+            {"type":"function_call","name":"read_file","call_id":"c2"}
+        ]});
+        let first = json!({"role":"tool","tool_call_id":"c1","content":"one"});
+        let second = json!({"role":"tool","tool_call_id":"c2","content":"two"});
+        let valid = vec![assistant.clone(), first.clone(), second.clone()];
+        assert!(request("model", &valid, None, "scope", false, None).is_ok());
+        let partial = vec![assistant.clone(), first.clone()];
+        assert_eq!(
+            request("model", &partial, None, "scope", false, None).unwrap_err(),
+            CONTINUATION_INCOMPLETE
+        );
+        let mut corrupt = valid.clone();
+        corrupt[0][CONTINUATION_KEY]["items"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert_eq!(
+            request("model", &corrupt, None, "scope", false, None).unwrap_err(),
+            CONTINUATION_INCOMPLETE
+        );
+        corrupt[0][CONTINUATION_KEY]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"function_call","name":"read_file","call_id":"c1"}));
+        assert_eq!(
+            request("model", &corrupt, None, "scope", false, None).unwrap_err(),
+            CONTINUATION_INCOMPLETE
+        );
+        let mut wrong_namespace = valid.clone();
+        wrong_namespace[0][CONTINUATION_KEY]["items"][1]["namespace"] = json!("unadmitted");
+        assert_eq!(
+            request("model", &wrong_namespace, None, "scope", false, None).unwrap_err(),
+            CONTINUATION_INCOMPLETE
+        );
+        let mut empty = valid.clone();
+        empty[0][CONTINUATION_KEY]["items"] = json!([]);
+        assert_eq!(
+            request("model", &empty, None, "scope", false, None).unwrap_err(),
+            CONTINUATION_INCOMPLETE
+        );
+        let mut recovered = partial;
+        // The canonical projection keeps only completed pairs; a later human
+        // may continue without replaying the interrupted provider state.
+        recovered[0]["tool_calls"].as_array_mut().unwrap().pop();
+        recovered.push(json!({"role":"user","content":"continue"}));
+        let body = request("model", &recovered, None, "scope", false, None).unwrap();
+        assert!(!body.to_string().contains("opaque"));
+    }
+
+    #[test]
+    fn active_continuation_maps_runtime_ids_and_blocks_a_changed_route() {
+        let assistant = json!({"role":"assistant", "tool_calls":[
+            {"id":"internal","provider_id":"original","function":{"name":"lookup","arguments":"{}"}}
+        ], CONTINUATION_KEY:{"connection_id":"old","model":"model","items":[
+            {"type":"function_call","call_id":"original","name":"lookup"}
+        ]}});
+        let result = json!({"role":"tool","tool_call_id":"internal","content":"found"});
+        let messages = vec![assistant, result];
+        fn provider_id(call: &Value) -> Option<&str> {
+            call["provider_id"].as_str()
+        }
+        assert!(validate_active_continuations(&messages, "model", "old", provider_id).is_ok());
+        assert_eq!(
+            validate_active_continuations(&messages, "model", "new", provider_id).unwrap_err(),
+            CONTINUATION_SCOPE_CHANGED
+        );
+        assert_eq!(
+            validate_active_continuations(&messages[..1], "model", "old", provider_id).unwrap_err(),
+            CONTINUATION_INCOMPLETE
         );
     }
 

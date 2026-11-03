@@ -47,6 +47,12 @@ Scripts can still supply both explicitly:
 astra model add work-model --provider deepseek --model deepseek-v4-flash --api-key-stdin
 ```
 
+When the provider requires the Responses API, select **Responses** in model
+settings or pass `--api-format responses` to `astra model add`. The default for
+OpenAI-compatible API-key models is Chat Completions. Use the API format
+documented by your provider; credential or network failures do not cause Astra
+to guess a different format.
+
 With `--api-key-stdin`, the alias and required provider/model arguments remain
 mandatory; only the interactive wizard offers a default alias. Keys should be
 entered at the hidden prompt or supplied via stdin, never as command arguments.
