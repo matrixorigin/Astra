@@ -22,6 +22,9 @@ pub fn truncate_str(s: &str, max: usize) -> String {
 /// char budget — `max_chars=5` on "hello world" returns "hell…".
 /// Multi-line input is reduced to the first line first.
 pub fn truncate_line(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let line = s.lines().next().unwrap_or(s);
     if line.chars().count() <= max_chars {
         line.to_string()
@@ -32,16 +35,23 @@ pub fn truncate_line(s: &str, max_chars: usize) -> String {
 }
 
 fn truncate_to_width(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
-        truncate_str(s, max_chars.saturating_sub(1))
+        let head: String = s.chars().take(max_chars - 1).collect();
+        format!("{head}…")
     }
 }
 
 /// Shorten a path by keeping the filename and truncating the directory prefix with "...".
 #[must_use]
 pub fn shorten_path(path: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     if path.chars().count() <= max_chars {
         return path.to_string();
     }
@@ -67,7 +77,7 @@ pub fn shorten_path(path: &str, max_chars: usize) -> String {
         }
     }
 
-    format!(".../{filename}")
+    truncate_to_width(&format!(".../{filename}"), max_chars)
 }
 
 /// Format the most readable GitHub repository display for tool previews.
@@ -117,6 +127,19 @@ mod tests {
         assert_eq!(shorten_path("/a/b/c/d/e/file.txt", 15), ".../e/file.txt");
         assert_eq!(shorten_path("/a/very_long_filename.txt", 10), "very_long…");
         assert_eq!(shorten_path("/a/b/c/short.txt", 14), ".../short.txt");
+    }
+
+    #[test]
+    fn previews_respect_zero_and_tight_budgets() {
+        for budget in 0..=8 {
+            for input in ["hello world", "数据目录/文件名.rs", "/a/b/c/file.rs", "a"] {
+                assert!(truncate_line(input, budget).chars().count() <= budget);
+                assert!(shorten_path(input, budget).chars().count() <= budget);
+            }
+        }
+        assert_eq!(truncate_line("hello", 0), "");
+        assert_eq!(shorten_path("/a/b/c", 0), "");
+        assert_eq!(shorten_path("/a/b/c", 1), "…");
     }
 
     #[test]
