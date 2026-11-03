@@ -147,17 +147,25 @@ async fn responses_continuation_survives_probe_updates_but_fences_route_changes(
         assistant,
         json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}),
     ];
-    let replay = |execution: &AdmittedModelExecution| {
+    let bind = |execution: &AdmittedModelExecution| {
+        let mut bound = messages.clone();
+        bound[1][CONTINUATION_KEY] = output.continuation(
+            execution.response_scope.as_deref().unwrap(),
+            execution.upstream_model_name(),
+        );
+        bound
+    };
+    let replay = |execution: &AdmittedModelExecution, messages: &[serde_json::Value]| {
         request(
             execution.upstream_model_name(),
-            &messages,
+            messages,
             None,
             execution.response_scope.as_deref().unwrap(),
             false,
             None,
         )
     };
-    assert!(replay(&original).is_ok());
+    assert!(replay(&original, &messages).is_ok());
 
     quirks.probe_endpoint = Some("/health".into());
     quirks.probe_headers = Some(json!({"User-Agent":"probe"}).as_object().unwrap().clone());
@@ -167,7 +175,7 @@ async fn responses_continuation_survives_probe_updates_but_fences_route_changes(
     let refreshed = admitted(&service, &id).await;
     assert!(original.has_same_execution_identity(&refreshed));
     assert_eq!(refreshed.response_scope.as_deref(), Some(scope));
-    assert!(replay(&refreshed).is_ok());
+    assert!(replay(&refreshed, &messages).is_ok());
 
     quirks.supported_reasoning_efforts = Some(vec!["high".into()]);
     quirks.request_headers = Some(Default::default());
@@ -184,16 +192,80 @@ async fn responses_continuation_survives_probe_updates_but_fences_route_changes(
         Some(scope)
     );
 
+    quirks.request_headers = Some(json!({"X-Tenant":"tenant-a"}).as_object().unwrap().clone());
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    service.update_model(name.clone(), update).await.unwrap();
+    let with_header = admitted(&service, &id).await;
+    let header_scope = with_header.response_scope.as_deref().unwrap();
+    let header_messages = bind(&with_header);
+
+    quirks.request_headers = Some(json!({"x-tenant":"tenant-a"}).as_object().unwrap().clone());
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    service.update_model(name.clone(), update).await.unwrap();
+    let same_header = admitted(&service, &id).await;
+    assert_eq!(same_header.response_scope.as_deref(), Some(header_scope));
+    assert_eq!(
+        same_header.header_overrides.get("x-tenant").unwrap(),
+        "tenant-a"
+    );
+    assert!(replay(&same_header, &header_messages).is_ok());
+
+    let mut conflicting = quirks.clone();
+    conflicting.request_headers = Some(
+        json!({"X-Tenant":"tenant-a", "x-tenant":"tenant-b"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let mut update = model_patch();
+    update.quirks = Some(conflicting.clone());
+    assert!(matches!(
+        service.update_model(name.clone(), update).await,
+        Err((StatusCode::BAD_REQUEST, _))
+    ));
+    assert_eq!(
+        admitted(&service, &id).await.response_scope,
+        same_header.response_scope
+    );
+
+    // A previously stored ambiguous configuration must also fail closed at
+    // execution admission, even when it bypassed current write validation.
+    sqlx::query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
+        .bind(serde_json::to_string(&conflicting).unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let legacy = service.revalidate_model_offering(id.clone()).await.unwrap();
+    assert!(AdmittedModelExecution::from_offering(legacy).is_err());
+    let mut disable = model_patch();
+    disable.is_active = Some(false);
+    service.update_model(name.clone(), disable).await.unwrap();
+    let mut enable = model_patch();
+    enable.is_active = Some(true);
+    assert!(matches!(
+        service.update_model(name.clone(), enable).await,
+        Err((StatusCode::BAD_REQUEST, _))
+    ));
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    update.is_active = Some(true);
+    service.update_model(name.clone(), update).await.unwrap();
+
     quirks.request_headers = Some(json!({"x-tenant":"other"}).as_object().unwrap().clone());
     let mut update = model_patch();
     update.quirks = Some(quirks);
     service.update_model(name.clone(), update).await.unwrap();
     let changed_route = admitted(&service, &id).await;
-    assert_ne!(changed_route.response_scope.as_deref(), Some(scope));
+    assert_eq!(changed_route.header_overrides["x-tenant"], "other");
+    assert_ne!(changed_route.response_scope.as_deref(), Some(header_scope));
     assert_eq!(
-        replay(&changed_route).unwrap_err(),
+        replay(&changed_route, &header_messages).unwrap_err(),
         CONTINUATION_SCOPE_CHANGED
     );
+    let changed_messages = bind(&changed_route);
 
     sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
         .bind(encryptor.encrypt("second-key").unwrap())
@@ -203,13 +275,20 @@ async fn responses_continuation_survives_probe_updates_but_fences_route_changes(
         .unwrap();
     let rotated = admitted(&service, &id).await;
     assert_ne!(rotated.response_scope, changed_route.response_scope);
-    assert_eq!(replay(&rotated).unwrap_err(), CONTINUATION_SCOPE_CHANGED);
+    assert_eq!(
+        replay(&rotated, &changed_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+    let rotated_messages = bind(&rotated);
     let mut update = model_patch();
     update.base_url = Some("http://127.0.0.1:2".into());
     service.update_model(name, update).await.unwrap();
     let moved = admitted(&service, &id).await;
     assert_ne!(moved.response_scope, rotated.response_scope);
-    assert_eq!(replay(&moved).unwrap_err(), CONTINUATION_SCOPE_CHANGED);
+    assert_eq!(
+        replay(&moved, &rotated_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
         .bind(&id)
         .execute(&pool)

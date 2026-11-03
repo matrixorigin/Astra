@@ -16,7 +16,7 @@ fn budget() -> TokenBudget {
 }
 
 #[test]
-fn ordered_compaction_preserves_active_authority_with_its_entire_human_turn() {
+fn ordered_compaction_preserves_active_controls_and_retry_dependencies() {
     let mut messages = vec![
         json!({"role":"system", "content":"stable contract"}),
         json!({"role":"user", "content":"initial goal"}),
@@ -34,7 +34,7 @@ fn ordered_compaction_preserves_active_authority_with_its_entire_human_turn() {
         "active_work_attempt_start",
         RuntimeAuthorityLifetime::CurrentUserTurn,
     );
-    messages.push(authority);
+    messages.push(authority.clone());
     for index in 0..8 {
         messages.push(
             json!({"role":"assistant", "content":null, "_round_index":99,
@@ -46,10 +46,23 @@ fn ordered_compaction_preserves_active_authority_with_its_entire_human_turn() {
             "content":format!("current evidence {index}"), "_round_index":99, "_timestamp":1}),
         );
     }
-    let protected = messages[3..].to_vec();
+    let partial = json!({"role":"assistant", "content":"unfinished response"});
+    let mut retry = json!({"role":"user", "content":
+        render_append_only_runtime_authority_frame(
+            "output_cap_continuation", RuntimeAuthorityLifetime::NextAssistantDecision,
+            "Continue the unfinished response.",
+        ).unwrap()
+    });
+    mark_append_only_required_context(
+        &mut retry,
+        "output_cap_continuation",
+        RuntimeAuthorityLifetime::NextAssistantDecision,
+    );
+    messages.extend([partial.clone(), retry.clone()]);
     let outcome =
         CompactionEngine::aggressive_pipeline().compress_if_needed(&mut messages, &budget());
     assert!(outcome.total_tokens_freed > 0);
+    assert!(!outcome.budget_satisfied);
     assert!(
         !messages
             .iter()
@@ -59,11 +72,27 @@ fn ordered_compaction_preserves_active_authority_with_its_entire_human_turn() {
         .iter()
         .position(|message| message["content"] == "current human goal")
         .expect("current human anchor must survive");
-    assert_eq!(
-        &messages[anchor..],
-        protected.as_slice(),
-        "active authority and its entire ordered current-turn suffix must survive"
+    let work = messages
+        .iter()
+        .position(|message| message == &authority)
+        .unwrap();
+    let partial_index = messages
+        .iter()
+        .position(|message| message == &partial)
+        .unwrap();
+    assert!(anchor < work && work < partial_index);
+    assert_eq!(&messages[partial_index..], &[partial, retry]);
+    assert!(
+        messages
+            .iter()
+            .filter(|message| message["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("active-")))
+            .count()
+            < 8,
+        "older tool rounds must be compactable"
     );
+    astra_turn_types::validate_canonical_tool_pairing(&messages).unwrap();
 }
 
 #[test]

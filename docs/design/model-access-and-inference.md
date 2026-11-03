@@ -49,7 +49,9 @@ wire protocol. Protocol selection is independent of credential ownership: API
 keys use their admitted endpoint and headers, while subscriptions retain their
 connection fencing and refresh rules. API-key continuation state is scoped to
 the Offering, provider route, request headers, and credential generation;
-probe-only and unrelated capability changes do not invalidate it. Model checks use
+header names are case-insensitive, and invalid or duplicate configured headers
+are rejected at configuration and execution admission. Probe-only and unrelated
+capability changes do not invalidate it. Model checks use
 the selected wire protocol; the ordinary provider default remains unchanged.
 Explicit request temperatures are not silently discarded. Internal memory
 judgments express a deterministic sampling preference; when Responses sampling

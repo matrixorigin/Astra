@@ -37,7 +37,13 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let app = Router::new().route("/responses", post(
         |State(requests): State<Arc<Mutex<Vec<Value>>>>, headers: HeaderMap, Json(body): Json<Value>| async move {
-            assert_eq!(headers.get("authorization").unwrap(), "Bearer test-key");
+            if body["input"].to_string().contains("look up") {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer custom");
+                assert_eq!(headers.get("x-tenant").unwrap(), "tenant-a");
+                assert_eq!(headers.get_all("x-tenant").iter().count(), 1);
+            } else {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer test-key");
+            }
             if body["input"].to_string().contains("context failure") {
                 return (StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"maximum context length secret provider detail"}}))).into_response();
             }
@@ -70,7 +76,50 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         .unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let scope = format!("sha256:{}", "a".repeat(64));
+    let mut offering = astra_services::ResolvedModelOffering {
+        offering_id: "offering".into(),
+        model: astra_services::ResolvedActiveLlmModel {
+            inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+            response_scope: Some("credential-generation".into()),
+            supported_reasoning_efforts: None,
+            price_snapshot: None,
+            model_name: "model".into(),
+            wire_model_name: None,
+            api_key: "test-key".into(),
+            base_url: base.clone(),
+            provider: "openai".into(),
+            tags: Vec::new(),
+            request_body_overrides: None,
+            fixed_temperature: None,
+            thinking_protocol: Some(
+                astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning,
+            ),
+            prompt_cache_capability: None,
+            thinking_capability: None,
+            context_window: None,
+            max_completion_tokens: None,
+            request_headers: Some(
+                json!({"X-Tenant":"tenant-a", "Authorization":"Bearer custom"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        },
+    };
+    let first_execution =
+        astra_services::AdmittedModelExecution::from_offering(offering.clone()).unwrap();
+    offering.model.request_headers = Some(
+        json!({"x-tenant":"tenant-a", "authorization":"Bearer custom"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let second_execution = astra_services::AdmittedModelExecution::from_offering(offering).unwrap();
+    assert_eq!(
+        first_execution.response_scope,
+        second_execution.response_scope
+    );
+    let scope = first_execution.response_scope.clone().unwrap();
     fn cache_capability() -> CacheCapability {
         CacheCapability {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
@@ -136,8 +185,10 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     let thinking = ThinkingConfig::Adaptive {
         effort: astra_turn_core::thinking_config::ThinkingEffort::Max,
     };
+    let mut first_call = call(&first_messages, &tools, &scope, &base, &thinking);
+    first_call.route = LlmExecutionRoute::from_admitted(&first_execution);
     let first = call_llm_and_collect_with_stream_callback(
-        call(&first_messages, &tools, &scope, &base, &thinking),
+        first_call,
         LlmCancel::None,
         None,
         None,
@@ -150,8 +201,10 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     messages.push(json!({"role":"assistant","content":"","tool_calls":first.tool_calls,astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}));
     messages.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
     messages.push(snapshot("updated optional observation"));
+    let mut second_call = call(&messages, &tools, &scope, &base, &thinking);
+    second_call.route = LlmExecutionRoute::from_admitted(&second_execution);
     let second = call_llm_and_collect_with_stream_callback(
-        call(&messages, &tools, &scope, &base, &thinking),
+        second_call,
         LlmCancel::None,
         None,
         None,

@@ -1196,29 +1196,30 @@ pub struct AdmittedModelExecution {
     pub request_timeout_ms: Option<u64>,
 }
 
-fn response_scope(offering_id: &str, identity: &str) -> String {
-    let input = serde_json::to_vec(&(offering_id, identity)).expect("string tuple serializes");
+fn response_scope(
+    offering_id: &str,
+    identity: &str,
+    header_overrides: &HashMap<String, String>,
+) -> String {
+    let headers: BTreeMap<_, _> = header_overrides
+        .iter()
+        .filter(|(name, _)| !name.starts_with("__astra_"))
+        .collect();
+    let input = serde_json::to_vec(&(offering_id, identity, headers))
+        .expect("model route identity serializes");
     format!("sha256:{:x}", Sha256::digest(input))
 }
 
 /// Bind replay to the actual route and credential, independently of probe and
-/// capability configuration. Header ordering and an empty map do not change it.
+/// capability configuration. Execution headers are added at admission.
 fn response_connection_identity(
     provider: &str,
     base_url: &str,
     model: &str,
     encrypted: &str,
-    request_headers: Option<&Map<String, Value>>,
 ) -> String {
-    let headers: BTreeMap<_, _> = request_headers.into_iter().flatten().collect();
-    let input = serde_json::to_vec(&(
-        provider,
-        base_url.trim_end_matches('/'),
-        model,
-        encrypted,
-        headers,
-    ))
-    .expect("model route identity serializes");
+    let input = serde_json::to_vec(&(provider, base_url.trim_end_matches('/'), model, encrypted))
+        .expect("model route identity serializes");
     format!("{:x}", Sha256::digest(input))
 }
 
@@ -1265,7 +1266,7 @@ impl AdmittedModelExecution {
             .model
             .response_scope
             .as_deref()
-            .map(|identity| response_scope(&offering.offering_id, identity));
+            .map(|identity| response_scope(&offering.offering_id, identity, &header_overrides));
         Ok(Self {
             inference_protocol: offering.model.inference_protocol,
             response_scope,
@@ -1474,24 +1475,43 @@ impl ResolvedActiveLlmModel {
     /// Header values are intentionally required to be strings at the
     /// admission boundary; executors never reinterpret arbitrary JSON.
     pub fn execution_header_overrides(&self) -> Result<HashMap<String, String>, String> {
-        self.request_headers
-            .as_ref()
-            .map(|headers| {
-                headers
-                    .iter()
-                    .map(|(name, value)| {
-                        value
-                            .as_str()
-                            .map(|value| (name.clone(), value.to_string()))
-                            .ok_or_else(|| {
-                                format!("model request header '{name}' must contain a string value")
-                            })
-                    })
-                    .collect()
-            })
-            .transpose()
-            .map(Option::unwrap_or_default)
+        normalize_model_request_headers(self.request_headers.as_ref())
     }
+}
+
+fn normalize_model_request_headers(
+    headers: Option<&Map<String, Value>>,
+) -> Result<HashMap<String, String>, String> {
+    let mut normalized = HashMap::new();
+    for (name, value) in headers.into_iter().flatten() {
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("model request header '{name}' must contain a string value"))?;
+        // Runtime metadata is not sent as an HTTP header. Preserve its exact
+        // spelling so normalizing a differently cased wire header cannot turn
+        // it into metadata that the transport would silently drop.
+        if name.starts_with("__astra_") {
+            normalized.insert(name.clone(), value.to_owned());
+            continue;
+        }
+        let header = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| "model request header has an invalid name".to_string())?;
+        let name = header.as_str();
+        if name.starts_with("__astra_") {
+            return Err("model request header uses a reserved name".to_string());
+        }
+        reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| format!("model request header '{name}' has an invalid value"))?;
+        if normalized
+            .insert(name.to_owned(), value.to_owned())
+            .is_some()
+        {
+            return Err(format!(
+                "model request header '{name}' is specified more than once"
+            ));
+        }
+    }
+    Ok(normalized)
 }
 
 const ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -1908,7 +1928,6 @@ fn build_resolved_active_llm_from_row(
             &base_url,
             quirks.wire_model_name.as_deref().unwrap_or(&model_name),
             &encrypted,
-            quirks.request_headers.as_ref(),
         )
     });
     let wire_model_name = quirks.wire_model_name;
@@ -4943,6 +4962,8 @@ impl ModelService for DatabaseModelService {
         if let Some(quirks) = &request.quirks {
             validate_inference_config(&request.provider, quirks)
                 .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+            normalize_model_request_headers(quirks.request_headers.as_ref())
+                .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
         }
         if request.provider == crate::chatgpt::PROVIDER {
             return Err(error_response_coded(
@@ -5325,6 +5346,13 @@ impl ModelService for DatabaseModelService {
         let provider = request.provider.as_deref().unwrap_or(&stored_provider);
         validate_inference_config(provider, quirks)
             .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+        // A malformed legacy configuration must not prevent an administrator
+        // from disabling the model. Replacements and reactivation still fail
+        // closed before the configuration can be used.
+        if request.is_active != Some(false) || request.quirks.is_some() {
+            normalize_model_request_headers(quirks.request_headers.as_ref())
+                .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+        }
         let base_url = request.base_url.as_deref().or(stored_base_url.as_deref());
         let probe_name = quirks.wire_model_name.as_deref().unwrap_or(&model_name);
         let mut connectivity = None;
@@ -7656,14 +7684,15 @@ mod tests {
             offering_thinking_protocol(&quirks, "openai", "https://api.openai.com/v1", "model"),
             ThinkingProtocol::ResponsesReasoning
         );
-        let scope = response_scope("offering-a", "credential-generation-a");
+        let headers = HashMap::new();
+        let scope = response_scope("offering-a", "credential-generation-a", &headers);
         assert_ne!(
             scope,
-            response_scope("offering-b", "credential-generation-a")
+            response_scope("offering-b", "credential-generation-a", &headers)
         );
         assert_ne!(
             scope,
-            response_scope("offering-a", "credential-generation-b")
+            response_scope("offering-a", "credential-generation-b", &headers)
         );
         assert!(!scope.contains("credential-generation"));
         assert!(validate_inference_config("openai", &quirks).is_ok());
@@ -7698,29 +7727,16 @@ mod tests {
     #[test]
     fn responses_identity_tracks_route_and_credential() {
         let identity = response_connection_identity;
-        let expected = identity("openai", "https://example.test/v1", "model", "key-a", None);
+        let expected = identity("openai", "https://example.test/v1", "model", "key-a");
         assert_eq!(
             expected,
-            identity(
-                "openai",
-                "https://example.test/v1/",
-                "model",
-                "key-a",
-                Some(&Map::new()),
-            )
+            identity("openai", "https://example.test/v1/", "model", "key-a")
         );
         for changed in [
-            identity("other", "https://example.test/v1", "model", "key-a", None),
-            identity("openai", "https://other.test/v1", "model", "key-a", None),
-            identity("openai", "https://example.test/v1", "other", "key-a", None),
-            identity("openai", "https://example.test/v1", "model", "key-b", None),
-            identity(
-                "openai",
-                "https://example.test/v1",
-                "model",
-                "key-a",
-                Some(serde_json::json!({"x-tenant":"other"}).as_object().unwrap()),
-            ),
+            identity("other", "https://example.test/v1", "model", "key-a"),
+            identity("openai", "https://other.test/v1", "model", "key-a"),
+            identity("openai", "https://example.test/v1", "other", "key-a"),
+            identity("openai", "https://example.test/v1", "model", "key-b"),
         ] {
             assert_ne!(expected, changed);
         }
@@ -8159,6 +8175,60 @@ mod tests {
             context_window: Some(200_000),
             max_completion_tokens: Some(16_384),
             request_headers: None,
+        }
+    }
+
+    #[test]
+    fn admitted_execution_uses_unambiguous_http_headers_for_scope_and_transport() {
+        let admit = |headers: Value| {
+            let mut model = sample_resolved_active_model("model");
+            model.response_scope = Some("credential-generation".into());
+            model.request_headers = Some(headers.as_object().unwrap().clone());
+            AdmittedModelExecution::from_offering(ResolvedModelOffering {
+                offering_id: "offering".into(),
+                model,
+            })
+        };
+
+        let first = admit(serde_json::json!({
+            "X-Tenant": "tenant-a", "Authorization": "Bearer custom"
+        }))
+        .unwrap();
+        let same = admit(serde_json::json!({
+            "authorization": "Bearer custom", "x-tenant": "tenant-a"
+        }))
+        .unwrap();
+        assert_eq!(first.header_overrides, same.header_overrides);
+        assert_eq!(first.response_scope, same.response_scope);
+        assert_eq!(first.header_overrides["authorization"], "Bearer custom");
+        assert_eq!(first.header_overrides["x-tenant"], "tenant-a");
+
+        let changed = admit(serde_json::json!({
+            "x-tenant": "tenant-b", "authorization": "Bearer custom"
+        }))
+        .unwrap();
+        assert_ne!(first.response_scope, changed.response_scope);
+        let with_metadata = admit(serde_json::json!({
+            "__astra_connection_tokens": "metadata", "x-tenant": "tenant-a",
+            "authorization": "Bearer custom"
+        }))
+        .unwrap();
+        assert_eq!(first.response_scope, with_metadata.response_scope);
+        assert_eq!(
+            with_metadata.header_overrides["__astra_connection_tokens"],
+            "metadata"
+        );
+
+        for invalid in [
+            serde_json::json!({"X-Tenant":"a", "x-tenant":"b"}),
+            serde_json::json!({"X-Tenant":"a", "x-tenant":"a"}),
+            serde_json::json!({"bad name":"value"}),
+            serde_json::json!({"Authorization":"sensitive-value\ninvalid"}),
+            serde_json::json!({"x-tenant":42}),
+            serde_json::json!({"__ASTRA_connection_tokens":"wire value"}),
+        ] {
+            let error = admit(invalid).unwrap_err();
+            assert!(!error.contains("sensitive-value"));
         }
     }
 
