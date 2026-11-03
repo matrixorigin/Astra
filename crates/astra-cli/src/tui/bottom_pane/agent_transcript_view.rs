@@ -21,6 +21,7 @@ use crate::tui::history_cell::{
 struct ToolCoverage {
     target: Option<String>,
     settled: bool,
+    terminal_preview: bool,
     receipt: Option<crate::tui::agent_control_status::DelegationReceipt>,
 }
 
@@ -75,7 +76,7 @@ impl LiveTranscript {
                 tool_use_id,
                 identity,
                 receipt,
-                ..
+                cell,
             } => {
                 let Some(identity) = identity else {
                     return true;
@@ -87,7 +88,12 @@ impl LiveTranscript {
                     return true;
                 };
                 if !coverage.settled {
-                    return true;
+                    return !(coverage.terminal_preview
+                        && coverage.target.as_ref() == Some(identity)
+                        && matches!(
+                            cell.status,
+                            crate::tui::history_cell::tool::ToolStatus::Running
+                        ));
                 }
                 if is_delegation_name(identity) {
                     if coverage.target.as_ref() != Some(identity) {
@@ -216,9 +222,8 @@ impl LiveTranscript {
         known_target: Option<&str>,
     ) {
         let name = name.trim().to_owned();
-        let completion_target = live_tool_identity(&name, &description);
         let incoming = (name != "invoke_tool")
-            .then(|| completion_target.clone())
+            .then(|| live_tool_identity(&name, ""))
             .flatten();
         let index = (!tool_use_id.is_empty())
             .then(|| {
@@ -236,7 +241,11 @@ impl LiveTranscript {
                     .or(known_target)
                     .unwrap_or(&name)
                     .to_owned(),
-                description.clone(),
+                if name == "invoke_tool" && known_target.is_none() {
+                    String::new()
+                } else {
+                    description.clone()
+                },
             );
             if known_target.is_none()
                 && name == "invoke_tool"
@@ -256,7 +265,7 @@ impl LiveTranscript {
             unreachable!()
         };
         let delegated = identity.as_deref().is_some_and(is_delegation_name)
-            || completion_target.as_deref().is_some_and(is_delegation_name)
+            || incoming.as_deref().is_some_and(is_delegation_name)
             || known_target.is_some_and(is_delegation_name)
             || receipt.is_some();
         if known_target.is_some_and(|target| {
@@ -266,11 +275,7 @@ impl LiveTranscript {
         }) {
             *identity = None;
         }
-        if let Some(incoming) = incoming.as_ref().or_else(|| {
-            completion_target
-                .as_ref()
-                .filter(|target| is_delegation_name(target))
-        }) {
+        if let Some(incoming) = incoming.as_ref() {
             if identity.as_ref().is_some_and(|old| old != incoming) {
                 *identity = None;
             }
@@ -812,16 +817,12 @@ impl AgentTranscriptView {
             .into_iter()
             .flat_map(|page| &page.events)
             .filter_map(|entry| entry.event.as_ref());
-        let mut requested = std::collections::HashSet::new();
-        let mut settled = std::collections::HashSet::new();
-        let mut has_gap = false;
         let mut private_ids = std::collections::HashSet::new();
         for event in activity_events {
             if matches!(
                 event.get("type").and_then(serde_json::Value::as_str),
                 Some("stream_gap" | "durable_events_compacted")
             ) {
-                has_gap = true;
                 continue;
             }
             let Some(id) = event
@@ -840,47 +841,28 @@ impl AgentTranscriptView {
             {
                 private_ids.insert(id);
             }
-            match event.get("type").and_then(serde_json::Value::as_str) {
-                Some("tool_call_start") => {
-                    requested.insert(id);
-                }
-                Some("tool_call_end") => {
-                    settled.insert(id);
-                }
-                _ => {}
-            }
         }
-        // A gap makes an ordinary pair incomplete evidence. Preserve live
-        // content, while retaining the existing delegation privacy boundary.
-        let represented = |id: &str, cell: &ToolCell| {
-            self.canonical
-                .tools
-                .get(&(Some(self.run_id.clone()), id.to_owned()))
-                .is_some_and(|tool| tool.settled)
-                || (requested.contains(id)
-                    && settled.contains(id)
-                    && (!has_gap || activity_tool_identity(&cell.name, &cell.description).1))
-        };
 
-        if self.live.items.iter().any(|item| match item {
-            LiveTranscriptItem::Notice { .. } => false,
-            LiveTranscriptItem::Tool {
-                tool_use_id,
-                cell,
-                identity,
-                receipt,
-                ..
-            } => {
-                receipt.is_some()
-                    || identity.as_deref().is_some_and(is_delegation_name)
-                    || !represented(tool_use_id, cell)
-            }
-            _ => true,
-        }) {
+        if self
+            .live
+            .items
+            .iter()
+            .any(|item| !matches!(item, LiveTranscriptItem::Notice { .. }))
+        {
             // A terminal edge does not promise that every streamed part is
             // persisted. Report loaded coverage, not a guessed storage state.
-            projected.push(TranscriptItem::rendered(
+            projected.push(TranscriptItem::rendered_kind(
                 TranscriptItemId::from_widget_id(LIVE_ID_BASE - 1),
+                if self
+                    .live
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, LiveTranscriptItem::Tool { .. }))
+                {
+                    TranscriptItemKind::Tool
+                } else {
+                    TranscriptItemKind::System
+                },
                 vec![Line::from("Live activity · not in loaded history")],
                 0,
             ));
@@ -915,10 +897,7 @@ impl AgentTranscriptView {
                     identity,
                     receipt,
                     ..
-                } if receipt.is_some()
-                    || identity.as_deref().is_some_and(is_delegation_name)
-                    || !represented(tool_use_id, cell) =>
-                {
+                } => {
                     if identity.is_none()
                         && let Some(receipt) = receipt
                     {
@@ -963,7 +942,6 @@ impl AgentTranscriptView {
                     vec![Line::from(format!("• {text}"))],
                     1,
                 )),
-                LiveTranscriptItem::Tool { .. } => {}
             }
         }
     }
@@ -1477,6 +1455,21 @@ fn project_durable_transcript(
                                 })
                             });
                         let coverage = ToolCoverage {
+                            terminal_preview: compatible
+                                && result_item
+                                    .is_some_and(|item| item.role == "tool_observation_preview")
+                                && result.is_some_and(|result| {
+                                    matches!(
+                                        result.status.as_deref(),
+                                        Some(
+                                            "completed"
+                                                | "failed"
+                                                | "rejected"
+                                                | "cancelled"
+                                                | "interrupted"
+                                        )
+                                    )
+                                }),
                             target,
                             settled: compatible
                                 && result_item
@@ -1490,6 +1483,7 @@ fn project_durable_transcript(
                                 if old.target != coverage.target {
                                     old.target = None;
                                     old.settled = false;
+                                    old.terminal_preview = false;
                                 }
                             })
                             .or_insert(coverage);
@@ -1499,6 +1493,17 @@ fn project_durable_transcript(
                     } else {
                         format!("tool:{}", call.tool_use_id)
                     };
+                    if result_item.is_some_and(|item| item.role == "tool_observation_preview") {
+                        projected.push(TranscriptItem::rendered_kind(
+                            TranscriptItemId::from_canonical(
+                                canonical_id.clone(),
+                                format!("{component}:partial"),
+                            ),
+                            TranscriptItemKind::Tool,
+                            vec![Line::from("Partial retained output")],
+                            0,
+                        ));
+                    }
                     projected.push(TranscriptItem::tool(
                         TranscriptItemId::from_canonical(canonical_id.clone(), component),
                         cell,
@@ -1536,6 +1541,17 @@ fn project_durable_transcript(
                             .or_insert(ToolCoverage {
                                 target,
                                 settled: item.role != "tool_observation_preview",
+                                terminal_preview: item.role == "tool_observation_preview"
+                                    && matches!(
+                                        result.status.as_deref(),
+                                        Some(
+                                            "completed"
+                                                | "failed"
+                                                | "rejected"
+                                                | "cancelled"
+                                                | "interrupted"
+                                        )
+                                    ),
                                 receipt: None,
                             });
                     }
@@ -1575,6 +1591,14 @@ fn project_durable_transcript(
                             || result.is_some_and(|result| !result.runtime_advisories.is_empty())))
                     .then(|| tool_display_content(item, delegation)),
                 );
+                if item.role == "tool_observation_preview" {
+                    projected.push(TranscriptItem::rendered_kind(
+                        TranscriptItemId::from_canonical(canonical_id, "partial"),
+                        TranscriptItemKind::Tool,
+                        vec![Line::from("Partial retained output")],
+                        0,
+                    ));
+                }
                 projected.push(TranscriptItem::tool(id, cell, 1));
             }
             role => projected.push(TranscriptItem::rendered_kind(
@@ -2358,12 +2382,61 @@ mod tests {
     }
 
     #[test]
+    fn review_partial_output_does_not_resurrect_a_terminal_tool() {
+        let (mut items, _) = delegation_history(1);
+        items[1].role = "tool_observation_preview".into();
+        let mut view = loading_view(80, 24);
+        view.refresh_agent_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::ToolStarted {
+                name: "agent".into(),
+                description: r#"{"action":"spawn"}"#.into(),
+                tool_use_id: "spawn-0".into(),
+            },
+        });
+        let mut canonical = page();
+        canonical.items = items;
+        view.apply_page(canonical, true, AgentTranscriptSource::LocalJournalOnly);
+        let text = view.transcript.export_plain_lines().join("\n");
+        assert!(!text.contains("Running Agent"), "{text}");
+    }
+
+    #[test]
+    fn review_ordinary_carrier_completion_description_is_not_tool_identity() {
+        let mut view = loading_view(80, 24);
+        for kind in [
+            AgentLiveEventKind::ToolStarted {
+                name: "invoke_tool".into(),
+                description: r#"{"name":"read_file","arguments":{"path":"manifest.json"}}"#.into(),
+                tool_use_id: "read-manifest".into(),
+            },
+            AgentLiveEventKind::ToolCompleted {
+                name: "invoke_tool".into(),
+                description: r#"{"name":"agent"}"#.into(),
+                status: "completed".into(),
+                duration_ms: 1,
+                output_summary: None,
+                output: Some("ORDINARY_FILE_CONTENT".into()),
+                tool_use_id: "read-manifest".into(),
+            },
+        ] {
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind,
+            });
+        }
+        let text = view.transcript.export_plain_lines().join("\n");
+        assert!(text.contains("ORDINARY_FILE_CONTENT"), "{text}");
+    }
+
+    #[test]
     fn late_carrier_completion_uses_canonical_identity_and_keeps_stronger_evidence() {
         for (canonical_target, completion_name) in [
             ("agent", "invoke_tool"),
             ("read_file", "agent"),
             ("agent", "read_file"),
-            ("read_file", "invoke_tool"),
         ] {
             for (status, payload, expected) in [
                 (
@@ -2484,7 +2557,7 @@ mod tests {
 
     #[test]
     fn partial_history_keeps_start_only_delegation() {
-        for partial in ["preview", "result_only", "wrong_run", "wrong_target"] {
+        for partial in ["result_only", "wrong_run", "wrong_target"] {
             let (mut items, _) = delegation_history(1);
             match partial {
                 "preview" => items[1].role = "tool_observation_preview".into(),
@@ -3232,8 +3305,8 @@ mod tests {
         let projected = durable_transcript_items(&[observed, result, call]);
         assert_eq!(
             projected.len(),
-            2,
-            "result-before-call must not duplicate a row"
+            3,
+            "two tool rows and one partial-output marker"
         );
         let view = TranscriptView::from_snapshot(TranscriptSnapshot::new(projected), 24, 100);
         let text = view.export_plain_lines().join("\n");
