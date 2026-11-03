@@ -778,6 +778,9 @@ pub trait AgenticLoopHost: Send {
     /// not create a second lifecycle owner.
     fn on_turn_started(&mut self, _state: &AgenticLoopState) {}
 
+    /// Settle retained auxiliary usage before final turn facts are recorded.
+    async fn on_turn_usage_settlement(&mut self, _state: &mut AgenticLoopState) {}
+
     /// Close the Explain Analyze turn root with the lifecycle-owned outcome.
     async fn on_turn_terminal(
         &mut self,

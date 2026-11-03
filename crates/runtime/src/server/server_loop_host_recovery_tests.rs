@@ -630,3 +630,314 @@ async fn length_continuation_failure_keeps_inclusive_input_when_cache_lane_becom
     ledger.assert_quiescent();
     provider.assert_complete();
 }
+
+#[tokio::test]
+async fn work_abort_settles_usage_received_before_terminal_once() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "interrupted auxiliary stream",
+        |request| request.path == "/v1/chat/completions",
+        vec![ProviderResponse::Stream {
+            content_type: "text/event-stream",
+            chunks: vec![
+                b"data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3},\"choices\":[{\"delta\":{\"content\":\"seen\"}}]}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+            release_before_chunk: Some((1, release.clone())),
+        }],
+    )]).await;
+    let observations = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let scope = astra_turn_types::InferenceInvocationScope::Run {
+        session_id: "aux-session".into(),
+        run_id: "aux-run".into(),
+        turn: 1,
+        round: 0,
+        operation_id: "work_test".into(),
+        logical_attempt: 0,
+    };
+    let config = summary_test_config(format!("{}/v1", provider.base_url));
+    let authority = crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+        0, "owner", 0, None, None, None,
+    );
+    let client = RuntimeSummaryClient::new(config.execution_route(), 64, authority)
+        .with_observations(observations.clone(), scope);
+    let judge = SummaryClientWorkAdmissionJudge::new(Box::new(client));
+    let usage = Arc::clone(&judge.usage);
+    let handle = tokio::spawn(async move {
+        let result = judge
+            .summarize(
+                "work_test",
+                "initial",
+                &[json!({"role":"user","content":"decide"})],
+            )
+            .await;
+        (
+            result.map(|_| unreachable!("terminal remains blocked")),
+            Instant::now(),
+        )
+    });
+    let mut host = test_host_builder("aux-user", "aux-session").build();
+    host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+        purpose: SemanticJudgmentPurpose::WorkAdmission,
+        wait_node_id: None,
+        handle,
+        usage,
+        started_at: Instant::now(),
+        round_index: 0,
+        source: None,
+    });
+    observations.wait_for_measured_input(17).await;
+    host.abort_pending_work_admission().await;
+    let mut state = create_test_state();
+    let outcome = host
+        .finalize_work_admission_usage_at_turn_exit(
+            &mut state,
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "cancelled",
+            )),
+        )
+        .await;
+    assert!(outcome.is_err());
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    assert_eq!(state.qualified_usage.unwrap().input_tokens(), None);
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(3));
+    let _ = host
+        .finalize_work_admission_usage_at_turn_exit(&mut state, outcome)
+        .await;
+    assert_eq!(
+        state.provider_input_tokens(),
+        17,
+        "settlement is exactly once"
+    );
+    assert_eq!(state.total_completion, 3);
+    observations.assert_quiescent();
+    release.notify_waiters();
+    provider.assert_complete();
+}
+
+#[tokio::test]
+async fn cancelled_compaction_settles_usage_before_turn_facts_once() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "interrupted compaction", |request| request.path == "/v1/chat/completions",
+        vec![ProviderResponse::Stream { content_type: "text/event-stream", chunks: vec![
+            b"data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3},\"choices\":[{\"delta\":{\"content\":\"seen\"}}]}\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ], release_before_chunk: Some((1, release.clone())) }],
+    )]).await;
+    let observations = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let scope = astra_turn_types::InferenceInvocationScope::Run {
+        session_id: "compact-session".into(),
+        run_id: "compact-run".into(),
+        turn: 1,
+        round: 0,
+        operation_id: "compact_test".into(),
+        logical_attempt: 0,
+    };
+    let config = summary_test_config(format!("{}/v1", provider.base_url));
+    let authority = crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+        0, "owner", 0, None, None, None,
+    );
+    let mut client = RuntimeSummaryClient::new(config.execution_route(), 64, authority)
+        .with_observations(observations.clone(), scope);
+    let mut host = test_host_builder("compact-user", "compact-session").build();
+    install_interrupted_summary_sink(&mut client, &host.auxiliary_summary_usage);
+    let accounted = AccountedSummaryClient::new(&client, Arc::clone(&host.auxiliary_summary_usage));
+    let messages = [json!({"role":"user","content":"summarize"})];
+    {
+        let request = accounted.summarize(
+            astra_turn_types::InferencePurpose::RequiredCompaction,
+            &messages,
+        );
+        tokio::pin!(request);
+        tokio::select! { biased; _ = observations.wait_for_measured_input(17) => {}, result = &mut request => panic!("unexpected completion: {result:?}") }
+    }
+    let mut state = create_test_state();
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    assert_eq!(state.qualified_usage.unwrap().input_tokens(), None);
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(3));
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    observations.assert_quiescent();
+    release.notify_waiters();
+    provider.assert_complete();
+}
+
+#[tokio::test]
+async fn fenced_summary_settles_received_usage_once() {
+    for (lease_loss, input, output) in [(false, 17, Some(3)), (true, 17, None), (false, 0, None)] {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let usage = match (input, output) {
+            (17, Some(3)) => json!({"prompt_tokens":17,"completion_tokens":3}),
+            (17, None) => json!({"prompt_tokens":17}),
+            (0, None) => json!({"prompt_tokens":0}),
+            _ => unreachable!(),
+        };
+        let frame = format!(
+            "data: {}\n\n",
+            json!({"usage":usage,"choices":[{"delta":{"content":"seen"}}]})
+        )
+        .into_bytes();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "fenced summary",
+            |request| request.path == "/v1/chat/completions",
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks: vec![frame, b"data: [DONE]\n\n".to_vec()],
+                release_before_chunk: Some((1, release.clone())),
+            }],
+        )])
+        .await;
+        let observations =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
+        let scope = astra_turn_types::InferenceInvocationScope::Run {
+            session_id: "fence-session".into(),
+            run_id: "fence-run".into(),
+            turn: 1,
+            round: 0,
+            operation_id: "fence_test".into(),
+            logical_attempt: 0,
+        };
+        let cancelled = Arc::new(tokio_util::sync::CancellationToken::new());
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority = crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+            0,
+            "owner",
+            0,
+            None,
+            Some(cancelled.clone()),
+            Some(lost.clone()),
+        );
+        let config = summary_test_config(format!("{}/v1", provider.base_url));
+        let mut client = RuntimeSummaryClient::new(config.execution_route(), 64, authority)
+            .with_observations(observations.clone(), scope);
+        let mut host = test_host_builder("fence-user", "fence-session").build();
+        install_interrupted_summary_sink(&mut client, &host.auxiliary_summary_usage);
+        let accounted =
+            AccountedSummaryClient::new(&client, Arc::clone(&host.auxiliary_summary_usage));
+        let messages = [json!({"role":"user","content":"summarize"})];
+        let request = accounted.summarize(
+            astra_turn_types::InferencePurpose::RequiredCompaction,
+            &messages,
+        );
+        tokio::pin!(request);
+        tokio::select! { biased; _ = observations.wait_for_measured_input(input) => {}, result = &mut request => panic!("unexpected completion: {result:?}") }
+        if lease_loss {
+            lost.store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            cancelled.cancel();
+        }
+        let error = request.await.unwrap_err();
+        assert_eq!(
+            host.auxiliary_summary_usage
+                .lock()
+                .unwrap()
+                .provider_reported,
+            1
+        );
+        assert_eq!(
+            error.kind,
+            if lease_loss {
+                astra_core::ErrorKind::ContractViolation
+            } else {
+                astra_core::ErrorKind::Cancelled
+            }
+        );
+        let mut state = create_test_state();
+        host.on_turn_usage_settlement(&mut state).await;
+        assert_eq!(state.provider_input_tokens(), input);
+        assert_eq!(state.total_completion, output.unwrap_or(0));
+        assert_eq!(state.qualified_usage.unwrap().input_tokens(), None);
+        assert_eq!(state.qualified_usage.unwrap().output_tokens(), output);
+        host.on_turn_usage_settlement(&mut state).await;
+        assert_eq!(state.provider_input_tokens(), input);
+        assert_eq!(state.total_completion, output.unwrap_or(0));
+        observations.assert_quiescent();
+        release.notify_waiters();
+        provider.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn dropped_delegation_judgment_settles_through_host() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "interrupted delegation", |request| request.path == "/v1/chat/completions",
+        vec![ProviderResponse::Stream { content_type: "text/event-stream", chunks: vec![
+            b"data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3},\"choices\":[{\"delta\":{\"content\":\"seen\"}}]}\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ], release_before_chunk: Some((1, release.clone())) }],
+    )]).await;
+    let observations = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let scope = astra_turn_types::InferenceInvocationScope::Run {
+        session_id: "delegation-session".into(),
+        run_id: "delegation-run".into(),
+        turn: 1,
+        round: 0,
+        operation_id: "delegation_test".into(),
+        logical_attempt: 0,
+    };
+    let config = summary_test_config(format!("{}/v1", provider.base_url));
+    let authority = crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+        0, "owner", 0, None, None, None,
+    );
+    let mut client = RuntimeSummaryClient::new(config.execution_route(), 64, authority)
+        .with_observations(observations.clone(), scope);
+    let mut host = test_host_builder("delegation-user", "delegation-session").build();
+    install_interrupted_summary_sink(&mut client, &host.auxiliary_summary_usage);
+    let messages = [json!({"role":"user","content":"decide"})];
+    {
+        let call = host.summarize_delegation_judgment_once(
+            &client,
+            "delegation_test",
+            "initial",
+            "initial",
+            &messages,
+        );
+        tokio::pin!(call);
+        tokio::select! { biased; _ = observations.wait_for_measured_input(17) => {}, result = &mut call => panic!("unexpected completion: {result:?}") }
+    }
+    let mut state = create_test_state();
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(3));
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    observations.assert_quiescent();
+    release.notify_waiters();
+    provider.assert_complete();
+}
+
+#[tokio::test]
+async fn tool_admission_settles_complete_work_usage_without_loss() {
+    let mut host = test_host_builder("work-user", "work-session").build();
+    host.work_admission_usage = WorkAdmissionUsage {
+        attempts: 1,
+        completed_calls: 1,
+        provider_reported: 1,
+        unpartitioned_input_tokens: 17,
+        usage: crate::turn::token_usage::TokenUsage {
+            output_tokens: 3,
+            ..Default::default()
+        },
+        qualified_usage: Some(
+            astra_turn_types::CanonicalTokenUsage::new(None, None, None, Some(3)).unwrap(),
+        ),
+    };
+    let mut state = create_test_state();
+    let outcome = host.handle_admitted_tool_invocations(&mut state, &[]).await;
+    assert!(outcome.auxiliary_usage.is_none());
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+    assert_eq!(state.qualified_usage.unwrap().output_tokens(), Some(3));
+    host.on_turn_usage_settlement(&mut state).await;
+    assert_eq!(state.provider_input_tokens(), 17);
+    assert_eq!(state.total_completion, 3);
+}

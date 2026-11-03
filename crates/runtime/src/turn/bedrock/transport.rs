@@ -93,8 +93,9 @@ pub(crate) async fn collect_bedrock_stream_for_wire(
     idle_timeout: std::time::Duration,
     authorized_tool_names: &HashSet<String>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn crate::turn::llm::client::ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, BedrockStreamError> {
-    collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
+    collect_bedrock_stream_with_usage_observer(
         response,
         model_name,
         started,
@@ -104,6 +105,7 @@ pub(crate) async fn collect_bedrock_stream_for_wire(
         crate::turn::llm::client::llm_semantic_progress_timeout(),
         Some(authorized_tool_names),
         stream_callback,
+        usage_observer,
     )
     .await
 }
@@ -132,6 +134,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline(
     .await
 }
 
+#[cfg(test)]
 async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
     response: reqwest::Response,
     model_name: &str,
@@ -141,7 +144,34 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
     idle_timeout: std::time::Duration,
     semantic_progress_timeout: std::time::Duration,
     authorized_tool_names: Option<&HashSet<String>>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, BedrockStreamError> {
+    collect_bedrock_stream_with_usage_observer(
+        response,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_timeout,
+        semantic_progress_timeout,
+        authorized_tool_names,
+        stream_callback,
+        None,
+    )
+    .await
+}
+
+async fn collect_bedrock_stream_with_usage_observer(
+    response: reqwest::Response,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: Option<std::time::Duration>,
+    cancel: LlmCancel<'_>,
+    idle_timeout: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn crate::turn::llm::client::ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, BedrockStreamError> {
     let mut decoder = FrameDecoder::new();
     let mut accum = BedrockStreamAccumulator::new();
@@ -259,6 +289,12 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                 }
             };
             for ev in events {
+                if matches!(ev, BedrockStreamEvent::Usage(_))
+                    && let Some((observer, attempt)) = usage_observer
+                    && let Some((usage, presence)) = accum.usage_snapshot()
+                {
+                    observer.note_usage_snapshot(attempt, usage, presence);
+                }
                 match &ev {
                     BedrockStreamEvent::TextDelta(text) => {
                         yield_state.observe_text(text, TokioInstant::now());
@@ -430,6 +466,90 @@ pub(crate) mod tests {
             .send()
             .await
             .expect("request Bedrock fixture")
+    }
+
+    #[tokio::test]
+    async fn metadata_snapshot_survives_dropped_stream() {
+        use crate::turn::llm::client::{
+            ProviderAttemptAdmission, ProviderAttemptObserver, ProviderWireRequestIdentity,
+        };
+        #[derive(Default)]
+        struct Observer {
+            snapshot: std::sync::Mutex<
+                Option<(
+                    crate::turn::token_usage::TokenUsage,
+                    crate::turn::token_usage::TokenUsagePresence,
+                )>,
+            >,
+            changed: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl ProviderAttemptObserver for Observer {
+            async fn begin_attempt(
+                &self,
+                _: &ProviderWireRequestIdentity,
+                _: Option<u32>,
+            ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+                unreachable!()
+            }
+            async fn finish_attempt(
+                &self,
+                _: u32,
+                _: &astra_services::InferenceInvocationTerminal,
+            ) -> Result<(), astra_core::ClassifiedError> {
+                unreachable!()
+            }
+            fn note_usage_snapshot(
+                &self,
+                _: u32,
+                usage: crate::turn::token_usage::TokenUsage,
+                presence: crate::turn::token_usage::TokenUsagePresence,
+            ) {
+                *self.snapshot.lock().unwrap() = Some((usage, presence));
+                self.changed.notify_one();
+            }
+        }
+        let app = axum::Router::new().route("/", axum::routing::post(|| async {
+            let body = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(axum::body::Bytes::from(eventstream_frame("metadata", br#"{"usage":{"inputTokens":17,"outputTokens":3}}"#)));
+                std::future::pending::<()>().await;
+            };
+            axum::body::Body::from_stream(body)
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let observer = Observer::default();
+        {
+            let call = collect_bedrock_stream_with_usage_observer(
+                response,
+                "bedrock-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                None,
+                None,
+                Some((&observer, 0)),
+            );
+            tokio::pin!(call);
+            tokio::select! { biased; _ = observer.changed.notified() => {}, result = &mut call => panic!("unexpected completion: {result:?}") }
+        }
+        let (usage, presence) = observer.snapshot.lock().unwrap().unwrap();
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.output_tokens, 3);
+        assert!(presence.fresh_input_tokens && presence.output_tokens);
+        assert!(!presence.cache_read_tokens && !presence.cache_creation_tokens);
+        server.abort();
     }
 
     async fn stalled_body_response() -> reqwest::Response {

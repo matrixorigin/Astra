@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -85,6 +84,7 @@ pub(crate) struct RuntimeSummaryClient {
     prompt_cache_tools: Vec<Value>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     authority: DurableInferenceRunAuthority,
+    interrupted_usage_sink: Option<astra_turn_core::cloud_summary::InterruptedSummaryUsageSink>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     observations: Option<(
         crate::server::provider_test_support::ProviderObservationsFixture,
@@ -105,6 +105,7 @@ impl RuntimeSummaryClient {
             prompt_cache_tools: Vec::new(),
             cache_capability: None,
             authority,
+            interrupted_usage_sink: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
             observations: None,
         }
@@ -237,19 +238,93 @@ impl RuntimeSummaryClient {
     }
 }
 
-// Match the raw usage map that the summary projection actually returns. PTL
-// responses intentionally have no map, so their whole observed input survives.
+/// The observer already owns per-attempt snapshots; dropping a call transfers
+/// those facts synchronously to the existing accounting owner, once.
+struct InterruptedUsageGuard<'a> {
+    observer: &'a RunScopedProviderObserver,
+    sink: Option<&'a astra_turn_core::cloud_summary::InterruptedSummaryUsageSink>,
+    armed: bool,
+}
+
+impl Drop for InterruptedUsageGuard<'_> {
+    fn drop(&mut self) {
+        let Some(sink) = self.sink.filter(|_| self.armed) else {
+            return;
+        };
+        sink(interrupted_usage(&self.observer.facts()));
+    }
+}
+
+fn interrupted_usage(
+    facts: &[super::client::ProviderAttemptObservation],
+) -> astra_turn_core::cloud_summary::InterruptedSummaryUsage {
+    let mut observed = 0u64;
+    let mut input_was_measured = false;
+    let mut numeric = crate::turn::token_usage::TokenUsage::default();
+    let mut qualified: Option<astra_turn_types::CanonicalTokenUsage> = None;
+    let mut observed_lanes = [false; 4];
+    for fact in facts {
+        input_was_measured |= fact.measured_input_tokens.is_some();
+        observed = observed.saturating_add(fact.observed_input_tokens());
+        if let Some(usage) = fact.qualified_usage {
+            for (seen, value) in observed_lanes.iter_mut().zip([
+                usage.input_tokens(),
+                usage.cached_input_tokens(),
+                usage.cache_creation_tokens(),
+                usage.output_tokens(),
+            ]) {
+                *seen |= value.is_some();
+            }
+            numeric.input_tokens = numeric
+                .input_tokens
+                .saturating_add(usage.input_tokens().unwrap_or(0));
+            numeric.cached_input_tokens = numeric
+                .cached_input_tokens
+                .saturating_add(usage.cached_input_tokens().unwrap_or(0));
+            numeric.cache_creation_tokens = numeric
+                .cache_creation_tokens
+                .saturating_add(usage.cache_creation_tokens().unwrap_or(0));
+            numeric.output_tokens = numeric
+                .output_tokens
+                .saturating_add(usage.output_tokens().unwrap_or(0));
+            qualified = Some(match qualified {
+                None => usage,
+                Some(total) => total.checked_add(usage).unwrap_or_else(|_| {
+                    astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                        .expect("unknown usage")
+                }),
+            });
+        }
+    }
+    let known_input = numeric.normalized_prompt_cache_usage().total_input_tokens();
+    let mut usage = numeric.to_json_map();
+    // Numeric subtotals are lower bounds, never canonical evidence.
+    usage.remove("total_tokens");
+    for (seen, key) in observed_lanes.into_iter().zip([
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_tokens",
+        "output_tokens",
+    ]) {
+        if !seen {
+            usage.remove(key);
+        }
+    }
+    astra_turn_core::cloud_summary::InterruptedSummaryUsage {
+        usage,
+        input_was_measured,
+        qualified_usage: qualified,
+        unpartitioned_input_tokens: observed.saturating_sub(known_input),
+    }
+}
+
+// Match the usage map that the summary projection actually returns.
 fn summary_unpartitioned_input(
     observed_input_tokens: u64,
     result: &Result<super::client::LlmCallResult, astra_core::ClassifiedError>,
 ) -> u64 {
     let counted = match result {
         Ok(result) => crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage),
-        // Context-window errors are returned as a typed PTL response with
-        // no raw usage map, so retain all observed input in its complement.
-        Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
-            crate::turn::token_usage::TokenUsage::default()
-        }
         Err(error) => error
             .details_json
             .as_deref()
@@ -268,6 +343,13 @@ fn summary_unpartitioned_input(
 
 #[async_trait]
 impl SummaryLlmClient for RuntimeSummaryClient {
+    fn set_interrupted_usage_sink(
+        &mut self,
+        sink: astra_turn_core::cloud_summary::InterruptedSummaryUsageSink,
+    ) {
+        self.interrupted_usage_sink = Some(sink);
+    }
+
     async fn summarize(
         &self,
         purpose: InferencePurpose,
@@ -293,6 +375,11 @@ impl SummaryLlmClient for RuntimeSummaryClient {
         let observer = match self.observations.clone() {
             Some((observations, scope)) => observer.with_observations(observations, scope),
             None => observer,
+        };
+        let mut interrupted_guard = InterruptedUsageGuard {
+            observer: &observer,
+            sink: self.interrupted_usage_sink.as_ref(),
+            armed: true,
         };
         let call = LlmCall {
             purpose,
@@ -332,10 +419,10 @@ impl SummaryLlmClient for RuntimeSummaryClient {
         };
         // The Run already owns cancellation, lease loss and deadline. Model
         // calls borrow that authority instead of creating another DB lease.
-        let result = tokio::select! {
+        let (result, fenced) = tokio::select! {
             biased;
-            error = self.authority.wait_for_local_fence("auxiliary model request") => Err(error),
-            result = execute => result,
+            error = self.authority.wait_for_local_fence("auxiliary model request") => (Err(error), true),
+            result = execute => (result, false),
         };
         let execution_provenance =
             Some(astra_turn_core::cloud_summary::SummaryExecutionProvenance {
@@ -344,11 +431,22 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 provider: self.route.provider.clone(),
             });
         let facts = observer.facts();
+        interrupted_guard.armed = false;
+        let input_was_measured = facts
+            .iter()
+            .any(|fact| fact.measured_input_tokens.is_some());
         let observed_input_tokens = facts.iter().fold(0u64, |total, fact| {
             total.saturating_add(fact.observed_input_tokens())
         });
-        let unpartitioned_input_tokens =
-            summary_unpartitioned_input(observed_input_tokens, &result);
+        let interrupted = (fenced
+            || result
+                .as_ref()
+                .is_err_and(|error| error.kind == astra_core::ErrorKind::ContextWindow))
+        .then(|| interrupted_usage(&facts));
+        let unpartitioned_input_tokens = interrupted.as_ref().map_or_else(
+            || summary_unpartitioned_input(observed_input_tokens, &result),
+            |usage| usage.unpartitioned_input_tokens,
+        );
         let qualified_usage = facts
             .into_iter()
             .filter_map(|fact| fact.qualified_usage)
@@ -366,6 +464,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             // repair path. No call from this private adapter is executable.
             Ok(result) if !result.tool_calls.is_empty() || result.full_text.trim().is_empty() => {
                 Ok(SummaryResponse {
+                    input_was_measured,
                     unpartitioned_input_tokens,
                     judgment_provenance: result.judgment_provenance,
                     model_used: result.model_used,
@@ -378,6 +477,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 })
             }
             Ok(result) => Ok(SummaryResponse {
+                input_was_measured,
                 unpartitioned_input_tokens,
                 judgment_provenance: result.judgment_provenance,
                 model_used: result.model_used,
@@ -390,13 +490,17 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
                 Ok(SummaryResponse {
+                    input_was_measured,
                     unpartitioned_input_tokens,
                     judgment_provenance: None,
                     model_used: String::new(),
                     text: String::new(),
                     is_ptl_error: true,
                     finish_reason: None,
-                    usage: serde_json::Map::new(),
+                    usage: interrupted
+                        .as_ref()
+                        .map(|usage| usage.usage.clone())
+                        .unwrap_or_default(),
                     qualified_usage,
                     // The local request id can identify the invocation even
                     // when the provider rejected the request for context
@@ -417,6 +521,10 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     .unwrap_or_else(|| serde_json::json!({}));
                 details["qualified_usage"] = usage.to_json();
                 details["unpartitioned_input_tokens"] = unpartitioned_input_tokens.into();
+                details["input_was_measured"] = input_was_measured.into();
+                if let Some(interrupted) = interrupted {
+                    details["usage"] = Value::Object(interrupted.usage);
+                }
                 Err(error.with_details_json(details.to_string()))
             }
         }
@@ -1017,7 +1125,7 @@ mod tests {
     #[test]
     fn summary_error_projection_retains_input_not_returned_in_raw_usage() {
         for (kind, expected) in [
-            (astra_core::ErrorKind::ContextWindow, 100),
+            (astra_core::ErrorKind::ContextWindow, 60),
             (astra_core::ErrorKind::Cancelled, 60),
         ] {
             let error = astra_core::ClassifiedError::new(kind, "provider rejected the summary")
@@ -1045,12 +1153,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.text, "summary");
+        assert!(summary.input_was_measured);
         assert_eq!(summary.unpartitioned_input_tokens, 17);
         let usage = summary.qualified_usage.unwrap();
         assert_eq!(usage.input_tokens(), None);
         assert_eq!(usage.cached_input_tokens(), None);
         assert_eq!(usage.cache_creation_tokens(), None);
         assert_eq!(usage.output_tokens(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn summary_distinguishes_missing_input_measurement_from_zero() {
+        for input in [None, Some(0), Some(17)] {
+            let mut response = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}]});
+            if let Some(input) = input {
+                response["usage"] = serde_json::json!({"prompt_tokens":input});
+            }
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let response = response.clone();
+                    async move { summary_provider_response(response) }
+                }),
+            );
+            let execution = summary_execution(spawn_summary_test_server(app).await);
+            let summary = test_client(summary_route(&execution), 64)
+                .summarize(
+                    InferencePurpose::RequiredCompaction,
+                    &[serde_json::json!({"role":"user","content":"summarize"})],
+                )
+                .await
+                .unwrap();
+            assert_eq!(summary.input_was_measured, input.is_some());
+            assert_eq!(summary.unpartitioned_input_tokens, input.unwrap_or(0));
+            assert!(summary.usage.is_empty());
+        }
     }
 
     #[tokio::test]

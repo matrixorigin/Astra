@@ -22,6 +22,7 @@ struct Attempts {
     next: AtomicU32,
     finished: Mutex<Vec<astra_services::InferenceInvocationTerminal>>,
     measured_inputs: Mutex<Vec<u64>>,
+    snapshots: Mutex<Vec<super::UsageSnapshot>>,
 }
 #[async_trait]
 impl ProviderAttemptObserver for Attempts {
@@ -38,6 +39,14 @@ impl ProviderAttemptObserver for Attempts {
         if let Some(total) = presence.measured_input_tokens {
             self.measured_inputs.lock().unwrap().push(total);
         }
+    }
+    fn note_usage_snapshot(
+        &self,
+        _: u32,
+        usage: crate::turn::token_usage::TokenUsage,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.snapshots.lock().unwrap().push((usage, presence));
     }
     async fn finish_attempt(
         &self,
@@ -676,11 +685,18 @@ fn responses_finish_reason_comes_from_provider_truncation_evidence() {
         "conn",
         "model",
         "display-model",
+        None,
     );
     assert_eq!(truncated.finish_reason.as_deref(), Some("length"));
     assert_eq!(truncated.full_text, "partial");
     // Without truncation evidence the stop/tool_calls distinction is kept.
-    let stopped = super::result(ResponseOutput::default(), "conn", "model", "display-model");
+    let stopped = super::result(
+        ResponseOutput::default(),
+        "conn",
+        "model",
+        "display-model",
+        None,
+    );
     assert_eq!(stopped.finish_reason.as_deref(), Some("stop"));
     let calls = super::result(
         ResponseOutput {
@@ -692,6 +708,7 @@ fn responses_finish_reason_comes_from_provider_truncation_evidence() {
         "conn",
         "model",
         "display-model",
+        None,
     );
     assert_eq!(calls.finish_reason.as_deref(), Some("tool_calls"));
 }
@@ -711,6 +728,7 @@ fn truncated_multi_item_text_reaches_runtime_without_provider_replay() {
         "connection",
         "wire",
         "display",
+        None,
     );
     assert_eq!(value.full_text, "prefix partial tail");
     assert_eq!(value.finish_reason.as_deref(), Some("length"));
@@ -725,11 +743,136 @@ fn response_result_couples_normalized_values_and_presence() {
         usage: json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":30}}).as_object().unwrap().clone(),
         ..Default::default()
     };
-    let actual = result(output, "connection", "wire-model", "display-model");
+    let actual = result(output, "connection", "wire-model", "display-model", None);
     assert_eq!(actual.usage["input_tokens"], 30);
     assert_eq!(actual.usage["cached_input_tokens"], 40);
     assert_eq!(actual.usage["cache_creation_tokens"], 30);
     assert!(
         actual.usage_presence.fresh_input_tokens && actual.usage_presence.cache_creation_tokens
     );
+}
+#[test]
+fn responses_usage_tracks_only_codec_accepted_bounded_fields() {
+    let mut accumulator = ResponseAccumulator::default();
+    let mut reported = serde_json::Map::new();
+    let mut latest = None;
+    let event = json!({"type":"response.created","response":{"usage":{"input_tokens":17,"extension":{"private":999}}}});
+    super::observe_with_usage(&mut accumulator, &event, &mut reported, &mut latest, None).unwrap();
+    let (_, presence) = latest.unwrap();
+    assert_eq!(presence.measured_input_tokens, Some(17));
+    assert!(!presence.output_tokens);
+    let malformed = json!({"response":{"usage":{"input_tokens":999}}});
+    assert!(
+        super::observe_with_usage(
+            &mut accumulator,
+            &malformed,
+            &mut reported,
+            &mut latest,
+            None
+        )
+        .is_err()
+    );
+    assert_eq!(latest.unwrap().1.measured_input_tokens, Some(17));
+    let event = json!({"type":"response.failed","response":{"usage":{"input_tokens":-1,"output_tokens":5},"error":{"code":"failure"}}});
+    assert!(
+        super::observe_with_usage(&mut accumulator, &event, &mut reported, &mut latest, None)
+            .is_err()
+    );
+    let (usage, presence) = latest.unwrap();
+    assert!(presence.input_invalid);
+    assert!(!presence.output_invalid);
+    assert_eq!(usage.output_tokens, 5);
+    assert!(presence.output_tokens);
+    assert!(!reported.contains_key("extension"));
+    assert!(reported.len() <= 2);
+}
+
+#[test]
+fn responses_usage_stays_bounded_and_invalid_output_does_not_erase_input() {
+    let mut accumulator = ResponseAccumulator::default();
+    let mut reported = serde_json::Map::new();
+    let mut latest = None;
+    for index in 0..1000 {
+        let event = json!({"type":"response.in_progress","response":{"usage":{
+            "input_tokens":17, (format!("extra_{index}")): index,
+            "input_tokens_details":{"cached_tokens":3,"ignored":index}
+        }}});
+        super::observe_with_usage(&mut accumulator, &event, &mut reported, &mut latest, None)
+            .unwrap();
+    }
+    assert_eq!(reported.len(), 2);
+    assert_eq!(
+        reported["prompt_tokens_details"].as_object().unwrap().len(),
+        1
+    );
+    let event = json!({"type":"response.in_progress","response":{"usage":{"output_tokens":-1}}});
+    super::observe_with_usage(&mut accumulator, &event, &mut reported, &mut latest, None).unwrap();
+    let (usage, presence) = latest.unwrap();
+    assert_eq!(presence.measured_input_tokens, Some(17));
+    assert!(presence.output_invalid);
+    assert_eq!(usage.cached_input_tokens, 3);
+}
+
+#[test]
+fn responses_usage_aliases_cannot_hide_invalid_or_conflicting_evidence() {
+    for (raw, input_valid, output_valid) in [
+        (
+            json!({"input_tokens":17,"prompt_tokens":-1,"output_tokens":3}),
+            false,
+            true,
+        ),
+        (
+            json!({"input_tokens":17,"prompt_tokens":18,"output_tokens":3}),
+            false,
+            true,
+        ),
+        (
+            json!({"input_tokens":17,"output_tokens":3,"completion_tokens":-1}),
+            true,
+            false,
+        ),
+        (
+            json!({"input_tokens":17,"output_tokens":3,"completion_tokens":4}),
+            true,
+            false,
+        ),
+        (
+            json!({"input_tokens":17,"prompt_tokens":null,"output_tokens":3,"completion_tokens":3}),
+            true,
+            true,
+        ),
+        (
+            json!({"input_tokens":17,"output_tokens":3,"input_tokens_details":{"cached_tokens":1},"prompt_tokens_details":{"cached_tokens":-1}}),
+            false,
+            true,
+        ),
+        (
+            json!({"input_tokens":17,"output_tokens":3,"input_tokens_details":null,"prompt_tokens_details":{"cached_tokens":1}}),
+            true,
+            true,
+        ),
+    ] {
+        let mut accumulator = ResponseAccumulator::default();
+        let mut reported = serde_json::Map::new();
+        let mut latest = None;
+        let observer = Attempts::default();
+        let event = json!({"type":"response.in_progress","response":{"usage":raw}});
+        super::observe_with_usage(
+            &mut accumulator,
+            &event,
+            &mut reported,
+            &mut latest,
+            Some((&observer, 0)),
+        )
+        .unwrap();
+        let (_, presence) = observer.snapshots.lock().unwrap()[0];
+        assert_eq!(!presence.input_invalid, input_valid, "{event}");
+        assert_eq!(!presence.output_invalid, output_valid, "{event}");
+        assert_eq!(
+            presence.measured_input_tokens,
+            input_valid.then_some(17),
+            "{event}"
+        );
+        assert_eq!(presence.output_tokens, output_valid, "{event}");
+    }
 }
