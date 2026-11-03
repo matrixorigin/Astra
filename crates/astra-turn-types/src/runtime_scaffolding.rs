@@ -7,6 +7,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use thiserror::Error;
 
 pub const RUNTIME_MESSAGE_PROVENANCE_FIELD: &str = "_astra_runtime_provenance";
@@ -362,19 +363,64 @@ pub fn append_only_runtime_authority_is_active(history: &[Value], index: usize) 
         return false;
     };
     let suffix = &history[index + 1..];
-    if suffix.iter().any(|message| {
+    let superseded = suffix.iter().any(|message| {
         runtime_message_delivery(message) == Some(RuntimeMessageDelivery::AppendOnlyRequiredContext)
             && runtime_authority_kind(message) == Some(kind)
-    }) || suffix.iter().any(is_human_user_message)
-    {
+    });
+    if superseded {
         return false;
     }
-    match lifetime {
-        RuntimeAuthorityLifetime::CurrentUserTurn => true,
-        RuntimeAuthorityLifetime::NextAssistantDecision => !suffix
-            .iter()
-            .any(|message| message.get("role").and_then(Value::as_str) == Some("assistant")),
+    let later_human = suffix.iter().any(is_human_user_message);
+    if later_human {
+        return false;
     }
+    let later_assistant = lifetime == RuntimeAuthorityLifetime::NextAssistantDecision
+        && suffix
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("assistant"));
+    authority_is_active(lifetime, superseded, later_human, later_assistant)
+}
+
+fn authority_is_active(
+    lifetime: RuntimeAuthorityLifetime,
+    superseded: bool,
+    later_human: bool,
+    later_assistant: bool,
+) -> bool {
+    !superseded
+        && !later_human
+        && (lifetime == RuntimeAuthorityLifetime::CurrentUserTurn || !later_assistant)
+}
+
+/// Compute the same authority lifetimes in one reverse pass. `retained`
+/// allows a compaction owner to verify a candidate without cloning history.
+#[must_use]
+pub fn active_append_only_authority_mask(
+    history: &[Value],
+    retained: Option<&[bool]>,
+) -> Option<Vec<bool>> {
+    if retained.is_some_and(|mask| mask.len() != history.len()) {
+        return None;
+    }
+    let mut active = vec![false; history.len()];
+    let mut later_human = false;
+    let mut later_assistant = false;
+    let mut later_kinds = HashSet::new();
+    for (index, message) in history.iter().enumerate().rev() {
+        if retained.is_some_and(|mask| !mask[index]) {
+            continue;
+        }
+        if let Some(kind) = runtime_authority_kind(message) {
+            let superseded = !later_kinds.insert(kind);
+            if let Some(lifetime) = runtime_authority_lifetime(message) {
+                active[index] =
+                    authority_is_active(lifetime, superseded, later_human, later_assistant);
+            }
+        }
+        later_human |= is_human_user_message(message);
+        later_assistant |= message.get("role").and_then(Value::as_str) == Some("assistant");
+    }
+    Some(active)
 }
 
 /// Earliest canonical suffix boundary that must survive a history rewrite so
@@ -387,9 +433,9 @@ pub fn append_only_runtime_authority_is_active(history: &[Value], index: usize) 
 /// conversation span.
 #[must_use]
 pub fn active_append_only_authority_protected_suffix_start(history: &[Value]) -> Option<usize> {
-    let first_active = history.iter().enumerate().find_map(|(index, _)| {
-        append_only_runtime_authority_is_active(history, index).then_some(index)
-    })?;
+    let first_active = active_append_only_authority_mask(history, None)?
+        .into_iter()
+        .position(|active| active)?;
     Some(
         history[..=first_active]
             .iter()
@@ -528,6 +574,49 @@ mod tests {
             history.push(json!({"role":"user", "content":"new human goal"}));
             assert!(!append_only_runtime_authority_is_active(&history, 2));
         }
+    }
+
+    #[test]
+    fn authority_mask_matches_single_frame_lifetimes_after_selection() {
+        let frame = |kind, lifetime| {
+            let mut message = json!({"role":"user", "content":"control"});
+            mark_append_only_required_context(&mut message, kind, lifetime);
+            message
+        };
+        let history = vec![
+            json!({"role":"user", "content":"first request"}),
+            frame("work", RuntimeAuthorityLifetime::CurrentUserTurn),
+            json!({"role":"assistant", "content":"decision"}),
+            frame("work", RuntimeAuthorityLifetime::NextAssistantDecision),
+            frame("snapshot", RuntimeAuthorityLifetime::CurrentUserTurn),
+            json!({"role":"user", "content":"follow-up"}),
+            frame("retry", RuntimeAuthorityLifetime::NextAssistantDecision),
+            json!({"role":"assistant", "content":"later decision"}),
+        ];
+        for removed in [None, Some(2), Some(5), Some(7)] {
+            let keep: Vec<_> = (0..history.len())
+                .map(|index| Some(index) != removed)
+                .collect();
+            let projected: Vec<_> = history
+                .iter()
+                .zip(&keep)
+                .filter_map(|(message, keep)| keep.then_some(message.clone()))
+                .collect();
+            let actual = active_append_only_authority_mask(&history, Some(&keep)).unwrap();
+            let mut projected_index = 0;
+            for (index, retained) in keep.iter().enumerate() {
+                if *retained {
+                    assert_eq!(
+                        actual[index],
+                        append_only_runtime_authority_is_active(&projected, projected_index)
+                    );
+                    projected_index += 1;
+                } else {
+                    assert!(!actual[index]);
+                }
+            }
+        }
+        assert!(active_append_only_authority_mask(&history, Some(&[true])).is_none());
     }
 
     #[test]

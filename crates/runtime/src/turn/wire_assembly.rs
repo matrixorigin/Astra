@@ -339,6 +339,7 @@ pub(crate) fn wire_budget_status_with_metadata(
     context_window: Option<u32>,
     max_completion_tokens: Option<u32>,
     requested_output_tokens: usize,
+    responses_scope: Option<(&str, &str)>,
 ) -> WireBudgetStatus {
     let tool_tokens = tools
         .iter()
@@ -350,7 +351,55 @@ pub(crate) fn wire_budget_status_with_metadata(
         .map(crate::prompts::estimate_json_value_tokens)
         .map(|tokens| tokens.saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD))
         .sum();
-    let estimated_input_tokens = crate::prompts::estimate_wire_input_tokens(messages, tool_tokens);
+    let mut estimated_input_tokens =
+        crate::prompts::estimate_wire_input_tokens(messages, tool_tokens);
+    if let Some((connection, wire_model)) = responses_scope {
+        for message in messages {
+            let Some(saved) = message.get(astra_core::model_wire::responses::CONTINUATION_KEY)
+            else {
+                continue;
+            };
+            if message["role"] != "assistant" {
+                continue;
+            }
+            let original = crate::prompts::estimate_json_value_tokens(message)
+                .saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD);
+            // A matching scope replays provider items; a changed scope sends
+            // ordinary content. Reuse the codec for both rather than counting
+            // the two representations together.
+            let ordinary = (saved["connection_id"] != connection || saved["model"] != wire_model)
+                .then(|| {
+                    let mut visible = message.clone();
+                    if let Some(object) = visible.as_object_mut() {
+                        object.remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+                    }
+                    visible
+                });
+            let Ok(request) = astra_core::model_wire::responses::request(
+                wire_model,
+                std::slice::from_ref(ordinary.as_ref().unwrap_or(message)),
+                None,
+                connection,
+                false,
+                None,
+            ) else {
+                // Invalid state keeps the conservative estimate; the actual
+                // request preparation still rejects it.
+                continue;
+            };
+            let Some(items) = request["input"].as_array() else {
+                continue;
+            };
+            let replay = items.iter().fold(0_usize, |total, item| {
+                total
+                    .saturating_add(crate::prompts::estimate_json_value_tokens(item))
+                    .saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD)
+            });
+            estimated_input_tokens = estimated_input_tokens
+                .saturating_sub(original)
+                .saturating_add(replay);
+        }
+    }
     let budget = crate::prompts::budget_for_model_with_metadata(
         Some(model_name),
         context_window,
@@ -368,56 +417,41 @@ pub(crate) fn wire_budget_status_with_metadata(
     }
 }
 
-pub(crate) fn augment_manifest_trace_with_wire_budget_and_metadata(
-    trace: &mut Value,
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    context_window: Option<u32>,
-    max_completion_tokens: Option<u32>,
-    requested_output_tokens: usize,
-) -> WireBudgetStatus {
-    let status = wire_budget_status_with_metadata(
-        messages,
-        tools,
-        model_name,
-        context_window,
-        max_completion_tokens,
-        requested_output_tokens,
-    );
-    set_manifest_wire_budget(trace, status);
-    status
-}
-
 /// Trim only the canonical history when the fully assembled provider wire
 /// still exceeds its hard input budget.  All runtime-owned producers are
 /// already present in `status.estimated_input_tokens`; this helper therefore
 /// has one owner and does not maintain a second list of late context types.
 ///
 /// The pass is deliberately bounded and pure with respect to provider I/O:
-/// it reuses the existing tiered compactor, preserving the active append-only
-/// suffix and tool-call pairing rules.  A caller must reassemble and measure
+/// it reuses the existing tiered compactor, preserving active authority and
+/// tool-call pairing rules. A caller must reassemble and measure
 /// the wire after this function returns.
 pub(crate) fn compact_history_for_wire_budget(
     history: &mut Vec<Value>,
     status: WireBudgetStatus,
+    staged_authority: &[Value],
+    protect: Option<&dyn Fn(&[Value]) -> Vec<bool>>,
 ) -> Option<crate::turn::cloud::compaction::CompactBoundary> {
     if history.is_empty() || !status.hard_limit_exceeded() {
         return None;
     }
 
-    let target_input = status
-        .model_limit
-        .saturating_sub(status.requested_output_tokens)
-        .saturating_sub(status.reserved_protocol_tokens);
-    let history_tokens = crate::prompts::estimate_wire_input_tokens(history, 0);
-    // `estimated_input_tokens` is the complete provider input estimate and
-    // already includes tool schemas.  Keep schemas in the fixed cost: giving
-    // their tokens back to history would make the recomposed request exceed
-    // the same budget we just measured.
-    let fixed_tokens = status.estimated_input_tokens.saturating_sub(history_tokens);
-    let available_history_tokens = target_input.saturating_sub(fixed_tokens);
-    let history_chars = history
+    // Staged frames are supersession witnesses, not committed history. They
+    // must participate in retention before the candidate is reassembled.
+    let original_len = history.len();
+    let mut candidate = history.clone();
+    candidate.extend_from_slice(staged_authority);
+    let deficit = status
+        .estimated_input_tokens
+        .saturating_add(status.requested_output_tokens)
+        .saturating_add(status.reserved_protocol_tokens)
+        .saturating_sub(status.model_limit);
+    let history_tokens = crate::prompts::estimate_wire_input_tokens(&candidate, 0);
+    // Translate only the measured provider-wire shortfall into a reduction of
+    // canonical history. The two representations need not have the same
+    // absolute size (Responses can replay saved items instead of content).
+    let available_history_tokens = history_tokens.saturating_sub(deficit);
+    let history_chars = candidate
         .iter()
         .map(|message| {
             serde_json::to_string(message)
@@ -433,15 +467,23 @@ pub(crate) fn compact_history_for_wire_budget(
             .checked_div(history_tokens)
             .unwrap_or(0)
     };
-    let result = crate::turn::cloud::compaction::compact_tiered_impl(
-        history,
+    let result = crate::turn::cloud::compaction::compact_tiered_impl_with_protection(
+        &candidate,
         budget_chars,
         2_000,
         CompactionTier::AggressivePrune,
         4,
+        protect,
     );
-    let boundary = result.boundary?;
-    *history = result.messages;
+    let mut boundary = result.boundary?;
+    let mut compacted = result.messages;
+    if !compacted.ends_with(staged_authority) {
+        return None;
+    }
+    compacted.truncate(compacted.len() - staged_authority.len());
+    boundary.messages_before = original_len;
+    boundary.messages_after = compacted.len();
+    *history = compacted;
     Some(boundary)
 }
 
@@ -1167,7 +1209,8 @@ fn validate_append_only_runtime_authority(
 /// wire shape. Expired frames stay only in canonical state. A frame whose
 /// typed lifetime is still active is re-homed to the ordinary required-system
 /// lane so provider switching cannot turn runtime authority into human intent
-/// or silently discard an unconsumed control.
+/// or silently discard an unconsumed control. Advisory snapshots are rebuilt
+/// from the current context selection for the destination provider.
 pub(crate) fn rehome_append_only_runtime_authority(
     messages: &mut Vec<Value>,
 ) -> Result<Vec<Value>, AppendOnlyRuntimeAuthorityError> {
@@ -1194,6 +1237,8 @@ pub(crate) fn rehome_append_only_runtime_authority(
     }
 
     let original = std::mem::take(messages);
+    let active = astra_turn_types::active_append_only_authority_mask(&original, None)
+        .expect("an unfiltered history always has a valid activity mask");
     let mut projected = Vec::with_capacity(original.len());
     let mut rehomed = Vec::new();
     for (index, mut message) in original.iter().cloned().enumerate() {
@@ -1205,7 +1250,10 @@ pub(crate) fn rehome_append_only_runtime_authority(
         }
 
         let (kind, lifetime, content) = validate_append_only_runtime_authority(&message)?;
-        if !append_only_runtime_authority_is_active(&original, index, &message) {
+        if !active[index] {
+            continue;
+        }
+        if kind == RuntimeAuthorityKind::RuntimeContextSnapshot.as_str() {
             continue;
         }
         message["role"] = Value::String("system".to_string());
@@ -1603,7 +1651,7 @@ pub(crate) struct InvokedSkillRef<'a> {
 /// Presence is established by delivered instructions, never by a call, a
 /// short receipt or user-authored prose. Reuse canonical call pairing and the
 /// existing authority/rendering owners rather than tracking another cache.
-fn retained_invoked_skills<'a>(
+pub(crate) fn retained_invoked_skills<'a>(
     history: &[Value],
     runtime_context: &[Value],
     skills: &[InvokedSkillRef<'a>],
@@ -1638,8 +1686,10 @@ fn retained_invoked_skills<'a>(
             (expected["content"].as_str() == Some(payload)).then_some(name)
         })
     };
+    let active = astra_turn_types::active_append_only_authority_mask(history, None)
+        .expect("an unfiltered history always has a valid activity mask");
     for (index, message) in history.iter().enumerate() {
-        if astra_turn_types::append_only_runtime_authority_is_active(history, index)
+        if active[index]
             && let Ok(frame) = astra_turn_types::parse_append_only_runtime_authority_frame(message)
             && let Some(name) = frame.kind.strip_prefix("invoked_skill_context:")
             && let Some(name) = matches_attachment(name, &frame.payload)
@@ -1786,6 +1836,20 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         cache_capability,
         provider,
     );
+    if matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+    ) && matches!(
+        cache_cap.volatile_delivery,
+        astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly
+    ) {
+        // A prior All placement may have retained an advisory snapshot. It
+        // cannot become required context when the destination suppresses it.
+        compacted_messages.retain(|message| {
+            astra_turn_types::runtime_authority_kind(message)
+                != Some(RuntimeAuthorityKind::RuntimeContextSnapshot.as_str())
+        });
+    }
     if !cache_cap.is_valid()
         || (matches!(
             cache_cap.volatile_placement,
@@ -3158,6 +3222,82 @@ mod tests {
     }
 
     #[test]
+    fn provider_switch_rebuilds_advisory_context_without_replaying_old_snapshot() {
+        use astra_turn_core::cache_placement::VolatileDeliveryPolicy;
+
+        let human = json!({"role":"user", "content":"finish"});
+        let required = required_append_only_runtime_authority_message(
+            "required contract",
+            RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let snapshot = required_append_only_runtime_authority_message(
+            r#"{"contexts":["old advisory"]}"#,
+            RuntimeAuthorityKind::RuntimeContextSnapshot,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let original = vec![human, required, snapshot];
+        for (policy, current, expected) in [
+            (
+                VolatileDeliveryPolicy::All,
+                "new advisory",
+                Some("new advisory"),
+            ),
+            (VolatileDeliveryPolicy::All, "", None),
+            (VolatileDeliveryPolicy::RequiredOnly, "new advisory", None),
+        ] {
+            let mut history = original.clone();
+            let mut preamble = rehome_append_only_runtime_authority(&mut history).unwrap();
+            preamble.extend(runtime_system_context_message(current, false));
+            let capability = astra_turn_core::cache_placement::CacheCapability {
+                volatile_delivery: policy,
+                ..required_only_tail_capability()
+            };
+            let output = assemble_llm_messages_with_cache_capability_output(
+                vec![json!({"role":"system", "content":"stable"})],
+                preamble,
+                Vec::new(),
+                history,
+                &PostCompactAttachments::default(),
+                "sid",
+                "openai",
+                "model",
+                &astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                Some(capability),
+                &cache_cfg(),
+            )
+            .unwrap();
+            let wire = serde_json::to_string(&output.messages).unwrap();
+            assert!(wire.contains("required contract"));
+            assert!(!wire.contains("old advisory"));
+            assert_eq!(wire.contains("new advisory"), expected.is_some());
+        }
+        // Canonical history still contains the old All snapshot when a later
+        // request switches back to an append-only RequiredOnly placement.
+        let output = assemble_llm_messages_with_cache_capability_output(
+            vec![json!({"role":"system", "content":"stable"})],
+            vec![runtime_system_context_message("new advisory", false).unwrap()],
+            Vec::new(),
+            original,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "model",
+            &astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+            Some(append_only_required_capability()),
+            &cache_cfg(),
+        )
+        .unwrap();
+        let wire = serde_json::to_string(&output.messages).unwrap();
+        assert!(wire.contains("required contract"));
+        assert!(!wire.contains("old advisory") && !wire.contains("new advisory"));
+    }
+
+    #[test]
     fn provider_switch_without_append_only_frames_keeps_history_allocation() {
         let mut history = vec![
             json!({"role": "user", "content": "inspect"}),
@@ -3906,15 +4046,9 @@ mod tests {
             "content": [{"type": "text", "text": "你好世界".repeat(400)}]
         })];
         let mut trace = json!({"wire": {"message_count": 1}});
-        let status = augment_manifest_trace_with_wire_budget_and_metadata(
-            &mut trace,
-            &messages,
-            &[],
-            "model",
-            Some(1_000),
-            None,
-            100,
-        );
+        let status =
+            wire_budget_status_with_metadata(&messages, &[], "model", Some(1_000), None, 100, None);
+        set_manifest_wire_budget(&mut trace, status);
 
         assert!(status.soft_target_exceeded());
         assert!(status.hard_limit_exceeded());
@@ -3924,6 +4058,147 @@ mod tests {
             trace["wire"]["budget"]["enforcement"],
             "observational_estimate_provider_authoritative"
         );
+    }
+
+    #[test]
+    fn responses_budget_counts_scoped_replay_once() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let content = "result ".repeat(1_500);
+        let output = ResponseOutput {
+            items: vec![json!({"type":"message", "role":"assistant", "content":[
+                {"type":"output_text", "text":content}
+            ]})],
+            ..Default::default()
+        };
+        let mut assistant = json!({"role":"assistant", "content":content});
+        assistant[CONTINUATION_KEY] = output.continuation(&connection, "wire-model");
+        let messages = vec![json!({"role":"user", "content":"goal"}), assistant];
+        let wire = request("wire-model", &messages, None, &connection, false, None).unwrap();
+        let actual =
+            crate::prompts::estimate_wire_input_tokens(wire["input"].as_array().unwrap(), 0);
+        let scoped = wire_budget_status_with_metadata(
+            &messages,
+            &[],
+            "display-model",
+            Some(5_000),
+            None,
+            256,
+            Some((&connection, "wire-model")),
+        );
+        let switched = wire_budget_status_with_metadata(
+            &messages,
+            &[],
+            "display-model",
+            Some(5_000),
+            None,
+            256,
+            Some(("other-connection", "wire-model")),
+        );
+        let switched_wire = request(
+            "wire-model",
+            &messages,
+            None,
+            "other-connection",
+            false,
+            None,
+        )
+        .unwrap();
+        let switched_actual = crate::prompts::estimate_wire_input_tokens(
+            switched_wire["input"].as_array().unwrap(),
+            0,
+        );
+        let unprojected = wire_budget_status_with_metadata(
+            &messages,
+            &[],
+            "display-model",
+            Some(5_000),
+            None,
+            256,
+            None,
+        );
+        assert!(scoped.estimated_input_tokens.abs_diff(actual) < 100);
+        assert!(switched.estimated_input_tokens.abs_diff(switched_actual) < 100);
+        assert!(!scoped.hard_limit_exceeded() && !switched.hard_limit_exceeded());
+        assert!(unprojected.hard_limit_exceeded());
+        assert!(unprojected.estimated_input_tokens > scoped.estimated_input_tokens + 1_000);
+    }
+
+    #[test]
+    fn small_responses_wire_deficit_preserves_unneeded_recent_tool_rounds() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let text = "response ".repeat(4_500);
+        let mut history = vec![json!({"role":"user", "content":"goal"})];
+        for index in 0..3 {
+            let id = format!("call-{index}");
+            history.push(json!({"role":"assistant", "tool_calls":[{
+                "id":id, "type":"function", "function":{
+                    "name":"read_file", "arguments":json!({"path":"x".repeat(5_000)}).to_string()
+                }
+            }]}));
+            history.push(json!({"role":"tool", "tool_call_id":id, "content":"evidence"}));
+        }
+        let mut assistant = json!({"role":"assistant", "content":text});
+        assistant[CONTINUATION_KEY] = ResponseOutput {
+            items: vec![json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]})],
+            ..Default::default()
+        }.continuation(&connection, "model");
+        history.push(assistant.clone());
+        history.push(
+            required_append_only_runtime_authority_message(
+                "retry",
+                RuntimeAuthorityKind::OutputCapContinuation,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let mut status = wire_budget_status_with_metadata(
+            &history,
+            &[],
+            "model",
+            Some(100_000),
+            None,
+            256,
+            Some((&connection, "model")),
+        );
+        // A single old call is far larger than this measured shortfall.
+        status.model_limit = status.estimated_input_tokens
+            + status.requested_output_tokens
+            + status.reserved_protocol_tokens
+            - 100;
+        assert!(status.hard_limit_exceeded());
+        let before = history.len();
+        assert!(compact_history_for_wire_budget(&mut history, status, &[], None).is_some());
+        assert!(history.iter().any(|message| message == &assistant));
+        assert!(
+            !history
+                .iter()
+                .any(|message| message["tool_call_id"] == "call-0")
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message["tool_call_id"] == "call-1")
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message["tool_call_id"] == "call-2")
+        );
+        assert_eq!(history.len(), before - 2);
+        let after = wire_budget_status_with_metadata(
+            &history,
+            &[],
+            "model",
+            Some(status.model_limit as u32),
+            None,
+            status.requested_output_tokens,
+            Some((&connection, "model")),
+        );
+        assert!(!after.hard_limit_exceeded());
+        astra_turn_types::validate_canonical_tool_pairing(&history).unwrap();
     }
 
     #[test]
@@ -3949,7 +4224,7 @@ mod tests {
             model_limit: 2_500,
         };
 
-        assert!(compact_history_for_wire_budget(&mut history, status).is_some());
+        assert!(compact_history_for_wire_budget(&mut history, status, &[], None).is_some());
         assert!(
             history.len() < 16,
             "bounded final-wire repair should reduce canonical history, not add another context lane"
@@ -3988,7 +4263,7 @@ mod tests {
         };
 
         assert!(
-            compact_history_for_wire_budget(&mut history, status).is_some(),
+            compact_history_for_wire_budget(&mut history, status, &[], None).is_some(),
             "schema cost must consume history budget instead of being handed back to the compactor"
         );
     }
@@ -4008,8 +4283,15 @@ mod tests {
             }
         })];
 
-        let status =
-            wire_budget_status_with_metadata(&messages, &tools, "model", Some(32_000), None, 1_000);
+        let status = wire_budget_status_with_metadata(
+            &messages,
+            &tools,
+            "model",
+            Some(32_000),
+            None,
+            1_000,
+            None,
+        );
         let expected = crate::prompts::estimate_wire_input_tokens(
             &messages,
             tools

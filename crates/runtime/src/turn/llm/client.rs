@@ -4322,6 +4322,19 @@ fn consolidate_system_messages_inner(
         out.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
     }
     out.extend(rest);
+    if !preserve_responses {
+        // A Responses-only reasoning item has no content on another wire.
+        // Keep it in canonical history for same-scope replay, but do not send
+        // an empty assistant turn to providers that cannot consume it.
+        out.retain(|message| {
+            !(message["role"] == "assistant"
+                && message
+                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                    .is_some()
+                && message["content"].as_str().is_some_and(str::is_empty)
+                && message["tool_calls"].as_array().is_none_or(Vec::is_empty))
+        });
+    }
     if !allow_suffix_dependent_history_repair {
         let provider_ids = provider_history_ids(&out);
         strip_internal_runtime_markers_with_ids(&mut out, &provider_ids, preserve_responses);
@@ -15331,6 +15344,79 @@ mod tests {
             "",
             "empty object content must be degraded to empty string, not bare '{{}}'",
         );
+    }
+
+    #[test]
+    fn canonical_responses_retry_switches_to_anthropic_without_empty_assistant() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let mut assistant = json!({"role":"assistant", "content":""});
+        assistant[CONTINUATION_KEY] = ResponseOutput {
+            items: vec![
+                json!({"type":"reasoning", "id":"rs", "summary":[], "encrypted_content":"opaque"}),
+            ],
+            ..Default::default()
+        }
+        .continuation(&connection, "model");
+        let control = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "retry required Work",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        for new_user in [false, true] {
+            let mut history = vec![
+                json!({"role":"user", "content":"goal"}),
+                assistant.clone(),
+                control.clone(),
+            ];
+            if new_user {
+                history.push(json!({"role":"user", "content":"new question"}));
+            }
+            let canonical = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(history).unwrap();
+            let replay = request("model", &canonical, None, &connection, false, None).unwrap();
+            assert!(
+                replay["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["encrypted_content"] == "opaque")
+            );
+            let mut switched = canonical.clone();
+            let mut required =
+                crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut switched)
+                    .unwrap();
+            required.extend(switched);
+            let projected = consolidate_system_messages_for_protocol(
+                &required,
+                "anthropic",
+                None,
+                LlmProviderProtocol::AnthropicMessages,
+            );
+            let body = build_provider_request_body(
+                &projected,
+                &[],
+                "claude-test",
+                "anthropic",
+                None,
+                None,
+                false,
+                &ThinkingConfig::Off,
+            );
+            assert!(body["messages"].as_array().unwrap().iter().all(|message| {
+                message["role"] != "assistant"
+                    || message["content"]
+                        .as_array()
+                        .is_some_and(|blocks| !blocks.is_empty())
+            }));
+            assert_eq!(body.to_string().contains("retry required Work"), !new_user);
+            assert!(
+                canonical
+                    .iter()
+                    .any(|message| message.get(CONTINUATION_KEY).is_some())
+            );
+        }
     }
 
     #[test]

@@ -4324,6 +4324,12 @@ impl AgenticLoopState {
         &mut self,
         permit: Option<crate::turn::canonical_commit::CanonicalRewritePermit>,
     ) {
+        // A shorter history cannot keep an index into its former length.
+        // Retaining the current prefix is conservative until the next request;
+        // messages appended after this rewrite remain eligible for compaction.
+        if let Some(prefix) = &mut self.last_request_message_count {
+            *prefix = (*prefix).min(self.messages.len());
+        }
         let Some(permit) = permit else {
             return;
         };
@@ -14136,7 +14142,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state
             .messages
             .push(json!({"role": "user", "content": "go"}));
-        state.last_request_message_count = Some(state.messages.len());
+        // A prior canonical rewrite shortened a previously larger request.
+        // New tool results must not inherit its stale prefix boundary.
+        state.last_request_message_count = Some(101);
+        state.finish_canonical_rewrite(None);
+        assert_eq!(state.last_request_message_count, Some(state.messages.len()));
 
         for (i, name) in [
             "read_file",

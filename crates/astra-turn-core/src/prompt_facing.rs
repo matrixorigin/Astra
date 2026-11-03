@@ -339,13 +339,25 @@ fn canonical_text_message(
     role: &str,
     preserve_turn_semantics: bool,
 ) -> Option<Value> {
-    let raw_content = extract_text_content(message)?;
-    let content = prompt_facing_content_for_role(role, &raw_content)?;
+    let saved = canonical_provider_continuation(message).filter(|saved| {
+        // Calls require the complete assistant/tool group handled separately.
+        !saved["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call"))
+    });
+    let content =
+        extract_text_content(message).and_then(|raw| prompt_facing_content_for_role(role, &raw));
+    // A completed Responses item can carry replayable reasoning without
+    // visible text. Preserve only validated provider state at this canonical
+    // boundary; display projections still omit reasoning-only messages.
+    if content.is_none() && saved.is_none() {
+        return None;
+    }
     let mut projected = json!({
         "role": role,
-        "content": content,
+        "content": content.unwrap_or_default(),
     });
-    if let Some(saved) = canonical_provider_continuation(message) {
+    if let Some(saved) = saved {
         projected[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
     }
     if message
@@ -748,6 +760,71 @@ mod tests {
                 .get(CONTINUATION_KEY)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn canonical_history_replays_reasoning_only_responses_after_restore() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let output = ResponseOutput {
+            items: vec![
+                json!({"type":"reasoning", "id":"rs-1", "summary":[], "encrypted_content":"opaque"}),
+            ],
+            ..Default::default()
+        };
+        let mut assistant = json!({"role":"assistant", "content":""});
+        assistant[CONTINUATION_KEY] = output.continuation(&connection, "model");
+        let retry_content = astra_turn_types::render_append_only_runtime_authority_frame(
+            "canonical_work_establishment_retry",
+            RuntimeAuthorityLifetime::NextAssistantDecision,
+            "retry",
+        )
+        .unwrap();
+        let mut retry = json!({"role":"user", "content":retry_content});
+        mark_append_only_required_context(
+            &mut retry,
+            "canonical_work_establishment_retry",
+            RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let original = vec![json!({"role":"user", "content":"goal"}), assistant, retry];
+        let committed = super::sanitize_canonical_turn_delta_with_turn_semantics(original, false)
+            .expect("canonical commit");
+        let restored =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(committed)
+                .expect("canonical restore");
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[1]["role"], "assistant");
+        assert_eq!(restored[1]["content"], "");
+        let replay = request("model", &restored, None, &connection, false, None).unwrap();
+        assert!(
+            replay["input"].as_array().unwrap().iter().any(|item| {
+                item["type"] == "reasoning" && item["encrypted_content"] == "opaque"
+            })
+        );
+        let switched =
+            request("model", &restored, None, "another-connection", false, None).unwrap();
+        assert!(!switched.to_string().contains("opaque"));
+        assert_eq!(sanitize_prompt_facing_messages(restored.clone()).len(), 1);
+
+        let mut invalid = restored;
+        invalid[1][CONTINUATION_KEY]["connection_id"] = json!("invalid");
+        let sanitized =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(invalid)
+                .expect("invalid provider state is dropped");
+        assert_eq!(sanitized.len(), 2);
+
+        let mut orphan = json!({"role":"assistant", "content":""});
+        orphan[CONTINUATION_KEY] = ResponseOutput {
+            items: vec![json!({"type":"function_call", "call_id":"c", "name":"read_file"})],
+            ..Default::default()
+        }
+        .continuation(&connection, "model");
+        let sanitized = super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+            json!({"role":"user", "content":"goal"}),
+            orphan,
+        ])
+        .unwrap();
+        assert_eq!(sanitized.len(), 1);
     }
 
     #[test]

@@ -189,7 +189,7 @@ pub use resume::{
 pub use runtime_scaffolding::{
     APPEND_ONLY_RUNTIME_AUTHORITY_POLICY, APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD,
     ParsedRuntimeAuthorityFrame, RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeAuthorityFrameError,
-    RuntimeAuthorityLifetime, RuntimeMessageDelivery,
+    RuntimeAuthorityLifetime, RuntimeMessageDelivery, active_append_only_authority_mask,
     active_append_only_authority_protected_suffix_start, append_only_runtime_authority_is_active,
     has_append_only_runtime_authority_policy, is_human_user_message, is_runtime_owned_message,
     is_runtime_owned_provenance, mark_append_only_required_context,

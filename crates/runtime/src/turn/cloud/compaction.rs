@@ -1,8 +1,8 @@
 use crate::prompts::{CompactConfig, CompactionTier};
 use astra_turn_core::compression_types::{
     CompressionResult, DUPLICATE_OUTPUT_CALL_ID_FIELD, TokenBudget, calls_have_same_identity,
-    duplicate_output_reference, duplicate_output_targets, matching_result_attribution,
-    unique_tool_observations,
+    duplicate_output_reference, duplicate_output_referenced_targets as referenced_tool_results,
+    duplicate_output_targets, matching_result_attribution, unique_tool_observations,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -207,6 +207,9 @@ pub(crate) fn build_spill_summary(messages: &[serde_json::Value]) -> String {
     };
 
     for msg in messages {
+        if astra_turn_types::is_runtime_owned_message(msg) {
+            continue;
+        }
         if let Some(summary) = astra_turn_core::cloud::history_summary::history_summary_text(msg) {
             historical_summaries.push(summary);
             continue;
@@ -482,14 +485,6 @@ fn tool_pair_spans(messages: &[Value]) -> Vec<(usize, usize)> {
     merged
 }
 
-fn referenced_tool_results(messages: &[Value]) -> Vec<bool> {
-    let mut referenced = vec![false; messages.len()];
-    for target in duplicate_output_targets(messages).into_iter().flatten() {
-        referenced[target] = true;
-    }
-    referenced
-}
-
 /// Invocation pairing is bidirectional; a dedup reference has a one-way
 /// dependency on its later evidence. Retaining evidence must not force all
 /// obsolete references to survive. Each message and span is visited once.
@@ -528,6 +523,83 @@ fn close_retained_dependencies(messages: &[Value], keep: &mut [bool]) {
     }
 }
 
+/// Identify the active frames and the messages they depend on without making
+/// the entire current turn immutable. This is derived from the original
+/// history for each rewrite; it is not persisted or used as execution state.
+struct AuthorityRetention {
+    active: Vec<bool>,
+    protected: Vec<bool>,
+}
+
+fn authority_retention(
+    messages: &[Value],
+    keep: Option<&[bool]>,
+    protect: Option<&dyn Fn(&[Value]) -> Vec<bool>>,
+) -> Option<AuthorityRetention> {
+    let additional = protect.map(|select| select(messages));
+    if additional
+        .as_ref()
+        .is_some_and(|mask| mask.len() != messages.len())
+    {
+        return None;
+    }
+    let retained = |index: usize| keep.is_none_or(|mask| mask[index]);
+    let human = messages
+        .iter()
+        .enumerate()
+        .rfind(|(index, message)| {
+            retained(*index) && astra_turn_types::is_human_user_message(message)
+        })
+        .map(|(index, _)| index);
+    let mut plan = AuthorityRetention {
+        active: astra_turn_types::active_append_only_authority_mask(messages, keep)?,
+        protected: vec![false; messages.len()],
+    };
+    for (index, message) in messages.iter().enumerate().rev() {
+        if !retained(index) {
+            continue;
+        }
+        if additional.as_ref().is_some_and(|mask| mask[index]) {
+            plan.protected[index] = true;
+        }
+        let delivery = astra_turn_types::runtime_message_delivery(message);
+        if astra_turn_types::is_runtime_owned_message(message) && delivery.is_none() {
+            return None;
+        }
+        if delivery == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext) {
+            astra_turn_types::parse_append_only_runtime_authority_frame(message).ok()?;
+            let kind = astra_turn_types::runtime_authority_kind(message)?;
+            if plan.active[index] {
+                let anchor = human.filter(|anchor| *anchor < index)?;
+                plan.protected[anchor] = true;
+                plan.protected[index] = true;
+                if matches!(
+                    kind,
+                    "output_cap_continuation" | "canonical_work_establishment_retry"
+                ) {
+                    // A retry can be staged after other runtime frames when
+                    // a failed request switches providers. Those frames do
+                    // not change which assistant response the retry governs.
+                    let previous = (0..index).rev().find(|previous| {
+                        astra_turn_types::runtime_message_delivery(&messages[*previous])
+                            != Some(
+                                astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext,
+                            )
+                    })?;
+                    if !retained(previous) || messages[previous]["role"] != "assistant" {
+                        return None;
+                    }
+                    plan.protected[previous] = true;
+                }
+            }
+        }
+    }
+    if plan.protected.iter().any(|protected| *protected) {
+        close_retained_dependencies(messages, &mut plan.protected);
+    }
+    Some(plan)
+}
+
 /// Apply a removal mask only after authority, pairing and net-progress checks.
 /// The policy supplies its head/tail/pivot; this owns all destructive splicing.
 fn prune_selected_messages(
@@ -535,13 +607,28 @@ fn prune_selected_messages(
     mut keep: Vec<bool>,
     boundary: Option<Value>,
     pivot: Option<usize>,
+    protect: Option<&dyn Fn(&[Value]) -> Vec<bool>>,
 ) -> CompressionResult {
-    if let Some(start) =
-        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
-    {
-        keep[start..].fill(true);
+    let Some(authority) = authority_retention(messages, None, protect) else {
+        return CompressionResult::default();
+    };
+    for (index, message) in messages.iter().enumerate() {
+        if astra_turn_types::runtime_message_delivery(message)
+            == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            && !authority.active[index]
+        {
+            keep[index] = false;
+        }
+        keep[index] |= authority.protected[index];
     }
     close_retained_dependencies(messages, &mut keep);
+    let Some(retained_authority) = authority_retention(messages, Some(&keep), protect) else {
+        return CompressionResult::default();
+    };
+    if authority.active != retained_authority.active {
+        // Removing an expiry witness must never revive an old control.
+        return CompressionResult::default();
+    }
     let removed_count = keep.iter().filter(|retained| !**retained).count();
     let removed_tokens: u64 = messages
         .iter()
@@ -591,11 +678,6 @@ pub(crate) fn compact_middle_messages(
 ) -> CompressionResult {
     let head_end = protected_head_end(messages);
     let mut tail_start = messages.len().saturating_sub(keep_tail);
-    if let Some(start) =
-        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
-    {
-        tail_start = tail_start.min(start);
-    }
     // Reserve the complete call/result span rather than retaining only its
     // producer. A later pivot must be chosen from the actual removed span.
     for (start, end) in tool_pair_spans(messages) {
@@ -628,7 +710,7 @@ pub(crate) fn compact_middle_messages(
     if reactive {
         boundary["_reactive"] = Value::Bool(true);
     }
-    let mut result = prune_selected_messages(messages, keep, Some(boundary), pivot);
+    let mut result = prune_selected_messages(messages, keep, Some(boundary), pivot, None);
     if result.estimated_tokens_freed > 0 {
         let turns_removed = result.affected_turns.len();
         result.description = if reactive {
@@ -828,20 +910,16 @@ pub(crate) fn truncate_old_tool_results(
     keep_length: usize,
 ) -> CompressionResult {
     let head_end = protected_head_end(messages);
-    let suffix_start =
-        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
-            .unwrap_or(messages.len());
+    let Some(authority) = authority_retention(messages, None, None) else {
+        return CompressionResult::default();
+    };
     let cutoff = budget.now_secs.saturating_sub(age_secs);
     let referenced = referenced_tool_results(messages);
     let mut result = CompressionResult::default();
     let mut count = 0;
-    for (index, message) in messages
-        .iter_mut()
-        .enumerate()
-        .take(suffix_start)
-        .skip(head_end)
-    {
-        if referenced[index]
+    for (index, message) in messages.iter_mut().enumerate().skip(head_end) {
+        if authority.protected[index]
+            || referenced[index]
             || message.get("role").and_then(Value::as_str) != Some("tool")
             || message
                 .get("_timestamp")
@@ -881,9 +959,9 @@ pub(crate) fn truncate_old_tool_results(
 #[allow(clippy::ptr_arg)] // Fixed engine stages share a mutable candidate-vector interface.
 pub(crate) fn compact_duplicate_tool_outputs(messages: &mut Vec<Value>) -> CompressionResult {
     let head_end = protected_head_end(messages);
-    let suffix_start =
-        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
-            .unwrap_or(messages.len());
+    let Some(authority) = authority_retention(messages, None, None) else {
+        return CompressionResult::default();
+    };
     let referenced = referenced_tool_results(messages);
     let replacements = {
         let observations = unique_tool_observations(messages);
@@ -933,7 +1011,7 @@ pub(crate) fn compact_duplicate_tool_outputs(messages: &mut Vec<Value>) -> Compr
                 };
                 let calls_match = calls_have_same_identity(call, retained_call);
                 if index >= head_end
-                    && index < suffix_start
+                    && !authority.protected[index]
                     && !referenced[index]
                     && calls_match
                     && matching_result_attribution(message, retained)
@@ -986,12 +1064,13 @@ fn truncate_tool_results_to_serialized_budget(
     messages: &mut [Value],
     budget_chars: usize,
     preserve_latest: bool,
+    protect: Option<&dyn Fn(&[Value]) -> Vec<bool>>,
 ) -> bool {
     const MIN_TOOL_EVIDENCE_CHARS: usize = 80;
     const SUFFIX: &str = "\n...[compacted for context budget; re-run tool if needed]";
-    let suffix_start =
-        astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
-            .unwrap_or(messages.len());
+    let Some(authority) = authority_retention(messages, None, protect) else {
+        return false;
+    };
     let latest_tool_index = preserve_latest
         .then(|| {
             messages
@@ -1005,11 +1084,12 @@ fn truncate_tool_results_to_serialized_budget(
     let referenced = referenced_tool_results(messages);
     let mut total_chars = serialized_message_chars(messages);
     let mut changed = false;
-    for (index, message) in messages.iter_mut().enumerate().take(suffix_start) {
+    for (index, message) in messages.iter_mut().enumerate() {
         if total_chars <= budget_chars {
             break;
         }
-        if message.get("role").and_then(Value::as_str) != Some("tool")
+        if authority.protected[index]
+            || message.get("role").and_then(Value::as_str) != Some("tool")
             || referenced[index]
             || Some(index) == latest_tool_index
         {
@@ -1035,50 +1115,70 @@ fn truncate_tool_results_to_serialized_budget(
     changed
 }
 
-fn prune_oldest_conversation_span(messages: &mut Vec<Value>) -> bool {
-    let first_user_idx = messages.iter().position(is_plain_user_task);
-    let conversation_indices: Vec<usize> = messages
+fn prune_oldest_conversation_span(
+    messages: &mut Vec<Value>,
+    protect: Option<&dyn Fn(&[Value]) -> Vec<bool>>,
+) -> bool {
+    let Some(first_user) = messages.iter().position(is_plain_user_task) else {
+        return false;
+    };
+    let Some(authority) = authority_retention(messages, None, protect) else {
+        return false;
+    };
+    let latest_user = messages.iter().rposition(is_plain_user_task);
+    let mut mandatory = authority.protected;
+    for (index, message) in messages.iter().enumerate() {
+        mandatory[index] |= index == first_user
+            || Some(index) == latest_user
+            || message.get("role").and_then(Value::as_str) == Some("system");
+    }
+    close_retained_dependencies(messages, &mut mandatory);
+
+    // A cutoff must not split a call/result group. Merged spans do not
+    // overlap, so marking every blocked cutoff remains linear in history size.
+    let mut blocked = vec![false; messages.len() + 1];
+    for (start, end) in tool_pair_spans(messages) {
+        blocked[start + 1..=end].fill(true);
+    }
+    let mut removable_prefix = vec![0_usize; messages.len() + 1];
+    for (index, required) in mandatory.iter().enumerate() {
+        removable_prefix[index + 1] = removable_prefix[index] + usize::from(!required);
+    }
+    let conversation: Vec<_> = messages
         .iter()
         .enumerate()
         .filter_map(|(index, message)| {
-            (is_plain_user_task(message)
-                || message.get("role").and_then(Value::as_str) == Some("assistant"))
+            (index > first_user
+                && (is_plain_user_task(message)
+                    || message.get("role").and_then(Value::as_str) == Some("assistant")))
             .then_some(index)
         })
         .collect();
-    let Some(first_user_idx) = first_user_idx else {
-        return false;
-    };
-    let Some(tail_start) = conversation_indices
-        .iter()
-        .copied()
-        .find(|index| *index > first_user_idx)
-    else {
-        return false;
-    };
-    let tail_is_user = is_plain_user_task(&messages[tail_start]);
-    let Some(next_tail_start) = conversation_indices.iter().copied().find(|index| {
-        *index > tail_start && (!tail_is_user || is_plain_user_task(&messages[*index]))
-    }) else {
-        return false;
-    };
-    if astra_turn_types::active_append_only_authority_protected_suffix_start(messages)
-        .is_some_and(|start| next_tail_start > start)
-    {
-        return false;
+    let mut current = 0;
+    while current + 1 < conversation.len() {
+        let start = conversation[current];
+        let mut next = current + 1;
+        if is_plain_user_task(&messages[start]) && !mandatory[start] {
+            // An old human request and its responses form one history span.
+            while next < conversation.len() && !is_plain_user_task(&messages[conversation[next]]) {
+                next += 1;
+            }
+            if next == conversation.len() {
+                return false;
+            }
+        }
+        let cutoff = conversation[next];
+        if !blocked[cutoff] && removable_prefix[cutoff] > removable_prefix[first_user + 1] {
+            let keep = (0..messages.len())
+                .map(|index| mandatory[index] || index >= cutoff)
+                .collect();
+            return prune_selected_messages(messages, keep, None, latest_user, protect)
+                .estimated_tokens_freed
+                > 0;
+        }
+        current = next;
     }
-    let latest_user = messages.iter().rposition(is_plain_user_task);
-    let keep = messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            message.get("role").and_then(Value::as_str) == Some("system")
-                || index == first_user_idx
-                || Some(index) == latest_user
-                || index >= next_tail_start
-        })
-        .collect();
-    prune_selected_messages(messages, keep, None, latest_user).estimated_tokens_freed > 0
+    false
 }
 
 // Compaction Types
@@ -1162,6 +1262,19 @@ impl CompactBoundary {
     pub fn with_discovered_tools(mut self, tools: Vec<String>) -> Self {
         self.discovered_tools = tools;
         self
+    }
+}
+
+/// Combine successive pressure rewrites into one boundary for the selected
+/// request, keeping the original input and final output counts.
+pub(crate) fn accumulate_compaction_boundary(
+    accumulated: &mut Option<CompactBoundary>,
+    next: CompactBoundary,
+) {
+    if let Some(first) = accumulated {
+        first.messages_after = next.messages_after;
+    } else {
+        *accumulated = Some(next);
     }
 }
 
@@ -1278,6 +1391,26 @@ pub(crate) fn compact_tiered_impl(
     tier: CompactionTier,
     keep_recent_turns: usize,
 ) -> CompactResult {
+    compact_tiered_impl_with_protection(
+        messages,
+        budget_chars,
+        keep_chars,
+        tier,
+        keep_recent_turns,
+        None,
+    )
+}
+
+/// Retry context already contains evidence that ordinary assembly would
+/// rebuild. Preserve it while using the same compaction owner.
+pub(crate) fn compact_tiered_impl_with_protection(
+    messages: &[Value],
+    budget_chars: usize,
+    keep_chars: usize,
+    tier: CompactionTier,
+    keep_recent_turns: usize,
+    protect: Option<&dyn Fn(&[Value]) -> Vec<bool>>,
+) -> CompactResult {
     let messages_before = messages.len();
 
     if tier == CompactionTier::Normal {
@@ -1330,20 +1463,45 @@ pub(crate) fn compact_tiered_impl(
         CompactionTier::AggressivePrune => keep_chars / 2,
     };
 
-    let protected_suffix_start =
-        astra_turn_types::active_append_only_authority_protected_suffix_start(&compacted)
-            .unwrap_or(compacted.len());
+    let Some(mut authority) = authority_retention(&compacted, None, protect) else {
+        return CompactResult {
+            messages: compacted,
+            boundary: None,
+            tier,
+            session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
+            history_summary: None,
+        };
+    };
+    if tier == CompactionTier::AggressivePrune
+        && compacted.iter().enumerate().any(|(index, message)| {
+            astra_turn_types::runtime_message_delivery(message)
+                == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+                && !authority.active[index]
+        })
+    {
+        let keep = vec![true; compacted.len()];
+        prune_selected_messages(&mut compacted, keep, None, None, protect);
+        let Some(updated_authority) = authority_retention(&compacted, None, protect) else {
+            return CompactResult {
+                messages: messages.to_vec(),
+                boundary: None,
+                tier,
+                session_memory_context: None,
+                retrieved_memory_entries: Vec::new(),
+                history_summary: None,
+            };
+        };
+        authority = updated_authority;
+    }
     let latest_tool_index = compacted
         .iter()
         .rposition(|message| message.get("role").and_then(Value::as_str) == Some("tool"));
     let referenced = referenced_tool_results(&compacted);
     const TOOL_COMPACT_SUFFIX: &str = "\n...[compacted for context budget]";
-    for (index, message) in compacted
-        .iter_mut()
-        .enumerate()
-        .take(protected_suffix_start)
-    {
-        if message.get("role").and_then(Value::as_str) != Some("tool")
+    for (index, message) in compacted.iter_mut().enumerate() {
+        if authority.protected[index]
+            || message.get("role").and_then(Value::as_str) != Some("tool")
             || referenced[index]
             || Some(index) == latest_tool_index
         {
@@ -1374,7 +1532,10 @@ pub(crate) fn compact_tiered_impl(
         if assistant_indices.len() > keep_recent_turns {
             let compact_count = assistant_indices.len() - keep_recent_turns;
             for &index in assistant_indices.iter().take(compact_count) {
-                if index >= protected_suffix_start
+                if authority.protected[index]
+                    || compacted[index]
+                        .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                        .is_some()
                     || !compacted[index]
                         .get("content")
                         .is_some_and(Value::is_string)
@@ -1419,7 +1580,7 @@ pub(crate) fn compact_tiered_impl(
                         || index >= tail_start
                 })
                 .collect();
-            prune_selected_messages(&mut compacted, keep, None, latest_user_idx);
+            prune_selected_messages(&mut compacted, keep, None, latest_user_idx, protect);
         }
     }
 
@@ -1431,14 +1592,15 @@ pub(crate) fn compact_tiered_impl(
         &mut compacted,
         budget_chars,
         tier == CompactionTier::AggressivePrune,
+        protect,
     );
     if tier == CompactionTier::AggressivePrune {
         while serialized_message_chars(&compacted) > budget_chars
-            && prune_oldest_conversation_span(&mut compacted)
+            && prune_oldest_conversation_span(&mut compacted, protect)
         {
-            truncate_tool_results_to_serialized_budget(&mut compacted, budget_chars, true);
+            truncate_tool_results_to_serialized_budget(&mut compacted, budget_chars, true, protect);
         }
-        truncate_tool_results_to_serialized_budget(&mut compacted, budget_chars, false);
+        truncate_tool_results_to_serialized_budget(&mut compacted, budget_chars, false, protect);
     }
 
     let boundary = (compacted != messages).then(|| {
@@ -1631,7 +1793,10 @@ mod tests {
         kind: &str,
         lifetime: astra_turn_types::RuntimeAuthorityLifetime,
     ) -> Value {
-        let mut message = json!({"role": "user", "content": content});
+        let frame =
+            astra_turn_types::render_append_only_runtime_authority_frame(kind, lifetime, content)
+                .unwrap();
+        let mut message = json!({"role": "user", "content": frame});
         astra_turn_types::mark_append_only_required_context(&mut message, kind, lifetime);
         message
     }
@@ -1685,10 +1850,51 @@ mod tests {
             astra_turn_types::active_append_only_authority_protected_suffix_start(&result.messages),
             Some(human_index)
         );
+        assert!(serialized_message_chars(&result.messages) < serialized_message_chars(&messages));
         assert!(
-            !prune_oldest_conversation_span(&mut result.messages.clone()),
+            !prune_oldest_conversation_span(&mut result.messages.clone(), None),
             "repeated budget pruning must stop before splitting the protected current-turn suffix"
         );
+    }
+
+    #[test]
+    fn protected_oldest_round_does_not_block_later_pruning() {
+        let mut messages = vec![user("goal")];
+        for id in ["skill", "old", "recent"] {
+            messages.push(json!({"role":"assistant", "tool_calls":[{
+                "id":id, "type":"function", "function":{
+                    "name":"read_file", "arguments":json!({"path":"x".repeat(3_000)}).to_string()
+                }
+            }]}));
+            messages.push(tool_with_id(id, "evidence"));
+        }
+        messages.push(assistant("partial"));
+        let protect = |history: &[Value]| {
+            history
+                .iter()
+                .map(|message| message["role"] == "tool" && message["tool_call_id"] == "skill")
+                .collect()
+        };
+        assert!(prune_oldest_conversation_span(
+            &mut messages,
+            Some(&protect)
+        ));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["tool_call_id"] == "skill")
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message["tool_call_id"] == "old")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["tool_call_id"] == "recent")
+        );
+        astra_turn_types::validate_canonical_tool_pairing(&messages).unwrap();
     }
 
     #[test]
@@ -1710,7 +1916,7 @@ mod tests {
             compact_tiered_with_result(&messages, 1, 100, CompactionTier::AggressivePrune, 1);
 
         assert!(result.messages.iter().all(|message| {
-            message.get("content").and_then(Value::as_str) != Some("expired control")
+            astra_turn_types::runtime_authority_kind(message) != Some("old_work")
         }));
         assert!(result.messages.iter().any(|message| {
             message.get("content").and_then(Value::as_str) == Some("current goal")
@@ -1846,7 +2052,8 @@ mod tests {
         assert!(truncate_tool_results_to_serialized_budget(
             &mut messages,
             0,
-            false
+            false,
+            None,
         ));
         assert!(
             messages
@@ -2700,13 +2907,293 @@ mod mechanical_owner_tests {
     use serde_json::json;
 
     #[test]
-    fn every_raw_budget_tier_preserves_the_entire_active_authority_suffix() {
+    fn active_authority_does_not_prevent_current_turn_budget_compaction() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        use astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn;
+
+        let work = required_append_only_runtime_authority_message(
+            "Keep the current Work contract",
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let snapshot = required_append_only_runtime_authority_message(
+            "{\"contexts\":[]}",
+            RuntimeAuthorityKind::RuntimeContextSnapshot,
+            CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let mut messages = vec![
+            json!({"role":"user", "content":"Complete the task"}),
+            work.clone(),
+            snapshot.clone(),
+        ];
+        for index in 0..12 {
+            let id = format!("call-{index}");
+            messages.push(json!({"role":"assistant", "content":null, "tool_calls":[{
+                "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+            }]}));
+            messages.push(
+                json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(1200)}),
+            );
+        }
+        astra_turn_types::validate_canonical_tool_pairing(&messages).unwrap();
+
+        let result =
+            compact_tiered_impl(&messages, 12_000, 200, CompactionTier::AggressivePrune, 2);
+
+        assert!(serialized_message_chars(&result.messages) <= 12_000);
+        assert!(result.messages.contains(&work));
+        assert!(result.messages.contains(&snapshot));
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|message| message["content"] == "Complete the task")
+        );
+        astra_turn_types::validate_canonical_tool_pairing(&result.messages).unwrap();
+    }
+
+    #[test]
+    fn pressure_keeps_retry_response_and_does_not_revive_expired_authority() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        use astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision;
+
+        let frame = |kind, content| {
+            required_append_only_runtime_authority_message(content, kind, NextAssistantDecision)
+                .unwrap()
+                .unwrap()
+        };
+        let expired = frame(RuntimeAuthorityKind::ExecutionTimeBudget, "old deadline");
+        let retry = frame(
+            RuntimeAuthorityKind::OutputCapContinuation,
+            "continue the response",
+        );
+        let partial = json!({"role":"assistant", "content":"unfinished response"});
+        let mut messages = vec![
+            json!({"role":"user", "content":"Complete the task"}),
+            expired,
+        ];
+        for index in 0..8 {
+            let id = format!("call-{index}");
+            messages.push(json!({"role":"assistant", "content":null, "tool_calls":[{
+                "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+            }]}));
+            messages.push(
+                json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(1200)}),
+            );
+        }
+        messages.extend([partial.clone(), retry.clone()]);
+        let result =
+            compact_tiered_impl(&messages, 12_000, 200, CompactionTier::AggressivePrune, 1);
+
+        assert!(serialized_message_chars(&result.messages) <= 12_000);
+        let retry_index = result
+            .messages
+            .iter()
+            .position(|message| message == &retry)
+            .unwrap();
+        assert_eq!(result.messages[retry_index - 1], partial);
+        assert!(astra_turn_types::append_only_runtime_authority_is_active(
+            &result.messages,
+            retry_index
+        ));
+        assert!(result.messages.iter().enumerate().all(|(index, message)| {
+            astra_turn_types::runtime_authority_kind(message) != Some("execution_time_budget")
+                || !astra_turn_types::append_only_runtime_authority_is_active(
+                    &result.messages,
+                    index,
+                )
+        }));
+        astra_turn_types::validate_canonical_tool_pairing(&result.messages).unwrap();
+    }
+
+    #[test]
+    fn active_advisory_snapshot_does_not_pin_an_unrelated_tool_pair() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        let call = json!({"role":"assistant", "content":"preceding decision ".repeat(100), "tool_calls":[{
+            "id":"protected", "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+        }]});
+        let result = json!({"role":"tool", "tool_call_id":"protected", "content":"unrelated evidence ".repeat(1200)});
+        let frame = required_append_only_runtime_authority_message(
+            "selected advisory",
+            RuntimeAuthorityKind::RuntimeContextSnapshot,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let mut messages = vec![
+            json!({"role":"user", "content":"goal"}),
+            call.clone(),
+            result.clone(),
+            frame.clone(),
+        ];
+        for index in 0..8 {
+            let id = format!("later-{index}");
+            messages.push(json!({"role":"assistant", "content":null, "tool_calls":[{
+                "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+            }]}));
+            messages.push(
+                json!({"role":"tool", "tool_call_id":id, "content":"other evidence ".repeat(800)}),
+            );
+        }
+        let compacted =
+            compact_tiered_impl(&messages, 12_000, 200, CompactionTier::AggressivePrune, 1);
+        assert!(serialized_message_chars(&compacted.messages) <= 12_000);
+        assert!(!compacted.messages.contains(&result));
+        assert!(compacted.messages.contains(&frame));
+        astra_turn_types::validate_canonical_tool_pairing(&compacted.messages).unwrap();
+    }
+
+    #[test]
+    fn pairing_cannot_revive_a_consumed_control() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        let frame = required_append_only_runtime_authority_message(
+            "expired deadline",
+            RuntimeAuthorityKind::ExecutionTimeBudget,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        let original = vec![
+            json!({"role":"user", "content":"goal"}),
+            frame,
+            json!({"role":"assistant", "content":"the decision consuming the control"}),
+        ];
+        astra_turn_types::validate_canonical_tool_pairing(&original).unwrap();
+        let mut candidate = original.clone();
+        let outcome =
+            prune_selected_messages(&mut candidate, vec![true, true, false], None, Some(0), None);
+        assert!(outcome.estimated_tokens_freed > 0);
+        assert_eq!(candidate, vec![original[0].clone()]);
+        astra_turn_types::validate_canonical_tool_pairing(&candidate).unwrap();
+    }
+
+    #[test]
+    fn retry_after_other_runtime_frames_keeps_its_assistant_under_pressure() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        for kind in [
+            RuntimeAuthorityKind::OutputCapContinuation,
+            RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+        ] {
+            let work = required_append_only_runtime_authority_message(
+                "active Work",
+                RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap();
+            let retry = required_append_only_runtime_authority_message(
+                "retry the preceding response",
+                kind,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+            let assistant = json!({"role":"assistant", "content":"partial result"});
+            let mut messages = vec![json!({"role":"user", "content":"goal"})];
+            for index in 0..10 {
+                let id = format!("call-{index}");
+                messages.push(json!({"role":"assistant", "tool_calls":[{
+                    "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+                }]}));
+                messages.push(
+                    json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(800)}),
+                );
+            }
+            messages.extend([assistant.clone(), work.clone(), retry.clone()]);
+            astra_turn_types::validate_canonical_tool_pairing(&messages).unwrap();
+            let result =
+                compact_tiered_impl(&messages, 12_000, 200, CompactionTier::AggressivePrune, 2);
+            assert!(serialized_message_chars(&result.messages) <= 12_000);
+            assert!(result.messages.ends_with(&[assistant, work, retry]));
+            astra_turn_types::validate_canonical_tool_pairing(&result.messages).unwrap();
+        }
+    }
+
+    #[test]
+    fn responses_replay_content_is_not_shortened_only_in_canonical_history() {
+        let text = "earlier answer ".repeat(1_000);
+        let mut old = json!({"role":"assistant", "content":text});
+        old[astra_core::model_wire::responses::CONTINUATION_KEY] = json!({
+            "connection_id":"connection", "model":"model", "items":[{
+                "type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]
+            }]
+        });
+        let mut messages = vec![json!({"role":"user", "content":"goal"}), old.clone()];
+        for index in 0..2 {
+            let id = format!("call-{index}");
+            messages.push(json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}));
+            messages.push(
+                json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(1_000)}),
+            );
+        }
+        messages.push(json!({"role":"assistant", "content":"latest response"}));
+        let result = compact_tiered_impl(&messages, 1, 100, CompactionTier::CompactHistory, 1);
+        assert!(result.boundary.is_some());
+        assert!(result.messages.contains(&old));
+        let request = astra_core::model_wire::responses::request(
+            "model",
+            &result.messages,
+            None,
+            "connection",
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(serde_json::to_string(&request).unwrap().contains(&text));
+    }
+
+    #[test]
+    fn malformed_or_anchorless_authority_fails_closed_during_compaction() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        let frame = required_append_only_runtime_authority_message(
+            "required control",
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let mut malformed = frame.clone();
+        malformed["content"] = json!("invalid frame");
+        for messages in [
+            vec![json!({"role":"user", "content":"goal"}), malformed],
+            vec![frame],
+        ] {
+            let result = compact_tiered_impl(&messages, 1, 100, CompactionTier::AggressivePrune, 1);
+            assert_eq!(result.messages, messages);
+            assert!(result.boundary.is_none());
+        }
+    }
+
+    #[test]
+    fn every_raw_budget_tier_preserves_active_authority_and_compacts_old_results() {
         for tier in [
             CompactionTier::TrimSchemas,
             CompactionTier::CompactHistory,
             CompactionTier::AggressivePrune,
         ] {
-            let mut authority = json!({"role":"user", "content":"current Work contract"});
+            let content = astra_turn_types::render_append_only_runtime_authority_frame(
+                "work",
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+                "current Work contract",
+            )
+            .unwrap();
+            let mut authority = json!({"role":"user", "content":content});
             astra_turn_types::mark_append_only_required_context(
                 &mut authority,
                 "work",
@@ -2717,7 +3204,7 @@ mod mechanical_owner_tests {
                 json!({"role":"user", "content":"initial goal"}),
                 json!({"role":"assistant", "content":"old answer ".repeat(1000)}),
                 json!({"role":"user", "content":"current goal"}),
-                authority,
+                authority.clone(),
             ];
             for index in 0..8 {
                 messages.push(json!({"role":"assistant", "content":"current response ".repeat(200),
@@ -2730,11 +3217,11 @@ mod mechanical_owner_tests {
                 .iter()
                 .position(|message| message["content"] == "current goal")
                 .unwrap();
-            assert_eq!(
-                &result.messages[anchor..],
-                &messages[3..],
-                "tier {tier:?} must preserve the ordered authority suffix"
+            assert_eq!(result.messages[anchor + 1], authority);
+            assert!(
+                serialized_message_chars(&result.messages) < serialized_message_chars(&messages)
             );
+            astra_turn_types::validate_canonical_tool_pairing(&result.messages).unwrap();
         }
     }
 
@@ -2892,7 +3379,8 @@ mod mechanical_owner_tests {
         let mut keep = vec![false; messages.len()];
         keep[6] = true;
         assert!(
-            prune_selected_messages(&mut messages, keep, None, None).estimated_tokens_freed > 0
+            prune_selected_messages(&mut messages, keep, None, None, None).estimated_tokens_freed
+                > 0
         );
         assert_eq!(
             messages.len(),

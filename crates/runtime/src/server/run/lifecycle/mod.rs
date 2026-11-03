@@ -5513,11 +5513,9 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
         opening
             .ok_or("root Run is missing its immutable opening")?
             .bind_context_authority(admission.authority.clone(), &self.request.message)?;
-        self.full_llm_capture = run_admission.session_metadata().map(|metadata| {
-            crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(
-                metadata.as_object(),
-            )
-        });
+        self.full_llm_capture = run_admission
+            .session_capture_override()
+            .map(crate::turn::llm::exchange_capture::session_full_llm_capture_override_enabled);
         self.admission = Some(admission);
         Ok(())
     }

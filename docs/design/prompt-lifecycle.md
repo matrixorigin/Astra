@@ -136,13 +136,19 @@ Unchanged snapshots are deduplicated across tool rounds; a changed or empty
 snapshot supersedes the previous facts, and a new human turn expires them.
 Their historical bytes remain cacheable evidence, with no instruction or execution authority.
 This preserves the full selected context without a separate cache history or
-additional database admission query. Ordinary context budgeting and compaction
-still bound retained history; cache hit rate is never a reason to omit context.
+additional database admission query. When context pressure requires a rewrite,
+compaction may remove expired frames and older complete tool rounds while
+retaining the active snapshot, required controls and their dependencies. This
+can invalidate the provider cache; cache hit rate never overrides the budget
+or permits omitting active context.
 
 When an active session changes to a non-append wire shape, expired frames are
-removed from the provider projection. Active authority is unframed and re-homed
-to the required system lane; kinds rebuilt by a current authoritative source
-replace their historical frame instead of being duplicated. Canonical history
+removed from the provider projection. Active required authority is unframed and
+re-homed to the required system lane; kinds rebuilt by a current authoritative
+source replace their historical frame instead of being duplicated. Advisory
+snapshots are replaced by the destination provider's current context selection
+and delivery policy, including when returning to an append-only `RequiredOnly`
+placement. Canonical history
 retains the typed record needed for deterministic resume, while the chosen
 provider projection contains each effective authority kind once. Correctness is
 never weakened to preserve cache reuse.

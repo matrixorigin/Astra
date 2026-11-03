@@ -168,6 +168,7 @@ impl ProviderGateway {
         };
         let app = Router::new()
             .route("/v1/chat/completions", post(provider_handler))
+            .route("/v1/responses", post(provider_handler))
             .route("/v1/messages", post(provider_handler))
             .route("/v1/systemone", post(provider_handler))
             .route("/model/{model}/converse", post(provider_handler))

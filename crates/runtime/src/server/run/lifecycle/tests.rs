@@ -12057,22 +12057,30 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
         }
     }
     let pool = setup_lifecycle_run_db_it().await;
-    for (reject, capture) in [
-        (false, None),
-        (false, Some(true)),
-        (false, Some(false)),
-        (true, Some(true)),
+    for (reject, metadata, capture) in [
+        (false, None, None),
+        (false, Some(json!({"full_llm_capture": true})), Some(true)),
+        (false, Some(json!({"full_llm_capture": false})), Some(false)),
+        (false, Some(json!({"full_llm_capture": "true"})), None),
+        (false, Some(json!({"full_llm_capture": null})), None),
+        (false, Some(json!({"full_llm_capture": 1})), None),
+        (
+            false,
+            Some(json!({"full_llm_capture": false, "unrelated": "x".repeat(65_536)})),
+            Some(false),
+        ),
+        (true, Some(json!({"full_llm_capture": true})), Some(true)),
     ] {
         let suffix = Uuid::new_v4();
         let user = format!("atomic-start-user-{suffix}");
         let session = format!("atomic-start-session-{suffix}");
         let run = format!("atomic-start-run-{suffix}");
         crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
-        if let Some(enabled) = capture {
+        if let Some(metadata) = metadata {
             sqlx::query(
                 "UPDATE agent_sessions SET metadata = ? WHERE user_id = ? AND session_id = ?",
             )
-            .bind(json!({"full_llm_capture": enabled}).to_string())
+            .bind(metadata.to_string())
             .bind(&user)
             .bind(&session)
             .execute(pool.get())

@@ -120,6 +120,15 @@ pub fn duplicate_output_targets(messages: &[Value]) -> Vec<Option<usize>> {
         .collect()
 }
 
+/// Results referenced by a retained duplicate placeholder must remain intact.
+pub fn duplicate_output_referenced_targets(messages: &[Value]) -> Vec<bool> {
+    let mut referenced = vec![false; messages.len()];
+    for target in duplicate_output_targets(messages).into_iter().flatten() {
+        referenced[target] = true;
+    }
+    referenced
+}
+
 pub fn matching_result_attribution(left: &Value, right: &Value) -> bool {
     let ignored = |key: &str| {
         matches!(

@@ -5541,7 +5541,7 @@ pub struct RunMutationAdmission {
     opening_hash: Option<String>,
     context_admission_hash: Option<String>,
     operation: RunMutationOperation,
-    session_metadata: Option<serde_json::Value>,
+    session_capture_override: Option<Option<bool>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5561,7 +5561,7 @@ impl RunMutationAdmission {
             opening_hash: run.opening_hash.clone(),
             context_admission_hash: run.context_admission_hash.clone(),
             operation,
-            session_metadata: None,
+            session_capture_override: None,
         }
     }
 
@@ -5569,10 +5569,10 @@ impl RunMutationAdmission {
         self.generation
     }
 
-    /// Session configuration read under the same owned opening fence. It is
-    /// absent for ordinary mutations and is never client-supplied authority.
-    pub fn session_metadata(&self) -> Option<&serde_json::Value> {
-        self.session_metadata.as_ref()
+    /// The outer option proves a Session was read under the opening fence;
+    /// the inner option is its explicit capture override, if any.
+    pub fn session_capture_override(&self) -> Option<Option<bool>> {
+        self.session_capture_override
     }
 
     /// Only a freshly claimed terminal can skip raw-history membership reads.
@@ -14732,7 +14732,7 @@ impl DatabaseRunStateStore {
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
         let independent = run_requires_independent_admission(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
-        let session_metadata = if independent {
+        let session_capture_override = if independent {
             crate::storage::admit_independent_run_creation(
                 &mut tx,
                 &record.session_id,
@@ -14747,7 +14747,7 @@ impl DatabaseRunStateStore {
                 &record.user_id,
             )
             .await
-            .map(|()| Some(serde_json::Value::Null))
+            .map(|()| Some(None))
         }
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
@@ -14756,7 +14756,8 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
-        let session_metadata = session_metadata.ok_or(RunAdmissionError::SessionBusy)?;
+        let session_capture_override =
+            session_capture_override.ok_or(RunAdmissionError::SessionBusy)?;
         let provider_owner = record
             .opening
             .loaded()?
@@ -14827,7 +14828,7 @@ impl DatabaseRunStateStore {
             let mut admission =
                 RunMutationAdmission::from_record(&record, RunMutationOperation::Opening);
             if independent {
-                admission.session_metadata = Some(session_metadata);
+                admission.session_capture_override = Some(session_capture_override);
             }
             participant
                 .stage(&mut tx, &admission, record.opening.loaded_mut()?)
