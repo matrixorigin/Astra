@@ -12405,6 +12405,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_null_markers_cannot_hide_raw_usage_conflicts() {
+        let mut frames = Vec::new();
+        for usage in [
+            json!({
+                "prompt_tokens":null,"completion_tokens":null,"input_tokens":4,"output_tokens":7,
+                "cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                "opencode":{"tokens":{"input":5,"output":8,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+            }),
+            json!({"opencode":{"tokens":{"input":4,"output":7}}}),
+        ] {
+            frames.push(Ok(Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"usage":usage})
+            ))));
+        }
+        frames.push(Ok(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )));
+        let result = collect_llm_stream(
+            stream::iter(frames),
+            "opencode-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .expect("invalid accounting evidence must not discard the answer");
+        assert_eq!(result.full_text, "done");
+        assert!(result.usage_presence.input_invalid && result.usage_presence.output_invalid);
+        assert!(result.usage.is_empty());
+        let terminal = provider_attempt_terminal_from_result(&result);
+        assert_ne!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::ProviderExact
+        );
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_opencode_usage_reaches_provider_accounting() {
         for (usage, expected_input, expected_output) in [
             (

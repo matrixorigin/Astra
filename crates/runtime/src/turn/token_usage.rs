@@ -406,48 +406,18 @@ fn parse_openai_usage(
     u: &Map<String, Value>,
     same_frame_aliases: bool,
 ) -> Option<(TokenUsage, TokenUsagePresence)> {
-    // Select the existing generic dialect before reconciling OpenCode lanes.
-    // Anthropic-shaped OpenAI-compatible responses use the same normalizer so
-    // the extension cannot bypass validation or change a fresh input to a total.
-    let disjoint_aliases = !u.contains_key("prompt_tokens")
-        && !u.contains_key("completion_tokens")
-        && ![
-            "prompt_tokens_details",
-            "prompt_cache_hit_tokens",
-            "prompt_cache_miss_tokens",
-        ]
-        .iter()
-        .any(|key| u.get(*key).is_some_and(|value| !value.is_null()))
-        && [
-            "input_tokens",
-            "output_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        ]
-        .iter()
-        .any(|key| u.contains_key(*key));
     let mut input_invalid = false;
     let mut output_invalid = false;
-    let prompt = decode_count(
-        u.get(if disjoint_aliases {
-            "input_tokens"
-        } else {
-            "prompt_tokens"
-        }),
-        &mut input_invalid,
-    );
+    // Decode every reported alias independently. Null is absence, and a field
+    // on the output side cannot select or suppress an input dialect.
+    let prompt = decode_count(u.get("prompt_tokens"), &mut input_invalid);
+    let native_input = decode_count(u.get("input_tokens"), &mut input_invalid);
     let hit = decode_count(u.get("prompt_cache_hit_tokens"), &mut input_invalid);
     let miss = decode_count(u.get("prompt_cache_miss_tokens"), &mut input_invalid);
     let top_read = decode_count(u.get("cache_read_input_tokens"), &mut input_invalid);
     let top_write = decode_count(u.get("cache_creation_input_tokens"), &mut input_invalid);
-    let output = decode_count(
-        u.get(if disjoint_aliases {
-            "output_tokens"
-        } else {
-            "completion_tokens"
-        }),
-        &mut output_invalid,
-    );
+    let completion = decode_count(u.get("completion_tokens"), &mut output_invalid);
+    let native_output = decode_count(u.get("output_tokens"), &mut output_invalid);
     let details = u.get("prompt_tokens_details").and_then(Value::as_object);
     input_invalid |= u
         .get("prompt_tokens_details")
@@ -488,11 +458,11 @@ fn parse_openai_usage(
         total
     });
     let opencode_output = decode_opencode("output", &mut output_invalid);
-    let opencode_input_reported = [opencode_input, opencode_read, write_5m, write_1h]
-        .into_iter()
-        .any(|value| value.is_some());
     let mut output_conflict = false;
-    let output = reconcile_usage_aliases(&[output, opencode_output], &mut output_conflict);
+    let output = reconcile_usage_aliases(
+        &[completion, native_output, opencode_output],
+        &mut output_conflict,
+    );
     output_invalid |= same_frame_aliases && output_conflict;
     let native_partition = hit.is_some() || miss.is_some();
     let mut alias_conflict = false;
@@ -500,10 +470,7 @@ fn parse_openai_usage(
         || nested_read.is_some()
         || nested_write.is_some()
         || cache_write.is_some()
-        || (opencode_input_reported
-            && !disjoint_aliases
-            && top_read.is_none()
-            && top_write.is_none());
+        || (top_read.is_none() && top_write.is_none());
     // These fields mirror the same lanes, not additional billable usage.
     // Cumulative snapshots arriving in different frames may be repaired later.
     let cached = reconcile_usage_aliases(
@@ -533,19 +500,16 @@ fn parse_openai_usage(
                 .and_then(|cache| total.checked_sub(cache))
         })
     };
-    let fresh = if disjoint_aliases {
-        prompt
-    } else if native_partition {
+    let fresh = if native_partition {
         miss.or_else(derived_fresh)
     } else if inclusive {
         derived_fresh()
-    } else if top_read.is_some() || top_write.is_some() {
+    } else {
         // Explicit top-level proxy cache lanes select the disjoint dialect.
         prompt
-    } else {
-        None
     };
-    let fresh = reconcile_usage_aliases(&[fresh, opencode_input], &mut alias_conflict);
+    let fresh =
+        reconcile_usage_aliases(&[fresh, native_input, opencode_input], &mut alias_conflict);
     input_invalid |= same_frame_aliases && alias_conflict;
     let known_sum = [fresh, cached, creation]
         .into_iter()
@@ -577,23 +541,17 @@ fn parse_openai_usage(
             .and_then(|((fresh, read), write)| fresh.checked_add(read)?.checked_add(write))
             .filter(|total| i64::try_from(*total).is_ok())
     };
-    let measured_input_tokens = if inclusive && opencode_input_reported {
+    let measured_input_tokens = if inclusive {
         prompt.or_else(measured_partition)
-    } else if inclusive {
-        prompt
-    } else if disjoint_aliases || top_read.is_some() || top_write.is_some() {
-        measured_partition()
     } else {
-        prompt
+        measured_partition()
     }
     .filter(|_| !input_invalid && !partition_conflict && !alias_conflict);
-    if !disjoint_aliases
-        && prompt.zip(output).is_some_and(|(input, output)| {
-            input
-                .checked_add(output)
-                .is_none_or(|sum| i64::try_from(sum).is_err())
-        })
-    {
+    if prompt.zip(output).is_some_and(|(input, output)| {
+        input
+            .checked_add(output)
+            .is_none_or(|sum| i64::try_from(sum).is_err())
+    }) {
         input_invalid = true;
         output_invalid = true;
     }
@@ -610,7 +568,6 @@ fn parse_openai_usage(
         && presence.measured_input_tokens.is_none()
         && !input_invalid
         && !output_invalid
-        && !disjoint_aliases
     {
         return None;
     }
@@ -689,6 +646,77 @@ fn parse_disjoint_usage(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn null_openai_markers_do_not_hide_reported_alias_conflicts() {
+        for generic in [
+            serde_json::json!({"prompt_tokens":null,"completion_tokens":null,"input_tokens":4,"output_tokens":7}),
+            serde_json::json!({"prompt_tokens":null,"completion_tokens":8,"input_tokens":4,"output_tokens":7}),
+            serde_json::json!({"prompt_tokens":16,"completion_tokens":null,"input_tokens":4,"output_tokens":7}),
+            serde_json::json!({"prompt_tokens":16,"completion_tokens":8,"input_tokens":4,"output_tokens":7}),
+        ] {
+            let mut raw = generic;
+            raw["cache_read_input_tokens"] = serde_json::json!(6);
+            raw["cache_creation_input_tokens"] = serde_json::json!(5);
+            // The nested inclusive cache counts make prompt_tokens=16 agree
+            // with OpenCode input=5; input_tokens=4 must still be checked.
+            raw["prompt_tokens_details"] =
+                serde_json::json!({"cached_tokens":6,"cache_write_tokens":5});
+            raw["opencode"] = serde_json::json!({"tokens":{"input":5,"output":8,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}});
+            let (usage, presence) =
+                super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+            assert!(presence.input_invalid, "{raw}");
+            assert!(presence.output_invalid, "{raw}");
+            assert!(usage.to_qualified_json_map(presence).is_empty(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn null_openai_markers_preserve_consistent_disjoint_evidence() {
+        for (input, output, read, short, long) in [(4, 7, 6, 2, 3), (0, 0, 0, 0, 0)] {
+            let raw = serde_json::json!({
+                "prompt_tokens":null,"completion_tokens":null,
+                "input_tokens":input,"output_tokens":output,
+                "cache_read_input_tokens":read,"cache_creation_input_tokens":short+long,
+                "opencode":{"tokens":{"input":input,"output":output,"cache_read":read,"cache_write_5m":short,"cache_write_1h":long}}
+            });
+            let (usage, presence) =
+                super::parse_usage(super::UsageDialect::OpenAi, raw.as_object().unwrap()).unwrap();
+            assert_eq!(
+                presence.measured_input_tokens,
+                Some(input + read + short + long)
+            );
+            assert_eq!(
+                serde_json::Value::Object(usage.to_qualified_json_map(presence)),
+                serde_json::json!({
+                    "input_tokens":input,"cached_input_tokens":read,"cache_creation_tokens":short+long,
+                    "output_tokens":output,"total_tokens":input+read+short+long+output
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn null_markers_cannot_make_raw_stream_alias_conflicts_repairable() {
+        let contradictory = serde_json::json!({
+            "prompt_tokens":null,"completion_tokens":null,"input_tokens":4,"output_tokens":7,
+            "cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+            "opencode":{"tokens":{"input":5,"output":8,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+        });
+        let mut accumulated = serde_json::Map::new();
+        let (_, invalid) = super::update_openai_usage(
+            &mut accumulated,
+            contradictory.as_object().unwrap(),
+            super::TokenUsagePresence::default(),
+        )
+        .unwrap();
+        let matching = serde_json::json!({"opencode":{"tokens":{"input":4,"output":7}}});
+        let (usage, presence) =
+            super::update_openai_usage(&mut accumulated, matching.as_object().unwrap(), invalid)
+                .unwrap();
+        assert!(presence.input_invalid && presence.output_invalid);
+        assert!(usage.to_qualified_json_map(presence).is_empty());
+    }
+
     #[test]
     fn opencode_extension_preserves_existing_disjoint_dialects() {
         for generic in [

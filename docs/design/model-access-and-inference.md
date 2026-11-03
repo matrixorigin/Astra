@@ -1068,6 +1068,9 @@ generic and OpenCode fields must agree, and a complete input partition must
 match an inclusive prompt total. The generic fields retain their existing
 inclusive or disjoint semantics; Anthropic-shaped OpenAI-compatible responses
 reconcile the extension through the same OpenAI usage normalizer.
+Aliases are decoded independently: null fields carry no evidence, and reported
+`input_tokens`/`output_tokens` remain subject to reconciliation even when
+`prompt_tokens`/`completion_tokens` are also present.
 The existing streaming collector retains
 partial cumulative samples and rejects invalid or contradictory raw evidence.
 This extends usage normalization, not the model invocation protocol or billing
