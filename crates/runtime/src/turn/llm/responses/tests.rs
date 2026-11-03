@@ -71,6 +71,14 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let scope = format!("sha256:{}", "a".repeat(64));
+    fn cache_capability() -> CacheCapability {
+        CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        }
+    }
     fn call<'a>(
         messages: &'a [Value],
         tools: &'a [Value],
@@ -82,7 +90,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             messages,
             tools,
-            cache_capability: None,
+            cache_capability: Some(cache_capability()),
             route: LlmExecutionRoute {
                 inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
                 response_scope: Some(scope),
@@ -110,7 +118,21 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     let tools = vec![
         json!({"type":"function","function":{"name":"lookup","description":"look up","parameters":{"type":"object","properties":{}}}}),
     ];
-    let first_messages = vec![json!({"role":"user","content":"look up"})];
+    let snapshot = |content: &str| {
+        crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            content,
+            crate::turn::wire_assembly::RuntimeAuthorityKind::RuntimeContextSnapshot,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap()
+    };
+    let mut first_messages = vec![json!({"role":"system","content":"stable policy"})];
+    crate::turn::wire_assembly::ensure_append_only_runtime_authority_policy(&mut first_messages);
+    first_messages.extend([
+        json!({"role":"user","content":"look up"}),
+        snapshot("first optional observation"),
+    ]);
     let thinking = ThinkingConfig::Adaptive {
         effort: astra_turn_core::thinking_config::ThinkingEffort::Max,
     };
@@ -127,6 +149,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     let mut messages = first_messages;
     messages.push(json!({"role":"assistant","content":"","tool_calls":first.tool_calls,astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}));
     messages.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
+    messages.push(snapshot("updated optional observation"));
     let second = call_llm_and_collect_with_stream_callback(
         call(&messages, &tools, &scope, &base, &thinking),
         LlmCancel::None,
@@ -141,6 +164,19 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     let requests = requests.lock().unwrap();
     assert_eq!(requests[0]["reasoning"]["effort"], "max");
     assert_eq!(requests[0]["include"][0], "reasoning.encrypted_content");
+    assert!(
+        requests[1]["input"]
+            .as_array()
+            .unwrap()
+            .starts_with(requests[0]["input"].as_array().unwrap()),
+        "Responses must preserve the complete preceding request, including all runtime context"
+    );
+    assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+    assert!(
+        requests[1]["input"]
+            .to_string()
+            .contains("updated optional observation")
+    );
     assert!(
         requests[1]["input"]
             .as_array()

@@ -1268,12 +1268,14 @@ impl SessionExecutionActivity {
 /// New independent executions check occupancy in their existing owned Session
 /// read, before inserting a Run. Excluding the requested Run key permits only
 /// the unique-key replay path; a duplicate never returns a new execution grant.
+/// Return the admitted Session metadata from that same locked read. `None`
+/// means occupied; a Session without metadata returns an empty object.
 pub(crate) async fn admit_independent_run_creation<T>(
     tx: &mut T,
     session_id: &str,
     user_id: &str,
     run_id: &str,
-) -> Result<bool, sqlx::Error>
+) -> Result<Option<serde_json::Value>, sqlx::Error>
 where
     T: TransactionConnection,
 {
@@ -1285,7 +1287,9 @@ where
             }
             error => error,
         })?;
-    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT session.status, ");
+    let mut query = sqlx::QueryBuilder::<MySql>::new(
+        "SELECT session.status, IFNULL(CAST(session.metadata AS CHAR), '{}') AS metadata_json, ",
+    );
     push_session_execution_activity(&mut query, user_id, session_id, Some(run_id));
     query
         .push(" FROM agent_sessions session WHERE session.user_id = ")
@@ -1302,7 +1306,13 @@ where
     if status != "active" {
         return Err(sqlx::Error::RowNotFound);
     }
-    Ok(SessionExecutionActivity::from_row(&row)?.is_idle())
+    if !SessionExecutionActivity::from_row(&row)?.is_idle() {
+        return Ok(None);
+    }
+    let metadata: String = row.try_get("metadata_json")?;
+    let metadata =
+        serde_json::from_str(&metadata).map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    Ok(Some(metadata))
 }
 
 /// Read actual Run/lease/effect custody under an already held Session fence.

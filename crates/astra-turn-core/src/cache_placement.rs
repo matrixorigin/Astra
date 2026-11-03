@@ -106,7 +106,7 @@ pub enum VolatilePlacement {
     /// deployment has verified that marked context is not treated as a new
     /// human request. This keeps the human message in the reusable prefix.
     TailAfterUser,
-    /// Append required runtime authority as a provenance-tagged `user` frame
+    /// Append selected runtime context as provenance-tagged `user` frames
     /// and retain that frame in conversation order. This is an explicit
     /// deployment wire shape for providers which support prefix reuse for
     /// appended conversation messages but treat every `system` message as
@@ -194,11 +194,12 @@ impl<'de> Deserialize<'de> for CacheCapability {
         if matches!(
             wire.volatile_placement,
             VolatilePlacement::AppendOnlyUserTail
-        ) && (!matches!(volatile_delivery, VolatileDeliveryPolicy::RequiredOnly)
-            || !matches!(wire.protocol, CacheProtocol::OpenAiAutoPrefix))
-        {
+        ) && !matches!(
+            wire.protocol,
+            CacheProtocol::OpenAiAutoPrefix | CacheProtocol::StrictHistoryMatch
+        ) {
             return Err(serde::de::Error::custom(
-                "append_only_user_tail requires open_ai_auto_prefix with volatile_delivery=required_only",
+                "append_only_user_tail requires a prefix or strict-history cache protocol",
             ));
         }
         Ok(Self {
@@ -211,9 +212,8 @@ impl<'de> Deserialize<'de> for CacheCapability {
 }
 
 impl CacheCapability {
-    /// Append-only history can extend a provider prefix only when every
-    /// admitted volatile message is durable. Today only required authority is
-    /// durable, so optional volatile delivery is an incoherent combination.
+    /// Append-only history requires a deployment that reuses complete prior
+    /// requests. Delivery independently selects which context is retained.
     #[must_use]
     pub fn is_valid(self) -> bool {
         match self.volatile_placement {
@@ -221,8 +221,10 @@ impl CacheCapability {
                 matches!(self.protocol, CacheProtocol::OpenAiAutoPrefix)
             }
             VolatilePlacement::AppendOnlyUserTail => {
-                matches!(self.protocol, CacheProtocol::OpenAiAutoPrefix)
-                    && matches!(self.volatile_delivery, VolatileDeliveryPolicy::RequiredOnly)
+                matches!(
+                    self.protocol,
+                    CacheProtocol::OpenAiAutoPrefix | CacheProtocol::StrictHistoryMatch
+                )
             }
             _ => true,
         }
@@ -416,25 +418,38 @@ mod tests {
     }
 
     #[test]
-    fn append_only_requires_prefix_protocol_and_required_only_delivery() {
-        for value in [
-            serde_json::json!({
-                "protocol": "OpenAiAutoPrefix",
-                "volatile_placement": "AppendOnlyUserTail",
-            }),
-            serde_json::json!({
-                "protocol": "OpenAiAutoPrefix",
-                "volatile_placement": "AppendOnlyUserTail",
-                "volatile_delivery": "All",
-            }),
-            serde_json::json!({
-                "protocol": "MarkerExplicit",
-                "volatile_placement": "AppendOnlyUserTail",
-                "volatile_delivery": "RequiredOnly",
-            }),
+    fn append_only_accepts_both_delivery_policies_for_history_caches() {
+        for protocol in [
+            CacheProtocol::OpenAiAutoPrefix,
+            CacheProtocol::StrictHistoryMatch,
         ] {
-            let error = serde_json::from_value::<CacheCapability>(value).unwrap_err();
-            assert!(error.to_string().contains("append_only_user_tail"));
+            for delivery in [
+                VolatileDeliveryPolicy::All,
+                VolatileDeliveryPolicy::RequiredOnly,
+            ] {
+                let capability = CacheCapability {
+                    protocol,
+                    volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+                    volatile_delivery: delivery,
+                    reuse_scope: None,
+                };
+                assert!(capability.is_valid());
+                assert_eq!(
+                    serde_json::from_value::<CacheCapability>(
+                        serde_json::to_value(capability).unwrap()
+                    )
+                    .unwrap(),
+                    capability
+                );
+            }
+        }
+        for protocol in [
+            CacheProtocol::MarkerExplicit,
+            CacheProtocol::BedrockCachePoint,
+            CacheProtocol::None,
+        ] {
+            let value = serde_json::json!({"protocol":protocol,"volatile_placement":"AppendOnlyUserTail","volatile_delivery":"All"});
+            assert!(serde_json::from_value::<CacheCapability>(value).is_err());
         }
     }
 

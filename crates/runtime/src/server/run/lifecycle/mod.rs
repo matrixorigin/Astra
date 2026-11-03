@@ -5450,6 +5450,7 @@ struct RootTurnStartParticipant<'a> {
     admission: Option<CanonicalTurnAdmission>,
     prepared: Option<PreparedRootContextAdmission>,
     rejection: Option<(StatusCode, Json<ErrorResponse>)>,
+    full_llm_capture: Option<bool>,
 }
 
 #[async_trait]
@@ -5512,6 +5513,11 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
         opening
             .ok_or("root Run is missing its immutable opening")?
             .bind_context_authority(admission.authority.clone(), &self.request.message)?;
+        self.full_llm_capture = run_admission.session_metadata().map(|metadata| {
+            crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(
+                metadata.as_object(),
+            )
+        });
         self.admission = Some(admission);
         Ok(())
     }
@@ -15286,6 +15292,7 @@ impl AgenticRunLifecycleService {
             admission: None,
             prepared: None,
             rejection: None,
+            full_llm_capture: None,
         });
         // Win the durable session slot before provisioning any resources.
         // Exact retries attach to the winner instead of repeating preparation.
@@ -15321,7 +15328,11 @@ impl AgenticRunLifecycleService {
             }
         };
         let mut canonical_turn = root_start.as_mut().and_then(|p| p.admission.take());
+        let full_llm_capture = root_start.as_ref().and_then(|p| p.full_llm_capture);
         drop(root_start);
+        if let Some(enabled) = full_llm_capture {
+            request.full_llm_capture = enabled;
+        }
         let execution_start_authority = match start_claim {
             DurableRunStartClaim::Started { authority } => authority,
             DurableRunStartClaim::Existing {

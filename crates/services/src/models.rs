@@ -409,13 +409,10 @@ fn validate_inference_config(provider: &str, quirks: &QuirksData) -> Result<(), 
                     capability.protocol,
                     PromptCacheProtocolData::MarkerExplicit
                         | PromptCacheProtocolData::BedrockCachePoint
-                ) || capability.volatile_placement
-                    == PromptCacheVolatilePlacementData::AppendOnlyUserTail
+                )
             })
         {
-            return Err(
-                "Responses does not support marker-based or append-only prompt caching".into(),
-            );
+            return Err("Responses does not support marker-based prompt caching".into());
         }
     }
     Ok(())
@@ -507,13 +504,12 @@ impl Serialize for PromptCacheCapabilityData {
         if matches!(
             self.volatile_placement,
             PromptCacheVolatilePlacementData::AppendOnlyUserTail
-        ) && (!matches!(
-            self.volatile_delivery,
-            PromptCacheVolatileDeliveryData::RequiredOnly
-        ) || !matches!(self.protocol, PromptCacheProtocolData::OpenAiAutoPrefix))
-        {
+        ) && !matches!(
+            self.protocol,
+            PromptCacheProtocolData::OpenAiAutoPrefix | PromptCacheProtocolData::StrictHistoryMatch
+        ) {
             return Err(serde::ser::Error::custom(
-                "append_only_user_tail requires open_ai_auto_prefix with volatile_delivery=required_only",
+                "append_only_user_tail requires a prefix or strict-history cache protocol",
             ));
         }
         let mut state = serializer.serialize_struct(
@@ -580,13 +576,12 @@ impl<'de> Deserialize<'de> for PromptCacheCapabilityData {
         if matches!(
             wire.volatile_placement,
             PromptCacheVolatilePlacementData::AppendOnlyUserTail
-        ) && (!matches!(
-            volatile_delivery,
-            PromptCacheVolatileDeliveryData::RequiredOnly
-        ) || !matches!(wire.protocol, PromptCacheProtocolData::OpenAiAutoPrefix))
-        {
+        ) && !matches!(
+            wire.protocol,
+            PromptCacheProtocolData::OpenAiAutoPrefix | PromptCacheProtocolData::StrictHistoryMatch
+        ) {
             return Err(serde::de::Error::custom(
-                "append_only_user_tail requires open_ai_auto_prefix with volatile_delivery=required_only",
+                "append_only_user_tail requires a prefix or strict-history cache protocol",
             ));
         }
         Ok(Self {
@@ -7667,7 +7662,7 @@ mod tests {
             "schema_version":2, "protocol":"openai_auto_prefix", "volatile_placement":"append_only_user_tail",
             "volatile_delivery":"required_only", "reuse_scope":"conversation_turns"
         })).unwrap());
-        assert!(validate_inference_config("openai", &invalid).is_err());
+        assert!(validate_inference_config("openai", &invalid).is_ok());
     }
 
     #[test]
@@ -9234,27 +9229,23 @@ mod tests {
     }
 
     #[test]
-    fn append_only_prompt_cache_capability_requires_prefix_protocol_and_required_delivery() {
-        for value in [
-            serde_json::json!({
-                "protocol": "openai_auto_prefix",
-                "volatile_placement": "append_only_user_tail",
-            }),
-            serde_json::json!({
-                "schema_version": PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION,
-                "protocol": "openai_auto_prefix",
-                "volatile_placement": "append_only_user_tail",
-                "volatile_delivery": "all",
-            }),
-            serde_json::json!({
-                "schema_version": PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION,
-                "protocol": "marker_explicit",
-                "volatile_placement": "append_only_user_tail",
-                "volatile_delivery": "required_only",
-            }),
-        ] {
-            let error = serde_json::from_value::<PromptCacheCapabilityData>(value).unwrap_err();
-            assert!(error.to_string().contains("append_only_user_tail"));
+    fn append_only_prompt_cache_capability_keeps_delivery_independent() {
+        for protocol in ["openai_auto_prefix", "strict_history_match"] {
+            for delivery in ["all", "required_only"] {
+                let value = serde_json::json!({
+                    "schema_version": PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION,
+                    "protocol": protocol, "volatile_placement": "append_only_user_tail",
+                    "volatile_delivery": delivery,
+                });
+                let capability =
+                    serde_json::from_value::<PromptCacheCapabilityData>(value.clone()).unwrap();
+                assert_eq!(serde_json::to_value(capability).unwrap(), value);
+            }
+        }
+        for protocol in ["marker_explicit", "bedrock_cache_point", "none"] {
+            assert!(serde_json::from_value::<PromptCacheCapabilityData>(serde_json::json!({
+                "protocol":protocol, "volatile_placement":"append_only_user_tail", "volatile_delivery":"all"
+            })).is_err());
         }
     }
 

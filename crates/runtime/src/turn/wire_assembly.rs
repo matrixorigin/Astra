@@ -462,6 +462,7 @@ pub(crate) enum RuntimeAuthorityKind {
     ExecutionTimeBudget,
     OutputCapContinuation,
     ArtifactRecovery,
+    RuntimeContextSnapshot,
 }
 
 impl RuntimeAuthorityKind {
@@ -499,6 +500,7 @@ impl RuntimeAuthorityKind {
             Self::ExecutionTimeBudget => "execution_time_budget",
             Self::OutputCapContinuation => "output_cap_continuation",
             Self::ArtifactRecovery => "artifact_recovery",
+            Self::RuntimeContextSnapshot => "runtime_context_snapshot",
         }
     }
 }
@@ -1001,7 +1003,7 @@ impl std::fmt::Display for AppendOnlyRuntimeAuthorityError {
                 "child context is missing its parent, run or agent identity"
             }
             Self::InvalidCacheCapability => {
-                "append-only placement requires required-only volatile delivery"
+                "cache placement is incompatible with the declared protocol"
             }
             Self::MissingOrInvalidDelivery => {
                 "runtime provenance has a missing or unknown delivery"
@@ -1870,6 +1872,38 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
             Some(message)
         }));
     }
+    if matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+    ) {
+        let mut optional_context = Vec::new();
+        runtime_system_messages.retain(|message| {
+            if is_required_runtime_preamble(message) {
+                true
+            } else {
+                optional_context.push(message["content"].clone());
+                false
+            }
+        });
+        if matches!(
+            cache_cap.volatile_delivery,
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::All
+        ) {
+            // Selected advisory evidence uses the existing frame, lifetime,
+            // retry and compaction owners. Replacing a wire-only suffix would
+            // invalidate a complete-history cache. An empty snapshot clears
+            // disappeared evidence; an unchanged turn-scoped snapshot dedupes.
+            let snapshot = serde_json::json!({"contexts": optional_context});
+            runtime_system_messages.push(
+                required_runtime_preamble_message(
+                    &snapshot.to_string(),
+                    RuntimeAuthorityKind::RuntimeContextSnapshot,
+                    astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+                )
+                .expect("a nonempty snapshot has text content"),
+            );
+        }
+    }
     // Re-homed authority precedes live source projections. If the same kind
     // is rebuilt or updated in this round, the latest source-owned value is
     // the sole authority sent to the provider.
@@ -1899,22 +1933,12 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         cache_cap.volatile_placement,
         astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
     ) {
-        let mut remaining_runtime_system_messages = Vec::new();
-        for message in runtime_system_messages {
-            if is_required_runtime_preamble(&message) {
-                let message = into_append_only_runtime_authority(message)?;
-                if !append_only_runtime_authority_is_redundant(&compacted_messages, &message) {
-                    new_append_only_runtime_messages.push(message);
-                }
-            } else {
-                // Optional delivery is an independent capability dimension.
-                // When explicitly enabled it remains a non-durable system
-                // suffix; only required runtime authority may enter the
-                // append-only provenance lane.
-                remaining_runtime_system_messages.push(message);
+        for message in runtime_system_messages.drain(..) {
+            let message = into_append_only_runtime_authority(message)?;
+            if !append_only_runtime_authority_is_redundant(&compacted_messages, &message) {
+                new_append_only_runtime_messages.push(message);
             }
         }
-        runtime_system_messages = remaining_runtime_system_messages;
     }
 
     let mut llm_messages = system_messages;
@@ -1935,14 +1959,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         insert_runtime_system_context(
             &mut llm_messages,
             runtime_system_messages,
-            if matches!(
-                cache_cap.volatile_placement,
-                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
-            ) {
-                astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
-            } else {
-                cache_cap.volatile_placement
-            },
+            cache_cap.volatile_placement,
         )
     };
     // Keep Anthropic's existing message-level cache boundary on the last stable
@@ -2468,6 +2485,131 @@ mod tests {
         }
     }
 
+    #[test]
+    fn append_only_all_context_preserves_history_and_expires_snapshots() {
+        use astra_turn_core::cache_placement::{CacheProtocol, VolatileDeliveryPolicy};
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: CacheProtocol::StrictHistoryMatch,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            ..append_only_required_capability()
+        };
+        let human = json!({"role":"user","content":"read the evidence"});
+        let assemble = |history, context: &str| {
+            let mut preamble = vec![
+                required_runtime_preamble_message(
+                    "required environment",
+                    RuntimeAuthorityKind::EdgeRequiredContext,
+                    astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+                )
+                .unwrap(),
+            ];
+            preamble.extend(runtime_system_context_message(context, false));
+            assemble_llm_messages_with_cache_capability_output(
+                vec![json!({"role":"system","content":"stable rules"})],
+                preamble,
+                Vec::new(),
+                history,
+                &PostCompactAttachments::default(),
+                "sid",
+                "openai",
+                "alias",
+                &astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                Some(capability),
+                &cache_cfg(),
+            )
+            .unwrap()
+        };
+        let first = assemble(
+            vec![human.clone()],
+            "all optional context, including dynamic facts",
+        );
+        let mut history = vec![human];
+        history.extend(first.new_append_only_runtime_messages.clone());
+        let snapshot_index = history.len() - 1;
+        let snapshot =
+            astra_turn_types::parse_append_only_runtime_authority_frame(&history[snapshot_index])
+                .unwrap();
+        assert_eq!(snapshot.kind, "runtime_context_snapshot");
+        assert_eq!(
+            snapshot.lifetime,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&snapshot.payload).unwrap()["contexts"],
+            json!(["all optional context, including dynamic facts"])
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|m| astra_turn_types::is_human_user_message(m))
+                .count(),
+            1
+        );
+        let retry = assemble(
+            history.clone(),
+            "all optional context, including dynamic facts",
+        );
+        assert!(retry.new_append_only_runtime_messages.is_empty());
+        assert_eq!(
+            retry.messages, first.messages,
+            "an undispatched retry must not duplicate context"
+        );
+
+        history.extend([
+            json!({"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"call-1","content":"exact file evidence"}),
+        ]);
+        assert!(astra_turn_types::append_only_runtime_authority_is_active(
+            &history,
+            snapshot_index
+        ));
+        let unchanged = assemble(
+            history.clone(),
+            "all optional context, including dynamic facts",
+        );
+        assert!(
+            unchanged.new_append_only_runtime_messages.is_empty(),
+            "unchanged evidence must not grow with every tool round"
+        );
+        assert!(unchanged.messages.starts_with(&first.messages));
+        let second = assemble(history.clone(), "updated context; retain every fact");
+        assert!(second.messages.starts_with(&first.messages));
+        assert_eq!(
+            second.new_append_only_runtime_messages.len(),
+            1,
+            "the unchanged turn-scoped environment is already present"
+        );
+        history.extend(second.new_append_only_runtime_messages);
+        assert!(!astra_turn_types::append_only_runtime_authority_is_active(
+            &history,
+            snapshot_index
+        ));
+        let cleared = assemble(history.clone(), "");
+        assert_eq!(cleared.new_append_only_runtime_messages.len(), 1);
+        let empty_snapshot = astra_turn_types::parse_append_only_runtime_authority_frame(
+            &cleared.new_append_only_runtime_messages[0],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&empty_snapshot.payload).unwrap()["contexts"],
+            json!([]),
+            "absence must supersede disappeared advisory facts"
+        );
+        history.extend(cleared.new_append_only_runtime_messages);
+        history.push(json!({"role":"assistant","content":"done"}));
+        history.push(json!({"role":"user","content":"new request"}));
+        let rehomed = rehome_append_only_runtime_authority(&mut history).unwrap();
+        assert!(
+            rehomed.is_empty(),
+            "expired snapshots and prior-turn controls must not reappear after a provider switch"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|m| !astra_turn_types::is_runtime_owned_message(m))
+        );
+    }
+
     fn settlement(
         round_index: u32,
         signal: &str,
@@ -2806,33 +2948,6 @@ mod tests {
             .unwrap_err();
             assert_eq!(error, expected);
         }
-    }
-
-    #[test]
-    fn append_only_shape_rejects_optional_volatile_delivery() {
-        let capability = astra_turn_core::cache_placement::CacheCapability {
-            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
-            ..append_only_required_capability()
-        };
-        let error = assemble_llm_messages_with_cache_capability_output(
-            vec![json!({"role": "system", "content": "stable rules"})],
-            vec![runtime_system_context_message("changing optional", false).unwrap()],
-            Vec::new(),
-            vec![json!({"role": "user", "content": "finish"})],
-            &PostCompactAttachments::default(),
-            "sid",
-            "openai",
-            "alias",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            Some(capability),
-            &cache_cfg(),
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            AppendOnlyRuntimeAuthorityError::InvalidCacheCapability
-        );
     }
 
     #[test]

@@ -12057,12 +12057,28 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
         }
     }
     let pool = setup_lifecycle_run_db_it().await;
-    for reject in [false, true] {
+    for (reject, capture) in [
+        (false, None),
+        (false, Some(true)),
+        (false, Some(false)),
+        (true, Some(true)),
+    ] {
         let suffix = Uuid::new_v4();
         let user = format!("atomic-start-user-{suffix}");
         let session = format!("atomic-start-session-{suffix}");
         let run = format!("atomic-start-run-{suffix}");
         crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+        if let Some(enabled) = capture {
+            sqlx::query(
+                "UPDATE agent_sessions SET metadata = ? WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(json!({"full_llm_capture": enabled}).to_string())
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        }
         let service = db_backed_test_service(&pool, "atomic-start-owner");
         let request = prepared_test_request("accepted input is durable before workspace setup");
         let make_participant = || RootTurnStartParticipant {
@@ -12074,6 +12090,7 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
             admission: None,
             prepared: None,
             rejection: None,
+            full_llm_capture: None,
         };
         let mut participant = RejectAfterInput(make_participant());
         let result = service
@@ -12095,6 +12112,13 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
                 },
             )
             .await;
+        assert_eq!(
+            participant.0.full_llm_capture,
+            Some(capture.unwrap_or_else(|| {
+                crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(None)
+            })),
+            "capture must follow the Session read under opening admission, including explicit opt-out"
+        );
         if reject {
             assert!(
                 result
@@ -12156,6 +12180,10 @@ async fn db_root_start_owns_input_without_controller_state_and_rolls_back_failur
                 blocked,
                 astra_services::runs::RunAdmissionError::SessionBusy
             ));
+            assert!(
+                loser.full_llm_capture.is_none(),
+                "a busy Session grants no diagnostic configuration"
+            );
             drop(loser);
             assert_eq!(
                 service.weighted_admission.usage(&user).1.provider_slots,
@@ -35893,6 +35921,7 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             admission: None,
             prepared: None,
             rejection: None,
+            full_llm_capture: None,
         };
         assert!(matches!(
             service

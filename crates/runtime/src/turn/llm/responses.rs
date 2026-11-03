@@ -56,7 +56,7 @@ pub(super) fn prepare(
             capability.protocol,
             astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit
                 | astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint
-        ) || capability.volatile_placement == VolatilePlacement::AppendOnlyUserTail
+        )
     }) {
         return Err(error(
             astra_core::ErrorKind::ContractViolation,

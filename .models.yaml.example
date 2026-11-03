@@ -61,11 +61,23 @@
 #     reuse_scope: conversation_turns
 # Required runtime instructions remain visible with typed authority/lifetimes;
 # optional volatile advisories are omitted. No model-name heuristic enables it.
+# For a deployment verified to reuse only complete prior requests (including
+# Responses), retain all context with the existing append-only layout:
+#   prompt_cache_capability:
+#     schema_version: 2
+#     protocol: strict_history_match
+#     volatile_placement: append_only_user_tail
+#     volatile_delivery: all
+#     reuse_scope: conversation_turns
+# Optional snapshots use canonical history, dedupe unchanged facts within a
+# human turn, and expire on supersession or a new human turn;
+# they are excluded from human speech, display, and memory extraction.
 # A prefix-caching OpenAI-compatible deployment verified to treat marked
 # runtime context after a human message as evidence may instead select
 # `volatile_placement: tail_after_user`. Keep `volatile_delivery: all` to
 # retain optional context. This can reuse a long human message on the next
 # turn; it changes message order and requires deployment-specific validation.
+# Tail replacement does not provide complete-history reuse on strict gateways.
 # Reload with: astra admin model load .models.yaml --update-existing
 #
 # Thinking/reasoning checks use maintained adapter defaults where available.
