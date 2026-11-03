@@ -6,6 +6,7 @@ pub(crate) use astra_turn_core::orchestration::agent_result_wire::agent_tool_run
 pub(crate) use astra_turn_core::orchestration::agent_result_wire::project_agent_tool_wire as project_agent_control_wire;
 
 pub(crate) fn delegation_target(name: &str, arguments: &str) -> Option<String> {
+    let name = name.trim();
     if matches!(name, "agent" | "agent_fanout") {
         return Some(name.to_string());
     }
@@ -16,6 +17,7 @@ pub(crate) fn delegation_target(name: &str, arguments: &str) -> Option<String> {
         .ok()?
         .get("name")?
         .as_str()
+        .map(str::trim)
         .filter(|target| matches!(*target, "agent" | "agent_fanout"))
         .map(str::to_string)
 }
@@ -131,6 +133,18 @@ mod tests {
     use super::agent_control_interrupted_message;
     use super::{compact_delegation_result, delegation_target};
     use astra_turn_core::orchestration::agent_result_wire::AgentToolResultStatusKind;
+
+    #[test]
+    fn normalized_delegation_names_share_the_runtime_identity() {
+        assert_eq!(
+            delegation_target(" invoke_tool ", r#"{"name":" agent "}"#),
+            Some("agent".into())
+        );
+        assert_eq!(
+            delegation_target(" agent_fanout ", "{}"),
+            Some("agent_fanout".into())
+        );
+    }
 
     #[test]
     fn shared_agent_control_status_kind_roundtrips_via_from_str() {

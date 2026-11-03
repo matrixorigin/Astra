@@ -424,6 +424,8 @@ impl TranscriptSnapshot {
     }
 }
 
+type ExpandedActivityCache = (TranscriptItemId, u16, Arc<str>, Vec<Line<'static>>);
+
 /// Full conversation transcript including thinking content and tool output.
 pub(crate) struct TranscriptView {
     title: String,
@@ -431,6 +433,7 @@ pub(crate) struct TranscriptView {
     lines: Vec<Line<'static>>,
     row_items: Vec<Option<TranscriptItemId>>,
     expanded: HashSet<TranscriptItemId>,
+    activity_cache: Option<ExpandedActivityCache>,
     width: u16,
     scroll: usize,
     cursor: usize,
@@ -470,6 +473,7 @@ impl TranscriptView {
             lines: Vec::new(),
             row_items: Vec::new(),
             expanded: HashSet::new(),
+            activity_cache: None,
             width,
             scroll: 0,
             cursor: 0,
@@ -629,12 +633,40 @@ impl TranscriptView {
     fn rebuild_lines(&mut self) {
         self.lines.clear();
         self.row_items.clear();
+        if !self.snapshot.items.iter().any(|item| {
+            self.expanded.contains(&item.id)
+                && matches!(item.content, TranscriptContent::Activity(_))
+        }) {
+            self.activity_cache = None;
+        }
         for item in &self.snapshot.items {
             if !item.matches_filter(self.filter) {
                 continue;
             }
             let expanded = self.expanded.contains(&item.id);
-            let item_lines = item.render(self.width, expanded);
+            let item_lines = if let TranscriptContent::Activity(text) = &item.content
+                && expanded
+            {
+                let hit = self
+                    .activity_cache
+                    .as_ref()
+                    .is_some_and(|(id, width, old, _)| {
+                        id == &item.id
+                            && *width == self.width
+                            && (Arc::ptr_eq(old, text) || old == text)
+                    });
+                if !hit {
+                    self.activity_cache = Some((
+                        item.id.clone(),
+                        self.width,
+                        text.clone(),
+                        item.render(self.width, true),
+                    ));
+                }
+                self.activity_cache.as_ref().unwrap().3.clone()
+            } else {
+                item.render(self.width, expanded)
+            };
             if item_lines.is_empty() {
                 continue;
             }
@@ -1397,6 +1429,31 @@ mod tests {
             ReasoningCell::from_text(text, Some(1_200)),
             0,
         )])
+    }
+
+    #[test]
+    fn expanded_activity_cache_tracks_text_width_and_removal() {
+        let snapshot = |text: String| {
+            TranscriptSnapshot::new(vec![TranscriptItem::activity(
+                TranscriptItemId::from_widget_id(8),
+                TranscriptItemKind::Tool,
+                text,
+            )])
+        };
+        let mut view = TranscriptView::from_snapshot(snapshot("A".repeat(100)), 24, 80);
+        view.expand_item(&TranscriptItemId::from_widget_id(8));
+        view.replace_snapshot(snapshot("A".repeat(100)), 80);
+        assert_eq!(view.lines.len(), 2);
+        view.replace_snapshot(snapshot("B".repeat(100)), 10);
+        assert_eq!(view.lines.len(), 10);
+        assert!(
+            view.lines
+                .iter()
+                .all(|line| !super::line_plain_text(line).contains('A'))
+        );
+        view.replace_snapshot(TranscriptSnapshot::new(vec![]), 10);
+        assert!(view.lines.is_empty());
+        assert!(view.activity_cache.is_none());
     }
 
     #[test]

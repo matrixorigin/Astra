@@ -28,6 +28,7 @@ enum LiveTranscriptItem {
     Tool {
         tool_use_id: String,
         cell: ToolCell,
+        identity: Option<String>,
     },
     Notice {
         text: String,
@@ -48,6 +49,7 @@ impl LiveTranscript {
     fn reconcile_durable_items(
         &mut self,
         durable_items: &[astra_thin_client::SessionTranscriptItem],
+        run_id: &str,
     ) {
         let durable_tool_ids = durable_items
             .iter()
@@ -88,8 +90,36 @@ impl LiveTranscript {
             LiveTranscriptItem::Reasoning(cell) => !cell
                 .model_item_id()
                 .is_some_and(|id| reasoning_ids.contains(id)),
-            LiveTranscriptItem::Tool { tool_use_id, .. } => {
-                !durable_tool_ids.contains(tool_use_id.as_str())
+            LiveTranscriptItem::Tool {
+                tool_use_id,
+                identity,
+                cell,
+            } => {
+                if identity.as_deref().is_some_and(is_delegation_name) {
+                    !durable_items.iter().any(|item| {
+                        item.run_id.as_deref() == Some(run_id)
+                            && item.tool_result.as_ref().is_some_and(|result| {
+                                !tool_use_id.is_empty()
+                                    && result.tool_use_id == *tool_use_id
+                                    && result.name.as_ref() == identity.as_ref()
+                                    && durable_items
+                                        .iter()
+                                        .filter(|call_item| call_item.run_id == item.run_id)
+                                        .flat_map(|call_item| &call_item.tool_calls)
+                                        .filter(|call| call.tool_use_id == *tool_use_id)
+                                        .all(|call| {
+                                            live_tool_identity(&call.name, &call.arguments).as_ref()
+                                                == identity.as_ref()
+                                        })
+                                    && crate::tui::agent_control_status::compact_delegation_result(
+                                        result.status.as_deref(),
+                                        Some(&item.content),
+                                    ) == cell.output_summary.as_deref().unwrap_or_default()
+                            })
+                    })
+                } else {
+                    !durable_tool_ids.contains(tool_use_id.as_str())
+                }
             }
             // Only typed evidence can reconcile a live attention notice with
             // durable history. Plain status text remains view-local so a
@@ -166,16 +196,23 @@ impl LiveTranscript {
 
     fn tool_started(&mut self, tool_use_id: String, name: String, description: String) {
         self.finish_open_model_item();
-        if self
-            .items
-            .iter()
-            .any(|item| matches!(item, LiveTranscriptItem::Tool { tool_use_id: id, .. } if id == &tool_use_id))
-        {
-            return;
+        if !tool_use_id.is_empty() {
+            if let Some(LiveTranscriptItem::Tool { identity, .. }) = self.items.iter_mut().find(|item| matches!(item, LiveTranscriptItem::Tool { tool_use_id: id, .. } if id == &tool_use_id)) {
+                if live_tool_identity(&name, &description).as_ref().is_some_and(|incoming| identity.as_ref() != Some(incoming)) { *identity = None; }
+                return;
+            }
         }
+        let identity = live_tool_identity(&name, &description);
+        let display_name = identity.as_deref().unwrap_or(&name);
+        let description = if identity.as_deref().is_some_and(is_delegation_name) {
+            crate::tui::agent_control_status::compact_delegation_description(&name, &description)
+        } else {
+            description
+        };
         self.items.push(LiveTranscriptItem::Tool {
             tool_use_id,
-            cell: ToolCell::new_running(name, description),
+            cell: ToolCell::new_running(display_name, description),
+            identity,
         });
     }
 
@@ -191,33 +228,43 @@ impl LiveTranscript {
         output_summary: Option<String>,
         output: Option<String>,
     ) {
-        let tool = self.items.iter_mut().rev().find_map(|item| match item {
-            LiveTranscriptItem::Tool {
-                tool_use_id: id,
-                cell,
-            } if id == &tool_use_id => Some(cell),
-            _ => None,
-        });
-        let cell = match tool {
-            Some(cell) => cell,
-            None => {
-                self.finish_open_model_item();
-                self.items.push(LiveTranscriptItem::Tool {
-                    tool_use_id,
-                    cell: ToolCell::new_running(name.clone(), description.clone()),
-                });
-                match self.items.last_mut() {
-                    Some(LiveTranscriptItem::Tool { cell, .. }) => cell,
-                    _ => unreachable!("newly appended live item must be a tool"),
-                }
+        let incoming = (name != "invoke_tool")
+            .then(|| live_tool_identity(&name, &description))
+            .flatten();
+        let index = (!tool_use_id.is_empty())
+            .then(|| {
+                self.items.iter().rposition(|item|
+            matches!(item, LiveTranscriptItem::Tool { tool_use_id: id, .. } if id == &tool_use_id)
+        )
+            })
+            .flatten();
+        let index = index.unwrap_or_else(|| {
+            self.tool_started(tool_use_id, name.clone(), description.clone());
+            if name == "invoke_tool"
+                && let Some(LiveTranscriptItem::Tool { identity, .. }) = self.items.last_mut()
+            {
+                *identity = None;
             }
+            self.items.len() - 1
+        });
+        let LiveTranscriptItem::Tool { cell, identity, .. } = &mut self.items[index] else {
+            unreachable!()
         };
-        let (_, was_private) = activity_tool_identity(&cell.name, &cell.description);
-        let (_, incoming_private) = activity_tool_identity(&name, &description);
-        if was_private || (incoming_private && !matches!(name.trim(), "" | "tool")) {
-            cell.name = "tool".into();
+        if let Some(incoming) = incoming.as_ref() {
+            if identity.as_ref().is_some_and(|old| old != incoming) {
+                *identity = None;
+            }
         }
-        cell.complete(&status, duration_ms, description, output_summary, output);
+        let delegated = identity.as_deref().is_some_and(is_delegation_name);
+        if delegated {
+            let receipt = crate::tui::agent_control_status::compact_delegation_result(
+                Some(&status),
+                output.as_deref().or(output_summary.as_deref()),
+            );
+            cell.complete(&status, duration_ms, String::new(), Some(receipt), None);
+        } else {
+            cell.complete(&status, duration_ms, description, output_summary, output);
+        }
     }
 
     fn notice(
@@ -561,7 +608,7 @@ impl AgentTranscriptView {
                     Some("Local agent history · server transcript unavailable · R refresh".into())
                 }
             });
-        self.live.reconcile_durable_items(&self.items);
+        self.live.reconcile_durable_items(&self.items, &self.run_id);
         if let Some(commit) = self.pending_transcript_commit.as_ref()
             && self.items.iter().any(|item| {
                 item.source_event_id.as_deref() == Some(commit.source_event_id.as_str())
@@ -768,10 +815,10 @@ impl AgentTranscriptView {
             else {
                 continue;
             };
-            let (name, _, private) = activity_identity(event);
-            if private
-                && (name != "tool"
-                    || event.get("type").and_then(serde_json::Value::as_str)
+            let (_, target, private) = activity_identity(event);
+            if is_delegation_name(&target)
+                || (private
+                    && event.get("type").and_then(serde_json::Value::as_str)
                         == Some("tool_call_start"))
             {
                 private_ids.insert(id);
@@ -797,7 +844,14 @@ impl AgentTranscriptView {
 
         if self.live.items.iter().any(|item| match item {
             LiveTranscriptItem::Notice { .. } => false,
-            LiveTranscriptItem::Tool { tool_use_id, cell } => !represented(tool_use_id, cell),
+            LiveTranscriptItem::Tool {
+                tool_use_id,
+                cell,
+                identity,
+            } => {
+                identity.as_deref().is_some_and(is_delegation_name)
+                    || !represented(tool_use_id, cell)
+            }
             _ => true,
         }) {
             // A terminal edge does not promise that every streamed part is
@@ -832,11 +886,16 @@ impl AgentTranscriptView {
                 LiveTranscriptItem::Reasoning(cell) => {
                     projected.push(TranscriptItem::reasoning(id, cell.clone(), 1));
                 }
-                LiveTranscriptItem::Tool { tool_use_id, cell }
-                    if !represented(tool_use_id, cell) =>
+                LiveTranscriptItem::Tool {
+                    tool_use_id,
+                    cell,
+                    identity,
+                } if identity.as_deref().is_some_and(is_delegation_name)
+                    || !represented(tool_use_id, cell) =>
                 {
-                    if private_ids.contains(tool_use_id.as_str())
-                        || activity_tool_identity(&cell.name, &cell.description).1
+                    if identity.is_none()
+                        || (private_ids.contains(tool_use_id.as_str())
+                            && !identity.as_deref().is_some_and(is_delegation_name))
                     {
                         projected.push(TranscriptItem::rendered_kind(
                             id,
@@ -1063,7 +1122,7 @@ impl AgentTranscriptView {
                 }
             }
         }
-        self.live.reconcile_durable_items(&self.items);
+        self.live.reconcile_durable_items(&self.items, &self.run_id);
         self.rebuild_transcript();
         true
     }
@@ -1580,6 +1639,30 @@ impl BottomPaneView for AgentTranscriptView {
                         // the newest entries; R returns to the latest page.
                         page.events.truncate(128);
                         let mut starts = std::collections::HashMap::<String, (String, bool)>::new();
+                        let mut seen = std::collections::HashMap::new();
+                        let mut conflicts = std::collections::HashSet::new();
+                        for event in page.events.iter().filter_map(|entry| entry.event.as_ref()) {
+                            if matches!(
+                                event.get("type").and_then(serde_json::Value::as_str),
+                                Some("tool_call" | "tool_call_start")
+                            ) {
+                                if let Some(id) = event
+                                    .get("call_id")
+                                    .or_else(|| event.get("tool_call_id"))
+                                    .or_else(|| event.pointer("/tool_call/id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|id| !id.is_empty())
+                                {
+                                    let (_, identity, _) = activity_identity(event);
+                                    if seen
+                                        .insert(id, identity.clone())
+                                        .is_some_and(|old| old != identity)
+                                    {
+                                        conflicts.insert(id);
+                                    }
+                                }
+                            }
+                        }
                         self.activity_items = page
                             .events
                             .iter()
@@ -1613,35 +1696,36 @@ impl BottomPaneView for AgentTranscriptView {
                                                         entry.1 = true;
                                                     }
                                                 })
-                                                .or_insert((identity, private));
+                                                .or_insert((identity.clone(), private));
+                                            if let Some((start, private)) = starts.get(id) {
+                                                protected = *start != identity
+                                                    || (*private && !is_delegation_name(start));
+                                            }
                                         } else if matches!(kind, "tool_result" | "tool_call_end") {
                                             if let Some((start, was_private)) = starts.get(id) {
-                                                let unresolved_carrier = identity == "invoke_tool"
-                                                    && [
-                                                        event.get("arguments"),
-                                                        event.get("description"),
-                                                    ]
-                                                    .into_iter()
-                                                    .flatten()
-                                                    .all(|value| {
-                                                        value.is_null()
-                                                            || value.as_str().is_some_and(|text| {
-                                                                text.trim().is_empty()
-                                                            })
-                                                    });
+                                                let unresolved_carrier = identity == "invoke_tool";
                                                 if (identity == "tool" || unresolved_carrier)
-                                                    && !*was_private
+                                                    && (!*was_private || is_delegation_name(start))
                                                 {
                                                     inferred_name = Some(start.clone());
                                                 } else {
-                                                    protected = *was_private
-                                                        || private
+                                                    protected = (*was_private
+                                                        && !is_delegation_name(start))
                                                         || *start != identity;
                                                 }
                                             }
                                         }
                                     }
                                 }
+                                protected |= event
+                                    .and_then(|event| {
+                                        event
+                                            .get("call_id")
+                                            .or_else(|| event.get("tool_call_id"))
+                                            .or_else(|| event.pointer("/tool_call/id"))
+                                    })
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|id| conflicts.contains(id));
                                 let inferred = inferred_name.and_then(|name| {
                                     let mut event = event?.clone();
                                     event.as_object_mut()?.insert("tool".into(), name.into());
@@ -1920,6 +2004,15 @@ impl BottomPaneView for AgentTranscriptView {
     }
 }
 
+fn is_delegation_name(name: &str) -> bool {
+    matches!(name, "agent" | "agent_fanout")
+}
+
+fn live_tool_identity(name: &str, arguments: &str) -> Option<String> {
+    let (name, private) = activity_tool_identity(name, arguments);
+    (!private || is_delegation_name(&name)).then_some(name)
+}
+
 fn activity_identity(event: &serde_json::Value) -> (String, String, bool) {
     let name = [
         event.get("tool"),
@@ -1947,7 +2040,18 @@ fn activity_identity(event: &serde_json::Value) -> (String, String, bool) {
                 .unwrap_or_else(|| value.to_string())
         })
         .unwrap_or_default();
-    let (identity, private) = activity_tool_identity(name, &args);
+    let completion = matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some("tool_result" | "tool_call_end")
+    );
+    let (identity, private) = activity_tool_identity(
+        name,
+        if completion && name == "invoke_tool" {
+            ""
+        } else {
+            &args
+        },
+    );
     (name.to_string(), identity, private)
 }
 
@@ -2002,6 +2106,41 @@ fn activity_event_text_with_protection(
                 None => "outcome unknown",
             },
         );
+    if !protected && is_delegation_name(&activity_identity(event).1) {
+        let args = event
+            .get("arguments")
+            .or_else(|| event.get("description"))
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string())
+            })
+            .unwrap_or_default();
+        let receipt = if matches!(kind, "tool_call" | "tool_call_start") {
+            crate::tui::agent_control_status::compact_delegation_description(&name, &args)
+        } else {
+            let payload = event
+                .get("output")
+                .filter(|v| !v.is_null())
+                .or_else(|| event.get("result"))
+                .or_else(|| event.get("output_summary"));
+            let payload = payload.map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| v.to_string())
+            });
+            crate::tui::agent_control_status::compact_delegation_result(
+                Some(if status == "outcome unknown" {
+                    "uncertain"
+                } else {
+                    status.strip_prefix("reported ").unwrap_or(status)
+                }),
+                payload.as_deref(),
+            )
+        };
+        return format!("{name} · {status}\n{receipt}");
+    }
     if protected || private {
         return format!(
             "{name} · {status}\nDelegated or unresolved tool details are available in the corresponding agent view."
@@ -2042,12 +2181,132 @@ mod tests {
     use crossterm::event::KeyModifiers;
 
     #[test]
+    fn recorded_conflicting_starts_protect_both_orders() {
+        for names in [["read_file", "agent"], ["agent", "read_file"]] {
+            let mut view = loading_view(80, 24);
+            let events = names.iter().enumerate().map(|(index, name)| astra_thin_client::protocol::RunActivityEvent { event_idx: index as i64, event: Some(serde_json::json!({"type":"tool_call_start", "call_id":"conflict", "tool":name, "description":"PRIVATE_CONFLICT"})) }).collect();
+            view.refresh_agent_transcript(AgentTranscriptUpdate::ActivityLoaded {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                replace: true,
+                page: Ok(astra_thin_client::protocol::RunActivityPage {
+                    session_id: "session-1".into(),
+                    run_id: "run-child".into(),
+                    source_run_id: "root".into(),
+                    events,
+                    next_before_event_idx: None,
+                    has_more: false,
+                }),
+            });
+            assert!(
+                !view
+                    .transcript
+                    .export_plain_lines()
+                    .join("\n")
+                    .contains("PRIVATE_CONFLICT")
+            );
+        }
+    }
+
+    #[test]
+    fn failed_delegation_keeps_failure_receipt() {
+        let mut view = loading_view(80, 24);
+        for kind in [
+            AgentLiveEventKind::ToolStarted {
+                name: "agent".into(),
+                description: r#"{"action":"spawn"}"#.into(),
+                tool_use_id: "spawn".into(),
+            },
+            AgentLiveEventKind::ToolCompleted {
+                name: "agent".into(),
+                description: r#"{"action":"spawn"}"#.into(),
+                status: "failed".into(),
+                duration_ms: 1,
+                output_summary: Some("Agent spawn rejected: selected model unavailable".into()),
+                output: Some(
+                    r#"{"status":"spawn_rejected","error":"selected model unavailable"}"#.into(),
+                ),
+                tool_use_id: "spawn".into(),
+            },
+        ] {
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind,
+            });
+        }
+        let exported = view.transcript.export_plain_lines().join("\n");
+        assert!(
+            exported.contains("selected model unavailable"),
+            "{exported}"
+        );
+        let mut partial = page();
+        let mut result = partial.items[0].clone();
+        result.role = "tool".into();
+        result.run_id = Some("run-child".into());
+        result.content = "{}".into();
+        result.tool_result = Some(
+            serde_json::from_value(
+                serde_json::json!({"tool_use_id":"spawn", "name":"invoke_tool", "status":"failed"}),
+            )
+            .unwrap(),
+        );
+        partial.items = vec![result];
+        view.apply_page(partial, true, AgentTranscriptSource::DurableServer);
+        assert!(
+            view.transcript
+                .export_plain_lines()
+                .join("\n")
+                .contains("selected model unavailable")
+        );
+    }
+
+    #[test]
+    fn resolved_deferred_live_completion_keeps_output() {
+        for completion_name in ["read_file", "invoke_tool"] {
+            let mut view = loading_view(80, 24);
+            for kind in [
+                AgentLiveEventKind::ToolStarted {
+                    name: "invoke_tool".into(),
+                    description: r#"{"name":"read_file","arguments":{"path":"notes.txt"}}"#.into(),
+                    tool_use_id: "normal-read".into(),
+                },
+                AgentLiveEventKind::ToolCompleted {
+                    name: completion_name.into(),
+                    description: r#"{"name":"notes.txt"}"#.into(),
+                    status: "completed".into(),
+                    duration_ms: 1,
+                    output_summary: Some("ordinary read completed".into()),
+                    output: Some("UNIQUE_NORMAL_FILE_CONTENT".into()),
+                    tool_use_id: "normal-read".into(),
+                },
+            ] {
+                view.refresh_agent_live_event(&AgentLiveEvent {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    kind,
+                });
+            }
+            let exported = view.transcript.export_plain_lines().join("\n");
+            assert!(
+                exported.contains("UNIQUE_NORMAL_FILE_CONTENT"),
+                "{exported}"
+            );
+        }
+    }
+
+    #[test]
     fn recorded_activity_uses_observed_details_without_showing_delegation_payloads() {
         let start = serde_json::json!({"type":"tool_call_start", "tool":"read_file", "description":"notes.txt"});
         assert!(activity_event_text_with_protection(Some(&start), false).contains("notes.txt"));
         let end = serde_json::json!({"type":"tool_call_end", "tool":"read_file", "output":null, "output_summary":"loaded"});
         let text = activity_event_text_with_protection(Some(&end), false);
         assert!(text.contains("loaded") && !text.contains("null"), "{text}");
+        let carrier = serde_json::json!({"type":"tool_call_end", "tool":"invoke_tool", "description":{"name":"worker", "prompt":"PRIVATE_CHILD_RESULT"}, "output":"PRIVATE_CHILD_RESULT"});
+        assert!(
+            !activity_event_text_with_protection(Some(&carrier), false)
+                .contains("PRIVATE_CHILD_RESULT")
+        );
         for tool in ["agent", "invoke_tool", "tool"] {
             let event = serde_json::json!({"type":"tool_call_end", "tool":tool, "output":"PRIVATE_CHILD_RESULT"});
             assert!(
@@ -2080,6 +2339,12 @@ mod tests {
             assert!(activity_event_text_with_protection(Some(&event), false).contains(expected));
         }
         assert!(activity_event_text_with_protection(None, false).contains("unavailable"));
+        let unknown = serde_json::json!({"type":"tool_call_end", "tool":"agent", "executed":null, "status":"reported completed", "output":{"status":"completed"}});
+        let text = activity_event_text_with_protection(Some(&unknown), false);
+        assert!(
+            text.contains("Agent control: uncertain") && !text.contains("Agent control: completed"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2129,7 +2394,7 @@ mod tests {
             RunActivityEvent {
                 event_idx: 6,
                 event: Some(
-                    serde_json::json!({"type":"tool_call_start", "tool":"read_file", "call_id":"same", "description":"other"}),
+                    serde_json::json!({"type":"tool_call_start", "tool":"read_file", "call_id":"same", "description":"PRIVATE_CONFLICT_START"}),
                 ),
             },
             RunActivityEvent {
@@ -2206,7 +2471,8 @@ mod tests {
         assert!(
             !text.contains("PRIVATE_CHILD_RESULT")
                 && !text.contains("PRIVATE_PROMPT")
-                && !text.contains("PRIVATE_CONFLICT_RESULT"),
+                && !text.contains("PRIVATE_CONFLICT_RESULT")
+                && !text.contains("PRIVATE_CONFLICT_START"),
             "{text}"
         );
     }
