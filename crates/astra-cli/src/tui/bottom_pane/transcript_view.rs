@@ -254,15 +254,40 @@ impl TranscriptItem {
         }
     }
 
-    pub(crate) fn tool(id: TranscriptItemId, cell: ToolCell, separator_rows: usize) -> Self {
+    pub(crate) fn tool(
+        id: TranscriptItemId,
+        cell: impl Into<Arc<ToolCell>>,
+        separator_rows: usize,
+    ) -> Self {
         Self {
             model_item_id: None,
             tool_identity: None,
             id,
             kind: TranscriptItemKind::Tool,
-            content: TranscriptContent::Tool(Arc::new(cell)),
+            content: TranscriptContent::Tool(cell.into()),
             separator_rows,
         }
+    }
+
+    pub(crate) fn tool_cell(&self) -> Option<&ToolCell> {
+        match &self.content {
+            TranscriptContent::Tool(cell) => Some(cell),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn tool_request(&self) -> Option<Self> {
+        self.tool_cell().map(|cell| {
+            Self::rendered_kind(
+                self.id.clone(),
+                TranscriptItemKind::Tool,
+                vec![
+                    Line::from("Recorded tool request"),
+                    Line::from(cell.description.clone()),
+                ],
+                1,
+            )
+        })
     }
 
     fn is_expandable(&self, width: u16) -> bool {

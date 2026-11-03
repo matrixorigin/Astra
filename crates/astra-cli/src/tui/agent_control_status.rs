@@ -103,7 +103,11 @@ pub(crate) fn delegation_receipt(status: Option<&str>, payload: Option<&str>) ->
         "partial failure"
     } else {
         match wire_status {
-            "launched" => "launched",
+            "launched" if parsed.as_ref().is_some_and(|value| matches!(
+                astra_turn_core::orchestration::agent_result_wire::decode_agent_tool_result(value),
+                Some(astra_turn_core::orchestration::agent_result_wire::DecodedAgentToolResult::ControlReceipt(
+                    astra_turn_core::orchestration::agent_result_wire::AgentControlReceipt::Spawn)))) => "launched",
+            "launched" => "uncertain",
             "completed" | "success" => "completed",
             "completed_with_issues" => "completed with issues",
             "failed" | "error" | "spawn_rejected" => "failed",
@@ -161,6 +165,20 @@ mod tests {
     use super::agent_control_interrupted_message;
     use super::{compact_delegation_result, delegation_target};
     use astra_turn_core::orchestration::agent_result_wire::AgentToolResultStatusKind;
+
+    #[test]
+    fn launch_claim_requires_the_shared_typed_receipt() {
+        let valid = r#"{"result_family":"control_receipt","success":true,"action":"spawn","status":"launched","parent_run_id":"parent","agent_id":"agent","run_id":"child"}"#;
+        let malformed = r#"{"status":"launched","run_id":"child"}"#;
+        assert!(
+            compact_delegation_result(Some("launched"), Some(valid))
+                .contains("Agent control: launched")
+        );
+        assert!(
+            compact_delegation_result(Some("launched"), Some(malformed))
+                .contains("Agent control: uncertain")
+        );
+    }
 
     #[test]
     fn unexecuted_rejection_keeps_its_structured_reason() {

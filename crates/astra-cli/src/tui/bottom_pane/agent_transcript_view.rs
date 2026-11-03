@@ -19,11 +19,11 @@ use crate::tui::history_cell::{
 
 #[derive(Debug, Clone)]
 struct ToolCoverage {
-    target: Option<String>,
-    settled: bool,
-    terminal_preview: bool,
+    identity: ToolIdentity,
+    compatible_result: bool,
     request_present: bool,
     result_index: Option<usize>,
+    projection_index: usize,
     receipt: Option<crate::tui::agent_control_status::DelegationReceipt>,
 }
 
@@ -36,6 +36,69 @@ struct CanonicalProjection {
     evidence: std::collections::HashSet<String>,
 }
 
+#[derive(Debug, Clone)]
+enum ToolIdentity {
+    Unresolved,
+    Known(String),
+    Conflicting,
+}
+
+impl ToolIdentity {
+    fn target(&self) -> Option<&str> {
+        match self {
+            Self::Known(target) => Some(target),
+            _ => None,
+        }
+    }
+    fn observe(&mut self, incoming: &str) -> bool {
+        match self {
+            Self::Unresolved => {
+                *self = Self::Known(incoming.to_owned());
+                true
+            }
+            Self::Known(previous) if previous != incoming => {
+                *self = Self::Conflicting;
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+fn compact_live_delegation(
+    cell: &mut Option<Arc<ToolCell>>,
+    receipt: &mut Option<crate::tui::agent_control_status::DelegationReceipt>,
+    target: &str,
+    request: &str,
+) {
+    if receipt.is_some() {
+        return;
+    }
+    let Some(live) = cell.as_ref() else {
+        return;
+    };
+    let status = match live.status {
+        crate::tui::history_cell::tool::ToolStatus::Uncertain => Some("uncertain"),
+        crate::tui::history_cell::tool::ToolStatus::Failed => Some("failed"),
+        crate::tui::history_cell::tool::ToolStatus::Rejected => Some("rejected"),
+        _ => None,
+    };
+    let projected = crate::tui::agent_control_status::delegation_receipt(
+        status,
+        live.output.as_deref().or(live.output_summary.as_deref()),
+    );
+    let live = Arc::make_mut(cell.as_mut().unwrap());
+    live.name = target.to_owned();
+    live.description = if request.is_empty() {
+        "Agent control · Ctrl+G agents".into()
+    } else {
+        request.to_owned()
+    };
+    live.output = None;
+    live.output_summary = Some(projected.text());
+    *receipt = Some(projected);
+}
+
 /// The live, non-durable suffix of an agent conversation. It deliberately
 /// preserves the same content boundaries as the canonical transcript: output,
 /// reasoning, tool calls, and high-value attention evidence are distinct
@@ -46,10 +109,10 @@ enum LiveTranscriptItem {
     Reasoning(ReasoningCell),
     Tool {
         tool_use_id: String,
-        cell: ToolCell,
-        identity: Option<String>,
+        cell: Option<Arc<ToolCell>>,
+        request: String,
+        identity: ToolIdentity,
         receipt: Option<crate::tui::agent_control_status::DelegationReceipt>,
-        retained_request: bool,
     },
     Notice {
         text: String,
@@ -64,7 +127,9 @@ struct LiveTranscript {
 
 impl LiveTranscript {
     fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items
+            .iter()
+            .all(|item| matches!(item, LiveTranscriptItem::Tool { cell: None, .. }))
     }
 
     fn reconcile_durable_items(
@@ -72,6 +137,7 @@ impl LiveTranscript {
         canonical: &CanonicalProjection,
         run_id: &str,
         items: &[astra_thin_client::SessionTranscriptItem],
+        event: Option<&AgentLiveEventKind>,
     ) {
         self.items.retain_mut(|item| match item {
             LiveTranscriptItem::Assistant(cell) => !cell
@@ -83,78 +149,95 @@ impl LiveTranscript {
             LiveTranscriptItem::Tool {
                 tool_use_id,
                 identity,
-                receipt,
                 cell,
-                retained_request,
+                receipt,
+                request,
             } => {
-                let Some(identity) = identity else {
-                    return true;
-                };
+                // Compare large results only when this call or its loaded page changes.
+                if let Some(event) = event {
+                    match event {
+                        AgentLiveEventKind::ToolStarted {
+                            tool_use_id: id, ..
+                        }
+                        | AgentLiveEventKind::ToolCompleted {
+                            tool_use_id: id, ..
+                        } if id == tool_use_id => {}
+                        _ => return true,
+                    }
+                }
                 let Some(coverage) = canonical
                     .tools
                     .get(&(Some(run_id.to_owned()), tool_use_id.clone()))
                 else {
                     return true;
                 };
-                if (!coverage.request_present || *retained_request)
-                    && coverage.target.as_ref() == Some(identity)
-                {
-                    *retained_request = true;
-                    if let Some(item) = coverage.result_index.and_then(|index| items.get(index)) {
-                        let result = item.tool_result.as_ref().unwrap();
-                        if matches!(
-                            cell.status,
-                            crate::tui::history_cell::tool::ToolStatus::Running
-                        ) && definitive_tool_status(result.status.as_deref())
-                            && (coverage.settled || coverage.terminal_preview)
-                        {
-                            let summary = if is_delegation_name(identity) {
-                                let projected =
-                                    crate::tui::agent_control_status::delegation_receipt(
-                                        result.status.as_deref(),
-                                        Some(&item.content),
-                                    );
-                                let text = projected.text();
-                                *receipt = Some(projected);
-                                text
-                            } else {
-                                "Result recorded in loaded history".into()
-                            };
-                            cell.complete(
-                                result.status.as_deref().unwrap(),
-                                result.duration_ms.unwrap_or_default(),
-                                String::new(),
-                                Some(summary),
-                                None,
-                            );
+                match &coverage.identity {
+                    ToolIdentity::Known(target) if identity.observe(target) => {
+                        if is_delegation_name(target) {
+                            compact_live_delegation(cell, receipt, target, request);
+                        } else if let Some(cell) = cell {
+                            Arc::make_mut(cell).name = target.to_owned();
                         }
                     }
+                    ToolIdentity::Conflicting => *identity = ToolIdentity::Conflicting,
+                    _ => {}
+                }
+                let Some(identity) = identity.target() else {
+                    return true;
+                };
+                let Some(live) = cell.as_ref() else {
+                    return true;
+                };
+                if coverage.identity.target() != Some(identity) || !coverage.compatible_result {
                     return true;
                 }
-                if !coverage.settled {
-                    return !(coverage.terminal_preview
-                        && coverage.target.as_ref() == Some(identity)
-                        && matches!(
-                            cell.status,
-                            crate::tui::history_cell::tool::ToolStatus::Running
-                        ));
-                }
-                if is_delegation_name(identity) {
-                    if coverage.target.as_ref() != Some(identity) {
-                        return true;
-                    }
-                    match (receipt, &coverage.receipt) {
-                        (None, Some(_)) => false,
+                let Some(result) = coverage.result_index.and_then(|index| items.get(index)) else {
+                    return true;
+                };
+                let same_status = canonical
+                    .items
+                    .get(coverage.projection_index)
+                    .and_then(TranscriptItem::tool_cell)
+                    .is_some_and(|stored| stored.status == live.status);
+                let covered = if live.status == crate::tui::history_cell::tool::ToolStatus::Running
+                {
+                    true
+                } else if result.role == "tool_observation_preview" || !same_status {
+                    false
+                } else if is_delegation_name(identity) {
+                    match (receipt.as_ref(), coverage.receipt.as_ref()) {
                         (Some(live), Some(stored)) => {
-                            (!matches!(live.outcome, "uncertain" | "updated")
-                                && live.outcome != stored.outcome)
-                                || (live.detail.is_some() && stored.detail.is_none())
+                            (live.outcome == stored.outcome)
+                                && (live.detail.is_none() || live.detail == stored.detail)
                         }
-                        _ => true,
+                        _ => false,
                     }
                 } else {
-                    coverage.target.as_ref() != Some(identity)
+                    match live.output.as_deref() {
+                        Some(output) => output == result.content,
+                        None => live.output_summary.as_deref().is_none_or(|summary| {
+                            result.content == summary
+                                || result.content.lines().next() == Some(summary)
+                        }),
+                    }
+                };
+                let summary_covered = live.output_summary.as_deref().is_none_or(|summary| {
+                    result.content == summary
+                        || result.content.lines().next() == Some(summary)
+                        || canonical
+                            .items
+                            .get(coverage.projection_index)
+                            .and_then(TranscriptItem::tool_cell)
+                            .and_then(|cell| cell.output_summary.as_deref())
+                            == Some(summary)
+                });
+                if covered && !is_delegation_name(identity) && !summary_covered {
+                    Arc::make_mut(cell.as_mut().unwrap()).output = None;
+                } else if covered {
+                    *cell = None;
+                    *receipt = None;
                 }
+                true
             }
             LiveTranscriptItem::Notice {
                 evidence: Some(evidence),
@@ -228,25 +311,39 @@ impl LiveTranscript {
 
     fn tool_started(&mut self, tool_use_id: String, name: String, description: String) {
         self.finish_open_model_item();
-        if !tool_use_id.is_empty() {
-            if let Some(LiveTranscriptItem::Tool { identity, .. }) = self.items.iter_mut().find(|item| matches!(item, LiveTranscriptItem::Tool { tool_use_id: id, .. } if id == &tool_use_id)) {
-                if live_tool_identity(&name, &description).as_ref().is_some_and(|incoming| identity.as_ref() != Some(incoming)) { *identity = None; }
-                return;
+        let incoming = live_tool_identity(&name, &description);
+        let request = match incoming.as_deref() {
+            Some(target) if is_delegation_name(target) => {
+                crate::tui::agent_control_status::compact_delegation_description(
+                    &name,
+                    &description,
+                )
             }
-        }
-        let identity = live_tool_identity(&name, &description);
-        let display_name = identity.as_deref().unwrap_or(&name);
-        let description = if identity.as_deref().is_some_and(is_delegation_name) {
-            crate::tui::agent_control_status::compact_delegation_description(&name, &description)
-        } else {
-            description
+            Some(_) => description,
+            None => "Delegated or unresolved tool activity".into(),
         };
+        if !tool_use_id.is_empty()
+            && let Some(LiveTranscriptItem::Tool { identity, request: previous, cell, receipt, .. }) = self.items.iter_mut()
+                .find(|item| matches!(item, LiveTranscriptItem::Tool { tool_use_id: id, .. } if id == &tool_use_id)) {
+            if let Some(target) = incoming.as_deref() {
+                let resolved = identity.observe(target);
+                if identity.target().is_some() && (resolved || previous.is_empty()) {
+                    *previous = request.clone();
+                    if let Some(cell) = cell { let cell = Arc::make_mut(cell); cell.name = target.to_owned(); cell.description = request; }
+                }
+                if identity.target().is_some_and(is_delegation_name) { compact_live_delegation(cell, receipt, target, previous); }
+            }
+            return;
+        }
         self.items.push(LiveTranscriptItem::Tool {
             tool_use_id,
-            cell: ToolCell::new_running(display_name, description),
-            identity,
+            cell: Some(Arc::new(ToolCell::new_running(
+                incoming.as_deref().unwrap_or(&name),
+                request.clone(),
+            ))),
+            request,
+            identity: incoming.map_or(ToolIdentity::Unresolved, ToolIdentity::Known),
             receipt: None,
-            retained_request: false,
         });
     }
 
@@ -283,17 +380,10 @@ impl LiveTranscript {
                     .or(known_target)
                     .unwrap_or(&name)
                     .to_owned(),
-                if name == "invoke_tool" && known_target.is_none() {
-                    String::new()
-                } else {
-                    description.clone()
-                },
+                String::new(),
             );
-            if known_target.is_none()
-                && name == "invoke_tool"
-                && let Some(LiveTranscriptItem::Tool { identity, .. }) = self.items.last_mut()
-            {
-                *identity = None;
+            if let Some(LiveTranscriptItem::Tool { request, .. }) = self.items.last_mut() {
+                request.clear();
             }
             self.items.len() - 1
         });
@@ -301,27 +391,28 @@ impl LiveTranscript {
             cell,
             identity,
             receipt,
+            request,
             ..
         } = &mut self.items[index]
         else {
             unreachable!()
         };
-        let delegated = identity.as_deref().is_some_and(is_delegation_name)
+        let delegated = identity.target().is_some_and(is_delegation_name)
             || incoming.as_deref().is_some_and(is_delegation_name)
             || known_target.is_some_and(is_delegation_name)
             || receipt.is_some();
-        if known_target.is_some_and(|target| {
-            identity
-                .as_deref()
-                .is_some_and(|identity| identity != target)
-        }) {
-            *identity = None;
+        if let Some(target) = known_target {
+            identity.observe(target);
         }
-        if let Some(incoming) = incoming.as_ref() {
-            if identity.as_ref().is_some_and(|old| old != incoming) {
-                *identity = None;
-            }
+        if let Some(incoming) = incoming.as_deref() {
+            identity.observe(incoming);
         }
+        let cell = Arc::make_mut(cell.get_or_insert_with(|| {
+            Arc::new(ToolCell::new_running(
+                identity.target().unwrap_or(&name),
+                request.clone(),
+            ))
+        }));
         if delegated {
             let projected_receipt = crate::tui::agent_control_status::delegation_receipt(
                 Some(&status),
@@ -686,7 +777,7 @@ impl AgentTranscriptView {
                 }
             });
         self.live
-            .reconcile_durable_items(&self.canonical, &self.run_id, &self.items);
+            .reconcile_durable_items(&self.canonical, &self.run_id, &self.items, None);
         if let Some(commit) = self.pending_transcript_commit.as_ref()
             && self.items.iter().any(|item| {
                 item.source_event_id.as_deref() == Some(commit.source_event_id.as_str())
@@ -885,37 +976,16 @@ impl AgentTranscriptView {
             }
         }
 
-        if self
-            .live
-            .items
-            .iter()
-            .any(|item| !matches!(item, LiveTranscriptItem::Notice { .. }))
-        {
-            // A terminal edge does not promise that every streamed part is
-            // persisted. Report loaded coverage, not a guessed storage state.
-            projected.push(TranscriptItem::rendered_kind(
-                TranscriptItemId::from_widget_id(LIVE_ID_BASE - 1),
-                if self
-                    .live
-                    .items
-                    .iter()
-                    .any(|item| matches!(item, LiveTranscriptItem::Tool { .. }))
-                {
-                    TranscriptItemKind::Tool
-                } else {
-                    TranscriptItemKind::System
-                },
-                vec![Line::from("Live activity · not in loaded history")],
-                0,
-            ));
-        }
-
+        let mut live_items = Vec::new();
+        let mut has_live_content = false;
+        let mut has_live_tools = false;
         for (index, item) in self.live.items.iter().enumerate() {
+            let before = live_items.len();
             let id = TranscriptItemId::from_widget_id(
                 LIVE_ID_BASE.saturating_add(u64::try_from(index).unwrap_or(u64::MAX - 2)),
             );
             match item {
-                LiveTranscriptItem::Assistant(cell) if cell.is_live() => projected.push(
+                LiveTranscriptItem::Assistant(cell) if cell.is_live() => live_items.push(
                     // This is the same mutable suffix contract as the root
                     // transcript: preserve current content and provenance,
                     // but never rebuild a growing Markdown document on every
@@ -928,48 +998,132 @@ impl AgentTranscriptView {
                     ),
                 ),
                 LiveTranscriptItem::Assistant(cell) => {
-                    projected.push(TranscriptItem::committed(id, Arc::new(cell.clone()), 1))
+                    live_items.push(TranscriptItem::committed(id, Arc::new(cell.clone()), 1))
                 }
                 LiveTranscriptItem::Reasoning(cell) => {
-                    projected.push(TranscriptItem::reasoning(id, cell.clone(), 1));
+                    live_items.push(TranscriptItem::reasoning(id, cell.clone(), 1));
                 }
                 LiveTranscriptItem::Tool {
                     tool_use_id,
                     cell,
+                    request,
                     identity,
                     receipt,
-                    ..
                 } => {
-                    if identity.is_none()
-                        && let Some(receipt) = receipt
-                    {
-                        projected.push(TranscriptItem::rendered_kind(
-                            id,
-                            TranscriptItemKind::Tool,
-                            vec![Line::from(format!(
-                                "Conflicting tool identity · {}",
-                                receipt.text()
-                            ))],
-                            1,
-                        ));
-                    } else if identity.is_none()
+                    let coverage = identity.target().and_then(|identity| {
+                        self.canonical
+                            .tools
+                            .get(&(Some(self.run_id.clone()), tool_use_id.clone()))
+                            .filter(|coverage| coverage.identity.target() == Some(identity))
+                    });
+                    let protected = identity.target().is_none()
                         || (private_ids.contains(tool_use_id.as_str())
-                            && !identity.as_deref().is_some_and(is_delegation_name))
-                    {
-                        projected.push(TranscriptItem::rendered_kind(
+                            && !identity.target().is_some_and(is_delegation_name));
+                    let protected_message = if matches!(identity, ToolIdentity::Conflicting) {
+                        "Conflicting tool identity · details unavailable"
+                    } else {
+                        "Delegated or unresolved tool activity"
+                    };
+                    if cell.is_none() {
+                        // A request fallback supplements a currently loaded result;
+                        // it does not bypass the conversation page window.
+                        if coverage.is_none() {
+                            continue;
+                        }
+                        if request.is_empty()
+                            && coverage.is_some_and(|coverage| coverage.result_index.is_some())
+                        {
+                            continue;
+                        }
+                        if coverage.is_some_and(|coverage| {
+                            coverage.request_present && coverage.result_index.is_some()
+                        }) {
+                            continue;
+                        }
+                        if let Some(coverage) = coverage.filter(|coverage| coverage.request_present)
+                        {
+                            if !protected
+                                && let Some(request) = self
+                                    .canonical
+                                    .items
+                                    .get(coverage.projection_index)
+                                    .and_then(TranscriptItem::tool_request)
+                            {
+                                projected[coverage.projection_index] = request;
+                                continue;
+                            }
+                        }
+                        let description = if !protected {
+                            request.as_str()
+                        } else {
+                            protected_message
+                        };
+                        live_items.push(TranscriptItem::rendered_kind(
                             id,
                             TranscriptItemKind::Tool,
-                            vec![Line::from("Delegated or unresolved tool activity")],
+                            vec![
+                                Line::from("Observed request · retained in this view"),
+                                Line::from(description.to_owned()),
+                            ],
                             1,
                         ));
                     } else {
-                        projected.push(TranscriptItem::tool(id, cell.clone(), 1));
+                        if let Some(coverage) = coverage.filter(|coverage| {
+                            coverage.request_present && coverage.result_index.is_none()
+                        }) {
+                            if !protected
+                                && cell.as_ref().is_some_and(|cell| {
+                                    cell.status
+                                        == crate::tui::history_cell::tool::ToolStatus::Running
+                                })
+                            {
+                                continue;
+                            }
+                            if !protected
+                                && let Some(request) = self
+                                    .canonical
+                                    .items
+                                    .get(coverage.projection_index)
+                                    .and_then(TranscriptItem::tool_request)
+                            {
+                                projected[coverage.projection_index] = request;
+                            }
+                        }
+                        if identity.target().is_none()
+                            && let Some(receipt) = receipt
+                        {
+                            live_items.push(TranscriptItem::rendered_kind(
+                                id,
+                                TranscriptItemKind::Tool,
+                                vec![Line::from(format!(
+                                    "Conflicting tool identity · {}",
+                                    receipt.text()
+                                ))],
+                                1,
+                            ));
+                        } else if identity.target().is_none()
+                            || (private_ids.contains(tool_use_id.as_str())
+                                && !identity.target().is_some_and(is_delegation_name))
+                        {
+                            live_items.push(TranscriptItem::rendered_kind(
+                                id,
+                                TranscriptItemKind::Tool,
+                                vec![Line::from(protected_message)],
+                                1,
+                            ));
+                        } else {
+                            live_items.push(TranscriptItem::tool(
+                                id,
+                                cell.as_ref().unwrap().clone(),
+                                1,
+                            ));
+                        }
                     }
                 }
                 LiveTranscriptItem::Notice {
                     text: _,
                     evidence: Some(evidence),
-                } => projected.push(TranscriptItem::rendered_kind(
+                } => live_items.push(TranscriptItem::rendered_kind(
                     id,
                     transcript_evidence_kind(evidence),
                     transcript_evidence_lines(evidence),
@@ -978,14 +1132,31 @@ impl AgentTranscriptView {
                 LiveTranscriptItem::Notice {
                     text,
                     evidence: None,
-                } => projected.push(TranscriptItem::rendered_kind(
+                } => live_items.push(TranscriptItem::rendered_kind(
                     id,
                     TranscriptItemKind::Agent,
                     vec![Line::from(format!("• {text}"))],
                     1,
                 )),
             }
+            if live_items.len() > before && !matches!(item, LiveTranscriptItem::Notice { .. }) {
+                has_live_content = true;
+                has_live_tools |= matches!(item, LiveTranscriptItem::Tool { .. });
+            }
         }
+        if has_live_content {
+            projected.push(TranscriptItem::rendered_kind(
+                TranscriptItemId::from_widget_id(LIVE_ID_BASE - 1),
+                if has_live_tools {
+                    TranscriptItemKind::Tool
+                } else {
+                    TranscriptItemKind::System
+                },
+                vec![Line::from("Live activity · not in loaded history")],
+                0,
+            ));
+        }
+        projected.extend(live_items);
     }
 
     fn rebuild_transcript(&mut self) {
@@ -1063,7 +1234,7 @@ impl AgentTranscriptView {
                 self.canonical
                     .tools
                     .get(&(Some(self.run_id.clone()), tool_use_id.clone()))
-                    .and_then(|coverage| coverage.target.as_deref()),
+                    .and_then(|coverage| coverage.identity.target()),
             ),
             AgentLiveEventKind::Signal(signal) => {
                 if matches!(signal, AgentLiveSignal::ExecutionWaiting { .. }) {
@@ -1184,8 +1355,12 @@ impl AgentTranscriptView {
                 }
             }
         }
-        self.live
-            .reconcile_durable_items(&self.canonical, &self.run_id, &self.items);
+        self.live.reconcile_durable_items(
+            &self.canonical,
+            &self.run_id,
+            &self.items,
+            Some(&event.kind),
+        );
         self.rebuild_transcript();
         true
     }
@@ -1511,32 +1686,41 @@ fn project_durable_transcript(
                                         || Some(name.trim()) == target.as_deref()
                                 })
                             });
-                        let coverage = ToolCoverage {
-                            request_present: true,
-                            result_index: result_entry.map(|(index, _)| index),
-                            terminal_preview: compatible
-                                && result_item
-                                    .is_some_and(|item| item.role == "tool_observation_preview")
-                                && result.is_some_and(|result| {
-                                    definitive_tool_status(result.status.as_deref())
-                                }),
-                            target,
-                            settled: compatible
-                                && result.is_some_and(|result| {
-                                    definitive_tool_status(result.status.as_deref())
-                                })
-                                && result_item
-                                    .is_some_and(|item| item.role != "tool_observation_preview"),
-                            receipt,
-                        };
+                        let mut identity =
+                            target.map_or(ToolIdentity::Unresolved, ToolIdentity::Known);
+                        if let Some(result_target) = result
+                            .and_then(|result| result.name.as_deref())
+                            .and_then(|name| live_tool_identity(name, ""))
+                        {
+                            identity.observe(&result_target);
+                        }
+                        let coverage =
+                            ToolCoverage {
+                                projection_index: projected.len()
+                                    + usize::from(result_item.is_some_and(|item| {
+                                        item.role == "tool_observation_preview"
+                                    })),
+                                request_present: true,
+                                result_index: result_entry.map(|(index, _)| index),
+                                identity,
+                                compatible_result: compatible,
+                                receipt,
+                            };
                         canonical
                             .tools
                             .entry((item.run_id.clone(), call.tool_use_id.clone()))
                             .and_modify(|old| {
-                                if old.target != coverage.target {
-                                    old.target = None;
-                                    old.settled = false;
-                                    old.terminal_preview = false;
+                                match &coverage.identity {
+                                    ToolIdentity::Known(target) => {
+                                        old.identity.observe(target);
+                                    }
+                                    ToolIdentity::Conflicting => {
+                                        old.identity = ToolIdentity::Conflicting
+                                    }
+                                    ToolIdentity::Unresolved => {}
+                                }
+                                if matches!(old.identity, ToolIdentity::Conflicting) {
+                                    old.compatible_result = false;
                                 }
                             })
                             .or_insert(coverage);
@@ -1594,13 +1778,13 @@ fn project_durable_transcript(
                             .tools
                             .entry((item.run_id.clone(), result.tool_use_id.clone()))
                             .or_insert(ToolCoverage {
+                                projection_index: projected.len()
+                                    + usize::from(item.role == "tool_observation_preview"),
                                 request_present: false,
                                 result_index: Some(item_index),
-                                target,
-                                settled: item.role != "tool_observation_preview"
-                                    && definitive_tool_status(result.status.as_deref()),
-                                terminal_preview: item.role == "tool_observation_preview"
-                                    && definitive_tool_status(result.status.as_deref()),
+                                identity: target
+                                    .map_or(ToolIdentity::Unresolved, ToolIdentity::Known),
+                                compatible_result: true,
                                 receipt: delegation.then(|| {
                                     crate::tui::agent_control_status::delegation_receipt(
                                         result.status.as_deref(),
@@ -2210,32 +2394,6 @@ impl BottomPaneView for AgentTranscriptView {
     }
 }
 
-fn definitive_tool_status(status: Option<&str>) -> bool {
-    status.is_some_and(|status| {
-        matches!(
-            status.trim().to_ascii_lowercase().as_str(),
-            "completed"
-                | "complete"
-                | "ok"
-                | "success"
-                | "succeeded"
-                | "passed"
-                | "done"
-                | "completed_with_issues"
-                | "failed"
-                | "error"
-                | "rejected"
-                | "denied"
-                | "timeout"
-                | "timed_out"
-                | "partial_failure"
-                | "cancelled"
-                | "interrupted"
-                | "skipped"
-        )
-    })
-}
-
 fn is_delegation_name(name: &str) -> bool {
     matches!(name, "agent" | "agent_fanout")
 }
@@ -2462,7 +2620,290 @@ mod tests {
     }
 
     #[test]
-    fn qa_unpaired_partial_result_preserves_known_invocation_arguments() {
+    fn call_only_page_keeps_canonical_arguments_with_live_result() {
+        for (started, completed) in [(true, false), (true, true), (false, true)] {
+            let mut view = loading_view(80, 24);
+            if started {
+                view.refresh_agent_live_event(&AgentLiveEvent {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    kind: AgentLiveEventKind::ToolStarted {
+                        name: "read_file".into(),
+                        description: "brief live display".into(),
+                        tool_use_id: "spawn-0".into(),
+                    },
+                });
+            }
+            if completed {
+                view.refresh_agent_live_event(&AgentLiveEvent {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    kind: AgentLiveEventKind::ToolCompleted {
+                        name: "read_file".into(),
+                        description: "brief live display".into(),
+                        status: "completed".into(),
+                        duration_ms: 1,
+                        output_summary: None,
+                        output: Some("unique live body".into()),
+                        tool_use_id: "spawn-0".into(),
+                    },
+                });
+            }
+            if !started {
+                let (mut result_items, _) = delegation_history(1);
+                result_items.remove(0);
+                result_items[0].tool_result.as_mut().unwrap().name = Some("read_file".into());
+                result_items[0].tool_result.as_mut().unwrap().status = Some("completed".into());
+                result_items[0].content = "unique live body".into();
+                let mut latest = page();
+                latest.items = result_items;
+                view.apply_page(latest, true, AgentTranscriptSource::DurableServer);
+            }
+            let (mut items, _) = delegation_history(1);
+            items.truncate(1);
+            items[0].tool_calls[0].name = "read_file".into();
+            items[0].tool_calls[0].arguments = r#"{"path":"canonical-path.txt"}"#.into();
+            let mut canonical = page();
+            canonical.items = items;
+            view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+            let text = view.transcript.export_plain_lines().join("\n");
+            assert!(text.contains("canonical-path.txt"), "{text}");
+            assert_eq!(text.contains("Running"), !completed, "{text}");
+            assert_eq!(
+                text.matches("unique live body").count(),
+                usize::from(completed && started),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_start_supplies_request_without_reopening_completed_tool() {
+        for completion_name in ["read_file", "invoke_tool"] {
+            let mut view = loading_view(80, 24);
+            for kind in [
+                AgentLiveEventKind::ToolCompleted {
+                    name: completion_name.into(),
+                    description: "opaque completion display".into(),
+                    status: "completed".into(),
+                    duration_ms: 1,
+                    output_summary: None,
+                    output: Some("body".into()),
+                    tool_use_id: "read".into(),
+                },
+                AgentLiveEventKind::ToolStarted {
+                    name: "read_file".into(),
+                    description: "authoritative-request.txt".into(),
+                    tool_use_id: "read".into(),
+                },
+            ] {
+                view.refresh_agent_live_event(&AgentLiveEvent {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    kind,
+                });
+            }
+            let text = view.transcript.export_plain_lines().join("\n");
+            assert!(
+                text.contains("authoritative-request.txt")
+                    && text.contains("body")
+                    && !text.contains("Running"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn uncovered_result_is_shared_across_snapshot_refreshes() {
+        let mut view = loading_view(80, 24);
+        for kind in [
+            AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: "notes.txt".into(),
+                tool_use_id: "read".into(),
+            },
+            AgentLiveEventKind::ToolCompleted {
+                name: "read_file".into(),
+                description: "notes.txt".into(),
+                status: "completed".into(),
+                duration_ms: 1,
+                output_summary: None,
+                output: Some("uncovered full result".repeat(128)),
+                tool_use_id: "read".into(),
+            },
+        ] {
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind,
+            });
+        }
+        let original = match &view.live.items[0] {
+            LiveTranscriptItem::Tool {
+                cell: Some(cell), ..
+            } => cell.clone(),
+            _ => panic!("live result missing"),
+        };
+        view.refresh_agent_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("answer".into()),
+                text: "Next step".into(),
+            },
+        });
+        let mut snapshot = Vec::new();
+        view.append_live_projection(&mut snapshot);
+        let projected = snapshot.iter().find_map(TranscriptItem::tool_cell).unwrap();
+        assert!(
+            std::ptr::eq(projected, original.as_ref()),
+            "snapshot deep-copied the result"
+        );
+    }
+
+    #[test]
+    fn full_pair_deduplicates_even_after_result_only_page() {
+        for (result_only_first, diagnostic) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let status = if diagnostic { "failed" } else { "completed" };
+            let (mut items, _) = delegation_history(1);
+            items[0].tool_calls[0].name = "read_file".into();
+            items[0].tool_calls[0].arguments = r#"{"path":"notes.txt"}"#.into();
+            items[1].tool_result.as_mut().unwrap().name = Some("read_file".into());
+            items[1].tool_result.as_mut().unwrap().status = Some(status.into());
+            items[1].content = "FULL_UNIQUE_BODY".into();
+            let mut view = loading_view(80, 24);
+            for kind in [
+                AgentLiveEventKind::ToolStarted {
+                    name: "read_file".into(),
+                    description: r#"{"path":"notes.txt"}"#.into(),
+                    tool_use_id: "spawn-0".into(),
+                },
+                AgentLiveEventKind::ToolCompleted {
+                    name: "read_file".into(),
+                    description: r#"{"path":"notes.txt"}"#.into(),
+                    status: status.into(),
+                    duration_ms: 1,
+                    output_summary: diagnostic.then(|| r#"{"advisory":{"executed":false}}"#.into()),
+                    output: Some("FULL_UNIQUE_BODY".into()),
+                    tool_use_id: "spawn-0".into(),
+                },
+            ] {
+                view.refresh_agent_live_event(&AgentLiveEvent {
+                    agent_id: "agent-1".into(),
+                    run_id: "run-child".into(),
+                    kind,
+                });
+            }
+            if result_only_first {
+                let mut latest = page();
+                latest.items = vec![items[1].clone()];
+                view.apply_page(latest, true, AgentTranscriptSource::DurableServer);
+                let mut older = page();
+                older.items = vec![items[0].clone()];
+                view.apply_page(older, false, AgentTranscriptSource::DurableServer);
+            } else {
+                let mut canonical = page();
+                canonical.items = items;
+                view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+            }
+            let text = view.transcript.export_plain_lines().join("\n");
+            assert_eq!(
+                text.matches("FULL_UNIQUE_BODY").count(),
+                1,
+                "result_only_first={result_only_first}: {text}"
+            );
+            if diagnostic {
+                assert!(text.contains("Did not run"), "{text}");
+            }
+            assert!(view.live.items.iter().any(|item| matches!(item,
+                LiveTranscriptItem::Tool { cell, request, .. } if request.contains("notes.txt") && cell.as_ref().is_none_or(|cell| cell.output.is_none()))),
+                "covered result body must be released");
+            if !diagnostic {
+                let result = view
+                    .items
+                    .iter()
+                    .find(|item| item.tool_result.is_some())
+                    .unwrap()
+                    .clone();
+                let mut empty = page();
+                empty.items.clear();
+                view.apply_page(empty, true, AgentTranscriptSource::DurableServer);
+                let unloaded = view.transcript.export_plain_lines().join("\n");
+                assert!(
+                    !unloaded.contains("FULL_UNIQUE_BODY") && !unloaded.contains("notes.txt"),
+                    "{unloaded}"
+                );
+                let mut latest = page();
+                latest.items = vec![result.clone()];
+                view.apply_page(latest, true, AgentTranscriptSource::DurableServer);
+                let restored = view.transcript.export_plain_lines().join("\n");
+                assert!(
+                    restored.contains("notes.txt")
+                        && restored.matches("FULL_UNIQUE_BODY").count() == 1,
+                    "{restored}"
+                );
+                let mut conflicting = result.clone();
+                conflicting.tool_result.as_mut().unwrap().name = Some("agent".into());
+                conflicting.content = r#"{"status":"completed"}"#.into();
+                let (mut conflict_items, _) = delegation_history(1);
+                conflict_items.truncate(1);
+                conflict_items[0].tool_calls[0].name = "read_file".into();
+                conflict_items[0].tool_calls[0].arguments =
+                    r#"{"path":"different-canonical-input"}"#.into();
+                conflict_items.push(conflicting);
+                let mut changed = page();
+                changed.items = conflict_items;
+                view.apply_page(changed, true, AgentTranscriptSource::DurableServer);
+                assert!(
+                    !view
+                        .transcript
+                        .export_plain_lines()
+                        .join("\n")
+                        .contains("notes.txt")
+                );
+                let mut restored_page = page();
+                restored_page.items = vec![result];
+                view.apply_page(restored_page, true, AgentTranscriptSource::DurableServer);
+                assert!(
+                    !view
+                        .transcript
+                        .export_plain_lines()
+                        .join("\n")
+                        .contains("notes.txt"),
+                    "conflict cannot be silently forgotten"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn returned_spawn_control_is_not_a_running_tool() {
+        for status in ["completed", "launched"] {
+            let (mut items, _) = delegation_history(1);
+            items[1].tool_result.as_mut().unwrap().status = Some(status.into());
+            items[1].content = serde_json::json!({"result_family":"control_receipt","success":true,"action":"spawn","status":status,"parent_run_id":"run-child","agent_id":"launched-agent","run_id":"launched-child"}).to_string();
+            let mut view = loading_view(80, 24);
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::ToolStarted {
+                    name: "agent".into(),
+                    description: r#"{"action":"spawn"}"#.into(),
+                    tool_use_id: "spawn-0".into(),
+                },
+            });
+            let mut canonical = page();
+            canonical.items = items;
+            view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+            let text = view.transcript.export_plain_lines().join("\n");
+            assert!(!text.contains("Running Agent"), "status={status}: {text}");
+        }
+    }
+
+    #[test]
+    fn unpaired_partial_result_preserves_known_invocation_arguments() {
         let mut view = loading_view(100, 24);
         view.refresh_agent_live_event(&AgentLiveEvent {
             agent_id: "agent-1".into(),
@@ -2514,13 +2955,16 @@ mod tests {
     }
 
     #[test]
-    fn qa_named_terminal_result_on_latest_page_retires_running_row() {
+    fn named_result_on_latest_page_stops_running_indicator() {
         for (target, status) in [
             ("read_file", "failed"),
             ("agent", "failed"),
             ("agent_fanout", "failed"),
             ("read_file", "success"),
             ("agent", "completed"),
+            ("read_file", "running"),
+            ("read_file", "uncertain"),
+            ("agent", "still_running"),
         ] {
             let (mut items, _) = delegation_history(1);
             items.remove(0);
@@ -2546,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn review_partial_output_does_not_resurrect_a_terminal_tool() {
+    fn partial_output_does_not_resurrect_a_terminal_tool() {
         let (mut items, _) = delegation_history(1);
         items[1].role = "tool_observation_preview".into();
         let mut view = loading_view(80, 24);
@@ -2567,7 +3011,7 @@ mod tests {
     }
 
     #[test]
-    fn review_ordinary_carrier_completion_description_is_not_tool_identity() {
+    fn ordinary_carrier_completion_description_is_not_tool_identity() {
         let mut view = loading_view(80, 24);
         for kind in [
             AgentLiveEventKind::ToolStarted {
@@ -2720,7 +3164,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_history_keeps_start_only_delegation() {
+    fn incomplete_history_preserves_uncovered_or_conflicting_evidence() {
         for partial in ["result_only", "wrong_run", "wrong_target"] {
             let (mut items, _) = delegation_history(1);
             match partial {
@@ -2751,44 +3195,62 @@ mod tests {
             let mut canonical = page();
             canonical.items = items;
             view.apply_page(canonical, true, AgentTranscriptSource::LocalJournalOnly);
-            assert!(
-                view.transcript
-                    .export_plain_lines()
-                    .join("\n")
-                    .contains("Running Agent"),
-                "{partial}"
-            );
+            let text = view.transcript.export_plain_lines().join("\n");
+            if partial == "wrong_target" {
+                assert!(
+                    text.contains("Conflicting tool identity") && !text.contains("Running Agent"),
+                    "{text}"
+                );
+            } else {
+                assert!(text.contains("Running Agent"), "{partial}: {text}");
+            }
         }
     }
 
     #[test]
-    fn canonical_completion_resolves_unknown_live_receipt() {
-        let (mut items, _) = delegation_history(1);
-        items[1].content = r#"{"status":"completed"}"#.into();
-        items[1].tool_result.as_mut().unwrap().status = Some("completed".into());
-        let mut view = loading_view(80, 24);
-        view.apply_live_event(&AgentLiveEvent {
-            agent_id: "agent-1".into(),
-            run_id: "run-child".into(),
-            kind: AgentLiveEventKind::ToolCompleted {
-                name: "agent".into(),
-                description: "{}".into(),
-                status: "uncertain".into(),
-                duration_ms: 0,
-                output: None,
-                output_summary: None,
-                tool_use_id: "spawn-0".into(),
-            },
-        });
-        let mut canonical = page();
-        canonical.items = items;
-        view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
-        let text = view.transcript.export_plain_lines().join("\n");
-        assert!(
-            !text.contains("Live activity · not in loaded history"),
-            "{text}"
-        );
-        assert!(text.contains("Agent control: completed"), "{text}");
+    fn canonical_completion_preserves_distinct_live_status_evidence() {
+        for (status, payload) in [
+            ("uncertain", r#"{"status":"completed"}"#),
+            (
+                "failed",
+                r#"{"status":"failed","error":"same child failure"}"#,
+            ),
+        ] {
+            let (mut items, _) = delegation_history(1);
+            items[1].content = payload.into();
+            items[1].tool_result.as_mut().unwrap().status = Some("completed".into());
+            let mut view = loading_view(80, 24);
+            view.apply_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::ToolCompleted {
+                    name: "agent".into(),
+                    description: "{}".into(),
+                    status: status.into(),
+                    duration_ms: 0,
+                    output: Some(payload.into()),
+                    output_summary: None,
+                    tool_use_id: "spawn-0".into(),
+                },
+            });
+            let mut canonical = page();
+            canonical.items = items;
+            view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+            let text = view.transcript.export_plain_lines().join("\n");
+            assert!(
+                text.contains("Live activity · not in loaded history"),
+                "{text}"
+            );
+            let expected = if status == "uncertain" {
+                "Could not confirm Agent"
+            } else {
+                "Failed Agent"
+            };
+            assert!(
+                text.contains(expected) && !text.contains("Running Agent"),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -2844,6 +3306,23 @@ mod tests {
     fn recorded_conflicting_starts_protect_both_orders() {
         for names in [["read_file", "agent"], ["agent", "read_file"]] {
             let mut view = loading_view(80, 24);
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::ToolStarted {
+                    name: "read_file".into(),
+                    description: "PRIVATE_CONFLICT_REQUEST".into(),
+                    tool_use_id: "conflict".into(),
+                },
+            });
+            let (mut result_items, _) = delegation_history(1);
+            result_items.remove(0);
+            let result = result_items[0].tool_result.as_mut().unwrap();
+            result.tool_use_id = "conflict".into();
+            result.name = Some("read_file".into());
+            let mut latest = page();
+            latest.items = result_items;
+            view.apply_page(latest, true, AgentTranscriptSource::DurableServer);
             let events = names.iter().enumerate().map(|(index, name)| astra_thin_client::protocol::RunActivityEvent { event_idx: index as i64, event: Some(serde_json::json!({"type":"tool_call_start", "call_id":"conflict", "tool":name, "description":"PRIVATE_CONFLICT"})) }).collect();
             view.refresh_agent_transcript(AgentTranscriptUpdate::ActivityLoaded {
                 agent_id: "agent-1".into(),
@@ -4401,12 +4880,12 @@ mod tests {
         );
         assert_eq!(
             view.live.items.len(),
-            2,
-            "only live objects with a stable durable identity may reconcile"
+            3,
+            "two live objects and one lightweight request fallback remain"
         );
-        let reconciled = rendered(&view);
+        let reconciled = view.transcript.export_plain_lines().join("\n");
         assert_eq!(reconciled.matches("I found the race.").count(), 2);
-        assert_eq!(reconciled.matches("src/scheduler.rs").count(), 1);
+        assert!(reconciled.contains("src/scheduler.rs"));
         assert_eq!(
             reconciled
                 .matches("Permission required · git status")
