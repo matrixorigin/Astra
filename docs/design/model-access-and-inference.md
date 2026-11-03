@@ -1065,7 +1065,10 @@ cached input, and output evidence. Output already includes reasoning. The checke
 sum of `cache_write_5m` and `cache_write_1h` is cache-creation evidence only when
 both counts are reported; a missing lifetime is unknown, not zero. Mirrored
 generic and OpenCode fields must agree, and a complete input partition must
-match the inclusive prompt total. The existing streaming collector retains
+match an inclusive prompt total. The generic fields retain their existing
+inclusive or disjoint semantics; Anthropic-shaped OpenAI-compatible responses
+reconcile the extension through the same OpenAI usage normalizer.
+The existing streaming collector retains
 partial cumulative samples and rejects invalid or contradictory raw evidence.
 This extends usage normalization, not the model invocation protocol or billing
 authority; it does not introduce another run lifecycle.
