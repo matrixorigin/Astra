@@ -2422,6 +2422,28 @@ impl WorkAdmissionUsage {
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
         };
+        let input_was_measured = match result {
+            Ok(response) => response.input_was_measured,
+            Err(_) => {
+                error_details
+                    .as_ref()
+                    .and_then(|details| details.get("input_was_measured"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            }
+        };
+        if usage.is_none_or(serde_json::Map::is_empty) && input_was_measured {
+            self.provider_reported = self.provider_reported.saturating_add(1);
+        }
+        self.complete_usage(usage, qualified, unpartitioned_input_tokens);
+    }
+
+    fn complete_usage(
+        &mut self,
+        usage: Option<&serde_json::Map<String, Value>>,
+        qualified: Option<astra_turn_types::CanonicalTokenUsage>,
+        unpartitioned_input_tokens: u64,
+    ) {
         self.completed_calls = self.completed_calls.saturating_add(1);
         self.unpartitioned_input_tokens = self
             .unpartitioned_input_tokens
@@ -2472,22 +2494,25 @@ impl WorkAdmissionUsage {
 /// Record every compaction attempt at the existing auxiliary settlement boundary.
 struct AccountedSummaryClient<'a> {
     client: &'a dyn astra_turn_core::cloud_summary::SummaryLlmClient,
-    usage: std::sync::Mutex<WorkAdmissionUsage>,
+    usage: Arc<std::sync::Mutex<WorkAdmissionUsage>>,
 }
 
 impl<'a> AccountedSummaryClient<'a> {
-    fn new(client: &'a dyn astra_turn_core::cloud_summary::SummaryLlmClient) -> Self {
-        Self {
-            client,
-            usage: std::sync::Mutex::new(WorkAdmissionUsage::default()),
-        }
+    fn new(
+        client: &'a dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+        usage: Arc<std::sync::Mutex<WorkAdmissionUsage>>,
+    ) -> Self {
+        Self { client, usage }
     }
 
     fn settle(self, state: &mut AgenticLoopState) {
-        self.usage
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .settle_into(state);
+        let usage = std::mem::take(
+            &mut *self
+                .usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        usage.settle_into(state);
     }
 }
 
@@ -2828,6 +2853,7 @@ fn pending_work_admission_judge_for_test(
 
 struct SummaryClientSkillAutoRouteJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+    usage: Arc<std::sync::Mutex<WorkAdmissionUsage>>,
 }
 
 const RESOLVED_TURN_LLM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -2864,11 +2890,33 @@ fn reconcile_trusted_workflow_topology(
     }
 }
 
+fn install_interrupted_summary_sink(
+    client: &mut dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+    usage: &Arc<std::sync::Mutex<WorkAdmissionUsage>>,
+) {
+    let usage = Arc::clone(usage);
+    client.set_interrupted_usage_sink(Arc::new(move |snapshot| {
+        let mut usage = usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if snapshot.usage.is_empty() && snapshot.input_was_measured {
+            usage.provider_reported = usage.provider_reported.saturating_add(1);
+        }
+        usage.complete_usage(
+            Some(&snapshot.usage),
+            snapshot.qualified_usage,
+            snapshot.unpartitioned_input_tokens,
+        );
+    }));
+}
+
 impl SummaryClientWorkAdmissionJudge {
-    fn new(client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>) -> Self {
+    fn new(mut client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>) -> Self {
+        let usage = Arc::new(std::sync::Mutex::new(WorkAdmissionUsage::default()));
+        install_interrupted_summary_sink(client.as_mut(), &usage);
         Self {
             client,
-            usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage::default())),
+            usage,
             timings: Arc::new(std::sync::Mutex::new(WorkAdmissionTimingBuffer::default())),
             recovery_used: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             classification_observations: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3115,11 +3163,14 @@ impl SummaryClientSkillAutoRouteJudge {
         ctx: &astra_services::SkillAutoRouteJudgeContext,
     ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
         let messages = astra_services::skill_auto_route_judge_messages(ctx)?;
-        let response = self
-            .client
-            .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
-            .await
-            .map_err(SkillAutoRouteJudgeError::Inference)?;
+        let accounted = AccountedSummaryClient::new(self.client.as_ref(), Arc::clone(&self.usage));
+        let response = astra_turn_core::cloud_summary::SummaryLlmClient::summarize(
+            &accounted,
+            astra_turn_types::InferencePurpose::Introspection,
+            &messages,
+        )
+        .await
+        .map_err(SkillAutoRouteJudgeError::Inference)?;
         if response.is_ptl_error || response.finish_reason.as_deref() != Some("stop") {
             return Err(SkillAutoRouteJudgeError::Rejected(
                 "skill judgment did not finish normally".into(),
@@ -3656,6 +3707,7 @@ pub struct ServerAgenticLoopHost {
     /// Provider-reported usage from the bounded Work classifier and its one
     /// repair. Folded exactly once into the user-visible turn aggregate.
     work_admission_usage: WorkAdmissionUsage,
+    auxiliary_summary_usage: Arc<std::sync::Mutex<WorkAdmissionUsage>>,
     /// Bounded logical-call observations have a longer lifetime than token
     /// accounting: they survive per-round usage reconciliation until the
     /// terminal Explain snapshot is emitted.
@@ -5154,6 +5206,16 @@ impl crate::turn::llm::client::ProviderAttemptObserver
         self.inner.finish_attempt(attempt_index, terminal).await
     }
 
+    fn note_usage_snapshot(
+        &self,
+        attempt_index: u32,
+        usage: crate::turn::token_usage::TokenUsage,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.inner
+            .note_usage_snapshot(attempt_index, usage, presence);
+    }
+
     fn note_usage_presence(
         &self,
         attempt_index: u32,
@@ -6069,6 +6131,7 @@ impl ServerAgenticLoopHostBuilder {
                 astra_config::user_profile::WorkspaceMutationIntent::Unknown,
             pending_work_admission_judge: None,
             work_admission_usage: WorkAdmissionUsage::default(),
+            auxiliary_summary_usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage::default())),
             work_admission_timing_buffer: Arc::new(std::sync::Mutex::new(
                 WorkAdmissionTimingBuffer::default(),
             )),
@@ -6811,9 +6874,10 @@ impl ServerAgenticLoopHost {
         validate: impl Fn(&str) -> Result<(), String>,
     ) -> Option<Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>>
     {
-        let (client, configured_route) = self
+        let (mut client, configured_route) = self
             .delegation_judgment_client(state, operation_id, max_output_tokens)
             .await?;
+        install_interrupted_summary_sink(client.as_mut(), &self.auxiliary_summary_usage);
         let response = self
             .summarize_delegation_judgment_once(
                 client.as_ref(),
@@ -6873,7 +6937,7 @@ impl ServerAgenticLoopHost {
                 && host.clamp_execution_timeout(auxiliary_slice) == Some(auxiliary_slice)
         };
         if (response.is_err() || invalid_response) && configured_route {
-            if let Some(primary) = self
+            if let Some(mut primary) = self
                 .turn_intent_summary_client(state, operation_id, max_output_tokens)
                 .await
             {
@@ -6885,6 +6949,7 @@ impl ServerAgenticLoopHost {
                     stage,
                     "configured judgment route failed; falling back to the primary selector"
                 );
+                install_interrupted_summary_sink(primary.as_mut(), &self.auxiliary_summary_usage);
                 let response = self
                     .summarize_delegation_judgment_once(
                         primary.as_ref(),
@@ -6923,15 +6988,19 @@ impl ServerAgenticLoopHost {
         attempt: &'static str,
         messages: &[Value],
     ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError> {
-        self.work_admission_usage.begin_attempt();
+        let accounted =
+            AccountedSummaryClient::new(client, Arc::clone(&self.auxiliary_summary_usage));
         let mut timing = AuxiliaryCallTimingGuard::new(
             Arc::clone(&self.work_admission_timing_buffer),
             stage,
             attempt,
         );
-        let response = client
-            .summarize(astra_turn_types::InferencePurpose::Introspection, messages)
-            .await;
+        let response = astra_turn_core::cloud_summary::SummaryLlmClient::summarize(
+            &accounted,
+            astra_turn_types::InferencePurpose::Introspection,
+            messages,
+        )
+        .await;
         if let Err(error) = &response {
             tracing::warn!(
                 operation_id,
@@ -6946,7 +7015,6 @@ impl ServerAgenticLoopHost {
         } else {
             astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
         });
-        self.work_admission_usage.complete_call(&response);
         response
     }
 
@@ -8798,7 +8866,7 @@ impl ServerAgenticLoopHost {
         // crosses skill revisions; previous-context evidence must not do so.
         self.work_admission_classification_observations =
             Arc::clone(&judge.classification_observations);
-        let Some(planner_client) = self
+        let Some(mut planner_client) = self
             .turn_intent_summary_client(state, "work_plan", TURN_INTENT_JUDGE_MAX_OUTPUT_TOKENS)
             .await
         else {
@@ -8810,6 +8878,7 @@ impl ServerAgenticLoopHost {
                 Some(WorkAdmissionUnavailableReason::AdmissionMaterialUnavailable);
             return false;
         };
+        install_interrupted_summary_sink(planner_client.as_mut(), &judge.usage);
         let planner = SummaryClientWorkAdmissionJudge {
             client: planner_client,
             usage: Arc::clone(&judge.usage),
@@ -17429,18 +17498,23 @@ impl ServerAgenticLoopHost {
         llm_cfg: &ResolvedTurnLlmConfig,
     ) -> crate::turn::cloud::compaction::CompactResult {
         let compact_config = crate::prompts::CompactConfig::from_env();
-        let summary_client = self.summary_client(
+        let mut summary_client = self.summary_client(
             llm_cfg,
             compact_config.summary_token_budget,
             state,
             "required_compaction",
         );
+        if let Some(client) = summary_client.as_mut() {
+            install_interrupted_summary_sink(client, &self.auxiliary_summary_usage);
+        }
         let summary_client = summary_client
             .as_ref()
             .map(|client| client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient);
         #[cfg(test)]
         let summary_client = self.test_compaction_client.as_deref().or(summary_client);
-        let accounted_client = summary_client.map(AccountedSummaryClient::new);
+        let accounted_client = summary_client.map(|client| {
+            AccountedSummaryClient::new(client, Arc::clone(&self.auxiliary_summary_usage))
+        });
         let summary_client = accounted_client
             .as_ref()
             .map(|client| client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient);
@@ -18938,16 +19012,25 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         ));
     }
 
+    async fn on_turn_usage_settlement(&mut self, state: &mut AgenticLoopState) {
+        self.abort_pending_work_admission().await;
+        std::mem::take(&mut self.work_admission_usage).settle_into(state);
+        let auxiliary = std::mem::take(
+            &mut *self
+                .auxiliary_summary_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        auxiliary.settle_into(state);
+    }
+
     async fn on_turn_terminal(
         &mut self,
         state: &mut AgenticLoopState,
         result: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
     ) {
-        self.abort_pending_work_admission().await;
-        let unflushed_auxiliary = std::mem::take(&mut self.work_admission_usage);
-        if unflushed_auxiliary.attempts > 0 {
-            state.settle_admitted_auxiliary_usage(unflushed_auxiliary.into());
-        }
+        // Also support callers which close the terminal without the outer loop.
+        self.on_turn_usage_settlement(state).await;
         self.flush_classification_observations(state);
         let timing_buffer = self
             .work_admission_timing_buffer
@@ -19379,13 +19462,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 return None;
             }
         };
-        let client = self
+        let mut client = self
             .judgment_summary_client(state, "skill_auto_route", &request)
             .await
             .ok()?;
-        let judged = SummaryClientSkillAutoRouteJudge { client }
-            .judge(&service_ctx)
-            .await;
+        install_interrupted_summary_sink(client.as_mut(), &self.auxiliary_summary_usage);
+        let judged = SummaryClientSkillAutoRouteJudge {
+            client,
+            usage: Arc::clone(&self.auxiliary_summary_usage),
+        }
+        .judge(&service_ctx)
+        .await;
 
         match judged {
             Ok(Some(skill_name)) => {
@@ -22070,10 +22157,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .pre_execution_rejections
             .extend(pre_execution_rejections);
         result.delegation_model_admissions = admissions;
-        let auxiliary = std::mem::take(&mut self.work_admission_usage);
-        if auxiliary.attempts > 0 {
-            result.auxiliary_usage = Some(auxiliary.into());
-        }
+        let summary_usage = std::mem::take(
+            &mut *self
+                .auxiliary_summary_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        summary_usage.settle_into(state);
+        std::mem::take(&mut self.work_admission_usage).settle_into(state);
         self.resolved_deferred_activations_for_delivery.clear();
         result
     }
@@ -22209,9 +22300,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // select a different schema prefix and defeat inline reuse.
             state.sticky_tool_schemas.clone()
         };
-        let client =
+        let mut client =
             self.pre_turn_summary_client(&config, state, summary_tools, cache_capability)?;
-        let accounted_client = AccountedSummaryClient::new(client.as_ref());
+        install_interrupted_summary_sink(client.as_mut(), &self.auxiliary_summary_usage);
+        let accounted_client =
+            AccountedSummaryClient::new(client.as_ref(), Arc::clone(&self.auxiliary_summary_usage));
         let summary_text = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
             &state.messages[..spill_count],
@@ -26062,6 +26155,7 @@ mod tests {
                     )
                 })?;
             Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                input_was_measured: false,
                 unpartitioned_input_tokens: 0,
                 qualified_usage: None,
                 judgment_provenance: Some(self.provenance),
@@ -26114,6 +26208,7 @@ mod tests {
         ] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let judge = SummaryClientSkillAutoRouteJudge {
+                usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage::default())),
                 client: Box::new(SequencedSummaryClient {
                     provenance,
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([
@@ -26152,9 +26247,11 @@ mod tests {
             [(false, Some("length")), (true, Some("stop")), (false, None)]
         {
             let judge = SummaryClientSkillAutoRouteJudge {
+                usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage::default())),
                 client: Box::new(UsageSequencedSummaryClient {
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([Ok(
                         astra_turn_core::cloud_summary::SummaryResponse {
+                            input_was_measured: false,
                             unpartitioned_input_tokens: 0,
                             qualified_usage: None,
                             judgment_provenance: Some(
@@ -26184,6 +26281,7 @@ mod tests {
         output_tokens: u64,
     ) -> astra_turn_core::cloud_summary::SummaryResponse {
         astra_turn_core::cloud_summary::SummaryResponse {
+            input_was_measured: false,
             unpartitioned_input_tokens: 0,
             qualified_usage: None,
             judgment_provenance: Some(
@@ -26211,6 +26309,7 @@ mod tests {
         provider: &str,
     ) -> astra_turn_core::cloud_summary::SummaryResponse {
         astra_turn_core::cloud_summary::SummaryResponse {
+            input_was_measured: false,
             unpartitioned_input_tokens: 0,
             qualified_usage: None,
             judgment_provenance: Some(if provider == "typesafe" {
@@ -27309,6 +27408,7 @@ mod tests {
         for received in [false, true] {
             let response = if received {
                 Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    input_was_measured: false,
                     unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: Some(
@@ -27669,6 +27769,33 @@ mod tests {
         let qualified = accounting.settled_qualified_usage().unwrap();
         assert_eq!(qualified.input_tokens(), None);
         assert_eq!(qualified.output_tokens(), Some(3));
+    }
+
+    #[test]
+    fn work_admission_preserves_input_measurement_coverage_including_zero() {
+        for (measured, input) in [(false, 0), (true, 0), (true, 17)] {
+            let mut response = summary_response_with_usage("summary", 0, 0, 0);
+            response.usage.clear();
+            response.input_was_measured = measured;
+            response.unpartitioned_input_tokens = input;
+            let mut success = WorkAdmissionUsage::default();
+            success.begin_attempt();
+            success.complete_call(&Ok(response));
+            assert_eq!(success.provider_reported, u32::from(measured));
+            assert_eq!(success.unpartitioned_input_tokens, input);
+            let mut failure = WorkAdmissionUsage::default();
+            failure.begin_attempt();
+            failure.complete_call(&Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "failed",
+            )
+            .with_details_json(
+                json!({"input_was_measured": measured, "unpartitioned_input_tokens": input})
+                    .to_string(),
+            )));
+            assert_eq!(failure.provider_reported, u32::from(measured));
+            assert_eq!(failure.unpartitioned_input_tokens, input);
+        }
     }
 
     #[test]
@@ -37024,6 +37151,7 @@ mod tests {
                 "historical constraint was unavailable"
             };
             Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                input_was_measured: false,
                 unpartitioned_input_tokens: 10,
                 text: format!(
                     "### Primary Request\n{fact}\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress"
@@ -42440,6 +42568,7 @@ mod tests {
                 }
                 if attempt == 1 && self.success_on_retry {
                     return Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                        input_was_measured: false,
                         unpartitioned_input_tokens: 0,
                         qualified_usage: None,
                         judgment_provenance: None,
@@ -51432,9 +51561,12 @@ mod tests {
                 .expect("configured route");
             assert_eq!(result.is_ok(), primary_succeeds);
             assert_eq!(
-                host.work_admission_usage.attempts,
+                host.auxiliary_summary_usage.lock().unwrap().attempts,
                 if partial_budget { 1 } else { 2 }
             );
+            let mut state = create_durable_execution_test_state("selector-session");
+            host.on_turn_usage_settlement(&mut state).await;
+            assert_eq!(host.auxiliary_summary_usage.lock().unwrap().attempts, 0);
         }
         // HTTP 400 is permanent; an expired Run deadline prevents the third dispatch.
         assert_eq!(requests.lock().await.len(), 2);

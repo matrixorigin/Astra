@@ -1293,6 +1293,15 @@ pub(crate) trait ProviderAttemptObserver: Send + Sync {
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError>;
 
+    /// Replace the validated cumulative snapshot for this physical attempt.
+    fn note_usage_snapshot(
+        &self,
+        _attempt_index: u32,
+        _usage: crate::turn::token_usage::TokenUsage,
+        _presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+    }
+
     /// Preserve provider lane presence for Explain Analyze without changing
     /// the inference ledger's normalized accounting contract.
     fn note_usage_presence(
@@ -1451,6 +1460,16 @@ impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
                 Err(self.ledger_deadline_error("terminalization", Some(terminal)))
             },
         }
+    }
+
+    fn note_usage_snapshot(
+        &self,
+        attempt_index: u32,
+        usage: crate::turn::token_usage::TokenUsage,
+        presence: crate::turn::token_usage::TokenUsagePresence,
+    ) {
+        self.inner
+            .note_usage_snapshot(attempt_index, usage, presence);
     }
 
     fn note_usage_presence(
@@ -5659,6 +5678,7 @@ async fn call_prepared_llm_with_total_budget(
                     idle_pre,
                     &authorized_tool_names,
                     stream_callback.as_deref_mut(),
+                    attempt_observer.zip(observed_attempt),
                 )
                 .await
                 {
@@ -5889,6 +5909,7 @@ async fn call_prepared_llm_with_total_budget(
                     started,
                     stream_budget,
                     lease,
+                    attempt_observer.zip(observed_attempt),
                 )
                 .await
             } else {
@@ -5904,6 +5925,7 @@ async fn call_prepared_llm_with_total_budget(
                         idle_post,
                         &authorized_tool_names,
                         stream_callback.as_deref_mut(),
+                        attempt_observer.zip(observed_attempt),
                     )
                     .await
                 } else {
@@ -5917,6 +5939,7 @@ async fn call_prepared_llm_with_total_budget(
                         idle_post,
                         &authorized_tool_names,
                         stream_callback.as_deref_mut(),
+                        attempt_observer.zip(observed_attempt),
                     )
                     .await
                 }
@@ -6422,8 +6445,9 @@ async fn collect_llm_stream_for_wire(
     idle_post: std::time::Duration,
     authorized_tool_names: &HashSet<String>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
-    collect_llm_stream_with_semantic_progress_deadline_and_surface(
+    collect_llm_stream_with_usage_observer(
         stream,
         model_name,
         started,
@@ -6434,6 +6458,7 @@ async fn collect_llm_stream_for_wire(
         llm_semantic_progress_timeout(),
         Some(authorized_tool_names),
         stream_callback,
+        usage_observer,
     )
     .await
 }
@@ -6464,6 +6489,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline(
     .await
 }
 
+#[cfg(test)]
 async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
@@ -6474,7 +6500,36 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     idle_post: std::time::Duration,
     semantic_progress_timeout: std::time::Duration,
     authorized_tool_names: Option<&HashSet<String>>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_llm_stream_with_usage_observer(
+        stream,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_pre,
+        idle_post,
+        semantic_progress_timeout,
+        authorized_tool_names,
+        stream_callback,
+        None,
+    )
+    .await
+}
+
+async fn collect_llm_stream_with_usage_observer(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: Option<std::time::Duration>,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -6686,6 +6741,9 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 current_usage_presence(&usage_presence),
             ) {
                 replace_usage_presence(&usage_presence, observed);
+                if let Some((observer, attempt)) = usage_observer {
+                    observer.note_usage_snapshot(attempt, extracted, observed);
+                }
                 usage = extracted.to_qualified_json_map(observed);
                 made_progress = true;
             }
@@ -7065,8 +7123,9 @@ async fn collect_anthropic_llm_stream_for_wire(
     idle_post: std::time::Duration,
     authorized_tool_names: &HashSet<String>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
-    collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
+    collect_anthropic_llm_stream_with_usage_observer(
         stream,
         model_name,
         started,
@@ -7077,6 +7136,7 @@ async fn collect_anthropic_llm_stream_for_wire(
         llm_semantic_progress_timeout(),
         Some(authorized_tool_names),
         stream_callback,
+        usage_observer,
     )
     .await
 }
@@ -7107,6 +7167,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline(
     .await
 }
 
+#[cfg(test)]
 async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surface(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
     model_name: &str,
@@ -7117,7 +7178,36 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
     idle_post: std::time::Duration,
     semantic_progress_timeout: std::time::Duration,
     authorized_tool_names: Option<&HashSet<String>>,
+    stream_callback: Option<&mut LlmStreamCallback<'_>>,
+) -> Result<LlmCallResult, StreamCollectError> {
+    collect_anthropic_llm_stream_with_usage_observer(
+        stream,
+        model_name,
+        started,
+        provider_work_budget,
+        cancel,
+        idle_pre,
+        idle_post,
+        semantic_progress_timeout,
+        authorized_tool_names,
+        stream_callback,
+        None,
+    )
+    .await
+}
+
+async fn collect_anthropic_llm_stream_with_usage_observer(
+    stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
+    model_name: &str,
+    started: Instant,
+    provider_work_budget: Option<std::time::Duration>,
+    cancel: LlmCancel<'_>,
+    idle_pre: std::time::Duration,
+    idle_post: std::time::Duration,
+    semantic_progress_timeout: std::time::Duration,
+    authorized_tool_names: Option<&HashSet<String>>,
     mut stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let mut full_text = String::new();
     let mut reasoning = String::new();
@@ -7350,6 +7440,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         &usage_presence,
                         usage_tokens.qualified_snapshot(retained_usage_presence).1,
                     );
+                    if let Some((observer, attempt)) = usage_observer {
+                        let (snapshot, presence) =
+                            usage_tokens.qualified_snapshot(retained_usage_presence);
+                        observer.note_usage_snapshot(attempt, snapshot, presence);
+                    }
                     made_progress = true;
                 }
             }
@@ -7572,6 +7667,11 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         &usage_presence,
                         usage_tokens.qualified_snapshot(retained_usage_presence).1,
                     );
+                    if let Some((observer, attempt)) = usage_observer {
+                        let (snapshot, presence) =
+                            usage_tokens.qualified_snapshot(retained_usage_presence);
+                        observer.note_usage_snapshot(attempt, snapshot, presence);
+                    }
                     made_progress = true;
                 }
             }
@@ -12510,6 +12610,7 @@ mod tests {
             stream_idle_timeout_after_progress(),
             &allowed,
             None,
+            None,
         )
         .await
         .expect("collect with a partial exact surface");
@@ -12526,6 +12627,7 @@ mod tests {
             stream_idle_timeout(),
             stream_idle_timeout_after_progress(),
             &no_tools,
+            None,
             None,
         )
         .await

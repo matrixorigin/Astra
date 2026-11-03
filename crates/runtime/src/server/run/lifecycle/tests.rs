@@ -16,6 +16,52 @@ mod trace_ingestion_tests;
 mod skill_ledger_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
+#[tokio::test]
+async fn caught_loop_panic_settles_host_usage_before_returning_error() {
+    struct PanicHost {
+        pending: u64,
+        tools: std::collections::HashSet<String>,
+        executed: bool,
+    }
+    #[async_trait]
+    impl AgenticLoopHost for PanicHost {
+        async fn execute_turn(
+            &mut self,
+            _: &mut AgenticLoopState,
+        ) -> Result<crate::turn::agentic_loop::host::HostTurnResult, astra_core::ClassifiedError>
+        {
+            self.executed = true;
+            panic!("fixture panic after usage");
+        }
+        async fn on_turn_usage_settlement(&mut self, state: &mut AgenticLoopState) {
+            state.unpartitioned_input_tokens += std::mem::take(&mut self.pending);
+        }
+        fn emit_headless_line(
+            &mut self,
+            _: crate::turn::agentic::headless_round::HeadlessStderrStyle,
+            _: String,
+        ) {
+        }
+        fn is_quiet(&self) -> bool {
+            true
+        }
+        fn valid_tool_names(&self) -> &std::collections::HashSet<String> {
+            &self.tools
+        }
+    }
+    let mut host = PanicHost {
+        pending: 17,
+        tools: Default::default(),
+        executed: false,
+    };
+    let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+    let result = run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+    assert!(result.is_err());
+    assert!(host.executed);
+    assert_eq!(state.unpartitioned_input_tokens, 17);
+    assert_eq!(host.pending, 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn native_guidance_wait_is_idle_but_preserves_retry_and_closed_subscription() {
     let (sender, receiver) = tokio::sync::watch::channel(-1);

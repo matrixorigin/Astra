@@ -200,6 +200,13 @@ impl BedrockStreamAccumulator {
     ///
     /// `messageStop` without this fact is not a protocol-complete success:
     /// metadata is emitted after the semantic stop frame.
+    pub(crate) fn usage_snapshot(
+        &self,
+    ) -> Option<(TokenUsage, crate::turn::token_usage::TokenUsagePresence)> {
+        self.usage
+            .map(|usage| usage.qualified_snapshot(self.usage_presence))
+    }
+
     pub fn has_usage_metadata(&self) -> bool {
         self.usage_metadata_received
     }

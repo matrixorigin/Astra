@@ -511,6 +511,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
     }
 
+    host.on_turn_usage_settlement(state).await;
+
     // One loop exit owns turn facts and settlement. Round trace callbacks are
     // observations: they must not append the same cumulative tool facts again.
     // Waiting/delegated/rejected control does not settle an unfinished turn.

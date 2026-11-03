@@ -3490,6 +3490,7 @@ async fn run_agentic_loop_with_host_panic_safe<H: AgenticLoopHost>(
     {
         Ok(outcome) => outcome,
         Err(payload) => {
+            host.on_turn_usage_settlement(state).await;
             let message = format!(
                 "agentic loop panicked: {}",
                 panic_payload_message(payload.as_ref())

@@ -22,7 +22,16 @@ pub(crate) struct RunScopedProviderObserver {
         astra_turn_types::InferenceInvocationScope,
         String,
     )>,
-    attempts: Mutex<BTreeMap<u32, (ProviderAttemptObservation, TokenUsagePresence)>>,
+    attempts: Mutex<
+        BTreeMap<
+            u32,
+            (
+                ProviderAttemptObservation,
+                TokenUsagePresence,
+                Option<crate::turn::token_usage::TokenUsage>,
+            ),
+        >,
+    >,
 }
 
 impl RunScopedProviderObserver {
@@ -63,35 +72,65 @@ impl RunScopedProviderObserver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .map(|(fact, presence)| {
+            .map(|(fact, presence, live)| {
                 let mut fact = fact.clone();
                 if fact.dispatch_started {
-                    fact.measured_input_tokens = (!presence.input_invalid)
-                        .then_some(presence.measured_input_tokens)
-                        .flatten();
+                    let mut presence = *presence;
                     let unknown =
                         astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
                             .expect("unknown usage is valid");
-                    fact.qualified_usage = Some(match fact.terminal.as_ref() {
-                        Some(terminal)
-                            if terminal.usage_status
-                                != astra_services::InferenceUsageStatus::Unavailable =>
+                    let terminal_usage = fact
+                        .terminal
+                        .as_ref()
+                        .filter(|terminal| {
+                            terminal.usage_status
+                                != astra_services::InferenceUsageStatus::Unavailable
+                        })
+                        .map(|terminal| crate::turn::token_usage::TokenUsage {
+                            input_tokens: terminal.usage.input.fresh_input_tokens,
+                            cached_input_tokens: terminal.usage.input.cache_read_tokens,
+                            cache_creation_tokens: terminal.usage.input.cache_creation_tokens,
+                            output_tokens: terminal.usage.output_tokens,
+                        });
+                    if let (Some(terminal), Some(snapshot)) = (terminal_usage, *live) {
+                        let input_conflict = (presence.fresh_input_tokens
+                            && terminal.input_tokens != snapshot.input_tokens)
+                            || (presence.cache_read_tokens
+                                && terminal.cached_input_tokens != snapshot.cached_input_tokens)
+                            || (presence.cache_creation_tokens
+                                && terminal.cache_creation_tokens
+                                    != snapshot.cache_creation_tokens);
+                        if input_conflict {
+                            presence.input_invalid = true;
+                            presence.fresh_input_tokens = false;
+                            presence.cache_read_tokens = false;
+                            presence.cache_creation_tokens = false;
+                            presence.measured_input_tokens = None;
+                        }
+                        if presence.output_tokens
+                            && terminal.output_tokens != snapshot.output_tokens
                         {
-                            let usage = &terminal.usage;
+                            presence.output_invalid = true;
+                            presence.output_tokens = false;
+                        }
+                    }
+                    fact.measured_input_tokens = (!presence.input_invalid)
+                        .then_some(presence.measured_input_tokens)
+                        .flatten();
+                    fact.qualified_usage =
+                        Some(terminal_usage.or(*live).map_or(unknown, |usage| {
                             astra_turn_types::CanonicalTokenUsage::new(
                                 (presence.fresh_input_tokens && !presence.input_invalid)
-                                    .then_some(usage.input.fresh_input_tokens),
+                                    .then_some(usage.input_tokens),
                                 (presence.cache_read_tokens && !presence.input_invalid)
-                                    .then_some(usage.input.cache_read_tokens),
+                                    .then_some(usage.cached_input_tokens),
                                 (presence.cache_creation_tokens && !presence.input_invalid)
-                                    .then_some(usage.input.cache_creation_tokens),
+                                    .then_some(usage.cache_creation_tokens),
                                 (presence.output_tokens && !presence.output_invalid)
                                     .then_some(usage.output_tokens),
                             )
                             .unwrap_or(unknown)
-                        }
-                        _ => unknown,
-                    });
+                        }));
                 }
                 fact
             })
@@ -103,7 +142,7 @@ impl RunScopedProviderObserver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .any(|(fact, _)| fact.dispatch_started)
+            .any(|(fact, _, _)| fact.dispatch_started)
     }
 }
 
@@ -140,7 +179,7 @@ impl ProviderAttemptObserver for RunScopedProviderObserver {
                 "retained model attempt has no prepared request",
             ));
         }
-        if let Some((fact, _)) = attempts.get(&index) {
+        if let Some((fact, _, _)) = attempts.get(&index) {
             if fact.dispatch_started || !fact.request.matches_wire(wire) {
                 return Err(astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::ContractViolation,
@@ -163,6 +202,7 @@ impl ProviderAttemptObserver for RunScopedProviderObserver {
                         measured_input_tokens: None,
                     },
                     TokenUsagePresence::default(),
+                    None,
                 ),
             );
         }
@@ -189,7 +229,7 @@ impl ProviderAttemptObserver for RunScopedProviderObserver {
             .attempts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (fact, _) = attempts.get_mut(&index).ok_or_else(|| {
+        let (fact, _, _) = attempts.get_mut(&index).ok_or_else(|| {
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContractViolation,
                 "model terminal has no observed request",
@@ -209,8 +249,31 @@ impl ProviderAttemptObserver for RunScopedProviderObserver {
         Ok(())
     }
 
+    fn note_usage_snapshot(
+        &self,
+        index: u32,
+        usage: crate::turn::token_usage::TokenUsage,
+        presence: TokenUsagePresence,
+    ) {
+        {
+            if let Some((fact, observed, live)) = self
+                .attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&index)
+                && fact.dispatch_started
+                && fact.terminal.is_none()
+            {
+                *observed = presence;
+                *live = Some(usage);
+            }
+        }
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        self.publish_observations(false);
+    }
+
     fn note_usage_presence(&self, index: u32, presence: TokenUsagePresence) {
-        if let Some((_, observed)) = self
+        if let Some((_, observed, _)) = self
             .attempts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -221,7 +284,7 @@ impl ProviderAttemptObserver for RunScopedProviderObserver {
     }
 
     fn note_dispatch_started(&self, index: u32) {
-        if let Some((fact, _)) = self
+        if let Some((fact, _, _)) = self
             .attempts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -420,5 +483,145 @@ mod tests {
         );
         assert_eq!(observer.facts()[0].measured_input_tokens, None);
         assert_eq!(observer.facts()[0].observed_input_tokens(), 0);
+    }
+    #[tokio::test]
+    async fn cumulative_snapshots_replace_and_conflicting_lanes_are_quarantined() {
+        let observer = RunScopedProviderObserver::new(authority(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        observer.begin_attempt(&wire(), None).await.unwrap();
+        observer.note_dispatch_started(0);
+        let presence = TokenUsagePresence {
+            fresh_input_tokens: true,
+            output_tokens: true,
+            measured_input_tokens: Some(7),
+            ..Default::default()
+        };
+        let snapshot = crate::turn::token_usage::TokenUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+            ..Default::default()
+        };
+        observer.note_usage_snapshot(0, snapshot, presence);
+        observer.note_usage_snapshot(
+            0,
+            crate::turn::token_usage::TokenUsage {
+                output_tokens: 0,
+                ..snapshot
+            },
+            presence,
+        );
+        assert_eq!(
+            observer.facts()[0].qualified_usage.unwrap().output_tokens(),
+            Some(0)
+        );
+        observer.note_usage_snapshot(0, snapshot, presence);
+        observer
+            .finish_attempt(
+                0,
+                &astra_services::InferenceInvocationTerminal {
+                    status: astra_services::InferenceTerminalStatus::Succeeded,
+                    usage: astra_services::InferenceUsage {
+                        input: astra_turn_types::NormalizedPromptCacheUsage::new(8, 0, 0),
+                        output_tokens: 3,
+                    },
+                    usage_status: astra_services::InferenceUsageStatus::ProviderPartial,
+                    provider_response_id: None,
+                    error_kind: None,
+                    error_message: None,
+                },
+            )
+            .await
+            .unwrap();
+        let fact = &observer.facts()[0];
+        assert_eq!(fact.measured_input_tokens, None);
+        assert_eq!(fact.qualified_usage.unwrap().input_tokens(), None);
+        assert_eq!(fact.qualified_usage.unwrap().output_tokens(), Some(3));
+        observer.note_usage_snapshot(0, Default::default(), Default::default());
+        assert_eq!(
+            observer.facts()[0],
+            *fact,
+            "late frames cannot change a terminal attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_stream_keeps_usage_received_before_terminal() {
+        use super::super::client::{
+            LlmCall, LlmCancel, LlmExecutionRoute, LlmStreamUpdate, RuntimeToolChoice,
+        };
+        use axum::{Router, body::Body, response::Response, routing::post};
+        for (provider, path, frame) in [
+            ("openai", "/chat/completions", &b"data: {\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":3},\"choices\":[{\"delta\":{\"content\":\"seen\"}}]}\n\n"[..]),
+            ("anthropic", "/v1/messages", &b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":17,\"output_tokens\":3}}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"seen\"}}\n\n"[..]),
+        ] {
+        let app = Router::new().route(path, post(move || async move {
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(frame));
+                std::future::pending::<()>().await;
+            };
+            Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(stream)).unwrap()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut on_frame = |event| {
+            if matches!(event, LlmStreamUpdate::Text(_)) {
+                cancel.cancel();
+            }
+        };
+        let observer = RunScopedProviderObserver::new(authority(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let base = format!("http://{address}");
+        let call = LlmCall {
+            purpose: astra_turn_types::InferencePurpose::Introspection,
+            messages: &[serde_json::json!({"role":"user","content":"summarize"})],
+            tools: &[],
+            cache_capability: None,
+            route: LlmExecutionRoute {
+                subscription: None,
+                model_name: "fixture-model",
+                api_key: "fixture-key",
+                base_url: &base,
+                provider,
+                fixed_temperature: None,
+                supported_reasoning_efforts: None,
+                thinking_protocol: None,
+                wire_model_name: None,
+                header_overrides: None,
+                request_body_overrides: None,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: Some(16),
+            temperature: None,
+            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        };
+        let prepared =
+            super::super::client::prepare_streaming_call(call, RuntimeToolChoice::None).unwrap();
+        {
+            let call = super::super::client::call_prepared_llm_and_collect_with_stream_callback(
+                prepared,
+                LlmCancel::None,
+                Some(&mut on_frame),
+                Some(&observer),
+                None,
+            );
+            tokio::pin!(call);
+            tokio::select! { biased; _ = cancel.cancelled() => {}, result = &mut call => panic!("stream finished before fence: {result:?}") }
+        }
+        let facts = observer.facts();
+        assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].observed_input_tokens(), 17, "{provider}: already received input survives cancellation");
+            assert_eq!(facts[0].measured_input_tokens, (provider == "openai").then_some(17));
+        assert_eq!(facts[0].qualified_usage.unwrap().output_tokens(), Some(3));
+        server.abort();
+        }
     }
 }

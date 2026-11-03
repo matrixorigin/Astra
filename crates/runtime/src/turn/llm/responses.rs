@@ -145,15 +145,139 @@ fn normalized_usage(
         .unwrap_or_default()
 }
 
+fn invalid_aliases(values: [Option<&serde_json::Value>; 2]) -> bool {
+    let mut previous = None;
+    for value in values
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_null())
+    {
+        let count = value.as_u64().filter(|count| i64::try_from(*count).is_ok());
+        if count.is_none() || previous.is_some_and(|previous| Some(previous) != count) {
+            return true;
+        }
+        previous = count;
+    }
+    false
+}
+
+// Only the fields understood by the usage parser belong in the cumulative
+// snapshot; arbitrary provider extensions must not grow retained state.
+fn usage_update(
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut update = serde_json::Map::new();
+    for (source, target) in [
+        ("prompt_tokens", "prompt_tokens"),
+        ("completion_tokens", "completion_tokens"),
+        ("prompt_cache_hit_tokens", "prompt_cache_hit_tokens"),
+        ("prompt_cache_miss_tokens", "prompt_cache_miss_tokens"),
+        ("cache_read_input_tokens", "cache_read_input_tokens"),
+        ("cache_creation_input_tokens", "cache_creation_input_tokens"),
+        ("input_tokens", "prompt_tokens"),
+        ("output_tokens", "completion_tokens"),
+    ] {
+        if let Some(value) = raw.get(source).filter(|value| !value.is_null()) {
+            update.insert(
+                target.into(),
+                if value.is_number() || value.is_null() {
+                    value.clone()
+                } else {
+                    serde_json::Value::Bool(false)
+                },
+            );
+        }
+    }
+    for (first, second, target) in [
+        ("input_tokens", "prompt_tokens", "prompt_tokens"),
+        ("output_tokens", "completion_tokens", "completion_tokens"),
+    ] {
+        if invalid_aliases([raw.get(first), raw.get(second)]) {
+            update.insert(target.into(), serde_json::Value::Bool(false));
+        }
+    }
+    let details = [
+        raw.get("input_tokens_details"),
+        raw.get("prompt_tokens_details"),
+    ];
+    if details.iter().flatten().any(|value| !value.is_null()) {
+        let value = if details
+            .iter()
+            .flatten()
+            .any(|value| !value.is_null() && !value.is_object())
+        {
+            serde_json::Value::Bool(false)
+        } else {
+            let mut filtered = serde_json::Map::new();
+            for key in [
+                "cached_tokens",
+                "cache_creation_input_tokens",
+                "cache_write_tokens",
+            ] {
+                let values = details.map(|detail| detail.and_then(|value| value.get(key)));
+                if invalid_aliases(values) {
+                    filtered.insert(key.into(), serde_json::Value::Bool(false));
+                } else if let Some(value) =
+                    values.into_iter().flatten().find(|value| !value.is_null())
+                {
+                    filtered.insert(key.into(), value.clone());
+                }
+            }
+            serde_json::Value::Object(filtered)
+        };
+        update.insert("prompt_tokens_details".into(), value);
+    }
+    update
+}
+
+type UsageSnapshot = (
+    crate::turn::token_usage::TokenUsage,
+    crate::turn::token_usage::TokenUsagePresence,
+);
+
+fn observe_with_usage(
+    accumulator: &mut ResponseAccumulator,
+    event: &serde_json::Value,
+    reported: &mut serde_json::Map<String, serde_json::Value>,
+    latest: &mut Option<UsageSnapshot>,
+    observer: Option<(&dyn super::ProviderAttemptObserver, u32)>,
+) -> Result<Option<(String, bool)>, ResponsesStreamError> {
+    let observed = accumulator.observe(event);
+    // The codec captures usage even when a typed failed/incomplete event
+    // returns an error, but it rejects a missing event type before capture.
+    if event["type"].as_str().is_some()
+        && let Some(raw) = event
+            .pointer("/response/usage")
+            .and_then(serde_json::Value::as_object)
+    {
+        let previous = latest.map(|(_, presence)| presence).unwrap_or_default();
+        if let Some(snapshot) =
+            crate::turn::token_usage::update_openai_usage(reported, &usage_update(raw), previous)
+        {
+            *latest = Some(snapshot);
+            if let Some((observer, attempt)) = observer {
+                observer.note_usage_snapshot(attempt, snapshot.0, snapshot.1);
+            }
+        }
+    }
+    observed
+}
+
 fn result(
     output: ResponseOutput,
     connection: &str,
     model: &str,
     display_model: &str,
+    latest_usage: Option<(
+        crate::turn::token_usage::TokenUsage,
+        crate::turn::token_usage::TokenUsagePresence,
+    )>,
 ) -> LlmCallResult {
     let continuation = (output.finish_reason.as_deref() != Some("length"))
         .then(|| output.continuation(connection, model));
-    let (usage, presence) = normalized_usage(&output.usage);
+    let (usage, presence) = latest_usage
+        .map(|(usage, presence)| (usage.to_qualified_json_map(presence), presence))
+        .unwrap_or_else(|| normalized_usage(&output.usage));
     let finish_reason = output.finish_reason.clone().unwrap_or_else(|| {
         if output.tool_calls.is_empty() {
             "stop".to_owned()
@@ -185,11 +309,14 @@ pub(super) async fn collect(
     started: Instant,
     budget: Option<Duration>,
     lease: &astra_services::chatgpt::CredentialLease,
+    usage_observer: Option<(&dyn super::ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
     let binding = route
         .subscription
         .expect("Responses preparation requires a connection");
     let mut accumulator = ResponseAccumulator::default();
+    let mut reported_usage = serde_json::Map::new();
+    let mut latest_usage = None;
     let mut rejected = false;
     let exchange = async {
         let mut stream = response.bytes_stream();
@@ -263,7 +390,14 @@ pub(super) async fn collect(
                         idle_deadline =
                             tokio::time::Instant::now() + stream_idle_timeout_after_progress();
                     }
-                    let delta = accumulator.observe(&event).map_err(|failure| {
+                    let delta = observe_with_usage(
+                        &mut accumulator,
+                        &event,
+                        &mut reported_usage,
+                        &mut latest_usage,
+                        usage_observer,
+                    )
+                    .map_err(|failure| {
                         if matches!(
                             event["type"].as_str(),
                             Some("response.failed" | "response.incomplete" | "error")
@@ -324,6 +458,7 @@ pub(super) async fn collect(
                             binding.connection_id(),
                             route.wire_model_name.unwrap_or(route.model_name),
                             route.model_name,
+                            latest_usage,
                         );
                         return Ok(result);
                     }
@@ -349,7 +484,9 @@ pub(super) async fn collect(
         }
     };
     outcome.map_err(|error| {
-        let (usage, presence) = normalized_usage(&accumulator.output.usage);
+        let (usage, presence) = latest_usage
+            .map(|(usage, presence)| (usage.to_qualified_json_map(presence), presence))
+            .unwrap_or_else(|| normalized_usage(&accumulator.output.usage));
         StreamCollectError::Provider {
             error,
             rejected,
