@@ -109,6 +109,12 @@ wrappers are retired. Runtime admission owns provider-batch partitioning and
 ordered result reconciliation; the shared invocation parser and canonical
 history evidence remain the carrier and recovery contracts.
 
+Malformed carrier arguments return the canonical parser's specific, static
+reason through the existing tool-level rejection. Missing target names are
+never inferred from selection history, even when only one tool is selected.
+Rejected calls do not dispatch tools or change capability authority; corrected
+calls still pass the same current-schema and provider-binding admission.
+
 Ordinary `agent` spawn, status (`list`), result collection (`get_result`), wait (`wait`), and
 communication (`send_message`) share a compact resident contract when the
 delegation capability is admitted. Its fields and per-action requirements and

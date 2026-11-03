@@ -188,9 +188,9 @@ impl CanonicalToolInvocation {
             return Err(DeferredToolInvocationError::Malformed);
         }
         let args = crate::tool::args::shape::parse_tool_call_arguments(canonical_call)
-            .map_err(|_| DeferredToolInvocationError::Malformed)?;
+            .map_err(DeferredToolInvocationError::InvalidArguments)?;
         let invocation = parse_deferred_tool_invocation(&args)
-            .map_err(|_| DeferredToolInvocationError::Malformed)?;
+            .map_err(DeferredToolInvocationError::InvalidArguments)?;
         if invocation.name == DEFERRED_TOOL_INVOCATION_CARRIER {
             return Err(DeferredToolInvocationError::NotActivated);
         }
@@ -279,6 +279,7 @@ impl std::ops::Deref for CanonicalToolInvocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferredToolInvocationError {
     Malformed,
+    InvalidArguments(&'static str),
     NotActivated,
     ActivationStale,
 }
@@ -288,6 +289,7 @@ impl DeferredToolInvocationError {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Malformed => "invoke_tool arguments do not match the carrier contract",
+            Self::InvalidArguments(reason) => reason,
             Self::NotActivated => {
                 "invoke_tool target was not selected from this session's deferred catalog"
             }
@@ -308,14 +310,17 @@ pub fn parse_deferred_tool_invocation(
     let object = args
         .as_object()
         .ok_or("invoke_tool arguments must be a JSON object")?;
-    if object.len() != 2 || !object.contains_key("name") || !object.contains_key("arguments") {
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "name" | "arguments"))
+    {
         return Err("invoke_tool accepts exactly name and arguments");
     }
     let name = object
         .get("name")
         .and_then(Value::as_str)
         .and_then(astra_core::canonical_names::normalize_name)
-        .ok_or("invoke_tool target name is missing")?
+        .ok_or("invoke_tool requires a nonempty string name identifying the target tool")?
         .to_string();
     let arguments = object
         .get("arguments")
@@ -347,9 +352,9 @@ where
         return Ok(None);
     }
     let args = crate::tool::args::shape::parse_tool_call_arguments(canonical_call)
-        .map_err(|_| DeferredToolInvocationError::Malformed)?;
+        .map_err(DeferredToolInvocationError::InvalidArguments)?;
     let invocation = parse_deferred_tool_invocation(&args)
-        .map_err(|_| DeferredToolInvocationError::Malformed)?;
+        .map_err(DeferredToolInvocationError::InvalidArguments)?;
     // The carrier is transport, never a deferred capability. Permitting it as
     // a target would create a recursive and ambiguous execution path.
     if invocation.name == DEFERRED_TOOL_INVOCATION_CARRIER {
@@ -1041,12 +1046,29 @@ mod tests {
     #[test]
     fn carrier_invocation_rejects_hidden_authority_and_malformed_targets() {
         for args in [
+            json!({"arguments": {"query": "evidence"}}),
             json!({"name": "bash", "arguments": {}, "route": "edge"}),
             json!({"name": "bash", "arguments": []}),
             json!({"name": " ", "arguments": {}}),
             json!({"name": "bash"}),
         ] {
-            assert!(parse_deferred_tool_invocation(&args).is_err(), "{args}");
+            let reason = parse_deferred_tool_invocation(&args).unwrap_err();
+            let call = json!({"id":"invalid-carrier","type":"function","function":{
+                "name":"invoke_tool","arguments":args.to_string()
+            }});
+            let deferred = canonicalize_deferred_tool_invocation(&call, &[], |_| {
+                panic!("invalid arguments must be rejected before selection lookup")
+            })
+            .unwrap_err();
+            let resident = CanonicalToolInvocation::resident_from_carrier(&call).unwrap_err();
+            for error in [deferred, resident] {
+                assert_eq!(error, DeferredToolInvocationError::InvalidArguments(reason));
+                assert_eq!(
+                    error.as_str(),
+                    reason,
+                    "recovery must receive the original parser reason"
+                );
+            }
         }
     }
 
