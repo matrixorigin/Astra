@@ -16715,7 +16715,12 @@ mod tests {
         .await
         .expect_err("should fail with context window");
         assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
-        assert!(err.message.contains("context_length_exceeded"));
+        assert_eq!(
+            err.message,
+            "Model provider rejected the request (HTTP 400)"
+        );
+        let details: Value = serde_json::from_str(err.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["code"], "context_length_exceeded");
     }
 
     #[tokio::test]
