@@ -62,6 +62,7 @@ impl TranscriptItemId {
 enum TranscriptContent {
     Committed(Arc<dyn HistoryCell>),
     Rendered(Vec<Line<'static>>),
+    Activity(Arc<str>),
     RenderedTrusted(Vec<Line<'static>>),
     Reasoning(ReasoningCell),
     Tool(ToolCell),
@@ -183,6 +184,20 @@ impl TranscriptItem {
         Self::rendered_kind(id, TranscriptItemKind::System, lines, separator_rows)
     }
 
+    /// Recorded activity keeps full text for expansion, search, and export;
+    /// the normal view renders a bounded preview.
+    pub(crate) fn activity(id: TranscriptItemId, kind: TranscriptItemKind, text: String) -> Self {
+        let text = crate::tui::render::line_utils::sanitize_terminal_text(&text).into_owned();
+        Self {
+            model_item_id: None,
+            tool_identity: None,
+            id,
+            kind,
+            content: TranscriptContent::Activity(text.into()),
+            separator_rows: 0,
+        }
+    }
+
     pub(crate) fn rendered_kind(
         id: TranscriptItemId,
         kind: TranscriptItemKind,
@@ -254,6 +269,7 @@ impl TranscriptItem {
         match &self.content {
             TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref(), width),
             TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => false,
+            TranscriptContent::Activity(text) => !text.is_empty(),
             TranscriptContent::Reasoning(cell) => cell.has_transcript_details(width),
             TranscriptContent::Tool(cell) => cell.has_transcript_details(),
         }
@@ -263,6 +279,7 @@ impl TranscriptItem {
         match &self.content {
             TranscriptContent::Committed(cell) => cell_label(cell.as_ref()),
             TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => "item",
+            TranscriptContent::Activity(_) => "activity details",
             TranscriptContent::Reasoning(_) => "reasoning",
             TranscriptContent::Tool(_) => "tool details",
         }
@@ -272,6 +289,37 @@ impl TranscriptItem {
         let lines = match &self.content {
             TranscriptContent::Committed(cell) => cell_lines(cell.as_ref(), width, expanded),
             TranscriptContent::Rendered(lines) => lines.clone(),
+            TranscriptContent::Activity(text) => {
+                let preview_bytes = usize::from(width.max(1)).saturating_mul(20).min(512);
+                let mut end = text.len().min(preview_bytes);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let input = if expanded {
+                    text.as_ref()
+                } else {
+                    &text[..end]
+                };
+                let mut source = input
+                    .lines()
+                    .take(if expanded { usize::MAX } else { 6 })
+                    .map(|line| Line::from(line.to_owned()))
+                    .collect::<Vec<_>>();
+                let omitted = !expanded && (end < text.len() || source.len() > 5);
+                if !expanded {
+                    source.truncate(5);
+                }
+                let mut lines =
+                    crate::tui::wrapping::word_wrap_lines(source, width.max(1) as usize);
+                let wrapped_truncated = !expanded && lines.len() > 5;
+                if wrapped_truncated {
+                    lines.truncate(5);
+                }
+                if omitted || wrapped_truncated {
+                    lines.push(Line::from("… expand for full activity"));
+                }
+                lines
+            }
             TranscriptContent::RenderedTrusted(lines) => lines.clone(),
             TranscriptContent::Reasoning(cell) => cell.transcript_lines(width, expanded),
             TranscriptContent::Tool(cell) => cell.transcript_lines(width, expanded),
@@ -512,7 +560,10 @@ impl TranscriptView {
     pub(crate) fn export_plain_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for item in &self.snapshot.items {
-            lines.extend(item.render(self.width, true).iter().map(line_plain_text));
+            match &item.content {
+                TranscriptContent::Activity(text) => lines.extend(text.lines().map(str::to_owned)),
+                _ => lines.extend(item.render(self.width, true).iter().map(line_plain_text)),
+            }
             lines.extend(std::iter::repeat_n(String::new(), item.separator_rows));
         }
         while lines.last().is_some_and(String::is_empty) {
@@ -646,6 +697,23 @@ impl TranscriptView {
             })
     }
 
+    fn expand_item(&mut self, id: &TranscriptItemId) {
+        if self
+            .snapshot
+            .items
+            .iter()
+            .any(|item| item.id == *id && matches!(item.content, TranscriptContent::Activity(_)))
+        {
+            let items = &self.snapshot.items;
+            self.expanded.retain(|other| {
+                !items.iter().any(|item| {
+                    item.id == *other && matches!(item.content, TranscriptContent::Activity(_))
+                })
+            });
+        }
+        self.expanded.insert(id.clone());
+    }
+
     fn toggle_current_item(&mut self) {
         let Some(id) = self.item_at_or_near(self.cursor) else {
             self.status = Some("Nothing to expand".to_string());
@@ -663,7 +731,7 @@ impl TranscriptView {
         let expanded = if self.expanded.remove(&id) {
             false
         } else {
-            self.expanded.insert(id.clone());
+            self.expand_item(&id);
             true
         };
         self.rebuild_lines();
@@ -690,7 +758,7 @@ impl TranscriptView {
             return false;
         }
         let label = item.label();
-        self.expanded.insert(id.clone());
+        self.expand_item(&id);
         self.rebuild_lines();
         if let Some(row) = self.row_for_locator((id, 0)) {
             self.move_cursor_to(row);
@@ -791,71 +859,110 @@ impl TranscriptView {
 
     fn find_search_match(&mut self, query: &str, forward: bool) {
         let needle = query.to_lowercase();
-        let searchable =
-            self.snapshot
-                .items
-                .iter()
-                .filter(|item| item.matches_filter(self.filter))
-                .flat_map(|item| {
-                    item.render(self.width, true).into_iter().enumerate().map(
-                        move |(offset, line)| (item.id.clone(), offset, line_plain_text(&line)),
-                    )
-                })
-                .collect::<Vec<_>>();
-        let matches = searchable
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (_, _, text))| {
-                text.to_lowercase().contains(&needle).then_some(index)
+        let locator = self.row_locator(self.cursor);
+        let current = locator
+            .as_ref()
+            .and_then(|(id, offset)| {
+                self.snapshot
+                    .items
+                    .iter()
+                    .position(|item| &item.id == id)
+                    .map(|index| (index, *offset))
             })
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
+            .unwrap_or((usize::MAX, usize::MAX));
+        // Keep only the neighbouring matches. A newline-heavy activity page can
+        // contain millions of matching lines; search must not retain them all.
+        let mut first = None;
+        let mut last = None;
+        let mut after = None;
+        let mut before = None;
+        let mut count = 0usize;
+        let mut record = |index: usize, offset: usize| {
+            count += 1;
+            let candidate = (index, offset, count);
+            if first.is_none() {
+                first = Some(candidate);
+            }
+            last = Some(candidate);
+            if (index, offset) > current && after.is_none() {
+                after = Some(candidate);
+            }
+            if (index, offset) < current {
+                before = Some(candidate);
+            }
+        };
+        for (index, item) in self.snapshot.items.iter().enumerate() {
+            if !item.matches_filter(self.filter) {
+                continue;
+            }
+            if let TranscriptContent::Activity(text) = &item.content {
+                let lower = text.to_lowercase();
+                let mut offset = 0usize;
+                for (line, lower_line) in text.lines().zip(lower.lines()) {
+                    let width = usize::from(self.width.max(1));
+                    if UnicodeWidthStr::width(line) <= width && !line.contains('\t') {
+                        if lower_line.contains(&needle) {
+                            record(index, offset);
+                        }
+                        offset = offset.saturating_add(1);
+                        continue;
+                    }
+                    let wrapped =
+                        crate::tui::wrapping::word_wrap_lines([Line::from(line.to_owned())], width);
+                    if lower_line.contains(&needle) {
+                        let mut boundaries = Vec::with_capacity(wrapped.len());
+                        let mut consumed = 0usize;
+                        let mut lower_consumed = 0usize;
+                        for row in &wrapped {
+                            let text = line_plain_text(row);
+                            if !text.is_empty() {
+                                if let Some(start) = line[consumed..].find(&text) {
+                                    let end = consumed + start + text.len();
+                                    lower_consumed += line[consumed..end].to_lowercase().len();
+                                    consumed = end;
+                                }
+                            }
+                            boundaries.push(lower_consumed);
+                        }
+                        let mut previous_row = None;
+                        for (position, _) in lower_line.match_indices(&needle) {
+                            let row = boundaries
+                                .partition_point(|end| *end <= position)
+                                .min(boundaries.len().saturating_sub(1));
+                            if previous_row != Some(row) {
+                                record(index, offset.saturating_add(row));
+                                previous_row = Some(row);
+                            }
+                        }
+                    }
+                    offset = offset.saturating_add(wrapped.len().max(1));
+                }
+            } else {
+                for (offset, line) in item.render(self.width, true).iter().enumerate() {
+                    if line_plain_text(line).to_lowercase().contains(&needle) {
+                        record(index, offset);
+                    }
+                }
+            }
+        }
+        let selected = if forward {
+            after.or(first)
+        } else {
+            before.or(last)
+        };
+        let Some((index, offset, ordinal)) = selected else {
             self.status = Some(format!("No matches for /{query}"));
             return;
-        }
-
-        let current = self.row_locator(self.cursor);
-        let current_index = current
-            .and_then(|locator| {
-                searchable
-                    .iter()
-                    .position(|(id, offset, _)| id == &locator.0 && *offset == locator.1)
-            })
-            .unwrap_or_else(|| searchable.len().saturating_sub(1));
-        let match_index = if forward {
-            matches
-                .iter()
-                .copied()
-                .find(|index| *index > current_index)
-                .unwrap_or(matches[0])
-        } else {
-            matches
-                .iter()
-                .copied()
-                .rev()
-                .find(|index| *index < current_index)
-                .unwrap_or_else(|| *matches.last().expect("matches is not empty"))
         };
-        let (id, offset, _) = &searchable[match_index];
-        if self
-            .snapshot
-            .items
-            .iter()
-            .find(|item| &item.id == id)
-            .is_some_and(|item| item.is_expandable(self.width))
-        {
-            self.expanded.insert(id.clone());
+        let id = self.snapshot.items[index].id.clone();
+        if self.snapshot.items[index].is_expandable(self.width) {
+            self.expand_item(&id);
             self.rebuild_lines();
         }
-        if let Some(row) = self.row_for_locator((id.clone(), *offset)) {
+        if let Some(row) = self.row_for_locator((id, offset)) {
             self.move_cursor_to(row);
         }
-        let ordinal = matches
-            .iter()
-            .position(|index| *index == match_index)
-            .unwrap_or(0)
-            + 1;
-        self.status = Some(format!("Match {ordinal}/{} · /{query}", matches.len()));
+        self.status = Some(format!("Match {ordinal}/{count} · /{query}"));
     }
 
     fn selection_bounds(&self) -> Option<(usize, usize)> {
@@ -1290,6 +1397,135 @@ mod tests {
             ReasoningCell::from_text(text, Some(1_200)),
             0,
         )])
+    }
+
+    #[test]
+    fn activity_search_finds_matches_across_wrapped_lines() {
+        let text = format!("{}needle suffix", "x".repeat(78));
+        let item = TranscriptItem::activity(
+            TranscriptItemId::from_widget_id(1),
+            TranscriptItemKind::Tool,
+            text,
+        );
+        let mut view = TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item]), 24, 80);
+        view.find_search_match("needle", true);
+        assert!(
+            view.status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Match 1/1")),
+            "{:?}",
+            view.status
+        );
+        assert!(view.expanded.contains(&TranscriptItemId::from_widget_id(1)));
+    }
+
+    #[test]
+    fn activity_search_tracks_word_wrap_and_repeated_matches() {
+        let item = TranscriptItem::activity(
+            TranscriptItemId::from_widget_id(1),
+            TranscriptItemKind::Tool,
+            "one two three TARGET".into(),
+        );
+        let mut view = TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item]), 24, 10);
+        view.find_search_match("target", true);
+        assert!(
+            super::line_plain_text(&view.lines[view.cursor]).contains("TARGET"),
+            "{:?}",
+            view.lines[view.cursor]
+        );
+        let item = TranscriptItem::activity(
+            TranscriptItemId::from_widget_id(2),
+            TranscriptItemKind::Tool,
+            "needle----needle".into(),
+        );
+        let mut view = TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item]), 24, 8);
+        view.find_search_match("needle", true);
+        assert!(
+            view.status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Match 1/2")),
+            "{:?}",
+            view.status
+        );
+        view.find_search_match("needle", true);
+        assert!(
+            view.status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Match 2/2")),
+            "{:?}",
+            view.status
+        );
+    }
+
+    #[test]
+    fn wrapped_activity_preview_always_indicates_omission() {
+        let text = format!(
+            "heading\n{}",
+            (0..4)
+                .map(|_| "x".repeat(81))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let item = TranscriptItem::activity(
+            TranscriptItemId::from_widget_id(1),
+            TranscriptItemKind::Tool,
+            text,
+        );
+        let view = TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item]), 24, 80);
+        assert!(rendered(&view).contains("expand for full activity"));
+    }
+
+    #[test]
+    fn activity_search_over_newline_heavy_window_keeps_one_item_expanded() {
+        let text = "x\n".repeat(10_000);
+        let items = (0..128)
+            .map(|index| {
+                TranscriptItem::activity(
+                    TranscriptItemId::from_widget_id(index),
+                    TranscriptItemKind::Tool,
+                    text.clone(),
+                )
+            })
+            .collect();
+        let snapshot = TranscriptSnapshot::new(items);
+        let mut view = TranscriptView::from_snapshot(snapshot.clone(), 24, 80);
+        view.find_search_match("x", true);
+        assert!(
+            view.status
+                .as_deref()
+                .is_some_and(|status| status.contains("/1280000")),
+            "{:?}",
+            view.status
+        );
+        view.find_search_match("x", true);
+        view.replace_snapshot(snapshot, 80);
+        assert!(view.lines.len() <= 10_000 + 128 * 6, "{}", view.lines.len());
+    }
+
+    #[test]
+    fn recorded_activity_preview_is_bounded_and_full_text_is_expandable() {
+        let text = format!("{}\n{}", "x".repeat(2000), "\n".repeat(16_000));
+        let item = TranscriptItem::activity(
+            TranscriptItemId::from_widget_id(1),
+            TranscriptItemKind::Tool,
+            text.clone(),
+        );
+        let snapshot = TranscriptSnapshot::new((0..128).map(|_| item.clone()).collect());
+        let mut view = TranscriptView::from_snapshot(snapshot.clone(), 24, 80);
+        assert!(view.lines.len() <= 128 * 6, "{}", view.lines.len());
+        view.replace_snapshot(snapshot, 80);
+        assert!(view.lines.len() <= 128 * 6);
+        let full = item
+            .render(80, true)
+            .iter()
+            .map(super::line_plain_text)
+            .collect::<String>();
+        assert!(full.contains(&"x".repeat(2000)));
+        let single =
+            TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item.clone()]), 24, 80);
+        assert_eq!(single.export_plain_lines()[0], "x".repeat(2000));
+        let narrow = TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item]), 24, 1);
+        assert!(narrow.lines.len() <= 6);
     }
 
     #[test]
