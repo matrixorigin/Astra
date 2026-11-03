@@ -157,6 +157,8 @@ pub struct SummaryResponse {
     /// Aggregate evidence for all dispatched attempts, distinct from the
     /// final response's physical usage. Missing evidence is not measured zero.
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    /// Observed inclusive input not assigned to a proven billing lane.
+    pub unpartitioned_input_tokens: u64,
     /// Actual durable execution that produced this response. Absence means
     /// the adapter cannot prove an admitted invocation and must never be
     /// replaced with a requested attempt or generated correlation ID.
@@ -458,6 +460,7 @@ pub mod test_support {
         pub fn success(text: &str) -> Self {
             Self {
                 responses: vec![Ok(SummaryResponse {
+                    unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),
@@ -477,6 +480,7 @@ pub mod test_support {
             Self {
                 responses: vec![
                     Ok(SummaryResponse {
+                        unpartitioned_input_tokens: 0,
                         qualified_usage: None,
                         judgment_provenance: None,
                         model_used: "fixture-model".into(),
@@ -487,6 +491,7 @@ pub mod test_support {
                         execution: None,
                     }),
                     Ok(SummaryResponse {
+                        unpartitioned_input_tokens: 0,
                         qualified_usage: None,
                         judgment_provenance: None,
                         model_used: "fixture-model".into(),
@@ -506,6 +511,7 @@ pub mod test_support {
         pub fn always_ptl() -> Self {
             Self {
                 responses: vec![Ok(SummaryResponse {
+                    unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: None,
                     model_used: "fixture-model".into(),

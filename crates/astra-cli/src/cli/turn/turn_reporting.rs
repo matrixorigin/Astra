@@ -269,6 +269,58 @@ pub(crate) fn project_primary_usage(
     }
 }
 
+/// Turn-level usage for the scrollback footer.
+///
+/// The canonical Explain Analyze attribution owns the number whenever it
+/// exists: it is the only source that can prove which physical attempts belong
+/// to the selected model. Some topologies deliver no provider-attempt facts at
+/// all, and the footer must still report the turn it just ran. The turn's
+/// accounted usage carries the same normalized disjoint lanes the runtime
+/// bills, so it is used as a lower bound instead of dropping the segment.
+///
+/// The fallback never invents completeness: `complete` and `input_complete`
+/// are derived from lane presence alone. An unknown write bucket therefore
+/// keeps the cache percentage off while the token count stays visible with
+/// `≥` and the cache read lane still renders as a measured count.
+pub(crate) fn project_turn_usage(
+    attribution: &UsageAttribution,
+    raw_usage_observed: bool,
+    accounted: Option<astra_turn_types::CanonicalTokenUsage>,
+) -> PrimaryUsageProjection {
+    if attribution.primary.is_some() {
+        return project_primary_usage(attribution, raw_usage_observed);
+    }
+    let observed_elsewhere = attribution.has_observed_state() || raw_usage_observed;
+    let Some(accounted) = accounted else {
+        return PrimaryUsageProjection {
+            observed: observed_elsewhere,
+            ..PrimaryUsageProjection::default()
+        };
+    };
+    let fresh_input_tokens = accounted.input_tokens();
+    let cache_read_tokens = accounted.cached_input_tokens();
+    let cache_creation_tokens = accounted.cache_creation_tokens();
+    let output_tokens = accounted.output_tokens();
+    PrimaryUsageProjection {
+        fresh_input_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        output_tokens,
+        observed: fresh_input_tokens.is_some()
+            || cache_read_tokens.is_some()
+            || cache_creation_tokens.is_some()
+            || output_tokens.is_some()
+            || observed_elsewhere,
+        complete: fresh_input_tokens.is_some()
+            && cache_read_tokens.is_some()
+            && cache_creation_tokens.is_some()
+            && output_tokens.is_some(),
+        input_complete: fresh_input_tokens.is_some()
+            && cache_read_tokens.is_some()
+            && cache_creation_tokens.is_some(),
+    }
+}
+
 fn primary_usage_summary(result: &StreamResult) -> Option<String> {
     let attribution = &result.usage_attribution;
     let raw_has_values = result.prompt_tokens > 0
@@ -386,7 +438,7 @@ pub(crate) fn print_context_window_warning(budget_pressure: f64) {
 mod tests {
     use super::{
         build_history_text, build_turn_tool_summary, compact_completion_parts,
-        evaluation_status_notice_for_result, interruption_status_notice,
+        evaluation_status_notice_for_result, interruption_status_notice, project_turn_usage,
     };
     use astra_services::session_journal;
     use std::time::Duration;
@@ -744,5 +796,83 @@ mod tests {
     fn history_text_noop_without_tool_summary() {
         let full_text = "No tools used.";
         assert_eq!(build_history_text(full_text, &[]), full_text);
+    }
+
+    fn accounted(
+        fresh: Option<u64>,
+        read: Option<u64>,
+        creation: Option<u64>,
+        output: Option<u64>,
+    ) -> astra_turn_types::CanonicalTokenUsage {
+        astra_turn_types::CanonicalTokenUsage::new(fresh, read, creation, output).unwrap()
+    }
+
+    #[test]
+    fn turn_usage_falls_back_to_accounted_lanes_without_explain_attribution() {
+        use crate::cli::stream::streaming_types::UsageAttribution;
+        // A topology that delivered no provider-attempt facts still measured
+        // this turn: the footer must report it as a lower bound, not drop it.
+        let projection = project_turn_usage(
+            &UsageAttribution::default(),
+            true,
+            Some(accounted(Some(10_000), Some(90_000), Some(0), Some(20))),
+        );
+        assert_eq!(projection.fresh_input_tokens, Some(10_000));
+        assert_eq!(projection.cache_read_tokens, Some(90_000));
+        assert_eq!(projection.cache_creation_tokens, Some(0));
+        assert_eq!(projection.output_tokens, Some(20));
+        assert!(projection.observed);
+        assert!(projection.complete);
+        assert!(projection.input_complete);
+    }
+
+    #[test]
+    fn turn_usage_fallback_keeps_unknown_write_lane_partial() {
+        use crate::cli::stream::streaming_types::UsageAttribution;
+        let projection = project_turn_usage(
+            &UsageAttribution::default(),
+            true,
+            Some(accounted(Some(10_000), Some(90_000), None, Some(20))),
+        );
+        assert!(projection.observed);
+        // An unknown write bucket cannot prove the cache-rate denominator.
+        assert!(!projection.complete);
+        assert!(!projection.input_complete);
+        assert_eq!(projection.cache_read_tokens, Some(90_000));
+    }
+
+    #[test]
+    fn turn_usage_prefers_explain_attribution_over_accounted_fallback() {
+        use crate::cli::stream::streaming_types::{AttributedTokenUsage, UsageAttribution};
+        let attribution = UsageAttribution {
+            primary: Some(AttributedTokenUsage {
+                fresh_input_tokens: Some(100),
+                cache_read_tokens: Some(900),
+                cache_creation_tokens: Some(0),
+                output_tokens: Some(5),
+            }),
+            primary_complete: true,
+            primary_input_complete: true,
+            ..UsageAttribution::default()
+        };
+        let projection = project_turn_usage(
+            &attribution,
+            true,
+            Some(accounted(Some(1), Some(2), Some(3), Some(4))),
+        );
+        assert_eq!(projection.fresh_input_tokens, Some(100));
+        assert_eq!(projection.cache_read_tokens, Some(900));
+        assert!(projection.complete);
+        assert!(projection.input_complete);
+    }
+
+    #[test]
+    fn turn_usage_without_any_measurement_stays_empty() {
+        use crate::cli::stream::streaming_types::UsageAttribution;
+        let projection = project_turn_usage(&UsageAttribution::default(), false, None);
+        assert!(!projection.observed);
+        assert!(!projection.complete);
+        assert_eq!(projection.fresh_input_tokens, None);
+        assert_eq!(projection.cache_read_tokens, None);
     }
 }

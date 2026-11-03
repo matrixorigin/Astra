@@ -2184,6 +2184,7 @@ struct WorkAdmissionUsage {
     attempts: u32,
     provider_reported: u32,
     completed_calls: u32,
+    unpartitioned_input_tokens: u64,
     qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
 }
 
@@ -2381,7 +2382,68 @@ impl WorkAdmissionUsage {
         self.usage.output_tokens = self.usage.output_tokens.saturating_add(usage.output_tokens);
     }
 
+    fn complete_call(
+        &mut self,
+        result: &Result<
+            astra_turn_core::cloud_summary::SummaryResponse,
+            astra_core::ClassifiedError,
+        >,
+    ) {
+        let error_details = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.details_json.as_deref())
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        let usage = match result {
+            Ok(response) => Some(&response.usage),
+            Err(_) => error_details
+                .as_ref()
+                .and_then(|details| details.get("usage"))
+                .and_then(Value::as_object),
+        };
+        let qualified = match result {
+            Ok(response) => response.qualified_usage,
+            Err(_) => error_details
+                .as_ref()
+                .and_then(|details| details.get("qualified_usage"))
+                .filter(|usage| !usage.is_null())
+                .map(|usage| {
+                    astra_turn_types::CanonicalTokenUsage::from_json(usage).unwrap_or_else(|_| {
+                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                            .expect("unknown usage is valid")
+                    })
+                }),
+        };
+        let unpartitioned_input_tokens = match result {
+            Ok(response) => response.unpartitioned_input_tokens,
+            Err(_) => error_details
+                .as_ref()
+                .and_then(|details| details.get("unpartitioned_input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        };
+        self.completed_calls = self.completed_calls.saturating_add(1);
+        self.unpartitioned_input_tokens = self
+            .unpartitioned_input_tokens
+            .saturating_add(unpartitioned_input_tokens);
+        self.absorb_qualified(qualified);
+        if let Some(usage) = usage {
+            self.absorb(usage);
+        }
+    }
+
+    fn settle_into(self, state: &mut AgenticLoopState) {
+        state.unpartitioned_input_tokens = state
+            .unpartitioned_input_tokens
+            .saturating_add(self.unpartitioned_input_tokens);
+        state.add_qualified_usage(self.settled_qualified_usage());
+        state.settle_admitted_auxiliary_usage(self.into());
+    }
+
     fn merge(&mut self, other: Self) {
+        self.unpartitioned_input_tokens = self
+            .unpartitioned_input_tokens
+            .saturating_add(other.unpartitioned_input_tokens);
         self.completed_calls = self.completed_calls.saturating_add(other.completed_calls);
         self.absorb_qualified(other.qualified_usage);
         self.usage.input_tokens = self
@@ -2404,6 +2466,48 @@ impl WorkAdmissionUsage {
         self.provider_reported = self
             .provider_reported
             .saturating_add(other.provider_reported);
+    }
+}
+
+/// Record every compaction attempt at the existing auxiliary settlement boundary.
+struct AccountedSummaryClient<'a> {
+    client: &'a dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+    usage: std::sync::Mutex<WorkAdmissionUsage>,
+}
+
+impl<'a> AccountedSummaryClient<'a> {
+    fn new(client: &'a dyn astra_turn_core::cloud_summary::SummaryLlmClient) -> Self {
+        Self {
+            client,
+            usage: std::sync::Mutex::new(WorkAdmissionUsage::default()),
+        }
+    }
+
+    fn settle(self, state: &mut AgenticLoopState) {
+        self.usage
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .settle_into(state);
+    }
+}
+
+#[async_trait::async_trait]
+impl astra_turn_core::cloud_summary::SummaryLlmClient for AccountedSummaryClient<'_> {
+    async fn summarize(
+        &self,
+        purpose: astra_turn_types::InferencePurpose,
+        messages: &[Value],
+    ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError> {
+        self.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .begin_attempt();
+        let result = self.client.summarize(purpose, messages).await;
+        self.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .complete_call(&result);
+        result
     }
 }
 
@@ -2927,42 +3031,10 @@ impl SummaryClientWorkAdmissionJudge {
         } else {
             astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
         });
-        let error_details = result
-            .as_ref()
-            .err()
-            .and_then(|error| error.details_json.as_deref())
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-        let usage = match &result {
-            Ok(response) => Some(&response.usage),
-            Err(_) => error_details
-                .as_ref()
-                .and_then(|details| details.get("usage"))
-                .and_then(Value::as_object),
-        };
-        let qualified = match &result {
-            Ok(response) => response.qualified_usage,
-            Err(_) => error_details
-                .as_ref()
-                .and_then(|details| details.get("qualified_usage"))
-                .filter(|usage| !usage.is_null())
-                .map(|usage| {
-                    astra_turn_types::CanonicalTokenUsage::from_json(usage).unwrap_or_else(|_| {
-                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
-                            .expect("unknown usage is valid")
-                    })
-                }),
-        };
-        {
-            let mut accounting = self
-                .usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            accounting.completed_calls = accounting.completed_calls.saturating_add(1);
-            accounting.absorb_qualified(qualified);
-            if let Some(usage) = usage {
-                accounting.absorb(usage);
-            }
-        }
+        self.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .complete_call(&result);
         result.map_err(astra_services::TurnIntentJudgeError::Inference)
     }
 
@@ -6874,21 +6946,7 @@ impl ServerAgenticLoopHost {
         } else {
             astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
         });
-        let error_details = response
-            .as_ref()
-            .err()
-            .and_then(|error| error.details_json.as_deref())
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-        let usage = match &response {
-            Ok(response) => Some(&response.usage),
-            Err(_) => error_details
-                .as_ref()
-                .and_then(|details| details.get("usage"))
-                .and_then(Value::as_object),
-        };
-        if let Some(usage) = usage {
-            self.work_admission_usage.absorb(usage);
-        }
+        self.work_admission_usage.complete_call(&response);
         response
     }
 
@@ -17382,6 +17440,10 @@ impl ServerAgenticLoopHost {
             .map(|client| client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient);
         #[cfg(test)]
         let summary_client = self.test_compaction_client.as_deref().or(summary_client);
+        let accounted_client = summary_client.map(AccountedSummaryClient::new);
+        let summary_client = accounted_client
+            .as_ref()
+            .map(|client| client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient);
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
@@ -17392,6 +17454,9 @@ impl ServerAgenticLoopHost {
             session_facts: None,
         };
         let mut result = ctx.compact(messages, system_messages, visible_tools).await;
+        if let Some(client) = accounted_client {
+            client.settle(state);
+        }
         // Admission owns canonical rewrite authority. Without a valid permit,
         // retain the request-local result and the existing WAL predecessor.
         if let Some(candidate) = crate::turn::cloud::compaction::prepare_request_summary(
@@ -17773,8 +17838,7 @@ impl ServerAgenticLoopHost {
         // path returned.
         self.abort_pending_work_admission().await;
         let auxiliary = std::mem::take(&mut self.work_admission_usage);
-        state.add_qualified_usage(auxiliary.settled_qualified_usage());
-        state.settle_admitted_auxiliary_usage(auxiliary.into());
+        auxiliary.settle_into(state);
         if let Err(error) = &mut outcome {
             *error = attach_work_admission_usage(error.clone(), auxiliary);
         }
@@ -19599,6 +19663,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         self.current_model_item_id = state.current_model_item_id.clone();
         let mut qualified_attempt_usage: Option<astra_turn_types::CanonicalTokenUsage> = None;
+        let mut observed_input_tokens = 0u64;
         let outcome = async {
         let turn_started = Instant::now();
         if let Some(executor) = state.runtime_tool_executor.as_deref() {
@@ -20826,6 +20891,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             };
             let llm_round_latency_ms = llm_round_start.elapsed().as_millis() as u64;
             let provider_attempts = provider_observer.facts();
+            for attempt in &provider_attempts {
+                observed_input_tokens = observed_input_tokens.saturating_add(attempt.observed_input_tokens());
+            }
+
             let mut qualified_invocation_usage: Option<astra_turn_types::CanonicalTokenUsage> = None;
             // The invocation's final facts are read once after its call has
             // stopped. Each request key is unique in its existing owner map.
@@ -21803,6 +21872,42 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         .await;
         let outcome =
             outcome.map_err(|error| attach_qualified_error_usage(error, qualified_attempt_usage));
+        // Reconcile against the actual caller projection only after the logical
+        // call settles: an unknown retry can erase a previously known canonical
+        // lane without erasing the physical input that was observed.
+        let counted = match &outcome {
+            Ok(result) => crate::turn::token_usage::TokenUsage {
+                input_tokens: result.accum.prompt_tokens,
+                cached_input_tokens: result.accum.cache_read_tokens,
+                cache_creation_tokens: result.accum.cache_creation_tokens,
+                output_tokens: 0,
+            },
+            Err(error) => {
+                let details = error
+                    .details_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+                let usage = details.as_ref().and_then(|details| {
+                    let key = if details
+                        .pointer("/provider_response/transport_success")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        "usage"
+                    } else {
+                        "qualified_usage"
+                    };
+                    details.get(key).and_then(Value::as_object)
+                });
+                usage
+                    .map(crate::turn::token_usage::TokenUsage::from_partial_json_map)
+                    .unwrap_or_default()
+            }
+        };
+        state.unpartitioned_input_tokens = state.unpartitioned_input_tokens.saturating_add(
+            observed_input_tokens
+                .saturating_sub(counted.normalized_prompt_cache_usage().total_input_tokens()),
+        );
         self.finalize_work_admission_usage_at_turn_exit(state, outcome)
             .await
     }
@@ -22106,7 +22211,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         let client =
             self.pre_turn_summary_client(&config, state, summary_tools, cache_capability)?;
-        if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
+        let accounted_client = AccountedSummaryClient::new(client.as_ref());
+        let summary_text = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
             &state.messages[..spill_count],
             if matches!(
@@ -22117,10 +22223,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else {
                 astra_turn_core::cloud_summary::InlineSummaryHistoryProjection::Semantic
             },
-            client.as_ref(),
+            &accounted_client,
         )
-        .await
-        {
+        .await;
+        accounted_client.settle(state);
+        if let Some(summary_text) = summary_text {
             let event = apply_pre_turn_summary(state, pressure, summary_text, spill_count);
             if event.is_none() {
                 state.compaction_effectiveness.record_futile();
@@ -22860,42 +22967,51 @@ fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
 fn normalize_usage_to_canonical(
     raw: &serde_json::Map<String, Value>,
 ) -> serde_json::Map<String, Value> {
-    // Anthropic and canonical shapes both use `input_tokens`/`output_tokens`.
-    // Provider-specific cache keys are the deterministic discriminator and
-    // must be handled before completing a canonical-like map.
-    let looks_anthropic = raw.contains_key("cache_read_input_tokens")
-        || raw.contains_key("cache_creation_input_tokens");
-    // Anthropic dialect (Messages API, deepseek `/anthropic` endpoint, …):
-    // `input_tokens`/`output_tokens` plus separate `cache_read_input_tokens`
-    // and `cache_creation_input_tokens`. Must be checked BEFORE the generic
-    // `input_tokens` canonical fast-path above would match, otherwise the
-    // cache fields would leak through verbatim.
-    if looks_anthropic {
-        if let Some(canonical) = crate::turn::token_usage::extract_usage(
-            crate::turn::token_usage::UsageDialect::AnthropicMessages,
-            raw,
-        ) {
-            return canonical.to_json_map();
-        }
-    }
-    // Canonical or canonical-like shape. Complete missing cache buckets with
-    // zeros and recompute `total_tokens` so error artifacts never surface a
-    // partial token schema.
-    if raw.contains_key("input_tokens")
-        || raw.contains_key("cached_input_tokens")
-        || raw.contains_key("cache_creation_tokens")
-        || raw.contains_key("output_tokens")
+    use crate::turn::token_usage::{UsageDialect, parse_usage};
+    // OpenAI-shaped proxies can also echo the top-level cache aliases.
+    let dialect = if raw.contains_key("prompt_tokens")
+        || raw.contains_key("completion_tokens")
+        || raw.contains_key("prompt_tokens_details")
+        || raw.contains_key("prompt_cache_hit_tokens")
+        || raw.contains_key("prompt_cache_miss_tokens")
     {
-        return crate::turn::token_usage::TokenUsage::from_partial_json_map(raw).to_json_map();
+        Some(UsageDialect::OpenAi)
+    } else if raw.contains_key("cache_read_input_tokens")
+        || raw.contains_key("cache_creation_input_tokens")
+    {
+        Some(UsageDialect::AnthropicMessages)
+    } else {
+        None
+    };
+    if let Some(dialect) = dialect {
+        return parse_usage(dialect, raw)
+            .map(|(usage, presence)| usage.to_qualified_json_map(presence))
+            .unwrap_or_default();
     }
-    // Detect OpenAI dialect (prompt_tokens / completion_tokens / …).
-    if raw.contains_key("prompt_tokens") || raw.contains_key("completion_tokens") {
-        if let Some(canonical) = crate::turn::token_usage::extract_usage(
-            crate::turn::token_usage::UsageDialect::OpenAi,
-            raw,
-        ) {
-            return canonical.to_json_map();
+    if [
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_tokens",
+        "output_tokens",
+    ]
+    .iter()
+    .any(|key| raw.contains_key(*key))
+    {
+        // Reuse disjoint parsing to quarantine each invalid side independently.
+        let mut lanes = serde_json::Map::new();
+        for (from, to) in [
+            ("input_tokens", "input_tokens"),
+            ("cached_input_tokens", "cache_read_input_tokens"),
+            ("cache_creation_tokens", "cache_creation_input_tokens"),
+            ("output_tokens", "output_tokens"),
+        ] {
+            if let Some(value) = raw.get(from) {
+                lanes.insert(to.into(), value.clone());
+            }
         }
+        return parse_usage(UsageDialect::AnthropicMessages, &lanes)
+            .map(|(usage, presence)| usage.to_qualified_json_map(presence))
+            .unwrap_or_default();
     }
     raw.clone()
 }
@@ -25946,6 +26062,7 @@ mod tests {
                     )
                 })?;
             Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                unpartitioned_input_tokens: 0,
                 qualified_usage: None,
                 judgment_provenance: Some(self.provenance),
                 model_used: "fixture-model".into(),
@@ -26038,6 +26155,7 @@ mod tests {
                 client: Box::new(UsageSequencedSummaryClient {
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([Ok(
                         astra_turn_core::cloud_summary::SummaryResponse {
+                            unpartitioned_input_tokens: 0,
                             qualified_usage: None,
                             judgment_provenance: Some(
                                 astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
@@ -26066,6 +26184,7 @@ mod tests {
         output_tokens: u64,
     ) -> astra_turn_core::cloud_summary::SummaryResponse {
         astra_turn_core::cloud_summary::SummaryResponse {
+            unpartitioned_input_tokens: 0,
             qualified_usage: None,
             judgment_provenance: Some(
                 astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
@@ -26092,6 +26211,7 @@ mod tests {
         provider: &str,
     ) -> astra_turn_core::cloud_summary::SummaryResponse {
         astra_turn_core::cloud_summary::SummaryResponse {
+            unpartitioned_input_tokens: 0,
             qualified_usage: None,
             judgment_provenance: Some(if provider == "typesafe" {
                 astra_turn_types::JudgmentResponseProvenance::ProviderProbability
@@ -26314,6 +26434,7 @@ mod tests {
                 wait_node_id: None,
                 handle: tokio::spawn(std::future::pending()),
                 usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage {
+                    unpartitioned_input_tokens: 0,
                     completed_calls: 0,
                     qualified_usage: None,
                     attempts: 1,
@@ -27188,6 +27309,7 @@ mod tests {
         for received in [false, true] {
             let response = if received {
                 Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                    unpartitioned_input_tokens: 0,
                     qualified_usage: None,
                     judgment_provenance: Some(
                         astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
@@ -27448,6 +27570,7 @@ mod tests {
     async fn aborted_work_admission_keeps_owner_scoped_usage() {
         let mut host = test_host_builder("u-work-abort-usage", "s-work-abort-usage").build();
         let usage = Arc::new(std::sync::Mutex::new(WorkAdmissionUsage {
+            unpartitioned_input_tokens: 0,
             completed_calls: 0,
             qualified_usage: None,
             usage: crate::turn::token_usage::TokenUsage {
@@ -27487,6 +27610,7 @@ mod tests {
     async fn join_error_keeps_work_admission_usage() {
         let mut host = test_host_builder("u-work-join-usage", "s-work-join-usage").build();
         let usage = Arc::new(std::sync::Mutex::new(WorkAdmissionUsage {
+            unpartitioned_input_tokens: 0,
             completed_calls: 0,
             qualified_usage: None,
             usage: crate::turn::token_usage::TokenUsage {
@@ -27511,6 +27635,40 @@ mod tests {
         assert!(!host.resolve_pending_work_admission(None, true).await);
         assert_eq!(host.work_admission_usage.attempts, 1);
         assert_eq!(host.work_admission_usage.usage.input_tokens, 9);
+    }
+
+    #[test]
+    fn work_admission_complete_call_keeps_measured_input_on_success_and_failure() {
+        let mut accounting = WorkAdmissionUsage::default();
+        let mut response = summary_response_with_usage("summary", 3, 5, 2);
+        response.unpartitioned_input_tokens = 11;
+        response.qualified_usage = Some(
+            astra_turn_types::CanonicalTokenUsage::new(Some(3), Some(5), None, Some(2)).unwrap(),
+        );
+        accounting.begin_attempt();
+        accounting.complete_call(&Ok(response));
+        accounting.begin_attempt();
+        accounting.complete_call(&Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Cancelled,
+            "cancelled",
+        )
+        .with_details_json(
+            serde_json::json!({
+                "qualified_usage":{"output_tokens":1},
+                "unpartitioned_input_tokens":17,
+                "usage":{"output_tokens":1}
+            })
+            .to_string(),
+        )));
+        assert_eq!(accounting.attempts, 2);
+        assert_eq!(accounting.completed_calls, 2);
+        assert_eq!(accounting.unpartitioned_input_tokens, 28);
+        assert_eq!(accounting.usage.input_tokens, 3);
+        assert_eq!(accounting.usage.cached_input_tokens, 5);
+        assert_eq!(accounting.usage.output_tokens, 3);
+        let qualified = accounting.settled_qualified_usage().unwrap();
+        assert_eq!(qualified.input_tokens(), None);
+        assert_eq!(qualified.output_tokens(), Some(3));
     }
 
     #[test]
@@ -27553,6 +27711,7 @@ mod tests {
     #[tokio::test]
     async fn turn_exit_finalizes_work_admission_usage_once_on_success_and_error() {
         let usage = WorkAdmissionUsage {
+            unpartitioned_input_tokens: 19,
             completed_calls: 0,
             qualified_usage: None,
             usage: crate::turn::token_usage::TokenUsage {
@@ -27590,6 +27749,7 @@ mod tests {
         assert_eq!(success.accum.cache_creation_tokens, 0);
         assert_eq!(success.accum.completion_tokens, 6);
         assert_eq!(success_state.total_prompt, 7);
+        assert_eq!(success_state.provider_input_tokens(), 34);
         assert!(success_state.qualified_usage.is_some());
         assert_eq!(success_state.qualified_usage.unwrap().input_tokens(), None);
         assert!(
@@ -27611,6 +27771,7 @@ mod tests {
             .await
             .expect("second finalization");
         assert_eq!(second.accum.prompt_tokens, 11);
+        assert_eq!(success_state.provider_input_tokens(), 34);
         assert_eq!(success_state.qualified_usage.unwrap().input_tokens(), None);
         assert_eq!(
             success_state.total_prompt, 7,
@@ -27637,6 +27798,7 @@ mod tests {
         assert_eq!(details["usage"]["input_tokens"], 11);
         assert_eq!(details["work_admission_usage"]["attempts"], 2);
         assert_eq!(error_state.total_prompt, 7);
+        assert_eq!(error_state.provider_input_tokens(), 34);
         assert_eq!(error_state.qualified_usage, success_state.qualified_usage);
         assert_eq!(error_state.total_cache_read, 5);
         assert_eq!(error_state.total_cache_creation, 3);
@@ -32800,6 +32962,24 @@ mod tests {
     /// persistence with no runtime error. This test pins both anchors.
 
     #[test]
+    fn error_capture_retains_cache_write_partition_and_unknown_lanes() {
+        let invalid = json!({"input_tokens":-1,"output_tokens":7});
+        let actual = normalize_usage_to_canonical(invalid.as_object().unwrap());
+        assert_eq!(actual["output_tokens"], 7);
+        assert!(!actual.contains_key("input_tokens"));
+        let full = json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":30}});
+        let actual = normalize_usage_to_canonical(full.as_object().unwrap());
+        assert_eq!(actual["input_tokens"], 30);
+        assert_eq!(actual["cache_creation_tokens"], 30);
+        let partial = json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40}});
+        let actual = normalize_usage_to_canonical(partial.as_object().unwrap());
+        assert_eq!(actual["cached_input_tokens"], 40);
+        assert!(
+            !actual.contains_key("input_tokens") && !actual.contains_key("cache_creation_tokens")
+        );
+    }
+
+    #[test]
     fn llm_capture_error_response_includes_partial_details() {
         let error = astra_core::ClassifiedError::new(
             astra_core::ErrorKind::StreamTransport,
@@ -32815,15 +32995,15 @@ mod tests {
         let response = llm_capture_error_response(&error);
         assert_eq!(response["partial_full_text"].as_str(), Some("half answer"));
         assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(10));
-        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(0));
-        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(0));
+        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), None);
+        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), None);
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(4));
-        assert_eq!(response["usage"]["total_tokens"].as_i64(), Some(14));
+        assert_eq!(response["usage"]["total_tokens"].as_i64(), None);
         assert_eq!(response["kind"].as_str(), Some("stream_transport"));
     }
 
     #[test]
-    fn llm_capture_error_response_completes_canonical_like_usage() {
+    fn llm_capture_error_response_preserves_unknown_canonical_lanes() {
         let error =
             astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
                 .with_details_json(
@@ -32834,15 +33014,10 @@ mod tests {
                 );
         let response = llm_capture_error_response(&error);
         assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(8));
-        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(0));
-        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(0));
+        assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), None);
+        assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), None);
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(3));
-        assert_eq!(response["usage"]["total_tokens"].as_i64(), Some(11));
-        assert_eq!(
-            response["usage"].as_object().expect("usage object").len(),
-            5,
-            "canonical-like error usage must be completed to the exact canonical schema"
-        );
+        assert_eq!(response["usage"]["total_tokens"].as_i64(), None);
     }
 
     #[test]
@@ -32861,7 +33036,7 @@ mod tests {
                     .to_string(),
                 );
         let response = llm_capture_error_response(&error);
-        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(17));
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), None);
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(3));
         assert!(
             response["usage"].get("prompt_tokens").is_none(),
@@ -34664,10 +34839,12 @@ mod tests {
 
     #[test]
     fn partial_openai_cache_usage_preserves_measured_request_input() {
+        // A hit-only native payload cannot prove the write bucket, so the
+        // request usage stays partial while the measured input survives.
         let raw = json!({
             "prompt_tokens": 100_000,
             "completion_tokens": 20,
-            "prompt_tokens_details": {"cached_tokens": 90_000}
+            "prompt_cache_hit_tokens": 90_000
         });
         let (tokens, presence) = crate::turn::token_usage::parse_usage(
             crate::turn::token_usage::UsageDialect::OpenAi,
@@ -34684,6 +34861,39 @@ mod tests {
         assert_eq!(accum.current_request_input_tokens, Some(100_000));
         assert_eq!(accum.measured_request_input_tokens(), Some(100_000));
         assert_eq!(accum.current_request_usage, None);
+    }
+
+    #[test]
+    fn openai_nested_cache_usage_promotes_to_complete_request_usage() {
+        let raw = json!({
+            "prompt_tokens": 100_000,
+            "completion_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 90_000, "cache_write_tokens": 0}
+        });
+        let (tokens, presence) = crate::turn::token_usage::parse_usage(
+            crate::turn::token_usage::UsageDialect::OpenAi,
+            raw.as_object().unwrap(),
+        )
+        .unwrap();
+        let result = LlmCallResult {
+            full_text: "done".into(),
+            usage: tokens.to_qualified_json_map(presence),
+            usage_presence: presence,
+            ..Default::default()
+        };
+        let accum = ServerAgenticLoopHost::result_to_accum_with_usage(&result, None);
+        assert_eq!(accum.measured_request_input_tokens(), Some(100_000));
+        // The explicitly reported zero write bucket closes the partition,
+        // so the full physical request usage is known, not partial.
+        assert_eq!(
+            accum.current_request_usage,
+            Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 10_000,
+                cache_read_tokens: 90_000,
+                cache_creation_tokens: 0,
+                output_tokens: 20,
+            })
+        );
     }
 
     #[test]
@@ -36814,6 +37024,7 @@ mod tests {
                 "historical constraint was unavailable"
             };
             Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                unpartitioned_input_tokens: 10,
                 text: format!(
                     "### Primary Request\n{fact}\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress"
                 ),
@@ -36981,6 +37192,8 @@ mod tests {
                     }
                     let mut fixed = pipeline.system_messages;
                     fixed.extend(pipeline.volatile_preamble);
+                    let input_before = state.provider_input_tokens();
+                    let calls_before = requests.lock().unwrap().len();
                     let result = host
                         .compact_messages_via_memoria(
                             &mut state,
@@ -36991,6 +37204,10 @@ mod tests {
                             &config,
                         )
                         .await;
+                    assert_eq!(
+                        state.provider_input_tokens(),
+                        input_before + 10 * (requests.lock().unwrap().len() - calls_before) as u64
+                    );
                     let observations: Vec<_> =
                         crate::turn::wire_assembly::observe_context_compaction(
                             format!("reuse:{generation}:{round}"),
@@ -40447,6 +40664,7 @@ mod tests {
         )
         .build();
         let usage = Arc::new(std::sync::Mutex::new(WorkAdmissionUsage {
+            unpartitioned_input_tokens: 0,
             completed_calls: 0,
             qualified_usage: None,
             usage: crate::turn::token_usage::TokenUsage {
@@ -42222,6 +42440,7 @@ mod tests {
                 }
                 if attempt == 1 && self.success_on_retry {
                     return Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                        unpartitioned_input_tokens: 0,
                         qualified_usage: None,
                         judgment_provenance: None,
                         model_used: "fixture-model".into(),
@@ -49179,7 +49398,7 @@ mod tests {
         let gateway = ProviderGateway::start(vec![ProviderScript::new("declared idless control", |request| request.path == "/v1/chat/completions" && request.body["model"] == "native-terminal-model", vec![ProviderResponse::OpenAi(json!({
             "id":"idless-response","model":"native-terminal-model",
             "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"mcp__provider__runtime_control","arguments":"{\"action\":\"revise_current_agent\"}"}}]},"finish_reason":"tool_calls"}],
-            "usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}
+            "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}
         }))])]).await;
         let inference = ProviderObservationsFixture::default();
         let session = "session-native-idless-control";
@@ -49270,7 +49489,7 @@ mod tests {
             json!({"choices":[{"delta":{"content":" tail"}}]}),
             json!({
                 "choices":[{"delta":{},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":8,"completion_tokens":4}
+                "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":8,"completion_tokens":4}
             }),
         ];
         let release = Arc::new(tokio::sync::Notify::new());
@@ -49390,7 +49609,7 @@ mod tests {
             json!({"choices":[{"delta":{"content":" tail"}}]}),
             json!({
                 "choices":[{"delta":{},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":8,"completion_tokens":4}
+                "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":8,"completion_tokens":4}
             }),
         ];
         let release = Arc::new(tokio::sync::Notify::new());
@@ -49497,7 +49716,7 @@ mod tests {
                 }
             } else {
                 ProviderResponse::OpenAi(
-                    json!({"model":model, "choices":[{"index":0,"message":{"role":"assistant","content":json!({"answers":answers}).to_string()},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                    json!({"model":model, "choices":[{"index":0,"message":{"role":"assistant","content":json!({"answers":answers}).to_string()},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":7,"completion_tokens":3}}),
                 )
             };
             let observer_path = if native {
@@ -49529,12 +49748,12 @@ mod tests {
                     assert_eq!(context.contains("stale tool outage"), suppress_observer);
                     if !suppress_observer { assert!(context.contains("Server-owned executor")); }
                     true
-                }, vec![ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"acknowledged", "tool_calls": if work_boundary { json!([{"id":"work-boundary","type":"function","function":{"name":"start_work","arguments":r#"{"goal":"Verify the change","activation":"start","tasks":[{"objective":"Verify","expected_result":"Evidence"}]}"#}}]) } else { json!([]) }},"finish_reason":if work_boundary {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":11,"completion_tokens":2}})), ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"continued"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2}}))]),
+                }, vec![ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"acknowledged", "tool_calls": if work_boundary { json!([{"id":"work-boundary","type":"function","function":{"name":"start_work","arguments":r#"{"goal":"Verify the change","activation":"start","tasks":[{"objective":"Verify","expected_result":"Evidence"}]}"#}}]) } else { json!([]) }},"finish_reason":if work_boundary {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":11,"completion_tokens":2}})), ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"continued"},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":11,"completion_tokens":2}}))]),
                 ProviderScript::new("typed Work boundary judgment", |wire| {
                     if wire.path != "/v1/chat/completions" || wire.body["model"] != "observer-model" { return false; }
                     let request = astra_turn_types::judgment_request_from_messages(wire.body["messages"].as_array().unwrap()).unwrap();
                     request.questions.len() == 23
-                }, if work_boundary { vec![ProviderResponse::OpenAi(json!({"model":"observer-model","choices":[{"index":0,"message":{"role":"assistant","content":discrete_classification_response(false)},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}))] } else { vec![] }),
+                }, if work_boundary { vec![ProviderResponse::OpenAi(json!({"model":"observer-model","choices":[{"index":0,"message":{"role":"assistant","content":discrete_classification_response(false)},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":7,"completion_tokens":3}}))] } else { vec![] }),
             ]).await;
             let ledger = ProviderObservationsFixture::default();
             let session = "source-bound-user-observation";
@@ -49734,7 +49953,7 @@ mod tests {
             let provider = ProviderGateway::start(vec![ProviderScript::new(
                 "primary without optional observation",
                 |wire| wire.path == "/v1/chat/completions" && wire.body["model"] == "primary-model",
-                vec![ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"continued"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2}}))].into_iter().filter(|_| admission_mode == "disabled").collect(),
+                vec![ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"continued"},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":11,"completion_tokens":2}}))].into_iter().filter(|_| admission_mode == "disabled").collect(),
             )]).await;
             let ledger = ProviderObservationsFixture::default();
             let session = "capacity-gated-observation";
@@ -49812,7 +50031,7 @@ mod tests {
             json!({"choices":[{"delta":{"content":"final answer"}}]}),
             json!({
                 "choices":[{"delta":{},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":8,"completion_tokens":4}
+                "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":8,"completion_tokens":4}
             }),
         ];
         let release = Arc::new(tokio::sync::Notify::new());
@@ -49907,7 +50126,7 @@ mod tests {
         })];
         let final_events = vec![json!({
             "choices": [{"delta": {}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+            "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 8, "completion_tokens": 4}
         })];
         let chunks = initial_events
             .into_iter()
@@ -50003,7 +50222,7 @@ mod tests {
             vec![json!({"choices": [{"delta": {"content": "Fixed and verified."}}]})];
         let final_events = vec![json!({
             "choices": [{"delta": {}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+            "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 8, "completion_tokens": 4}
         })];
         let chunks = initial_events
             .into_iter()
@@ -50079,7 +50298,7 @@ mod tests {
         ];
         let final_events = vec![json!({
             "choices":[{"delta":{},"finish_reason":"tool_calls"}],
-            "usage":{"prompt_tokens":8,"completion_tokens":4}
+            "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":8,"completion_tokens":4}
         })];
         let release = Arc::new(tokio::sync::Notify::new());
         let boundary = initial_events.len();
@@ -50214,7 +50433,7 @@ mod tests {
         };
         let responses = batches.iter().map(|batch| ProviderResponse::OpenAi(json!({
             "choices": [{"message": {"role":"assistant", "tool_calls":calls(batch)}, "finish_reason":"tool_calls"}],
-            "usage":{"prompt_tokens":10,"completion_tokens":5}
+            "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":10,"completion_tokens":5}
         }))).collect();
         let provider = ProviderGateway::start(vec![ProviderScript::new(
             "reused provider IDs",
@@ -50346,7 +50565,7 @@ mod tests {
         ];
         let final_events = vec![json!({
             "choices":[{"delta":{},"finish_reason":"tool_calls"}],
-            "usage":{"prompt_tokens":8,"completion_tokens":4}
+            "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":8,"completion_tokens":4}
         })];
         let chunks = initial_events
             .into_iter()
@@ -50465,7 +50684,7 @@ mod tests {
                     "finish_reason": "stop"
                 }
             ],
-            "usage": { "prompt_tokens": 12, "completion_tokens": 5 }
+            "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}, "prompt_tokens": 12, "completion_tokens": 5 }
         });
         let provider = ProviderGateway::start(vec![ProviderScript::new(
             "execute_turn_persists_full_journal_request_and_response_when_session_capture_enabled",

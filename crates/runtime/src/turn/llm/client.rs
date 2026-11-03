@@ -1079,6 +1079,25 @@ pub(crate) struct ProviderAttemptObservation {
     pub terminal: Option<astra_services::InferenceInvocationTerminal>,
     /// None means not dispatched; an empty sample means dispatched, unknown.
     pub qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
+    /// Inclusive physical input, independent of disjoint billing qualification.
+    pub measured_input_tokens: Option<u64>,
+}
+
+impl ProviderAttemptObservation {
+    /// Inclusive observed input, falling back to the proven lane subtotal.
+    pub(crate) fn observed_input_tokens(&self) -> u64 {
+        if !self.dispatch_started {
+            return 0;
+        }
+        let known = self.qualified_usage.map_or(0, |usage| {
+            usage
+                .input_tokens()
+                .unwrap_or(0)
+                .saturating_add(usage.cached_input_tokens().unwrap_or(0))
+                .saturating_add(usage.cache_creation_tokens().unwrap_or(0))
+        });
+        self.measured_input_tokens.unwrap_or(known)
+    }
 }
 
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
@@ -6671,8 +6690,11 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 made_progress = true;
             }
         }
-        if yield_state.is_terminal() && !usage.is_empty() {
-            break;
+
+        // The terminal frame owns its delta; subsequent frames may only
+        // refine usage until DONE/EOF or the fixed terminal deadline.
+        if yield_state.is_terminal() {
+            continue;
         }
 
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
@@ -6695,9 +6717,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .and_then(|c| c.get("delta"))
             .and_then(Value::as_object)
         else {
-            if yield_state.is_terminal() && !usage.is_empty() {
-                break;
-            }
             continue;
         };
 
@@ -6876,9 +6895,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     });
                 }
             }
-        }
-        if yield_state.is_terminal() && !usage.is_empty() {
-            break;
         }
     }
 
@@ -10700,13 +10716,12 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
         let r = parse_nonstream_response_for_provider(&v, "openai", "test-model");
+        assert_eq!(r.usage_presence.measured_input_tokens, Some(10));
+        assert!(!r.usage_presence.fresh_input_tokens);
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.reasoning, "think");
         assert_eq!(r.tool_calls.len(), 1);
-        assert_eq!(
-            r.usage.get("input_tokens").and_then(Value::as_u64),
-            Some(10)
-        );
+        assert_eq!(r.usage.get("input_tokens").and_then(Value::as_u64), None);
         assert_eq!(
             r.usage.get("output_tokens").and_then(Value::as_u64),
             Some(5)
@@ -12046,6 +12061,8 @@ mod tests {
             yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n"));
             tokio::time::sleep(Duration::from_millis(300)).await;
             yield Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n"));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            yield Ok(Bytes::from(format!("data: {}\n\n", json!({"usage":{"prompt_tokens_details":{"cached_tokens":4,"cache_write_tokens":3}}}))));
             std::future::pending::<()>().await;
         });
         let started = TokioInstant::now();
@@ -12061,9 +12078,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.full_text, "done");
-        assert_eq!(result.usage["input_tokens"], 10);
+        assert_eq!(result.usage["input_tokens"], 3);
+        assert_eq!(result.usage["cached_input_tokens"], 4);
+        assert_eq!(result.usage["cache_creation_tokens"], 3);
         assert_eq!(result.usage["output_tokens"], 3);
-        assert_eq!(started.elapsed(), Duration::from_millis(300));
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
     }
 
     #[tokio::test]
@@ -12127,12 +12146,11 @@ mod tests {
         )
         .await
         .expect("collect");
+        assert_eq!(res.usage_presence.measured_input_tokens, Some(3));
+        assert!(!res.usage_presence.fresh_input_tokens);
         assert_eq!(res.full_text, "Hi there");
         assert_eq!(res.reasoning, "R");
-        assert_eq!(
-            res.usage.get("input_tokens").and_then(Value::as_u64),
-            Some(3)
-        );
+        assert_eq!(res.usage.get("input_tokens").and_then(Value::as_u64), None);
         assert_eq!(
             res.usage.get("output_tokens").and_then(Value::as_u64),
             Some(4)
@@ -12148,36 +12166,41 @@ mod tests {
 
     #[tokio::test]
     async fn collect_llm_stream_preserves_usage_lanes_across_partial_chunks() {
-        for (updates, expected_fresh, expected_cached) in [
+        for (updates, expected_fresh, expected_cached, expected_creation_known) in [
             (
                 vec![
                     json!({"prompt_tokens": 100}),
                     json!({"completion_tokens": 5}),
                 ],
-                100,
                 0,
+                0,
+                false,
             ),
             (
                 vec![
                     json!({"prompt_tokens": 100}),
                     json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens_details": {"cache_write_tokens": 0}}),
                     json!({"completion_tokens": 5, "prompt_tokens": null}),
                 ],
                 70,
                 30,
+                true,
             ),
             (
                 vec![
                     json!({"prompt_tokens_details": {"cached_tokens": 30}}),
+                    json!({"prompt_tokens_details": {"cache_write_tokens": 0}}),
                     json!({"prompt_tokens": 100}),
                     json!({"completion_tokens": 5}),
                 ],
                 70,
                 30,
+                true,
             ),
         ] {
             let mut frames = vec![Ok(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n",
             ))];
             for usage in updates {
                 frames.push(Ok(Bytes::from(format!(
@@ -12185,6 +12208,7 @@ mod tests {
                     json!({"usage": usage})
                 ))));
             }
+            frames.push(Ok(Bytes::from(format!("data: {}\n\n", json!({"choices":[{"delta":{"content":"late text","tool_calls":[{"index":0,"id":"late-call","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"length"}]})))));
             frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
             let result = collect_llm_stream(
                 stream::iter(frames),
@@ -12197,18 +12221,28 @@ mod tests {
             )
             .await
             .expect("partial usage chunks must converge");
+            assert_eq!(result.full_text, "Hello");
+            assert!(result.tool_calls.is_empty());
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
             let terminal = provider_attempt_terminal_from_result(&result);
             assert_eq!(terminal.usage.input.fresh_input_tokens, expected_fresh);
             assert_eq!(terminal.usage.input.cache_read_tokens, expected_cached);
             assert_eq!(terminal.usage.output_tokens, 5);
             assert_eq!(
                 terminal.usage_status,
-                astra_services::InferenceUsageStatus::ProviderPartial
+                if expected_creation_known {
+                    astra_services::InferenceUsageStatus::ProviderExact
+                } else {
+                    astra_services::InferenceUsageStatus::ProviderPartial
+                }
             );
-            assert!(result.usage_presence.fresh_input_tokens);
+            assert_eq!(result.usage_presence.fresh_input_tokens, expected_fresh > 0);
             assert!(result.usage_presence.output_tokens);
             assert_eq!(result.usage_presence.cache_read_tokens, expected_cached > 0);
-            assert!(!result.usage_presence.cache_creation_tokens);
+            assert_eq!(
+                result.usage_presence.cache_creation_tokens,
+                expected_creation_known
+            );
         }
     }
 
@@ -12284,7 +12318,7 @@ mod tests {
         for repaired in [false, true] {
             let mut frames = vec![Ok(Bytes::from(format!(
                 "data: {}\n\n",
-                json!({"usage":{"prompt_tokens":50,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80}}})
+                json!({"usage":{"prompt_tokens":50,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":0}}})
             )))];
             if repaired {
                 frames.push(Ok(Bytes::from(format!(

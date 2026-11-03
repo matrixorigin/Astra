@@ -3923,46 +3923,60 @@ impl ProviderAttemptState {
     ) -> Vec<ProviderAttemptObservation> {
         self.requests
             .iter()
-            .map(|(attempt, request)| ProviderAttemptObservation {
-                request: request.clone(),
-                dispatch_started: dispatched_attempts.contains_key(attempt),
-                terminal: self.terminals.get(attempt).cloned(),
-                qualified_usage: dispatched_attempts.get(attempt).map(|presence| {
-                    let unknown =
-                        astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
-                            .expect("unknown usage is valid");
-                    let committed = self.terminals.get(attempt);
-                    let pending = self.pending_terminals.get(attempt);
-                    if let (Some(committed), Some(pending)) = (committed, pending)
-                        && (committed.usage != pending.usage
+            .map(|(attempt, request)| {
+                let committed = self.terminals.get(attempt);
+                let pending = self.pending_terminals.get(attempt);
+                let conflicting = match (committed, pending) {
+                    (Some(committed), Some(pending)) => {
+                        committed.usage != pending.usage
                             || committed.usage_status != pending.usage_status
-                            || committed.status != pending.status)
-                    {
-                        tracing::warn!(
-                            attempt,
-                            "conflicting pending and committed usage; capture unavailable"
-                        );
-                        return unknown;
+                            || committed.status != pending.status
                     }
-                    let (Some(terminal), Some(presence)) = (committed.or(pending), presence) else {
-                        return unknown;
-                    };
-                    if terminal.usage_status == astra_services::InferenceUsageStatus::Unavailable {
-                        return unknown;
-                    }
-                    let usage = &terminal.usage;
-                    astra_turn_types::CanonicalTokenUsage::new(
-                        (presence.fresh_input_tokens && !presence.input_invalid)
-                            .then_some(usage.input.fresh_input_tokens),
-                        (presence.cache_read_tokens && !presence.input_invalid)
-                            .then_some(usage.input.cache_read_tokens),
-                        (presence.cache_creation_tokens && !presence.input_invalid)
-                            .then_some(usage.input.cache_creation_tokens),
-                        (presence.output_tokens && !presence.output_invalid)
-                            .then_some(usage.output_tokens),
-                    )
-                    .unwrap_or(unknown)
-                }),
+                    _ => false,
+                };
+                ProviderAttemptObservation {
+                    request: request.clone(),
+                    dispatch_started: dispatched_attempts.contains_key(attempt),
+                    measured_input_tokens: dispatched_attempts
+                        .get(attempt)
+                        .and_then(|presence| presence.as_ref())
+                        .filter(|presence| !presence.input_invalid && !conflicting)
+                        .and_then(|presence| presence.measured_input_tokens),
+                    terminal: self.terminals.get(attempt).cloned(),
+                    qualified_usage: dispatched_attempts.get(attempt).map(|presence| {
+                        let unknown =
+                            astra_turn_types::CanonicalTokenUsage::new(None, None, None, None)
+                                .expect("unknown usage is valid");
+                        if conflicting {
+                            tracing::warn!(
+                                attempt,
+                                "conflicting pending and committed usage; capture unavailable"
+                            );
+                            return unknown;
+                        }
+                        let (Some(terminal), Some(presence)) = (committed.or(pending), presence)
+                        else {
+                            return unknown;
+                        };
+                        if terminal.usage_status
+                            == astra_services::InferenceUsageStatus::Unavailable
+                        {
+                            return unknown;
+                        }
+                        let usage = &terminal.usage;
+                        astra_turn_types::CanonicalTokenUsage::new(
+                            (presence.fresh_input_tokens && !presence.input_invalid)
+                                .then_some(usage.input.fresh_input_tokens),
+                            (presence.cache_read_tokens && !presence.input_invalid)
+                                .then_some(usage.input.cache_read_tokens),
+                            (presence.cache_creation_tokens && !presence.input_invalid)
+                                .then_some(usage.input.cache_creation_tokens),
+                            (presence.output_tokens && !presence.output_invalid)
+                                .then_some(usage.output_tokens),
+                        )
+                        .unwrap_or(unknown)
+                    }),
+                }
             })
             .collect()
     }
@@ -8828,6 +8842,7 @@ mod tests {
             serde_json::json!({})
         );
         let presence = crate::turn::token_usage::TokenUsagePresence {
+            measured_input_tokens: Some(10),
             fresh_input_tokens: true,
             output_tokens: true,
             ..Default::default()
@@ -8845,6 +8860,10 @@ mod tests {
             error_message: None,
         };
         state.pending_terminals.insert(1, terminal.clone());
+        assert_eq!(
+            state.attempt_facts(&dispatched)[1].measured_input_tokens,
+            Some(10)
+        );
         let pending = state.attempt_facts(&dispatched);
         assert!(
             pending[1].terminal.is_none(),
@@ -8871,6 +8890,10 @@ mod tests {
                 .unwrap()
                 .to_json(),
             serde_json::json!({})
+        );
+        assert_eq!(
+            state.attempt_facts(&dispatched)[1].measured_input_tokens,
+            None
         );
         state.pending_terminals.remove(&1);
         let revoked = BTreeMap::from([(

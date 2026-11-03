@@ -11557,9 +11557,10 @@ pub(crate) async fn run_tui_session(
                                     let primary_usage = turn_usage.as_ref().map_or_else(
                                         Default::default,
                                             |usage| {
-                                            crate::cli::turn::turn_reporting::project_primary_usage(
+                                            crate::cli::turn::turn_reporting::project_turn_usage(
                                                 &usage.usage_attribution,
                                                 usage.usage_observed,
+                                                usage.qualified_usage,
                                             )
                                         },
                                     );

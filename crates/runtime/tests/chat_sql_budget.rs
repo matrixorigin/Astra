@@ -254,7 +254,7 @@ fn authentication_snapshot_count(statements: &[String]) -> usize {
 fn answer(message: Value, reason: &str) -> ProviderResponse {
     ProviderResponse::OpenAi(json!({
         "choices": [{"index": 0, "message": message, "finish_reason": reason}],
-        "usage": {"prompt_tokens": 42, "completion_tokens": 7, "total_tokens": 49}
+        "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 42, "completion_tokens": 7, "total_tokens": 49}
     }))
 }
 
@@ -349,7 +349,7 @@ async fn ordinary_chat_releases_session_locks_before_waiting_for_the_provider() 
     let response = format!("data: {}\n\n", json!({
         "id":"held-provider", "object":"chat.completion.chunk", "model":model,
         "choices":[{"index":0,"delta":{"role":"assistant","content":"Locks were released."},"finish_reason":"stop"}],
-        "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
+        "usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
     })).into_bytes();
     b.ctx
         .install_native_provider(

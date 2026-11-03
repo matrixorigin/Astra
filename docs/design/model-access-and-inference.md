@@ -522,6 +522,14 @@ measurement separately as `last_request_input_tokens` or nested
 `last_request_usage.input_total_tokens`. CLI context observers forward that
 validated measurement independently of complete billing lanes, including
 updates that arrive while those lanes remain unknown.
+Run input totals include each settled attempt fact’s validated inclusive input
+once, including auxiliary calls and failed attempts. The portion not assigned to known
+billing lanes is retained separately through continuation; it never becomes fresh
+input or proves a zero cache-hit rate. Missing measurements remain incomplete
+evidence, while known lane subtotals still count toward the run budget. Older
+handoffs without this observed subtotal remain readable, without claiming complete
+measurement. Handoffs written by a newer binary are not a downgrade format:
+upgrade execution workers before assigning them runs written by the new version.
 
 ```text
 Primary agent       120k tokens   Personal Cloud

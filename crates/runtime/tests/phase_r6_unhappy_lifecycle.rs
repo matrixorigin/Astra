@@ -23,8 +23,8 @@ async fn recover_from_call(
     )
     .unwrap();
     let gateway = ProviderGateway::start(vec![ProviderScript::new("primary recovery", |r| r.path == "/v1/chat/completions" && r.body["model"] == "provider-fixture-model", vec![
-        ProviderResponse::OpenAi(json!({"id":"misbehaving-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":preliminary_text,"tool_calls":[{"id":"call-unhappy","type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
-        ProviderResponse::OpenAi(json!({"id":"recovery-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"The request could not be executed; no changes were made."},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":6,"total_tokens":21}})),
+        ProviderResponse::OpenAi(json!({"id":"misbehaving-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":preliminary_text,"tool_calls":[{"id":"call-unhappy","type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
+        ProviderResponse::OpenAi(json!({"id":"recovery-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"The request could not be executed; no changes were made."},"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens":15,"completion_tokens":6,"total_tokens":21}})),
     ])]).await;
     let ledger = ProviderObservationsFixture::default();
     let session = format!("unhappy-fixture-{}", uuid::Uuid::new_v4());

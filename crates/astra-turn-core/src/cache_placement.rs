@@ -102,6 +102,10 @@ pub enum VolatilePlacement {
     /// letting later tool rounds reuse the accumulated conversation prefix
     /// without rewriting any conversation message.
     TailSuffix,
+    /// Place runtime context after the final human message when the
+    /// deployment has verified that marked context is not treated as a new
+    /// human request. This keeps the human message in the reusable prefix.
+    TailAfterUser,
     /// Append required runtime authority as a provenance-tagged `user` frame
     /// and retain that frame in conversation order. This is an explicit
     /// deployment wire shape for providers which support prefix reuse for
@@ -177,6 +181,13 @@ impl<'de> Deserialize<'de> for CacheCapability {
         }
 
         let wire = WireCapability::deserialize(deserializer)?;
+        if matches!(wire.volatile_placement, VolatilePlacement::TailAfterUser)
+            && !matches!(wire.protocol, CacheProtocol::OpenAiAutoPrefix)
+        {
+            return Err(serde::de::Error::custom(
+                "tail_after_user requires openai_auto_prefix",
+            ));
+        }
         let volatile_delivery = wire
             .volatile_delivery
             .unwrap_or(VolatileDeliveryPolicy::All);
@@ -205,11 +216,16 @@ impl CacheCapability {
     /// durable, so optional volatile delivery is an incoherent combination.
     #[must_use]
     pub fn is_valid(self) -> bool {
-        !matches!(
-            self.volatile_placement,
-            VolatilePlacement::AppendOnlyUserTail
-        ) || (matches!(self.protocol, CacheProtocol::OpenAiAutoPrefix)
-            && matches!(self.volatile_delivery, VolatileDeliveryPolicy::RequiredOnly))
+        match self.volatile_placement {
+            VolatilePlacement::TailAfterUser => {
+                matches!(self.protocol, CacheProtocol::OpenAiAutoPrefix)
+            }
+            VolatilePlacement::AppendOnlyUserTail => {
+                matches!(self.protocol, CacheProtocol::OpenAiAutoPrefix)
+                    && matches!(self.volatile_delivery, VolatileDeliveryPolicy::RequiredOnly)
+            }
+            _ => true,
+        }
     }
 
     /// Resolve the transport-level default for a provider.
@@ -284,6 +300,28 @@ impl CacheCapability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_after_user_requires_prefix_caching() {
+        let mut capability = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailAfterUser,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        };
+        assert!(capability.is_valid());
+        let value = serde_json::to_value(capability).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CacheCapability>(value).unwrap(),
+            capability
+        );
+        capability.protocol = CacheProtocol::MarkerExplicit;
+        assert!(!capability.is_valid());
+        assert!(
+            serde_json::from_value::<CacheCapability>(serde_json::to_value(capability).unwrap())
+                .is_err()
+        );
+    }
 
     #[test]
     fn anthropic_provider_gets_marker_isolated() {

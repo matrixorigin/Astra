@@ -134,6 +134,17 @@ pub(super) fn prepare(
     })
 }
 
+fn normalized_usage(
+    raw: &serde_json::Map<String, serde_json::Value>,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    crate::turn::token_usage::TokenUsagePresence,
+) {
+    crate::turn::token_usage::parse_usage(crate::turn::token_usage::UsageDialect::OpenAi, raw)
+        .map(|(usage, presence)| (usage.to_qualified_json_map(presence), presence))
+        .unwrap_or_default()
+}
+
 fn result(
     output: ResponseOutput,
     connection: &str,
@@ -142,10 +153,7 @@ fn result(
 ) -> LlmCallResult {
     let continuation = (output.finish_reason.as_deref() != Some("length"))
         .then(|| output.continuation(connection, model));
-    let presence = crate::turn::token_usage::extract_usage_presence(
-        crate::turn::token_usage::UsageDialect::OpenAi,
-        &output.usage,
-    );
+    let (usage, presence) = normalized_usage(&output.usage);
     let finish_reason = output.finish_reason.clone().unwrap_or_else(|| {
         if output.tool_calls.is_empty() {
             "stop".to_owned()
@@ -159,7 +167,7 @@ fn result(
         full_text: output.text,
         reasoning: output.reasoning,
         tool_calls: output.tool_calls,
-        usage: output.usage,
+        usage,
         usage_presence: presence,
         model_used: display_model.into(),
         finish_reason: Some(finish_reason),
@@ -341,7 +349,7 @@ pub(super) async fn collect(
         }
     };
     outcome.map_err(|error| {
-        let usage = accumulator.output.usage;
+        let (usage, presence) = normalized_usage(&accumulator.output.usage);
         StreamCollectError::Provider {
             error,
             rejected,
@@ -349,10 +357,7 @@ pub(super) async fn collect(
                 full_text: accumulator.output.text,
                 reasoning: accumulator.output.reasoning,
                 response_id: accumulator.output.response_id,
-                usage_presence: crate::turn::token_usage::extract_usage_presence(
-                    crate::turn::token_usage::UsageDialect::OpenAi,
-                    &usage,
-                ),
+                usage_presence: presence,
                 usage,
                 model_used: route.model_name.into(),
                 ..Default::default()

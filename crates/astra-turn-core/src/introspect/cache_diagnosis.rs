@@ -718,7 +718,7 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
                 triggered_on: vec![(sample.turn, sample.round)],
             })
         }
-        VolatilePlacement::TailSuffix => {
+        VolatilePlacement::TailSuffix | VolatilePlacement::TailAfterUser => {
             // Last message must carry all volatile content; anything
             // before is inside the auto-prefix.
             if vol_idx == tail_idx {

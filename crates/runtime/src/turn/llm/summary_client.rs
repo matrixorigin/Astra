@@ -237,6 +237,35 @@ impl RuntimeSummaryClient {
     }
 }
 
+// Match the raw usage map that the summary projection actually returns. PTL
+// responses intentionally have no map, so their whole observed input survives.
+fn summary_unpartitioned_input(
+    observed_input_tokens: u64,
+    result: &Result<super::client::LlmCallResult, astra_core::ClassifiedError>,
+) -> u64 {
+    let counted = match result {
+        Ok(result) => crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage),
+        // Context-window errors are returned as a typed PTL response with
+        // no raw usage map, so retain all observed input in its complement.
+        Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
+            crate::turn::token_usage::TokenUsage::default()
+        }
+        Err(error) => error
+            .details_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|details| {
+                details
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .map(crate::turn::token_usage::TokenUsage::from_partial_json_map)
+            })
+            .unwrap_or_default(),
+    };
+    observed_input_tokens
+        .saturating_sub(counted.normalized_prompt_cache_usage().total_input_tokens())
+}
+
 #[async_trait]
 impl SummaryLlmClient for RuntimeSummaryClient {
     async fn summarize(
@@ -314,8 +343,13 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 model_name: self.route.model_name.clone(),
                 provider: self.route.provider.clone(),
             });
-        let qualified_usage = observer
-            .facts()
+        let facts = observer.facts();
+        let observed_input_tokens = facts.iter().fold(0u64, |total, fact| {
+            total.saturating_add(fact.observed_input_tokens())
+        });
+        let unpartitioned_input_tokens =
+            summary_unpartitioned_input(observed_input_tokens, &result);
+        let qualified_usage = facts
             .into_iter()
             .filter_map(|fact| fact.qualified_usage)
             .reduce(|left, right| {
@@ -332,6 +366,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             // repair path. No call from this private adapter is executable.
             Ok(result) if !result.tool_calls.is_empty() || result.full_text.trim().is_empty() => {
                 Ok(SummaryResponse {
+                    unpartitioned_input_tokens,
                     judgment_provenance: result.judgment_provenance,
                     model_used: result.model_used,
                     text: String::new(),
@@ -343,6 +378,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                 })
             }
             Ok(result) => Ok(SummaryResponse {
+                unpartitioned_input_tokens,
                 judgment_provenance: result.judgment_provenance,
                 model_used: result.model_used,
                 text: result.full_text,
@@ -354,6 +390,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }),
             Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => {
                 Ok(SummaryResponse {
+                    unpartitioned_input_tokens,
                     judgment_provenance: None,
                     model_used: String::new(),
                     text: String::new(),
@@ -379,6 +416,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     .filter(Value::is_object)
                     .unwrap_or_else(|| serde_json::json!({}));
                 details["qualified_usage"] = usage.to_json();
+                details["unpartitioned_input_tokens"] = unpartitioned_input_tokens.into();
                 Err(error.with_details_json(details.to_string()))
             }
         }
@@ -921,7 +959,7 @@ mod tests {
                             "message": {"role": "assistant", "content": "structured summary"},
                             "finish_reason": "stop"
                         }],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                        "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 10, "completion_tokens": 2}
                     });
                     summary_provider_response(response)
                 }
@@ -976,6 +1014,45 @@ mod tests {
         assert_eq!(body.get("tool_choice"), Some(&Value::String("none".into())));
     }
 
+    #[test]
+    fn summary_error_projection_retains_input_not_returned_in_raw_usage() {
+        for (kind, expected) in [
+            (astra_core::ErrorKind::ContextWindow, 100),
+            (astra_core::ErrorKind::Cancelled, 60),
+        ] {
+            let error = astra_core::ClassifiedError::new(kind, "provider rejected the summary")
+                .with_details_json(
+                    serde_json::json!({"usage":{"cached_input_tokens":40}}).to_string(),
+                );
+            assert_eq!(summary_unpartitioned_input(100, &Err(error)), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_only_summary_retains_inclusive_input_without_fabricating_billing_lanes() {
+        let app = Router::new().route("/chat/completions", post(|| async {
+            summary_provider_response(serde_json::json!({
+                "choices": [{"message": {"role":"assistant", "content":"summary"}, "finish_reason":"stop"}],
+                "usage": {"prompt_tokens":17,"completion_tokens":2}
+            }))
+        }));
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let summary = test_client(summary_route(&execution), 64)
+            .summarize(
+                InferencePurpose::RequiredCompaction,
+                &[serde_json::json!({"role":"user","content":"summarize"})],
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.text, "summary");
+        assert_eq!(summary.unpartitioned_input_tokens, 17);
+        let usage = summary.qualified_usage.unwrap();
+        assert_eq!(usage.input_tokens(), None);
+        assert_eq!(usage.cached_input_tokens(), None);
+        assert_eq!(usage.cache_creation_tokens(), None);
+        assert_eq!(usage.output_tokens(), Some(2));
+    }
+
     #[tokio::test]
     async fn generic_openai_compatible_work_admission_uses_provider_defaults_once() {
         let provider_requests = Arc::new(AtomicU32::new(0));
@@ -1017,7 +1094,7 @@ mod tests {
                             },
                             "finish_reason": "stop"
                         }],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 30}
+                        "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 10, "completion_tokens": 30}
                     });
                     summary_provider_response(response)
                 }
@@ -1163,7 +1240,7 @@ mod tests {
                         },
                         "finish_reason": "tool_calls"
                     }],
-                    "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+                    "usage": {"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"prompt_tokens": 7, "completion_tokens": 3}
                 });
                 summary_provider_response(response)
             }),

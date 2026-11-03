@@ -148,6 +148,9 @@ pub(crate) fn cache_capability_from_model_metadata(
         astra_services::PromptCacheVolatilePlacementData::TailSuffix => {
             astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
         }
+        astra_services::PromptCacheVolatilePlacementData::TailAfterUser => {
+            astra_turn_core::cache_placement::VolatilePlacement::TailAfterUser
+        }
         astra_services::PromptCacheVolatilePlacementData::AppendOnlyUserTail => {
             astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
         }
@@ -1216,6 +1219,7 @@ pub(crate) fn assemble_context_pipeline(
             (system, preamble)
         }
         VolatilePlacement::TailSuffix
+        | VolatilePlacement::TailAfterUser
         | VolatilePlacement::AppendOnlyUserTail
         | VolatilePlacement::Free => {
             let mut stable_text = String::new();
@@ -4430,6 +4434,7 @@ mod context_cache_contract_tests {
             .expect("prepare provider body once");
             let wire = prepared.identity();
             attempts.push(crate::turn::llm::client::ProviderAttemptObservation {
+                measured_input_tokens: None,
                 qualified_usage: Some(
                     astra_turn_types::CanonicalTokenUsage::new(None, None, None, None).unwrap(),
                 ),

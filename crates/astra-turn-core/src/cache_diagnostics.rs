@@ -482,9 +482,9 @@ fn prompt_snapshot_fingerprint_system_blocks(
         let visible = match cache_capability.volatile_placement {
             VolatilePlacement::CurrentUserOnly => true,
             VolatilePlacement::MarkerIsolated => true,
-            VolatilePlacement::TailSuffix | VolatilePlacement::AppendOnlyUserTail => {
-                leading_system_prefix_open
-            }
+            VolatilePlacement::TailSuffix
+            | VolatilePlacement::TailAfterUser
+            | VolatilePlacement::AppendOnlyUserTail => leading_system_prefix_open,
             VolatilePlacement::Free => false,
         };
         if !visible {

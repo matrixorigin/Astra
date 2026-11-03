@@ -122,6 +122,16 @@ select `AppendOnlyUserTail` to retain the stable authority policy and append
 runtime instructions with their existing lifetime and supersession semantics.
 Do not silently reinterpret an explicitly selected `TailSuffix` capability.
 
+An OpenAI-compatible prefix-caching deployment can explicitly select
+`TailAfterUser` after verifying that it treats marked runtime context following
+a human message as evidence, not a new human request. On a human-message tail,
+the runtime context follows the human message so the latter can remain in the
+next request's reusable prefix. Tool results remain contiguous with their
+assistant calls, and other tail shapes keep the existing suffix boundary.
+Delivery policy remains independent: `all` retains optional context. This
+changes provider message order, not canonical conversation history or runtime
+authority, and is never inferred from a model name.
+
 Repeated states within one typed authority kind must not create a new system
 instruction for every changing value. The stable leading turn-focus policy
 defines how to interpret `boundary_instruction` in marked runtime-owned context.

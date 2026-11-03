@@ -21,6 +21,7 @@ mod fixture {
 struct Attempts {
     next: AtomicU32,
     finished: Mutex<Vec<astra_services::InferenceInvocationTerminal>>,
+    measured_inputs: Mutex<Vec<u64>>,
 }
 #[async_trait]
 impl ProviderAttemptObserver for Attempts {
@@ -32,6 +33,11 @@ impl ProviderAttemptObserver for Attempts {
         Ok(ProviderAttemptAdmission::Admitted(
             self.next.fetch_add(1, Ordering::SeqCst),
         ))
+    }
+    fn note_usage_presence(&self, _: u32, presence: crate::turn::token_usage::TokenUsagePresence) {
+        if let Some(total) = presence.measured_input_tokens {
+            self.measured_inputs.lock().unwrap().push(total);
+        }
     }
     async fn finish_attempt(
         &self,
@@ -150,7 +156,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
             .is_some()
     );
     assert!(partial.provider_continuation.is_none());
-    assert_eq!(partial.usage["completion_tokens"], 5);
+    assert_eq!(partial.usage["output_tokens"], 5);
     assert_eq!(limited_attempts.finished.lock().unwrap().len(), 1);
     // Run the same typed terminal through the real Server host and tool
     // executor. The provider's one continuation also exhausts its output cap.
@@ -239,7 +245,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
         .await
         .unwrap();
     assert_eq!(first.tool_calls[0]["id"], "call-1");
-    assert_eq!(first.usage["prompt_tokens"], 20);
+    assert_eq!(first.usage_presence.measured_input_tokens, Some(20));
     let mut calls = first.tool_calls;
     calls[0]["id"] = json!("internal-call");
     calls[0][astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] = json!("call-1");
@@ -382,7 +388,10 @@ async fn responses_transport_recovery_and_credential_fencing() {
         if has_usage {
             let terminals = attempts.finished.lock().unwrap();
             let terminal = terminals.last().unwrap();
-            assert_eq!(terminal.usage.input.total_input_tokens(), 17);
+            assert_eq!(
+                attempts.measured_inputs.lock().unwrap().last().copied(),
+                Some(17)
+            );
             assert_eq!(terminal.usage.output_tokens, 23);
             assert_eq!(
                 terminal.provider_response_id.as_deref(),
@@ -705,7 +714,22 @@ fn truncated_multi_item_text_reaches_runtime_without_provider_replay() {
     );
     assert_eq!(value.full_text, "prefix partial tail");
     assert_eq!(value.finish_reason.as_deref(), Some("length"));
-    assert_eq!(value.usage["completion_tokens"], 34);
+    assert_eq!(value.usage["output_tokens"], 34);
     assert!(value.tool_calls.is_empty());
     assert!(value.provider_continuation.is_none());
+}
+
+#[test]
+fn response_result_couples_normalized_values_and_presence() {
+    let output = ResponseOutput {
+        usage: json!({"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":30}}).as_object().unwrap().clone(),
+        ..Default::default()
+    };
+    let actual = result(output, "connection", "wire-model", "display-model");
+    assert_eq!(actual.usage["input_tokens"], 30);
+    assert_eq!(actual.usage["cached_input_tokens"], 40);
+    assert_eq!(actual.usage["cache_creation_tokens"], 30);
+    assert!(
+        actual.usage_presence.fresh_input_tokens && actual.usage_presence.cache_creation_tokens
+    );
 }
