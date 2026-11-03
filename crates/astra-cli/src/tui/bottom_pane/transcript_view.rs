@@ -65,7 +65,7 @@ enum TranscriptContent {
     Activity(Arc<str>),
     RenderedTrusted(Vec<Line<'static>>),
     Reasoning(ReasoningCell),
-    Tool(ToolCell),
+    Tool(Arc<ToolCell>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +260,7 @@ impl TranscriptItem {
             tool_identity: None,
             id,
             kind: TranscriptItemKind::Tool,
-            content: TranscriptContent::Tool(cell),
+            content: TranscriptContent::Tool(Arc::new(cell)),
             separator_rows,
         }
     }
