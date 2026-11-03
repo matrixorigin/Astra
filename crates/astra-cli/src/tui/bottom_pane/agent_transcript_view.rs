@@ -22,6 +22,8 @@ struct ToolCoverage {
     target: Option<String>,
     settled: bool,
     terminal_preview: bool,
+    request_present: bool,
+    result_index: Option<usize>,
     receipt: Option<crate::tui::agent_control_status::DelegationReceipt>,
 }
 
@@ -47,6 +49,7 @@ enum LiveTranscriptItem {
         cell: ToolCell,
         identity: Option<String>,
         receipt: Option<crate::tui::agent_control_status::DelegationReceipt>,
+        retained_request: bool,
     },
     Notice {
         text: String,
@@ -64,8 +67,13 @@ impl LiveTranscript {
         self.items.is_empty()
     }
 
-    fn reconcile_durable_items(&mut self, canonical: &CanonicalProjection, run_id: &str) {
-        self.items.retain(|item| match item {
+    fn reconcile_durable_items(
+        &mut self,
+        canonical: &CanonicalProjection,
+        run_id: &str,
+        items: &[astra_thin_client::SessionTranscriptItem],
+    ) {
+        self.items.retain_mut(|item| match item {
             LiveTranscriptItem::Assistant(cell) => !cell
                 .model_item_id()
                 .is_some_and(|id| canonical.outputs.contains(id)),
@@ -77,6 +85,7 @@ impl LiveTranscript {
                 identity,
                 receipt,
                 cell,
+                retained_request,
             } => {
                 let Some(identity) = identity else {
                     return true;
@@ -87,6 +96,41 @@ impl LiveTranscript {
                 else {
                     return true;
                 };
+                if (!coverage.request_present || *retained_request)
+                    && coverage.target.as_ref() == Some(identity)
+                {
+                    *retained_request = true;
+                    if let Some(item) = coverage.result_index.and_then(|index| items.get(index)) {
+                        let result = item.tool_result.as_ref().unwrap();
+                        if matches!(
+                            cell.status,
+                            crate::tui::history_cell::tool::ToolStatus::Running
+                        ) && definitive_tool_status(result.status.as_deref())
+                            && (coverage.settled || coverage.terminal_preview)
+                        {
+                            let summary = if is_delegation_name(identity) {
+                                let projected =
+                                    crate::tui::agent_control_status::delegation_receipt(
+                                        result.status.as_deref(),
+                                        Some(&item.content),
+                                    );
+                                let text = projected.text();
+                                *receipt = Some(projected);
+                                text
+                            } else {
+                                "Result recorded in loaded history".into()
+                            };
+                            cell.complete(
+                                result.status.as_deref().unwrap(),
+                                result.duration_ms.unwrap_or_default(),
+                                String::new(),
+                                Some(summary),
+                                None,
+                            );
+                        }
+                    }
+                    return true;
+                }
                 if !coverage.settled {
                     return !(coverage.terminal_preview
                         && coverage.target.as_ref() == Some(identity)
@@ -109,10 +153,7 @@ impl LiveTranscript {
                         _ => true,
                     }
                 } else {
-                    coverage
-                        .target
-                        .as_ref()
-                        .is_some_and(|target| target != identity)
+                    coverage.target.as_ref() != Some(identity)
                 }
             }
             LiveTranscriptItem::Notice {
@@ -205,6 +246,7 @@ impl LiveTranscript {
             cell: ToolCell::new_running(display_name, description),
             identity,
             receipt: None,
+            retained_request: false,
         });
     }
 
@@ -644,7 +686,7 @@ impl AgentTranscriptView {
                 }
             });
         self.live
-            .reconcile_durable_items(&self.canonical, &self.run_id);
+            .reconcile_durable_items(&self.canonical, &self.run_id, &self.items);
         if let Some(commit) = self.pending_transcript_commit.as_ref()
             && self.items.iter().any(|item| {
                 item.source_event_id.as_deref() == Some(commit.source_event_id.as_str())
@@ -1143,7 +1185,7 @@ impl AgentTranscriptView {
             }
         }
         self.live
-            .reconcile_durable_items(&self.canonical, &self.run_id);
+            .reconcile_durable_items(&self.canonical, &self.run_id, &self.items);
         self.rebuild_transcript();
         true
     }
@@ -1317,10 +1359,13 @@ fn project_durable_transcript(
 
     let tool_results = items
         .iter()
-        .filter_map(|item| {
+        .enumerate()
+        .filter_map(|(index, item)| {
             let result = item.tool_result.as_ref()?;
-            (!result.tool_use_id.is_empty())
-                .then_some(((item.run_id.as_deref(), result.tool_use_id.as_str()), item))
+            (!result.tool_use_id.is_empty()).then_some((
+                (item.run_id.as_deref(), result.tool_use_id.as_str()),
+                (index, item),
+            ))
         })
         .collect::<std::collections::HashMap<_, _>>();
     let paired_tool_result_seqs = items
@@ -1329,12 +1374,12 @@ fn project_durable_transcript(
             item.tool_calls.iter().filter_map(|call| {
                 tool_results
                     .get(&(item.run_id.as_deref(), call.tool_use_id.as_str()))
-                    .map(|result| result.item_seq)
+                    .map(|(_, result)| result.item_seq)
             })
         })
         .collect::<std::collections::HashSet<_>>();
     let mut projected = Vec::new();
-    for item in items {
+    for (item_index, item) in items.iter().enumerate() {
         let canonical_id = transcript_item_identity(item);
         if let Some(reasoning) = item.reasoning.as_deref() {
             projected.push(TranscriptItem::reasoning(
@@ -1376,9 +1421,18 @@ fn project_durable_transcript(
                     ));
                 }
                 for (index, call) in item.tool_calls.iter().enumerate() {
-                    let result_item = tool_results
+                    let result_entry = tool_results
                         .get(&(item.run_id.as_deref(), call.tool_use_id.as_str()))
                         .copied();
+                    let result_item = result_entry.map(|(_, item)| item);
+                    let conflict = result_item
+                        .and_then(|item| item.tool_result.as_ref())
+                        .and_then(|result| result.name.as_deref())
+                        .is_some_and(|name| {
+                            name.trim() != "invoke_tool"
+                                && live_tool_identity(&call.name, &call.arguments).as_deref()
+                                    != Some(name.trim())
+                        });
                     // A delegation's prompt and result belong to the child run.
                     // The invoking run needs a compact control receipt only.
                     let delegation = crate::tui::agent_control_status::delegation_target(
@@ -1429,7 +1483,9 @@ fn project_durable_transcript(
                             result.status.as_deref().unwrap_or("uncertain"),
                             result.duration_ms.unwrap_or_default(),
                             description,
-                            if delegation.is_some() {
+                            if conflict {
+                                Some("Conflicting tool identity · details unavailable".into())
+                            } else if delegation.is_some() {
                                 receipt.as_ref().map(|receipt| receipt.text())
                             } else {
                                 result_item.content.lines().next().map(|line| {
@@ -1440,8 +1496,9 @@ fn project_durable_transcript(
                                     }
                                 })
                             },
-                            (delegation.is_none() || !result.runtime_advisories.is_empty())
-                                .then(|| tool_display_content(result_item, delegation.is_some())),
+                            (!conflict
+                                && (delegation.is_none() || !result.runtime_advisories.is_empty()))
+                            .then(|| tool_display_content(result_item, delegation.is_some())),
                         );
                     }
                     if collect_coverage && !call.tool_use_id.is_empty() {
@@ -1455,23 +1512,19 @@ fn project_durable_transcript(
                                 })
                             });
                         let coverage = ToolCoverage {
+                            request_present: true,
+                            result_index: result_entry.map(|(index, _)| index),
                             terminal_preview: compatible
                                 && result_item
                                     .is_some_and(|item| item.role == "tool_observation_preview")
                                 && result.is_some_and(|result| {
-                                    matches!(
-                                        result.status.as_deref(),
-                                        Some(
-                                            "completed"
-                                                | "failed"
-                                                | "rejected"
-                                                | "cancelled"
-                                                | "interrupted"
-                                        )
-                                    )
+                                    definitive_tool_status(result.status.as_deref())
                                 }),
                             target,
                             settled: compatible
+                                && result.is_some_and(|result| {
+                                    definitive_tool_status(result.status.as_deref())
+                                })
                                 && result_item
                                     .is_some_and(|item| item.role != "tool_observation_preview"),
                             receipt,
@@ -1518,16 +1571,18 @@ fn project_durable_transcript(
                 let result = item.tool_result.as_ref();
                 let delegation = result
                     .and_then(|result| result.name.as_deref())
+                    .map(str::trim)
                     .is_some_and(|name| matches!(name, "agent" | "agent_fanout"));
                 // An unpaired deferred carrier cannot be resolved safely: its
                 // initiating call may be on another page. Keep its payload out
                 // of this transcript rather than guessing its logical target.
-                let unresolved_carrier =
-                    result.and_then(|result| result.name.as_deref()) == Some("invoke_tool");
+                let unresolved_carrier = result
+                    .and_then(|result| result.name.as_deref())
+                    .map(str::trim)
+                    .is_none_or(|name| matches!(name, "invoke_tool" | "tool" | ""));
                 if collect_coverage
                     && let Some(result) = result
                     && !result.tool_use_id.is_empty()
-                    && !delegation
                     && !unresolved_carrier
                 {
                     let target = result
@@ -1539,20 +1594,19 @@ fn project_durable_transcript(
                             .tools
                             .entry((item.run_id.clone(), result.tool_use_id.clone()))
                             .or_insert(ToolCoverage {
+                                request_present: false,
+                                result_index: Some(item_index),
                                 target,
-                                settled: item.role != "tool_observation_preview",
+                                settled: item.role != "tool_observation_preview"
+                                    && definitive_tool_status(result.status.as_deref()),
                                 terminal_preview: item.role == "tool_observation_preview"
-                                    && matches!(
+                                    && definitive_tool_status(result.status.as_deref()),
+                                receipt: delegation.then(|| {
+                                    crate::tui::agent_control_status::delegation_receipt(
                                         result.status.as_deref(),
-                                        Some(
-                                            "completed"
-                                                | "failed"
-                                                | "rejected"
-                                                | "cancelled"
-                                                | "interrupted"
-                                        )
-                                    ),
-                                receipt: None,
+                                        Some(&item.content),
+                                    )
+                                }),
                             });
                     }
                 }
@@ -2156,6 +2210,32 @@ impl BottomPaneView for AgentTranscriptView {
     }
 }
 
+fn definitive_tool_status(status: Option<&str>) -> bool {
+    status.is_some_and(|status| {
+        matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "completed"
+                | "complete"
+                | "ok"
+                | "success"
+                | "succeeded"
+                | "passed"
+                | "done"
+                | "completed_with_issues"
+                | "failed"
+                | "error"
+                | "rejected"
+                | "denied"
+                | "timeout"
+                | "timed_out"
+                | "partial_failure"
+                | "cancelled"
+                | "interrupted"
+                | "skipped"
+        )
+    })
+}
+
 fn is_delegation_name(name: &str) -> bool {
     matches!(name, "agent" | "agent_fanout")
 }
@@ -2382,6 +2462,90 @@ mod tests {
     }
 
     #[test]
+    fn qa_unpaired_partial_result_preserves_known_invocation_arguments() {
+        let mut view = loading_view(100, 24);
+        view.refresh_agent_live_event(&AgentLiveEvent {
+            agent_id: "agent-1".into(),
+            run_id: "run-child".into(),
+            kind: AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: r#"{"path":"IMPORTANT_REQUEST_PATH"}"#.into(),
+                tool_use_id: "spawn-0".into(),
+            },
+        });
+        assert!(
+            view.transcript
+                .export_plain_lines()
+                .join("\n")
+                .contains("IMPORTANT_REQUEST_PATH")
+        );
+        let (mut items, _) = delegation_history(1);
+        items.remove(0);
+        items[0].role = "tool_observation_preview".into();
+        items[0].content = "partial retained line".into();
+        items[0].tool_result.as_mut().unwrap().name = Some("read_file".into());
+        let mut canonical = page();
+        canonical.items = items;
+        view.apply_page(canonical, true, AgentTranscriptSource::LocalJournalOnly);
+        let text = view.transcript.export_plain_lines().join("\n");
+        assert!(text.contains("IMPORTANT_REQUEST_PATH"), "{text}");
+        assert!(!text.contains("Running"), "{text}");
+        let latest = view.items.clone();
+        let mut older = page();
+        let mut call = older.items.remove(0);
+        call.content.clear();
+        call.reasoning = None;
+        call.item_seq = -1;
+        call.tool_calls = vec![astra_thin_client::SessionTranscriptToolCall {
+            tool_use_id: "spawn-0".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"IMPORTANT_REQUEST_PATH"}"#.into(),
+        }];
+        older.items = vec![call];
+        view.apply_page(older, false, AgentTranscriptSource::LocalJournalOnly);
+        let mut replacement = page();
+        replacement.items = latest;
+        view.apply_page(replacement, true, AgentTranscriptSource::LocalJournalOnly);
+        let text = view.transcript.export_plain_lines().join("\n");
+        assert!(
+            text.contains("IMPORTANT_REQUEST_PATH") && !text.contains("Running"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn qa_named_terminal_result_on_latest_page_retires_running_row() {
+        for (target, status) in [
+            ("read_file", "failed"),
+            ("agent", "failed"),
+            ("agent_fanout", "failed"),
+            ("read_file", "success"),
+            ("agent", "completed"),
+        ] {
+            let (mut items, _) = delegation_history(1);
+            items.remove(0);
+            items[0].tool_result.as_mut().unwrap().name = Some(target.into());
+            items[0].tool_result.as_mut().unwrap().status = Some(status.into());
+            items[0].content = serde_json::json!({"status":status}).to_string();
+            let mut view = loading_view(80, 24);
+            view.refresh_agent_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::ToolStarted {
+                    name: target.into(),
+                    description: "{}".into(),
+                    tool_use_id: "spawn-0".into(),
+                },
+            });
+            let mut canonical = page();
+            canonical.items = items;
+            view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+            let text = view.transcript.export_plain_lines().join("\n");
+            assert!(!text.contains("Running"), "target={target}: {text}");
+        }
+    }
+
+    #[test]
     fn review_partial_output_does_not_resurrect_a_terminal_tool() {
         let (mut items, _) = delegation_history(1);
         items[1].role = "tool_observation_preview".into();
@@ -2560,7 +2724,6 @@ mod tests {
         for partial in ["result_only", "wrong_run", "wrong_target"] {
             let (mut items, _) = delegation_history(1);
             match partial {
-                "preview" => items[1].role = "tool_observation_preview".into(),
                 "result_only" => {
                     items.remove(0);
                 }
