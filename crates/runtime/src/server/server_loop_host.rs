@@ -22761,9 +22761,17 @@ fn live_tool_completed_fields(
         .unwrap_or(false)
         || event.get("type").and_then(Value::as_str) == Some("tool_transport_failed");
     let status = event
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(if failed { "error" } else { "ok" })
+        .get("executed")
+        .filter(|value| value.is_null())
+        .map(|_| "uncertain")
+        .or_else(|| event.get("status").and_then(Value::as_str))
+        .unwrap_or(if failed {
+            "error"
+        } else if event.get("success").and_then(Value::as_bool) == Some(true) {
+            "ok"
+        } else {
+            "uncertain"
+        })
         .to_string();
     let name = event
         .get("tool_name")
@@ -22787,12 +22795,12 @@ fn live_tool_completed_fields(
         .or_else(|| event.get("summary"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
-    let output = event
-        .get("result")
-        .or_else(|| event.get("output"))
-        .or_else(|| event.get("error"))
+    let output = [event.get("result"), event.get("output"), event.get("error")]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_null())
         .map(live_value_to_string)
-        .filter(|value| !value.is_empty());
+        .find(|value| !value.trim().is_empty());
     let tool_use_id = event
         .get("call_id")
         .or_else(|| event.get("tool_call_id"))
@@ -52833,6 +52841,18 @@ mod tests {
                     && output.as_deref() == Some("ok")
                     && tool_use_id == "call-1"
         ));
+    }
+
+    #[test]
+    fn server_sse_tool_null_result_preserves_output_fallback() {
+        let event = json!({"type":"tool_call_end", "call_id":"call", "tool":"bash", "result":null, "output":"available"});
+        let Some(AgentLiveEventKind::ToolCompleted { output, status, .. }) =
+            super::agent_live_event_kind_from_server_sse(&event)
+        else {
+            panic!("completion not projected")
+        };
+        assert_eq!(output.as_deref(), Some("available"));
+        assert_eq!(status, "uncertain");
     }
 
     #[test]

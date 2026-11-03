@@ -6,6 +6,7 @@ pub(crate) use astra_turn_core::orchestration::agent_result_wire::agent_tool_run
 pub(crate) use astra_turn_core::orchestration::agent_result_wire::project_agent_tool_wire as project_agent_control_wire;
 
 pub(crate) fn delegation_target(name: &str, arguments: &str) -> Option<String> {
+    let name = name.trim();
     if matches!(name, "agent" | "agent_fanout") {
         return Some(name.to_string());
     }
@@ -16,6 +17,7 @@ pub(crate) fn delegation_target(name: &str, arguments: &str) -> Option<String> {
         .ok()?
         .get("name")?
         .as_str()
+        .map(str::trim)
         .filter(|target| matches!(*target, "agent" | "agent_fanout"))
         .map(str::to_string)
 }
@@ -46,7 +48,26 @@ pub(crate) fn compact_delegation_description(name: &str, arguments: &str) -> Str
     format!("Agent {action} · Ctrl+G agents")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DelegationReceipt {
+    pub outcome: &'static str,
+    pub detail: Option<String>,
+}
+
+impl DelegationReceipt {
+    pub fn text(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("Agent control: {} · {detail}", self.outcome),
+            None => format!("Agent control: {} · Ctrl+G agents", self.outcome),
+        }
+    }
+}
+
 pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&str>) -> String {
+    delegation_receipt(status, payload).text()
+}
+
+pub(crate) fn delegation_receipt(status: Option<&str>, payload: Option<&str>) -> DelegationReceipt {
     let parsed = payload
         .and_then(astra_turn_core::orchestration::agent_result_wire::agent_control_result_value);
     let wire_status = if matches!(
@@ -82,7 +103,11 @@ pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&s
         "partial failure"
     } else {
         match wire_status {
-            "launched" => "launched",
+            "launched" if parsed.as_ref().is_some_and(|value| matches!(
+                astra_turn_core::orchestration::agent_result_wire::decode_agent_tool_result(value),
+                Some(astra_turn_core::orchestration::agent_result_wire::DecodedAgentToolResult::ControlReceipt(
+                    astra_turn_core::orchestration::agent_result_wire::AgentControlReceipt::Spawn)))) => "launched",
+            "launched" => "uncertain",
             "completed" | "success" => "completed",
             "completed_with_issues" => "completed with issues",
             "failed" | "error" | "spawn_rejected" => "failed",
@@ -105,6 +130,15 @@ pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&s
                     .and_then(serde_json::Value::as_str)
                     .or_else(|| value.get("reason")?.as_str())
                     .or_else(|| value.get("advisory")?.get("next_step")?.as_str())
+                    .or_else(|| {
+                        let executed = value
+                            .get("executed")
+                            .or_else(|| value.get("advisory")?.get("executed"))
+                            .and_then(serde_json::Value::as_bool);
+                        (executed == Some(false))
+                            .then(|| value.get("output")?.as_str())
+                            .flatten()
+                    })
             })
         })
     })
@@ -118,9 +152,9 @@ pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&s
             .collect::<String>()
     })
     .filter(|value| !value.trim().is_empty());
-    match detail {
-        Some(detail) => format!("Agent control: {status} · {detail}"),
-        None => format!("Agent control: {status} · Ctrl+G agents"),
+    DelegationReceipt {
+        outcome: status,
+        detail,
     }
 }
 
@@ -131,6 +165,46 @@ mod tests {
     use super::agent_control_interrupted_message;
     use super::{compact_delegation_result, delegation_target};
     use astra_turn_core::orchestration::agent_result_wire::AgentToolResultStatusKind;
+
+    #[test]
+    fn launch_claim_requires_the_shared_typed_receipt() {
+        let valid = r#"{"result_family":"control_receipt","success":true,"action":"spawn","status":"launched","parent_run_id":"parent","agent_id":"agent","run_id":"child"}"#;
+        let malformed = r#"{"status":"launched","run_id":"child"}"#;
+        assert!(
+            compact_delegation_result(Some("launched"), Some(valid))
+                .contains("Agent control: launched")
+        );
+        assert!(
+            compact_delegation_result(Some("launched"), Some(malformed))
+                .contains("Agent control: uncertain")
+        );
+    }
+
+    #[test]
+    fn unexecuted_rejection_keeps_its_structured_reason() {
+        let payload = r#"{"status":"rejected","advisory":{"executed":false},"output":"Tool is not admitted in this run"}"#;
+        assert!(
+            compact_delegation_result(Some("rejected"), Some(payload))
+                .contains("Tool is not admitted in this run")
+        );
+        let executed = r#"{"status":"failed","executed":true,"output":"private child output"}"#;
+        assert!(
+            !compact_delegation_result(Some("failed"), Some(executed))
+                .contains("private child output")
+        );
+    }
+
+    #[test]
+    fn normalized_delegation_names_share_the_runtime_identity() {
+        assert_eq!(
+            delegation_target(" invoke_tool ", r#"{"name":" agent "}"#),
+            Some("agent".into())
+        );
+        assert_eq!(
+            delegation_target(" agent_fanout ", "{}"),
+            Some("agent_fanout".into())
+        );
+    }
 
     #[test]
     fn shared_agent_control_status_kind_roundtrips_via_from_str() {

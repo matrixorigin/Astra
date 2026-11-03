@@ -251,6 +251,18 @@ separately from canonical conversation items; C1 `item_seq` and C3 `event_idx`
 are independent cursor domains and do not establish a shared chronological order.
 `A` loads older activity; `R` refreshes the conversation and latest activity.
 
+Large recorded tool outputs use bounded previews; expanding one activity collapses
+the previously expanded activity. Search and export retain the full available text.
+Live tools keep their logical identity when a deferred carrier resolves. Delegation
+shows a compact control receipt, including safe failure details, instead of the
+child prompt or result. A recorded pair alone does not retire that live receipt.
+An unpaired recorded call is a request with its result not loaded; only matching
+live evidence can mark it running. Covered live requests retained to supplement a
+result-only page are best effort and bounded to 128 entries and 512 KiB per open
+view. Eviction may discard a request that was never recorded; older history is
+not guaranteed to contain it. Uncovered live results and diagnostics remain
+separate evidence and are not included in this fallback budget.
+
 The authorized child's immutable root is the C3 source. The API checks both
 Run scopes and pages the root stream, selecting only tool presentation events
 whose embedded Run identity exactly matches the child. The page's
