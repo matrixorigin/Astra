@@ -5450,6 +5450,7 @@ struct RootTurnStartParticipant<'a> {
     admission: Option<CanonicalTurnAdmission>,
     prepared: Option<PreparedRootContextAdmission>,
     rejection: Option<(StatusCode, Json<ErrorResponse>)>,
+    full_llm_capture: Option<bool>,
 }
 
 #[async_trait]
@@ -5512,6 +5513,9 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
         opening
             .ok_or("root Run is missing its immutable opening")?
             .bind_context_authority(admission.authority.clone(), &self.request.message)?;
+        self.full_llm_capture = run_admission
+            .session_capture_override()
+            .map(crate::turn::llm::exchange_capture::session_full_llm_capture_override_enabled);
         self.admission = Some(admission);
         Ok(())
     }
@@ -5580,7 +5584,7 @@ impl RunExecutionCapacity {
 }
 
 pub struct AgenticRunLifecycleService {
-    default_execution_timeout_s: Result<u64, String>,
+    default_execution_timeout_s: Result<Option<u64>, String>,
     /// Process-local run handles (run_id -> state) for live cancellation, pause,
     /// and active SSE fanout. Durable state is the user-visible authority.
     runs: Arc<RwLock<HashMap<String, RunState>>>,
@@ -9629,9 +9633,10 @@ impl AgenticRunLifecycleService {
                         "runtime_timeout_invalid",
                     )
                 })?;
-                request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
-                    remaining_seconds: *seconds,
-                });
+                request.execution_time_budget =
+                    seconds.map(|seconds| astra_services::runs::ExecutionTimeBudget {
+                        remaining_seconds: seconds,
+                    });
             }
             let now_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -15285,6 +15290,7 @@ impl AgenticRunLifecycleService {
             admission: None,
             prepared: None,
             rejection: None,
+            full_llm_capture: None,
         });
         // Win the durable session slot before provisioning any resources.
         // Exact retries attach to the winner instead of repeating preparation.
@@ -15320,7 +15326,11 @@ impl AgenticRunLifecycleService {
             }
         };
         let mut canonical_turn = root_start.as_mut().and_then(|p| p.admission.take());
+        let full_llm_capture = root_start.as_ref().and_then(|p| p.full_llm_capture);
         drop(root_start);
+        if let Some(enabled) = full_llm_capture {
+            request.full_llm_capture = enabled;
+        }
         let execution_start_authority = match start_claim {
             DurableRunStartClaim::Started { authority } => authority,
             DurableRunStartClaim::Existing {

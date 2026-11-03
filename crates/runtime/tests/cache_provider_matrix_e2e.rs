@@ -752,9 +752,9 @@ async fn append_only_metadata_drives_real_output_cap_continuation_and_wal() {
         model: "append-alias",
         is_marker_isolated: false,
         cache_capability: Some(CacheCapability {
-            protocol: CacheProtocol::OpenAiAutoPrefix,
+            protocol: CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::AppendOnlyUserTail,
-            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            volatile_delivery: VolatileDeliveryPolicy::All,
             reuse_scope: Some(CacheReuseScope::ConversationTurns),
         }),
     };

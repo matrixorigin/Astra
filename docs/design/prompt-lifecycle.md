@@ -108,10 +108,15 @@ from a model name. Missing legacy delivery metadata retains the pre-axis `all`
 behavior, while newly serialized metadata is versioned and writes every
 behavioral field explicitly.
 
-`append_only_user_tail` is a distinct provider wire shape, not a compatibility
-fallback. It is valid only with `required_only` delivery. A required runtime
-control is appended as a typed, runtime-owned `role=user` frame so the next
-request strictly extends the prior provider history. Provider role is not
+`append_only_user_tail` is a distinct provider wire shape for prefix and
+strict-history caches, including Responses. A selected runtime control is
+appended as a typed, runtime-owned `role=user` frame so the next request
+strictly extends the complete prior request. With `all` delivery, optional
+context is retained in an advisory snapshot using the same
+canonical history, lifetime, retry and compaction owners. Replacing even a
+trailing context message can invalidate the whole conversation cache on a
+strict-history deployment; an unchanged system header alone is insufficient.
+`required_only` suppresses new optional snapshots. Provider role is not
 semantic authorship: intent, memory, observer, display, turn-boundary, and
 ordinary summary projections must use typed provenance and must never count
 that frame as human speech. Unknown runtime provenance fails closed and cannot
@@ -126,10 +131,24 @@ compaction may retain the exact frame bytes only under the same stable semantic
 policy used by main inference; all other summary/learning projections exclude
 runtime-owned frames.
 
+Advisory snapshots remain current within their human turn until superseded.
+Unchanged snapshots are deduplicated across tool rounds; a changed or empty
+snapshot supersedes the previous facts, and a new human turn expires them.
+Their historical bytes remain cacheable evidence, with no instruction or execution authority.
+This preserves the full selected context without a separate cache history or
+additional database admission query. When context pressure requires a rewrite,
+compaction may remove expired frames and older complete tool rounds while
+retaining the active snapshot, required controls and their dependencies. This
+can invalidate the provider cache; cache hit rate never overrides the budget
+or permits omitting active context.
+
 When an active session changes to a non-append wire shape, expired frames are
-removed from the provider projection. Active authority is unframed and re-homed
-to the required system lane; kinds rebuilt by a current authoritative source
-replace their historical frame instead of being duplicated. Canonical history
+removed from the provider projection. Active required authority is unframed and
+re-homed to the required system lane; kinds rebuilt by a current authoritative
+source replace their historical frame instead of being duplicated. Advisory
+snapshots are replaced by the destination provider's current context selection
+and delivery policy, including when returning to an append-only `RequiredOnly`
+placement. Canonical history
 retains the typed record needed for deterministic resume, while the chosen
 provider projection contains each effective authority kind once. Correctness is
 never weakened to preserve cache reuse.

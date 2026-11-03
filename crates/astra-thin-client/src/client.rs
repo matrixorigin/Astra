@@ -4123,7 +4123,7 @@ mod tests {
         )
         .with_offering_id("offer-memory");
         request.max_tokens = 128;
-        request.temperature = 0.0;
+        request.temperature = Some(0.0);
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(header("authorization", "Bearer token"))

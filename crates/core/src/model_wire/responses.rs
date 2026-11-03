@@ -5,7 +5,19 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 pub const CONTINUATION_KEY: &str = "_astra_responses";
+pub const CONTINUATION_SCOPE_CHANGED: &str =
+    "Model configuration changed during tool continuation; start a new turn";
 const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
+
+/// Construct the same endpoint for Responses requests and their route identity.
+pub fn endpoint_url(base_url: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(base_url) else {
+        return base_url.to_owned();
+    };
+    let path = format!("{}/responses", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    url.into()
+}
 
 /// Retain only scoped, replayable assistant protocol state at canonical
 /// persistence boundaries. This metadata grants no tool execution authority.
@@ -15,7 +27,13 @@ pub fn validated_continuation(message: &Value) -> Option<Value> {
     }
     let saved = message.get(CONTINUATION_KEY)?;
     let connection = saved["connection_id"].as_str()?;
-    uuid::Uuid::parse_str(connection).ok()?;
+    if uuid::Uuid::parse_str(connection).is_err()
+        && !connection.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return None;
+    }
     let model = saved["model"].as_str()?;
     if model.is_empty() || model.len() > 255 || model.chars().any(char::is_control) {
         return None;
@@ -166,12 +184,31 @@ pub fn request(
     no_tools: bool,
     max_output_tokens: Option<usize>,
 ) -> Result<Value, String> {
+    // Outer None means not yet searched; inner None means no user role was found.
+    // Runtime checks the separate human boundary before projection.
+    let mut last_user: Option<Option<usize>> = None;
     let mut input = Vec::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .ok_or("Message role is missing")?;
+        if role == "assistant"
+            && let Some(saved) = message.get(CONTINUATION_KEY)
+            && (saved["connection_id"] != connection || saved["model"] != model)
+            && message["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty())
+            && !last_user
+                .get_or_insert_with(|| {
+                    messages
+                        .iter()
+                        .rposition(|message| message["role"] == "user")
+                })
+                .is_some_and(|user_index| user_index > index)
+        {
+            return Err(CONTINUATION_SCOPE_CHANGED.into());
+        }
         if role == "assistant"
             && let Some(saved) = message.get(CONTINUATION_KEY)
             && saved["connection_id"] == connection
@@ -693,24 +730,62 @@ pub fn decode_sse(text: &str) -> Result<ResponseOutput, ResponsesStreamError> {
     let mut output = ResponseAccumulator::default();
     let text = text.replace("\r\n", "\n");
     for block in text.split("\n\n") {
-        let data = block
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let event = serde_json::from_str(&data)
-            .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE JSON"))?;
-        output.observe(&event)?;
+        observe_sse_block(&mut output, block)?;
     }
     output.finish()
+}
+
+/// Decode one complete SSE event using the same Responses validation as batch decoding.
+pub fn observe_sse_block(
+    output: &mut ResponseAccumulator,
+    block: &str,
+) -> Result<(), ResponsesStreamError> {
+    let data = block
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(());
+    }
+    let event = serde_json::from_str(&data)
+        .map_err(|_| ResponsesStreamError::Codec("Invalid Responses SSE JSON"))?;
+    output.observe(&event)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_url_appends_to_the_path_before_query_and_fragment() {
+        for (base, expected) in [
+            (
+                "https://example.test/v1/",
+                "https://example.test/v1/responses",
+            ),
+            (
+                "https://example.test/v1/?workspace=one#part",
+                "https://example.test/v1/responses?workspace=one#part",
+            ),
+            (
+                "https://example.test/v1#part?text",
+                "https://example.test/v1/responses#part?text",
+            ),
+            (
+                "https://example.test/v1\\?workspace=one",
+                "https://example.test/v1/responses?workspace=one",
+            ),
+            (
+                "https://example.test/a%2Fb/?workspace=one",
+                "https://example.test/a%2Fb/responses?workspace=one",
+            ),
+        ] {
+            assert_eq!(endpoint_url(base), expected);
+        }
+    }
+
     fn completion(items: Value) -> Value {
         json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":items,
             "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}})
@@ -768,9 +843,22 @@ mod tests {
         assert_eq!(body["input"][1], items[1]);
         assert_eq!(body["input"][2]["type"], "function_call_output");
         assert_eq!(body["input"][2]["call_id"], "call-1");
+        assert!(
+            request(
+                "model",
+                &messages,
+                None,
+                "different-connection",
+                false,
+                None
+            )
+            .is_err()
+        );
+        let mut completed = messages.to_vec();
+        completed.push(json!({"role":"user", "content":"new turn"}));
         let switched = request(
             "model",
-            &messages,
+            &completed,
             None,
             "different-connection",
             false,
@@ -785,6 +873,120 @@ mod tests {
         assert_eq!(
             body["input"][1]["arguments"],
             "canonical-normalized-arguments"
+        );
+    }
+
+    #[test]
+    fn changed_scope_uses_the_later_user_boundary_and_preserves_error_order() {
+        let assistant = json!({
+            "role":"assistant", "content":"", "tool_calls":[{
+                "id":"call-1", "function":{"name":"lookup","arguments":"{}"}
+            }],
+            CONTINUATION_KEY:{"connection_id":"old", "model":"model", "items":[]}
+        });
+        let user = json!({"role":"user", "content":"next turn"});
+        for (model, connection) in [("model", "new"), ("other-model", "old")] {
+            for messages in [
+                vec![assistant.clone()],
+                vec![user.clone(), assistant.clone()],
+            ] {
+                assert_eq!(
+                    request(model, &messages, None, connection, false, None).unwrap_err(),
+                    CONTINUATION_SCOPE_CHANGED
+                );
+            }
+            let messages = vec![assistant.clone(), user.clone()];
+            assert!(request(model, &messages, None, connection, false, None).is_ok());
+        }
+
+        for calls in [None, Some(Value::Null), Some(json!([]))] {
+            let mut no_calls = assistant.clone();
+            if let Some(calls) = calls {
+                no_calls["tool_calls"] = calls;
+            } else {
+                no_calls.as_object_mut().unwrap().remove("tool_calls");
+            }
+            assert!(request("model", &[no_calls], None, "new", false, None).is_ok());
+        }
+        let tool_user = json!({"role":"user", "tool_call_id":"call-1", "content":"result"});
+        assert!(
+            request(
+                "model",
+                &[assistant.clone(), tool_user],
+                None,
+                "new",
+                false,
+                None
+            )
+            .is_ok()
+        );
+
+        for (messages, expected) in [
+            (
+                vec![assistant.clone(), json!({"role":42})],
+                CONTINUATION_SCOPE_CHANGED,
+            ),
+            (
+                vec![json!({"role":42}), assistant.clone()],
+                "Message role is missing",
+            ),
+            (
+                vec![assistant.clone(), json!({"role":42}), user],
+                "Message role is missing",
+            ),
+            (
+                vec![assistant, json!({"role":"user", "content":{}})],
+                "Unsupported message content",
+            ),
+        ] {
+            assert_eq!(
+                request("model", &messages, None, "new", false, None).unwrap_err(),
+                expected
+            );
+        }
+        assert!(request("model", &[], None, "new", false, None).is_ok());
+    }
+
+    #[test]
+    fn changed_scope_after_long_history_preserves_tool_pairs() {
+        let old_scope = format!("sha256:{}", "a".repeat(64));
+        let new_scope = format!("sha256:{}", "b".repeat(64));
+        let mut messages = vec![json!({"role":"user", "content":"old turn"})];
+        for index in 0..1000 {
+            let id = format!("call-{index}");
+            let output = ResponseOutput {
+                items: vec![json!({
+                    "type":"function_call", "name":"lookup", "namespace":"astra",
+                    "call_id":id, "arguments":"{}"
+                })],
+                ..Default::default()
+            };
+            let mut assistant = json!({
+                "role":"assistant", "content":"", "tool_calls":[{
+                    "id":id, "function":{"name":"lookup","arguments":"{}"}
+                }]
+            });
+            assistant[CONTINUATION_KEY] = output.continuation(&old_scope, "model");
+            assert!(validated_continuation(&assistant).is_some());
+            messages.push(assistant);
+            messages.push(json!({"role":"tool", "tool_call_id":id, "content":"ok"}));
+        }
+        messages.push(json!({"role":"user", "content":"new turn"}));
+        let body = request("model", &messages, None, &new_scope, false, None).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2002);
+        for (index, pair) in input[1..2001].chunks_exact(2).enumerate() {
+            let id = format!("call-{index}");
+            assert_eq!(pair[0]["type"], "function_call");
+            assert_eq!(pair[0]["call_id"], id);
+            assert_eq!(pair[1]["type"], "function_call_output");
+            assert_eq!(pair[1]["call_id"], id);
+        }
+        assert_eq!(input[2001]["role"], "user");
+        messages.push(messages[1].clone());
+        assert_eq!(
+            request("model", &messages, None, &new_scope, false, None).unwrap_err(),
+            CONTINUATION_SCOPE_CHANGED
         );
     }
     #[test]
@@ -894,6 +1096,13 @@ mod tests {
         assert!(validated_continuation(&message).is_none());
         message[CONTINUATION_KEY]["items"][0]["role"] = json!("assistant");
         message[CONTINUATION_KEY]["connection_id"] = json!("unscoped");
+        assert!(validated_continuation(&message).is_none());
+        message[CONTINUATION_KEY]["connection_id"] = json!(format!("sha256:{}", "a".repeat(64)));
+        assert!(validated_continuation(&message).is_some());
+        let other = format!("sha256:{}", "b".repeat(64));
+        let projected = request("model", &[message.clone()], None, &other, false, None).unwrap();
+        assert!(!projected.to_string().contains("final_answer"));
+        message[CONTINUATION_KEY]["connection_id"] = json!(format!("sha256:{}", "z".repeat(64)));
         assert!(validated_continuation(&message).is_none());
     }
     #[test]

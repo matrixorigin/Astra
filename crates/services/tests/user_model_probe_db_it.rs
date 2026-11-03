@@ -471,8 +471,8 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     .await
     .unwrap();
     assert_views(None, None).await;
-    // Hold an actual connectivity request, rotate through the public service,
-    // then release either success or failure from the superseded configuration.
+    // Hold an actual connectivity request, then update the key or status through
+    // the public service before releasing the older success or failure.
     fail_probe.store(false, std::sync::atomic::Ordering::SeqCst);
     for outcome in [1, 2] {
         let before = requests.load(std::sync::atomic::Ordering::SeqCst);
@@ -506,7 +506,17 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             outcome == 2,
             "old success or failure cannot change the replacement status"
         );
-        assert!(current.thinking_probe.is_none());
+        if outcome == 1 {
+            assert!(
+                current.thinking_probe.is_none(),
+                "a new key invalidates the prior observation"
+            );
+        } else {
+            assert!(
+                current.thinking_probe.is_some(),
+                "reusing the same key preserves the prior observation"
+            );
+        }
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst) - before,
             2,
@@ -629,6 +639,20 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     ).fetch_one(pool.get()).await.unwrap();
     assert_eq!(restored, saved);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), before);
+
+    // An idempotent credential update retains the encrypted identity and its
+    // probe evidence instead of invalidating active model controls.
+    let before_key: (String, String) = sqlx::query_as(
+        "SELECT api_key_encrypted, CAST(thinking_probe_json AS CHAR) FROM infra_llm_models WHERE model_name = 'admin-fixture'",
+    ).fetch_one(pool.get()).await.unwrap();
+    service
+        .update_model("admin-fixture".into(), patch(Some("rotated-key"), None))
+        .await
+        .unwrap();
+    let after_key: (String, String) = sqlx::query_as(
+        "SELECT api_key_encrypted, CAST(thinking_probe_json AS CHAR) FROM infra_llm_models WHERE model_name = 'admin-fixture'",
+    ).fetch_one(pool.get()).await.unwrap();
+    assert_eq!(before_key, after_key);
 
     // Credential updates inherit a stored endpoint/header only when quirks
     // is absent. A replacement object must clear both of these old controls.

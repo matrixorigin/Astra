@@ -327,6 +327,9 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id: id,
                 model: ResolvedActiveLlmModel {
+                    inference_protocol: None,
+                    response_scope_key: None,
+                    supported_reasoning_efforts: None,
                     price_snapshot: None,
                     model_name: "jev".into(),
                     wire_model_name: None,

@@ -569,6 +569,9 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         }
         _ = std::future::ready(()) => {}
     }
+    // An input wait can be restored at a slice boundary before the next loop
+    // preparation. Resolve the same round authority without charging a round.
+    super::lifecycle::prepare_iteration_budget(state)?;
     let slice_exhausted =
         state.remaining_turns == 0 || state.current_round_index as usize + 1 >= state.max_turns;
     let no_synthesis_budget = slice_exhausted
@@ -4311,6 +4314,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 limit,
             } => {
                 let detail = format!("Infrastructure round limit reached: {rounds}/{limit} rounds");
+                let _cancelled = super::lifecycle::cancel_unfinished_child_agents(
+                    host,
+                    state,
+                    &detail,
+                    astra_turn_core::orchestration_types::CancellationOrigin::Runtime,
+                )
+                .await;
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::BudgetExhausted,
                     ResumeAction::ContinueImmediately,

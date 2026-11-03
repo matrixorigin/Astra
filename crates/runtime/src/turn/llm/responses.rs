@@ -9,8 +9,22 @@ use astra_core::model_wire::responses::{
 mod tests;
 
 pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::ClassifiedError {
-    astra_core::ClassifiedError::new(kind, format!("ChatGPT subscription request failed: {code}"))
-        .with_details_json(json!({"source":"chatgpt","code":code}).to_string())
+    let message = match code {
+        "unsupported_responses_generation_settings" => {
+            "The selected model cannot use the requested generation settings".to_string()
+        }
+        "unsupported_responses_reasoning_control" => {
+            "The selected model does not support the requested reasoning setting".to_string()
+        }
+        "unsupported_responses_input" => "The selected model cannot process this input".to_string(),
+        "responses_continuation_scope_changed" => {
+            "The model configuration changed during this turn. Start a new turn to continue."
+                .to_string()
+        }
+        _ => format!("Model request failed: {code}"),
+    };
+    astra_core::ClassifiedError::new(kind, message)
+        .with_details_json(json!({"source":"responses","code":code}).to_string())
 }
 pub(super) fn credential_error(
     value: (
@@ -37,51 +51,114 @@ pub(super) fn prepare(
     tool_choice: RuntimeToolChoice,
     started: Instant,
 ) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
-    let credential = call.route.subscription.ok_or_else(|| {
-        error(
-            astra_core::ErrorKind::InvalidRequest,
-            "model_connection_required",
+    if call.cache_capability.is_some_and(|capability| {
+        matches!(
+            capability.protocol,
+            astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit
+                | astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint
         )
-    })?;
-    let fixed_base = credential.api_base().map_err(credential_error)?;
-    if call.route.base_url != fixed_base || call.route.completions_url_override.is_some() {
+    }) {
         return Err(error(
             astra_core::ErrorKind::ContractViolation,
-            "subscription_endpoint_mismatch",
+            "unsupported_responses_cache_placement",
         ));
     }
+    if let Some(credential) = call.route.subscription {
+        let fixed_base = credential.api_base().map_err(credential_error)?;
+        if call.route.base_url != fixed_base || call.route.completions_url_override.is_some() {
+            return Err(error(
+                astra_core::ErrorKind::ContractViolation,
+                "subscription_endpoint_mismatch",
+            ));
+        }
+    } else if call.route.completions_url_override.is_some() {
+        return Err(error(
+            astra_core::ErrorKind::ContractViolation,
+            "responses_endpoint_override_unsupported",
+        ));
+    }
+    let scope = call
+        .route
+        .subscription
+        .map(|credential| credential.connection_id())
+        .or(call.route.response_scope)
+        .ok_or_else(|| {
+            error(
+                astra_core::ErrorKind::ContractViolation,
+                "response_scope_missing",
+            )
+        })?;
     if call
         .route
         .request_body_overrides
         .is_some_and(|values| !values.is_empty())
         || call.route.fixed_temperature.is_some()
+        || (call.route.subscription.is_none() && call.temperature.is_some())
     {
         return Err(error(
             astra_core::ErrorKind::InvalidRequest,
-            "unsupported_subscription_generation_settings",
+            if call.route.subscription.is_some() {
+                "unsupported_subscription_generation_settings"
+            } else {
+                "unsupported_responses_generation_settings"
+            },
         ));
     }
-    if !matches!(
+    let api_off = call.route.subscription.is_none()
+        && matches!(call.thinking, ThinkingConfig::Off)
+        && call
+            .route
+            .supported_reasoning_efforts
+            .is_some_and(|efforts| efforts.iter().any(|effort| effort == "none"));
+    if !(matches!(
         call.thinking,
         ThinkingConfig::ModelDefault | ThinkingConfig::Adaptive { .. }
-    ) || matches!(call.thinking, ThinkingConfig::Adaptive { .. })
-        && (call.route.thinking_protocol
-            != Some(astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning)
-            || call.route.supported_reasoning_efforts.is_none())
+    ) || api_off)
+        || matches!(call.thinking, ThinkingConfig::Adaptive { .. })
+            && (call.route.thinking_protocol
+                != Some(astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning)
+                || call.route.subscription.is_some()
+                    && call.route.supported_reasoning_efforts.is_none())
     {
         return Err(error(
             astra_core::ErrorKind::InvalidRequest,
-            "unsupported_subscription_reasoning_control",
+            if call.route.subscription.is_some() {
+                "unsupported_subscription_reasoning_control"
+            } else {
+                "unsupported_responses_reasoning_control"
+            },
         ));
     }
     call.validate_declared_reasoning()?;
     let model = call.route.wire_model_name.unwrap_or(call.route.model_name);
+    // Decide whether this is a new human turn before runtime-owned context is
+    // projected into user-role messages for the provider.
+    let active_start = call
+        .messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)
+        .map_or(0, |index| index + 1);
+    if call.messages[active_start..].iter().any(|message| {
+        message["role"] == "assistant"
+            && message["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty())
+            && message
+                .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                .is_some_and(|saved| saved["connection_id"] != scope || saved["model"] != model)
+    }) {
+        return Err(error(
+            astra_core::ErrorKind::InvalidRequest,
+            "responses_continuation_scope_changed",
+        ));
+    }
     // Direct and pre-projected calls share runtime authority/order, continuation
     // and provider-call-ID projection before the codec encodes the request.
-    let messages = consolidate_system_messages_for_provider(
+    let messages = consolidate_system_messages_for_protocol(
         call.messages,
         call.route.provider,
         call.cache_capability,
+        LlmProviderProtocol::OpenAiResponses,
     );
     let mut tools = call.tools.to_vec();
     for tool in &mut tools {
@@ -91,20 +168,32 @@ pub(super) fn prepare(
         model,
         &messages,
         Some(&tools),
-        credential.connection_id(),
+        scope,
         matches!(tool_choice, RuntimeToolChoice::None),
         call.max_output_tokens,
     )
-    .map_err(|_| {
+    .map_err(|cause| {
         error(
             astra_core::ErrorKind::InvalidRequest,
-            "unsupported_subscription_input",
+            if cause == astra_core::model_wire::responses::CONTINUATION_SCOPE_CHANGED {
+                "responses_continuation_scope_changed"
+            } else if call.route.subscription.is_some() {
+                "unsupported_subscription_input"
+            } else {
+                "unsupported_responses_input"
+            },
         )
     })?;
+    if call.route.subscription.is_none() {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
     call.thinking.apply_openai_protocol(
         &mut body,
         astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning,
     );
+    if api_off {
+        body["reasoning"] = json!({"effort":"none"});
+    }
     let authorized_tool_names = if matches!(tool_choice, RuntimeToolChoice::None) {
         HashSet::new()
     } else {
@@ -119,9 +208,9 @@ pub(super) fn prepare(
     let request = PreparedProviderRequest::from_json_with_cache_capability(
         &body,
         LlmProviderProtocol::OpenAiResponses,
-        None,
+        call.cache_capability,
     )?;
-    let url = format!("{}/responses", call.route.base_url.trim_end_matches('/'));
+    let url = astra_core::model_wire::responses::endpoint_url(call.route.base_url);
     Ok(PreparedStreamingCall {
         purpose: call.purpose,
         route: call.route,
@@ -308,12 +397,21 @@ pub(super) async fn collect(
     mut callback: Option<&mut LlmStreamCallback<'_>>,
     started: Instant,
     budget: Option<Duration>,
-    lease: &astra_services::chatgpt::CredentialLease,
+    lease: Option<&astra_services::chatgpt::CredentialLease>,
     usage_observer: Option<(&dyn super::ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
-    let binding = route
-        .subscription
-        .expect("Responses preparation requires a connection");
+    let binding = route.subscription;
+    let scope = binding
+        .map(|credential| credential.connection_id())
+        .or(route.response_scope)
+        .ok_or_else(|| StreamCollectError::Provider {
+            error: error(
+                astra_core::ErrorKind::ContractViolation,
+                "response_scope_missing",
+            ),
+            partial: LlmCallResult::default(),
+            rejected: false,
+        })?;
     let mut accumulator = ResponseAccumulator::default();
     let mut reported_usage = serde_json::Map::new();
     let mut latest_usage = None;
@@ -326,7 +424,7 @@ pub(super) async fn collect(
         let mut admitted_items = HashSet::new();
         loop {
             let next = tokio::select! {
-                _=lease.cancel.cancelled()=>return Err(error(astra_core::ErrorKind::Cancelled,"model_connection_unavailable")),
+                _=wait_lease_cancel(lease)=>return Err(error(astra_core::ErrorKind::Cancelled,"model_connection_unavailable")),
                 _=wait_llm_cancel(cancel)=>return Err(error(astra_core::ErrorKind::Cancelled,"cancelled")),
                 _=tokio::time::sleep_until(idle_deadline)=>return Err(error(astra_core::ErrorKind::ProviderDeadline,"stream_progress_deadline")),
                 value=stream.next()=>value,
@@ -446,7 +544,9 @@ pub(super) async fn collect(
                                 "tool_not_admitted",
                             ));
                         }
-                        binding.ensure_current().await.map_err(credential_error)?;
+                        if let Some(binding) = binding {
+                            binding.ensure_current().await.map_err(credential_error)?;
+                        }
                         let output = std::mem::take(&mut accumulator).finish().map_err(|_| {
                             error(
                                 astra_core::ErrorKind::StreamTransport,
@@ -455,7 +555,7 @@ pub(super) async fn collect(
                         })?;
                         let result = result(
                             output,
-                            binding.connection_id(),
+                            scope,
                             route.wire_model_name.unwrap_or(route.model_name),
                             route.model_name,
                             latest_usage,
@@ -478,7 +578,7 @@ pub(super) async fn collect(
         tokio::select! {
             biased;
             _=wait_llm_cancel(cancel)=>Err(error(astra_core::ErrorKind::Cancelled,"cancelled")),
-            _=lease.cancel.cancelled()=>Err(error(astra_core::ErrorKind::Cancelled,"model_connection_unavailable")),
+            _=wait_lease_cancel(lease)=>Err(error(astra_core::ErrorKind::Cancelled,"model_connection_unavailable")),
             _=wait_optional_deadline(deadline)=>Err(error(astra_core::ErrorKind::ProviderDeadline,"provider_deadline")),
             value=&mut exchange=>value,
         }
@@ -501,4 +601,11 @@ pub(super) async fn collect(
             },
         }
     })
+}
+
+async fn wait_lease_cancel(lease: Option<&astra_services::chatgpt::CredentialLease>) {
+    match lease {
+        Some(lease) => lease.cancel.cancelled().await,
+        None => std::future::pending().await,
+    }
 }

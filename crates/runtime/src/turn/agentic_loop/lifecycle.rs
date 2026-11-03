@@ -2918,6 +2918,47 @@ fn reserve_budget_settlement_boundary(state: &mut AgenticLoopState) {
     }
 }
 
+/// Renew an internal scheduling slice without changing an explicit lifetime
+/// limit or erasing consumed iterations. One owner updates the same counters
+/// persisted in the execution checkpoint; renewal does not depend on model
+/// claims or inferred progress.
+pub(super) fn prepare_iteration_budget(
+    state: &mut AgenticLoopState,
+) -> Result<(), astra_core::ClassifiedError> {
+    if state.max_turns == 0 || state.remaining_turns > state.max_turns {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "invalid execution slice accounting",
+        ));
+    }
+    let consumed = usize::try_from(state.charged_iterations)
+        .map_err(|_| "execution iteration accounting exceeds runtime capacity".to_string())?;
+    let limit = state
+        .agentic_turn_budget
+        .hard_turn_limit
+        .map(|limit| limit.get());
+    let mut boundary = limit.map_or(state.max_turns, |limit| state.max_turns.min(limit));
+    let uncharged = boundary
+        .checked_sub(consumed)
+        .ok_or_else(|| "charged iterations exceed the admitted execution boundary".to_string())?;
+    let mut remaining = state.remaining_turns.min(uncharged);
+    // Keep enough space for work plus its existing settlement boundary. A
+    // soft slice must not activate final-answer or child-cancellation policy.
+    if remaining <= 3 {
+        let slice = state.agentic_turn_budget.initial_turns.max(4);
+        let extension = limit.map_or(slice, |limit| slice.min(limit - boundary));
+        boundary = boundary
+            .checked_add(extension)
+            .ok_or_else(|| "execution iteration boundary overflow".to_string())?;
+        remaining = remaining
+            .checked_add(extension)
+            .ok_or_else(|| "execution iteration accounting overflow".to_string())?;
+    }
+    state.max_turns = boundary;
+    state.remaining_turns = remaining;
+    Ok(())
+}
+
 /// Unified diagnosis of all stall conditions evaluated at interruption time.
 ///
 /// Computes the signal string, human-readable summary, and restricted tool
@@ -3457,11 +3498,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         .charged_iterations
         .checked_add(1)
         .ok_or_else(|| "execution iteration accounting overflow".to_string())?;
-    let limit = state.agentic_turn_budget.initial_turns;
-    state.max_turns = state.max_turns.min(limit);
-    state.remaining_turns = state
-        .remaining_turns
-        .min(limit.saturating_sub(usize::try_from(state.charged_iterations).unwrap_or(usize::MAX)));
+    prepare_iteration_budget(state)?;
     if state.remaining_turns == 0 {
         let cancelled = cancel_child_agents_with_timeout(
             host,
@@ -4081,7 +4118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heavy_checkpoint_records_actual_charged_iterations_for_same_run() {
+    async fn heavy_checkpoint_preserves_renewed_boundary_and_cumulative_charges() {
         let sessions = tempfile::tempdir().expect("isolated journal");
         let _journal = astra_services::session_journal::JournalDirGuard::new(sessions.path());
         let mut host = MockHost::new(Vec::new());
@@ -4091,12 +4128,12 @@ mod tests {
         state.current_run_id = Some("same-budget-run".into());
         state.current_run_owner_generation = Some(3);
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(
-            50,
+            24,
             std::num::NonZeroUsize::new(50),
         );
-        state.max_turns = 50;
-        state.remaining_turns = 50;
-        for iteration in 0..2 {
+        state.max_turns = 24;
+        state.remaining_turns = 24;
+        for iteration in 0..25 {
             let prepared = prepare_turn_iteration(&mut host, &mut state, iteration)
                 .await
                 .expect("iteration preparation");
@@ -4142,8 +4179,16 @@ mod tests {
         };
         let wire = serde_json::to_value(heavy).expect("checkpoint serialization");
         assert_eq!(wire["run_execution_budget"]["run_id"], "same-budget-run");
-        assert_eq!(wire["run_execution_budget"]["charged_iterations"], 2);
-        assert_eq!(wire["run_execution_budget"]["remaining_iterations"], 48);
+        assert_eq!(wire["run_execution_budget"]["charged_iterations"], 25);
+        assert_eq!(
+            wire["run_execution_budget"]["granted_iteration_boundary"],
+            48
+        );
+        assert_eq!(wire["run_execution_budget"]["remaining_iterations"], 23);
+        assert_eq!(
+            wire["run_execution_budget"]["effective_hard_turn_limit"],
+            50
+        );
         assert_eq!(
             heavy.run_execution_control.as_ref(),
             Some(&expected_control)
@@ -4182,6 +4227,27 @@ mod tests {
                 );
             }
             assert_eq!((state.charged_iterations, state.remaining_turns), before);
+        }
+    }
+
+    #[test]
+    fn invalid_slice_accounting_fails_without_changing_the_checkpoint_facts() {
+        for (boundary, remaining, charged) in [(24, 1, 25), (usize::MAX, 0, usize::MAX)] {
+            let mut state = make_state();
+            state.current_run_id = Some("accounting-test".into());
+            state.current_run_owner_generation = Some(0);
+            state.max_turns = boundary;
+            state.remaining_turns = remaining;
+            state.charged_iterations = charged as u64;
+            let before = state.run_execution_budget_snapshot();
+
+            assert!(prepare_iteration_budget(&mut state).is_err());
+
+            assert_eq!(state.run_execution_budget_snapshot(), before);
+            assert_eq!(
+                (state.max_turns, state.remaining_turns),
+                (boundary, remaining)
+            );
         }
     }
 
@@ -4327,13 +4393,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_mutation_does_not_renew_exhausted_allowance() {
+    async fn observed_mutation_does_not_renew_an_explicit_hard_limit() {
         let mut state = make_state();
         let fallback = astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
         state.task_profile = fallback;
         state.agentic_turn_budget = fallback.agentic_turn_budget;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(24);
         state.max_turns = fallback.agentic_turn_budget.initial_turns;
         state.remaining_turns = 0;
+        state.charged_iterations = 24;
         state.hooks.workspace_root_hint = Some("/workspace".into());
         state.stall.tool_call_records = vec![committed_write_record(23, "/workspace/src/lib.rs")];
         let mut host = MockHost::new(Vec::new());
@@ -4348,6 +4416,60 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::BudgetExhausted)
         );
+    }
+
+    #[tokio::test]
+    async fn infrastructure_ceiling_survives_slice_renewal_and_cancels_children() {
+        use crate::turn::agentic_loop::host::tests::{edge_tool_result, make_edge_tool_with_args};
+        let sessions = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(sessions.path());
+        let mut state = make_state();
+        state.owner_user_id = Some("infrastructure-budget-test".into());
+        state.current_session_id = Some(uuid::Uuid::new_v4().to_string());
+        state.current_run_id = Some("fixture-parent".into());
+        state.current_run_owner_generation = Some(0);
+        state.agentic_turn_budget = state.task_profile.agentic_turn_budget;
+        state.max_turns = state.agentic_turn_budget.initial_turns;
+        state.remaining_turns = state.max_turns;
+        state.stall.circuit_breaker =
+            astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
+                astra_turn_core::loop_circuit_breaker::BreakerConfig {
+                    absolute_max_rounds: 28,
+                    ..Default::default()
+                },
+            );
+        state.stall.tool_call_records.push(agent_record(
+            "spawn",
+            json!({"description": "Review remaining evidence"}),
+            Some(json!({"status": "launched", "agent_id": "pending-child"})),
+            None,
+        ));
+        let turns = (0..40)
+            .map(|index| {
+                let mut tool = make_edge_tool_with_args(
+                    "read_file",
+                    json!({"path": format!("/workspace/source-{index}.rs")}),
+                    &format!("source {index}"),
+                );
+                tool.request_id = format!("read-{index}");
+                edge_tool_result(vec![tool], 10, 2, None)
+            })
+            .collect();
+        let mut host = MockHost::new(turns).with_valid_tools(&["read_file"]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+        assert_eq!(host.turn_count(), 28);
+        assert_eq!(host.cancelled_agent_ids, vec!["pending-child"]);
+        let interruption = state.interruption.as_ref().unwrap();
+        assert_eq!(interruption.kind, InterruptionKind::BudgetExhausted);
+        assert!(interruption.to_json().to_string().contains("28/28 rounds"));
+        assert!(state.max_turns > 24);
+        assert!(state.stall.last_heavy_checkpoint.is_some());
+        assert_eq!(state.llm_rounds_completed, 28);
     }
 
     #[test]

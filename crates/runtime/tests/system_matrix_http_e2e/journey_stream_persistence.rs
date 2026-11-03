@@ -852,7 +852,9 @@ async fn assert_concurrent_fanout_stream(
                     .is_some_and(|error| error.contains("empty_completion"))
             } else {
                 result["error"].as_str().is_some_and(|error| {
-                    error.contains("[invalid_request] LLM request rejected: 400")
+                    error.contains(
+                        "[invalid_request] Model provider rejected the request (HTTP 400)",
+                    )
                 })
             }
         }),
@@ -3266,9 +3268,10 @@ native_child_script(child_model.clone(),"Run three reviews and preserve every fa
             .collect::<std::collections::HashSet<_>>()
     );
     assert!(
-        children.iter().all(|child| child["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("[invalid_request] LLM request rejected: 400"))),
+        children
+            .iter()
+            .all(|child| child["error"].as_str().is_some_and(|error| error
+                .contains("[invalid_request] Model provider rejected the request (HTTP 400)"))),
         "failure provenance was lost: {children:?}"
     );
 

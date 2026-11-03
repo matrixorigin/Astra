@@ -406,15 +406,15 @@ impl Default for SpawnAgentInput {
     }
 }
 
-/// Resolve the proposed finite round allowance given an explicit
+/// Resolve the proposed initial execution slice given an explicit
 /// `initial_turns`, an optional `complexity` hint, and the agent-type default.
 ///
-/// Inputs are model-authored admission hints. The execution owner freezes the
-/// resolved allowance and applies inherited ceilings and deadlines. Rules:
+/// Inputs are model-authored sizing hints, not lifetime limits. The execution
+/// owner separately applies explicit ceilings and inherited deadlines. Rules:
 ///
-///  * an `initial_turns=Some(n)` hint sets the allowance when it is the only
+///  * an `initial_turns=Some(n)` hint sizes the slice when it is the only
 ///    constraint (with a minimum of 1);
-///  * `complexity=Some("light")` → at most 10 turns;
+///  * `complexity=Some("light")` → an initial slice of at most 10 turns;
 ///  * `complexity=Some("normal")` / None → default;
 ///  * `complexity=Some("deep")` / `"thorough"` → `2 × default`;
 ///  * when both are present, constraints compose by taking the smaller value;

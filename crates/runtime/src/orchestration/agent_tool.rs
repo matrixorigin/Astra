@@ -5150,7 +5150,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn handle_spawn_agent_tool_freezes_model_turn_hint_at_admission() {
+    async fn handle_spawn_agent_tool_keeps_model_turn_hint_as_an_initial_slice() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -5171,7 +5171,7 @@ pub(crate) mod tests {
             Some(10),
             "the child loop must preserve the model-suggested initial slice"
         );
-        assert_eq!(executor.take_captured_hard_turn_limit(), Some(Some(10)));
+        assert_eq!(executor.take_captured_hard_turn_limit(), Some(None));
     }
 
     #[tokio::test]
@@ -5217,7 +5217,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn persona_default_turn_budget_is_finite() {
+    async fn persona_default_turn_budget_only_sizes_the_initial_slice() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -5235,7 +5235,7 @@ pub(crate) mod tests {
         let completed = collect_spawn_receipt(&result, &ctx).await;
         assert_eq!(completed["status"], "completed", "{completed}");
         assert_eq!(executor.take_captured_max_turns(), Some(12));
-        assert_eq!(executor.take_captured_hard_turn_limit(), Some(Some(12)));
+        assert_eq!(executor.take_captured_hard_turn_limit(), Some(None));
     }
 
     #[tokio::test]
@@ -6931,7 +6931,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn deep_code_review_fanout_freezes_persona_allowance() {
+    async fn deep_code_review_fanout_does_not_promote_persona_sizing_to_a_hard_limit() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -6961,8 +6961,8 @@ pub(crate) mod tests {
         assert_eq!(executor.take_captured_max_turns(), Some(24));
         assert_eq!(
             executor.take_captured_hard_turn_limit(),
-            Some(Some(24)),
-            "the deep code-review allowance must not renew past its admitted 24 turns"
+            Some(None),
+            "persona sizing must not stop an unfinished review after 24 rounds"
         );
     }
 

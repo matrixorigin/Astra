@@ -28,7 +28,7 @@ pub use system::{
     build_pipeline_static_sections, build_skill_listing_section,
     build_skill_listing_section_for_model, build_skill_listing_section_with_caps,
     build_skill_listing_section_with_context_window_and_caps, default_overrides_dir,
-    execution_slice_guidance, load_overrides, parallel_batching_nudge_directive,
+    execution_round_limit_guidance, load_overrides, parallel_batching_nudge_directive,
     tool_round_guidance_trace, trailing_single_tool_round_streak,
 };
 pub(crate) use system::{

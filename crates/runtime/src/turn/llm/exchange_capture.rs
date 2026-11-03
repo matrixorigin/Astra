@@ -36,22 +36,26 @@ fn sanitize_component(raw: &str) -> String {
 pub(crate) fn session_full_llm_capture_enabled(
     metadata: Option<&serde_json::Map<String, Value>>,
 ) -> bool {
+    session_full_llm_capture_override_enabled(session_capture_override(metadata))
+}
+
+pub(crate) fn session_full_llm_capture_override_enabled(capture: Option<bool>) -> bool {
     resolve_full_llm_capture_enabled(
-        metadata,
+        capture,
         astra_config::runtime_config::RuntimeConfig::cached()
             .trace
             .category_enabled(astra_config::runtime_config::TraceCategory::LlmExchanges),
     )
 }
 
-fn resolve_full_llm_capture_enabled(
-    metadata: Option<&serde_json::Map<String, Value>>,
-    default_enabled: bool,
-) -> bool {
+fn resolve_full_llm_capture_enabled(capture: Option<bool>, default_enabled: bool) -> bool {
+    capture.unwrap_or(default_enabled)
+}
+
+fn session_capture_override(metadata: Option<&serde_json::Map<String, Value>>) -> Option<bool> {
     metadata
         .and_then(|metadata| metadata.get(FULL_LLM_CAPTURE_METADATA_KEY))
         .and_then(Value::as_bool)
-        .unwrap_or(default_enabled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -608,9 +612,12 @@ mod tests {
             json!("true"),
         )]);
 
-        assert!(resolve_full_llm_capture_enabled(Some(&enabled), false));
-        assert!(!resolve_full_llm_capture_enabled(Some(&disabled), true));
-        assert!(!resolve_full_llm_capture_enabled(Some(&wrong_type), false));
+        assert_eq!(session_capture_override(Some(&enabled)), Some(true));
+        assert_eq!(session_capture_override(Some(&disabled)), Some(false));
+        assert_eq!(session_capture_override(Some(&wrong_type)), None);
+        assert_eq!(session_capture_override(None), None);
+        assert!(resolve_full_llm_capture_enabled(Some(true), false));
+        assert!(!resolve_full_llm_capture_enabled(Some(false), true));
         assert!(!resolve_full_llm_capture_enabled(None, false));
         assert!(resolve_full_llm_capture_enabled(None, true));
     }

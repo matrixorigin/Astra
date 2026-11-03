@@ -4383,6 +4383,7 @@ mod tests {
             admission: None,
             prepared: None,
             rejection: None,
+            full_llm_capture: None,
         };
         assert!(matches!(
             service

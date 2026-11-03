@@ -923,7 +923,7 @@ fn authority(lifetime: RuntimeAuthorityLifetime) -> Value {
 }
 
 #[test]
-fn active_authority_protects_the_entire_suffix_in_every_policy() {
+fn active_authority_survives_current_turn_compaction_in_every_policy() {
     for engine in [
         CompactionEngine::default_pipeline_for(64_000),
         CompactionEngine::aggressive_pipeline(),
@@ -932,28 +932,57 @@ fn active_authority_protects_the_entire_suffix_in_every_policy() {
         let mut messages = conversation(4, 1, 300);
         let suffix_start = messages.len();
         messages.push(json!({"role":"user", "content":"current constrained human request"}));
-        messages.push(authority(RuntimeAuthorityLifetime::CurrentUserTurn));
+        let active = authority(RuntimeAuthorityLifetime::CurrentUserTurn);
+        messages.push(active.clone());
         for index in 0..8 {
             let id = format!("active-{index}");
             messages.push(assistant_calls(&[&id]));
             messages.push(json!({"role":"tool", "tool_call_id":id,
                 "content":format!("current evidence {index} {}", "large ".repeat(2000)), "_timestamp":1, "_round_index":0}));
         }
-        let suffix = messages[suffix_start..].to_vec();
+        let partial = json!({"role":"assistant", "content":"unfinished response"});
+        let mut retry = json!({"role":"user", "content":render_append_only_runtime_authority_frame(
+            "output_cap_continuation", RuntimeAuthorityLifetime::NextAssistantDecision,
+            "Continue the unfinished response."
+        ).unwrap()});
+        mark_append_only_required_context(
+            &mut retry,
+            "output_cap_continuation",
+            RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        messages.extend([partial.clone(), retry.clone()]);
+        let human = messages[suffix_start].clone();
+        let suffix_bytes = serde_json::to_vec(&messages[suffix_start..]).unwrap().len();
         let outcome = engine.compress_if_needed(&mut messages, &budget(1, 1_000_000));
         assert!(
             outcome.total_tokens_freed > 0,
             "older unprotected history remains compressible"
         );
+        assert!(!outcome.budget_satisfied);
         let anchor = messages
             .iter()
-            .position(|message| message == &suffix[0])
+            .position(|message| message == &human)
             .expect("human authority anchor");
-        assert_eq!(
-            &messages[anchor..],
-            suffix.as_slice(),
-            "active suffix must remain byte-for-byte ordered despite age and pressure"
+        let active_index = messages
+            .iter()
+            .position(|message| message == &active)
+            .expect("active authority");
+        assert!(
+            anchor < active_index,
+            "authority must follow its human anchor"
         );
+        let partial_index = messages
+            .iter()
+            .position(|message| message == &partial)
+            .unwrap();
+        assert!(active_index < partial_index);
+        assert_eq!(&messages[partial_index..], &[partial, retry]);
+        assert!(
+            serde_json::to_vec(&messages[anchor..]).unwrap().len() < suffix_bytes,
+            "completed tool rounds in the current turn must be compactable"
+        );
+        // An impossible budget may leave no optional tool evidence, but it
+        // cannot leave a half-pair or drop the control and its dependency.
         assert_tool_pairs_closed(&messages);
     }
 }

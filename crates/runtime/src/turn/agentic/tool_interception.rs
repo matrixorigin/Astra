@@ -3088,6 +3088,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_carrier_name_preserves_recovery_reason_without_inferring_a_target() {
+        let args = json!({"arguments":{"query":"evidence"}});
+        let call = json!({"id":"missing-target","type":"function","function":{
+            "name":"invoke_tool","arguments":args.to_string()
+        }});
+        let selection = [DeferredToolActivation {
+            name: "web_fetch".into(),
+            schema_digest: "sha256:current".into(),
+            descriptor: None,
+        }];
+        let result = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(std::slice::from_ref(&call), Some("tool_calls")),
+            &selection,
+            |_| panic!("missing target must fail before schema lookup"),
+        );
+        assert!(
+            result.admitted.is_empty(),
+            "even one selected tool cannot supply a missing target name"
+        );
+        assert_eq!(result.rejected.len(), 1);
+        let feedback: Value = serde_json::from_str(&result.rejected[0].result).unwrap();
+        assert_eq!(feedback["error_kind"], "deferred_tool_activation_invalid");
+        assert_eq!(feedback["retryable"], true);
+        assert_eq!(
+            feedback["error"],
+            "invoke_tool requires a nonempty string name identifying the target tool",
+            "the model must receive the parser's actionable reason"
+        );
+
+        let mut state = make_state();
+        let turn_result = provider_host_turn_result(&[call]);
+        let prepared = prepare_intercepted_tool_round(
+            &mut state,
+            &turn_result,
+            &result.admitted,
+            &[],
+            result.rejected,
+        )
+        .await;
+        assert_eq!(prepared.physical_tool_calls.len(), 1);
+        assert_eq!(prepared.pre_resolved_results.len(), 1);
+        assert_eq!(prepared.pre_resolved_results[0].call_id, "missing-target");
+        assert_eq!(
+            serde_json::from_str::<Value>(&prepared.pre_resolved_results[0].content).unwrap(),
+            feedback,
+            "the same rejection must reach the model as the paired tool result"
+        );
+        assert_eq!(state.stall.tool_call_records.len(), 1);
+        assert_eq!(
+            state.stall.tool_call_records[0].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        );
+    }
+
+    #[tokio::test]
     async fn failed_parallel_skill_never_enters_trusted_invocation_ledger() {
         struct FailingParallelResolver;
 

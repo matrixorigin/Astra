@@ -26,6 +26,12 @@ fn preserves_contract(
         && baseline.execution_placement == candidate.execution_placement
         && baseline.access_kind == candidate.access_kind
         && baseline.provider == candidate.provider
+        && baseline
+            .inference_protocol
+            .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&baseline.provider))
+            == candidate.inference_protocol.unwrap_or_else(|| {
+                astra_core::model_wire::llm_provider_protocol(&candidate.provider)
+            })
         && baseline.thinking_capability == candidate.thinking_capability
         && baseline.thinking_protocol == candidate.thinking_protocol
         && baseline.supported_reasoning_efforts == candidate.supported_reasoning_efforts

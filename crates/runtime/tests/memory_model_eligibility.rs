@@ -211,7 +211,7 @@ async fn check_memory_owner(
             invocation_scope: &control_scope,
             messages: &messages,
             max_output_tokens: 128,
-            temperature: 0.0,
+            preferred_temperature: 0.0,
             deadline: Duration::from_secs(5),
         };
         let response = client.complete(request).await.unwrap();

@@ -27,6 +27,7 @@ struct Grant {
     plan: bool,
 }
 pub struct ProviderState {
+    pub allow_test_api_key: AtomicBool,
     base: Mutex<String>,
     key: EncodingKey,
     jwks: Value,
@@ -76,6 +77,7 @@ impl ProviderFixture {
         let jwks = json!({"keys":[{"kty":"RSA","kid":"fixture-key","alg":"RS256","use":"sig",
             "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())}]});
         let state = Arc::new(ProviderState {
+            allow_test_api_key: AtomicBool::new(false),
             base: Mutex::new(String::new()),
             key: EncodingKey::from_rsa_der(der.as_bytes()),
             jwks,
@@ -281,6 +283,11 @@ async fn tokens(
     )
 }
 fn permitted(state: &ProviderState, headers: &HeaderMap) -> bool {
+    if state.allow_test_api_key.load(Ordering::SeqCst)
+        && headers.get("authorization").and_then(|value| value.to_str().ok()) == Some("Bearer fixture-api-key")
+    {
+        return true;
+    }
     headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())

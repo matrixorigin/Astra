@@ -299,6 +299,8 @@ mod tests {
         fn new(provider: &str, api_key: &str) -> Self {
             Self {
                 admitted: AdmittedModelExecution {
+                    inference_protocol: None,
+                    response_scope: None,
                     subscription: None,
                     admitted_at: std::time::Instant::now(),
                     price_snapshot: None,

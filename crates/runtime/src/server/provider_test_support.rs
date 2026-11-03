@@ -168,6 +168,7 @@ impl ProviderGateway {
         };
         let app = Router::new()
             .route("/v1/chat/completions", post(provider_handler))
+            .route("/v1/responses", post(provider_handler))
             .route("/v1/messages", post(provider_handler))
             .route("/v1/systemone", post(provider_handler))
             .route("/model/{model}/converse", post(provider_handler))
@@ -695,6 +696,9 @@ pub fn admitted_execution(
     let offering = astra_services::ResolvedModelOffering {
         offering_id: format!("fixture-{provider}"),
         model: astra_services::ResolvedActiveLlmModel {
+            inference_protocol: None,
+            response_scope_key: None,
+            supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: model.into(),
             wire_model_name: None,

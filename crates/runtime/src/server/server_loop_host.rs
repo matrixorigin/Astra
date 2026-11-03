@@ -1228,6 +1228,13 @@ fn apply_pre_turn_summary(
     let tokens_before = candidate.tokens_before;
     let messages_removed = candidate.messages_removed;
     let rewrite_permit = state.begin_canonical_rewrite();
+    state.last_request_message_count = state.last_request_message_count.map(|prefix| {
+        if prefix == 0 {
+            0
+        } else {
+            prefix.saturating_sub(spill_count).saturating_add(1)
+        }
+    });
     state.messages = candidate.messages;
     state.finish_canonical_rewrite(rewrite_permit);
     state.compact_tier_applied = CompactionTier::CompactHistory;
@@ -1603,7 +1610,22 @@ fn provider_retry_assistant(result: &LlmCallResult) -> Value {
             Value::String(result.reasoning_signature.clone()),
         );
     }
+    if let Some(continuation) = &result.provider_continuation {
+        object.insert(
+            astra_core::model_wire::responses::CONTINUATION_KEY.to_string(),
+            continuation.clone(),
+        );
+    }
     assistant
+}
+
+fn provider_retry_has_replayable_response(result: &LlmCallResult) -> bool {
+    !result.full_text.is_empty()
+        || result
+            .provider_continuation
+            .as_ref()
+            .and_then(|continuation| continuation["items"].as_array())
+            .is_some_and(|items| !items.is_empty())
 }
 
 fn output_cap_action_first_context() -> Option<Value> {
@@ -1962,6 +1984,8 @@ fn record_full_llm_response_event(
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    response_scope: Option<String>,
     subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     model_name: String,
     /// Upstream literal name to put in the request body's `model` field.
@@ -1991,8 +2015,28 @@ struct ResolvedTurnLlmConfig {
 }
 
 impl ResolvedTurnLlmConfig {
+    fn responses_budget_scope(&self) -> Option<(&str, &str)> {
+        let protocol = self
+            .inference_protocol
+            .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&self.provider));
+        if protocol != astra_core::model_wire::LlmProviderProtocol::OpenAiResponses {
+            return None;
+        }
+        let scope = self
+            .subscription
+            .as_ref()
+            .map(|credential| credential.connection_id())
+            .or(self.response_scope.as_deref())?;
+        Some((
+            scope,
+            self.wire_model_name.as_deref().unwrap_or(&self.model_name),
+        ))
+    }
+
     fn execution_route(&self) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            inference_protocol: self.inference_protocol,
+            response_scope: self.response_scope.clone(),
             subscription: self.subscription.clone(),
             model_name: self.model_name.clone(),
             wire_model_name: self.wire_model_name.clone(),
@@ -3222,6 +3266,8 @@ fn resolve_llm_model_for_turn(
         return Err("model override does not match the Offering admitted for this run".to_string());
     }
     Ok(ResolvedTurnLlmConfig {
+        inference_protocol: execution.inference_protocol,
+        response_scope: execution.response_scope.clone(),
         subscription: execution.subscription.clone(),
         model_name: execution.model_name.clone(),
         wire_model_name: execution.wire_model_name.clone(),
@@ -5308,14 +5354,246 @@ fn split_canonical_and_provider_budget_messages(
     canonical_messages: Vec<Value>,
     provider: &str,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
 ) -> (Vec<Value>, Vec<Value>) {
     let provider_budget_messages =
-        crate::turn::llm::client::consolidate_system_messages_for_provider(
+        crate::turn::llm::client::consolidate_system_messages_for_protocol(
             &canonical_messages,
             provider,
             cache_capability,
+            protocol.unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(provider)),
         );
     (canonical_messages, provider_budget_messages)
+}
+
+/// A physical retry can append a response and a runtime instruction after the
+/// first request was measured. Reuse the final-wire compactor on that actual
+/// request, without changing canonical history or publishing a partial retry.
+fn fit_physical_retry_wire_budget(
+    messages: &mut Vec<Value>,
+    tools: &[Value],
+    config: &ResolvedTurnLlmConfig,
+    requested_output_tokens: usize,
+    state: &AgenticLoopState,
+) -> Result<
+    (
+        crate::turn::wire_assembly::WireBudgetStatus,
+        usize,
+        Option<crate::turn::cloud::compaction::CompactBoundary>,
+    ),
+    astra_core::ClassifiedError,
+> {
+    let measure = |messages: &[Value]| {
+        let provider_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
+            messages,
+            &config.provider,
+            config.cache_capability,
+            config
+                .inference_protocol
+                .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&config.provider)),
+        );
+        crate::turn::wire_assembly::wire_budget_status_with_metadata(
+            &provider_messages,
+            tools,
+            &config.model_name,
+            config.context_window,
+            config.max_completion_tokens,
+            requested_output_tokens,
+            config.responses_budget_scope(),
+        )
+    };
+    let initial = measure(messages);
+    if !initial.hard_limit_exceeded() {
+        return Ok((initial, requested_output_tokens, None));
+    }
+
+    let skills: Vec<_> = state
+        .skills
+        .execution
+        .invoked
+        .values()
+        .map(|skill| crate::turn::wire_assembly::InvokedSkillRef {
+            name: &skill.name,
+            content: &skill.content,
+        })
+        .collect();
+    let retained_skills = if skills.is_empty() {
+        HashSet::new()
+    } else {
+        crate::turn::wire_assembly::retained_invoked_skills(messages, messages, &skills)
+    };
+    // A retry does not run normal assembly again. Keep any complete skill
+    // instructions already delivered as tool results; their call/result pairs
+    // are retained by the shared compactor's dependency closure.
+    let mut latest_skill_results: HashMap<String, (usize, String)> = HashMap::new();
+    for (id, (index, call)) in
+        astra_turn_core::compression_types::unique_tool_observations(messages)
+    {
+        if !crate::turn::skill_tool::is_skill_activation_call(call) {
+            continue;
+        }
+        let Some(name) = crate::turn::skill_tool::extract_skill_name(call) else {
+            continue;
+        };
+        let Some(skill) = state.skills.execution.invoked.get(&name) else {
+            continue;
+        };
+        if !skill.content.is_empty()
+            && astra_turn_core::prompt_facing::extract_text_content(&messages[index])
+                .is_some_and(|text| text.starts_with(&skill.content))
+        {
+            let latest = latest_skill_results
+                .entry(name)
+                .or_insert((index, id.to_owned()));
+            if index > latest.0 {
+                *latest = (index, id.to_owned());
+            }
+        }
+    }
+    let skill_results: HashSet<String> = latest_skill_results
+        .into_values()
+        .map(|(_, id)| id)
+        .collect();
+    let turn_start = messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)
+        .unwrap_or(0);
+    let work = messages[turn_start..]
+        .iter()
+        .rev()
+        .find(|message| {
+            crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
+                == Some("active_work_attempt_start")
+        })
+        .and_then(|message| message["content"].as_str())
+        .map(str::to_owned);
+    let protect = |history: &[Value]| {
+        let mut selected: Vec<bool> = history
+            .iter()
+            .map(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"]
+                        .as_str()
+                        .is_some_and(|id| skill_results.contains(id))
+            })
+            .collect();
+        if let Some(content) = work.as_deref()
+            && let Some(index) = history.iter().rposition(|message| {
+                crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
+                    == Some("active_work_attempt_start")
+                    && message["content"].as_str() == Some(content)
+            })
+        {
+            selected[index] = true;
+        }
+        selected
+    };
+    let last_assistant = messages
+        .iter()
+        .rfind(|message| message["role"] == "assistant")
+        .cloned();
+    let mut candidate = messages.clone();
+    let mut best = None;
+    let mut boundary = None;
+    for pass in 0..3 {
+        let status = if pass == 0 {
+            initial
+        } else {
+            measure(&candidate)
+        };
+        let available = status
+            .model_limit
+            .saturating_sub(status.estimated_input_tokens)
+            .saturating_sub(status.reserved_protocol_tokens);
+        let output = requested_output_tokens.min(available);
+        if !status.hard_limit_exceeded() {
+            *messages = candidate;
+            return Ok((status, output, boundary));
+        }
+        if output > 0
+            && best
+                .as_ref()
+                .is_none_or(|(_, _, previous, _)| output > *previous)
+        {
+            best = Some((
+                candidate.clone(),
+                status.with_requested_output_tokens(output),
+                output,
+                boundary.clone(),
+            ));
+        }
+        if pass == 2 {
+            break;
+        }
+        // Re-homed controls are already validated system projections. Their
+        // append-only provenance describes the canonical source, not the
+        // current wire shape; normalize only this disposable candidate.
+        for message in &mut candidate {
+            if message["role"] == "system"
+                && message[crate::turn::wire_assembly::RUNTIME_SYSTEM_CONTEXT_MARKER] == true
+                && astra_turn_types::runtime_message_delivery(message)
+                    == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            {
+                astra_turn_types::mark_runtime_owned_message(
+                    message,
+                    astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+                );
+            }
+        }
+        // The compactor works in serialized characters while the provider
+        // budget is estimated in tokens. Feed a measured remaining deficit
+        // back into the second pass instead of assuming a fixed ratio.
+        let compaction_status = if pass == 0 {
+            status
+        } else {
+            let deficit = status
+                .estimated_input_tokens
+                .saturating_add(requested_output_tokens)
+                .saturating_add(status.reserved_protocol_tokens)
+                .saturating_sub(status.model_limit);
+            status.with_requested_output_tokens(requested_output_tokens.saturating_add(deficit))
+        };
+        let compacted = crate::turn::wire_assembly::compact_history_for_wire_budget(
+            &mut candidate,
+            compaction_status,
+            &[],
+            Some(&protect),
+        );
+        let retained_work = work.as_ref().is_none_or(|content| {
+            candidate.iter().any(|message| {
+                crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
+                    == Some("active_work_attempt_start")
+                    && message["content"].as_str() == Some(content)
+            })
+        });
+        if compacted.is_none()
+            || candidate
+                .iter()
+                .rfind(|message| message["role"] == "assistant")
+                != last_assistant.as_ref()
+            || !retained_work
+            || (!retained_skills.is_empty()
+                && !retained_skills.is_subset(
+                    &crate::turn::wire_assembly::retained_invoked_skills(
+                        &candidate, &candidate, &skills,
+                    ),
+                ))
+        {
+            break;
+        }
+        crate::turn::cloud::compaction::accumulate_compaction_boundary(
+            &mut boundary,
+            compacted.expect("a successful compaction has a boundary"),
+        );
+    }
+    if let Some((compacted, status, output, boundary)) = best {
+        *messages = compacted;
+        return Ok((status, output, boundary));
+    }
+    Err(astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::ContextWindow,
+        "The request is too large for the selected model's context window.",
+    ))
 }
 
 fn explain_analyze_token_usage(
@@ -17559,9 +17837,9 @@ impl ServerAgenticLoopHost {
         result
     }
 
-    /// Assemble the final provider wire once, then perform at most one pure
-    /// history recomposition if the complete payload (including late runtime
-    /// context and tool schemas) exceeds the hard input budget.  Runtime
+    /// Assemble the final provider wire and perform bounded pure history
+    /// recomposition if the complete payload (including late runtime context
+    /// and tool schemas) exceeds the hard input budget. Runtime
     /// authority is leased once and committed only for the selected final
     /// projection, so a retry cannot duplicate or consume volatile context.
     fn assemble_llm_messages_with_final_budget(
@@ -17588,7 +17866,12 @@ impl ServerAgenticLoopHost {
         let mut assembly = None;
         let mut selected_output_tokens = requested_output_tokens;
         let mut final_wire_compaction_boundary = None;
-        for pass in 0..2 {
+        let mut fallback: Option<(
+            crate::turn::wire_assembly::LlmMessageAssembly,
+            usize,
+            Option<crate::turn::cloud::compaction::CompactBoundary>,
+        )> = None;
+        for pass in 0..3 {
             let candidate = crate::turn::llm::context::assemble_wire_messages_with_drained(
                 &mut crate::turn::llm::context::LlmWireAssemblyInput {
                     artifact_recovery_route: self.artifact_recovery_route(
@@ -17612,10 +17895,13 @@ impl ServerAgenticLoopHost {
             .inspect_err(|_| {
                 state.restore_volatile_attempt_lease();
             })?;
-            let wire_messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
+            let wire_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
                 &candidate.messages,
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
+                llm_cfg.inference_protocol.unwrap_or_else(|| {
+                    astra_core::model_wire::llm_provider_protocol(&llm_cfg.provider)
+                }),
             );
             let candidate_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
                 &wire_messages,
@@ -17624,29 +17910,44 @@ impl ServerAgenticLoopHost {
                 llm_cfg.context_window,
                 llm_cfg.max_completion_tokens,
                 requested_output_tokens,
+                llm_cfg.responses_budget_scope(),
             );
             let available_output_tokens = candidate_status
                 .model_limit
                 .saturating_sub(candidate_status.estimated_input_tokens)
                 .saturating_sub(candidate_status.reserved_protocol_tokens);
-            if !candidate_status.hard_limit_exceeded() || available_output_tokens > 0 {
+            if !candidate_status.hard_limit_exceeded() {
                 // Keep the typed candidate for the caller.  The consolidated
                 // clone above is budget-only; returning it would strip the
                 // runtime provenance that cache-identity projection needs.
                 assembly = Some(candidate);
-                // Input is the user/runtime authority. If it consumes more
-                // than the nominal output reserve, tighten the request's
-                // output cap to the exact remaining budget instead of
-                // dropping the latest user turn or failing a valid request.
                 selected_output_tokens = requested_output_tokens.min(available_output_tokens);
                 break;
             }
-            if pass == 0
+            if pass < 2
                 && let Some(boundary) = crate::turn::wire_assembly::compact_history_for_wire_budget(
                     &mut history,
                     candidate_status,
+                    if matches!(
+                        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
+                            llm_cfg.cache_capability,
+                            &llm_cfg.provider,
+                        ).volatile_placement,
+                        astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                    ) {
+                        &candidate.new_append_only_runtime_messages
+                    } else {
+                        &[]
+                    },
+                    None,
                 )
             {
+                let fallback_output = requested_output_tokens.min(available_output_tokens);
+                if fallback_output > 0
+                    && fallback.as_ref().is_none_or(|(_, output, _)| fallback_output > *output)
+                {
+                    fallback = Some((candidate, fallback_output, final_wire_compaction_boundary.clone()));
+                }
                 // The emergency recomposition is a real compaction boundary,
                 // not just a byte trim. Rebuild the history-dependent runtime
                 // contract and continuation note before measuring the second
@@ -17660,13 +17961,32 @@ impl ServerAgenticLoopHost {
                     crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
                     active_work_context,
                 );
-                final_wire_compaction_boundary = Some(boundary);
+                crate::turn::cloud::compaction::accumulate_compaction_boundary(
+                    &mut final_wire_compaction_boundary,
+                    boundary,
+                );
                 continue;
+            }
+            let current_output = requested_output_tokens.min(available_output_tokens);
+            if current_output > 0
+                && fallback
+                    .as_ref()
+                    .is_none_or(|(_, output, _)| current_output >= *output)
+            {
+                assembly = Some(candidate);
+                selected_output_tokens = current_output;
+                break;
+            }
+            if let Some((previous, output, boundary)) = fallback.take() {
+                assembly = Some(previous);
+                selected_output_tokens = output;
+                final_wire_compaction_boundary = boundary;
+                break;
             }
             state.restore_volatile_attempt_lease();
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContextWindow,
-                "final provider wire exceeds the model input budget after bounded history compaction",
+                "The request is too large for the selected model's context window.",
             )
             .with_details_json(
                 serde_json::json!({
@@ -20293,39 +20613,31 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 llm_messages,
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
+                llm_cfg.inference_protocol,
             );
-        let final_wire_budget_status =
-            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-                crate::turn::llm::context::augment_manifest_trace_with_wire_detail_from_identity(
-                    trace,
-                    &provider_budget_messages,
-                    &final_tools,
-                    &canonical_llm_messages,
-                    if self.full_llm_capture {
-                        crate::turn::llm::context::WireTraceDetail::Debug
-                    } else {
-                        crate::turn::llm::context::WireTraceDetail::MetricsOnly
-                    },
-                );
-                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
-                    trace,
-                    &provider_budget_messages,
-                    &final_tools,
-                    &llm_cfg.model_name,
-                    llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
-                    max_output_tokens,
-                )
-            } else {
-                crate::turn::wire_assembly::wire_budget_status_with_metadata(
-                    &provider_budget_messages,
-                    &final_tools,
-                    &llm_cfg.model_name,
-                    llm_cfg.context_window,
-                    llm_cfg.max_completion_tokens,
-                    max_output_tokens,
-                )
-            };
+        let final_wire_budget_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
+            &provider_budget_messages,
+            &final_tools,
+            &llm_cfg.model_name,
+            llm_cfg.context_window,
+            llm_cfg.max_completion_tokens,
+            max_output_tokens,
+            llm_cfg.responses_budget_scope(),
+        );
+        if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+            crate::turn::llm::context::augment_manifest_trace_with_wire_detail_from_identity(
+                trace,
+                &provider_budget_messages,
+                &final_tools,
+                &canonical_llm_messages,
+                if self.full_llm_capture {
+                    crate::turn::llm::context::WireTraceDetail::Debug
+                } else {
+                    crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                },
+            );
+            crate::turn::wire_assembly::set_manifest_wire_budget(trace, final_wire_budget_status);
+        }
         if let Some(node_id) = context_assembly_node_id.as_deref() {
             self.finish_explain_analyze_context_assembly(
                 node_id,
@@ -20430,7 +20742,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .model_limit
             .saturating_sub(final_wire_budget_status.estimated_input_tokens)
             .saturating_sub(final_wire_budget_status.reserved_protocol_tokens);
-        let output_cap_retry_limit = output_cap_retry_limit(
+        let mut output_cap_retry_limit = output_cap_retry_limit(
             max_output_tokens,
             requested_output_limit.or(llm_cfg.max_completion_tokens),
             context_output_limit,
@@ -20527,20 +20839,75 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
             }
             let attempt_label = llm_main_attempt_label(attempt_in_round);
-            // Admission and dispatch must consume the same already-assembled
-            // projection.  Runtime authority (including the immutable
-            // execution deadline) was added before the final wire budget was
-            // measured; projecting it again here would create a second,
-            // unbudgeted request shape.
-            let attempt_wire_budget_status =
-                final_wire_budget_status.with_requested_output_tokens(effective_max_output);
+            // Retry transitions can add a partial response and control after
+            // initial assembly. Budget the exact physical request again before
+            // admission, without draining or rebuilding volatile context.
+            let attempt_wire_budget_status = if attempt_in_round == 0 {
+                final_wire_budget_status.with_requested_output_tokens(effective_max_output)
+            } else {
+                let budget = fit_physical_retry_wire_budget(
+                    &mut llm_messages, &final_tools, &llm_cfg, effective_max_output, state,
+                ).and_then(|(status, output, boundary)| {
+                    primary_thinking.validate_output_budget(output as u64).map_err(|message| {
+                        astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, message)
+                    })?;
+                    Ok((status, output, boundary))
+                });
+                let (status, output, retry_compaction) = match budget {
+                    Ok(budget) => budget,
+                    Err(error) => {
+                        self.complete_request_preparation_phase_with_context(
+                            state, request_attempt_started_at, attempt_in_round,
+                            &mut request_preparation_recorded_attempts, TurnPhaseOutcome::Failed, None,
+                        );
+                        return Err(error);
+                    }
+                };
+                effective_max_output = output;
+                output_cap_retry_limit = output_cap_retry_limit.min(
+                    status.model_limit.saturating_sub(status.estimated_input_tokens)
+                        .saturating_sub(status.reserved_protocol_tokens),
+                );
+                let projected = crate::turn::llm::client::consolidate_system_messages_for_protocol(
+                    &llm_messages, &llm_cfg.provider, llm_cfg.cache_capability,
+                    llm_cfg.inference_protocol.unwrap_or_else(|| {
+                        astra_core::model_wire::llm_provider_protocol(&llm_cfg.provider)
+                    }),
+                );
+                if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+                    let initial_compaction = trace.pointer("/wire/final_history_compaction").cloned();
+                    let mut retries = trace.pointer("/wire/retry_history_compactions")
+                        .and_then(Value::as_array).cloned().unwrap_or_default();
+                    crate::turn::llm::context::augment_manifest_trace_with_wire_detail_from_identity(
+                        trace, &projected, &final_tools, &llm_messages,
+                        if self.full_llm_capture {
+                            crate::turn::llm::context::WireTraceDetail::Debug
+                        } else {
+                            crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                        },
+                    );
+                    crate::turn::wire_assembly::set_manifest_wire_budget(trace, status);
+                    if let Some(initial_compaction) = initial_compaction {
+                        trace["wire"]["final_history_compaction"] = initial_compaction;
+                    }
+                    if let Some(boundary) = retry_compaction {
+                        retries.push(json!({"attempt":attempt_in_round, "boundary":boundary}));
+                    }
+                    if !retries.is_empty() {
+                        trace["wire"]["retry_history_compactions"] = Value::Array(retries);
+                    }
+                }
+                if let Some(pipeline_session) = state.pipeline_session.as_mut() {
+                    pipeline_session.replace_pending_planned_wire_prompt_with_cache_capability(
+                        &projected, &final_tools, llm_cfg.cache_capability,
+                    );
+                }
+                status
+            };
             let attempt_context_metrics =
                 explain_analyze_context_budget(attempt_wire_budget_status, final_tools.len());
-            let admission_estimated_tokens = crate::prompts::estimate_wire_input_tokens(
-                &llm_messages,
-                state.pinned_tool_schema_tokens as usize,
-            )
-            .saturating_add(effective_max_output);
+            let admission_estimated_tokens = attempt_wire_budget_status
+                .estimated_input_tokens.saturating_add(effective_max_output);
             match crate::llm_provider_admission::admit_llm_provider_request(
                 self.shared_pool.as_ref(),
                 &llm_cfg.provider,
@@ -21359,6 +21726,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &r.tool_calls,
                 canonical_work_establishment_retries,
             ) {
+                if !provider_retry_has_replayable_response(&r) {
+                    let error = reject_provider_completion_without_delivery(&r)
+                        .expect_err("a retry without replayable output has no delivery");
+                    self.emit_progress_event(logical_request_usage_event(
+                        physical_attempt_usage, &r, qualified_attempt_usage,
+                    ));
+                    return Err(attach_transport_success_usage(
+                        error, &r, physical_attempt_usage_reported.then_some(physical_attempt_usage),
+                        qualified_attempt_usage,
+                    ));
+                }
                 canonical_work_establishment_retries += 1;
                 state
                     .hooks
@@ -21435,6 +21813,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
             if r.lifecycle_finish_reason() == Some("length")
                 && r.tool_calls.is_empty()
+                && provider_retry_has_replayable_response(&r)
                 && output_cap_continuations < MAX_OUTPUT_CAP_CONTINUATIONS
             {
                 output_cap_partial_text = r.full_text.clone();
@@ -24209,6 +24588,483 @@ mod tests {
             "the rebuilt candidate must carry one bounded skill recovery attachment"
         );
         assert!(message_text(skill_attachments[0]).contains("review instructions"));
+    }
+
+    #[test]
+    fn final_wire_compacts_long_active_turn_without_losing_required_context() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        use astra_turn_core::cache_placement::{CacheProtocol, VolatileDeliveryPolicy};
+        let mut capability = append_only_test_cache_capability();
+        capability.protocol = CacheProtocol::StrictHistoryMatch;
+        capability.volatile_delivery = VolatileDeliveryPolicy::All;
+        let mut host = test_host_builder("u-long-active-turn", "s-long-active-turn").build();
+        let mut state = create_test_state();
+        state.message = "Complete the task".into();
+        let work = required_append_only_runtime_authority_message(
+            "Keep the Work contract",
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        state.messages = vec![
+            json!({"role":"user", "content":state.message}),
+            work.clone(),
+        ];
+        for index in 0..12 {
+            let id = format!("call-{index}");
+            state
+                .messages
+                .push(json!({"role":"assistant", "content":null, "tool_calls":[{
+                    "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+                }]}));
+            state.messages.push(
+                json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(1200)}),
+            );
+        }
+        let mut llm_cfg = summary_test_config(String::new());
+        llm_cfg.cache_capability = Some(capability);
+        llm_cfg.context_window = Some(4_000);
+        llm_cfg.max_completion_tokens = Some(256);
+
+        let (wire, output_tokens, boundary) = host
+            .assemble_llm_messages_with_final_budget(
+                vec![json!({"role":"system", "content":"stable"})],
+                Vec::new(),
+                state.messages.clone(),
+                &mut state,
+                &llm_cfg,
+                &PromptCacheConfig::default(),
+                &[],
+                256,
+            )
+            .expect("a long active turn should compact before provider dispatch");
+
+        assert!(boundary.is_some());
+        assert!(output_tokens > 0);
+        assert!(wire.contains(&work));
+        assert!(wire.iter().any(|message| {
+            astra_turn_types::runtime_authority_kind(message) == Some("runtime_context_snapshot")
+        }));
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| {
+                    astra_turn_types::runtime_authority_kind(message)
+                        == Some("runtime_context_snapshot")
+                })
+                .count(),
+            1
+        );
+        astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
+    }
+
+    #[test]
+    fn final_wire_replaces_large_superseded_snapshot_under_pressure() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+            runtime_system_context_message,
+        };
+        use astra_turn_core::cache_placement::{CacheProtocol, VolatileDeliveryPolicy};
+
+        let mut capability = append_only_test_cache_capability();
+        capability.protocol = CacheProtocol::StrictHistoryMatch;
+        capability.volatile_delivery = VolatileDeliveryPolicy::All;
+        let mut host = test_host_builder("u-snapshot-budget", "s-snapshot-budget").build();
+        let mut state = create_test_state();
+        state.message = "Complete the task".into();
+        let old_snapshot = required_append_only_runtime_authority_message(
+            &format!("old snapshot {}", "x".repeat(10_000)),
+            RuntimeAuthorityKind::RuntimeContextSnapshot,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        state.messages = vec![
+            json!({"role":"user", "content":state.message}),
+            old_snapshot.clone(),
+        ];
+        let selected_context = format!("new snapshot {}", "y".repeat(10_000));
+        let mut llm_cfg = summary_test_config(String::new());
+        llm_cfg.cache_capability = Some(capability);
+        llm_cfg.context_window = Some(4_000);
+        llm_cfg.max_completion_tokens = Some(256);
+
+        let (wire, output_tokens, boundary) = host
+            .assemble_llm_messages_with_final_budget(
+                vec![json!({"role":"system", "content":"stable"})],
+                vec![runtime_system_context_message(&selected_context, false).unwrap()],
+                state.messages.clone(),
+                &mut state,
+                &llm_cfg,
+                &PromptCacheConfig::default(),
+                &[],
+                256,
+            )
+            .expect("a superseded snapshot should not exhaust the request budget");
+
+        assert!(boundary.is_some());
+        assert!(output_tokens > 0);
+        assert!(!wire.contains(&old_snapshot));
+        assert!(
+            wire.iter()
+                .any(|message| message_text(message).contains(&selected_context))
+        );
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|message| {
+                    astra_turn_types::runtime_authority_kind(message)
+                        == Some("runtime_context_snapshot")
+                })
+                .count(),
+            2,
+            "the selected snapshot is committed once; the superseded frame remains canonical"
+        );
+    }
+
+    #[test]
+    fn final_wire_budget_failure_does_not_commit_staged_snapshot() {
+        use crate::turn::wire_assembly::runtime_system_context_message;
+        use astra_turn_core::cache_placement::{CacheProtocol, VolatileDeliveryPolicy};
+
+        let mut capability = append_only_test_cache_capability();
+        capability.protocol = CacheProtocol::StrictHistoryMatch;
+        capability.volatile_delivery = VolatileDeliveryPolicy::All;
+        let mut host = test_host_builder("u-snapshot-failure", "s-snapshot-failure").build();
+        let mut state = create_test_state();
+        state.message = "Complete the task".into();
+        state.messages = vec![json!({"role":"user", "content":state.message})];
+        let original = state.messages.clone();
+        let mut llm_cfg = summary_test_config(String::new());
+        llm_cfg.cache_capability = Some(capability);
+        llm_cfg.context_window = Some(4_000);
+        llm_cfg.max_completion_tokens = Some(256);
+
+        let error = host
+            .assemble_llm_messages_with_final_budget(
+                vec![json!({"role":"system", "content":"stable"})],
+                vec![runtime_system_context_message(&"too large ".repeat(10_000), false).unwrap()],
+                state.messages.clone(),
+                &mut state,
+                &llm_cfg,
+                &PromptCacheConfig::default(),
+                &[],
+                256,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(state.messages, original);
+    }
+
+    #[test]
+    fn final_wire_recovers_output_reserve_before_tightening_it() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+            runtime_system_context_message,
+        };
+        use astra_turn_core::cache_placement::{CacheProtocol, VolatileDeliveryPolicy};
+        let mut capability = append_only_test_cache_capability();
+        capability.protocol = CacheProtocol::StrictHistoryMatch;
+        capability.volatile_delivery = VolatileDeliveryPolicy::All;
+        let mut host = test_host_builder("u-output-reserve", "s-output-reserve").build();
+        let mut state = create_test_state();
+        state.message = "Complete the task".into();
+        let old = required_append_only_runtime_authority_message(
+            &format!("old {}", "x".repeat(7_000)),
+            RuntimeAuthorityKind::RuntimeContextSnapshot,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        state.messages = vec![json!({"role":"user", "content":state.message}), old.clone()];
+        let mut cfg = summary_test_config(String::new());
+        cfg.cache_capability = Some(capability);
+        cfg.context_window = Some(5_000);
+        cfg.max_completion_tokens = Some(2_000);
+        let (wire, output, boundary) = host
+            .assemble_llm_messages_with_final_budget(
+                vec![json!({"role":"system", "content":"stable"})],
+                vec![
+                    runtime_system_context_message(&format!("new {}", "y".repeat(7_000)), false)
+                        .unwrap(),
+                ],
+                state.messages.clone(),
+                &mut state,
+                &cfg,
+                &PromptCacheConfig::default(),
+                &[],
+                2_000,
+            )
+            .unwrap();
+        assert!(boundary.is_some());
+        assert!(!wire.contains(&old));
+        assert_eq!(output, 2_000);
+
+        let mut state = create_test_state();
+        state.message = "u".repeat(14_000);
+        state.messages = vec![json!({"role":"user", "content":state.message})];
+        let (wire, output, boundary) = host
+            .assemble_llm_messages_with_final_budget(
+                vec![json!({"role":"system", "content":"stable"})],
+                Vec::new(),
+                state.messages.clone(),
+                &mut state,
+                &cfg,
+                &PromptCacheConfig::default(),
+                &[],
+                2_000,
+            )
+            .unwrap();
+        assert!(boundary.is_none());
+        assert!(output > 0 && output < 2_000);
+        assert!(
+            wire.iter()
+                .any(|message| message["content"] == state.message)
+        );
+    }
+
+    #[test]
+    fn physical_retry_remeasures_and_compacts_its_actual_wire() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, rehome_append_only_runtime_authority,
+            required_append_only_runtime_authority_message,
+        };
+        use astra_turn_core::cache_placement::VolatilePlacement;
+        for placement in [
+            VolatilePlacement::AppendOnlyUserTail,
+            VolatilePlacement::TailSuffix,
+        ] {
+            for kind in [
+                RuntimeAuthorityKind::OutputCapContinuation,
+                RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+            ] {
+                let mut capability = append_only_test_cache_capability();
+                capability.volatile_placement = placement;
+                let mut cfg = summary_test_config(String::new());
+                cfg.cache_capability = Some(capability);
+                cfg.context_window = Some(4_000);
+                cfg.max_completion_tokens = Some(256);
+                let required = required_append_only_runtime_authority_message(
+                    "required contract",
+                    RuntimeAuthorityKind::ActiveWorkAttemptStart,
+                    astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+                )
+                .unwrap()
+                .unwrap();
+                let mut messages = vec![
+                    json!({"role":"system", "content":"stable"}),
+                    json!({"role":"user", "content":"goal"}),
+                ];
+                if placement == VolatilePlacement::AppendOnlyUserTail {
+                    messages.push(required);
+                } else {
+                    let mut source = vec![json!({"role":"user", "content":"goal"}), required];
+                    messages.extend(rehome_append_only_runtime_authority(&mut source).unwrap());
+                }
+                for index in 0..10 {
+                    let id = format!("call-{index}");
+                    messages.push(json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}));
+                    messages.push(json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(800)}));
+                }
+                let assistant = json!({"role":"assistant", "content":"partial response"});
+                messages.push(assistant.clone());
+                let (mut wire, _) = ServerAgenticLoopHost::project_required_runtime_authority(
+                    &messages,
+                    &messages,
+                    "retry control",
+                    kind,
+                    astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                    "openai",
+                    capability,
+                )
+                .unwrap();
+                let original_len = wire.len();
+                let (status, output, boundary) =
+                    fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
+                        .unwrap();
+                assert!(!status.hard_limit_exceeded());
+                assert_eq!(
+                    output,
+                    256,
+                    "{placement:?} {kind:?}, status={status:?}, wire length={}",
+                    wire.len()
+                );
+                let boundary = boundary.expect("retry compaction boundary");
+                assert_eq!(boundary.messages_before, original_len);
+                assert_eq!(boundary.messages_after, wire.len());
+                assert!(wire.len() < original_len);
+                assert_eq!(
+                    wire.iter().rfind(|message| message["role"] == "assistant"),
+                    Some(&assistant)
+                );
+                let text = serde_json::to_string(&wire).unwrap();
+                assert!(text.contains("required contract") && text.contains("retry control"));
+                astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
+            }
+        }
+
+        let mut cfg = summary_test_config(String::new());
+        cfg.context_window = Some(4_000);
+        let mut wire = vec![
+            json!({"role":"user", "content":"too much ".repeat(10_000)}),
+            json!({"role":"assistant", "content":"partial"}),
+        ];
+        let original = wire.clone();
+        let error = fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(wire, original);
+    }
+
+    #[test]
+    fn physical_retry_releases_repeated_expired_work_frames() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        let mut cfg = summary_test_config(String::new());
+        cfg.cache_capability = Some(append_only_test_cache_capability());
+        cfg.context_window = Some(4_000);
+        let work = required_append_only_runtime_authority_message(
+            &"Work details ".repeat(100),
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        let mut messages = vec![json!({"role":"user", "content":"goal"})];
+        for index in 0..100 {
+            let id = format!("call-{index}");
+            messages.push(work.clone());
+            messages.push(json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}));
+            messages.push(json!({"role":"tool", "tool_call_id":id, "content":"evidence"}));
+        }
+        messages.push(json!({"role":"assistant", "content":"partial"}));
+        let (mut wire, _) = ServerAgenticLoopHost::project_required_runtime_authority(
+            &messages,
+            &messages,
+            "continue",
+            RuntimeAuthorityKind::OutputCapContinuation,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            "openai",
+            append_only_test_cache_capability(),
+        )
+        .unwrap();
+        let (status, output, boundary) =
+            fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
+                .unwrap();
+        assert!(!status.hard_limit_exceeded());
+        assert_eq!(output, 256);
+        assert!(boundary.is_some());
+        assert_eq!(wire.iter().filter(|message| **message == work).count(), 1);
+        astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
+    }
+
+    #[test]
+    fn physical_retry_never_discards_work_or_invoked_skill_evidence() {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, required_append_only_runtime_authority_message,
+        };
+        let mut cfg = summary_test_config(String::new());
+        cfg.cache_capability = Some(append_only_test_cache_capability());
+        cfg.context_window = Some(4_000);
+        let mut state = create_test_state();
+        let instructions = "review instructions ".repeat(100);
+        state.skills.execution.invoked.insert(
+            "review".into(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "review".into(),
+                content: instructions.clone(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+                execution_topology: None,
+            },
+        );
+        let work = required_append_only_runtime_authority_message(
+            "full Work contract",
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        let mut wire = vec![
+            json!({"role":"user", "content":"goal"}),
+            work.clone(),
+            json!({"role":"assistant", "tool_calls":[{"id":"skill", "type":"function", "function":{"name":"skill", "arguments":"{\"skill_name\":\"review\"}"}}]}),
+            json!({"role":"tool", "tool_call_id":"skill", "content":instructions}),
+        ];
+        for index in 0..10 {
+            let id = format!("call-{index}");
+            wire.push(json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}));
+            wire.push(json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(800)}));
+        }
+        wire.push(json!({"role":"assistant", "content":"partial"}));
+        let (wire, _) = ServerAgenticLoopHost::project_required_runtime_authority(
+            &wire,
+            &wire,
+            "continue",
+            RuntimeAuthorityKind::OutputCapContinuation,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            "openai",
+            append_only_test_cache_capability(),
+        )
+        .unwrap();
+        for preserve_work in [true, false] {
+            let mut candidate = wire.clone();
+            if !preserve_work {
+                candidate.retain(|message| message != &work);
+            }
+            let original = candidate.clone();
+            let (status, output, boundary) =
+                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state).unwrap();
+            assert!(!status.hard_limit_exceeded());
+            assert_eq!(output, 256);
+            assert!(boundary.is_some());
+            assert!(candidate.len() < original.len());
+            assert_eq!(candidate.contains(&work), preserve_work);
+            assert!(candidate.iter().any(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "skill"
+                    && message["content"] == instructions
+            }));
+            astra_turn_types::validate_canonical_tool_pairing(&candidate).unwrap();
+        }
+
+        // If the required Work contract itself cannot fit, report the limit
+        // without sending a truncated contract or mutating the retry history.
+        let huge_work = required_append_only_runtime_authority_message(
+            &"required work ".repeat(3_000),
+            RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        let mut oversized = vec![
+            json!({"role":"user", "content":"goal"}),
+            huge_work,
+            json!({"role":"assistant", "content":"partial"}),
+        ];
+        let (projected, _) = ServerAgenticLoopHost::project_required_runtime_authority(
+            &oversized,
+            &oversized,
+            "continue",
+            RuntimeAuthorityKind::OutputCapContinuation,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            "openai",
+            append_only_test_cache_capability(),
+        )
+        .unwrap();
+        oversized = projected;
+        let original = oversized.clone();
+        let error =
+            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state).unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(oversized, original);
     }
 
     #[tokio::test(start_paused = true)]
@@ -28861,6 +29717,8 @@ mod tests {
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
+            inference_protocol: None,
+            response_scope: None,
             subscription: None,
             model_name: "gpt-4o-mini".to_string(),
             wire_model_name: None,
@@ -35866,6 +36724,55 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_replays_completed_responses_reasoning_without_fabricating_empty_output() {
+        use crate::turn::wire_assembly::RuntimeAuthorityKind;
+        let result = LlmCallResult {
+            reasoning: "provider reasoning".into(),
+            provider_continuation: Some(json!({
+                "connection_id":"connection", "model":"model", "items":[{
+                    "type":"reasoning", "id":"rs-1", "summary":[], "encrypted_content":"opaque"
+                }]
+            })),
+            ..Default::default()
+        };
+        assert!(provider_retry_has_replayable_response(&result));
+        let assistant = provider_retry_assistant(&result);
+        for kind in [
+            RuntimeAuthorityKind::OutputCapContinuation,
+            RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+        ] {
+            let messages = vec![json!({"role":"user", "content":"goal"}), assistant.clone()];
+            let (wire, _) = ServerAgenticLoopHost::project_required_runtime_authority(
+                &messages,
+                &messages,
+                "retry control",
+                kind,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                "openai",
+                append_only_test_cache_capability(),
+            )
+            .unwrap();
+            let request = astra_core::model_wire::responses::request(
+                "model",
+                &wire,
+                None,
+                "connection",
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(request["input"].as_array().unwrap().iter().any(|item| {
+                item["type"] == "reasoning" && item["encrypted_content"] == "opaque"
+            }));
+        }
+        assert!(!provider_retry_has_replayable_response(&LlmCallResult {
+            reasoning: "incomplete reasoning only".into(),
+            finish_reason: Some("length".into()),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
     fn non_append_retry_uses_required_system_wire_without_append_canonical_frame() {
         let messages = vec![
             json!({"role":"user", "content":"finish the task"}),
@@ -38013,6 +38920,63 @@ mod tests {
         .expect("pre-turn compaction must remain committable");
         assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
         assert!(!packs.is_empty());
+    }
+
+    #[test]
+    fn pre_turn_summary_rebases_sent_prefix_before_microcompaction() {
+        let mut state = create_test_state();
+        state.max_turn_input_tokens = 20_000;
+        for index in 0..4 {
+            state.messages.push(
+                json!({"role":"user", "content":format!("old {index} {}", "context ".repeat(100))}),
+            );
+            state
+                .messages
+                .push(json!({"role":"assistant", "content":"old answer"}));
+        }
+        state
+            .messages
+            .push(json!({"role":"user", "content":"current task"}));
+        let pair = |id: String| {
+            [
+                json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}),
+                json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(200)}),
+            ]
+        };
+        state.messages.extend(pair("sent".into()));
+        state.last_request_message_count = Some(state.messages.len());
+        for index in 0..8 {
+            state.messages.extend(pair(format!("new-{index}")));
+        }
+        let old_prefix = state.last_request_message_count.unwrap();
+        let spill = pre_turn_summary_spill_count(&state.messages);
+        assert!(spill > 0 && spill < old_prefix);
+        apply_pre_turn_summary(&mut state, 0.9, "summary".into(), spill).unwrap();
+        assert_eq!(
+            state.last_request_message_count,
+            Some(old_prefix - spill + 1)
+        );
+
+        let stats = astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence_protected_prefix(
+            &mut state.messages, 0.0, state.compact_strategy, None, state.last_request_message_count,
+        );
+        assert!(stats.results_compacted >= 2);
+        let sent = state
+            .messages
+            .iter()
+            .find(|message| message["tool_call_id"] == "sent")
+            .unwrap();
+        assert!(!astra_turn_core::microcompact::is_cleared_content(
+            sent["content"].as_str().unwrap()
+        ));
+        let first_new = state
+            .messages
+            .iter()
+            .find(|message| message["tool_call_id"] == "new-0")
+            .unwrap();
+        assert!(astra_turn_core::microcompact::is_cleared_content(
+            first_new["content"].as_str().unwrap()
+        ));
     }
 
     #[test]
@@ -42411,7 +43375,9 @@ mod tests {
 
         state.max_turns = state.agentic_turn_budget.initial_turns;
         let old_limit = state.max_turns;
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(old_limit);
         state.remaining_turns = 0;
+        state.charged_iterations = u64::try_from(old_limit).unwrap();
         let prepared =
             crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 2)
                 .await
@@ -42426,7 +43392,7 @@ mod tests {
         );
         assert_eq!(
             state.max_turns, old_limit,
-            "rejected repetition cannot renew execution indefinitely"
+            "rejected repetition cannot extend an explicit execution limit"
         );
     }
 
@@ -45283,6 +46249,163 @@ mod tests {
             "unaccepted provider prose must not leak before the Work lifecycle exists: {emitted:?}"
         );
         inference_ledger.assert_quiescent();
+        provider.assert_complete();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn responses_reasoning_only_work_retry_is_dispatched_and_restorable_after_failure() {
+        use astra_services::models::{
+            PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
+            PromptCacheVolatileDeliveryData, PromptCacheVolatilePlacementData,
+        };
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let session_id = "session-responses-work-retry";
+        let scope = format!("sha256:{}", "a".repeat(64));
+        let ciphertext = "opaque-ciphertext-".repeat(3_000);
+        let reasoning =
+            json!({"type":"reasoning", "id":"rs-1", "summary":[], "encrypted_content":ciphertext});
+        let events = [
+            json!({"type":"response.output_item.done", "output_index":0, "item":reasoning}),
+            json!({"type":"response.completed", "response":{
+                "id":"resp-1", "status":"completed", "model":"gpt-5-mini", "output":[],
+                "usage":{"input_tokens":8, "output_tokens":4}
+            }}),
+        ];
+        let chunks = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "responses work retry followed by provider error",
+            |request| request.path == "/v1/responses",
+            vec![
+                ProviderResponse::Stream {
+                    content_type: "text/event-stream",
+                    chunks,
+                    release_before_chunk: None,
+                },
+                ProviderResponse::Json {
+                    status: axum::http::StatusCode::BAD_REQUEST,
+                    body: json!({"error":{"code":"unsupported_parameter"}}),
+                },
+            ],
+        )])
+        .await;
+        let mut execution = test_gateway_execution("unused", Some(3_000));
+        execution.inference_protocol =
+            Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses);
+        execution.response_scope = Some(scope.clone());
+        execution.thinking_protocol =
+            Some(astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning);
+        execution.context_window = Some(24_000);
+        execution.max_completion_tokens = Some(1_024);
+        execution.base_url = format!("{}/v1", provider.base_url);
+        execution.completions_url_override = None;
+        execution.api_key = "fixture-key".into();
+        execution.cache_capability = Some(PromptCacheCapabilityData {
+            protocol: PromptCacheProtocolData::OpenAiAutoPrefix,
+            volatile_placement: PromptCacheVolatilePlacementData::AppendOnlyUserTail,
+            volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
+            reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
+        });
+        let observations =
+            crate::server::provider_test_support::ProviderObservationsFixture::default();
+        let mut host = test_host_builder("user-responses-work-retry", session_id.to_string())
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, false,
+            ))
+            .with_provider_observations(observations.clone())
+            .with_admitted_model_execution(Some(execution))
+            .build();
+        let mut state = create_durable_execution_test_state(session_id);
+        state.message = "complete several independently verifiable outcomes".into();
+        state.user_intent = state.message.clone();
+        state.thinking = ThinkingConfig::ModelDefault;
+        state.messages = vec![json!({"role":"user", "content":"earlier goal"})];
+        for index in 0..10 {
+            let id = format!("earlier-{index}");
+            state
+                .messages
+                .push(json!({"role":"assistant", "tool_calls":[{
+                    "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+                }]}));
+            state.messages.push(json!({"role":"tool", "tool_call_id":id,
+                "content":"previous evidence ".repeat(200)}));
+        }
+        state
+            .messages
+            .push(json!({"role":"user", "content":state.message}));
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+        let error = match host.execute_turn(&mut state).await {
+            Ok(_) => panic!("the scripted provider fails the retry"),
+            Err(error) => error,
+        };
+        let requests = provider.requests.lock().await.clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "unexpected pre-dispatch error: {error:?}"
+        );
+        let trace = state
+            .last_llm_context_manifest_trace
+            .as_ref()
+            .expect("request trace");
+        assert!(trace.pointer("/wire/budget").is_some());
+        assert!(
+            trace
+                .pointer("/wire/retry_history_compactions")
+                .and_then(Value::as_array)
+                .is_some_and(|boundaries| !boundaries.is_empty()),
+            "the actual retry must exercise pressure compaction"
+        );
+        assert!(
+            requests[1].body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["type"] == "reasoning" && item["encrypted_content"] == ciphertext
+                })
+        );
+        assert!(
+            requests[1]
+                .body
+                .to_string()
+                .contains("canonical_work_establishment_retry")
+        );
+
+        let committed =
+            astra_turn_core::prompt_facing::sanitize_canonical_turn_delta_with_turn_semantics(
+                state.messages.clone(),
+                false,
+            )
+            .unwrap();
+        let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+            committed,
+        ).unwrap();
+        assert!(restored.iter().any(|message| {
+            message["role"] == "assistant"
+                && message
+                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                    .is_some()
+        }));
+        let replay = astra_core::model_wire::responses::request(
+            "gpt-5-mini",
+            &restored,
+            None,
+            &scope,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(replay["input"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "reasoning" && item["encrypted_content"] == ciphertext
+        }));
+        observations.assert_quiescent();
         provider.assert_complete();
     }
 
@@ -49193,10 +50316,31 @@ mod tests {
         assert!(resolved.request_timeout.is_none());
     }
 
+    #[test]
+    fn admitted_responses_protocol_reaches_turn_and_auxiliary_route() {
+        let mut offering = admitted_test_offering();
+        offering.model.inference_protocol =
+            Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses);
+        offering.model.response_scope_key =
+            Some(astra_services::models::ResponseScopeKey::for_model(
+                &astra_services::FernetTokenEncryptor::new("test-scope-secret").unwrap(),
+                "catalog-model",
+            ));
+        let execution = astra_services::AdmittedModelExecution::from_offering(offering).unwrap();
+        let turn = resolve_llm_model_for_turn(None, Some(&execution)).unwrap();
+        let route = turn.execution_route();
+        assert_eq!(route.inference_protocol, execution.inference_protocol);
+        assert_eq!(route.response_scope, execution.response_scope);
+        assert!(route.response_scope.unwrap().starts_with("sha256:"));
+    }
+
     pub(super) fn admitted_test_offering() -> astra_services::ResolvedModelOffering {
         astra_services::ResolvedModelOffering {
             offering_id: "offer-primary".to_string(),
             model: astra_services::ResolvedActiveLlmModel {
+                inference_protocol: None,
+                response_scope_key: None,
+                supported_reasoning_efforts: None,
                 price_snapshot: None,
                 model_name: "catalog-model".to_string(),
                 wire_model_name: Some("upstream-model".to_string()),
@@ -51807,6 +52951,8 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new(
             OwnedLlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 model_name: "gpt-4o-mini".to_string(),
                 wire_model_name: None,

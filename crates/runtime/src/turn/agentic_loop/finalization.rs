@@ -2966,16 +2966,8 @@ mod tests {
         );
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // E2E: progressive warning penalty drains budget
-    // Verifies that consecutive warnings from TurnGuard reduce remaining_turns
-    // progressively (2, 4, 6, ...) so spinning loops terminate faster.
-    // ═══════════════════════════════════════════════════════════════════════
-
     #[tokio::test]
-    async fn progressive_warning_penalty_limits_loop_duration() {
-        // Simulate 20 tool rounds — without progressive penalty this would
-        // run all 20. With it, the loop should terminate earlier.
+    async fn cache_hit_advice_does_not_terminate_authorized_tool_work() {
         let mut results = Vec::new();
         for _ in 0..20 {
             results.push(edge_tool_result(
@@ -2985,12 +2977,14 @@ mod tests {
                 Some(10),
             ));
         }
-        // Final text in case loop completes normally
         results.push(text_result("Done", 100, 50, Some(10)));
 
         let mut host = MockHost::new(results).with_valid_tools(&["read_file"]);
         let mut state = make_state();
-        state.max_turns = 50; // generous budget
+        state.agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(4, None);
+        state.max_turns = 4;
+        state.remaining_turns = 4;
 
         // Pre-seed cache hits to trigger warnings from the start
         for _ in 0..4 {
@@ -2999,21 +2993,14 @@ mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        // The loop should have terminated before using all 20 tool rounds.
-        // Use llm_rounds_completed directly — it is the authoritative count
-        // of attempted LLM calls (incremented once per execute_turn call,
-        // not influenced by render/tool-message bookkeeping). Combining
-        // render counts + tool-message counts is an indirect metric that
-        // can pass accidentally; `llm_rounds_completed` is what the
-        // progressive-penalty machinery is supposed to bound.
-        let llm_rounds = state.llm_rounds_completed;
-
-        // We don't assert exact count (depends on penalty math), but it
-        // must be significantly less than 20.
         assert!(
-            llm_rounds < 18,
-            "progressive penalty should limit loop to fewer LLM rounds, got llm_rounds={llm_rounds}. outcome={outcome:?}"
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
         );
+        assert_eq!(state.llm_rounds_completed, 21);
+        assert_eq!(state.stall.tool_call_records.len(), 20);
+        assert_eq!(state.final_text, "Done");
+        assert!(state.interruption.is_none(), "{:?}", state.interruption);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

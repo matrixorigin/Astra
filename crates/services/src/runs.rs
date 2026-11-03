@@ -5541,6 +5541,7 @@ pub struct RunMutationAdmission {
     opening_hash: Option<String>,
     context_admission_hash: Option<String>,
     operation: RunMutationOperation,
+    session_capture_override: Option<Option<bool>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5560,11 +5561,18 @@ impl RunMutationAdmission {
             opening_hash: run.opening_hash.clone(),
             context_admission_hash: run.context_admission_hash.clone(),
             operation,
+            session_capture_override: None,
         }
     }
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The outer option proves a Session was read under the opening fence;
+    /// the inner option is its explicit capture override, if any.
+    pub fn session_capture_override(&self) -> Option<Option<bool>> {
+        self.session_capture_override
     }
 
     /// Only a freshly claimed terminal can skip raw-history membership reads.
@@ -14724,7 +14732,7 @@ impl DatabaseRunStateStore {
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
         let independent = run_requires_independent_admission(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
-        let admitted = if independent {
+        let session_capture_override = if independent {
             crate::storage::admit_independent_run_creation(
                 &mut tx,
                 &record.session_id,
@@ -14739,7 +14747,7 @@ impl DatabaseRunStateStore {
                 &record.user_id,
             )
             .await
-            .map(|()| true)
+            .map(|()| Some(None))
         }
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
@@ -14748,9 +14756,8 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
-        if !admitted {
-            return Err(RunAdmissionError::SessionBusy);
-        }
+        let session_capture_override =
+            session_capture_override.ok_or(RunAdmissionError::SessionBusy)?;
         let provider_owner = record
             .opening
             .loaded()?
@@ -14818,12 +14825,13 @@ impl DatabaseRunStateStore {
         // handles duplicate identities and exact replay after rollback; a
         // preceding existence read repeats that work and cannot prove absence.
         if let Some(participant) = participant.as_mut() {
+            let mut admission =
+                RunMutationAdmission::from_record(&record, RunMutationOperation::Opening);
+            if independent {
+                admission.session_capture_override = Some(session_capture_override);
+            }
             participant
-                .stage(
-                    &mut tx,
-                    &RunMutationAdmission::from_record(&record, RunMutationOperation::Opening),
-                    record.opening.loaded_mut()?,
-                )
+                .stage(&mut tx, &admission, record.opening.loaded_mut()?)
                 .await
                 .map_err(RunAdmissionError::Persistence)?;
         }
@@ -41809,6 +41817,8 @@ mod tests {
             requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                inference_protocol: None,
+                response_scope: None,
                 subscription: None,
                 admitted_at: std::time::Instant::now(),
                 price_snapshot: None,

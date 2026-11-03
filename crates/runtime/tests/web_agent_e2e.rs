@@ -519,6 +519,9 @@ impl ModelService for TestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                inference_protocol: None,
+                response_scope_key: None,
+                supported_reasoning_efforts: None,
                 model_name,
                 wire_model_name: None,
                 api_key: "test-provider-secret".to_string(),
@@ -6111,6 +6114,16 @@ mod subscription_isolated_database;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn api_key_responses_agent_continues_persisted_session() {
+    responses_agent_uses_catalog_and_continues_persisted_session(true).await;
+}
+
+async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: bool) {
     use astra_services::chatgpt::ChatgptConfig;
     use astra_services::{DatabaseModelService, DatabaseSessionService};
     init_env();
@@ -6187,27 +6200,65 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
     }
     let (base, lifecycle) = make_app();
     let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
-    let authorization = post(
-        &app,
-        "/me/model-connections/chatgpt/authorizations",
-        json!({"redirect_uri":"http://127.0.0.1:14555/auth/callback","label":"public-agent-test"}),
-    )
-    .await;
-    let code = provider.issue_code(
-        &authorization,
-        &format!("public-{}", uuid::Uuid::new_v4()),
-        true,
-    );
-    let linked = post(
-        &app,
-        &format!(
-            "/me/model-connections/chatgpt/authorizations/{}/complete",
-            authorization["authorization_id"].as_str().unwrap()
-        ),
-        json!({"state":authorization["state"],"code":code,"client_id":"oaiapp_fixture"}),
-    )
-    .await;
-    let model=post(&app,"/me/models",json!({"name":format!("public-{}",uuid::Uuid::new_v4()),"provider":"chatgpt","model":"fixture-model","connection_id":linked["connection"]["connection_id"],"context_window":128000,"is_default":false})).await;
+    let model = if api_key {
+        provider
+            .state
+            .allow_test_api_key
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let service =
+            DatabaseModelService::new(settings.clone(), key.clone()).with_pool(pool.clone());
+        let model = service
+            .create_model(
+                USER_ID.to_string(),
+                ModelCreateRequestData {
+                    name: format!("api-responses-{}", uuid::Uuid::new_v4()),
+                    provider: "openai".into(),
+                    api_key: "fixture-api-key".into(),
+                    base_url: Some(format!("{}/v1", provider.base)),
+                    description: None,
+                    context_window: Some(128000),
+                    max_completion_tokens: None,
+                    input_modalities: vec!["text".into()],
+                    output_modalities: vec!["text".into()],
+                    supported_parameters: vec![],
+                    pricing: None,
+                    architecture: None,
+                    tags: vec![],
+                    quirks: Some(astra_services::models::QuirksData {
+                        inference_protocol: Some(
+                            astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                        ),
+                        supported_reasoning_efforts: Some(vec!["high".into(), "max".into()]),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        json!({"model_id":model.model_id})
+    } else {
+        let authorization = post(
+            &app,
+            "/me/model-connections/chatgpt/authorizations",
+            json!({"redirect_uri":"http://127.0.0.1:14555/auth/callback","label":"public-agent-test"}),
+        )
+        .await;
+        let code = provider.issue_code(
+            &authorization,
+            &format!("public-{}", uuid::Uuid::new_v4()),
+            true,
+        );
+        let linked = post(
+            &app,
+            &format!(
+                "/me/model-connections/chatgpt/authorizations/{}/complete",
+                authorization["authorization_id"].as_str().unwrap()
+            ),
+            json!({"state":authorization["state"],"code":code,"client_id":"oaiapp_fixture"}),
+        )
+        .await;
+        post(&app,"/me/models",json!({"name":format!("public-{}",uuid::Uuid::new_v4()),"provider":"chatgpt","model":"fixture-model","connection_id":linked["connection"]["connection_id"],"context_window":128000,"is_default":false})).await
+    };
     let session = post(
         &app,
         "/sessions",
@@ -6215,6 +6266,49 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
     )
     .await;
     let session_id = session["session_id"].as_str().unwrap();
+    if api_key {
+        let completion = json!({"operation":"memory_extraction","session_id":session_id,"turn":1,"round":0,"logical_attempt":0,
+            "model_selection":{"offering_id":model["model_id"]},"messages":[{"role":"user","content":"Reply OK"}]});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(completion.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let response_body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            status.is_success(),
+            "omitted temperature: {status}: {}",
+            String::from_utf8_lossy(&response_body)
+        );
+        let mut explicit = completion;
+        explicit["logical_attempt"] = json!(1);
+        explicit["temperature"] = json!(0.0);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(explicit.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
     drop(app);
     let (base, lifecycle) = make_app();
     *provider.state.script.lock().unwrap() = vec![
@@ -6233,7 +6327,13 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let lifecycle = Arc::new(lifecycle);
     let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
-    let payload = |message: &str| json!({"message":message,"session_id":session_id,"model_selection":{"offering_id":model["model_id"]},"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
+    let payload = |message: &str| {
+        let mut value = json!({"message":message,"session_id":session_id,"model_selection":{"offering_id":model["model_id"]},"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
+        if api_key {
+            value["context"] = json!({"thinking":{"mode":"adaptive","effort":"max"}});
+        }
+        value
+    };
     let first = chat_stream_collect(
         &app,
         payload("subscription-public-first: List the models I can use."),
@@ -6248,6 +6348,17 @@ async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session
         "the agent did not execute its scripted tool rounds"
     );
     let requests = provider.state.requests.lock().unwrap().clone();
+    if api_key {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["reasoning"]["effort"] == "max"
+                    && request["tools"]
+                        .as_array()
+                        .is_some_and(|tools| !tools.is_empty())),
+            "max reasoning with tools was not dispatched"
+        );
+    }
     assert!(
         requests.iter().any(
             |request| request["input"].as_array().unwrap().iter().any(|item| {

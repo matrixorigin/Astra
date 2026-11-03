@@ -6874,8 +6874,8 @@ impl DynamicAgentSpawner {
             input.complexity.as_deref(),
             agent_def.max_turns,
         );
-        // Freeze the persona's allowance with the shared budget owner.
-        // The inherited absolute deadline also bounds the child lifetime.
+        // Persona sizing selects a slice through the shared budget owner.
+        // Any inherited absolute deadline still bounds the child lifetime.
         let turn_budget =
             astra_turn_core::chat_turn_heuristics::resolve_spawned_agentic_turn_budget(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),

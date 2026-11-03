@@ -61,11 +61,23 @@
 #     reuse_scope: conversation_turns
 # Required runtime instructions remain visible with typed authority/lifetimes;
 # optional volatile advisories are omitted. No model-name heuristic enables it.
+# For a deployment verified to reuse only complete prior requests (including
+# Responses), retain all context with the existing append-only layout:
+#   prompt_cache_capability:
+#     schema_version: 2
+#     protocol: strict_history_match
+#     volatile_placement: append_only_user_tail
+#     volatile_delivery: all
+#     reuse_scope: conversation_turns
+# Optional snapshots use canonical history, dedupe unchanged facts within a
+# human turn, and expire on supersession or a new human turn;
+# they are excluded from human speech, display, and memory extraction.
 # A prefix-caching OpenAI-compatible deployment verified to treat marked
 # runtime context after a human message as evidence may instead select
 # `volatile_placement: tail_after_user`. Keep `volatile_delivery: all` to
 # retain optional context. This can reuse a long human message on the next
 # turn; it changes message order and requires deployment-specific validation.
+# Tail replacement does not provide complete-history reuse on strict gateways.
 # Reload with: astra admin model load .models.yaml --update-existing
 #
 # Thinking/reasoning checks use maintained adapter defaults where available.
@@ -78,6 +90,13 @@
 # deployments can report effort_only: Low/Medium/High control depth, not Off.
 # A plain model selection preserves the provider default; no global Low override
 # is installed by this declaration. Do not copy it to unverified deployments.
+# For an API-key model verified to use Responses, configure its entry with:
+#   inference_protocol: openai_responses
+#   thinking_protocol: responses_reasoning # or omit it to use the Responses default
+#   supported_reasoning_efforts: [high, max] # only values verified for this model
+# Replace any existing thinking_protocol: reasoning_effort; it applies to Chat
+# Completions and conflicts with Responses. Without an effort declaration, only
+# a successfully probed level is selectable.
 # Other supported declarations are enable_thinking, thinking_object and moonshot;
 # binary controls require observable reasoning-on and reasoning-off behavior.
 #

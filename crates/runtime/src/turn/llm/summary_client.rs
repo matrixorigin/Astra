@@ -209,6 +209,13 @@ impl RuntimeSummaryClient {
                     SummaryTemperatureEmission::Explicit(value),
                     SummaryGenerationPolicyProvenance::OfferingCapability,
                 )
+            } else if route.inference_protocol
+                == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+            {
+                (
+                    SummaryTemperatureEmission::ProviderDefault,
+                    SummaryGenerationPolicyProvenance::ConservativeProtocolDefault,
+                )
             } else if protocol == astra_core::model_wire::thinking::ThinkingProtocol::Moonshot {
                 (
                     SummaryTemperatureEmission::ProviderDefault,
@@ -604,6 +611,8 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            inference_protocol: None,
+            response_scope: None,
             subscription: None,
             admitted_at: std::time::Instant::now(),
             price_snapshot: None,
@@ -632,6 +641,8 @@ mod tests {
 
     fn summary_route(execution: &astra_services::AdmittedModelExecution) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
             subscription: execution.subscription.clone(),
             model_name: execution.model_name.clone(),
             wire_model_name: None,
@@ -780,6 +791,8 @@ mod tests {
         thinking_capability: Option<astra_services::models::ThinkingCapability>,
     ) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            inference_protocol: None,
+            response_scope: None,
             subscription: None,
             model_name: "test-model".to_string(),
             wire_model_name: None,

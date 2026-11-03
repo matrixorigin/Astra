@@ -2381,6 +2381,9 @@ mod tests {
         )
         .await;
         let selector = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: format!("{server_url}/v1"),
@@ -3305,6 +3308,9 @@ mod tests {
         // empty. We degrade to the deterministic rule-fallback path and
         // persist a session-memory snapshot instead of skipping the whole run.
         let selector_params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: "https://nope.invalid".to_string(),
@@ -3387,6 +3393,9 @@ mod tests {
         )
         .await;
         let first = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: "https://nope.invalid".to_string(),
@@ -3400,6 +3409,9 @@ mod tests {
             request_timeout: None,
         };
         let second = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: format!("{failing_url}/v1"),
@@ -3660,6 +3672,9 @@ mod tests {
         // the test).
         let memoria = Arc::new(CapturingMemoria::default());
         let selector_params = DirectMemoryInferenceClient {
+            inference_protocol: None,
+            response_scope: None,
+            supported_reasoning_efforts: None,
             fixed_temperature: None,
             thinking_protocol: None,
             base_url: "https://nope.invalid".to_string(),

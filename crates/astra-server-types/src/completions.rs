@@ -78,8 +78,13 @@ pub struct CompletionRequest {
     pub messages: Vec<Value>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
-    #[serde(default = "default_temperature")]
-    pub temperature: f64,
+    /// An omitted temperature uses the selected provider's applicable default.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub temperature: Option<f64>,
     /// Provider execution deadline owned and enforced by the Server. Client
     /// transports may add a small settlement grace, but must not race a
     /// second semantic inference deadline against this value.
@@ -88,6 +93,10 @@ pub struct CompletionRequest {
 }
 
 impl CompletionRequest {
+    #[must_use]
+    pub fn temperature_or_default(&self) -> f64 {
+        self.temperature.unwrap_or(default_temperature())
+    }
     #[must_use]
     pub fn new(
         operation: CompletionOperation,
@@ -106,7 +115,7 @@ impl CompletionRequest {
             model_selection: None,
             messages,
             max_tokens: default_max_tokens(),
-            temperature: default_temperature(),
+            temperature: None,
             timeout_ms: default_timeout_ms(),
         }
     }
@@ -188,6 +197,12 @@ const fn default_temperature() -> f64 {
     0.1
 }
 
+fn deserialize_temperature<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
+    f64::deserialize(deserializer).map(Some)
+}
+
 const fn default_timeout_ms() -> u64 {
     120_000
 }
@@ -252,7 +267,17 @@ mod tests {
         .expect("typed completion request");
 
         assert_eq!(request.max_tokens, 512);
-        assert!((request.temperature - 0.1).abs() < f64::EPSILON);
+        assert_eq!(request.temperature, None);
+        assert!((request.temperature_or_default() - 0.1).abs() < f64::EPSILON);
+        let explicit: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "operation":"verification_judge", "session_id":"session-1", "turn":2, "round":1,
+            "logical_attempt":0, "messages":[{"role":"user","content":"verify"}], "temperature":0.0
+        }))
+        .unwrap();
+        assert_eq!(explicit.temperature, Some(0.0));
+        let mut invalid = serde_json::to_value(&explicit).unwrap();
+        invalid["temperature"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<CompletionRequest>(invalid).is_err());
         assert_eq!(request.timeout_ms, 120_000);
         assert!(request.model_selection.is_none());
         assert_eq!(

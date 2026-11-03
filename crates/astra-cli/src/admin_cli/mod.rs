@@ -1145,6 +1145,20 @@ mod tests {
     }
 
     #[test]
+    fn model_load_preserves_responses_protocol() {
+        let entry: serde_yaml_ng::Value = serde_yaml_ng::from_str("name: test\nprovider: openai\ncontext_window: 128000\ninference_protocol: openai_responses\n").unwrap();
+        let payload = build_model_create_payload(
+            &entry,
+            "test",
+            "openai",
+            "key",
+            Some("https://api.openai.com/v1"),
+        )
+        .unwrap();
+        assert_eq!(payload["quirks"]["inference_protocol"], "openai_responses");
+    }
+
+    #[test]
     fn model_price_import_never_invents_missing_rates_or_currency() {
         for fields in [
             "pricing_prompt: 0",

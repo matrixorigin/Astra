@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! run_agentic_loop_with_host(host, state)
-//!   while turn_index < current_turn_budget:
+//!   until completion, interruption or an explicit limit:
 //!     ── cancel check ──────────────── cooperative, via cancel_flag
 //!     host.execute_turn(&mut state) → HostTurnResult    ← host-specific
 //!     ingest_agentic_turn_stream(...)                    ← runtime
@@ -31,13 +31,13 @@
 //!
 //! Before calling [`run_agentic_loop_with_host`]:
 //! - `state.messages` must contain at least one user message
-//! - `state.max_turns` and `state.remaining_turns` must be > 0
+//! - The iteration boundary and cumulative charges must be consistent
 //! - `state.message` must match the current user query text
 //!
 //! # Host Contract (invariants during loop)
 //!
 //! The runtime guarantees:
-//! - `execute_turn` is called at most `max_turns` times
+//! - Internal slices renew without expanding an explicit hard limit
 //! - Cancel flag is checked cooperatively between turns (not mid-turn)
 //! - Stall detection runs after every turn with tool calls
 //! - Post-tool policy contributes structured advisory evidence to subsequent
@@ -4218,7 +4218,7 @@ impl AgenticLoopState {
     /// boundary. Generic slice-pacing guidance must remain silent there so it
     /// cannot imply execution authority that the active boundary does not
     /// grant.
-    pub(crate) fn suppress_execution_slice_guidance(&self) -> bool {
+    pub(crate) fn suppress_execution_limit_guidance(&self) -> bool {
         self.budget_wrapup_injected
             || self.hooks.completion_settlement.text_only
             || self.hooks.completion_settlement.work_settlement_only
@@ -4324,6 +4324,12 @@ impl AgenticLoopState {
         &mut self,
         permit: Option<crate::turn::canonical_commit::CanonicalRewritePermit>,
     ) {
+        // A shorter history cannot keep an index into its former length.
+        // Retaining the current prefix is conservative until the next request;
+        // messages appended after this rewrite remain eligible for compaction.
+        if let Some(prefix) = &mut self.last_request_message_count {
+            *prefix = (*prefix).min(self.messages.len());
+        }
         let Some(permit) = permit else {
             return;
         };
@@ -5253,9 +5259,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 "loop preamble has not completed",
             )
         })? as usize;
-        if turn_index >= state.max_turns && state.remaining_turns != 0 {
-            break;
-        }
         state.current_round_index = turn_index as u32;
         let TurnIterationPrep {
             quiet,
@@ -5512,9 +5515,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         state.loop_entry.advance()?;
     }
-    // Exhausting the slice settles at the shared loop exit, like explicit returns.
-
-    Ok(AgenticLoopOutcome::Completed)
 }
 
 // ─── CTX_ helpers ────────────────────────────────────────────────────────────
@@ -7089,8 +7089,10 @@ pub(crate) mod tests {
                 state.cancellation.resolved_origin =
                     Some(crate::orchestration::CancellationOrigin::User);
             } else {
-                state.max_turns = 0;
-                state.remaining_turns = 1;
+                state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(1);
+                state.max_turns = 1;
+                state.remaining_turns = 0;
+                state.charged_iterations = 1;
             }
             let outcome = run_agentic_loop_with_host(&mut host, &mut state)
                 .await
@@ -7790,6 +7792,60 @@ pub(crate) mod tests {
             TurnInteractionMode::NonInteractive,
         ] {
             assert!(interaction_scoped_tool_restrictions(mode).contains(ASK_USER_TOOL_NAME));
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_slices_allow_valid_tool_work_past_initial_rounds() {
+        use astra_turn_core::chat_turn_heuristics::{
+            AgenticTurnBudgetOverride, resolve_agentic_turn_budget,
+        };
+        for (initial, hard_limit, tool_rounds) in [(24, None, 60), (24, Some(40), 32), (1, None, 8)]
+        {
+            let turns = (0..tool_rounds)
+                .map(|index| {
+                    let mut tool = make_edge_tool_with_args(
+                        "read_file",
+                        json!({"path": format!("/workspace/source-{index}.rs")}),
+                        &format!("source {index}"),
+                    );
+                    tool.request_id = format!("read-{index}");
+                    edge_tool_result(vec![tool], 10, 2, None)
+                })
+                .chain(std::iter::once(text_result(
+                    "Investigation complete.",
+                    10,
+                    2,
+                    None,
+                )))
+                .collect();
+            let mut host = MockHost::new(turns).with_valid_tools(&["read_file"]);
+            let mut state = make_state();
+            state.agentic_turn_budget = resolve_agentic_turn_budget(
+                state.task_profile,
+                hard_limit.and_then(std::num::NonZeroUsize::new),
+                Some(AgenticTurnBudgetOverride {
+                    initial_turns: Some(initial),
+                    hard_turn_limit: None,
+                }),
+            );
+            state.max_turns = state.agentic_turn_budget.initial_turns;
+            state.remaining_turns = state.max_turns;
+
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+            assert!(
+                matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+                "{outcome:?}"
+            );
+            assert_eq!(host.turn_count(), tool_rounds + 1);
+            assert_eq!(state.stall.tool_call_records.len(), tool_rounds);
+            assert_eq!(state.final_text, "Investigation complete.");
+            assert!(state.interruption.is_none(), "{:?}", state.interruption);
+            assert!(host.text_only_turns.iter().all(|text_only| !text_only));
+            assert_eq!(state.charged_iterations, (tool_rounds + 1) as u64);
+            assert_eq!(state.max_turns - state.remaining_turns, tool_rounds + 1);
+            assert!(hard_limit.is_none_or(|limit| state.max_turns <= limit));
         }
     }
 
@@ -8726,33 +8782,26 @@ pub(crate) mod tests {
     // ── Boundary condition tests ────────────────────────────────────────────
 
     #[tokio::test]
-    async fn max_turns_zero_completes_immediately() {
+    async fn invalid_zero_boundary_fails_before_provider_admission() {
         let mut host = MockHost::new(vec![text_result("unreachable", 10, 5, None)]);
         let mut state = make_state();
         state.max_turns = 0;
         state.remaining_turns = 10;
 
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
+        let error = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
         assert_eq!(host.current_turn, 0); // No turns executed
-        assert!(state.final_text.is_empty());
         assert!(host.rendered_final_text.is_empty());
         assert_eq!(state.remaining_turns, 10); // Unchanged
-        // EmptyCompletion interruption recorded
-        let interruption = state
-            .interruption
-            .as_ref()
-            .expect("should record interruption");
-        assert_eq!(
-            interruption.kind,
-            astra_turn_core::interruption::InterruptionKind::EmptyCompletion
-        );
     }
 
     #[tokio::test]
     async fn max_turns_one_executes_exactly_once() {
         let mut host = MockHost::new(vec![text_result("single turn", 10, 5, Some(33))]);
         let mut state = make_state();
+        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(1);
         state.max_turns = 1;
         state.remaining_turns = 1;
 
@@ -10853,16 +10902,16 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn input_wait_continuation_preserves_pause_and_charges_only_the_resumed_round() {
+    async fn input_wait_restoration_crosses_soft_boundary_and_charges_only_the_resumed_round() {
         use std::sync::atomic::Ordering;
         let mut state = make_state();
         state.current_run_id = Some("parent-run".into());
-        state.current_round_index = 6;
-        state.max_turns = 10;
-        state.remaining_turns = 5;
-        state.charged_iterations = 3;
+        state.current_round_index = 23;
+        state.max_turns = 24;
+        state.remaining_turns = 0;
+        state.charged_iterations = 24;
         state.loop_entry = LoopEntry::IterationBoundary {
-            next_index: 6,
+            next_index: 24,
             harness_pause_recovery_count: 2,
         };
         state
@@ -10939,8 +10988,10 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(state.current_round_index, 7);
-        assert_eq!((state.charged_iterations, state.remaining_turns), (4, 4));
+        assert_eq!(state.current_round_index, 25);
+        assert_eq!((state.charged_iterations, state.remaining_turns), (25, 23));
+        assert!(host.cancelled_agent_ids.is_empty());
+        assert!(state.interruption.is_none(), "{:?}", state.interruption);
         assert_eq!(state.final_text, "done");
         #[cfg(feature = "harness")]
         {
@@ -14091,7 +14142,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state
             .messages
             .push(json!({"role": "user", "content": "go"}));
-        state.last_request_message_count = Some(state.messages.len());
+        // A prior canonical rewrite shortened a previously larger request.
+        // New tool results must not inherit its stale prefix boundary.
+        state.last_request_message_count = Some(101);
+        state.finish_canonical_rewrite(None);
+        assert_eq!(state.last_request_message_count, Some(state.messages.len()));
 
         for (i, name) in [
             "read_file",

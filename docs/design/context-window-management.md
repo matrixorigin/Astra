@@ -36,13 +36,19 @@ futile-compaction breaker and durable artifact-write-before-install ordering
 remain with their existing owners. Estimated savings include new boundary and
 metadata costs; they are not provider-reported token usage.
 
-Active runtime authority remains attached to its real human anchor and ordered
-current-turn suffix. Provider user-role tool-result envelopes do not start a new
-human turn or expire authority. Expired authority can be pruned. If required
-context alone exceeds the window, the result remains truthfully over budget;
-compaction cannot delete controls to manufacture progress. Tool-call identities,
+Active runtime authority and its real human anchor remain in their original
+order. Under pressure, older completed tool rounds within that same human turn
+may be compacted while active controls and their immediate dependencies remain
+intact. Provider user-role tool-result envelopes do not start a new human turn
+or expire authority; an expired control must not become active after its expiry
+witness is removed. Invalid or unanchored authority is retained conservatively.
+If required context alone exceeds the window, the result remains truthfully
+over budget; compaction cannot delete controls to manufacture progress. Tool-call identities,
 opaque extension fields, ordered non-text blocks and artifact recovery handles
 survive every mechanical path. A no-op cannot silently normalize these fields.
+Each physical provider retry is measured again after its response and retry
+control are appended. Request-local compaction preserves that pair; if required
+input alone cannot fit, the request fails without installing a partial rewrite.
 
 Typed duplicate-output dependencies survive canonical commit and continuation
 restore. The shared validator checks unique forward invocation identity and
