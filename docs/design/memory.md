@@ -261,10 +261,18 @@ and use its invocation carrier for operations such as forget or update.
 With UC built-in memory explicitly enabled, MOI HMAC and MOI edge-token
 principals resolve their IAM subject through the configured `moi` external
 provider callback using action `resolve_memory_identity`. The pinned service
-credential is required. Its response binds `external_subject`, `issuer` and
-`uc_subject`; the issuer must exactly equal the configured UC issuer. Every
-operation repeats identity resolution and the existing live UC account-status
-check. The existing UC built-in policy, bounded owner derivation and owner-scoped
+credential is required. Its response binds `external_subject`, `issuer`,
+`uc_subject` and a required `memory_access` decision (`none`, `read_only` or
+`read_write`); the issuer must exactly equal the configured UC issuer. An
+identity-only response or unknown access value is an authority error, never an
+implicit read/write grant. `none` denies access without contacting UC or Memoria;
+`read_only` preserves recall but denies observation and other writes through the
+existing canonical policy. MOI must obtain this decision from its memory
+authorization policy; an active identity or permission to chat is insufficient.
+This change does not establish an all-or-nothing MOI product policy. Each
+operation resolves identity/access anew; an allowed grant also requires the
+existing live UC account-status check. The existing UC built-in policy,
+bounded owner derivation and owner-scoped
 Memoria transport apply; a provider request signature is not itself the grant.
 This is account-scoped personal memory and grants no workspace resource access.
 The same UC account uses the same personal-memory owner across MOI workspaces
@@ -289,6 +297,20 @@ Compare its effective issuer with Astra's configured issuer byte for byte before
 deployment, including any trailing slash. A normal observer authority resolution
 performs one MOI identity request and one UC account-status request; fetching an
 uncached UC service token can add another request.
+The identity callback has a two-second request deadline, including response-body
+reads, and an 8 KiB response limit for both successful and error responses,
+including chunked bodies. External-provider clients are reused per configured
+endpoint, preserving target-specific proxy and no-redirect policies; service
+credentials are attached per request, and identity/access decisions are not
+cached. Other provider actions retain their 30-second deadline with an 8 MiB
+response limit.
+
+The observer has a separate two-second budget for its entire authority lookup,
+including MOI and UC dependencies. Expiry cancels that lookup, records an error,
+and releases the existing async observer permit; it does not become access
+denial. The backend send retains its independent 30-second timeout. The existing
+four-slot scheduler still reports saturation during this bounded interval;
+this change does not introduce an unbounded queue or guarantee lossless delivery.
 The callback's explicit identity denial is HTTP 403 with error code
 `moi_memory_identity_denied`; the resolver returns `Denied` for that exact pair.
 Service-authentication failures, unclassified 403 responses, dependency failures
