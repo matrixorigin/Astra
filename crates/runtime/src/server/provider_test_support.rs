@@ -697,7 +697,7 @@ pub fn admitted_execution(
         offering_id: format!("fixture-{provider}"),
         model: astra_services::ResolvedActiveLlmModel {
             inference_protocol: None,
-            response_scope: None,
+            response_scope_key: None,
             supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: model.into(),

@@ -50321,7 +50321,11 @@ mod tests {
         let mut offering = admitted_test_offering();
         offering.model.inference_protocol =
             Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses);
-        offering.model.response_scope = Some("credential-generation".into());
+        offering.model.response_scope_key =
+            Some(astra_services::models::ResponseScopeKey::for_model(
+                &astra_services::FernetTokenEncryptor::new("test-scope-secret").unwrap(),
+                "catalog-model",
+            ));
         let execution = astra_services::AdmittedModelExecution::from_offering(offering).unwrap();
         let turn = resolve_llm_model_for_turn(None, Some(&execution)).unwrap();
         let route = turn.execution_route();
@@ -50335,7 +50339,7 @@ mod tests {
             offering_id: "offer-primary".to_string(),
             model: astra_services::ResolvedActiveLlmModel {
                 inference_protocol: None,
-                response_scope: None,
+                response_scope_key: None,
                 supported_reasoning_efforts: None,
                 price_snapshot: None,
                 model_name: "catalog-model".to_string(),

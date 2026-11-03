@@ -9,6 +9,16 @@ pub const CONTINUATION_SCOPE_CHANGED: &str =
     "Model configuration changed during tool continuation; start a new turn";
 const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
 
+/// Construct the same endpoint for Responses requests and their route identity.
+pub fn endpoint_url(base_url: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(base_url) else {
+        return base_url.to_owned();
+    };
+    let path = format!("{}/responses", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    url.into()
+}
+
 /// Retain only scoped, replayable assistant protocol state at canonical
 /// persistence boundaries. This metadata grants no tool execution authority.
 pub fn validated_continuation(message: &Value) -> Option<Value> {
@@ -747,6 +757,35 @@ pub fn observe_sse_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_url_appends_to_the_path_before_query_and_fragment() {
+        for (base, expected) in [
+            (
+                "https://example.test/v1/",
+                "https://example.test/v1/responses",
+            ),
+            (
+                "https://example.test/v1/?workspace=one#part",
+                "https://example.test/v1/responses?workspace=one#part",
+            ),
+            (
+                "https://example.test/v1#part?text",
+                "https://example.test/v1/responses#part?text",
+            ),
+            (
+                "https://example.test/v1\\?workspace=one",
+                "https://example.test/v1/responses?workspace=one",
+            ),
+            (
+                "https://example.test/a%2Fb/?workspace=one",
+                "https://example.test/a%2Fb/responses?workspace=one",
+            ),
+        ] {
+            assert_eq!(endpoint_url(base), expected);
+        }
+    }
+
     fn completion(items: Value) -> Value {
         json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":items,
             "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}})

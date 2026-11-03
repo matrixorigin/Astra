@@ -520,7 +520,7 @@ impl ModelService for TestModelService {
             offering_id,
             model: ResolvedActiveLlmModel {
                 inference_protocol: None,
-                response_scope: None,
+                response_scope_key: None,
                 supported_reasoning_efforts: None,
                 model_name,
                 wire_model_name: None,

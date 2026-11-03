@@ -210,7 +210,7 @@ pub(super) fn prepare(
         LlmProviderProtocol::OpenAiResponses,
         call.cache_capability,
     )?;
-    let url = format!("{}/responses", call.route.base_url.trim_end_matches('/'));
+    let url = astra_core::model_wire::responses::endpoint_url(call.route.base_url);
     Ok(PreparedStreamingCall {
         purpose: call.purpose,
         route: call.route,

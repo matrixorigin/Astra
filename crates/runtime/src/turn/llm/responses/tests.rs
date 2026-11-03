@@ -36,9 +36,12 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     };
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let app = Router::new().route("/responses", post(
-        |State(requests): State<Arc<Mutex<Vec<Value>>>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+        |State(requests): State<Arc<Mutex<Vec<Value>>>>, uri: axum::http::Uri, headers: HeaderMap, Json(body): Json<Value>| async move {
             if body["input"].to_string().contains("look up") {
-                assert_eq!(headers.get("authorization").unwrap(), "Bearer custom");
+                assert_eq!(uri.path(), "/responses");
+                assert_eq!(uri.query(), Some("workspace=one"));
+                let authorization = headers.get_all("authorization").iter().collect::<Vec<_>>();
+                assert_eq!(authorization, ["Basic dXNlcjpwYXNz", "Bearer custom"]);
                 assert_eq!(headers.get("x-tenant").unwrap(), "tenant-a");
                 assert_eq!(headers.get_all("x-tenant").iter().count(), 1);
             } else {
@@ -80,13 +83,19 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         offering_id: "offering".into(),
         model: astra_services::ResolvedActiveLlmModel {
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
-            response_scope: Some("credential-generation".into()),
+            response_scope_key: Some(astra_services::models::ResponseScopeKey::for_model(
+                &FernetTokenEncryptor::new("test-scope-secret").unwrap(),
+                "model",
+            )),
             supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: "model".into(),
             wire_model_name: None,
             api_key: "test-key".into(),
-            base_url: base.clone(),
+            base_url: format!(
+                "{}?workspace=one#first",
+                base.replacen("http://", "http://user:pass@", 1)
+            ),
             provider: "openai".into(),
             tags: Vec::new(),
             request_body_overrides: None,
@@ -113,6 +122,11 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             .as_object()
             .unwrap()
             .clone(),
+    );
+    offering.model.api_key = "unused-rotated-key".into();
+    offering.model.base_url = format!(
+        "{}\\?workspace=one",
+        base.replacen("http://", "http://%75ser:%70ass@", 1)
     );
     let second_execution = astra_services::AdmittedModelExecution::from_offering(offering).unwrap();
     assert_eq!(
@@ -198,7 +212,17 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     .await
     .unwrap();
     let mut messages = first_messages;
-    messages.push(json!({"role":"assistant","content":"","tool_calls":first.tool_calls,astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}));
+    let continuation = first.provider_continuation.unwrap();
+    let continuation_text = continuation.to_string();
+    for secret in [
+        "test-key",
+        "Bearer custom",
+        "user:pass",
+        "test-scope-secret",
+    ] {
+        assert!(!continuation_text.contains(secret));
+    }
+    messages.push(json!({"role":"assistant","content":"","tool_calls":first.tool_calls,astra_core::model_wire::responses::CONTINUATION_KEY:continuation}));
     messages.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
     messages.push(snapshot("updated optional observation"));
     let mut second_call = call(&messages, &tools, &scope, &base, &thinking);

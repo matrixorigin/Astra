@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -848,6 +849,24 @@ pub fn model_catalog_revision(items: &[ModelListItem]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+/// Secret key used for Responses continuation identities.
+#[derive(Clone, PartialEq)]
+pub struct ResponseScopeKey(String);
+
+impl ResponseScopeKey {
+    /// Derive a secret continuation key for a model's stable local name.
+    #[must_use]
+    pub fn for_model(encryptor: &FernetTokenEncryptor, model_name: &str) -> Self {
+        Self(encryptor.keyed_digest("astra.responses.scope-key.v1", model_name))
+    }
+}
+
+impl std::fmt::Debug for ResponseScopeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
 ///
 /// `Debug` is implemented manually to keep `api_key` out of any log line —
@@ -855,7 +874,9 @@ pub fn model_catalog_revision(items: &[ModelListItem]) -> String {
 #[derive(Clone, PartialEq)]
 pub struct ResolvedActiveLlmModel {
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
-    pub response_scope: Option<String>,
+    /// Secret, domain-separated key used to bind Responses continuations.
+    /// Like `api_key`, this is execution material and must not be logged or serialized.
+    pub response_scope_key: Option<ResponseScopeKey>,
     pub supported_reasoning_efforts: Option<Vec<String>>,
     pub price_snapshot: Option<InferencePriceSnapshot>,
     /// Local model name used for routing, telemetry, and capture-file labels.
@@ -1198,29 +1219,63 @@ pub struct AdmittedModelExecution {
 
 fn response_scope(
     offering_id: &str,
-    identity: &str,
+    model: &ResolvedActiveLlmModel,
+    key: &ResponseScopeKey,
     header_overrides: &HashMap<String, String>,
-) -> String {
+) -> Result<String, String> {
+    // Build, but never send, a request so URL-embedded credentials use the
+    // same normalization and Basic authentication rules as the transport.
+    static CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .tls_built_in_root_certs(false)
+            .build()
+    });
+    let client = CLIENT
+        .as_ref()
+        .map_err(|_| "model Responses endpoint is unavailable".to_string())?;
+    let request = client
+        .post(astra_core::model_wire::responses::endpoint_url(
+            &model.base_url,
+        ))
+        .build()
+        .map_err(|_| "model Responses endpoint URL is invalid".to_string())?;
+    // Reqwest converts its URL to an HTTP URI before sending; that conversion
+    // also removes fragments, which are not part of the request target.
+    let endpoint: axum::http::Uri = request
+        .url()
+        .as_str()
+        .parse()
+        .map_err(|_| "model Responses endpoint URL is invalid".to_string())?;
+    let url_authorization: Vec<_> = request
+        .headers()
+        .get_all(reqwest::header::AUTHORIZATION)
+        .iter()
+        .map(reqwest::header::HeaderValue::as_bytes)
+        .collect();
+    let authorization = header_overrides
+        .get("authorization")
+        .cloned()
+        .unwrap_or_else(|| format!("Bearer {}", model.api_key));
     let headers: BTreeMap<_, _> = header_overrides
         .iter()
-        .filter(|(name, _)| !name.starts_with("__astra_"))
+        .filter(|(name, _)| *name != "authorization" && !name.starts_with("__astra_"))
         .collect();
-    let input = serde_json::to_vec(&(offering_id, identity, headers))
-        .expect("model route identity serializes");
-    format!("sha256:{:x}", Sha256::digest(input))
-}
-
-/// Bind replay to the actual route and credential, independently of probe and
-/// capability configuration. Execution headers are added at admission.
-fn response_connection_identity(
-    provider: &str,
-    base_url: &str,
-    model: &str,
-    encrypted: &str,
-) -> String {
-    let input = serde_json::to_vec(&(provider, base_url.trim_end_matches('/'), model, encrypted))
-        .expect("model route identity serializes");
-    format!("{:x}", Sha256::digest(input))
+    let input = serde_json::to_vec(&(
+        offering_id,
+        &model.provider,
+        endpoint.to_string(),
+        url_authorization,
+        model.upstream_model_name(),
+        authorization,
+        headers,
+    ))
+    .expect("model route identity serializes");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key.0.as_bytes()).expect("HMAC accepts any key size");
+    mac.update(&input);
+    // The continuation codec's `sha256:` form holds an HMAC, not a raw hash.
+    Ok(format!("sha256:{:x}", mac.finalize().into_bytes()))
 }
 
 impl AdmittedModelExecution {
@@ -1264,9 +1319,17 @@ impl AdmittedModelExecution {
         let header_overrides = offering.model.execution_header_overrides()?;
         let response_scope = offering
             .model
-            .response_scope
-            .as_deref()
-            .map(|identity| response_scope(&offering.offering_id, identity, &header_overrides));
+            .response_scope_key
+            .as_ref()
+            .map(|key| {
+                response_scope(
+                    &offering.offering_id,
+                    &offering.model,
+                    key,
+                    &header_overrides,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             inference_protocol: offering.model.inference_protocol,
             response_scope,
@@ -1920,16 +1983,9 @@ fn build_resolved_active_llm_from_row(
         .supported_reasoning_efforts
         .clone()
         .or_else(|| cached_efforts(snapshot.as_deref(), &identity, thinking_protocol));
-    let response_identity = (quirks.inference_protocol
+    let response_scope_key = (quirks.inference_protocol
         == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses))
-    .then(|| {
-        response_connection_identity(
-            &provider,
-            &base_url,
-            quirks.wire_model_name.as_deref().unwrap_or(&model_name),
-            &encrypted,
-        )
-    });
+    .then(|| ResponseScopeKey::for_model(encryptor, &model_name));
     let wire_model_name = quirks.wire_model_name;
     let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
@@ -1966,7 +2022,7 @@ fn build_resolved_active_llm_from_row(
 
     Ok(ResolvedActiveLlmModel {
         inference_protocol: quirks.inference_protocol,
-        response_scope: response_identity,
+        response_scope_key,
         supported_reasoning_efforts,
         price_snapshot: row
             .try_get::<Option<String>, _>("pricing_json")
@@ -6284,7 +6340,7 @@ async fn probe_thinking_behavior_with_protocol_inner(
     if protocol == ThinkingProtocol::ResponsesReasoning {
         return match probe_responses(
             &client,
-            &format!("{}/responses", url.trim_end_matches('/')),
+            &astra_core::model_wire::responses::endpoint_url(url),
             model_name,
             api_key,
             probe_headers,
@@ -7676,7 +7732,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_protocol_resolves_reasoning_and_scopes_continuation() {
+    fn responses_protocol_resolves_reasoning() {
         let quirks: QuirksData =
             serde_json::from_value(serde_json::json!({"inference_protocol":"openai_responses"}))
                 .unwrap();
@@ -7684,17 +7740,6 @@ mod tests {
             offering_thinking_protocol(&quirks, "openai", "https://api.openai.com/v1", "model"),
             ThinkingProtocol::ResponsesReasoning
         );
-        let headers = HashMap::new();
-        let scope = response_scope("offering-a", "credential-generation-a", &headers);
-        assert_ne!(
-            scope,
-            response_scope("offering-b", "credential-generation-a", &headers)
-        );
-        assert_ne!(
-            scope,
-            response_scope("offering-a", "credential-generation-b", &headers)
-        );
-        assert!(!scope.contains("credential-generation"));
         assert!(validate_inference_config("openai", &quirks).is_ok());
         let mut declared = quirks.clone();
         declared.supported_reasoning_efforts = Some(vec!["high".into(), "max".into()]);
@@ -7725,21 +7770,104 @@ mod tests {
     }
 
     #[test]
-    fn responses_identity_tracks_route_and_credential() {
-        let identity = response_connection_identity;
-        let expected = identity("openai", "https://example.test/v1", "model", "key-a");
+    fn responses_scope_tracks_the_effective_route() {
+        let mut model = sample_resolved_active_model("model");
+        let encryptor = FernetTokenEncryptor::new("test-scope-secret").unwrap();
+        let scope_key = ResponseScopeKey::for_model(&encryptor, "model");
+        assert_eq!(format!("{scope_key:?}"), "<redacted>");
+        model.response_scope_key = Some(scope_key);
+        model.base_url = "https://EXAMPLE.test:443/v1".into();
+        let admit = |offering: &str, model| {
+            AdmittedModelExecution::from_offering(ResolvedModelOffering {
+                offering_id: offering.into(),
+                model,
+            })
+        };
+        let expected = admit("offering-a", model.clone()).unwrap().response_scope;
+        assert_ne!(
+            expected,
+            admit("offering-b", model.clone()).unwrap().response_scope
+        );
+        assert!(!format!("{model:?}").contains("test-scope-secret"));
+
+        let mut equivalent = model.clone();
+        equivalent.base_url = "https://example.test/v1/".into();
+        equivalent.request_headers = Some(
+            serde_json::json!({"Authorization":"Bearer sk-test"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
         assert_eq!(
             expected,
-            identity("openai", "https://example.test/v1/", "model", "key-a")
+            admit("offering-a", equivalent.clone())
+                .unwrap()
+                .response_scope
         );
-        for changed in [
-            identity("other", "https://example.test/v1", "model", "key-a"),
-            identity("openai", "https://other.test/v1", "model", "key-a"),
-            identity("openai", "https://example.test/v1", "other", "key-a"),
-            identity("openai", "https://example.test/v1", "model", "key-b"),
-        ] {
-            assert_ne!(expected, changed);
+        equivalent.api_key = "unused-key".into();
+        assert_eq!(
+            expected,
+            admit("offering-a", equivalent).unwrap().response_scope
+        );
+        let mut backslash = model.clone();
+        backslash.base_url = "https://example.test/v1\\".into();
+        assert_eq!(
+            expected,
+            admit("offering-a", backslash).unwrap().response_scope
+        );
+
+        let mut userinfo = model.clone();
+        userinfo.base_url = "https://user:pass@example.test/v1".into();
+        let mut encoded_userinfo = userinfo.clone();
+        encoded_userinfo.base_url = "https://%75ser:%70ass@example.test/v1".into();
+        assert_eq!(
+            admit("offering-a", userinfo).unwrap().response_scope,
+            admit("offering-a", encoded_userinfo)
+                .unwrap()
+                .response_scope
+        );
+        let mut first_fragment = model.clone();
+        first_fragment.base_url = "https://example.test/v1#first".into();
+        let mut second_fragment = first_fragment.clone();
+        second_fragment.base_url = "https://example.test/v1#second".into();
+        assert_eq!(
+            expected,
+            admit("offering-a", first_fragment.clone())
+                .unwrap()
+                .response_scope
+        );
+        assert_eq!(
+            admit("offering-a", first_fragment).unwrap().response_scope,
+            admit("offering-a", second_fragment).unwrap().response_scope
+        );
+
+        let mut changes = Vec::new();
+        let mut changed = model.clone();
+        changed.provider = "other".into();
+        changes.push(changed);
+        let mut changed = model.clone();
+        changed.base_url = "https://other.test/v1".into();
+        changes.push(changed);
+        let mut changed = model.clone();
+        changed.wire_model_name = Some("other".into());
+        changes.push(changed);
+        let mut changed = model.clone();
+        changed.api_key = "different-key".into();
+        changes.push(changed);
+        let mut changed = model.clone();
+        changed.response_scope_key = Some(ResponseScopeKey::for_model(&encryptor, "different"));
+        changes.push(changed);
+        for changed in changes {
+            assert_ne!(
+                expected,
+                admit("offering-a", changed).unwrap().response_scope
+            );
         }
+
+        let mut invalid = model;
+        invalid.base_url = "https://sensitive-user:sensitive-password@[".into();
+        let error = admit("offering-a", invalid).unwrap_err();
+        assert!(!error.contains("sensitive"));
     }
 
     #[test]
@@ -8158,7 +8286,7 @@ mod tests {
     fn sample_resolved_active_model(name: &str) -> ResolvedActiveLlmModel {
         ResolvedActiveLlmModel {
             inference_protocol: None,
-            response_scope: None,
+            response_scope_key: None,
             supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: name.to_string(),
@@ -8182,7 +8310,10 @@ mod tests {
     fn admitted_execution_uses_unambiguous_http_headers_for_scope_and_transport() {
         let admit = |headers: Value| {
             let mut model = sample_resolved_active_model("model");
-            model.response_scope = Some("credential-generation".into());
+            model.response_scope_key = Some(ResponseScopeKey::for_model(
+                &FernetTokenEncryptor::new("test-scope-secret").unwrap(),
+                "model",
+            ));
             model.request_headers = Some(headers.as_object().unwrap().clone());
             AdmittedModelExecution::from_offering(ResolvedModelOffering {
                 offering_id: "offering".into(),
@@ -9000,7 +9131,7 @@ mod tests {
     fn resolved_upstream_name_prefers_wire_model_name_when_set() {
         let r = ResolvedActiveLlmModel {
             inference_protocol: None,
-            response_scope: None,
+            response_scope_key: None,
             supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: "deepseek-v4-pro-anthropic".into(),
@@ -9027,7 +9158,7 @@ mod tests {
     fn resolved_upstream_name_falls_back_to_local_name_when_unset() {
         let r = ResolvedActiveLlmModel {
             inference_protocol: None,
-            response_scope: None,
+            response_scope_key: None,
             supported_reasoning_efforts: None,
             price_snapshot: None,
             model_name: "claude-sonnet-4-6".into(),

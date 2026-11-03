@@ -2334,7 +2334,9 @@ pub(crate) fn llm_request_url_for_provider(
 ) -> String {
     let base = base_url.trim_end_matches('/');
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::OpenAiResponses => format!("{base}/responses"),
+        LlmProviderProtocol::OpenAiResponses => {
+            astra_core::model_wire::responses::endpoint_url(base_url)
+        }
         LlmProviderProtocol::AnthropicMessages => {
             if base.ends_with("/v1") {
                 format!("{base}/messages")

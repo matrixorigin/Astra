@@ -613,7 +613,7 @@ mod tests {
                 offering_id,
                 model: ResolvedActiveLlmModel {
                     inference_protocol: None,
-                    response_scope: None,
+                    response_scope_key: None,
                     supported_reasoning_efforts: None,
                     price_snapshot: None,
                     model_name: "server-model".into(),

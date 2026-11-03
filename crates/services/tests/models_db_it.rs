@@ -282,11 +282,103 @@ async fn responses_continuation_survives_probe_updates_but_fences_route_changes(
     let rotated_messages = bind(&rotated);
     let mut update = model_patch();
     update.base_url = Some("http://127.0.0.1:2".into());
-    service.update_model(name, update).await.unwrap();
+    service.update_model(name.clone(), update).await.unwrap();
     let moved = admitted(&service, &id).await;
     assert_ne!(moved.response_scope, rotated.response_scope);
     assert_eq!(
         replay(&moved, &rotated_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+
+    let mut update = model_patch();
+    update.base_url = Some("http://LOCALHOST:80/v1".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let upper = admitted(&service, &id).await;
+    let upper_messages = bind(&upper);
+    let mut update = model_patch();
+    update.base_url = Some("http://localhost/v1".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let lower = admitted(&service, &id).await;
+    assert_eq!(upper.response_scope, lower.response_scope);
+    assert!(replay(&lower, &upper_messages).is_ok());
+    sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+        .bind(encryptor.encrypt("second-key").unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reencrypted = admitted(&service, &id).await;
+    assert_eq!(lower.response_scope, reencrypted.response_scope);
+    assert!(replay(&reencrypted, &bind(&lower)).is_ok());
+
+    let mut quirks = QuirksData {
+        inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+        request_headers: Some(
+            json!({"Authorization":"Bearer second-key", "x-tenant":"other"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
+        ..Default::default()
+    };
+    let mut update = model_patch();
+    update.quirks = Some(quirks.clone());
+    service.update_model(name.clone(), update).await.unwrap();
+    let override_before = admitted(&service, &id).await;
+    assert_eq!(lower.response_scope, override_before.response_scope);
+    assert!(replay(&override_before, &bind(&lower)).is_ok());
+    let override_messages = bind(&override_before);
+    sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+        .bind(encryptor.encrypt("unused-key-rotation").unwrap())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let override_after = admitted(&service, &id).await;
+    assert_eq!(
+        override_before.response_scope,
+        override_after.response_scope
+    );
+    assert!(replay(&override_after, &override_messages).is_ok());
+
+    quirks.request_headers = Some(
+        json!({"authorization":"Bearer changed", "x-tenant":"other"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let mut update = model_patch();
+    update.quirks = Some(quirks);
+    service.update_model(name.clone(), update).await.unwrap();
+    let changed_auth = admitted(&service, &id).await;
+    assert_ne!(changed_auth.response_scope, override_after.response_scope);
+    assert_eq!(
+        replay(&changed_auth, &override_messages).unwrap_err(),
+        CONTINUATION_SCOPE_CHANGED
+    );
+
+    // URL userinfo becomes an additional Authorization header in reqwest.
+    let mut update = model_patch();
+    update.base_url = Some("http://first:secret@localhost/v1".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let first_userinfo = admitted(&service, &id).await;
+    let first_messages = bind(&first_userinfo);
+    let mut update = model_patch();
+    update.base_url = Some("http://%66irst:%73ecret@localhost/v1".into());
+    service.update_model(name.clone(), update).await.unwrap();
+    let same_userinfo = admitted(&service, &id).await;
+    assert_eq!(first_userinfo.response_scope, same_userinfo.response_scope);
+    assert!(replay(&same_userinfo, &first_messages).is_ok());
+    let mut update = model_patch();
+    update.base_url = Some("http://second:secret@localhost/v1".into());
+    service.update_model(name, update).await.unwrap();
+    let second_userinfo = admitted(&service, &id).await;
+    assert_ne!(
+        first_userinfo.response_scope,
+        second_userinfo.response_scope
+    );
+    assert_eq!(
+        replay(&second_userinfo, &first_messages).unwrap_err(),
         CONTINUATION_SCOPE_CHANGED
     );
     sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
