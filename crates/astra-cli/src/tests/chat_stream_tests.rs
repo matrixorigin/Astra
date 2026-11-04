@@ -18,6 +18,122 @@ const TEST_SSE_HEADERS: [(&str, &str); 2] = [
     ),
 ];
 
+#[tokio::test]
+#[serial_test::serial]
+async fn admitted_attempt_with_lost_headers_then_rejection_retains_uncertainty() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = crate::test_utils::isolate_credentials();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let post_count = Arc::new(AtomicUsize::new(0));
+    let committed = admitted.clone();
+    let attempts = post_count.clone();
+    let server = tokio::spawn(async move {
+        'connections: loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 8192];
+            let headers_end = loop {
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    continue 'connections;
+                }
+                request.extend_from_slice(&buf[..read]);
+                assert!(request.len() < 1024 * 1024);
+                if let Some(end) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8(request[..headers_end].to_vec()).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < headers_end + length {
+                let read = socket.read(&mut buf).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buf[..read]);
+            }
+            let (content_type, body) = if headers.starts_with("GET /models") {
+                (
+                    "application/json",
+                    crate::test_utils::mock_model_catalog_json(&["test-model"]).to_string(),
+                )
+            } else if headers.starts_with("POST /chat/stream") {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // The synthetic Server admits the first request, but its
+                    // proxy loses response headers before any run id is visible.
+                    committed.fetch_add(1, Ordering::SeqCst);
+                    socket.write_all(b"HTTP/1.1 200").await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    continue;
+                }
+                ("text/event-stream",concat!(
+                    "data: {\"type\":\"error\",\"error_kind\":\"invalid_request\",\"message\":\"registration required\",",
+                    "\"error_code\":\"execution_binding_provider_required\",\"metadata\":{\"attempt_admission_state\":\"rejected\"}}\n\n",
+                    "data: [DONE]\n\n"
+                ).to_string())
+            } else {
+                panic!("unexpected mock HTTP route");
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{}: {}\r\n\r\n{body}",
+                body.len(),
+                astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                astra_server_types::AGENT_INTERACTION_API_MAJOR
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "possibly executed message");
+    let mut pm = PermissionManager::new(true);
+    let mut params = ChatTurnParams::basic_cli(
+        &context,
+        "synthetic-token",
+        Some("session-ambiguous-admission"),
+        &mut pm,
+    );
+    // Root interactive callers install a durable journal; utility callers do
+    // not publish continuity checkpoints even when they have a session id.
+    params.session_state_journal = Some(Arc::new(std::sync::Mutex::new(
+        crate::edge_tools::SessionStateRollbackJournal::default(),
+    )));
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(20), stream_chat_sse(params))
+        .await
+        .unwrap()
+        .expect_err("last physical request is rejected");
+    assert_eq!(admitted.load(Ordering::SeqCst), 1);
+    assert_eq!(post_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        failure.partial.error_code.as_deref(),
+        Some("execution_binding_provider_required")
+    );
+    assert!(failure.partial.prior_admission_ambiguous);
+    assert!(
+        !failure.partial.admission_rejected && !failure.partial.server_admission_not_dispatched
+    );
+    assert!(failure.partial.run_id.is_none());
+    assert!(
+        failure.partial.last_heavy_checkpoint.is_some(),
+        "do not discard recovery evidence because only the last attempt was rejected"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
 fn basic_chat_context<'a>(
     api: &'a astra_thin_client::ThinClient,
     registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
