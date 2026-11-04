@@ -2094,6 +2094,153 @@ for line in sys.stdin:
         assert!(second_rx.try_recv().is_err());
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn password_relogin_republishes_native_discovery_before_next_turn() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _selection = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        unsafe {
+            crate::test_utils::set_var_serial("ASTRA_ACCESS_TOKEN", "test-only-token");
+            crate::test_utils::set_var_serial("ASTRA_NATIVE_COLLABORATORS", "1");
+        }
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("account-test"),
+        )
+        .unwrap();
+        let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (consumer, mut state) = consumer(&root, runtime.path(), None);
+        let http = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id":"account-test","access_token":"profile-token","refresh_token":"profile-refresh"
+            }))).expect(1).mount(&http).await;
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"user_id":"account-test"})),
+            )
+            .expect(1)
+            .mount(&http)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true})))
+            .mount(&http)
+            .await;
+        let mut config = (*consumer.config).clone();
+        config.api = astra_thin_client::ThinClient::new(&http.uri(), None).unwrap();
+        config.edge_agent_id = chat_stream::try_edge_executor_instance_id()
+            .unwrap()
+            .to_owned();
+        config.edge_transport_id = Arc::new(tokio::sync::RwLock::new(config.edge_agent_id.clone()));
+        config.materialization_id =
+            astra_runtime_env::load_or_create_materialization_id(&root).unwrap();
+        let snapshot = Arc::new(
+            discovery_snapshot(
+                &config.edge_agent_id,
+                &config.materialization_id,
+                root.to_str().unwrap(),
+                consumer.snapshot.tool_declarations[0].clone(),
+            )
+            .unwrap(),
+        );
+        publish(&config, std::slice::from_ref(&snapshot))
+            .await
+            .unwrap();
+        let (sender, mut requests) = mpsc::channel(1);
+        let refresh = NativeRefresh::from(sender);
+        let (published, ready) = tokio::sync::watch::channel(refresh.requested());
+        let cancellation = CancellationToken::new();
+        let stop = cancellation.clone();
+        let task_config = config.clone();
+        let task_refresh = refresh.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    Some(()) = requests.recv() => {
+                        let captured = task_refresh.requested();
+                        publish(&task_config,std::slice::from_ref(&snapshot)).await.unwrap();
+                        published.send_replace(captured);
+                    }
+                }
+            }
+        });
+        state.native_delivery = Some(NativeDeliveryHandle {
+            cancellation,
+            withdrawal: CancellationToken::new(),
+            auth: config.auth.clone(),
+            account_id: config.account_id.clone(),
+            auth_owner: None,
+            refresh_tx: refresh.clone(),
+            discovered_executables: Arc::new(std::sync::Mutex::new(
+                native_codex::native_provider_executable_snapshot(),
+            )),
+            invocation_owner: None,
+            task: Some(task),
+            ready,
+            provider_available: Arc::new(AtomicBool::new(true)),
+        });
+        state.ingestion_user_id = Some("account-test".into());
+        state.native_delivery_session_id = Some("session-test".into());
+        state.native_delivery_attachment_epoch = Some(state.session_attachment_epoch);
+        state.native_delivery_refresh.bind(refresh);
+        let mut heartbeat = None;
+        let token = crate::cli::auth_flow::do_login_for_session(
+            &config.api,
+            None,
+            "user",
+            "password",
+            &mut state,
+            &mut heartbeat,
+        )
+        .await
+        .unwrap();
+        ensure_session_native_delivery(&mut state, &config.api, &token, "session-test")
+            .await
+            .unwrap();
+        let registrations: Vec<Value> = http
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/agents/edge")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert!(registrations.len() >= 3);
+        assert_eq!(registrations[0]["edge_agent_id"], config.edge_agent_id);
+        assert_eq!(registrations[1]["edge_agent_id"], config.edge_agent_id);
+        assert_eq!(
+            registrations[1]["capabilities"]["provider_discovery"],
+            json!([])
+        );
+        let last = registrations.last().unwrap();
+        assert_eq!(
+            last["capabilities"]["provider_discovery"][0]["tool_declarations"][0]["native_tool_name"],
+            native_codex::TOOL_NAME
+        );
+        assert_eq!(last["materialization_id"], config.materialization_id);
+        state.native_delivery.take().unwrap().shutdown().await;
+        super::super::stop_heartbeat(&mut heartbeat).await;
+        if let Some(spawner) = state.agent_spawner.take() {
+            spawner
+                .shutdown_and_wait_with_reason(Duration::from_secs(2), "test completed")
+                .await;
+        }
+        http.verify().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn refresh_waits_for_its_captured_publication_and_coalesces_requests() {
         let root = tempfile::tempdir().unwrap();

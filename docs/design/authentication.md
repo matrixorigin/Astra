@@ -216,6 +216,11 @@ the previous heartbeat. An account change stops and joins it before registering
 the new account's checkout. Same-account login retains the working heartbeat
 until registration succeeds, then joins it and starts the replacement. The
 registration request has a 15-second deadline, including response-body reads.
+Password authentication and registration use the existing workbench login task
+queue, so network waiting does not block keyboard handling or redraw. Password
+authentication (including any environment-identity check) also has a 15-second
+deadline. Once exchange starts, Escape/Ctrl-C reports that completion is pending
+instead of claiming cancellation after credentials may have committed.
 If registration fails, the saved login and model preference remain available;
 queued messages return to the composer for manual review and are not sent
 automatically. Local-state failures ask users to check workspace/state write
@@ -223,6 +228,18 @@ access; transport, timeout and server failures provide the relevant recovery.
 Diagnostics record only failure category and HTTP status, not private paths,
 URLs or response bodies. Retrying `/login` or restarting retries registration
 without repeating model-provider authorization.
+
+When a valid `ASTRA_ACCESS_TOKEN` controls turn authentication, password sign-in
+checks its authenticated account against the password response before saving
+credentials or changing the session. A conflicting or unverifiable identity is
+rejected with instructions to unset the environment override and restart.
+Same-account sign-in uses the environment bearer for registration and heartbeat,
+matching subsequent turn admission; the new profile credentials are still saved.
+After generic registration settles, the session's existing native-delivery
+refresh handle requests a fresh capability publication, including after an
+uncertain response. The next native turn waits for that publication, preserving
+collaborator discovery even when an environment bearer has no profile-generation
+change to trigger reconnection. No second delivery owner is created.
 
 An absent agent projection is not a registration-readiness gate: the first turn
 can initialize it lazily. The Server remains the execution admission authority.
