@@ -257,21 +257,39 @@ fn attach_runtime_environment_capabilities(body: &mut EdgeRegisterRequest) {
 }
 
 pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), ThinClientError> {
+    register_edge_once_classified(api, token)
+        .await
+        .map_err(|error| match error {
+            RegistrationFailure::LocalState(error) | RegistrationFailure::Request(error) => error,
+        })
+}
+
+enum RegistrationFailure {
+    LocalState(ThinClientError),
+    Request(ThinClientError),
+}
+
+async fn register_edge_once_classified(
+    api: &ThinClient,
+    token: &str,
+) -> Result<(), RegistrationFailure> {
     if !edge_cloud_registry_enabled() {
         return Ok(());
     }
-    let transport_id = try_edge_executor_instance_id().map_err(ThinClientError::InvalidInput)?;
+    let local_error = |error| RegistrationFailure::LocalState(ThinClientError::InvalidInput(error));
+    let transport_id = try_edge_executor_instance_id().map_err(local_error)?;
     let mut body = EdgeRegisterRequest::new(transport_id);
     enrich_register_body(&mut body);
     if let Some(worktree_path) = body.worktree_path.as_deref() {
         body.materialization_id = Some(
             astra_runtime_env::load_or_create_materialization_id(Path::new(worktree_path))
-                .map_err(ThinClientError::InvalidInput)?,
+                .map_err(local_error)?,
         );
     }
     attach_runtime_environment_capabilities(&mut body);
     api.post_agents_edge_register(Some(token), Some(transport_id), &body)
-        .await?;
+        .await
+        .map_err(RegistrationFailure::Request)?;
     Ok(())
 }
 
@@ -388,12 +406,33 @@ async fn rebind_after_login_with_timeout(
     owner_changed: bool,
     timeout: Duration,
 ) -> Result<(), String> {
+    prepare_login_rebind(heartbeat, owner_changed).await;
+    register_after_login_with_timeout(api, token, timeout).await?;
+    complete_login_rebind(api, token, profile, heartbeat).await;
+    Ok(())
+}
+
+pub(crate) async fn prepare_login_rebind(
+    heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
+    owner_changed: bool,
+) {
     // An account switch must retire the previous authority before registration.
     // A same-owner retry keeps its working lease alive until replacement succeeds.
     if owner_changed || !edge_cloud_registry_enabled() {
         stop_heartbeat(heartbeat).await;
     }
-    match tokio::time::timeout(timeout, register_edge_once(api, token)).await {
+}
+
+pub(crate) async fn register_after_login(api: &ThinClient, token: &str) -> Result<(), String> {
+    register_after_login_with_timeout(api, token, EDGE_REGISTER_TIMEOUT).await
+}
+
+async fn register_after_login_with_timeout(
+    api: &ThinClient,
+    token: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(timeout, register_edge_once_classified(api, token)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(login_registration_error(&error)),
         Err(_) => {
@@ -401,28 +440,36 @@ async fn rebind_after_login_with_timeout(
             return Err("Signed in, but local execution registration timed out. Your login is saved; retry /login or restart Astra before chatting.".into());
         }
     }
+    Ok(())
+}
+
+pub(crate) async fn complete_login_rebind(
+    api: &ThinClient,
+    token: &str,
+    profile: Option<&str>,
+    heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
+) {
     stop_heartbeat(heartbeat).await;
     if edge_cloud_registry_enabled() {
         *heartbeat =
             spawn_edge_heartbeat(api.clone(), token.to_owned(), profile.map(str::to_owned));
     }
-    Ok(())
 }
 
-fn login_registration_error(error: &ThinClientError) -> String {
+fn login_registration_error(error: &RegistrationFailure) -> String {
     // Raw HTTP bodies, URLs and filesystem paths can contain private data.
     let (kind, status, recovery) = match error {
-        ThinClientError::InvalidInput(_) => (
+        RegistrationFailure::LocalState(_) => (
             "local_state",
             None,
             "Check that the workspace and local Astra state are writable, then retry /login or restart Astra before chatting.",
         ),
-        ThinClientError::Api { status, .. } => (
+        RegistrationFailure::Request(ThinClientError::Api { status, .. }) => (
             "server",
             Some(status.as_u16()),
             "Retry /login or restart Astra before chatting; check the server registration service if the error persists.",
         ),
-        ThinClientError::Http(_) => (
+        RegistrationFailure::Request(ThinClientError::Http(_)) => (
             "transport",
             None,
             "Check connectivity, then retry /login or restart Astra before chatting.",
@@ -618,7 +665,11 @@ mod tests {
                 let peer = tokio::spawn(async move {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut buf = [0; 8192];
-                    stream.read(&mut buf).await.unwrap();
+                    let read = stream.read(&mut buf).await.unwrap();
+                    assert!(
+                        read > 0,
+                        "registration must send request bytes before stalling"
+                    );
                     if send_headers {
                         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
                     }
@@ -658,17 +709,24 @@ mod tests {
 
     #[test]
     fn login_registration_errors_distinguish_local_state_without_disclosing_causes() {
+        use super::RegistrationFailure;
         use astra_thin_client::ThinClientError;
-        let local =
-            super::login_registration_error(&ThinClientError::InvalidInput("private-path".into()));
+        let local = super::login_registration_error(&RegistrationFailure::LocalState(
+            ThinClientError::InvalidInput("private-path".into()),
+        ));
         assert!(local.contains("writable"));
         assert!(!local.contains("private-path"));
-        let remote = super::login_registration_error(&ThinClientError::Api {
-            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            body: "private-response".into(),
-        });
+        let remote =
+            super::login_registration_error(&RegistrationFailure::Request(ThinClientError::Api {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                body: "private-response".into(),
+            }));
         assert!(remote.contains("server registration service"));
         assert!(!remote.contains("private-response"));
+        let auth = super::login_registration_error(&RegistrationFailure::Request(
+            ThinClientError::InvalidInput("credential unavailable".into()),
+        ));
+        assert!(!auth.contains("writable") && !auth.contains("credential unavailable"));
     }
 
     #[tokio::test]
