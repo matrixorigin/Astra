@@ -251,6 +251,46 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         admitted.inference_protocol,
         Some(LlmProviderProtocol::OpenAiResponses)
     );
+    assert!(admitted.cache_capability.is_none());
+    // Admission reads the effective route, independently of model alias or
+    // the connectivity probe that created this isolated fixture row.
+    sqlx::query(
+        "UPDATE user_llm_models SET provider = ?, base_url = ? WHERE user_id = ? AND model_id = ?",
+    )
+    .bind("openai")
+    .bind("https://api.openai.com/v1")
+    .bind(&owner)
+    .bind(&responses.model_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let native = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    let cache = native
+        .cache_capability
+        .expect("native Responses cache layout");
+    assert_eq!(
+        cache.protocol,
+        astra_services::models::PromptCacheProtocolData::OpenAiAutoPrefix
+    );
+    assert_eq!(
+        cache.volatile_placement,
+        astra_services::models::PromptCacheVolatilePlacementData::AppendOnlyUserTail
+    );
+    assert_eq!(
+        cache.volatile_delivery,
+        astra_services::models::PromptCacheVolatileDeliveryData::All
+    );
+    assert_eq!(cache.reuse_scope, None);
+    sqlx::query("UPDATE user_llm_models SET provider = ? WHERE user_id = ? AND model_id = ?")
+        .bind("deepseek")
+        .bind(&owner)
+        .bind(&responses.model_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
     // A query in the persisted route must survive both connectivity and thinking probes.
     sqlx::query("UPDATE user_llm_models SET base_url = ? WHERE user_id = ? AND model_id = ?")
         .bind(format!("{base}?workspace=one"))

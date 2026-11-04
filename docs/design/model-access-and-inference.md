@@ -138,6 +138,11 @@ decoding and its connection fences, including cancellation during a stream.
 Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
 before wire encoding, including direct auxiliary calls. Requests send full
 history with `store:false` and `stream:true`.
+Personal API-key models using the native OpenAI Responses endpoint select the
+existing append-only runtime-context layout at admission. This preserves reusable
+conversation prefixes without dropping optional or required context. Custom
+OpenAI-compatible gateways retain their existing provider defaults because their
+message and caching semantics are not established by the API format alone.
 Functions use the standard flat Responses tool format. Completed provider output items,
 including encrypted reasoning and message phase, live in private canonical
 assistant-message metadata before tool execution/final checkpoint. Stateless
