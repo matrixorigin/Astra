@@ -13144,6 +13144,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_dsml_markdown_blocks_and_physical_lines() {
+        let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        let first = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"a.txt"}</||DSML||invoke></||DSML||
+ tool_calls>"#;
+        let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
+        for (content, expected, paths) in [
+            (
+                format!("The literal is: \\{call}"),
+                format!("The literal is: \\{call}"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character.\n\n`{call}`"),
+                format!("Use a ` character.\n\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character.\n\n{call}"),
+                "Use a ` character.\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                vec![],
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n{call}"),
+                "- Example\n  ~~~text\n  example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                "one</|DSML|\ncalls>    two</|DSML|calls>three".to_owned(),
+                "one    twothree".to_owned(),
+                vec![],
+            ),
+            (
+                format!("{first}    {second}"),
+                "    ".to_owned(),
+                vec!["a.txt", "b.txt"],
+            ),
+        ] {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["read_file".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.full_text, expected, "{content:?}");
+                assert_eq!(published, expected);
+                let arguments = result
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        assert_eq!(call["function"]["name"], "read_file");
+                        astra_turn_core::tool::args::shape::parse_tool_call_arguments(call).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    arguments,
+                    paths
+                        .iter()
+                        .map(|path| json!({"path":path}))
+                        .collect::<Vec<_>>()
+                );
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(nonstream.full_text, expected);
+                assert_eq!(
+                    nonstream
+                        .tool_calls
+                        .iter()
+                        .map(
+                            |call| astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                                call
+                            )
+                            .unwrap()
+                        )
+                        .collect::<Vec<_>>(),
+                    arguments
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_dsml_parameter_markup_preserves_answer_suffix() {
         let content = r#"Before.<||DSML||tool_calls><||DSML||invoke name="write_file"><||DSML||parameter name="path">example.txt</||DSML||parameter><||DSML||parameter name="content"><parameter=x>hello</||DSML||parameter></||DSML||invoke></||DSML||tool_calls>After."#;
         let mut frames = content

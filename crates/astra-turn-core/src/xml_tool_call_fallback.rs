@@ -866,10 +866,165 @@ mod tests {
     }
 
     #[test]
+    fn dsml_markdown_block_lifetimes_and_escaped_examples() {
+        let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        for (text, visible, executable) in [
+            (
+                format!("# Unmatched ` delimiter\n{call}"),
+                "# Unmatched ` delimiter\n".to_owned(),
+                true,
+            ),
+            (
+                "Escaped partial: \\<|DSML|invoke name=\"".to_owned(),
+                "Escaped partial: \\<|DSML|invoke name=\"".to_owned(),
+                false,
+            ),
+            (
+                format!("The literal is: \\{call}"),
+                format!("The literal is: \\{call}"),
+                false,
+            ),
+            (
+                format!("Use a ` character.\n\n`{call}`"),
+                format!("Use a ` character.\n\n`{call}`"),
+                false,
+            ),
+            (
+                format!("Use a ` character.\n\n{call}"),
+                "Use a ` character.\n\n".to_owned(),
+                true,
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                false,
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n{call}"),
+                "- Example\n  ~~~text\n  example\n".to_owned(),
+                true,
+            ),
+        ] {
+            let calls = parse_degraded_tool_calls(&text).unwrap_or_default();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                if executable {
+                    vec![Some("read_file")]
+                } else {
+                    vec![]
+                },
+                "{text:?}"
+            );
+            assert_eq!(strip_degraded_tool_calls(&text), visible);
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut published = String::new();
+            for ch in text.chars() {
+                published.push_str(&filter.push(&ch.to_string()));
+            }
+            published.push_str(&filter.finish());
+            assert_eq!(published, visible);
+        }
+    }
+
+    #[test]
+    fn dsml_commonmark_code_blocks_and_spans_are_data() {
+        use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+        let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        for text in [
+            format!("Use a ` character.\n\n`{call}`"),
+            format!("Use a ` character.\n# Heading\n`{call}`"),
+            format!("# Unmatched ` delimiter\n`{call}`"),
+            format!("- Example\ncontinued\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+            format!("- Example\n\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+            format!("> - Example\n>   ~~~text\n>   example\n> ~~~\n> {call}\n> ~~~\n"),
+        ] {
+            let mut code = String::new();
+            let mut block = false;
+            for event in Parser::new(&text) {
+                match event {
+                    Event::Start(Tag::CodeBlock(_)) => block = true,
+                    Event::End(TagEnd::CodeBlock) => block = false,
+                    Event::Code(text) => code.push_str(&text),
+                    Event::Text(text) if block => code.push_str(&text),
+                    _ => {}
+                }
+            }
+            assert!(
+                code.contains(call),
+                "fixture must render the invocation as CommonMark code: {text:?}"
+            );
+            assert!(
+                parse_degraded_tool_calls(&text).is_none(),
+                "literal was executed: {text:?}"
+            );
+            assert_eq!(strip_degraded_tool_calls(&text), text);
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut visible = String::new();
+            for ch in text.chars() {
+                visible.push_str(&filter.push(&ch.to_string()));
+            }
+            visible.push_str(&filter.finish());
+            assert_eq!(visible, text);
+        }
+    }
+
+    #[test]
+    fn dsml_newlines_inside_tags_do_not_restart_line_indentation() {
+        let text = "one</|DSML|\ncalls>    two</|DSML|calls>three";
+        assert_eq!(strip_degraded_tool_calls(text), "one    twothree");
+        let mut filter = DsmlToolCallStreamFilter::default();
+        let mut published = String::new();
+        for ch in text.chars() {
+            published.push_str(&filter.push(&ch.to_string()));
+        }
+        published.push_str(&filter.finish());
+        assert_eq!(published, "one    twothree");
+    }
+
+    #[test]
+    fn dsml_adversarial_unmatched_closers_are_linear_and_not_calls() {
+        let text = format!(
+            "{}{}",
+            "<|DSML|calls>".repeat(100_000),
+            "</|DSML|invoke>".repeat(100_000)
+        );
+        let started = std::time::Instant::now();
+        assert!(parse_degraded_tool_calls(&text).is_none());
+        assert_eq!(strip_degraded_tool_calls(&text), "");
+        let mut filter = DsmlToolCallStreamFilter::default();
+        let mut published = String::new();
+        for chunk in text.as_bytes().chunks(47) {
+            published.push_str(&filter.push(std::str::from_utf8(chunk).unwrap()));
+        }
+        published.push_str(&filter.finish());
+        assert_eq!(published, "");
+        eprintln!(
+            "adversarial nested scopes {} bytes: {:?}",
+            text.len(),
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn dsml_fragmented_long_prefixes_preserve_their_semantics() {
         for (text, expected) in [
             (" ".repeat(512 * 1024), " ".repeat(512 * 1024)),
             ("> ".repeat(128 * 1024), "> ".repeat(128 * 1024)),
+            (
+                format!(
+                    "{}first.\n{}",
+                    "> ".repeat(32_000),
+                    "continuation\n".repeat(4096)
+                ),
+                format!(
+                    "{}first.\n{}",
+                    "> ".repeat(32_000),
+                    "continuation\n".repeat(4096)
+                ),
+            ),
             ("`".repeat(512 * 1024), "`".repeat(512 * 1024)),
             (
                 format!("```text\n```{}\n", " ".repeat(512 * 1024)),

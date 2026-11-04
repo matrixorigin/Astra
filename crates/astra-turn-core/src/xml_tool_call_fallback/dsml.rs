@@ -4,7 +4,7 @@
 //! path, including named calls whose arguments cannot be decoded.
 
 use serde_json::{Value, json};
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 mod markdown;
 mod tag;
@@ -24,6 +24,7 @@ struct Tag {
     closing: bool,
     span: Range<usize>,
     raw: String,
+    literal: bool,
 }
 
 enum Fragment {
@@ -39,16 +40,65 @@ struct Lexer {
     cursor: usize,
     line_prefix_done: bool,
     indented: bool,
-    line_containers: Vec<Container>,
-    fence_containers: Vec<Container>,
+    line_containers: Arc<[Container]>,
+    block_containers: Arc<[Container]>,
+    paragraph_open: bool,
+    continuation_checked: usize,
+    fence_containers: Arc<[Container]>,
     prefix_cursor: markdown::Cursor,
     tag_scanner: Option<tag::Scanner>,
     delimiter_run: usize,
     fence_close_candidate: bool,
     literal: Option<(char, usize, bool)>,
     line_has_text: bool,
+    line_head: String,
     escaped: bool,
-    open: Vec<Kind>,
+    open: Scopes,
+}
+
+#[derive(Debug)]
+struct Scope {
+    kind: Kind,
+    previous_same: Option<usize>,
+    literal: bool,
+}
+
+/// Each push/pop updates a per-kind index. Missing closers take constant time;
+/// matching a parent pops each intervening scope at most once.
+#[derive(Debug, Default)]
+struct Scopes {
+    frames: Vec<Scope>,
+    last: [Option<usize>; 3],
+}
+
+impl Scopes {
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+    fn kind(&self) -> Option<Kind> {
+        self.frames.last().map(|scope| scope.kind)
+    }
+    fn visible(&self) -> bool {
+        self.frames.last().is_none_or(|scope| scope.literal)
+    }
+    fn push(&mut self, kind: Kind, literal: bool) {
+        let previous_same = self.last[kind as usize];
+        self.last[kind as usize] = Some(self.frames.len());
+        self.frames.push(Scope {
+            kind,
+            previous_same,
+            literal,
+        });
+    }
+    fn close(&mut self, kind: Kind) -> Option<bool> {
+        let index = self.last[kind as usize]?;
+        let literal = self.frames[index].literal;
+        while self.frames.len() > index {
+            let scope = self.frames.pop().unwrap();
+            self.last[scope.kind as usize] = scope.previous_same;
+        }
+        Some(literal)
+    }
 }
 
 impl Lexer {
@@ -61,7 +111,26 @@ impl Lexer {
         let mut fragments = Vec::new();
         while !self.remaining().is_empty() {
             if !self.line_prefix_done {
-                if self.open.is_empty() && !matches!(self.literal, Some((_, _, false))) {
+                let inline = matches!(self.literal, Some((_, _, false)));
+                let contextual = inline
+                    || (self.paragraph_open
+                        && !self.block_containers.is_empty()
+                        && self.literal.is_none());
+                let classify = contextual && markdown::may_interrupt(self.remaining());
+                let line_end = if classify {
+                    let tail = &self.remaining()[self.continuation_checked..];
+                    if let Some(end) = tail.find('\n') {
+                        self.continuation_checked + end + 1
+                    } else if finish {
+                        self.remaining().len()
+                    } else {
+                        self.continuation_checked = self.remaining().len();
+                        break;
+                    }
+                } else {
+                    0
+                };
+                if self.open.is_empty() {
                     let prefix = if matches!(self.literal, Some((_, _, true))) {
                         let Some(prefix) = self.prefix_cursor.fence(
                             &self.pending[self.cursor..],
@@ -79,19 +148,35 @@ impl Lexer {
                         None
                     };
                     let Some(prefix) = prefix.or_else(|| {
-                        self.prefix_cursor
-                            .normal(&self.pending[self.cursor..], finish)
+                        self.prefix_cursor.normal(
+                            &self.pending[self.cursor..],
+                            finish,
+                            &self.block_containers,
+                        )
                     }) else {
                         break;
                     };
                     self.prefix_cursor = markdown::Cursor::default();
-                    self.indented = prefix.indented;
-                    self.line_containers = prefix.containers;
+                    let interrupts = classify
+                        && markdown::interrupts_paragraph(
+                            &self.remaining()[prefix.continuation_end..line_end],
+                        );
+                    if inline && interrupts {
+                        self.literal = None;
+                    }
+                    self.indented = prefix.indented && !matches!(self.literal, Some((_, _, false)));
+                    self.line_containers = if contextual && prefix.left_context && !interrupts {
+                        self.block_containers.clone()
+                    } else {
+                        prefix.containers.into()
+                    };
+                    self.block_containers = self.line_containers.clone();
                     let end = prefix.end;
                     if end > 0 {
                         let text = self.remaining()[..end].to_owned();
                         self.consume(end);
                         self.line_has_text = false;
+                        self.line_head.clear();
                         fragments.push(Fragment::Text {
                             text,
                             visible: true,
@@ -135,22 +220,44 @@ impl Lexer {
                     }
                     tag::Scan::Incomplete => {
                         let len = self.remaining().len();
-                        self.consume(len);
-                        fragments.push(Fragment::Incomplete);
+                        if self.open.visible() && (self.escaped || !self.open.is_empty()) {
+                            let text = self.remaining().to_owned();
+                            self.consume(len);
+                            fragments.push(Fragment::Text {
+                                text,
+                                visible: true,
+                            });
+                        } else {
+                            self.consume(len);
+                            fragments.push(Fragment::Incomplete);
+                        }
                         continue;
                     }
                     tag::Scan::Tag { end, kind, closing }
-                        if self.open.last() != Some(&Kind::Parameter)
+                        if self.open.kind() != Some(Kind::Parameter)
                             || (closing && kind == Kind::Parameter) =>
                     {
                         let raw = self.remaining()[..end].to_owned();
                         let span = self.offset..self.offset + end;
+                        let escaped = self.escaped;
+                        let mut literal = if self.open.is_empty() {
+                            escaped
+                        } else {
+                            self.open.visible()
+                        };
                         if closing {
-                            if let Some(index) = self.open.iter().rposition(|open| *open == kind) {
-                                self.open.truncate(index);
+                            if !escaped {
+                                literal |= self.open.close(kind).unwrap_or(false);
+                            } else if !self.open.visible() {
+                                self.consume(end);
+                                fragments.push(Fragment::Text {
+                                    text: raw,
+                                    visible: false,
+                                });
+                                continue;
                             }
                         } else if !raw.trim_end_matches('>').trim_end().ends_with('/') {
-                            self.open.push(kind);
+                            self.open.push(kind, literal);
                         }
                         self.consume(end);
                         fragments.push(Fragment::Tag(Tag {
@@ -158,6 +265,7 @@ impl Lexer {
                             closing,
                             span,
                             raw,
+                            literal,
                         }));
                         continue;
                     }
@@ -196,6 +304,7 @@ impl Lexer {
                         self.literal = Some((first, count, fence));
                         if fence {
                             self.fence_containers = self.line_containers.clone();
+                            self.paragraph_open = false;
                         }
                     }
                     _ => {}
@@ -225,7 +334,7 @@ impl Lexer {
             self.consume(end);
             fragments.push(Fragment::Text {
                 text,
-                visible: self.open.is_empty(),
+                visible: self.open.visible(),
             });
         }
         self.pending.drain(..self.cursor);
@@ -236,12 +345,32 @@ impl Lexer {
     fn consume(&mut self, end: usize) {
         for ch in self.pending[self.cursor..self.cursor + end].chars() {
             if ch == '\n' {
+                let blank = !self.line_has_text;
+                if matches!(self.literal, Some((_, _, false)))
+                    && markdown::line_is_heading(&self.line_head)
+                {
+                    self.literal = None;
+                }
+                self.line_head.clear();
                 self.line_has_text = false;
                 self.line_prefix_done = false;
                 self.indented = false;
                 self.prefix_cursor = markdown::Cursor::default();
-            } else if !ch.is_whitespace() {
-                self.line_has_text = true;
+                self.continuation_checked = 0;
+                if blank {
+                    self.paragraph_open = false;
+                }
+            } else {
+                if self.line_head.len() < 8 {
+                    self.line_head.push(ch);
+                }
+                if !ch.is_whitespace() {
+                    self.line_has_text = true;
+                    self.line_prefix_done = true;
+                    if self.literal.is_none() && self.open.is_empty() {
+                        self.paragraph_open = true;
+                    }
+                }
             }
             self.escaped = ch == '\\' && !self.escaped;
         }
@@ -267,12 +396,13 @@ impl DsmlToolCallStreamFilter {
     fn project(&mut self, chunk: &str, finish: bool) -> String {
         let mut visible = String::new();
         for fragment in self.lexer.push(chunk, finish) {
-            if let Fragment::Text {
-                text,
-                visible: true,
-            } = fragment
-            {
-                visible.push_str(&text);
+            match fragment {
+                Fragment::Text {
+                    text,
+                    visible: true,
+                } => visible.push_str(&text),
+                Fragment::Tag(tag) if tag.literal => visible.push_str(&tag.raw),
+                _ => {}
             }
         }
         visible
@@ -311,7 +441,8 @@ pub(super) fn decode(text: &str) -> Decoded {
         let self_closed = opener.raw.trim_end_matches('>').trim_end().ends_with('/');
         // Determine ownership before validating the name. Every opener owns its
         // subtree, including unnamed/empty invocations and nested wrappers.
-        let mut open = vec![Kind::Invoke];
+        let mut open = Scopes::default();
+        open.push(Kind::Invoke, opener.literal);
         let boundary = if self_closed {
             None
         } else {
@@ -319,8 +450,7 @@ pub(super) fn decode(text: &str) -> Decoded {
                 .iter()
                 .position(|tag| {
                     if tag.closing {
-                        if let Some(parent) = open.iter().rposition(|kind| *kind == tag.kind) {
-                            open.truncate(parent);
+                        if open.close(tag.kind).is_some() {
                             return open.is_empty();
                         }
                         // A wrapper not opened inside this invocation is its
@@ -328,7 +458,7 @@ pub(super) fn decode(text: &str) -> Decoded {
                         return tag.kind == Kind::Calls;
                     }
                     if !tag.raw.trim_end_matches('>').trim_end().ends_with('/') {
-                        open.push(tag.kind);
+                        open.push(tag.kind, tag.literal);
                     }
                     false
                 })
@@ -347,7 +477,9 @@ pub(super) fn decode(text: &str) -> Decoded {
         };
         let span_end = closer.map(|tag| tag.span.end).unwrap_or(body_end);
         decoded.owned.push(opener.span.start..span_end);
-        if let Some(name) = super::extract_attr(&opener.raw, "name").filter(|name| !name.is_empty())
+        if !opener.literal
+            && let Some(name) =
+                super::extract_attr(&opener.raw, "name").filter(|name| !name.is_empty())
         {
             let body = &text[opener.span.end..body_end];
             let parameters = tags[index + 1..]

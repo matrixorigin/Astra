@@ -996,7 +996,15 @@ openers and nested wrappers; nested content cannot escape as another call.
 Complete-input scans use a cursor and compact once per batch; long indentation,
 delimiter runs, closing-fence whitespace, and unfinished tags do not rescan their
 accumulated prefix on each delta. DSML projection precedes legacy bare-XML cleanup
-so argument markup cannot consume answer text.
+so argument markup cannot consume answer text. Escaped tag openers and their
+matching markup are literal scopes, never executable invocations. Per-kind scope
+indexes make unmatched closers constant-time and matching pops amortized linear.
+Physical line-prefix state follows every byte consumed, including newlines inside
+tags. List context survives continuation lines; unmatched inline delimiters end at
+their CommonMark block boundary. The existing CommonMark parser determines
+paragraph interruption rather than a second set of block rules. Only ambiguous
+Markdown continuation lines wait for the line boundary; ordinary prose continues
+streaming, and this does not change tool dispatch or admission.
 
 Native structured calls take precedence. Recovered calls remain subject to the
 exact request tool surface and the ordinary argument, capability, policy and

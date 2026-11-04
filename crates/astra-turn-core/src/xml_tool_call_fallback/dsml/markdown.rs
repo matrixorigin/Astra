@@ -12,6 +12,8 @@ pub(super) struct Prefix {
     pub end: usize,
     pub indented: bool,
     pub containers: Vec<Container>,
+    pub continuation_end: usize,
+    pub left_context: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -75,18 +77,42 @@ pub(super) struct Cursor {
     at: Position,
     containers: Vec<Container>,
     next: usize,
+    inherited_done: bool,
+    continuation_end: usize,
+    left_context: bool,
 }
 
 impl Cursor {
-    fn prefix(at: Position, indented: bool, containers: &[Container]) -> Prefix {
+    fn prefix(&self, at: Position, indented: bool, containers: &[Container]) -> Prefix {
         Prefix {
             end: at.byte,
             indented,
             containers: containers.to_vec(),
+            continuation_end: self.continuation_end,
+            left_context: self.left_context,
         }
     }
 
-    pub(super) fn normal(&mut self, text: &str, finish: bool) -> Option<Prefix> {
+    pub(super) fn normal(
+        &mut self,
+        text: &str,
+        finish: bool,
+        inherited: &[Container],
+    ) -> Option<Prefix> {
+        if !self.inherited_done {
+            match self.continue_containers(text, finish, inherited)? {
+                Context::Blank(mut prefix) => {
+                    prefix.continuation_end = prefix.end;
+                    return Some(prefix);
+                }
+                Context::Left => {
+                    self.left_context = true;
+                }
+                Context::Matched => {}
+            }
+            self.inherited_done = true;
+            self.continuation_end = self.at.byte;
+        }
         let bytes = text.as_bytes();
         loop {
             let mut at = self.at;
@@ -94,7 +120,7 @@ impl Cursor {
             // Four columns already establish literal indentation. Do not wait
             // for the end of an arbitrarily long whitespace-only stream.
             if indent >= 4 {
-                return Some(Self::prefix(at, true, &self.containers));
+                return Some(self.prefix(at, true, &self.containers));
             }
             if at.byte == bytes.len() && !finish {
                 return None;
@@ -145,32 +171,29 @@ impl Cursor {
                     continue;
                 }
             }
-            return Some(Self::prefix(at, false, &self.containers));
+            return Some(self.prefix(at, false, &self.containers));
         }
     }
 
-    /// Only the opening containers are consumed inside a fence. Blank lines
-    /// may omit list padding; they do not leave the list or close its fence.
-    /// None needs more input, Some(None) has left the containing block.
-    pub(super) fn fence(
+    fn continue_containers(
         &mut self,
         text: &str,
         finish: bool,
         containers: &[Container],
-    ) -> Option<Option<Prefix>> {
+    ) -> Option<Context> {
         let bytes = text.as_bytes();
         for (i, container) in containers.iter().enumerate().skip(self.next) {
             let mut at = self.at;
             match container {
                 Container::Quote => {
                     if at.indent(bytes, 4) > 3 {
-                        return Some(None);
+                        return Some(Context::Left);
                     }
                     if at.byte == bytes.len() && !finish {
                         return None;
                     }
                     if !at.quote(bytes, finish)? {
-                        return Some(None);
+                        return Some(Context::Left);
                     }
                 }
                 Container::List(width) => {
@@ -180,21 +203,80 @@ impl Cursor {
                             return None;
                         }
                         if at.byte == bytes.len() || bytes.get(at.byte) == Some(&b'\n') {
-                            return Some(Some(Self::prefix(at, false, containers)));
+                            return Some(Context::Blank(self.prefix(at, false, containers)));
                         }
-                        return Some(None);
+                        return Some(Context::Left);
                     }
                     at.carry = padding - width;
                 }
             }
             self.at = at;
+            self.containers.push(container.clone());
             self.next = i + 1;
         }
+        Some(Context::Matched)
+    }
+
+    /// Only the opening containers are consumed inside a fence. Blank lines
+    /// may omit list padding; they do not leave the list or close its fence.
+    pub(super) fn fence(
+        &mut self,
+        text: &str,
+        finish: bool,
+        containers: &[Container],
+    ) -> Option<Option<Prefix>> {
+        match self.continue_containers(text, finish, containers)? {
+            Context::Left => return Some(None),
+            Context::Blank(prefix) => return Some(Some(prefix)),
+            Context::Matched => {}
+        }
         let mut at = self.at;
-        let indent = at.indent(bytes, 4);
-        if indent < 4 && at.byte == bytes.len() && !finish {
+        let indent = at.indent(text.as_bytes(), 4);
+        if indent < 4 && at.byte == text.len() && !finish {
             return None;
         }
-        Some(Some(Self::prefix(at, indent >= 4, containers)))
+        Some(Some(self.prefix(at, indent >= 4, containers)))
     }
+}
+
+enum Context {
+    Matched,
+    Left,
+    Blank(Prefix),
+}
+
+/// Use the same CommonMark parser already used by the CLI rather than a second
+/// list of paragraph-interruption rules. Called once per complete ambiguous
+/// continuation line; the streaming owner retains its newline scan cursor.
+pub(super) fn interrupts_paragraph(line: &str) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag};
+    const PREFIX: &str = "paragraph\n";
+    let source = format!("{PREFIX}{line}");
+    !matches!(Parser::new(&source).into_offset_iter().next(),Some((Event::Start(Tag::Paragraph),span)) if span.end>PREFIX.len())
+}
+
+/// ATX headings are single-line blocks; unmatched inline delimiters cannot
+/// extend into the following paragraph. Eight leading bytes suffice to decide
+/// the heading marker (up to six ASCII # characters followed by whitespace).
+pub(super) fn line_is_heading(head: &str) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag};
+    matches!(
+        Parser::new(head).next(),
+        Some(Event::Start(Tag::Heading { .. }))
+    )
+}
+
+/// Only CommonMark block-start candidates need complete-line lookahead.
+/// Ordinary prose continues streaming; this is a bounded lexical check, while
+/// the actual block decision stays with `interrupts_paragraph`.
+pub(super) fn may_interrupt(text: &str) -> bool {
+    text.chars()
+        .take(4)
+        .find(|ch| !matches!(ch, ' ' | '\t'))
+        .is_none_or(|ch| {
+            matches!(
+                ch,
+                '#' | '>' | '<' | '`' | '~' | '-' | '_' | '*' | '+' | '0'..='9' | '\r' | '\n'
+            )
+        })
 }
