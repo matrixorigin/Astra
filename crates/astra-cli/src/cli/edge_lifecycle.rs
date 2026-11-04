@@ -18,6 +18,7 @@ use astra_thin_client::{
 
 /// Maximum number of completed request IDs to track for deduplication.
 const MAX_COMPLETED_REQUEST_IDS: usize = 256;
+const EDGE_REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Process-scoped edge lifecycle state shared by the heartbeat loop and all
 /// edge-side SSE hosts within this CLI process.
@@ -366,17 +367,76 @@ pub(crate) async fn rebind_after_login(
     token: &str,
     profile: Option<&str>,
     heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
+    owner_changed: bool,
 ) -> Result<(), String> {
+    rebind_after_login_with_timeout(
+        api,
+        token,
+        profile,
+        heartbeat,
+        owner_changed,
+        EDGE_REGISTER_TIMEOUT,
+    )
+    .await
+}
+
+async fn rebind_after_login_with_timeout(
+    api: &ThinClient,
+    token: &str,
+    profile: Option<&str>,
+    heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
+    owner_changed: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    // An account switch must retire the previous authority before registration.
+    // A same-owner retry keeps its working lease alive until replacement succeeds.
+    if owner_changed || !edge_cloud_registry_enabled() {
+        stop_heartbeat(heartbeat).await;
+    }
+    match tokio::time::timeout(timeout, register_edge_once(api, token)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(login_registration_error(&error)),
+        Err(_) => {
+            tracing::warn!(target: "astra.edge.registration", operation = "login_rebind", failure_kind = "timeout", timeout_secs = timeout.as_secs(), "Edge registration did not settle before the login deadline");
+            return Err("Signed in, but local execution registration timed out. Your login is saved; retry /login or restart Astra before chatting.".into());
+        }
+    }
     stop_heartbeat(heartbeat).await;
-    register_edge_once(api, token).await.map_err(|_| {
-        "Signed in, but local execution registration failed. Your login is saved; retry /login or restart Astra before chatting."
-            .to_string()
-    })?;
     if edge_cloud_registry_enabled() {
         *heartbeat =
             spawn_edge_heartbeat(api.clone(), token.to_owned(), profile.map(str::to_owned));
     }
     Ok(())
+}
+
+fn login_registration_error(error: &ThinClientError) -> String {
+    // Raw HTTP bodies, URLs and filesystem paths can contain private data.
+    let (kind, status, recovery) = match error {
+        ThinClientError::InvalidInput(_) => (
+            "local_state",
+            None,
+            "Check that the workspace and local Astra state are writable, then retry /login or restart Astra before chatting.",
+        ),
+        ThinClientError::Api { status, .. } => (
+            "server",
+            Some(status.as_u16()),
+            "Retry /login or restart Astra before chatting; check the server registration service if the error persists.",
+        ),
+        ThinClientError::Http(_) => (
+            "transport",
+            None,
+            "Check connectivity, then retry /login or restart Astra before chatting.",
+        ),
+        _ => (
+            "response_or_credentials",
+            None,
+            "Retry /login or restart Astra before chatting; check the server registration service if the error persists.",
+        ),
+    };
+    tracing::warn!(target: "astra.edge.registration", operation = "login_rebind", failure_kind = kind, http_status = status, "Edge registration failed after login");
+    format!(
+        "Signed in, but local execution registration failed ({kind}). Your login is saved; {recovery}"
+    )
 }
 
 pub(crate) async fn stop_heartbeat(heartbeat: &mut Option<tokio::task::JoinHandle<()>>) {
@@ -531,7 +591,7 @@ mod tests {
         let api = ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
         let previous = heartbeat.as_ref().unwrap().abort_handle();
-        super::rebind_after_login(&api, "token", None, &mut heartbeat)
+        super::rebind_after_login(&api, "token", None, &mut heartbeat, true)
             .await
             .expect("explicit registry disable must not attempt registration");
         assert!(previous.is_finished());
@@ -539,6 +599,76 @@ mod tests {
             heartbeat.is_none(),
             "disabled registry must not start a heartbeat"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn login_registration_deadline_bounds_stalled_headers_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        for send_headers in [false, true] {
+            for owner_changed in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let api =
+                    ThinClient::new(&format!("http://{}", listener.local_addr().unwrap()), None)
+                        .unwrap();
+                let (sent, received) = tokio::sync::oneshot::channel();
+                let peer = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buf = [0; 8192];
+                    stream.read(&mut buf).await.unwrap();
+                    if send_headers {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
+                    }
+                    let _ = sent.send(());
+                    std::future::pending::<()>().await;
+                });
+                let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+                let previous = heartbeat.as_ref().unwrap().abort_handle();
+                let error = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    super::rebind_after_login_with_timeout(
+                        &api,
+                        "token",
+                        None,
+                        &mut heartbeat,
+                        owner_changed,
+                        Duration::from_millis(500),
+                    ),
+                )
+                .await
+                .expect("login must return without waiting for the peer")
+                .unwrap_err();
+                tokio::time::timeout(Duration::from_secs(1), received)
+                    .await
+                    .expect("the request must reach the peer before timing out")
+                    .expect("the registration reached the stalled peer");
+                assert!(error.contains("timed out"));
+                assert!(error.contains("Your login is saved"));
+                assert_eq!(previous.is_finished(), owner_changed);
+                assert_eq!(heartbeat.is_none(), owner_changed);
+                super::stop_heartbeat(&mut heartbeat).await;
+                peer.abort();
+                let _ = peer.await;
+            }
+        }
+    }
+
+    #[test]
+    fn login_registration_errors_distinguish_local_state_without_disclosing_causes() {
+        use astra_thin_client::ThinClientError;
+        let local =
+            super::login_registration_error(&ThinClientError::InvalidInput("private-path".into()));
+        assert!(local.contains("writable"));
+        assert!(!local.contains("private-path"));
+        let remote = super::login_registration_error(&ThinClientError::Api {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: "private-response".into(),
+        });
+        assert!(remote.contains("server registration service"));
+        assert!(!remote.contains("private-response"));
     }
 
     #[tokio::test]

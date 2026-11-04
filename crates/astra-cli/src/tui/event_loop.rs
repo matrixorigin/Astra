@@ -3542,7 +3542,25 @@ fn followup_gate_after_auth(
     }
 }
 
-/// Authentication was refused before any login task or view existed.
+/// Only a successful authentication completion may release queued messages.
+/// Failure also disarms an already queued wake, which must not submit a draft.
+fn authentication_followup_handoff(
+    queue: &mut VecDeque<NextTurnSubmission>,
+    pane: &mut BottomPane,
+    chat: &mut chat_widget::ChatWidget,
+    armed: &mut bool,
+    successful_gate: Option<FollowupReleaseGate>,
+) -> QueuedFollowupHandoff {
+    if let Some(gate) = successful_gate {
+        handoff_queued_followups(queue, pane, chat, gate)
+    } else {
+        *armed = false;
+        recover_followups_after_rejected_authentication(queue, pane, chat);
+        QueuedFollowupHandoff::HeldWithDraft
+    }
+}
+
+/// Authentication was refused or completion failed.
 /// The remaining FIFO will not get a later completion, so put it back
 /// in the composer.
 fn recover_followups_after_rejected_authentication(
@@ -13646,7 +13664,9 @@ pub(crate) async fn run_tui_session(
                                         let auth_session_id = state.session_id.clone();
                                         let auth_epoch = state.session_attachment_epoch;
                                         let allow_owner_change = bottom_pane.can_park_editors_for(None, auth_epoch);
-                                        match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state, allow_owner_change, &mut edge_heartbeat_task).await {
+                                        let auth_result = crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state, allow_owner_change, &mut edge_heartbeat_task).await;
+                                        let authenticated = auth_result.is_ok();
+                                        match auth_result {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -13677,22 +13697,23 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
-                                        resume_queued_followups_after_modal(
+                                        let handoff = authentication_followup_handoff(
                                             &mut queued_followup_submissions,
                                             &mut bottom_pane,
                                             &mut chat_widget,
-                                            &mut event_stream,
-                    &state,
-                    &mut followup_replay_armed,
-                                            followup_gate_after_auth(
+                                            &mut followup_replay_armed,
+                                            authenticated.then(|| followup_gate_after_auth(
                                                 auth_session_id.as_deref(),
                                                 auth_epoch,
                                                 state.session_id.as_deref(),
                                                 state.session_attachment_epoch,
                                                 model_catalog_loading,
                                                 slash_background_read_count,
-                                            ),
+                                            )),
                                         );
+                                        schedule_queued_handoff(&handoff, &state,
+                                            |event| event_stream.push_front(event),
+                                            &mut followup_replay_armed);
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -13703,7 +13724,9 @@ pub(crate) async fn run_tui_session(
                                         let auth_session_id = state.session_id.clone();
                                         let auth_epoch = state.session_attachment_epoch;
                                         let allow_owner_change = bottom_pane.can_park_editors_for(None, auth_epoch);
-                                        match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state, allow_owner_change, &mut edge_heartbeat_task).await {
+                                        let auth_result = crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state, allow_owner_change, &mut edge_heartbeat_task).await;
+                                        let authenticated = auth_result.is_ok();
+                                        match auth_result {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -13734,22 +13757,23 @@ pub(crate) async fn run_tui_session(
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
-                                        resume_queued_followups_after_modal(
+                                        let handoff = authentication_followup_handoff(
                                             &mut queued_followup_submissions,
                                             &mut bottom_pane,
                                             &mut chat_widget,
-                                            &mut event_stream,
-                    &state,
-                    &mut followup_replay_armed,
-                                            followup_gate_after_auth(
+                                            &mut followup_replay_armed,
+                                            authenticated.then(|| followup_gate_after_auth(
                                                 auth_session_id.as_deref(),
                                                 auth_epoch,
                                                 state.session_id.as_deref(),
                                                 state.session_attachment_epoch,
                                                 model_catalog_loading,
                                                 slash_background_read_count,
-                                            ),
+                                            )),
                                         );
+                                        schedule_queued_handoff(&handoff, &state,
+                                            |event| event_stream.push_front(event),
+                                            &mut followup_replay_armed);
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
@@ -19672,11 +19696,18 @@ mod tests {
             let mut queued = interactive_queue(["plain A".to_string()]);
             let mut pane = BottomPane::new();
             let mut chat = chat_widget::ChatWidget::new("");
-            assert!(recover_followups_after_rejected_authentication(
-                &mut queued,
-                &mut pane,
-                &mut chat,
-            ));
+            let mut armed = true;
+            assert_eq!(
+                authentication_followup_handoff(
+                    &mut queued,
+                    &mut pane,
+                    &mut chat,
+                    &mut armed,
+                    None,
+                ),
+                QueuedFollowupHandoff::HeldWithDraft
+            );
+            assert!(!armed, "an old queued wake must not submit restored input");
             assert!(queued.is_empty());
             assert_eq!(pane.composer.text(), "plain A");
         }
@@ -19720,7 +19751,13 @@ mod tests {
         let mut queued = interactive_queue(["plain B".to_string()]);
         let mut pane = BottomPane::new();
         assert_eq!(
-            handoff_queued_followups(&mut queued, &mut pane, &mut chat, same),
+            authentication_followup_handoff(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                &mut false,
+                Some(same)
+            ),
             QueuedFollowupHandoff::SubmitNext
         );
         assert!(pane.composer.is_empty());
