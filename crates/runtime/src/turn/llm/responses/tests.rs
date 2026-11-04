@@ -1328,14 +1328,24 @@ async fn responses_transport_recovery_and_credential_fencing() {
     assert!(invalid_state.interruption.is_none());
     assert_eq!(invalid_state.total_tool_calls, 0);
     assert!(!workspace.path().join("malformed-effect.txt").exists());
-    assert!(invalid_state.pending_provider_continuation.is_none());
+    assert!(
+        invalid_state
+            .pending_provider_continuation
+            .as_ref()
+            .is_none_or(|continuation| {
+                let serialized = continuation.to_string();
+                !serialized.contains("bad-call") && !serialized.contains("malformed-effect.txt")
+            })
+    );
     assert!(invalid_state.messages.iter().all(|message| {
-        message
-            .get(astra_core::model_wire::responses::CONTINUATION_KEY)
-            .is_none()
+        let serialized = message.to_string();
+        !serialized.contains("bad-call") && !serialized.contains("malformed-effect.txt")
     }));
     let recovery_requests = provider.state.requests.lock().unwrap().clone();
     assert_eq!(recovery_requests.len(), 2);
+    let recovery_request = recovery_requests[1].to_string();
+    assert!(!recovery_request.contains("bad-call"));
+    assert!(!recovery_request.contains("malformed-effect.txt"));
     assert!(
         recovery_requests[1]["input"]
             .as_array()

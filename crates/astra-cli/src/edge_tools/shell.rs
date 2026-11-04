@@ -6809,9 +6809,13 @@ mod tests {
         ).await;
 
         assert!(
-            !outcome.is_error,
-            "business command still completed: {outcome:?}"
+            outcome.is_error,
+            "workspace ownership is unsettled: {outcome:?}"
         );
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["error_kind"], "workspace_effect_unsettled");
+        assert_eq!(fields["execution_started"], true);
+        assert_eq!(fields["exit_code"], 0, "the command completed");
         assert!(dir.path().join("generated.txt").is_file());
         assert!(
             outcome.tool_result_fields.as_ref().is_none_or(|fields| {

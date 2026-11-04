@@ -57,6 +57,8 @@ fn is_executor_owned_fingerprint_path(path: &Path) -> bool {
 pub const OBSERVED_FIELD: &str = "workspace_mutation_observed";
 pub const SCOPE_FIELD: &str = "workspace_mutation_scope";
 pub const RECEIPT_FIELD: &str = "workspace_mutation_receipt";
+/// The workspace owner could not prove that prior effects have settled.
+pub const OWNERSHIP_UNSETTLED_FIELD: &str = "workspace_ownership_unsettled";
 /// A direct typed writer committed inside the bound workspace, but later
 /// workspace attribution is unavailable. This is not a mutation or observer
 /// receipt and must never be used to certify current file contents.
@@ -5963,9 +5965,10 @@ mod tests {
         fs::create_dir(&first).expect("first workspace");
         fs::create_dir(&second).expect("second workspace");
         symlink(&first, &link).expect("initial binding");
-        let writer = begin_workspace_writer_with_options(&link, None, Duration::from_secs(120))
+        let mut writer = begin_workspace_writer_with_options(&link, None, Duration::from_secs(120))
             .await
             .expect("writer registration");
+        writer.arm_abandonment_fence();
 
         fs::remove_file(&link).expect("remove old binding");
         symlink(&second, &link).expect("repoint binding");
