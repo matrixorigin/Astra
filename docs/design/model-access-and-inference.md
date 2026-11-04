@@ -60,6 +60,12 @@ evidence across canonical projection; incomplete or inconsistent evidence
 stops the current continuation before provider dispatch. A later human turn can
 continue with the completed canonical tool pairs. No separate continuation
 table or per-request database lookup is introduced.
+An effort accepted by one probe is an observation, not a complete provider
+inventory. Personal Responses models can try an unverified effort; a provider
+rejection is reported without silently changing the requested setting. The
+model default sends no effort override. Subscription catalogs retain their
+declared effort lists; administrator routes without a declaration continue to
+limit explicit controls to observed values.
 Explicit request temperatures are not silently discarded. Internal memory
 judgments express a deterministic sampling preference; when Responses sampling
 support is not established they use the provider default and the admitted

@@ -31,12 +31,15 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     let app = Router::new()
         .route(
             "/responses",
-            post(|axum::extract::State((_, _, hold)): axum::extract::State<(
+            post(|axum::extract::State((fail, _, hold)): axum::extract::State<(
                     Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>, Arc<ConnectivityHold>
                 )>, headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
                 if headers.get("authorization").is_none_or(|v| v != "Bearer valid-key" && v != "Bearer rotated-key")
                     || body["model"] != "deepseek-chat" || body["stream"] != true || body["store"] != false {
                     return (StatusCode::BAD_REQUEST, "invalid Responses request").into_response();
+                }
+                if body["reasoning"]["effort"] == "high" && fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (StatusCode::BAD_REQUEST, "high is not supported").into_response();
                 }
                 if body["reasoning"]["effort"] == "high" && hold.next.compare_exchange(4, 0, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
                     hold.started.notify_one();
@@ -256,6 +259,20 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         .execute(pool.get())
         .await
         .unwrap();
+    fail_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed_check = service
+        .check_user_model(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert!(failed_check.is_active);
+    assert!(failed_check.thinking_probe.unwrap().error.is_some());
+    let unknown = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert!(unknown.thinking_capability.is_none());
+    assert!(unknown.supported_reasoning_efforts.is_none());
+    fail_probe.store(false, std::sync::atomic::Ordering::SeqCst);
     let checked = service
         .check_user_model(owner.clone(), responses.model_id.clone())
         .await
@@ -272,10 +289,13 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         admitted.response_scope.as_deref(),
         Some(original_scope.as_str())
     );
-    assert_eq!(
-        admitted.supported_reasoning_efforts.as_deref(),
-        Some(["high".to_string()].as_slice())
-    );
+    assert!(admitted.supported_reasoning_efforts.is_none());
+    let catalog = service.list_models(owner.clone(), false).await.unwrap();
+    let personal = catalog
+        .iter()
+        .find(|item| item.offering_id == responses.model_id)
+        .unwrap();
+    assert!(personal.supported_reasoning_efforts.is_none());
     let same_scope = admitted.response_scope.clone();
     let bad_update = service
         .update_user_model(
@@ -566,6 +586,35 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         .check_model("admin-verified-fixture".into())
         .await
         .unwrap();
+    let mut responses_admin = request.clone();
+    responses_admin.name = "admin-responses-fixture".into();
+    responses_admin.quirks.as_mut().unwrap().inference_protocol =
+        Some(LlmProviderProtocol::OpenAiResponses);
+    service
+        .create_model(owner.clone(), responses_admin)
+        .await
+        .unwrap();
+    service
+        .check_model("admin-responses-fixture".into())
+        .await
+        .unwrap();
+    let catalog = service.list_models(owner.clone(), true).await.unwrap();
+    let admin = catalog
+        .iter()
+        .find(|item| item.name == "admin-responses-fixture")
+        .unwrap();
+    assert_eq!(
+        admin.supported_reasoning_efforts.as_deref(),
+        Some(["high".to_string()].as_slice())
+    );
+    let resolved = service
+        .revalidate_model_offering(admin.offering_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.model.supported_reasoning_efforts,
+        admin.supported_reasoning_efforts
+    );
     let assert_views = |expected, expected_error: Option<bool>| {
         let service = &service;
         let settings = &settings;

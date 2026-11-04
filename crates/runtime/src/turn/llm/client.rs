@@ -6308,12 +6308,36 @@ async fn call_prepared_llm_with_total_budget(
                             | "max_output_tokens"
                     )
                 });
-            let message = parameter.map_or_else(
-                || format!("Model provider rejected the request (HTTP {status})"),
-                |parameter| {
-                    format!("Model provider rejected parameter {parameter} (HTTP {status})")
-                },
-            );
+            let rejected_effort = (is_responses
+                && matches!(status, 400 | 422)
+                && matches!(
+                    parameter,
+                    Some("reasoning" | "reasoning.effort" | "reasoning_effort")
+                ))
+            .then(|| serde_json::from_slice::<Value>(&prepared_request.body).ok())
+            .flatten()
+            .and_then(|body| {
+                body.pointer("/reasoning/effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|effort| {
+                astra_core::model_wire::thinking::ThinkingProtocol::supports_responses_effort(
+                    effort,
+                )
+            });
+            let message = if let Some(effort) = rejected_effort {
+                format!(
+                    "The model provider rejected the {effort} reasoning setting. Choose another setting or Model default."
+                )
+            } else {
+                parameter.map_or_else(
+                    || format!("Model provider rejected the request (HTTP {status})"),
+                    |parameter| {
+                        format!("Model provider rejected parameter {parameter} (HTTP {status})")
+                    },
+                )
+            };
             Some(ProviderHttpRejection {
                 classified: astra_core::ClassifiedError::new(
                     if status == 400 && astra_core::is_llm_context_window_error(&text) {

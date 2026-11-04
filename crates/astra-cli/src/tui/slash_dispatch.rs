@@ -3160,10 +3160,22 @@ pub(crate) fn apply_model_picker_result(
         ));
         return Some(false);
     };
+    let protocol = entry.thinking_protocol.unwrap_or_default();
+    let personal_responses = entry.access_kind
+        == astra_services::models::ModelAccessKind::CloudByok
+        && entry.access_id == "cloud-byok"
+        && protocol == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning;
+    let observed_capability = entry.thinking_capability.map(|value| value.as_str());
+    let picker_capability =
+        if personal_responses && !matches!(observed_capability, Some("both" | "effort_only")) {
+            Some("effort_only")
+        } else {
+            observed_capability
+        };
     let opts: Vec<_> = astra_turn_core::thinking_config::thinking_options(
         (!entry.provider.trim().is_empty()).then_some(entry.provider.trim()),
-        entry.thinking_capability.map(|value| value.as_str()),
-        entry.thinking_protocol.unwrap_or_default(),
+        picker_capability,
+        protocol,
     )
     .into_iter()
     .filter(|option| {
@@ -3184,7 +3196,14 @@ pub(crate) fn apply_model_picker_result(
             .iter()
             .map(|option| SelectionItem {
                 name: option.label.into(),
-                description: None,
+                description: (protocol
+                    == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning
+                    && entry.supported_reasoning_efforts.is_none()
+                    && !matches!(
+                        option.config,
+                        astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+                    ))
+                .then(|| "Provider support for this setting is not verified".into()),
                 is_current: option.is_default,
             })
             .collect();

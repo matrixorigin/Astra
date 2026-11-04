@@ -282,12 +282,26 @@ pub(crate) fn validate_reasoning_control(
     );
     thinking.validate_output_budget(crate::prompts::capped_output_tokens(&budget) as u64)?;
     let protocol = execution.thinking_protocol.unwrap_or_default();
-    let supported = thinking.is_supported_by(
-        &execution.provider,
-        capability.map(|capability| capability.as_str()),
-        protocol,
-    ) && thinking
-        .is_within_declared_efforts(execution.supported_reasoning_efforts.as_deref());
+    // A personal Responses endpoint is explicitly selected by its owner, but
+    // its provider may not publish an exhaustive reasoning-effort inventory.
+    // Permit trying a protocol-valid effort without treating it as verified.
+    let unverified_personal_effort = execution.access_kind
+        == astra_services::models::ModelAccessKind::CloudByok
+        && execution.subscription.is_none()
+        && execution.response_scope.is_some()
+        && protocol == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning
+        && execution.supported_reasoning_efforts.is_none()
+        && matches!(
+            thinking,
+            astra_turn_core::thinking_config::ThinkingConfig::Adaptive { .. }
+        );
+    let supported = (unverified_personal_effort
+        || thinking.is_supported_by(
+            &execution.provider,
+            capability.map(|capability| capability.as_str()),
+            protocol,
+        ))
+        && thinking.is_within_declared_efforts(execution.supported_reasoning_efforts.as_deref());
     if supported {
         Ok(())
     } else {
@@ -472,6 +486,65 @@ mod tests {
             "outside the admission test contract",
             "test_operation_unsupported",
         ))
+    }
+
+    #[test]
+    fn personal_responses_can_try_unverified_efforts_without_weakening_declared_routes() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        use astra_services::models::{ModelAccessKind, ThinkingCapability};
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+        let mut execution = AdmittedModelExecution::from_endpoint(
+            "personal".into(),
+            "model".into(),
+            "openai".into(),
+            "http://127.0.0.1:1".into(),
+            "fixture".into(),
+            None,
+            128_000,
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        execution.response_scope = Some("scope".into());
+        execution.thinking_protocol = Some(ThinkingProtocol::ResponsesReasoning);
+        execution.thinking_capability = None;
+        for effort in [
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::Max,
+        ] {
+            assert!(
+                validate_reasoning_control(&execution, &ThinkingConfig::Adaptive { effort })
+                    .is_ok()
+            );
+        }
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::Off).is_err());
+        assert!(validate_reasoning_control(&execution, &ThinkingConfig::ModelDefault).is_ok());
+
+        let max = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::Max,
+        };
+        execution.access_kind = ModelAccessKind::SelfHosted;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "unknown gateway capability stays closed"
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        execution.response_scope = None;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "a gateway without a personal API-key route stays closed"
+        );
+        execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
+        execution.supported_reasoning_efforts = Some(vec!["high".into()]);
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "declared inventories remain binding"
+        );
+        execution.access_kind = ModelAccessKind::CloudByok;
+        assert!(
+            validate_reasoning_control(&execution, &max).is_err(),
+            "a declared list remains binding for personal routes"
+        );
     }
 
     #[test]

@@ -56,6 +56,12 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             if body["input"].to_string().contains("reject this") {
                 return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"unsupported_parameter","param":"temperature","message":"secret provider detail"}}))).into_response();
             }
+            if body["input"].to_string().contains("reject effort") {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"invalid_value","param":"reasoning.effort","message":"secret provider detail"}}))).into_response();
+            }
+            if body["input"].to_string().contains("low only") && body["reasoning"]["effort"] != "low" {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"invalid_value","param":"reasoning.effort"}}))).into_response();
+            }
             let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
             requests.lock().unwrap().push(body);
             let output = if continued {
@@ -441,6 +447,40 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
     assert!(error.message.contains("temperature"));
     assert!(!format!("{error:?}").contains("secret provider detail"));
+    let rejected_effort = vec![json!({"role":"user","content":"reject effort"})];
+    let error = call_llm_and_collect_with_stream_callback(
+        call(&rejected_effort, &tools, &scope, &base, &thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    assert!(error.message.contains("max reasoning setting"));
+    assert!(error.message.contains("Model default"));
+    assert!(!format!("{error:?}").contains("secret provider detail"));
+    let low_only = vec![json!({"role":"user","content":"low only"})];
+    let low = ThinkingConfig::Adaptive {
+        effort: astra_turn_core::thinking_config::ThinkingEffort::Low,
+    };
+    let result = call_llm_and_collect_with_stream_callback(
+        call(&low_only, &tools, &scope, &base, &low),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.tool_calls.len(),
+        1,
+        "the provider accepted the unverified low effort"
+    );
     for (text, kind) in [
         ("context failure", astra_core::ErrorKind::ContextWindow),
         ("billing failure", astra_core::ErrorKind::PaymentRequired),

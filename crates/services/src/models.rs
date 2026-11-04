@@ -2737,7 +2737,9 @@ fn admitted_user_model_from_row(
     );
     let thinking_protocol = Some(protocol);
     let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
-    let supported_efforts = cached_efforts(snapshot.as_deref(), &identity, protocol);
+    let supported_efforts = connection
+        .as_ref()
+        .and_then(|_| cached_efforts(snapshot.as_deref(), &identity, protocol));
     let mut execution = AdmittedModelExecution {
         inference_protocol,
         response_scope: None,
@@ -4217,7 +4219,9 @@ impl DatabaseModelService {
                     encrypted.as_deref().unwrap_or(""),
                     connection_id.as_deref().unwrap_or(""),
                 );
-                let efforts = cached_efforts(raw.as_deref(), &identity, protocol);
+                let efforts = connection_id
+                    .as_ref()
+                    .and_then(|_| cached_efforts(raw.as_deref(), &identity, protocol));
                 models.push(ModelListItem {
                     supported_reasoning_efforts: efforts,
                     thinking_protocol: Some(protocol),
