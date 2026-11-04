@@ -42,6 +42,7 @@ pub struct ProviderState {
     pub quota: AtomicBool,
     pub refresh_error: AtomicU16,
     pub requests: Mutex<Vec<Value>>,
+    pub terminal_output: Mutex<Option<Value>>,
     pub responses_calls: AtomicUsize,
     pub hold_responses: AtomicBool,
     pub truncate: AtomicBool,
@@ -92,6 +93,7 @@ impl ProviderFixture {
             quota: AtomicBool::new(false),
             refresh_error: AtomicU16::new(0),
             requests: Mutex::new(Vec::new()),
+            terminal_output: Mutex::new(None),
             responses_calls: AtomicUsize::new(0),
             hold_responses: AtomicBool::new(false),
             truncate: AtomicBool::new(false),
@@ -405,6 +407,10 @@ async fn responses(
             .all(|item| item["role"] != "system")
     );
     state.requests.lock().unwrap().push(body.clone());
+    if let Some(output) = state.terminal_output.lock().unwrap().take() {
+        let event = json!({"type":"response.completed","response":{"id":"response-fixture","status":"completed","model":body["model"],"output":output}});
+        return (StatusCode::OK, content, format!("data: {event}\n\n"));
+    }
     let continued = body["input"]
         .as_array()
         .unwrap()

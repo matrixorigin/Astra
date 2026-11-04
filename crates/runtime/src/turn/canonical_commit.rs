@@ -224,9 +224,9 @@ pub(crate) fn canonical_commit_delta(
     // A resumed suffix may continue the admitted user turn without another
     // human message; do not sanitize it as an unrelated empty conversation.
     let has_prior_user_context = mode == astra_turn_types::CanonicalDeltaModeV1::Append
-        && prior_messages.iter().rev().any(|message| {
-            message["role"] == "user" && !astra_turn_types::is_runtime_owned_message(message)
-        });
+        && prior_messages
+            .iter()
+            .any(astra_turn_types::is_human_user_message);
     let canonical_changed = if mode == astra_turn_types::CanonicalDeltaModeV1::Replace {
         astra_turn_core::prompt_facing::sanitize_canonical_replacement_with_turn_semantics(
             changed_messages.to_vec(),
@@ -354,6 +354,17 @@ mod tests {
                 false,
             ),
             (vec![authority()], false),
+            (
+                vec![json!({"role":"user", "tool_call_id":"call-1", "content":"result"})],
+                false,
+            ),
+            (
+                vec![json!({"role":"user", "content":[
+                    {"type":"text", "text":"result"},
+                    {"type":"tool_result", "tool_use_id":"call-1", "content":"done"}
+                ]})],
+                false,
+            ),
             (
                 vec![json!({"role": "user", "content": "try the capability"})],
                 true,

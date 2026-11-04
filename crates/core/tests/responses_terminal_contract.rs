@@ -143,6 +143,83 @@ fn completed_functions_require_complete_items_including_saved_replay() {
     }
 }
 
+#[test]
+fn completed_tool_rounds_validate_the_same_items_before_execution_and_replay() {
+    let connection = "00000000-0000-4000-8000-000000000001";
+    let valid = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]});
+    let invalid_messages = [
+        json!({"type":"message","content":[{"type":"output_text","text":"working"}]}),
+        json!({"type":"message","role":"assistant","content":[{"type":"output_text"}]}),
+        json!({"type":"message","role":"assistant","content":[{"type":"unknown","text":"working"}]}),
+    ];
+    assert!(decode(terminal("completed", json!([valid, call(None)]))).is_ok());
+    for invalid in invalid_messages {
+        for finished_items in [false, true] {
+            let items = vec![invalid.clone(), call(None)];
+            let mut stream = String::new();
+            if finished_items {
+                for (index, item) in items.iter().enumerate() {
+                    stream.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({"type":"response.output_item.done","output_index":index,"item":item})
+                    ));
+                }
+            }
+            let output = if finished_items {
+                json!([])
+            } else {
+                json!(items)
+            };
+            stream.push_str(&format!("data: {}\n\n", terminal("completed", output)));
+            assert!(decode_sse(&stream).is_err(), "invalid message: {invalid}");
+        }
+        let saved = json!({"role":"assistant", CONTINUATION_KEY:{
+            "connection_id":connection,"model":"model","items":[invalid,call(None)]
+        }});
+        assert!(validated_continuation(&saved).is_none());
+    }
+
+    for (field, value) in [
+        ("call_id", "x".repeat(513)),
+        ("call_id", "call\ninvalid".to_owned()),
+        ("name", "x".repeat(129)),
+    ] {
+        let mut invalid = call(None);
+        invalid[field] = json!(value);
+        assert!(decode(terminal("completed", json!([invalid]))).is_err());
+        let saved = json!({"role":"assistant", CONTINUATION_KEY:{
+            "connection_id":connection,"model":"model","items":[invalid]
+        }});
+        assert!(validated_continuation(&saved).is_none());
+    }
+
+    let mut items: Vec<_> = (0..4095)
+        .map(|index| json!({"type":"message","id":format!("m{index}"),"role":"assistant","content":[{"type":"output_text","text":"x"}]}))
+        .collect();
+    items.push(call(None));
+    let output = decode(terminal("completed", json!(items))).unwrap();
+    assert_eq!(output.tool_calls.len(), 1);
+    items.push(json!({"type":"reasoning","encrypted_content":"ciphertext"}));
+    assert!(decode(terminal("completed", json!(items))).is_err());
+
+    let mut stream = String::new();
+    for index in 0..4097 {
+        let item = if index == 0 {
+            call(None)
+        } else {
+            json!({"type":"reasoning","encrypted_content":"ciphertext"})
+        };
+        stream.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.output_item.done","output_index":index,"item":item
+            })
+        ));
+    }
+    stream.push_str(&format!("data: {}\n\n", terminal("completed", json!([]))));
+    assert!(decode_sse(&stream).is_err());
+}
+
 fn message(id: &str, text: &str, status: &str) -> Value {
     json!({"type":"message","id":id,"role":"assistant","status":status,"content":[{"type":"output_text","text":text,"annotations":[]}]})
 }

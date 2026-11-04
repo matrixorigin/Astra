@@ -68,19 +68,31 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             if body["input"].to_string().contains("low only") && body["reasoning"]["effort"] != "low" {
                 return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"invalid_value","param":"reasoning.effort"}}))).into_response();
             }
+            let malformed = body["input"].to_string().contains("malformed terminal");
+            let oversized = body["input"].to_string().contains("oversized terminal");
+            let fresh_turn = body["input"].to_string().contains("start a new turn");
             let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
             requests.lock().unwrap().push(body);
-            let output = if continued {
+            let output = if malformed {
+                json!([{"type":"message","content":[{"type":"output_text","text":"working"}]},
+                    {"type":"function_call","name":"lookup","call_id":"call-bad","arguments":"{}"}])
+            } else if oversized {
+                let mut items = vec![json!({"type":"function_call","name":"lookup","call_id":"call-large","arguments":"{}"})];
+                items.extend((0..4096).map(|_| json!({"type":"reasoning","encrypted_content":"ciphertext"})));
+                json!(items)
+            } else if continued || fresh_turn {
                 json!([{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}])
             } else {
                 json!([{"type":"reasoning","id":"reason-1","encrypted_content":"ciphertext","summary":[]},
                     {"type":"function_call","id":"fn-1","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             };
             let mut events = String::new();
-            for (index, item) in output.as_array().unwrap().iter().enumerate() {
-                events.push_str(&format!("data: {}\n\n", json!({"type":"response.output_item.done","output_index":index,"item":item})));
+            if !malformed && !oversized {
+                for (index, item) in output.as_array().unwrap().iter().enumerate() {
+                    events.push_str(&format!("data: {}\n\n", json!({"type":"response.output_item.done","output_index":index,"item":item})));
+                }
             }
-            events.push_str(&format!("data: {}\n\n", json!({"type":"response.completed","response":{"id":"response-1","status":"completed","model":"model","output":[],"usage":{"input_tokens":20,"output_tokens":5}}})));
+            events.push_str(&format!("data: {}\n\n", json!({"type":"response.completed","response":{"id":"response-1","status":"completed","model":"model","output":if malformed || oversized { output } else { json!([]) },"usage":{"input_tokens":20,"output_tokens":5}}})));
             ([("content-type", "text/event-stream")], events).into_response()
         }
     )).route("/chat/completions", post(|| async {
@@ -268,6 +280,46 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         .as_object_mut()
         .unwrap()
         .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+    let mut recovered_histories = Vec::new();
+    for tool_result in [
+        json!({"role":"user", "tool_call_id":"call-1", "content":"tool result"}),
+        json!({"role":"user", "content":[
+            {"type":"text", "text":"tool output"},
+            {"type":"tool_result", "tool_use_id":"call-1", "content":"tool result"}
+        ]}),
+    ] {
+        let mut history = lost_interrupted.clone();
+        history.push(tool_result);
+        let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(history).unwrap();
+        for protocol in [
+            LlmProviderProtocol::OpenAiResponses,
+            LlmProviderProtocol::OpenAiCompatible,
+        ] {
+            let mut attempt = call(&restored, &tools, &scope, &base, &thinking);
+            attempt.route.inference_protocol = Some(protocol);
+            let error = call_llm_and_collect_with_stream_callback(
+                attempt,
+                LlmCancel::None,
+                None,
+                None,
+                RuntimeToolChoice::Auto,
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.message.contains("Check their effects"));
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+        restored.push(json!({"role":"user", "content":"start a new turn"}));
+        assert!(
+            prepare_streaming_call(
+                call(&restored, &tools, &scope, &base, &thinking),
+                RuntimeToolChoice::Auto,
+            )
+            .is_ok()
+        );
+        recovered_histories.push(restored);
+    }
     let mut lost_interrupted = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(lost_interrupted).unwrap();
     for protocol in [
         LlmProviderProtocol::OpenAiResponses,
@@ -693,6 +745,22 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         1,
         "the provider accepted the unverified low effort"
     );
+    for input in ["malformed terminal", "oversized terminal"] {
+        let messages = vec![json!({"role":"user", "content":input})];
+        let before = wire_requests.lock().unwrap().len();
+        let failure = call_llm_and_collect_with_stream_callback(
+            call(&messages, &tools, &scope, &base, &thinking),
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.kind, astra_core::ErrorKind::StreamTransport);
+        assert_eq!(wire_requests.lock().unwrap().len(), before + 1);
+    }
     for (text, kind) in [
         ("context failure", astra_core::ErrorKind::ContextWindow),
         ("billing failure", astra_core::ErrorKind::PaymentRequired),
@@ -753,6 +821,27 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             .to_string()
             .contains(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
     );
+    drop(requests);
+    for history in recovered_histories {
+        let mut attempt = call(&history, &tools, &scope, &base, &thinking);
+        attempt.route = LlmExecutionRoute::from_admitted(&first_execution);
+        let result = call_llm_and_collect_with_stream_callback(
+            attempt,
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "done");
+        assert!(result.tool_calls.is_empty());
+        let requests = wire_requests.lock().unwrap();
+        let input = &requests.last().unwrap()["input"];
+        assert!(input.to_string().contains("start a new turn"));
+        assert!(!input.to_string().contains("call-1"));
+    }
     server.abort();
 }
 #[async_trait]
@@ -1080,25 +1169,28 @@ async fn responses_transport_recovery_and_credential_fencing() {
     };
     use crate::turn::agentic_loop::finalization::run_agentic_loop_with_host;
     let workspace = tempfile::TempDir::new().unwrap();
+    let build_host = |session: &str, ledger: ProviderObservationsFixture| {
+        crate::server::server_loop_host::ServerAgenticLoopHostBuilder::new(
+            settings.clone(),
+            key.clone(),
+            owner.clone(),
+            session.to_owned(),
+        )
+        .with_provider_observations(ledger)
+        .with_model_service(Some(Arc::new(service.clone())))
+        .with_admitted_model_execution(Some(admitted.clone()))
+        .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
+        .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
+        .with_static_tool_catalog_admissible(true)
+        .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        ))
+        .build()
+    };
     let session = format!("capped-{}", uuid::Uuid::new_v4());
     let ledger = ProviderObservationsFixture::default();
-    let mut host = crate::server::server_loop_host::ServerAgenticLoopHostBuilder::new(
-        settings,
-        key,
-        owner.clone(),
-        session.clone(),
-    )
-    .with_provider_observations(ledger.clone())
-    .with_model_service(Some(Arc::new(service.clone())))
-    .with_admitted_model_execution(Some(admitted.clone()))
-    .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
-    .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
-    .with_static_tool_catalog_admissible(true)
-    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
-        WorkspaceBinding::server_sandbox(workspace.path()),
-        ExecutorBinding::server_local(),
-    ))
-    .build();
+    let mut host = build_host(&session, ledger.clone());
     let mut state = loop_state(&session, Vec::new(), "Write the requested file.");
     state.thinking = ThinkingConfig::ModelDefault;
     state.owner_user_id = Some(owner.clone());
@@ -1148,8 +1240,36 @@ async fn responses_transport_recovery_and_credential_fencing() {
     assert!(provider.state.script.lock().unwrap().is_empty());
     assert_eq!(ledger.attempt_count(), 2);
     ledger.assert_quiescent();
-    provider.state.scripted.store(false, Ordering::SeqCst);
+
     provider.state.output_limit.store(false, Ordering::SeqCst);
+    provider.state.requests.lock().unwrap().clear();
+    *provider.state.terminal_output.lock().unwrap() = Some(json!([
+        {"type":"message", "content":[{"type":"output_text", "text":"working"}]},
+        {"type":"function_call", "name":"write_file", "call_id":"bad-call",
+         "arguments":json!({"path":"malformed-effect.txt", "content":"executed"}).to_string()}
+    ]));
+    let invalid_session = format!("invalid-{}", uuid::Uuid::new_v4());
+    let invalid_ledger = ProviderObservationsFixture::default();
+    let mut invalid_host = build_host(&invalid_session, invalid_ledger.clone());
+    let mut invalid_state = loop_state(&invalid_session, Vec::new(), "Write the requested file.");
+    invalid_state.thinking = ThinkingConfig::ModelDefault;
+    invalid_state.owner_user_id = Some(owner.clone());
+    bind_server_workspace(&mut invalid_state, workspace.path()).await;
+    invalid_state.skills.request_constraints.allowed_tools =
+        Some(["write_file".to_owned()].into_iter().collect());
+    let outcome = run_agentic_loop_with_host(&mut invalid_host, &mut invalid_state).await;
+    assert!(outcome.is_err() || invalid_state.interruption.is_some());
+    assert_eq!(invalid_state.total_tool_calls, 0);
+    assert!(!workspace.path().join("malformed-effect.txt").exists());
+    assert_eq!(
+        provider.state.requests.lock().unwrap().len(),
+        1,
+        "outcome: {outcome:?}, interruption: {:?}",
+        invalid_state.interruption
+    );
+    invalid_ledger.assert_quiescent();
+
+    provider.state.scripted.store(false, Ordering::SeqCst);
     provider.state.requests.lock().unwrap().clear();
     provider.state.unterminated.store(true, Ordering::SeqCst);
     let attempts = Attempts::default();

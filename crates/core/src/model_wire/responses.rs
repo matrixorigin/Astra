@@ -61,35 +61,6 @@ pub fn validated_continuation(message: &Value) -> Option<Value> {
         .map(|item| replay_item(item, true))
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
-    for item in &items {
-        match item["type"].as_str()? {
-            "message" => {
-                if item["role"] != "assistant" {
-                    return None;
-                }
-                for part in item["content"].as_array()? {
-                    match part["type"].as_str()? {
-                        "output_text" => {
-                            part["text"].as_str()?;
-                        }
-                        "refusal" => {
-                            part["refusal"].as_str()?;
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-            "function_call" => {
-                let id = item["call_id"].as_str()?;
-                let name = item["name"].as_str()?;
-                if id.is_empty() || id.len() > 512 || name.is_empty() || name.len() > 128 {
-                    return None;
-                }
-            }
-            "reasoning" => {}
-            _ => return None,
-        }
-    }
     Some(
         ResponseOutput {
             items,
@@ -151,12 +122,7 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
         return Err("Provider function call has an unexpected namespace".into());
     }
     let keys: &[&str] = match item["type"].as_str() {
-        Some("message") => {
-            if item.get("role").is_some_and(|role| role != "assistant") {
-                return Err("Provider continuation cannot introduce instructions".into());
-            }
-            &["id", "type", "role", "status", "phase", "content"]
-        }
+        Some("message") => &["id", "type", "role", "status", "phase", "content"],
         Some("reasoning") => &["id", "type", "status", "summary", "encrypted_content"],
         Some("function_call") => &["id", "type", "status", "name", "arguments", "call_id"],
         _ => return Err("Unsupported provider continuation item".into()),
@@ -180,7 +146,35 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
         let value = String::from_utf8(bytes).map_err(|_| "Invalid encrypted reasoning encoding")?;
         object.insert("encrypted_content".into(), json!(value));
     }
-    Ok(Value::Object(object))
+    let item = Value::Object(object);
+    if item["type"] == "message" {
+        if item["role"] != "assistant" {
+            return Err("Invalid Responses message role".into());
+        }
+        let parts = item["content"]
+            .as_array()
+            .ok_or("Invalid Responses message content")?;
+        for part in parts {
+            let value = match part["type"].as_str() {
+                Some("output_text") => part["text"].as_str(),
+                Some("refusal") => part["refusal"].as_str(),
+                _ => None,
+            };
+            if value.is_none() {
+                return Err("Invalid Responses message part".into());
+            }
+        }
+    } else if item["type"] == "function_call" {
+        let valid = |value: &Value, max_len| {
+            value.as_str().is_some_and(|value| {
+                !value.is_empty() && value.len() <= max_len && !value.chars().any(char::is_control)
+            })
+        };
+        if !valid(&item["call_id"], 512) || !valid(&item["name"], 128) {
+            return Err("Invalid Responses function identity".into());
+        }
+    }
+    Ok(item)
 }
 
 fn has_replayable_reasoning(item: &Value) -> bool {
@@ -519,7 +513,15 @@ pub struct ResponseOutput {
 }
 impl ResponseOutput {
     pub fn continuation(&self, connection: &str, model: &str) -> Value {
-        let mut items = self.items.clone();
+        // A text-only response can reveal reasoning capability without
+        // providing replayable private state. Keep that observation available
+        // to probes, but omit unusable state from the saved continuation.
+        let mut items: Vec<_> = self
+            .items
+            .iter()
+            .filter(|item| has_replayable_reasoning(item))
+            .cloned()
+            .collect();
         for item in &mut items {
             if item["type"] == "reasoning" {
                 // This is already provider-encrypted, opaque state. Encoding
@@ -813,15 +815,22 @@ impl ResponseAccumulator {
             .as_array()
             .filter(|items| !items.is_empty())
         {
-            items.clone()
+            if items.len() > MAX_CONTINUATION_ITEMS {
+                return Err(ResponsesStreamError::Codec(
+                    "Too many Responses output items",
+                ));
+            }
+            items
+                .iter()
+                .map(|item| replay_item(item, false))
+                .collect::<Result<Vec<_>, _>>()
         } else {
-            self.items.values().cloned().collect()
+            self.items
+                .values()
+                .map(|item| replay_item(item, false))
+                .collect::<Result<Vec<_>, _>>()
         };
-        self.output.items = items
-            .iter()
-            .map(|item| replay_item(item, false))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ResponsesStreamError::Codec(INVALID_OUTPUT))?;
+        self.output.items = items.map_err(|_| ResponsesStreamError::Codec(INVALID_OUTPUT))?;
         if self.output.items.is_empty() {
             return Err(ResponsesStreamError::Codec(
                 "Responses terminal output is missing",
@@ -879,15 +888,12 @@ impl ResponseAccumulator {
         {
             return Err(ResponsesStreamError::Codec(REASONING_CONTINUATION_MISSING));
         }
-        if call_ids.is_empty() {
-            // Text can still complete when a provider returned unusable
-            // reasoning, but that private state cannot be replayed later.
-            self.output.items.retain(has_replayable_reasoning);
-            if self.output.items.is_empty() {
-                return Err(ResponsesStreamError::Codec(
-                    "Responses terminal output is missing",
-                ));
-            }
+        // Text can still complete when a provider returned unusable
+        // reasoning, but that private state cannot be replayed later.
+        if call_ids.is_empty() && !self.output.items.iter().any(has_replayable_reasoning) {
+            return Err(ResponsesStreamError::Codec(
+                "Responses terminal output is missing",
+            ));
         }
         if !text.is_empty() {
             self.output.text = text;
@@ -1095,30 +1101,44 @@ mod tests {
 
     #[test]
     fn text_without_replayable_reasoning_remains_usable_in_the_next_turn() {
-        let output = decode_sse(&sse(&[completion(json!([
-            {"type":"reasoning", "summary":[]},
-            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
-        ]))]))
-        .unwrap();
-        assert_eq!(output.text, "answer");
-        assert_eq!(output.items.len(), 1);
-        let mut assistant = json!({"role":"assistant", "content":output.text});
-        assistant[CONTINUATION_KEY] = output.continuation("scope", "model");
-        let request = request(
-            "model",
-            &[
-                json!({"role":"user", "content":"question"}),
-                assistant,
-                json!({"role":"user", "content":"continue"}),
-            ],
-            None,
-            "scope",
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(request["input"].to_string().contains("answer"));
-        assert!(!request["input"].to_string().contains("reasoning"));
+        for reasoning in [
+            json!({"type":"reasoning", "summary":[]}),
+            json!({"type":"reasoning", "encrypted_content":null, "summary":[]}),
+            json!({"type":"reasoning", "encrypted_content":"", "summary":[]}),
+            json!({"type":"reasoning", "_astra_encrypted_content_b64":"b3BhcXVl", "summary":[]}),
+        ] {
+            let output = decode_sse(&sse(&[completion(json!([
+                reasoning,
+                {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+            ]))]))
+            .unwrap();
+            assert_eq!(output.text, "answer");
+            assert!(output.items.iter().any(|item| item["type"] == "reasoning"));
+            let mut assistant = json!({"role":"assistant", "content":output.text});
+            assistant[CONTINUATION_KEY] = output.continuation("scope", "model");
+            assert!(
+                assistant[CONTINUATION_KEY]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["type"] != "reasoning")
+            );
+            let request = request(
+                "model",
+                &[
+                    json!({"role":"user", "content":"question"}),
+                    assistant,
+                    json!({"role":"user", "content":"continue"}),
+                ],
+                None,
+                "scope",
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(request["input"].to_string().contains("answer"));
+            assert!(!request["input"].to_string().contains("reasoning"));
+        }
     }
 
     #[test]

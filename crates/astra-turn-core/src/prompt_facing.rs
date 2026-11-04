@@ -298,6 +298,11 @@ fn sanitize_canonical_continuation_messages_impl(
         }
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
         match role {
+            // Provider tool-result envelopes may use the user role, but they
+            // do not establish a new human turn or authorize its tool history.
+            "user" if !astra_turn_types::is_human_user_message(message) => {
+                index += 1;
+            }
             "user" | "system" => {
                 if let Some(projected) = canonical_text_message(message, role, role == "user") {
                     out.push(projected);
