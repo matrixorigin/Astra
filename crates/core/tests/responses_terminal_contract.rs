@@ -109,11 +109,20 @@ fn completed_functions_require_complete_items_including_saved_replay() {
                     );
                 }
             }
-            let mut saved = json!({"role":"assistant","content":"","tool_calls":[{"id":"call-fixture","function":{"name":"read_file","arguments":"{}"}}]});
+            let is_call = item["type"] == "function_call";
+            let mut saved = json!({"role":"assistant","content":""});
+            if is_call {
+                saved["tool_calls"] =
+                    json!([{"id":"call-fixture","function":{"name":"read_file","arguments":"{}"}}]);
+            }
             saved[CONTINUATION_KEY] =
                 json!({"connection_id":connection,"model":"model","items":[item]});
             assert_eq!(validated_continuation(&saved).is_some(), allowed);
-            let wire = request("model", &[saved], None, connection, false, None);
+            let mut messages = vec![saved];
+            if is_call {
+                messages.push(json!({"role":"tool","tool_call_id":"call-fixture","content":"ok"}));
+            }
+            let wire = request("model", &messages, None, connection, false, None);
             assert_eq!(wire.is_ok(), allowed);
             if let Ok(wire) = wire {
                 assert!(

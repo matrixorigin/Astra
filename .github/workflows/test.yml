@@ -637,6 +637,7 @@ jobs:
         env:
           ASTRA_TEST_DB_IT: "1"
           ASTRA_TEST_DB_IT_TEST_THREADS: "1"
+          ASTRA_BYOK_DEEPSEEK_BASE_URL: http://127.0.0.1:18994
         run: make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
       - name: Dump dependency logs
         if: failure() && env.RUN_TESTS == 'true'
