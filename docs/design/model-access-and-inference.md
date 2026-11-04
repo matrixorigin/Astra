@@ -44,7 +44,7 @@ The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
 backbone, invocation/provider-attempt ledger, tool execution, cancellation,
 canonical history and checkpoint paths as API-key models. `chatgpt` selects
 the shared Responses codec; it does not create another session state machine.
-Administrator-managed API-key Offerings can explicitly select the same Responses
+Administrator-managed and personal API-key Offerings can explicitly select the same Responses
 wire protocol. Protocol selection is independent of credential ownership: API
 keys use their admitted endpoint and headers, while subscriptions retain their
 connection fencing and refresh rules. API-key continuation state is scoped to
@@ -53,6 +53,19 @@ header names are case-insensitive, and invalid or duplicate configured headers
 are rejected at configuration and execution admission. Probe-only and unrelated
 capability changes do not invalidate it. Model checks use
 the selected wire protocol; the ordinary provider default remains unchanged.
+Personal model configuration stores the protocol separately from the optional
+thinking observation. Credential rotation and concurrent checks are fenced by
+the existing model row. A Responses tool group retains its scoped provider
+evidence across canonical projection; incomplete or inconsistent evidence
+stops the current continuation before provider dispatch. A later human turn can
+continue with the completed canonical tool pairs. No separate continuation
+table or per-request database lookup is introduced.
+An effort accepted by one probe is an observation, not a complete provider
+inventory. Personal Responses models can try an unverified effort; a provider
+rejection is reported without silently changing the requested setting. The
+model default sends no effort override. Subscription catalogs retain their
+declared effort lists; administrator routes without a declaration continue to
+limit explicit controls to observed values.
 Explicit request temperatures are not silently discarded. Internal memory
 judgments express a deterministic sampling preference; when Responses sampling
 support is not established they use the provider default and the admitted
@@ -125,10 +138,13 @@ decoding and its connection fences, including cancellation during a stream.
 Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
 before wire encoding, including direct auxiliary calls. Requests send full
 history with `store:false` and `stream:true`.
-Astra functions occupy the `astra` namespace. Completed provider output items,
+Functions use the standard flat Responses tool format. Completed provider output items,
 including encrypted reasoning and message phase, live in private canonical
-assistant-message metadata before tool execution/final checkpoint. Opaque
-provider-encrypted reasoning is base64 encoded for storage so generic text
+assistant-message metadata before tool execution/final checkpoint. Stateless
+Responses return encrypted reasoning without an `include` override. If a tool
+round contains reasoning without replayable encrypted content, Astra stops
+before executing its calls. Opaque provider-encrypted reasoning is base64
+encoded for storage so generic text
 redaction cannot corrupt ciphertext. Function arguments come from the canonical
 assistant tool calls; private metadata retains no second raw argument copy. Resume
 replays them only for the same connection and model; other protocols remove

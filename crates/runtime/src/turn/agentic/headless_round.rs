@@ -653,6 +653,347 @@ mod tests {
     use crate::orchestration::{InheritedPermissions, PermissionMode, PermissionSyncContext};
     use serde_json::json;
 
+    struct TestSkillResolver(usize);
+
+    impl astra_skills::traits::SkillResolver for TestSkillResolver {
+        fn resolve(
+            &self,
+            name: &str,
+        ) -> Result<astra_skills::traits::ResolvedSkill, astra_skills::SkillError> {
+            Ok(astra_skills::traits::ResolvedSkill {
+                name: name.into(),
+                instructions: "x".repeat(self.0),
+                max_tokens: None,
+                allowed_tools: Vec::new(),
+                execution_context: astra_skills::manifest::ExecutionContext::Inline,
+                hooks: astra_skills::hooks::SkillHooks::default(),
+                skill_dir: None,
+                source: astra_skills::manifest::SkillSourceKind::Local,
+                success_criteria: Vec::new(),
+                composition: None,
+                input_schema: None,
+                output_schema: None,
+                remote_url: None,
+                forward_headers: Vec::new(),
+                required_headers: Vec::new(),
+                aliases: Vec::new(),
+                effort: None,
+                agent_type: None,
+                trust_tier: astra_skills::manifest::TrustTier::Bundled,
+            })
+        }
+
+        fn available_skills(&self) -> Vec<astra_skills::traits::SkillToolInfo> {
+            vec![astra_skills::traits::SkillToolInfo {
+                name: "fixture".into(),
+                description: "test skill".into(),
+                ..Default::default()
+            }]
+        }
+    }
+
+    fn skill_and_sibling_calls() -> Vec<Value> {
+        vec![
+            json!({"id":"skill-call","type":"function","function":{
+                "name":"skill","arguments":"{\"skill_name\":\"fixture\"}"
+            }}),
+            json!({"id":"read-call","type":"function","function":{
+                "name":"read_file","arguments":"{}"
+            }}),
+        ]
+    }
+
+    async fn intercept_skill_round(
+        size: usize,
+        edge: Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult>,
+        client_owned: bool,
+    ) -> (
+        super::super::tool_interception::PreparedToolRound,
+        crate::turn::agentic_loop::host::AgenticLoopState,
+    ) {
+        use crate::turn::agentic::tool_interception::{
+            admit_tool_calls, try_prepare_intercepted_tool_round,
+        };
+        let calls = skill_and_sibling_calls();
+        let mut state = crate::turn::agentic_loop::host::tests::make_state();
+        state.skills.resolver = Some(std::sync::Arc::new(TestSkillResolver(size)));
+        if client_owned {
+            state
+                .skills
+                .client_pipeline_skills
+                .push(astra_turn_types::SkillCatalogIdentity {
+                    name: "fixture".into(),
+                    aliases: Vec::new(),
+                });
+        }
+        let admission = admit_tool_calls(&calls, Some("tool_calls"));
+        assert!(admission.rejected.is_empty());
+        let turn = crate::turn::agentic_loop::host::HostTurnResult {
+            accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                tool_calls: calls.clone(),
+                has_tool_calls: true,
+                ..Default::default()
+            },
+            ttft_ms: None,
+            error_kind: None,
+        };
+        let prepared = try_prepare_intercepted_tool_round(
+            &mut state,
+            &turn,
+            edge,
+            &admission.admitted,
+            &calls,
+            admission.rejected,
+        )
+        .await
+        .unwrap();
+        (prepared, state)
+    }
+
+    #[tokio::test]
+    async fn skill_siblings_keep_responses_round_complete() {
+        use crate::turn::llm::client::{
+            LlmCall, LlmCancel, LlmExecutionRoute, RuntimeToolChoice,
+            call_llm_and_collect_with_stream_callback,
+        };
+        use astra_core::model_wire::{LlmProviderProtocol, thinking::ThinkingProtocol};
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route("/responses", post(|State(requests): State<Arc<Mutex<Vec<Value>>>>, Json(body): Json<Value>| async move {
+                requests.lock().unwrap().push(body);
+                let item = json!({"type":"message","id":"answer","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]});
+                let event = json!({"type":"response.output_item.done","output_index":0,"item":item});
+                let done = json!({"type":"response.completed","response":{"id":"r1","status":"completed","model":"fixture-model","output":[]}});
+                ([("content-type", "text/event-stream")], format!("data: {event}\n\ndata: {done}\n\n")).into_response()
+            }))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let scope = format!("sha256:{}", "a".repeat(64));
+
+        for size in [10, 600] {
+            let (prepared, _) = intercept_skill_round(size, Vec::new(), false).await;
+            assert_eq!(prepared.physical_tool_calls.len(), 2);
+            assert_eq!(prepared.pre_resolved_results.len(), 2);
+            let calls = skill_and_sibling_calls();
+            let items = calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "type":"function_call", "call_id":call["id"],
+                        "name":call["function"]["name"], "arguments":call["function"]["arguments"]
+                    })
+                })
+                .collect();
+            let continuation = astra_core::model_wire::responses::ResponseOutput {
+                items,
+                ..Default::default()
+            }
+            .continuation(&scope, "fixture-model");
+            let mut messages = vec![json!({"role":"user","content":"use the skill"})];
+            let mut tool_results = Vec::new();
+            let mut step = StepRecorder::new("user", "session", "skill-round");
+            let opening = prepare_headless_tool_round(
+                None,
+                &prepared.physical_tool_calls,
+                &prepared.logical_tool_calls,
+                &prepared.edge_tool_round,
+                "",
+                "",
+                Some(&continuation),
+                &prepared.pre_resolved_results,
+                &mut messages,
+                &mut tool_results,
+                &mut step,
+                0,
+            )
+            .await;
+            assert!(opening.pre_resolved_ids.contains("read-call"));
+            assert!(messages.iter().any(|m| m["tool_call_id"] == "read-call"
+                && m["content"].as_str().unwrap().contains("Deferred")));
+            let thinking = ThinkingConfig::ModelDefault;
+            let result = call_llm_and_collect_with_stream_callback(
+                LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools: &[],
+                    cache_capability: None,
+                    route: LlmExecutionRoute {
+                        inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                        response_scope: Some(&scope),
+                        subscription: None,
+                        fixed_temperature: None,
+                        supported_reasoning_efforts: None,
+                        thinking_protocol: Some(ThinkingProtocol::ResponsesReasoning),
+                        model_name: "fixture-model",
+                        wire_model_name: None,
+                        api_key: "fixture-key",
+                        base_url: &base,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: Some(1024),
+                    temperature: None,
+                    thinking: &thinking,
+                },
+                LlmCancel::None,
+                None,
+                None,
+                RuntimeToolChoice::Auto,
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "done");
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            let input = request["input"].as_array().unwrap();
+            for id in ["skill-call", "read-call"] {
+                assert_eq!(
+                    input
+                        .iter()
+                        .filter(|item| item["type"] == "function_call" && item["call_id"] == id)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    input
+                        .iter()
+                        .filter(
+                            |item| item["type"] == "function_call_output" && item["call_id"] == id
+                        )
+                        .count(),
+                    1
+                );
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn skill_interception_preserves_edge_custody_and_conflicts() {
+        use astra_turn_core::headless_tool_assembly::{
+            EdgeMatchConflict, EdgeMatchOutcome, take_edge_output_for_tool_call_id_with_duration,
+        };
+        use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+
+        let edge = |name: &str| EdgeToolExecResult {
+            work_attribution: None,
+            execution_completion: None,
+            request_id: "read-call".into(),
+            tool: name.into(),
+            args: json!({}),
+            output: "already executed".into(),
+            tool_result_fields: None,
+            status: "completed".into(),
+            duration_ms: 1,
+        };
+        for (callbacks, expected) in [
+            (vec![edge("read_file")], EdgeMatchOutcome::Exact),
+            (
+                vec![edge("other")],
+                EdgeMatchOutcome::Conflict(EdgeMatchConflict::ToolNameMismatch),
+            ),
+            (
+                vec![edge("read_file"), edge("read_file")],
+                EdgeMatchOutcome::Conflict(EdgeMatchConflict::DuplicateIdentity),
+            ),
+        ] {
+            let (prepared, _) = intercept_skill_round(600, callbacks, false).await;
+            assert_eq!(prepared.physical_tool_calls.len(), 2);
+            assert!(
+                prepared
+                    .pre_resolved_results
+                    .iter()
+                    .all(|result| result.call_id != "read-call")
+            );
+            let mut consumed = vec![false; prepared.edge_tool_round.len()];
+            let matched = take_edge_output_for_tool_call_id_with_duration(
+                "read-call",
+                "read_file",
+                &prepared.edge_tool_round,
+                &mut consumed,
+            );
+            assert_eq!(matched.match_outcome, expected);
+            if expected == EdgeMatchOutcome::Exact {
+                assert_eq!(matched.output, "already executed");
+            }
+        }
+
+        let calls = skill_and_sibling_calls();
+        let mut state = crate::turn::agentic_loop::host::tests::make_state();
+        let admission = crate::turn::agentic::tool_interception::admit_tool_calls(&calls, None);
+        let turn = crate::turn::agentic_loop::host::HostTurnResult {
+            accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                tool_calls: calls.clone(),
+                ..Default::default()
+            },
+            ttft_ms: None,
+            error_kind: None,
+        };
+        let result = crate::turn::agentic::tool_interception::try_prepare_intercepted_tool_round(
+            &mut state,
+            &turn,
+            vec![edge("read_file")],
+            &admission.admitted,
+            &calls,
+            vec![crate::turn::agentic_loop::host::RejectedToolCall::ordinary(
+                calls[1].clone(),
+                "rejected".into(),
+            )],
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an execution receipt must not be replaced by a rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_owned_skill_callback_keeps_selection_and_custody() {
+        let callback = astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            work_attribution: None,
+            execution_completion: None,
+            request_id: "skill-call".into(),
+            tool: "skill".into(),
+            args: json!({}),
+            output: "client skill instructions".into(),
+            tool_result_fields: None,
+            status: "completed".into(),
+            duration_ms: 1,
+        };
+        let (prepared, state) = intercept_skill_round(600, vec![callback], true).await;
+        assert!(
+            state
+                .telemetry
+                .all_selected_skills
+                .iter()
+                .any(|name| name == "fixture")
+        );
+        assert!(
+            prepared
+                .pre_resolved_results
+                .iter()
+                .all(|result| result.call_id != "skill-call")
+        );
+        assert_eq!(
+            prepared.edge_tool_round[0].output,
+            "client skill instructions"
+        );
+    }
+
     fn server_idx(i: usize) -> usize {
         i
     }

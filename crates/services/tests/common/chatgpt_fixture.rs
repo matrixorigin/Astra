@@ -42,6 +42,7 @@ pub struct ProviderState {
     pub quota: AtomicBool,
     pub refresh_error: AtomicU16,
     pub requests: Mutex<Vec<Value>>,
+    pub terminal_output: Mutex<Option<Value>>,
     pub responses_calls: AtomicUsize,
     pub hold_responses: AtomicBool,
     pub truncate: AtomicBool,
@@ -92,6 +93,7 @@ impl ProviderFixture {
             quota: AtomicBool::new(false),
             refresh_error: AtomicU16::new(0),
             requests: Mutex::new(Vec::new()),
+            terminal_output: Mutex::new(None),
             responses_calls: AtomicUsize::new(0),
             hold_responses: AtomicBool::new(false),
             truncate: AtomicBool::new(false),
@@ -391,8 +393,11 @@ async fn responses(
     assert_eq!(body["stream"], true);
     // Budgeted subscription calls legitimately carry `max_output_tokens`; the
     // remaining keys stay forbidden on the subscription v1 wire.
-    for key in ["temperature", "previous_response_id", "messages"] {
+    for key in ["temperature", "previous_response_id", "messages", "include"] {
         assert!(body.get(key).is_none(), "unexpected {key}");
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        assert!(tools.iter().all(|tool| tool["type"] == "function"));
     }
     assert!(
         body["input"]
@@ -402,6 +407,10 @@ async fn responses(
             .all(|item| item["role"] != "system")
     );
     state.requests.lock().unwrap().push(body.clone());
+    if let Some(output) = state.terminal_output.lock().unwrap().take() {
+        let event = json!({"type":"response.completed","response":{"id":"response-fixture","status":"completed","model":body["model"],"output":output}});
+        return (StatusCode::OK, content, format!("data: {event}\n\n"));
+    }
     let continued = body["input"]
         .as_array()
         .unwrap()
@@ -420,15 +429,15 @@ async fn responses(
     let mut output = if let Some((name, arguments)) = action {
         let index = state.responses_calls.load(Ordering::SeqCst);
         json!([{"type":"reasoning","id":format!("reasoning-{index}"),"encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]},
-            {"type":"function_call","id":format!("function-{index}"),"namespace":"astra","name":name,"call_id":format!("call-{index}"),"arguments":arguments.to_string(),"status":"completed"}])
+            {"type":"function_call","id":format!("function-{index}"),"name":name,"call_id":format!("call-{index}"),"arguments":arguments.to_string(),"status":"completed"}])
     } else if !state.scripted.load(Ordering::SeqCst)
         && body.get("tools").is_some()
         && body["tool_choice"] != "none"
         && !continued
     {
-        let name = body["tools"][0]["tools"][0]["name"].as_str().unwrap();
+        let name = body["tools"][0]["name"].as_str().unwrap();
         json!([{"type":"reasoning","id":"reasoning-1","encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]},
-            {"type":"function_call","id":"function-1","namespace":"astra","name":name,"call_id":"call-1","arguments":"{}","status":"completed"}])
+            {"type":"function_call","id":"function-1","name":name,"call_id":"call-1","arguments":"{}","status":"completed"}])
     } else {
         json!([{"type":"message","id":"message-1","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":if continued {"Continued successfully"} else {"OK"},"annotations":[]}]}])
     };

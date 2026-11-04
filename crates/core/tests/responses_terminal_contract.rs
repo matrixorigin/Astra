@@ -14,7 +14,7 @@ fn decode(
     decode_sse(&format!("data: {event}\n\n"))
 }
 fn call(status: Option<&str>) -> Value {
-    let mut item = json!({"type":"function_call","id":"fc-fixture","namespace":"astra","call_id":"call-fixture","name":"read_file","arguments":"{}"});
+    let mut item = json!({"type":"function_call","id":"fc-fixture","call_id":"call-fixture","name":"read_file","arguments":"{}"});
     if let Some(status) = status {
         item["status"] = json!(status);
     }
@@ -109,11 +109,20 @@ fn completed_functions_require_complete_items_including_saved_replay() {
                     );
                 }
             }
-            let mut saved = json!({"role":"assistant","content":"","tool_calls":[{"id":"call-fixture","function":{"name":"read_file","arguments":"{}"}}]});
+            let is_call = item["type"] == "function_call";
+            let mut saved = json!({"role":"assistant","content":""});
+            if is_call {
+                saved["tool_calls"] =
+                    json!([{"id":"call-fixture","function":{"name":"read_file","arguments":"{}"}}]);
+            }
             saved[CONTINUATION_KEY] =
                 json!({"connection_id":connection,"model":"model","items":[item]});
             assert_eq!(validated_continuation(&saved).is_some(), allowed);
-            let wire = request("model", &[saved], None, connection, false, None);
+            let mut messages = vec![saved];
+            if is_call {
+                messages.push(json!({"role":"tool","tool_call_id":"call-fixture","content":"ok"}));
+            }
+            let wire = request("model", &messages, None, connection, false, None);
             assert_eq!(wire.is_ok(), allowed);
             if let Ok(wire) = wire {
                 assert!(
@@ -132,6 +141,83 @@ fn completed_functions_require_complete_items_including_saved_replay() {
             "required {field}"
         );
     }
+}
+
+#[test]
+fn completed_tool_rounds_validate_the_same_items_before_execution_and_replay() {
+    let connection = "00000000-0000-4000-8000-000000000001";
+    let valid = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]});
+    let invalid_messages = [
+        json!({"type":"message","content":[{"type":"output_text","text":"working"}]}),
+        json!({"type":"message","role":"assistant","content":[{"type":"output_text"}]}),
+        json!({"type":"message","role":"assistant","content":[{"type":"unknown","text":"working"}]}),
+    ];
+    assert!(decode(terminal("completed", json!([valid, call(None)]))).is_ok());
+    for invalid in invalid_messages {
+        for finished_items in [false, true] {
+            let items = vec![invalid.clone(), call(None)];
+            let mut stream = String::new();
+            if finished_items {
+                for (index, item) in items.iter().enumerate() {
+                    stream.push_str(&format!(
+                        "data: {}\n\n",
+                        json!({"type":"response.output_item.done","output_index":index,"item":item})
+                    ));
+                }
+            }
+            let output = if finished_items {
+                json!([])
+            } else {
+                json!(items)
+            };
+            stream.push_str(&format!("data: {}\n\n", terminal("completed", output)));
+            assert!(decode_sse(&stream).is_err(), "invalid message: {invalid}");
+        }
+        let saved = json!({"role":"assistant", CONTINUATION_KEY:{
+            "connection_id":connection,"model":"model","items":[invalid,call(None)]
+        }});
+        assert!(validated_continuation(&saved).is_none());
+    }
+
+    for (field, value) in [
+        ("call_id", "x".repeat(513)),
+        ("call_id", "call\ninvalid".to_owned()),
+        ("name", "x".repeat(129)),
+    ] {
+        let mut invalid = call(None);
+        invalid[field] = json!(value);
+        assert!(decode(terminal("completed", json!([invalid]))).is_err());
+        let saved = json!({"role":"assistant", CONTINUATION_KEY:{
+            "connection_id":connection,"model":"model","items":[invalid]
+        }});
+        assert!(validated_continuation(&saved).is_none());
+    }
+
+    let mut items: Vec<_> = (0..4095)
+        .map(|index| json!({"type":"message","id":format!("m{index}"),"role":"assistant","content":[{"type":"output_text","text":"x"}]}))
+        .collect();
+    items.push(call(None));
+    let output = decode(terminal("completed", json!(items))).unwrap();
+    assert_eq!(output.tool_calls.len(), 1);
+    items.push(json!({"type":"reasoning","encrypted_content":"ciphertext"}));
+    assert!(decode(terminal("completed", json!(items))).is_err());
+
+    let mut stream = String::new();
+    for index in 0..4097 {
+        let item = if index == 0 {
+            call(None)
+        } else {
+            json!({"type":"reasoning","encrypted_content":"ciphertext"})
+        };
+        stream.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.output_item.done","output_index":index,"item":item
+            })
+        ));
+    }
+    stream.push_str(&format!("data: {}\n\n", terminal("completed", json!([]))));
+    assert!(decode_sse(&stream).is_err());
 }
 
 fn message(id: &str, text: &str, status: &str) -> Value {

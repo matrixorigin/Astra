@@ -224,15 +224,20 @@ pub(crate) fn canonical_commit_delta(
     // A resumed suffix may continue the admitted user turn without another
     // human message; do not sanitize it as an unrelated empty conversation.
     let has_prior_user_context = mode == astra_turn_types::CanonicalDeltaModeV1::Append
-        && prior_messages.iter().rev().any(|message| {
-            message["role"] == "user" && !astra_turn_types::is_runtime_owned_message(message)
-        });
-    let canonical_changed =
+        && prior_messages
+            .iter()
+            .any(astra_turn_types::is_human_user_message);
+    let canonical_changed = if mode == astra_turn_types::CanonicalDeltaModeV1::Replace {
+        astra_turn_core::prompt_facing::sanitize_canonical_replacement_with_turn_semantics(
+            changed_messages.to_vec(),
+        )
+    } else {
         astra_turn_core::prompt_facing::sanitize_canonical_turn_delta_with_turn_semantics(
             changed_messages.to_vec(),
             has_prior_user_context,
         )
-        .map_err(|error| format!("canonical turn contains invalid user-turn semantics: {error}"))?;
+    }
+    .map_err(|error| format!("canonical turn contains invalid user-turn semantics: {error}"))?;
     let logical_segments = pack_canonical_turn_segments(canonical_changed);
     if logical_segments.is_empty() {
         return if allow_empty_delta {
@@ -350,6 +355,17 @@ mod tests {
             ),
             (vec![authority()], false),
             (
+                vec![json!({"role":"user", "tool_call_id":"call-1", "content":"result"})],
+                false,
+            ),
+            (
+                vec![json!({"role":"user", "content":[
+                    {"type":"text", "text":"result"},
+                    {"type":"tool_result", "tool_use_id":"call-1", "content":"done"}
+                ]})],
+                false,
+            ),
+            (
                 vec![json!({"role": "user", "content": "try the capability"})],
                 true,
             ),
@@ -378,6 +394,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn compacted_replacement_preserves_unanchored_incomplete_evidence() {
+        let mut marker = json!({"role":"assistant", "content":"", "tool_calls":[]});
+        marker[astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD] = json!(true);
+        let mut prior = vec![json!({"role":"system", "content":"instructions"}), marker];
+        prior.extend(
+            (0..10).map(|_| json!({"role":"assistant", "content":"progress ".repeat(100)})),
+        );
+        let mut proof = CanonicalRewriteProof::from_materialized_admission(&prior, "root", 1);
+        let permit = proof.begin(&prior);
+        let mut replacement = prior.clone();
+        assert!(
+            crate::turn::cloud::compaction::compact_middle_messages(&mut replacement, 2, false)
+                .estimated_tokens_freed
+                > 0
+        );
+        proof.finish(permit, &replacement, None);
+        let (mode, packs) = canonical_commit_delta(&prior, true, &replacement, Some(&proof), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+        let committed = packs.concat();
+        let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+        assert!(restored.iter().any(|message| {
+            message[astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD] == true
+        }));
+        let mut next_turn = restored;
+        next_turn.push(json!({"role":"user", "content":"continue"}));
+        let next_turn = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(next_turn).unwrap();
+        assert!(next_turn.iter().all(|message| {
+            message
+                .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_none()
+        }));
     }
 
     #[test]

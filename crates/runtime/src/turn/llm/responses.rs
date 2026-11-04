@@ -21,6 +21,11 @@ pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::Clas
             "The model configuration changed during this turn. Start a new turn to continue."
                 .to_string()
         }
+        "responses_continuation_incomplete" => INCOMPLETE_TOOL_CONTINUATION_MESSAGE.to_string(),
+        "responses_reasoning_continuation_missing" | "responses_invalid_output" => {
+            "The selected model returned an incomplete response. Check the model configuration or choose another model."
+                .to_string()
+        }
         _ => format!("Model request failed: {code}"),
     };
     astra_core::ClassifiedError::new(kind, message)
@@ -138,20 +143,22 @@ pub(super) fn prepare(
         .iter()
         .rposition(astra_turn_types::is_human_user_message)
         .map_or(0, |index| index + 1);
-    if call.messages[active_start..].iter().any(|message| {
-        message["role"] == "assistant"
-            && message["tool_calls"]
-                .as_array()
-                .is_some_and(|calls| !calls.is_empty())
-            && message
-                .get(astra_core::model_wire::responses::CONTINUATION_KEY)
-                .is_some_and(|saved| saved["connection_id"] != scope || saved["model"] != model)
-    }) {
-        return Err(error(
+    astra_core::model_wire::responses::validate_active_continuations(
+        &call.messages[active_start..],
+        model,
+        scope,
+        astra_turn_core::tool::args::shape::provider_tool_call_id,
+    )
+    .map_err(|cause| {
+        error(
             astra_core::ErrorKind::InvalidRequest,
-            "responses_continuation_scope_changed",
-        ));
-    }
+            if cause == astra_core::model_wire::responses::CONTINUATION_SCOPE_CHANGED {
+                "responses_continuation_scope_changed"
+            } else {
+                "responses_continuation_incomplete"
+            },
+        )
+    })?;
     // Direct and pre-projected calls share runtime authority/order, continuation
     // and provider-call-ID projection before the codec encodes the request.
     let messages = consolidate_system_messages_for_protocol(
@@ -177,6 +184,8 @@ pub(super) fn prepare(
             astra_core::ErrorKind::InvalidRequest,
             if cause == astra_core::model_wire::responses::CONTINUATION_SCOPE_CHANGED {
                 "responses_continuation_scope_changed"
+            } else if cause == astra_core::model_wire::responses::CONTINUATION_INCOMPLETE {
+                "responses_continuation_incomplete"
             } else if call.route.subscription.is_some() {
                 "unsupported_subscription_input"
             } else {
@@ -184,9 +193,6 @@ pub(super) fn prepare(
             },
         )
     })?;
-    if call.route.subscription.is_none() {
-        body["include"] = json!(["reasoning.encrypted_content"]);
-    }
     call.thinking.apply_openai_protocol(
         &mut body,
         astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning,

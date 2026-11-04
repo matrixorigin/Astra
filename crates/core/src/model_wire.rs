@@ -6,6 +6,20 @@ pub mod purpose;
 pub mod responses;
 pub mod thinking;
 
+/// Append an API path without placing it after the base URL's query.
+pub fn endpoint_url(base_url: &str, endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(base_url) else {
+        return base_url.to_owned();
+    };
+    let path = format!(
+        "{}/{}",
+        url.path().trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    );
+    url.set_path(&path);
+    url.into()
+}
+
 /// Wire format used for inference, independent of credential ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

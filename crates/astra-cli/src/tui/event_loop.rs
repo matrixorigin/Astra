@@ -22890,6 +22890,52 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn personal_responses_picker_allows_unverified_efforts() {
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session-1");
+        let rows = serde_json::from_value(serde_json::json!([{
+            "offering_id":"personal-offer", "access_id":"cloud-byok", "access_kind":"cloud_byok",
+            "access_label":"Personal", "execution_placement":"server", "name":"personal model", "provider":"openai",
+            "thinking_capability":null, "thinking_protocol":"responses_reasoning",
+            "is_active":true, "context_window":128000, "max_completion_tokens":null, "architecture":null
+        }])).unwrap();
+        bottom_pane.cache_model_catalog(rows);
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &bottom_pane::view::ViewResult::Model {
+                    name: "personal model".into()
+                },
+                &mut state,
+                &mut bottom_pane,
+                &mut widget,
+            ),
+            Some(true)
+        );
+        let low = bottom_pane::view::ViewResult::ModelThinking {
+            base_model: "personal model".into(),
+            config: ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+        };
+        assert_eq!(
+            slash_dispatch::apply_model_picker_result(
+                &low,
+                &mut state,
+                &mut bottom_pane,
+                &mut widget,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            bottom_pane.footer.model.as_deref(),
+            Some("personal model(thinking:low)")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn subscription_reasoning_picker_revalidates_exact_inventory() {
         use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
         let mut state = crate::cli::session::session_state::SessionState::default();

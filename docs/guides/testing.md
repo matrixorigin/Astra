@@ -631,14 +631,12 @@ not successful model inference.
 
 The provider-wire regression uses a strict loopback HTTP fixture and a disposable
 MatrixOne database, without real provider keys. Create the designated database
-first and supply its `MATRIXONE_*` connection settings. Choose an unused loopback
-port for the fixture:
+first and supply its `MATRIXONE_*` connection settings. The fixture binds an
+available loopback port:
 
 ```bash
 ASTRA_TEST_DB_IT=1 ASTRA_DATABASE_PREFIX= \
 ASTRA_DATABASE=astra_test_probe_local ASTRA_TEST_DATABASE=astra_test_probe_local \
-ASTRA_ALLOW_INSECURE_DEFAULTS=1 \
-ASTRA_BYOK_DEEPSEEK_BASE_URL=http://127.0.0.1:18994 \
 CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
   --features external-contract-tests --test user_model_probe_db_it -- --ignored
 ```
