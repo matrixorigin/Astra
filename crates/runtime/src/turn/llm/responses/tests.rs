@@ -272,6 +272,47 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         1,
         "incomplete evidence must fail before provider dispatch"
     );
+    // A result without a matching call in the same group can be the only
+    // surviving evidence of an already executed tool.
+    let mut extra_result = messages.clone();
+    extra_result.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
+    extra_result
+        .push(json!({"role":"tool", "tool_call_id":"missing-call", "content":"effect occurred"}));
+    let mut extra_result = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(extra_result).unwrap();
+    extra_result = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(extra_result).unwrap();
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&extra_result, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let error = call_llm_and_collect_with_stream_callback(
+            attempt,
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("Check their effects"));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "{protocol:?} dispatched an incomplete group"
+        );
+    }
+    extra_result.push(json!({"role":"user", "content":"start a new turn"}));
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&extra_result, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        assert!(prepare_streaming_call(attempt, RuntimeToolChoice::Auto).is_ok());
+    }
+
     let mut lost_interrupted = interrupted;
     lost_interrupted
         .iter_mut()
@@ -842,6 +883,28 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         assert!(input.to_string().contains("start a new turn"));
         assert!(!input.to_string().contains("call-1"));
     }
+    let mut attempt = call(&extra_result, &tools, &scope, &base, &thinking);
+    attempt.route = LlmExecutionRoute::from_admitted(&first_execution);
+    let result = call_llm_and_collect_with_stream_callback(
+        attempt,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.full_text, "done");
+    assert!(
+        !wire_requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("missing-call")
+    );
     server.abort();
 }
 #[async_trait]

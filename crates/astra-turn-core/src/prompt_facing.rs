@@ -518,6 +518,7 @@ fn append_complete_tool_group(
     let incomplete = assistant.get(INCOMPLETE_TOOL_GROUP_FIELD).is_some()
         || calls.is_empty()
         || matched_calls.len() != calls.len()
+        || matched_results.len() != tools.len()
         || saved.as_ref().is_some_and(|value| {
             value["invalid"] == true
                 || !astra_core::model_wire::responses::continuation_group_matches(
@@ -1047,19 +1048,25 @@ mod tests {
             ..Default::default()
         }
         .continuation(&uuid::Uuid::new_v4().to_string(), "model");
-        let projected = super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
-            json!({"role":"user", "content":"inspect"}),
-            complete,
-            restored[2].clone(),
+        for extra in [
             json!({"role":"tool", "tool_call_id":"orphan", "content":"unrelated"}),
-        ])
-        .unwrap();
-        assert_eq!(projected.len(), 3);
-        assert!(
-            projected[1]
-                .get(super::INCOMPLETE_TOOL_GROUP_FIELD)
-                .is_none()
-        );
+            json!({"role":"tool", "tool_call_id":"c1", "content":"duplicate"}),
+            json!({"role":"tool", "content":"missing identity"}),
+        ] {
+            let projected =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+                    json!({"role":"user", "content":"inspect"}),
+                    complete.clone(),
+                    restored[2].clone(),
+                    extra,
+                ])
+                .unwrap();
+            assert_eq!(projected[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+            let restored =
+                super::sanitize_canonical_continuation_messages_with_turn_semantics(projected)
+                    .unwrap();
+            assert_eq!(restored[1][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        }
     }
 
     #[test]
