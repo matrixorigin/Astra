@@ -179,7 +179,7 @@ pub fn sanitize_prompt_facing_messages_with_state(
 pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
-    sanitize_canonical_continuation_messages_impl(messages, false, false)
+    sanitize_canonical_continuation_messages_impl(messages, CanonicalProjection::Restore, false)
 }
 
 /// Project a current-turn delta for canonical commit, independent of outcome.
@@ -194,12 +194,31 @@ pub fn sanitize_canonical_turn_delta_with_turn_semantics(
     messages: Vec<Value>,
     has_prior_user_context: bool,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
-    sanitize_canonical_continuation_messages_impl(messages, true, has_prior_user_context)
+    sanitize_canonical_continuation_messages_impl(
+        messages,
+        CanonicalProjection::TurnDelta,
+        has_prior_user_context,
+    )
+}
+
+/// Project an authorized compaction replacement while retaining unresolved
+/// recovery evidence whose original user anchor may have been lost.
+pub fn sanitize_canonical_replacement_with_turn_semantics(
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    sanitize_canonical_continuation_messages_impl(messages, CanonicalProjection::Replacement, false)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanonicalProjection {
+    Restore,
+    TurnDelta,
+    Replacement,
 }
 
 fn sanitize_canonical_continuation_messages_impl(
     messages: Vec<Value>,
-    preserve_compacted_head: bool,
+    projection: CanonicalProjection,
     mut has_user_context: bool,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
     for message in &messages {
@@ -215,12 +234,12 @@ fn sanitize_canonical_continuation_messages_impl(
     // Otherwise two different owners could become indistinguishable and an
     // invalid reference could gain authority when this history is restored.
     let duplicate_targets = duplicate_output_targets(&messages);
-    let mut start = if preserve_compacted_head {
+    let mut start = if projection != CanonicalProjection::Restore {
         compacted_canonical_turn_start(&messages)?
     } else {
         latest_compaction_boundary_start(&messages).unwrap_or(0)
     };
-    if !preserve_compacted_head && start > 0 {
+    if projection == CanonicalProjection::Restore && start > 0 {
         let human = messages
             .iter()
             .rposition(astra_turn_types::is_human_user_message);
@@ -288,11 +307,25 @@ fn sanitize_canonical_continuation_messages_impl(
             }
             "assistant" if contains_tool_call_frame(message) => {
                 let block_end = consecutive_tool_block_end(&messages, index + 1);
-                if has_user_context
-                    || last_human.is_none_or(|human| index > human)
-                    || message.get(INCOMPLETE_TOOL_GROUP_FIELD).is_some()
+                if has_user_context {
+                    append_complete_tool_group(
+                        &mut out,
+                        message,
+                        &messages[index + 1..block_end],
+                        false,
+                    );
+                } else if projection != CanonicalProjection::TurnDelta
+                    && last_human.is_none_or(|human| index > human)
                 {
-                    append_complete_tool_group(&mut out, message, &messages[index + 1..block_end]);
+                    // A damaged restored history may have lost its user anchor.
+                    // Keep unresolved evidence, but do not admit a complete
+                    // tool round as a new conversation without that anchor.
+                    append_complete_tool_group(
+                        &mut out,
+                        message,
+                        &messages[index + 1..block_end],
+                        true,
+                    );
                 }
                 index = block_end;
             }
@@ -424,7 +457,12 @@ fn consecutive_tool_block_end(messages: &[Value], mut index: usize) -> usize {
     index
 }
 
-fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[Value]) {
+fn append_complete_tool_group(
+    out: &mut Vec<Value>,
+    assistant: &Value,
+    tools: &[Value],
+    only_incomplete: bool,
+) {
     let calls = assistant
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -486,6 +524,9 @@ fn append_complete_tool_group(out: &mut Vec<Value>, assistant: &Value, tools: &[
         || assistant["content"]
             .as_array()
             .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_use"));
+    if only_incomplete && !incomplete {
+        return;
+    }
     if matched_calls.is_empty() {
         let content = extract_text_content(assistant)
             .and_then(|text| prompt_facing_content_for_role("assistant", &text))
@@ -1157,6 +1198,58 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(new_turn, vec![json!({"role":"user", "content":"new turn"})]);
+    }
+
+    #[test]
+    fn unanchored_restore_keeps_only_unresolved_tool_evidence() {
+        let calls = json!([
+            {"id":"c1", "function":{"name":"write_file", "arguments":"{}"}},
+            {"id":"c2", "function":{"name":"write_file", "arguments":"{}"}}
+        ]);
+        let assistant = json!({"role":"assistant", "tool_calls":calls});
+        let first = json!({"role":"tool", "tool_call_id":"c1", "content":"done"});
+        let second = json!({"role":"tool", "tool_call_id":"c2", "content":"done"});
+        let user = json!({"role":"user", "content":"new turn"});
+
+        let complete = vec![assistant.clone(), first.clone(), second];
+        assert!(
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(complete.clone())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            super::sanitize_canonical_replacement_with_turn_semantics(complete.clone())
+                .unwrap()
+                .is_empty()
+        );
+        let mut followed = complete;
+        followed.push(user.clone());
+        assert_eq!(
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(followed).unwrap(),
+            vec![user.clone()]
+        );
+
+        let incomplete = vec![assistant, first];
+        assert!(
+            super::sanitize_canonical_turn_delta_with_turn_semantics(incomplete.clone(), false)
+                .unwrap()
+                .is_empty()
+        );
+        let restored =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(incomplete)
+                .unwrap();
+        assert_eq!(restored[0][super::INCOMPLETE_TOOL_GROUP_FIELD], true);
+        assert_eq!(
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(restored.clone())
+                .unwrap(),
+            restored
+        );
+        let mut followed = restored;
+        followed.push(user.clone());
+        assert_eq!(
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(followed).unwrap(),
+            vec![user]
+        );
     }
 
     #[test]

@@ -138,10 +138,13 @@ decoding and its connection fences, including cancellation during a stream.
 Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
 before wire encoding, including direct auxiliary calls. Requests send full
 history with `store:false` and `stream:true`.
-Astra functions occupy the `astra` namespace. Completed provider output items,
+Functions use the standard flat Responses tool format. Completed provider output items,
 including encrypted reasoning and message phase, live in private canonical
-assistant-message metadata before tool execution/final checkpoint. Opaque
-provider-encrypted reasoning is base64 encoded for storage so generic text
+assistant-message metadata before tool execution/final checkpoint. Stateless
+Responses return encrypted reasoning without an `include` override. If a tool
+round contains reasoning without replayable encrypted content, Astra stops
+before executing its calls. Opaque provider-encrypted reasoning is base64
+encoded for storage so generic text
 redaction cannot corrupt ciphertext. Function arguments come from the canonical
 assistant tool calls; private metadata retains no second raw argument copy. Resume
 replays them only for the same connection and model; other protocols remove

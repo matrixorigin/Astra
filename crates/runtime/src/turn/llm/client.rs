@@ -3821,8 +3821,7 @@ fn apply_required_tool_choice(
 
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::OpenAiResponses => {
-            body["tool_choice"] =
-                json!({"type":"function","namespace":"astra","name":required_tool_name});
+            body["tool_choice"] = json!({"type":"function","name":required_tool_name});
         }
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             body["tool_choice"] = json!({

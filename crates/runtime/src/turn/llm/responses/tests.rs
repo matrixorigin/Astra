@@ -48,6 +48,11 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             } else {
                 assert_eq!(headers.get("authorization").unwrap(), "Bearer test-key");
             }
+            if body.get("include").is_some()
+                || body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| tool["type"] != "function"))
+            {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"unsupported_parameter"}}))).into_response();
+            }
             if body["input"].to_string().contains("context failure") {
                 return (StatusCode::BAD_REQUEST, Json(json!({"error":{"message":"maximum context length secret provider detail"}}))).into_response();
             }
@@ -69,7 +74,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
                 json!([{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}])
             } else {
                 json!([{"type":"reasoning","id":"reason-1","encrypted_content":"ciphertext","summary":[]},
-                    {"type":"function_call","id":"fn-1","namespace":"astra","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+                    {"type":"function_call","id":"fn-1","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             };
             let mut events = String::new();
             for (index, item) in output.as_array().unwrap().iter().enumerate() {
@@ -540,7 +545,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     assert_eq!(second.full_text, "done");
     let requests = requests.lock().unwrap();
     assert_eq!(requests[0]["reasoning"]["effort"], "max");
-    assert_eq!(requests[0]["include"][0], "reasoning.encrypted_content");
+    assert!(requests[0].get("include").is_none());
     assert!(
         requests[2]["input"]
             .as_array()
@@ -844,14 +849,30 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
     let app = Router::new().route("/responses", post(
         |State(requests): State<Arc<Mutex<Vec<Value>>>>, headers: HeaderMap, Json(body): Json<Value>| async move {
             if headers.get("authorization").is_none_or(|value| value != "Bearer test-key" && value != "Bearer new-key")
-                || body["model"] != "fixture-model" || body["store"] != false || body["stream"] != true {
+                || body["model"] != "fixture-model" || body["store"] != false || body["stream"] != true
+                || body.get("include").is_some()
+                || body["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| tool["type"] != "function")) {
                 return (StatusCode::BAD_REQUEST, "invalid request").into_response();
             }
             let probe = body["input"].to_string().contains("Calculate 17 * 23");
             let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
+            let plain = body["input"].to_string().contains("plain lookup");
+            let missing_reasoning = body["input"].to_string().contains("missing reasoning");
+            let private_encoding = body["input"].to_string().contains("private encoding");
+            let unexpected_namespace = body["input"].to_string().contains("unexpected namespace");
             requests.lock().unwrap().push(body);
             let output = if probe || continued {
                 json!([{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}])
+            } else if plain {
+                json!([{"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else if missing_reasoning {
+                json!([{"type":"reasoning","id":"reason","summary":[]},
+                    {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else if private_encoding {
+                json!([{"type":"reasoning","_astra_encrypted_content_b64":"b3BhcXVl","summary":[]},
+                    {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else if unexpected_namespace {
+                json!([{"type":"function_call","namespace":"other","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             } else {
                 json!([{"type":"reasoning","id":"reason","summary":[],"encrypted_content":"opaque"},
                     {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
@@ -914,6 +935,33 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
             .full_text,
         "done"
     );
+    let mut plain_history = vec![json!({"role":"user","content":"plain lookup"})];
+    let plain = infer(&admitted, &plain_history, &tools, &attempts)
+        .await
+        .unwrap();
+    plain_history.push(json!({"role":"assistant", "tool_calls":plain.tool_calls,
+        astra_core::model_wire::responses::CONTINUATION_KEY:plain.provider_continuation.unwrap()}));
+    plain_history.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
+    assert_eq!(
+        infer(&admitted, &plain_history, &tools, &attempts)
+            .await
+            .unwrap()
+            .full_text,
+        "done"
+    );
+    for content in [
+        "missing reasoning",
+        "private encoding",
+        "unexpected namespace",
+    ] {
+        let before = requests.lock().unwrap().len();
+        let invalid = [json!({"role":"user", "content":content})];
+        let failure = infer(&admitted, &invalid, &tools, &attempts)
+            .await
+            .unwrap_err();
+        assert!(failure.message.contains("incomplete response"));
+        assert_eq!(requests.lock().unwrap().len(), before + 1);
+    }
     service
         .update_user_model(
             owner.clone(),
@@ -1421,7 +1469,7 @@ fn responses_and_openai_share_runtime_role_projection() {
         items: vec![
             json!({"type":"reasoning","encrypted_content":"opaque","summary":[]}),
             json!({"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Working"}]}),
-            json!({"type":"function_call","name":"read_file","namespace":"astra","call_id":"provider-call"}),
+            json!({"type":"function_call","name":"read_file","call_id":"provider-call"}),
         ],
         ..Default::default()
     }.continuation(connection, "fixture-model");

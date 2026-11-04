@@ -22,6 +22,10 @@ pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::Clas
                 .to_string()
         }
         "responses_continuation_incomplete" => INCOMPLETE_TOOL_CONTINUATION_MESSAGE.to_string(),
+        "responses_reasoning_continuation_missing" | "responses_invalid_output" => {
+            "The selected model returned an incomplete response. Check the model configuration or choose another model."
+                .to_string()
+        }
         _ => format!("Model request failed: {code}"),
     };
     astra_core::ClassifiedError::new(kind, message)
@@ -189,9 +193,6 @@ pub(super) fn prepare(
             },
         )
     })?;
-    if call.route.subscription.is_none() {
-        body["include"] = json!(["reasoning.encrypted_content"]);
-    }
     call.thinking.apply_openai_protocol(
         &mut body,
         astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning,

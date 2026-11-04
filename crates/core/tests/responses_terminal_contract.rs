@@ -14,7 +14,7 @@ fn decode(
     decode_sse(&format!("data: {event}\n\n"))
 }
 fn call(status: Option<&str>) -> Value {
-    let mut item = json!({"type":"function_call","id":"fc-fixture","namespace":"astra","call_id":"call-fixture","name":"read_file","arguments":"{}"});
+    let mut item = json!({"type":"function_call","id":"fc-fixture","call_id":"call-fixture","name":"read_file","arguments":"{}"});
     if let Some(status) = status {
         item["status"] = json!(status);
     }
