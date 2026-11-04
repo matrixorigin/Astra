@@ -2654,6 +2654,26 @@ async fn revalidate_admitted_model_executions_with_access(
     Ok(ordered)
 }
 
+// Native OpenAI BYOK always uses this endpoint. Compatible gateways may have
+// different cache and message-boundary semantics and need their own capability.
+const OPENAI_BYOK_BASE_URL: &str = "https://api.openai.com/v1";
+
+fn personal_model_cache_capability(
+    provider: &str,
+    base_url: &str,
+    inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+) -> Option<PromptCacheCapabilityData> {
+    (provider == "openai"
+        && base_url == OPENAI_BYOK_BASE_URL
+        && inference_protocol == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses))
+    .then_some(PromptCacheCapabilityData {
+        protocol: PromptCacheProtocolData::OpenAiAutoPrefix,
+        volatile_placement: PromptCacheVolatilePlacementData::AppendOnlyUserTail,
+        volatile_delivery: PromptCacheVolatileDeliveryData::All,
+        reuse_scope: None,
+    })
+}
+
 fn admitted_user_model_from_row(
     row: &sqlx::mysql::MySqlRow,
     user_id: &str,
@@ -2740,6 +2760,8 @@ fn admitted_user_model_from_row(
     let supported_efforts = connection
         .as_ref()
         .and_then(|_| cached_efforts(snapshot.as_deref(), &identity, protocol));
+    let cache_capability =
+        personal_model_cache_capability(&provider, &base_url, inference_protocol);
     let mut execution = AdmittedModelExecution {
         inference_protocol,
         response_scope: None,
@@ -2758,7 +2780,7 @@ fn admitted_user_model_from_row(
         api_key,
         base_url,
         provider,
-        cache_capability: None,
+        cache_capability,
         thinking_capability,
         fixed_temperature: None,
         supported_reasoning_efforts: supported_efforts,
@@ -5954,7 +5976,7 @@ fn user_byok_base_url(
             StatusCode::BAD_REQUEST,
             "Use provider openai-compatible to configure a custom base_url",
         )),
-        ("openai", None) => Ok("https://api.openai.com/v1".into()),
+        ("openai", None) => Ok(OPENAI_BYOK_BASE_URL.into()),
         ("anthropic", None) => Ok("https://api.anthropic.com".into()),
         ("deepseek", None) => Ok("https://api.deepseek.com".into()),
         (_, None) => Err(error_response(
@@ -7727,6 +7749,40 @@ fn resolve_model_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn personal_cache_policy_only_covers_native_responses() {
+        use astra_core::model_wire::LlmProviderProtocol::{OpenAiCompatible, OpenAiResponses};
+        assert!(
+            personal_model_cache_capability("openai", OPENAI_BYOK_BASE_URL, Some(OpenAiResponses))
+                .is_some()
+        );
+        for (provider, base, protocol) in [
+            ("openai", OPENAI_BYOK_BASE_URL, None),
+            ("openai", OPENAI_BYOK_BASE_URL, Some(OpenAiCompatible)),
+            (
+                "openai",
+                "https://gateway.example/v1",
+                Some(OpenAiResponses),
+            ),
+            (
+                "openai-compatible",
+                OPENAI_BYOK_BASE_URL,
+                Some(OpenAiResponses),
+            ),
+            (
+                "deepseek",
+                "https://api.deepseek.com",
+                Some(OpenAiResponses),
+            ),
+            ("chatgpt", OPENAI_BYOK_BASE_URL, Some(OpenAiResponses)),
+        ] {
+            assert!(
+                personal_model_cache_capability(provider, base, protocol).is_none(),
+                "{provider} {base} {protocol:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn responses_model_check_requires_a_complete_response() {

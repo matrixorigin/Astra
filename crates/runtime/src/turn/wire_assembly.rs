@@ -2533,7 +2533,7 @@ mod tests {
     fn append_only_all_context_preserves_history_and_expires_snapshots() {
         use astra_turn_core::cache_placement::{CacheProtocol, VolatileDeliveryPolicy};
         let capability = astra_turn_core::cache_placement::CacheCapability {
-            protocol: CacheProtocol::StrictHistoryMatch,
+            protocol: CacheProtocol::OpenAiAutoPrefix,
             volatile_delivery: VolatileDeliveryPolicy::All,
             ..append_only_required_capability()
         };
