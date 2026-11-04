@@ -15465,10 +15465,7 @@ for line in sys.stdin:
         assert!(result.is_error, "{result:?}");
         let fields = result.metadata.as_ref().unwrap();
         assert_eq!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
-        assert_eq!(
-            fields["error_kind"],
-            astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
-        );
+        assert_eq!(fields["error_kind"], astra_tools::TOOL_ERROR_KIND_CANCELLED);
         assert_eq!(fields["workspace_effect_settled"], false);
         assert!(
             matches!(

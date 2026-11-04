@@ -2365,7 +2365,10 @@ fn has_unsettled_side_effecting_outcome(state: &AgenticLoopState) -> bool {
                         | astra_core::ErrorKind::ToolOutcomeUnknown
                 )
             )
-            && (matches!(record.name.as_str(), "bash" | "run_script")
+            && ((matches!(
+                record.error_kind,
+                Some(astra_core::ErrorKind::ToolOutcomeUnknown | astra_core::ErrorKind::Cancelled)
+            ) && matches!(record.name.as_str(), "bash" | "run_script"))
                 || crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
                     &record.name,
                     super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
