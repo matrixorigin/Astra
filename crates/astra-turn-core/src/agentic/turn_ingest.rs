@@ -340,7 +340,17 @@ pub fn ingest_agentic_turn_stream(
             }
             k
         } else {
-            if astra_core::is_llm_context_window_error(err) {
+            // Structured envelopes (e.g. TaaS) are authoritative: a 413
+            // gateway byte limit must not count as context overflow.
+            if let Some(kind) = astra_core::structured_llm_error_kind(err) {
+                if kind == astra_core::ErrorKind::ContextWindow {
+                    *st.consecutive_context_window_errors =
+                        st.consecutive_context_window_errors.saturating_add(1);
+                } else {
+                    *st.consecutive_context_window_errors = 0;
+                }
+                kind
+            } else if astra_core::is_llm_context_window_error(err) {
                 *st.consecutive_context_window_errors =
                     st.consecutive_context_window_errors.saturating_add(1);
                 astra_core::ErrorKind::ContextWindow
@@ -1153,6 +1163,72 @@ mod tests {
             matches!(out, AgenticTurnIngestOutcome::Fatal(ref e) if e.message == "rate limited")
         );
         assert_eq!(pack.consecutive_context_window_errors, 0);
+    }
+
+    #[test]
+    fn fatal_structured_body_too_large_is_not_context_window() {
+        let err = Some(
+            r#"LLM error 413: {"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123"}}"#
+                .to_string(),
+        );
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            server_execution_summary: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
+            has_usage: false,
+            error_message: &err,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        pack.consecutive_context_window_errors = 3;
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
+        assert!(matches!(&out, AgenticTurnIngestOutcome::Fatal(e)
+            if e.kind == astra_core::ErrorKind::InvalidRequest
+        ));
+        assert_eq!(pack.consecutive_context_window_errors, 0);
+    }
+
+    #[test]
+    fn fatal_structured_context_length_exceeded_is_context_window() {
+        let err = Some(
+            r#"LLM error 400: {"error":{"message":"maximum context length exceeded","type":"context_length_exceeded","code":"context_length_exceeded","request_id":"req_def456"}}"#
+                .to_string(),
+        );
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &[],
+            server_execution_summary: None,
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            qualified_usage: None,
+            current_request_input_tokens: None,
+            current_request_usage: None,
+            has_usage: true,
+            error_message: &err,
+            error_kind: None,
+        };
+        let mut pack = Pack::new();
+        pack.consecutive_context_window_errors = 1;
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
+        assert!(matches!(&out, AgenticTurnIngestOutcome::Fatal(e)
+            if e.kind == astra_core::ErrorKind::ContextWindow
+        ));
+        assert_eq!(pack.consecutive_context_window_errors, 2);
     }
 
     #[test]

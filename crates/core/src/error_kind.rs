@@ -640,6 +640,65 @@ impl From<String> for ClassifiedError {
     }
 }
 
+// ── Structured LLM provider error envelope ───────────────────────────────────
+
+/// Structured classification for provider error envelope bodies.
+///
+/// Gateways such as TaaS return
+/// `{"error":{"message","type","param","code","request_id"}}` where
+/// `error.code` (falling back to `error.type`) authoritatively distinguishes
+/// failures that text needles cannot: an HTTP 413 gateway byte limit
+/// (`request_body_too_large`) is a request-size problem, not model context
+/// overflow, and `invalid_request` / `provider_schema_error` are parameter or
+/// schema rejections, not server faults. `context_length_exceeded` is the only
+/// envelope code that means the model's context window was exceeded.
+///
+/// `body` may be the raw JSON body or a message that embeds it after a prefix
+/// (e.g. `"LLM error 413: {json}"`): the whole string is parsed first, then
+/// the suffix starting at the first `{`.
+///
+/// Returns `None` when the body carries no recognized code, so callers fall
+/// back to their existing text-needle classification for upstreams that do
+/// not emit structured envelopes.
+#[must_use]
+pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
+    let error = llm_error_envelope_error(body)?;
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(serde_json::Value::as_str)?;
+    match code {
+        "context_length_exceeded" => Some(ErrorKind::ContextWindow),
+        "request_body_too_large" | "invalid_request" | "provider_schema_error" => {
+            Some(ErrorKind::InvalidRequest)
+        }
+        _ => None,
+    }
+}
+
+/// Extract `error.request_id` from a provider error envelope body for log
+/// correlation. Same parsing rules as [`structured_llm_error_kind`].
+#[must_use]
+pub fn structured_llm_error_request_id(body: &str) -> Option<String> {
+    let error = llm_error_envelope_error(body)?;
+    let request_id = error.get("request_id")?.as_str()?.trim();
+    (!request_id.is_empty()).then(|| request_id.to_string())
+}
+
+/// Parse the `error` object of a provider error envelope out of `body`,
+/// accepting either a raw JSON body or a message that embeds the JSON after a
+/// non-JSON prefix (e.g. `"LLM error 413: {...}"`).
+fn llm_error_envelope_error(body: &str) -> Option<serde_json::Value> {
+    let trimmed = body.trim();
+    let value = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .or_else(|| {
+            let start = trimmed.find('{')?;
+            serde_json::from_str::<serde_json::Value>(trimmed.get(start..)?).ok()
+        })?;
+    value.get("error").cloned()
+}
+
 // ── LLM error-message fallback classifier ────────────────────────────────────
 
 /// Boundary fallback for context-window / prompt-too-long provider text.
@@ -1406,6 +1465,88 @@ mod tests {
         assert!(!is_llm_context_window_error("rate limit exceeded"));
         assert!(!is_llm_context_window_error("internal server error"));
         assert!(!is_llm_context_window_error(""));
+    }
+
+    // ── structured_llm_error_kind ──
+
+    #[test]
+    fn structured_llm_error_kind_cases() {
+        let cases: &[(&str, Option<ErrorKind>)] = &[
+            // A 413 gateway byte limit is never model context overflow.
+            (
+                r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            // Only the envelope code may claim context-window overflow.
+            (
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"context_length_exceeded","param":null,"code":"context_length_exceeded","request_id":"req_def456"}}"#,
+                Some(ErrorKind::ContextWindow),
+            ),
+            (
+                r#"{"error":{"message":"unknown parameter 'temperature'","type":"invalid_request","param":"temperature","code":"invalid_request","request_id":"req_ghi789"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            (
+                r#"{"error":{"message":"schema rejected by provider","type":"provider_schema_error","param":"tools","code":"provider_schema_error","request_id":"req_jkl012"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            // error.type is accepted when error.code is absent.
+            (
+                r#"{"error":{"message":"context exceeded","type":"context_length_exceeded"}}"#,
+                Some(ErrorKind::ContextWindow),
+            ),
+            // Embedded in an "LLM error {status}: {json}" string.
+            (
+                r#"LLM error 413: {"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_mno345"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            (
+                r#"LLM error 400: {"error":{"message":"maximum context length exceeded","type":"context_length_exceeded","code":"context_length_exceeded","request_id":"req_pqr678"}}"#,
+                Some(ErrorKind::ContextWindow),
+            ),
+            // No recognized code → caller falls back to needle classification.
+            (
+                r#"{"error":{"message":"rate limited","type":"rate_limit","code":"rate_limit_exceeded"}}"#,
+                None,
+            ),
+            (r#"{"error":{"message":"no code here"}}"#, None),
+            (r#"{"usage":{"tokens":1}}"#, None),
+            // Unstructured text and invalid JSON → fallback.
+            ("maximum context length exceeded", None),
+            ("LLM error 413: not json at all", None),
+            ("", None),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                structured_llm_error_kind(input),
+                *expected,
+                "structured_llm_error_kind({input:?}) should be {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_llm_error_request_id_extraction() {
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123"}}"#
+            ),
+            Some("req_abc123".to_string())
+        );
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"LLM error 400: {"error":{"message":"bad param","code":"invalid_request","request_id":"req_def456"}}"#
+            ),
+            Some("req_def456".to_string())
+        );
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"error":{"message":"bad param","code":"invalid_request"}}"#
+            ),
+            None
+        );
+        assert_eq!(structured_llm_error_request_id("not json"), None);
     }
 
     #[test]

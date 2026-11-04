@@ -6241,6 +6241,11 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
+        // TaaS-style error envelopes carry a per-request id; surface it as a
+        // structured field on provider HTTP error logs for cross-system
+        // correlation. Empty when the body has no structured envelope.
+        let body_request_id = astra_core::structured_llm_error_request_id(&text);
+
         let structured_error = if status == 402
             && subscription.is_none()
             && !uses_moi_model_gateway_error_contract(header_overrides)
@@ -6304,7 +6309,11 @@ async fn call_prepared_llm_with_total_budget(
             );
             Some(ProviderHttpRejection {
                 classified: astra_core::ClassifiedError::new(
-                    if status == 400 && astra_core::is_llm_context_window_error(&text) {
+                    if let Some(kind) = astra_core::structured_llm_error_kind(&text) {
+                        // Structured envelopes (e.g. TaaS) are authoritative:
+                        // a 413 gateway byte limit is not context overflow.
+                        kind
+                    } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
                         astra_core::ErrorKind::ContextWindow
                     } else {
                         provider_http_error_kind(status, code)
@@ -6373,8 +6382,10 @@ async fn call_prepared_llm_with_total_budget(
 
             let tpm_exhaustion = is_tpm_exhaustion(&text);
             if tpm_exhaustion {
-                astra_core::agent_warn!(
-                    "llm",
+                tracing::warn!(
+                    target: "astra.agent",
+                    component = "llm",
+                    request_id = body_request_id.as_deref().unwrap_or(""),
                     "TPM exhaustion detected on {} — applying {}s retry delay",
                     model_key,
                     TPM_EXHAUST_DELAY_MS / 1000
@@ -6382,8 +6393,10 @@ async fn call_prepared_llm_with_total_budget(
             }
 
             let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms));
-            astra_core::agent_warn!(
-                "llm",
+            tracing::warn!(
+                target: "astra.agent",
+                component = "llm",
+                request_id = body_request_id.as_deref().unwrap_or(""),
                 "rate limit (429) on {}: action={:?}",
                 model_key,
                 action,
@@ -6409,8 +6422,10 @@ async fn call_prepared_llm_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &observed_error)
                 .await?;
             let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms));
-            astra_core::agent_warn!(
-                "llm",
+            tracing::warn!(
+                target: "astra.agent",
+                component = "llm",
+                request_id = body_request_id.as_deref().unwrap_or(""),
                 "server overload ({status}) on {}: action={:?}",
                 model_key,
                 action,
@@ -6433,6 +6448,21 @@ async fn call_prepared_llm_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &observed_error)
                 .await?;
             continue;
+        }
+
+        // Structured provider error envelopes (e.g. TaaS) carry an
+        // authoritative code: a 413 gateway byte limit is a request-size
+        // problem, never model context overflow. Keep the raw body out of
+        // non-context-window messages, matching the 4xx suppression above.
+        if let Some(kind) = astra_core::structured_llm_error_kind(&text) {
+            let message = if kind == astra_core::ErrorKind::ContextWindow {
+                format!("LLM error {status}: {text}")
+            } else {
+                last_err.clone()
+            };
+            let error = astra_core::ClassifiedError::new(kind, message);
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
         }
 
         // Context-window errors — classified at source, no string prefix needed.
@@ -8617,6 +8647,10 @@ fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
         ErrorKind::RateLimit
     } else if status >= 500 {
         ErrorKind::ServerError
+    } else if let Some(kind) = astra_core::structured_llm_error_kind(body) {
+        // Structured envelopes (e.g. TaaS) are authoritative: a 413 gateway
+        // byte limit is a request-size problem, never context overflow.
+        kind
     } else if status == 400 && astra_core::is_llm_context_window_error(body) {
         ErrorKind::ContextWindow
     } else if status == 400 {
@@ -16809,6 +16843,60 @@ mod tests {
         );
         let details: Value = serde_json::from_str(err.details_json.as_deref().unwrap()).unwrap();
         assert_eq!(details["code"], "context_length_exceeded");
+    }
+
+    /// Mock server that returns 413 with a TaaS-style request_body_too_large
+    /// envelope: the gateway byte limit, not model context overflow.
+    async fn mock_413_request_body_too_large() -> Response {
+        let body = r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_0123456789abcdef"}}"#;
+        Response::builder()
+            .status(413)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_classifies_gateway_body_limit_as_invalid_request() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route("/chat/completions", post(mock_413_request_body_too_large));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
+                    fixed_temperature: None,
+                    supported_reasoning_efforts: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("should fail with invalid request");
+        // The gateway byte limit must never be attributed to the model
+        // context window (which would trigger the compaction funnel).
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
+        // 4xx bodies stay suppressed; the envelope code only drives the kind.
+        assert_eq!(err.message, "LLM request rejected: 413");
     }
 
     #[tokio::test]
