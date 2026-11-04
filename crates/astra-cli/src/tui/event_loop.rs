@@ -8455,11 +8455,8 @@ pub(crate) async fn run_tui_session(
                     Ok(LoginEffect::Completed { uc }) => {
                         // Keep the old, identity-pinned heartbeat during browser
                         // waiting/cancellation, but join it before rebinding Edge.
-                        if let Some(task) = edge_heartbeat_task.take() {
-                            task.abort();
-                            let _ = task.await;
-                        }
-                        match auth_flow::finish_browser_session_login(api, profile, uc, &mut state).await {
+                        crate::cli::edge_lifecycle::stop_heartbeat(&mut edge_heartbeat_task).await;
+                        match auth_flow::finish_browser_session_login(api, profile, uc, &mut state, &mut edge_heartbeat_task).await {
                             Ok((replacement, token, modules)) => {
                                 pipeline_modules = modules;
                                 skill_registry = Arc::clone(&state.unified_skill_registry);
@@ -8473,11 +8470,6 @@ pub(crate) async fn run_tui_session(
                                 external_skill_discovery_pending = true;
                                 authenticated_api = replacement;
                                 api = &authenticated_api;
-                                if crate::cli::edge_lifecycle::edge_cloud_registry_enabled() {
-                                    edge_heartbeat_task = crate::cli::edge_lifecycle::spawn_edge_heartbeat(
-                                        api.clone(), token.clone(), profile.map(str::to_owned),
-                                    );
-                                }
                                 server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(api.clone(), profile, None);
                                 plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api.clone(), profile, None);
                                 server_agent_projection_sequence = None;
@@ -11836,7 +11828,7 @@ pub(crate) async fn run_tui_session(
                                     if let bottom_pane::view::ViewResult::Login { username, password } = &result {
                                         let auth_session_id = state.session_id.clone();
                                         let auth_epoch = state.session_attachment_epoch;
-                                        match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state).await {
+                                        match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state, &mut edge_heartbeat_task).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -11862,7 +11854,7 @@ pub(crate) async fn run_tui_session(
                                                 }
                                             }
                                             Err(e) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {e}")));
+                                                chat_widget.commit_system(history_cell::system::SystemCell::error(e));
                                             }
                                         }
                                         pending_deferred_slash_flush = false;
@@ -11891,7 +11883,7 @@ pub(crate) async fn run_tui_session(
                                     if let bottom_pane::view::ViewResult::Register { username, email, password } = &result {
                                         let auth_session_id = state.session_id.clone();
                                         let auth_epoch = state.session_attachment_epoch;
-                                        match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state).await {
+                                        match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state, &mut edge_heartbeat_task).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -11917,7 +11909,7 @@ pub(crate) async fn run_tui_session(
                                                 }
                                             }
                                             Err(e) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Register failed: {e}")));
+                                                chat_widget.commit_system(history_cell::system::SystemCell::error(e));
                                             }
                                         }
                                         pending_deferred_slash_flush = false;

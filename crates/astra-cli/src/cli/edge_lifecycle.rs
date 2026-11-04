@@ -359,6 +359,33 @@ pub fn spawn_edge_heartbeat(
     }))
 }
 
+/// Replace the login generation's heartbeat only after authentication commits.
+/// Registration must settle before this interactive login can report readiness.
+pub(crate) async fn rebind_after_login(
+    api: &ThinClient,
+    token: &str,
+    profile: Option<&str>,
+    heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
+) -> Result<(), String> {
+    stop_heartbeat(heartbeat).await;
+    register_edge_once(api, token).await.map_err(|_| {
+        "Signed in, but local execution registration failed. Your login is saved; retry /login or restart Astra before chatting."
+            .to_string()
+    })?;
+    if edge_cloud_registry_enabled() {
+        *heartbeat =
+            spawn_edge_heartbeat(api.clone(), token.to_owned(), profile.map(str::to_owned));
+    }
+    Ok(())
+}
+
+pub(crate) async fn stop_heartbeat(heartbeat: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = heartbeat.take() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 /// Register with the cloud (best-effort) and start a background heartbeat task.
 /// Returns `None` when registry is disabled, register failed, or heartbeat interval is `0`.
 ///
@@ -494,6 +521,24 @@ mod tests {
             Some(v) => env_set("ASTRA_EDGE_REGISTRY", v),
             None => env_remove("ASTRA_EDGE_REGISTRY"),
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn login_rebind_honors_explicit_registry_disable() {
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        env_set("ASTRA_EDGE_REGISTRY", "off");
+        let api = ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+        let previous = heartbeat.as_ref().unwrap().abort_handle();
+        super::rebind_after_login(&api, "token", None, &mut heartbeat)
+            .await
+            .expect("explicit registry disable must not attempt registration");
+        assert!(previous.is_finished());
+        assert!(
+            heartbeat.is_none(),
+            "disabled registry must not start a heartbeat"
+        );
     }
 
     #[tokio::test]

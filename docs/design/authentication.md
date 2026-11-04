@@ -210,6 +210,15 @@ not initialize a ready runtime. Existing transports retain their old generation
 binding; they cannot silently adopt another account. Authentication
 changes are refused while local background tasks are running.
 
+In-TUI password login and registration establish the same Edge registration
+and heartbeat boundary after saving credentials. Rejected authentication retains
+the previous heartbeat. A committed login stops and joins it before publishing
+the current account's checkout and starting the replacement heartbeat. If
+registration fails, the saved login and model preference remain available, but
+the new runtime and heartbeat are not initialized as ready; retrying `/login`
+or restarting the CLI retries registration without repeating model-provider
+authorization.
+
 At browser re-login the CLI drains and retires its old session-memory service
 before credential publication. Successful completion rebuilds that service with
 the authenticated identity, including when the process started signed out. It
