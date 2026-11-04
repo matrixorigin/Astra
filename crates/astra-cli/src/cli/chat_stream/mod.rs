@@ -26,8 +26,7 @@ pub(crate) use params::{
 };
 pub(crate) use params::{ChatTurnParams, CliExecutorObserver};
 // Only the settlement-boundary test in `crate::cli::turn::turn_settlement`
-// reaches through this far; the production trait impl in `sse_loop` calls
-// the function through its own closer-scoped re-export.
+// reaches through this far; the production host also requires retry provenance.
 #[cfg(test)]
 pub(crate) use sse_loop::is_pre_admission_rejection;
 pub(crate) use sse_loop::stream_chat_sse;

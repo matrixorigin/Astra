@@ -240,6 +240,7 @@ impl Drop for SandboxPolicyGuard<'_> {
 pub(crate) struct CliServerAdmissionHost<'a> {
     /// Sticky request-local evidence that admission dispatch may have begun.
     pub server_admission_dispatched: &'a mut bool,
+    pub prior_admission_ambiguous: bool,
     pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: String,
@@ -363,10 +364,13 @@ pub(crate) fn is_pre_admission_rejection(
 ) -> bool {
     error_code.is_some()
         && physical_run_id.is_none_or(|run_id| run_id.trim().is_empty())
-        && error_metadata
-            .and_then(|metadata| metadata.get("admission_state"))
-            .and_then(Value::as_str)
-            == Some("rejected")
+        && error_metadata.is_some_and(|metadata| {
+            metadata.get("admission_state").and_then(Value::as_str) == Some("rejected")
+                || metadata
+                    .get("attempt_admission_state")
+                    .and_then(Value::as_str)
+                    == Some("rejected")
+        })
 }
 
 impl CliServerAdmissionHost<'_> {
@@ -806,6 +810,15 @@ fn append_permission_mode_change_audit(
 }
 
 impl CliServerAdmissionHost<'_> {
+    pub(super) fn pre_admission_rejected(&self) -> bool {
+        !self.prior_admission_ambiguous
+            && is_pre_admission_rejection(
+                self.last_error_code.as_deref(),
+                self.last_error_metadata.as_ref(),
+                self.last_physical_run_id.as_deref(),
+            )
+    }
+
     pub(super) async fn fetch_remote_turn(
         &mut self,
         state: &mut RemoteTurnState,
@@ -934,6 +947,7 @@ impl CliServerAdmissionHost<'_> {
             () => {
                 fetch_chat_turn_sse(ChatTurnSseFetchRequest {
                     server_admission_dispatched: self.server_admission_dispatched,
+                    prior_admission_ambiguous: &mut self.prior_admission_ambiguous,
                     completion_checks: Some(&state.completion_checks),
                     tool_surface_config: &self.runtime_config.tool_surface,
                     api: self.api,
@@ -1805,7 +1819,7 @@ mod tests {
         };
         let mut accum = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            "data: {\"type\":\"error\",\"message\":\"registration required\",\"error_code\":\"execution_binding_provider_required\",\"metadata\":{\"admission_state\":\"rejected\"}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"registration required\",\"error_code\":\"execution_binding_provider_required\",\"metadata\":{\"attempt_admission_state\":\"rejected\"}}\n\n",
             &mut accum,
             &mut vec![],
         );

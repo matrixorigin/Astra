@@ -1028,6 +1028,9 @@ pub(crate) async fn request_password_authentication(
         if crate::cli::native_auth::active().is_some() {
             return Err("Use browser sign-in for the current authenticated connection.".to_string());
         }
+        if email.is_some() && crate::cli::session::session_runtime::active_env_access_token(chrono::Utc::now().timestamp()).is_some() {
+            return Err("Unset ASTRA_ACCESS_TOKEN and restart Astra before creating a new account. Use /login to sign in to an existing account.".into());
+        }
         let tokens = if let Some(email) = email {
             request_register_tokens(api, username, email, password).await?
         } else {
@@ -1048,7 +1051,9 @@ pub(crate) async fn request_password_authentication(
             }
         };
         Ok(PasswordAuthentication { tokens, execution_token })
-    }).await.map_err(|_| format!("{operation} failed: authentication timed out; retry sign-in."))?
+    }).await.map_err(|_| if email.is_some() {
+        "Registration outcome is unknown: the account may have been created. Try /login with the chosen credentials before registering again.".to_string()
+    } else { format!("{operation} failed: authentication timed out; retry sign-in.") })?
         .map_err(|error| format!("{operation} failed: {error}"))
 }
 
@@ -1076,9 +1081,8 @@ pub(crate) async fn prepare_password_session_login(
     })
 }
 
-/// A generic registration may replace native declarations even if its response
-/// is lost. Invalidate through the existing delivery owner after it settles;
-/// the next turn waits for that owner's fresh publication before admission.
+/// Native mode never sends a generic advertisement. Ask its existing owner to
+/// republish after credential changes; turn preparation awaits that publication.
 pub(crate) fn finish_password_session_login(
     prepared: &PreparedPasswordLogin,
     registration: Result<(), String>,
@@ -2045,7 +2049,7 @@ mod tests {
             Mock::given(method("POST")).and(path(endpoint))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "user_id":"account-b","access_token":"password-access","refresh_token":"password-refresh"
-                }))).expect(1).mount(&server).await;
+                }))).expect(if endpoint == "/auth/register" {0} else {1}).mount(&server).await;
         }
         Mock::given(method("GET"))
             .and(path("/auth/me"))
@@ -2054,7 +2058,7 @@ mod tests {
                 "Bearer environment-access",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user_id":"account-a"})))
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         let original = serde_json::to_value(load_credentials()).unwrap();
@@ -2074,7 +2078,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(error.contains("different account"));
+            assert!(error.contains(if email.is_some() {
+                "before creating a new account"
+            } else {
+                "different account"
+            }));
             assert!(!error.contains("environment-access") && !error.contains("password-access"));
             assert_eq!(serde_json::to_value(load_credentials()).unwrap(), original);
             assert_eq!(heartbeat.as_ref().unwrap().id(), previous);
@@ -2096,6 +2104,48 @@ mod tests {
                 .any(|request| request.url.path() == "/agents/edge")
         );
         server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn registration_override_conflict_precedes_committed_account_creation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe { crate::test_utils::set_var_serial("ASTRA_ACCESS_TOKEN", "environment-access") };
+        let server = MockServer::start().await;
+        let created = Arc::new(AtomicBool::new(false));
+        let committed = created.clone();
+        Mock::given(method("POST")).and(path("/auth/register"))
+            .respond_with(move |_: &wiremock::Request| {
+                committed.store(true,Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "user_id":"new-account","access_token":"new-access","refresh_token":"new-refresh"
+                }))
+            }).expect(0).mount(&server).await;
+        // Identity lookup can be unavailable; it must not happen after creation.
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = super::request_password_authentication(
+            &api,
+            "new-user",
+            "password",
+            Some("user@example.test"),
+        )
+        .await
+        .err()
+        .expect("environment override prevents new-account creation");
+        assert!(error.contains("before creating a new account"));
+        assert!(!created.load(Ordering::SeqCst));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]

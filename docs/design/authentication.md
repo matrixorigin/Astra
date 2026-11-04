@@ -229,25 +229,45 @@ Diagnostics record only failure category and HTTP status, not private paths,
 URLs or response bodies. Retrying `/login` or restarting retries registration
 without repeating model-provider authorization.
 
+Registration rejects an active `ASTRA_ACCESS_TOKEN` before the non-idempotent
+account-creation POST. Users must unset it and restart before creating a new
+account; no later identity lookup can turn a remotely created account into an
+apparent registration failure. A registration timeout reports an unknown outcome
+and directs users to try `/login` before registering again.
+
 When a valid `ASTRA_ACCESS_TOKEN` controls turn authentication, password sign-in
 checks its authenticated account against the password response before saving
 credentials or changing the session. A conflicting or unverifiable identity is
 rejected with instructions to unset the environment override and restart.
 Same-account sign-in uses the environment bearer for registration and heartbeat,
 matching subsequent turn admission; the new profile credentials are still saved.
-After generic registration settles, the session's existing native-delivery
-refresh handle requests a fresh capability publication, including after an
-uncertain response. The next native turn waits for that publication, preserving
-collaborator discovery even when an environment bearer has no profile-generation
-change to trigger reconnection. No second delivery owner is created.
+With `ASTRA_NATIVE_COLLABORATORS` selected, the interactive lifecycle does not
+send generic HTTP advertisements during startup or re-login. Native
+delivery is the only capability publisher: a timed-out generic POST cannot be
+buffered and forwarded later to erase a newer native advertisement. Credential
+completion requests a refresh through the existing native-delivery handle;
+the first selected native turn establishes or refreshes that owner and waits for
+publication before admission. A local runtime projection is not capacity-ready
+proof. No second delivery owner or publication generation scheme is added. Direct
+registration callers such as app-server keep their existing noninteractive policy.
+
+Graceful shutdown drains an in-flight password exchange before retiring the
+previous identity's runtime. A successful delayed response is published through
+the same credential/session transition reducer used by ordinary completion;
+teardown does not discard newly issued tokens or start a new runtime/heartbeat.
 
 An absent agent projection is not a registration-readiness gate: the first turn
 can initialize it lazily. The Server remains the execution admission authority.
 When execution selection rejects a new turn with
 `execution_binding_provider_required` before durable run creation, it includes
-`metadata.admission_state: rejected`. The CLI preserves that code, restores the
-draft and suggests `/login` or restarting to register the checkout. An admitted
-run or resume failure is never relabeled as an unexecuted turn.
+`metadata.attempt_admission_state: rejected`. The CLI preserves that code, restores the
+draft and suggests `/login` or restarting only when no earlier dispatched
+attempt remains ambiguous. The thin transport returns sticky retry provenance
+alongside the final response. Older clients ignore this new attempt-only field
+instead of interpreting it as the legacy `admission_state: rejected` guarantee. A lost response followed by a rejected retry keeps
+recovery evidence and reports unknown execution state without restoring a draft
+or claiming no model/tool ran. An admitted run or resume failure is never
+relabeled as an unexecuted turn.
 
 At browser re-login the CLI drains and retires its old session-memory service
 before credential publication. Successful completion rebuilds that service with

@@ -18538,8 +18538,17 @@ async fn missing_edge_registration_preserves_code_and_pre_admission_proof_in_sse
         Some("execution_binding_provider_required")
     );
     assert_eq!(
-        error.metadata.as_ref().unwrap()["admission_state"],
+        error.metadata.as_ref().unwrap()["attempt_admission_state"],
         "rejected"
+    );
+    assert!(
+        error
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("admission_state")
+            .is_none(),
+        "older clients must not read an attempt rejection as logical-turn proof"
     );
     let response = crate::server::http_helpers::sse_error_response_from_error_with_context(
         status,
@@ -18558,7 +18567,7 @@ async fn missing_edge_registration_preserves_code_and_pre_admission_proof_in_sse
         panic!("expected rejection event")
     };
     assert_eq!(raw["error_code"], "execution_binding_provider_required");
-    assert_eq!(raw["metadata"]["admission_state"], "rejected");
+    assert_eq!(raw["metadata"]["attempt_admission_state"], "rejected");
 }
 
 #[test]

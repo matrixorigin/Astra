@@ -167,14 +167,15 @@ use crate::server::tool_transport::{
 };
 use crate::server::{runtime_tool_executor, server_skill_subrun};
 
-/// Applied only during new-run preparation, before persist_run_start. Resume
-/// and already-admitted failures must never claim that no execution occurred.
+/// Applied only during new-run preparation, before persist_run_start. This is
+/// proof about one HTTP attempt, not earlier dispatched retries of the logical
+/// turn. Older clients must not mistake it for the legacy logical-turn proof.
 fn execution_selection_admission_rejection(
     (status, Json(mut error)): (StatusCode, Json<ErrorResponse>),
 ) -> (StatusCode, Json<ErrorResponse>) {
     if error.error_code.as_deref() == Some("execution_binding_provider_required") {
         error.metadata = Some(json!({
-            "admission_state": "rejected",
+            "attempt_admission_state": "rejected",
             "recovery_action": "register_or_select_execution_provider"
         }));
     }

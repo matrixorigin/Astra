@@ -259,14 +259,47 @@ fn attach_runtime_environment_capabilities(body: &mut EdgeRegisterRequest) {
 pub async fn register_edge_once(api: &ThinClient, token: &str) -> Result<(), ThinClientError> {
     register_edge_once_classified(api, token)
         .await
-        .map_err(|error| match error {
-            RegistrationFailure::LocalState(error) | RegistrationFailure::Request(error) => error,
-        })
+        .map_err(RegistrationFailure::into_thin_error)
 }
 
 enum RegistrationFailure {
+    Configuration(String),
     LocalState(ThinClientError),
     Request(ThinClientError),
+}
+
+impl RegistrationFailure {
+    fn into_thin_error(self) -> ThinClientError {
+        match self {
+            Self::LocalState(error) | Self::Request(error) => error,
+            Self::Configuration(error) => ThinClientError::InvalidInput(error),
+        }
+    }
+}
+
+async fn register_interactive_edge_once(
+    api: &ThinClient,
+    token: &str,
+) -> Result<(), ThinClientError> {
+    register_interactive_edge_once_classified(api, token)
+        .await
+        .map_err(RegistrationFailure::into_thin_error)
+}
+
+async fn register_interactive_edge_once_classified(
+    api: &ThinClient,
+    token: &str,
+) -> Result<(), RegistrationFailure> {
+    // Only the interactive lifecycle selects a native owner here. App-server
+    // and other direct registration callers retain their own existing policy.
+    // Never enqueue a generic publication that could arrive after native setup.
+    if edge_cloud_registry_enabled()
+        && native_delivery::native_collaborators_requested()
+            .map_err(RegistrationFailure::Configuration)?
+    {
+        return Ok(());
+    }
+    register_edge_once_classified(api, token).await
 }
 
 async fn register_edge_once_classified(
@@ -432,7 +465,12 @@ async fn register_after_login_with_timeout(
     token: &str,
     timeout: Duration,
 ) -> Result<(), String> {
-    match tokio::time::timeout(timeout, register_edge_once_classified(api, token)).await {
+    match tokio::time::timeout(
+        timeout,
+        register_interactive_edge_once_classified(api, token),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(login_registration_error(&error)),
         Err(_) => {
@@ -459,6 +497,11 @@ pub(crate) async fn complete_login_rebind(
 fn login_registration_error(error: &RegistrationFailure) -> String {
     // Raw HTTP bodies, URLs and filesystem paths can contain private data.
     let (kind, status, recovery) = match error {
+        RegistrationFailure::Configuration(_) => (
+            "configuration",
+            None,
+            "Set ASTRA_NATIVE_COLLABORATORS to true/false or 1/0, then restart Astra.",
+        ),
         RegistrationFailure::LocalState(_) => (
             "local_state",
             None,
@@ -509,13 +552,13 @@ pub async fn register_and_start_heartbeat(
     if !edge_cloud_registry_enabled() {
         return None;
     }
-    let (final_token, success) = match register_edge_once(api, token).await {
+    let (final_token, success) = match register_interactive_edge_once(api, token).await {
         Ok(()) => (token.to_string(), true),
         Err(ref e) if is_unauthorized(e) => {
             // Access token is stale. Try one silent refresh and retry.
             if attempt_token_refresh(api, profile).await {
                 if let Some(fresh) = current_access_token(profile) {
-                    match register_edge_once(api, &fresh).await {
+                    match register_interactive_edge_once(api, &fresh).await {
                         Ok(()) => (fresh, true),
                         Err(retry_err) => {
                             print_skip_notice(&retry_err);
@@ -645,6 +688,57 @@ mod tests {
         assert!(
             heartbeat.is_none(),
             "disabled registry must not start a heartbeat"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_registration_keeps_noninteractive_policy_with_native_env_present() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _native = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        env_set("ASTRA_NATIVE_COLLABORATORS", "1");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        register_edge_once(&api, "token").await.unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn native_mode_never_queues_generic_publications_for_late_delivery() {
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _native = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        for enabled in ["1", "true"] {
+            env_set("ASTRA_NATIVE_COLLABORATORS", enabled);
+            for _ in 0..3 {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    super::register_after_login(&api, "token"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no generic POST may enter a proxy queue, including on re-login"
         );
     }
 

@@ -462,10 +462,13 @@ pub(crate) struct PartialTurnData {
     pub error_metadata: Option<serde_json::Value>,
     /// Outer `None`: no cancellation observation; inner `None`: unknown.
     pub cancel_context_not_saved: Option<Option<bool>>,
-    /// The server rejected the request before durable Run admission. Such a
-    /// request is not a failed turn and must not be reconciled or journaled as
-    /// one.
+    /// The Server rejected admission and no earlier dispatched attempt remains
+    /// ambiguous. Only then may this logical submission restore its draft and
+    /// discard uncommitted execution recovery evidence.
     pub admission_rejected: bool,
+    /// An earlier dispatched attempt lost its response before the final reply.
+    /// That reply's rejection cannot prove this logical submission never ran.
+    pub prior_admission_ambiguous: bool,
     /// The CLI admission owner confirms that no Server execution request was
     /// dispatched. False means unknown, not proof that admission happened.
     pub server_admission_not_dispatched: bool,
