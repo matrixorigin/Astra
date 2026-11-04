@@ -182,6 +182,54 @@ fn spawn_password_registration(
     });
 }
 
+async fn settle_password_authentication(
+    profile: Option<&str>,
+    context: &PasswordLoginContext,
+    result: Result<crate::cli::auth_flow::PasswordAuthentication, String>,
+    state: &mut crate::cli::session::session_state::SessionState,
+) -> Result<crate::cli::auth_flow::PreparedPasswordLogin, String> {
+    let authentication = result?;
+    crate::cli::auth_flow::prepare_password_session_login(profile, &context.username, authentication, state)
+        .await.map_err(|error| if context.register {
+            format!("Account created, but local sign-in could not be completed: {error}. Try /login with the chosen credentials before registering again.")
+        } else { format!("Login failed: {error}") })
+}
+
+/// Credential exchange owns a possible remote account creation. Drain its
+/// successful result through the same publication owner before runtime teardown;
+/// joining a task and dropping its tokens is not successful settlement.
+async fn settle_login_tasks_for_shutdown(
+    phase: &super::login_control::LoginControl,
+    tasks: &mut tokio::task::JoinSet<Result<LoginEffect, String>>,
+    profile: Option<&str>,
+    state: &mut crate::cli::session::session_state::SessionState,
+) -> Vec<String> {
+    phase.prepare_shutdown(tasks);
+    let mut notices = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(LoginEffect::PasswordAuthenticated { context, result })) => {
+                match settle_password_authentication(profile, &context, result, state).await {
+                    Ok(_) => notices.push("Sign-in saved. Start Astra again to continue.".into()),
+                    Err(error) => notices.push(error),
+                }
+            }
+            Ok(Ok(LoginEffect::PasswordRegistered { result, .. })) => {
+                notices.push(
+                    result
+                        .err()
+                        .unwrap_or_else(|| "Sign-in saved. Start Astra again to continue.".into()),
+                );
+            }
+            Ok(Err(error)) => notices.push(error),
+            Err(error) if !error.is_cancelled() => notices
+                .push("Sign-in task did not complete. Try /login before registering again.".into()),
+            _ => {}
+        }
+    }
+    notices
+}
+
 fn cancel_login_on_key(
     key: crossterm::event::KeyEvent,
     phase: &super::login_control::LoginControl,
@@ -8522,23 +8570,18 @@ pub(crate) async fn run_tui_session(
                         });
                     }
                     Ok(LoginEffect::PasswordAuthenticated { context, result }) => {
-                        let prepared = match result {
-                            Ok(authentication) => {
-                                // Reads started by the old identity must not apply
-                                // after password credential publication.
-                                model_catalog_tasks.abort_all();
-                                while model_catalog_tasks.join_next().await.is_some() {}
-                                while model_catalog_rx.try_recv().is_ok() {}
-                                bottom_pane.clear_model_catalog();
-                                model_catalog_loading = false;
-                                slash_background_read_tasks.abort_all();
-                                slash_background_read_count = 0;
-                                slash_background_read_generation = slash_background_read_generation.wrapping_add(1);
-                                auth_flow::prepare_password_session_login(profile, &context.username, authentication, &mut state).await
-                                    .map_err(|error| format!("{} failed: {error}", if context.register {"Register"} else {"Login"}))
-                            },
-                            Err(error) => Err(error),
-                        };
+                        if result.is_ok() {
+                            // Retire reads that could otherwise apply old identity data.
+                            model_catalog_tasks.abort_all();
+                            while model_catalog_tasks.join_next().await.is_some() {}
+                            while model_catalog_rx.try_recv().is_ok() {}
+                            bottom_pane.clear_model_catalog();
+                            model_catalog_loading = false;
+                            slash_background_read_tasks.abort_all();
+                            slash_background_read_count = 0;
+                            slash_background_read_generation = slash_background_read_generation.wrapping_add(1);
+                        }
+                        let prepared = settle_password_authentication(profile, &context, result, &mut state).await;
                         match prepared {
                             Ok(prepared) => {
                                 crate::cli::edge_lifecycle::prepare_login_rebind(&mut edge_heartbeat_task, prepared.owner_changed).await;
@@ -13058,6 +13101,12 @@ pub(crate) async fn run_tui_session(
         );
     }
 
+    for notice in
+        settle_login_tasks_for_shutdown(&login_phase, &mut login_tasks, profile, &mut state).await
+    {
+        chat_widget.commit_system(history_cell::system::SystemCell::info(notice));
+    }
+
     // Stop read-side observers first so teardown does not race fresh remote
     // fetches into state that is already converging toward shutdown.
     drop(task_board);
@@ -13126,7 +13175,6 @@ pub(crate) async fn run_tui_session(
     model_setup_phase.cancel();
     model_setup_cancel.cancel();
     while model_setup_tasks.join_next().await.is_some() {}
-    login_phase.shutdown(&mut login_tasks).await;
     while model_catalog_tasks.join_next().await.is_some() {}
     for task in startup_observation_tasks {
         task.abort();
@@ -13825,6 +13873,99 @@ mod tests {
         .await
         .unwrap();
         assert!(phase.begin_exchange().is_err());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn sighup_during_committed_registration_settles_credentials_before_teardown() {
+        use crate::cli::session::session_guard::ShutdownSignal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let committed = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().route("/auth/register",axum::routing::post({
+            let committed = committed.clone();let started=started.clone();let release=release.clone();
+            move || {let committed=committed.clone();let started=started.clone();let release=release.clone();async move {
+                committed.store(true,Ordering::SeqCst);
+                started.notify_one();
+                release.notified().await;
+                axum::Json(serde_json::json!({"user_id":"new-account","access_token":"saved-access","refresh_token":"saved-refresh"}))
+            }}
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let phase = super::super::login_control::LoginControl::default();
+        phase.begin_exchange().unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        spawn_password_authentication(
+            &mut tasks,
+            api,
+            PasswordLoginContext {
+                username: "new-user".into(),
+                register: true,
+                session_id: None,
+                attachment_epoch: state.session_attachment_epoch,
+            },
+            "password".into(),
+            Some("user@example.test".into()),
+        );
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+        let (signal_tx, signal_rx) = tokio::sync::watch::channel(None);
+        signal_tx.send_replace(Some(ShutdownSignal::Sighup));
+        let signal = tokio::select! {
+            biased;
+            signal=await_shutdown_signal(signal_rx)=>signal,
+            _=tasks.join_next()=>panic!("registration response is held until after SIGHUP"),
+        };
+        assert_eq!(signal, ShutdownSignal::Sighup);
+        let mut settlement = Box::pin(settle_login_tasks_for_shutdown(
+            &phase, &mut tasks, None, &mut state,
+        ));
+        tokio::select! {
+            _=&mut settlement=>panic!("shutdown must await the pending account result"),
+            _=tokio::task::yield_now()=>{},
+        }
+        release.notify_one();
+        let notices = settlement.await;
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("Sign-in saved"))
+        );
+        assert!(tasks.is_empty());
+        assert!(
+            state.agent_spawner.is_none(),
+            "shutdown must not start a fresh runtime"
+        );
+        let credentials = crate::cli::cli_config::cli_utils::load_credentials();
+        assert_eq!(
+            credentials.profiles["default"].account_id.as_deref(),
+            Some("new-account")
+        );
+        assert_eq!(
+            credentials.profiles["default"].access_token.as_deref(),
+            Some("saved-access")
+        );
+        assert_eq!(
+            credentials.profiles["default"].refresh_token.as_deref(),
+            Some("saved-refresh")
+        );
+        peer.abort();
+        let _ = peer.await;
     }
 
     #[serial_test::serial]

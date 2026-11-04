@@ -28,11 +28,12 @@ impl LoginControl {
         self.0.load(Ordering::SeqCst) == 2
     }
 
-    pub(super) async fn shutdown<T: Send + 'static>(&self, tasks: &mut tokio::task::JoinSet<T>) {
+    /// Cancel only pre-exchange work. The owner must drain and settle any
+    /// committed exchange results instead of dropping successful credentials.
+    pub(super) fn prepare_shutdown<T: Send + 'static>(&self, tasks: &mut tokio::task::JoinSet<T>) {
         if self.cancel() {
             tasks.abort_all();
         }
-        while tasks.join_next().await.is_some() {}
     }
 }
 
@@ -73,7 +74,8 @@ mod tests {
             task_completed.store(true, Ordering::SeqCst);
         });
         let shutdown = tokio::spawn(async move {
-            control.shutdown(&mut tasks).await;
+            control.prepare_shutdown(&mut tasks);
+            while tasks.join_next().await.is_some() {}
         });
         tokio::task::yield_now().await;
         assert!(!shutdown.is_finished());

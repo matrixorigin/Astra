@@ -37,6 +37,14 @@ use crate::work::{WorkCatalogCursorV1, WorkCatalogPageV1, WorkTaskGraphPageV2};
 
 const HTTP_STREAM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const AUTHED_TEXT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// A final response does not settle earlier dispatched attempts whose response
+/// headers were lost. Keep that local transport evidence outside the wire body.
+#[derive(Debug)]
+pub struct DeveloperLoopAdmissionResponse {
+    pub response: Response,
+    pub prior_dispatch_ambiguous: bool,
+}
 /// Edge callbacks are control-plane acknowledgements, not long-lived streams.
 /// A peer that accepts bytes but never returns response headers must not stop
 /// the SSE consumer indefinitely. The budget has to outlast one slow database
@@ -1704,9 +1712,9 @@ impl ThinClient {
 
     /// Retry Server-owned loop admission on 429 and transport errors.
     ///
-    /// A retry is safe only before response headers arrive. Once the response
-    /// is returned, durable run identity and stream reconciliation belong to
-    /// the Server lifecycle.
+    /// A lost response before headers can still belong to an admitted Run.
+    /// Callers that interpret admission proofs must use the payload variant's
+    /// attempt provenance; the final response alone cannot settle earlier I/O.
     pub async fn post_developer_loop_retry_429(
         &self,
         token: &str,
@@ -1718,6 +1726,7 @@ impl ThinClient {
             Ok(payload.clone())
         })
         .await
+        .map(|admission| admission.response)
     }
 
     /// Retry admission with a fresh payload at every physical attempt, after
@@ -1725,22 +1734,30 @@ impl ThinClient {
     /// The factory may reject admission and record sticky dispatch evidence.
     /// Callers with an absolute execution deadline use this to publish a
     /// monotonically shrinking budget after 429 or transport waits.
+    /// The returned provenance is sticky across retries, including a final
+    /// rejection that did not itself admit any execution.
     pub async fn post_developer_loop_retry_429_with_payload<F>(
         &self,
         token: &str,
         max_attempts: u32,
         quiet: bool,
         mut payload_for_attempt: F,
-    ) -> Result<Response, ThinClientError>
+    ) -> Result<DeveloperLoopAdmissionResponse, ThinClientError>
     where
         F: FnMut() -> Result<Value, ThinClientError>,
     {
         let mut last_err: Option<ThinClientError> = None;
+        let mut prior_dispatch_ambiguous = false;
         for attempt in 0..max_attempts {
-            match self
-                .post_developer_loop_with_payload(token, &mut payload_for_attempt)
-                .await
-            {
+            let mut dispatched = false;
+            let result = self
+                .post_developer_loop_with_payload(token, &mut || {
+                    let payload = payload_for_attempt()?;
+                    dispatched = true;
+                    Ok(payload)
+                })
+                .await;
+            match result {
                 Ok(resp) => {
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
@@ -1759,10 +1776,14 @@ impl ThinClient {
                         sleep_between_attempts(delay_secs).await;
                         continue;
                     }
-                    return Ok(resp);
+                    return Ok(DeveloperLoopAdmissionResponse {
+                        response: resp,
+                        prior_dispatch_ambiguous,
+                    });
                 }
                 Err(e) => {
                     if attempt + 1 < max_attempts && e.is_transport() {
+                        prior_dispatch_ambiguous |= dispatched;
                         let delay_secs = 1u64 << attempt;
                         if !quiet {
                             tracing::warn!(
@@ -5621,7 +5642,11 @@ mod tests {
             })
             .await
             .expect("second admission succeeds");
-        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.response.status().as_u16(), 200);
+        assert!(
+            !response.prior_dispatch_ambiguous,
+            "429 responses are known rejections, not lost responses"
+        );
         let requests = srv.received_requests().await.expect("request history");
         assert_eq!(requests.len(), 2);
         let budgets = requests

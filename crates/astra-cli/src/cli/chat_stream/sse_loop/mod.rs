@@ -43,6 +43,7 @@ use server_admission_host::CliServerAdmissionHost;
 // `pub(crate)` (rather than the module-private `use` above) so the
 // settlement boundary test in `crate::cli::turn::turn_settlement` can call
 // the real classifier instead of re-deriving its logic.
+#[cfg(test)]
 pub(crate) use server_admission_host::is_pre_admission_rejection;
 
 fn non_tty_output_failure(
@@ -560,6 +561,7 @@ async fn stream_chat_sse_inner(
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliServerAdmissionHost {
         server_admission_dispatched,
+        prior_admission_ambiguous: false,
         runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
@@ -917,11 +919,8 @@ async fn stream_chat_sse_inner(
                 error_code: host.last_error_code.clone(),
                 error_metadata: host.last_error_metadata.clone(),
                 cancel_context_not_saved: None,
-                admission_rejected: is_pre_admission_rejection(
-                    host.last_error_code.as_deref(),
-                    host.last_error_metadata.as_ref(),
-                    host.last_physical_run_id.as_deref(),
-                ),
+                admission_rejected: host.pre_admission_rejected(),
+                prior_admission_ambiguous: host.prior_admission_ambiguous,
                 server_admission_not_dispatched: false,
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
