@@ -42,7 +42,7 @@ const MAX_NON_XML_RATIO: f64 = 0.20;
 /// { "id": "...", "type": "function", "function": { "name": "...", "arguments": "{...}" } }
 /// ```
 pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
-    let calls = select_non_overlapping(parse_invokes_with_positions(text))
+    let calls = select_non_overlapping(parse_invokes_with_positions(text, &dsml::decode(text)))
         .into_iter()
         .map(|parsed| parsed.call)
         .collect::<Vec<_>>();
@@ -229,9 +229,11 @@ fn invoke_block_end(text: &str, start: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-fn parse_invokes_with_positions(text: &str) -> Vec<ParsedDegradedCall> {
-    let mut calls = dsml::calls(text)
-        .into_iter()
+fn parse_invokes_with_positions(text: &str, decoded: &dsml::Decoded) -> Vec<ParsedDegradedCall> {
+    let mut calls = decoded
+        .calls
+        .iter()
+        .cloned()
         .map(|(span, call)| ParsedDegradedCall {
             span,
             format: DegradedCallFormat::Invoke,
@@ -242,10 +244,7 @@ fn parse_invokes_with_positions(text: &str) -> Vec<ParsedDegradedCall> {
     let mut search_from = 0;
     while let Some(start) = next_invoke_start(text, search_from) {
         let end = invoke_block_end(text, start);
-        if calls
-            .iter()
-            .any(|call| start >= call.span.start && start < call.span.end)
-        {
+        if decoded.owned.iter().any(|span| span.contains(&start)) {
             search_from = end.max(start + 1);
             continue;
         }
@@ -268,7 +267,10 @@ fn parse_invokes_with_positions(text: &str) -> Vec<ParsedDegradedCall> {
     calls
 }
 
-fn parse_tool_call_tags_with_positions(text: &str) -> Vec<ParsedDegradedCall> {
+fn parse_tool_call_tags_with_positions(
+    text: &str,
+    owned: &[Range<usize>],
+) -> Vec<ParsedDegradedCall> {
     if !text.contains("<tool_call>") {
         return Vec::new();
     }
@@ -290,7 +292,9 @@ fn parse_tool_call_tags_with_positions(text: &str) -> Vec<ParsedDegradedCall> {
         let inner = text[content_start..end]
             .trim_end_matches("</tool_call>")
             .replace('\0', "");
-        if let Some(call) = parse_single_tool_call_tag(inner.trim()) {
+        if !owned.iter().any(|span| span.contains(&start))
+            && let Some(call) = parse_single_tool_call_tag(inner.trim())
+        {
             calls.push(ParsedDegradedCall {
                 span: start..end,
                 format: DegradedCallFormat::ToolCallTag,
@@ -377,8 +381,9 @@ fn remove_ranges(text: &str, ranges: &[Range<usize>]) -> String {
 }
 
 fn parse_degraded_response(text: &str) -> ParsedDegradedResponse {
-    let mut candidates = parse_invokes_with_positions(text);
-    candidates.extend(parse_tool_call_tags_with_positions(text));
+    let decoded = dsml::decode(text);
+    let mut candidates = parse_invokes_with_positions(text, &decoded);
+    candidates.extend(parse_tool_call_tags_with_positions(text, &decoded.owned));
     let candidates = select_non_overlapping(candidates);
     let bare_suffix = bare_invokes_form_terminal_suffix(text, &candidates);
     let accepted_invokes: Vec<ParsedDegradedCall> = candidates
@@ -495,9 +500,11 @@ pub fn parse_degraded_tool_calls(text: &str) -> Option<Vec<Value>> {
 pub fn strip_degraded_tool_calls(text: &str) -> String {
     let parsed = parse_degraded_response(text);
     let after_accepted = remove_ranges(text, &parsed.strip_ranges);
-    let after_truncated_tail = strip_truncated_degraded_tool_call_tail(&after_accepted);
-    let after_residual_fragments = strip_residual_xml_fragments(&after_truncated_tail);
-    filter_dsml_tool_call_markup_for_display(&after_residual_fragments)
+    // DSML owns its parameter bytes. Remove protocol spans before the legacy
+    // bare-XML cleanup can interpret markup inside an argument as answer text.
+    let after_dsml = filter_dsml_tool_call_markup_for_display(&after_accepted);
+    let after_truncated_tail = strip_truncated_degraded_tool_call_tail(&after_dsml);
+    strip_residual_xml_fragments(&after_truncated_tail)
 }
 
 fn strip_truncated_degraded_tool_call_tail(text: &str) -> String {
@@ -719,6 +726,122 @@ mod tests {
                     .is_err()
             );
             assert_eq!(strip_degraded_tool_calls(text), "");
+        }
+    }
+
+    #[test]
+    fn dsml_invalid_outer_subtree_cannot_release_nested_invocations() {
+        for (text, outer) in [
+            (
+                r#"<||DSML||tool_calls><||DSML||invoke name=""><||DSML||invoke name="bash"><||DSML||parameter name="command">pwd</||DSML||parameter></||DSML||invoke></||DSML||invoke></||DSML||tool_calls>"#,
+                None,
+            ),
+            (
+                r#"<||DSML||tool_calls><||DSML||invoke><||DSML||invoke name="bash">{"command":"pwd"}</||DSML||invoke></||DSML||invoke></||DSML||tool_calls>"#,
+                None,
+            ),
+            (
+                r#"<｜DSML｜ calls><｜DSML｜ invoke name="write_file"><｜DSML｜ calls></｜DSML｜ calls><｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke></｜DSML｜ invoke></｜DSML｜ calls>"#,
+                Some("write_file"),
+            ),
+        ] {
+            let calls = parse_degraded_tool_calls(text).unwrap_or_default();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                outer.into_iter().map(Some).collect::<Vec<_>>()
+            );
+            for call in &calls {
+                assert!(
+                    serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                        .is_err()
+                );
+            }
+            assert_eq!(strip_degraded_tool_calls(text), "");
+        }
+    }
+
+    #[test]
+    fn dsml_container_and_indented_code_are_literal() {
+        let call = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
+        for text in [
+            format!("> ~~~text\n> {call}\n> ~~~"),
+            format!("    {call}\n"),
+            format!("- ~~~text\n  {call}\n  ~~~"),
+            format!("1. ~~~text\n   {call}\n   ~~~"),
+            format!("> - ~~~text\n>   {call}\n>   ~~~"),
+            format!("100. ~~~text\n     {call}\n     ~~~"),
+            format!("```text\n> ```\n{call}\n```"),
+            format!("\t{call}\n"),
+        ] {
+            assert!(
+                parse_degraded_tool_calls(&text).is_none(),
+                "code example: {text:?}"
+            );
+            assert_eq!(strip_degraded_tool_calls(&text), text);
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut visible = String::new();
+            for ch in text.chars() {
+                visible.push_str(&filter.push(&ch.to_string()));
+            }
+            visible.push_str(&filter.finish());
+            assert_eq!(visible, text);
+        }
+    }
+
+    #[test]
+    fn dsml_calls_after_markdown_container_end_are_recovered() {
+        let example = r#"<｜DSML｜ invoke name="example">{}</｜DSML｜ invoke>"#;
+        let real = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
+        for text in [
+            format!("100. ~~~text\n     {example}\n     ~~~\n{real}"),
+            format!("> ~~~text\n> {example}\n{real}"),
+            format!("- ~~~text\n  {example}\n{real}"),
+        ] {
+            let calls = parse_degraded_tool_calls(&text).unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("bash")]
+            );
+            let projected = strip_degraded_tool_calls(&text);
+            assert!(projected.contains(example));
+            assert!(!projected.contains(real));
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut visible = String::new();
+            for ch in text.chars() {
+                visible.push_str(&filter.push(&ch.to_string()));
+            }
+            visible.push_str(&filter.finish());
+            assert_eq!(visible, projected);
+        }
+    }
+
+    #[test]
+    fn dsml_parameter_body_is_not_legacy_xml_cleanup_input() {
+        let text = r#"Before.<||DSML||tool_calls><||DSML||invoke name="write_file"><||DSML||parameter name="path">example.txt</||DSML||parameter><||DSML||parameter name="content"><parameter=x>hello</||DSML||parameter></||DSML||invoke></||DSML||tool_calls>After."#;
+        assert_eq!(strip_degraded_tool_calls(text), "Before.After.");
+    }
+
+    #[test]
+    fn dsml_long_multiline_answer_preserves_text() {
+        for text in [
+            "Ordinary model answer with multiple words and no protocol markup on this line.\n"
+                .repeat(55_000),
+            "<a".repeat(250_000),
+        ] {
+            let started = std::time::Instant::now();
+            assert!(parse_degraded_tool_calls(&text).is_none());
+            assert_eq!(strip_degraded_tool_calls(&text), text);
+            eprintln!(
+                "DSML decode and projection: {} bytes in {:?}",
+                text.len(),
+                started.elapsed()
+            );
         }
     }
 

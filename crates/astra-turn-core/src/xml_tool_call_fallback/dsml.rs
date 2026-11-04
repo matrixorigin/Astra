@@ -33,6 +33,11 @@ enum Fragment {
 struct Lexer {
     pending: String,
     offset: usize,
+    cursor: usize,
+    line_prefix_done: bool,
+    indented: bool,
+    line_containers: Vec<Container>,
+    fence_containers: Vec<Container>,
     literal: Option<(char, usize, bool)>,
     line_has_text: bool,
     escaped: bool,
@@ -49,42 +54,250 @@ fn tag_regex() -> &'static Regex {
 /// A prefix is held only while it can still become a supported protocol tag.
 /// This also bounds normal-text latency when a chunk ends with `<`.
 fn tag_prefix(text: &str) -> bool {
-    let compact = text
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    let Some(tail) = compact.strip_prefix('<') else {
+    let Some(tail) = text.strip_prefix('<') else {
         return false;
     };
-    let tail = tail.strip_prefix('/').unwrap_or(tail);
-    for marker in ["｜dsml｜", "｜｜dsml｜｜", "|dsml|", "||dsml||"] {
-        if marker.starts_with(tail) {
-            return true;
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix('/').unwrap_or(tail).trim_start();
+    for marker in ["｜DSML｜", "｜｜DSML｜｜", "|DSML|", "||DSML||"] {
+        let mut chars = tail.char_indices();
+        let mut matched = true;
+        let mut end = 0;
+        for expected in marker.chars() {
+            match chars.next() {
+                None => return true,
+                Some((index, actual)) if actual.eq_ignore_ascii_case(&expected) => {
+                    end = index + actual.len_utf8();
+                }
+                _ => {
+                    matched = false;
+                    break;
+                }
+            }
         }
-        if let Some(name) = tail.strip_prefix(marker) {
-            return [
-                "tool_calls",
-                "function_calls",
-                "calls",
-                "invoke",
-                "parameter",
-            ]
-            .iter()
-            .any(|tag| tag.starts_with(name) || name.starts_with(tag));
+        if !matched {
+            continue;
         }
+        let name = tail[end..].trim_start();
+        return [
+            "tool_calls",
+            "function_calls",
+            "calls",
+            "invoke",
+            "parameter",
+        ]
+        .iter()
+        .any(|tag| {
+            let length = name.len().min(tag.len());
+            name.get(..length)
+                .is_some_and(|prefix| tag[..length].eq_ignore_ascii_case(prefix))
+                && (name.len() <= tag.len()
+                    || matches!(
+                        name.as_bytes()[tag.len()],
+                        b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'
+                    ))
+        });
     }
     false
 }
 
+#[derive(Clone, Debug)]
+enum Container {
+    Quote,
+    List(usize),
+}
+
+struct Prefix {
+    end: usize,
+    indented: bool,
+    containers: Vec<Container>,
+}
+
+fn indentation(bytes: &[u8], cursor: &mut usize) -> usize {
+    let mut columns = 0;
+    while let Some(ch) = bytes.get(*cursor) {
+        match ch {
+            b' ' => columns += 1,
+            b'\t' => columns += 4 - columns % 4,
+            _ => break,
+        }
+        *cursor += 1;
+    }
+    columns
+}
+
+/// Consume only Markdown container/indentation prefixes. Holding an unfinished
+/// prefix lets streaming and complete-input decoding make the same decision.
+/// Indented source is conservatively literal even when a paragraph could make
+/// CommonMark interpret it as continuation text: it must never become a call.
+fn markdown_prefix(text: &str, finish: bool) -> Option<Prefix> {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    let mut containers = Vec::new();
+    loop {
+        let indent = indentation(bytes, &mut cursor);
+        if cursor == bytes.len() && !finish {
+            return None;
+        }
+        if indent >= 4 {
+            return Some(Prefix {
+                end: cursor,
+                indented: true,
+                containers,
+            });
+        }
+        if bytes.get(cursor) == Some(&b'>') {
+            cursor += 1;
+            if bytes.get(cursor) == Some(&b' ') {
+                cursor += 1;
+            }
+            containers.push(Container::Quote);
+            continue;
+        }
+        let marker_end = match bytes.get(cursor) {
+            Some(b'-' | b'+' | b'*') => Some(cursor + 1),
+            Some(b'0'..=b'9') => {
+                let end = bytes[cursor..]
+                    .iter()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .count()
+                    + cursor;
+                if end == bytes.len() && end - cursor <= 9 && !finish {
+                    return None;
+                }
+                (end - cursor <= 9 && matches!(bytes.get(end), Some(b'.' | b')')))
+                    .then_some(end + 1)
+            }
+            _ => None,
+        };
+        if let Some(end) = marker_end {
+            if end == bytes.len() && !finish {
+                return None;
+            }
+            if matches!(bytes.get(end), Some(b' ' | b'\t')) {
+                let mut content = end;
+                let padding = indentation(bytes, &mut content);
+                if content == bytes.len() && !finish {
+                    return None;
+                }
+                // CommonMark list padding is one to four columns. With more
+                // padding, one column belongs to the marker and the remainder
+                // starts an indented code block.
+                let (content, padding) = if padding <= 4 {
+                    (content, padding)
+                } else {
+                    (end + 1, 1)
+                };
+                containers.push(Container::List(indent + end - cursor + padding));
+                cursor = content;
+                continue;
+            }
+        }
+        return Some(Prefix {
+            end: cursor,
+            indented: false,
+            containers,
+        });
+    }
+}
+
+/// A fenced block consumes only the containers that opened it. A new quote or
+/// list-looking line inside code is data, and leaving a container ends its fence.
+/// None waits for more prefix bytes; Some(None) leaves the containing block.
+fn fence_prefix(text: &str, finish: bool, containers: &[Container]) -> Option<Option<Prefix>> {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    for container in containers {
+        match container {
+            Container::Quote => {
+                if indentation(bytes, &mut cursor) > 3 {
+                    return Some(None);
+                }
+                if cursor == bytes.len() && !finish {
+                    return None;
+                }
+                if bytes.get(cursor) != Some(&b'>') {
+                    return Some(None);
+                }
+                cursor += 1;
+                if bytes.get(cursor) == Some(&b' ') {
+                    cursor += 1;
+                }
+            }
+            Container::List(width) => {
+                let mut columns = 0;
+                while columns < *width {
+                    match bytes.get(cursor) {
+                        Some(b' ') => columns += 1,
+                        Some(b'\t') => columns += 4 - columns % 4,
+                        None if !finish => return None,
+                        _ => return Some(None),
+                    }
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    let indent = indentation(bytes, &mut cursor);
+    if cursor == bytes.len() && !finish {
+        return None;
+    }
+    Some(Some(Prefix {
+        end: cursor,
+        indented: indent >= 4,
+        containers: containers.to_vec(),
+    }))
+}
+
 impl Lexer {
+    fn remaining(&self) -> &str {
+        &self.pending[self.cursor..]
+    }
+
     fn push(&mut self, chunk: &str, finish: bool) -> Vec<Fragment> {
         self.pending.push_str(chunk);
         let mut fragments = Vec::new();
-        while !self.pending.is_empty() {
-            let first = self.pending.chars().next().unwrap();
-            if self.literal.is_none() && first == '<' {
-                if let Some(captures) = tag_regex().captures(&self.pending) {
+        while !self.remaining().is_empty() {
+            if !self.line_prefix_done {
+                if self.open.is_empty() {
+                    let prefix = if matches!(self.literal, Some((_, _, true))) {
+                        let Some(prefix) =
+                            fence_prefix(self.remaining(), finish, &self.fence_containers)
+                        else {
+                            break;
+                        };
+                        if prefix.is_none() {
+                            self.literal = None;
+                        }
+                        prefix
+                    } else {
+                        None
+                    };
+                    let Some(prefix) = prefix.or_else(|| markdown_prefix(self.remaining(), finish))
+                    else {
+                        break;
+                    };
+                    self.indented = prefix.indented;
+                    self.line_containers = prefix.containers;
+                    let end = prefix.end;
+                    if end > 0 {
+                        let text = self.remaining()[..end].to_owned();
+                        self.consume(end);
+                        self.line_has_text = false;
+                        fragments.push(Fragment::Text {
+                            text,
+                            visible: true,
+                        });
+                    }
+                }
+                self.line_prefix_done = true;
+            }
+            let first = self.remaining().chars().next().unwrap_or('\n');
+            if self.remaining().is_empty() {
+                break;
+            }
+            if self.literal.is_none() && !self.indented && first == '<' {
+                if let Some(captures) = tag_regex().captures(self.remaining()) {
                     let end = captures.get(0).unwrap().end();
                     let closing = &captures[1] == "/";
                     let kind = match captures[2].to_ascii_lowercase().as_str() {
@@ -97,7 +310,7 @@ impl Lexer {
                     if self.open.last() != Some(&Kind::Parameter)
                         || (closing && kind == Kind::Parameter)
                     {
-                        let raw = self.pending[..end].to_owned();
+                        let raw = self.remaining()[..end].to_owned();
                         let span = self.offset..self.offset + end;
                         if closing {
                             if let Some(index) = self.open.iter().rposition(|open| *open == kind) {
@@ -115,17 +328,17 @@ impl Lexer {
                         }));
                         continue;
                     }
-                } else if !self.pending.contains('>') && tag_prefix(&self.pending) {
+                } else if tag_prefix(self.remaining()) && !self.remaining().contains('>') {
                     if !finish {
                         break;
                     }
                     let tail = self
-                        .pending
+                        .remaining()
                         .trim_start_matches('<')
                         .trim_start_matches('/')
                         .trim_start();
                     if tail.starts_with(['｜', '|']) {
-                        let len = self.pending.len();
+                        let len = self.remaining().len();
                         self.consume(len);
                         fragments.push(Fragment::Incomplete);
                         continue;
@@ -133,16 +346,21 @@ impl Lexer {
                 }
             }
             if self.open.is_empty()
+                && !self.indented
                 && matches!(first, '`' | '~')
                 && (!self.escaped || self.literal.is_some())
             {
-                let count = self.pending.chars().take_while(|ch| *ch == first).count();
-                if count == self.pending.len() && !finish {
+                let count = self
+                    .remaining()
+                    .chars()
+                    .take_while(|ch| *ch == first)
+                    .count();
+                if count == self.remaining().len() && !finish {
                     break;
                 }
                 let fence_end = if let Some((delimiter, length, true)) = self.literal {
                     if first == delimiter && !self.line_has_text && count >= length {
-                        let tail = &self.pending[count..];
+                        let tail = &self.remaining()[count..];
                         let line = tail.split('\n').next().unwrap_or(tail);
                         if line.trim().is_empty() && !tail.contains('\n') && !finish {
                             break;
@@ -162,11 +380,15 @@ impl Lexer {
                         self.literal = None
                     }
                     None if first == '`' || (count >= 3 && !self.line_has_text) => {
-                        self.literal = Some((first, count, count >= 3 && !self.line_has_text));
+                        let fence = count >= 3 && !self.line_has_text;
+                        self.literal = Some((first, count, fence));
+                        if fence {
+                            self.fence_containers = self.line_containers.clone();
+                        }
                     }
                     _ => {}
                 }
-                let text = self.pending[..count].to_owned();
+                let text = self.remaining()[..count].to_owned();
                 self.consume(count);
                 fragments.push(Fragment::Text {
                     text,
@@ -174,35 +396,43 @@ impl Lexer {
                 });
                 continue;
             }
-            // Publish runs, not individual characters; a long ordinary answer
-            // does not allocate one token or rescan its accumulated history.
-            let end = self
-                .pending
-                .char_indices()
-                .skip(1)
-                .find(|(_, ch)| matches!(ch, '<' | '`' | '~' | '\n'))
-                .map(|(index, _)| index)
-                .unwrap_or(self.pending.len());
-            let text = self.pending[..end].to_owned();
+            // Scan each run once and compact only after the batch. In particular,
+            // an ordinary multiline completion must not move its entire suffix
+            // for every line. Newlines end a run so prefixes are checked anew.
+            let end = if first == '\n' {
+                1
+            } else {
+                self.remaining()
+                    .char_indices()
+                    .skip(1)
+                    .find(|(_, ch)| matches!(ch, '<' | '`' | '~' | '\n'))
+                    .map(|(index, _)| index)
+                    .unwrap_or(self.remaining().len())
+            };
+            let text = self.remaining()[..end].to_owned();
             self.consume(end);
             fragments.push(Fragment::Text {
                 text,
                 visible: self.open.is_empty(),
             });
         }
+        self.pending.drain(..self.cursor);
+        self.cursor = 0;
         fragments
     }
 
     fn consume(&mut self, end: usize) {
-        for ch in self.pending[..end].chars() {
+        for ch in self.pending[self.cursor..self.cursor + end].chars() {
             if ch == '\n' {
                 self.line_has_text = false;
+                self.line_prefix_done = false;
+                self.indented = false;
             } else if !ch.is_whitespace() {
                 self.line_has_text = true;
             }
             self.escaped = ch == '\\' && !self.escaped;
         }
-        self.pending.drain(..end);
+        self.cursor += end;
         self.offset += end;
     }
 }
@@ -238,7 +468,14 @@ impl DsmlToolCallStreamFilter {
 
 /// Explicit DSML calls carry protocol intent without the ambiguous bare-XML
 /// heuristic. An incomplete named invocation remains a failed input, not `{}`.
-pub(super) fn calls(text: &str) -> Vec<(Range<usize>, Value)> {
+#[derive(Default)]
+pub(super) struct Decoded {
+    pub calls: Vec<(Range<usize>, Value)>,
+    /// Invalid unnamed invocations still own all nested syntax families.
+    pub owned: Vec<Range<usize>>,
+}
+
+pub(super) fn decode(text: &str) -> Decoded {
     let tags = Lexer::default()
         .push(text, true)
         .into_iter()
@@ -250,7 +487,7 @@ pub(super) fn calls(text: &str) -> Vec<(Range<usize>, Value)> {
             }
         })
         .collect::<Vec<_>>();
-    let mut calls = Vec::new();
+    let mut decoded = Decoded::default();
     let mut index = 0;
     while index < tags.len() {
         let opener = &tags[index];
@@ -258,32 +495,27 @@ pub(super) fn calls(text: &str) -> Vec<(Range<usize>, Value)> {
             index += 1;
             continue;
         }
-        let Some(name) = super::extract_attr(&opener.raw, "name").filter(|name| !name.is_empty())
-        else {
-            index += 1;
-            continue;
-        };
         let self_closed = opener.raw.trim_end_matches('>').trim_end().ends_with('/');
-        let mut nesting = 0;
+        // Determine ownership before validating the name. Every opener owns its
+        // subtree, including unnamed/empty invocations and nested wrappers.
+        let mut open = vec![Kind::Invoke];
         let boundary = if self_closed {
             None
         } else {
             tags[index + 1..]
                 .iter()
                 .position(|tag| {
-                    if tag.kind == Kind::Calls && tag.closing {
-                        return true;
-                    }
-                    if tag.kind != Kind::Invoke {
-                        return false;
-                    }
                     if tag.closing {
-                        if nesting == 0 {
-                            return true;
+                        if let Some(parent) = open.iter().rposition(|kind| *kind == tag.kind) {
+                            open.truncate(parent);
+                            return open.is_empty();
                         }
-                        nesting -= 1;
-                    } else if !tag.raw.trim_end_matches('>').trim_end().ends_with('/') {
-                        nesting += 1;
+                        // A wrapper not opened inside this invocation is its
+                        // containing envelope; it terminates an incomplete call.
+                        return tag.kind == Kind::Calls;
+                    }
+                    if !tag.raw.trim_end_matches('>').trim_end().ends_with('/') {
+                        open.push(tag.kind);
                     }
                     false
                 })
@@ -301,28 +533,32 @@ pub(super) fn calls(text: &str) -> Vec<(Range<usize>, Value)> {
                 .unwrap_or(text.len())
         };
         let span_end = closer.map(|tag| tag.span.end).unwrap_or(body_end);
-        let body = &text[opener.span.end..body_end];
-        let parameters = tags[index + 1..]
-            .iter()
-            .take_while(|tag| tag.span.start < body_end)
-            .collect::<Vec<_>>();
-        let arguments = if complete {
-            arguments(body, opener.span.end, &parameters)
-        } else {
-            None
-        };
-        // Retain the actual undecodable input so strict tool admission produces
-        // its existing ToolInvalidArgs result before any executor is called.
-        let arguments = arguments
-            .map(|args| args.to_string())
-            .unwrap_or_else(|| text[opener.span.start..span_end].to_owned());
-        calls.push((
-            opener.span.start..span_end,
-            json!({
-                "id": format!("xmlfb_{}", Uuid::new_v4()), "type":"function",
-                "function":{"name":name,"arguments":arguments},
-            }),
-        ));
+        decoded.owned.push(opener.span.start..span_end);
+        if let Some(name) = super::extract_attr(&opener.raw, "name").filter(|name| !name.is_empty())
+        {
+            let body = &text[opener.span.end..body_end];
+            let parameters = tags[index + 1..]
+                .iter()
+                .take_while(|tag| tag.span.start < body_end)
+                .collect::<Vec<_>>();
+            let arguments = if complete {
+                arguments(body, opener.span.end, &parameters)
+            } else {
+                None
+            };
+            // Retain the actual undecodable input so strict tool admission produces
+            // its existing ToolInvalidArgs result before any executor is called.
+            let arguments = arguments
+                .map(|args| args.to_string())
+                .unwrap_or_else(|| text[opener.span.start..span_end].to_owned());
+            decoded.calls.push((
+                opener.span.start..span_end,
+                json!({
+                    "id": format!("xmlfb_{}", Uuid::new_v4()), "type":"function",
+                    "function":{"name":name,"arguments":arguments},
+                }),
+            ));
+        }
         index = if self_closed {
             index + 1
         } else {
@@ -331,7 +567,7 @@ pub(super) fn calls(text: &str) -> Vec<(Range<usize>, Value)> {
                 .unwrap_or(tags.len())
         };
     }
-    calls
+    decoded
 }
 
 fn arguments(body: &str, base: usize, tags: &[&Tag]) -> Option<Value> {

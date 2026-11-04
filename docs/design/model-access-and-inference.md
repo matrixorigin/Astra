@@ -981,8 +981,15 @@ decoder for explicit DeepSeek DSML emitted in the text channel. Call recovery
 and streaming/final visible-text projection share one DSML lexer. It recognizes
 `tool_calls`, `function_calls`, and V4.1 `calls` wrappers with the published
 single-delimiter format and the observed doubled-delimiter spelling. Markdown
-code spans and fenced examples remain literal data. Parameter bodies are not
-independent tool-call sources.
+code spans, quote/list-contained fences, and indented code remain literal data.
+Container prefixes and partial delimiters are buffered until their meaning is
+known; a fence consumes only its opening containers. Indented text is treated
+conservatively as data even where paragraph continuation could render it as prose.
+Parameter bodies are not independent tool-call sources. Every invocation owns
+its full subtree before name/argument validation, including malformed unnamed
+openers and nested wrappers; nested content cannot escape as another call.
+Complete-input scans use a cursor and compact once per batch. DSML projection
+precedes legacy bare-XML cleanup so argument markup cannot consume answer text.
 
 Native structured calls take precedence. Recovered calls remain subject to the
 exact request tool surface and the ordinary argument, capability, policy and
