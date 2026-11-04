@@ -74,10 +74,17 @@ impl DurableEdgeResult {
             output: reason.into(),
             is_error: true,
             duration_ms: 0,
-            tool_result_fields: Some(Map::from_iter([(
-                "outcome_certainty".to_string(),
-                Value::String("unknown".to_string()),
-            )])),
+            tool_result_fields: Some(Map::from_iter([
+                (
+                    "outcome_certainty".to_string(),
+                    Value::String("unknown".to_string()),
+                ),
+                (
+                    "error_kind".to_string(),
+                    Value::String("tool_outcome_unknown".to_string()),
+                ),
+                ("retryable".to_string(), Value::Bool(false)),
+            ])),
         }
     }
 
@@ -428,9 +435,35 @@ impl EdgeInvocationJournal {
         }
         // Refuse identities that cannot carry even a bounded terminal result
         // before recording dispatch or permitting any side effects.
-        let terminal = DurableEdgeResult::outcome_unknown(
+        let mut terminal = DurableEdgeResult::outcome_unknown(
             "Edge tool result exceeded the transport limit; outcome evidence is unavailable and the tool was not re-executed",
-        ).client_message(request_id.to_owned(), identity.clone(), u64::MAX);
+        );
+        // Reserve room for the bounded execution facts a replacement result
+        // may need to retain, before allowing any physical dispatch.
+        let worst_case = Map::from_iter([
+            (
+                astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+                Value::Bool(true),
+            ),
+            ("workspace_effect_settled".into(), Value::Bool(false)),
+            ("execution_started".into(), Value::Bool(false)),
+            ("side_effects_maybe".into(), Value::Bool(false)),
+            ("cancelled".into(), Value::Bool(false)),
+            (
+                "execution_fact".into(),
+                Value::String("not_executed".into()),
+            ),
+            ("disposition".into(), Value::String("rejected".into())),
+            (
+                "error_kind".into(),
+                Value::String("tool_outcome_unknown".into()),
+            ),
+        ]);
+        astra_tools::preserve_workspace_ownership_evidence(
+            &worst_case,
+            terminal.tool_result_fields.as_mut().unwrap(),
+        );
+        let terminal = terminal.client_message(request_id.to_owned(), identity.clone(), u64::MAX);
         if serialized_json_len(&self.path, &terminal, "terminal result")? > MAX_EDGE_MESSAGE_BYTES {
             return Err(JournalError::TooLarge);
         }
@@ -607,9 +640,23 @@ impl EdgeInvocationJournal {
             if wire_result_len(&self.path, &request_id, &record)?.is_some_and(|size| size > MAX_EDGE_MESSAGE_BYTES) {
                 // A completed tool may have had side effects. Preserve unknown
                 // evidence semantics and never turn this into a retry request.
-                record.result = Some(DurableEdgeResult::outcome_unknown(
+                let mut bounded = DurableEdgeResult::outcome_unknown(
                     "Edge tool result exceeded the transport limit; outcome evidence is unavailable and the tool was not re-executed",
-                ));
+                );
+                if let Some(source) = record.result.as_ref().filter(|result| result.is_error)
+                    .and_then(|result| result.tool_result_fields.as_ref())
+                {
+                    let fields = bounded.tool_result_fields.as_mut().unwrap();
+                    astra_tools::preserve_workspace_ownership_evidence(source, fields);
+                    if let Some(started) = source.get("execution_started").and_then(Value::as_bool) {
+                        fields.insert("execution_started".into(), Value::Bool(started));
+                    }
+                    if source.get("error_kind").and_then(Value::as_str) == Some("cancelled") {
+                        fields.insert("error_kind".into(), Value::String("cancelled".into()));
+                        fields.insert("cancelled".into(), Value::Bool(true));
+                    }
+                }
+                record.result = Some(bounded);
                 if record.execution_generation.is_some() {
                     record.state = DurableState::OutcomeUnknownAwaitingAck;
                 }
@@ -995,6 +1042,55 @@ mod tests {
             ));
             assert!(!restored.acknowledge(&id, 1).await.unwrap());
             assert!(restored.acknowledge(&id, u64::MAX).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_result_preserves_owned_rejection_without_promoting_success_metadata() {
+        for is_error in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("journal.json");
+            let identity = identity("unsettled-boundary");
+            let id = identity.storage_key();
+            let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+            journal
+                .prepare(&id, &identity, 1, "run_script", &json!({}), true, None)
+                .await
+                .unwrap();
+            let result = DurableEdgeResult {
+                output: "x".repeat(MAX_EDGE_MESSAGE_BYTES),
+                is_error,
+                duration_ms: 1,
+                tool_result_fields: Some(Map::from_iter([
+                    (
+                        astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+                        Value::Bool(true),
+                    ),
+                    ("execution_started".into(), Value::Bool(false)),
+                    ("disposition".into(), Value::String("rejected".into())),
+                ])),
+            };
+            let bounded = journal.complete(&id, 1, result).await.unwrap().result;
+            let fields = bounded.tool_result_fields.as_ref().unwrap();
+            assert_eq!(
+                fields
+                    .get(astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD)
+                    .and_then(Value::as_bool),
+                is_error.then_some(true)
+            );
+            if is_error {
+                assert_eq!(fields["execution_started"], false);
+                assert_eq!(fields["disposition"], "rejected");
+            }
+            assert!(
+                serde_json::to_vec(&bounded.client_message(id.clone(), identity, 1))
+                    .unwrap()
+                    .len()
+                    <= MAX_EDGE_MESSAGE_BYTES
+            );
+            drop(journal);
+            let restored = EdgeInvocationJournal::open(path).await.unwrap();
+            assert_eq!(restored.pending_results().unwrap()[0].result, bounded);
         }
     }
 

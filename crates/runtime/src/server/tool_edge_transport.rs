@@ -540,14 +540,6 @@ async fn try_edge_websocket(
             return EdgeTransportAttempt::TransportDisconnected;
         }
     };
-    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
-        return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
-            request,
-            binding,
-            ToolTransportKind::EdgeWs,
-            true,
-        ));
-    }
     EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         edge_result.output,
         edge_result.is_error,

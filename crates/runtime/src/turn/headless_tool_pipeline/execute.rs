@@ -297,6 +297,18 @@ pub(super) fn execution_result_is_error(
 }
 
 fn structured_command_is_error(fields: &Map<String, Value>) -> Option<bool> {
+    let result_class = fields
+        .get("result_class")
+        .and_then(Value::as_str)
+        .and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(
+                Value::String(tag.to_string()),
+            )
+            .ok()
+        });
+    if result_class.is_some_and(astra_tools::exit_semantics::CommandResultClass::is_tool_error) {
+        return Some(true);
+    }
     if let Some(semantics) = fields
         .get("exit_semantics")
         .and_then(Value::as_str)
@@ -309,16 +321,7 @@ fn structured_command_is_error(fields: &Map<String, Value>) -> Option<bool> {
     {
         return Some(semantics.is_tool_error());
     }
-    fields
-        .get("result_class")
-        .and_then(Value::as_str)
-        .and_then(|tag| {
-            serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(
-                Value::String(tag.to_string()),
-            )
-            .ok()
-        })
-        .map(astra_tools::exit_semantics::CommandResultClass::is_tool_error)
+    result_class.map(astra_tools::exit_semantics::CommandResultClass::is_tool_error)
 }
 
 pub(super) fn execution_error_kind(
@@ -458,6 +461,16 @@ mod tests {
             ).unwrap()),
         ]);
         assert!(execution_result_is_error(Some(&fields), Some(true)));
+    }
+
+    #[test]
+    fn execution_error_result_class_overrides_successful_process_exit() {
+        let fields = Map::from_iter([
+            ("exit_semantics".into(), serde_json::json!("success")),
+            ("result_class".into(), serde_json::json!("execution_error")),
+            ("exit_code".into(), serde_json::json!(0)),
+        ]);
+        assert!(execution_result_is_error(Some(&fields), Some(false)));
     }
 
     #[test]

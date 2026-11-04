@@ -452,13 +452,20 @@ pub fn workspace_lease_failure_tool_result(
     failure: workspace_observation::WorkspaceLeaseFailure,
 ) -> ToolResult {
     match failure {
-        workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled => workspace_lease_result(
-            TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED,
-            format!(
-                "Tool '{name}' was not executed because an earlier operation may still be changing this workspace. Inspect that operation and its changes."
-            ),
-            false,
-        ),
+        workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled => {
+            let mut result = workspace_lease_result(
+                TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED,
+                format!(
+                    "Tool '{name}' was not executed because an earlier operation may still be changing this workspace. Inspect that operation and its changes."
+                ),
+                false,
+            );
+            result.metadata.get_or_insert_default().insert(
+                workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+                Value::Bool(true),
+            );
+            result
+        }
         workspace_observation::WorkspaceLeaseFailure::CoordinationHostUnsupported => {
             workspace_lease_result(
                 TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED,
@@ -608,7 +615,78 @@ pub fn workspace_effect_may_be_unsettled(fields: Option<&Map<String, Value>>) ->
             .get("workspace_observation_quarantined")
             .and_then(Value::as_bool)
             == Some(true)
+            || fields
+                .get("workspace_effect_settled")
+                .and_then(Value::as_bool)
+                == Some(false)
     })
+}
+
+/// Preserve bounded executor-owned facts when a result must be replaced.
+pub fn preserve_workspace_ownership_evidence(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+) {
+    if source
+        .get(workspace_observation::OWNERSHIP_UNSETTLED_FIELD)
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return;
+    }
+    for key in [
+        workspace_observation::OWNERSHIP_UNSETTLED_FIELD,
+        "workspace_effect_settled",
+        "execution_started",
+        "side_effects_maybe",
+        "cancelled",
+    ] {
+        if let Some(value) = source.get(key).and_then(Value::as_bool) {
+            target.insert(key.to_string(), Value::Bool(value));
+        }
+    }
+    for (key, allowed) in [
+        (
+            "execution_fact",
+            &["executed", "not_executed", "unknown"][..],
+        ),
+        ("disposition", &["executed", "rejected"][..]),
+        ("error_kind", &["cancelled", "tool_outcome_unknown"][..]),
+    ] {
+        if let Some(value) = source
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| allowed.contains(value))
+        {
+            target.insert(key.to_string(), Value::String(value.to_string()));
+        }
+    }
+}
+
+/// Append a note while preserving a producer-confirmed cancellation envelope.
+pub fn append_tool_output_note(
+    output: &mut String,
+    message: &str,
+    is_error: bool,
+    fields: Option<&Map<String, Value>>,
+) {
+    if is_error
+        && fields
+            .is_some_and(|fields| fields.get("cancelled").and_then(Value::as_bool) == Some(true))
+        && let Ok(mut value) = serde_json::from_str::<Value>(output)
+        && value.get("status").and_then(Value::as_str) == Some(TOOL_ERROR_KIND_CANCELLED)
+        && value.get("error_kind").and_then(Value::as_str) == Some(TOOL_ERROR_KIND_CANCELLED)
+        && let Some(Value::String(error)) = value.get_mut("error")
+    {
+        error.push_str("; ");
+        error.push_str(message);
+        *output = value.to_string();
+        return;
+    }
+    if !output.is_empty() {
+        output.push_str("\n\n");
+    }
+    output.push_str(message);
 }
 
 /// A workspace-capable provider call returned without proving that its
@@ -616,39 +694,44 @@ pub fn workspace_effect_may_be_unsettled(fields: Option<&Map<String, Value>>) ->
 /// replay could duplicate an effect that is still in flight.
 pub fn workspace_effect_unsettled_tool_result(name: &str, mut result: ToolResult) -> ToolResult {
     let message = format!(
-        "Tool '{name}' returned before its workspace effects were proven settled; the workspace was quarantined and the call must not be replayed"
+        "Tool '{name}' returned before its workspace effects were proven settled; the workspace was quarantined. Inspect it before continuing; the call must not be replayed"
     );
-    result.output = if result.output.is_empty() {
-        message.clone()
-    } else {
-        format!("{}\n\nError: {message}", result.output)
-    };
+    append_tool_output_note(
+        &mut result.output,
+        &format!("Error: {message}"),
+        result.is_error,
+        result.metadata.as_ref(),
+    );
     result.is_error = true;
     let metadata = result.metadata.get_or_insert_with(Map::new);
-    // Quarantine is an additional workspace fact, not a replacement for a
-    // provider's unknown outcome. Keep that typed cause so every consumer
-    // retains the non-replay/reconciliation guidance.
-    let outcome_unknown = metadata
-        .get("error_kind")
-        .and_then(Value::as_str)
-        .and_then(astra_core::ErrorKind::parse_tag)
-        == Some(astra_core::ErrorKind::ToolOutcomeUnknown);
+    // Preserve cancellation and unknown outcomes; workspace settlement is
+    // an independent fact needed for safe recovery.
+    if !matches!(
+        metadata.get("error_kind").and_then(Value::as_str),
+        Some("cancelled" | "tool_outcome_unknown")
+    ) {
+        metadata.insert(
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED.to_string()),
+        );
+    }
     metadata.extend(Map::from_iter([
         (
-            "error_kind".to_string(),
+            "result_class".to_string(),
             Value::String(
-                if outcome_unknown {
-                    astra_core::ErrorKind::ToolOutcomeUnknown.as_str()
-                } else {
-                    TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
-                }
-                .to_string(),
+                exit_semantics::CommandResultClass::ExecutionError
+                    .as_str()
+                    .into(),
             ),
         ),
         ("execution_started".to_string(), Value::Bool(true)),
         ("side_effects_maybe".to_string(), Value::Bool(true)),
         ("retryable".to_string(), Value::Bool(false)),
         ("workspace_effect_settled".to_string(), Value::Bool(false)),
+        (
+            workspace_observation::OWNERSHIP_UNSETTLED_FIELD.to_string(),
+            Value::Bool(true),
+        ),
     ]));
     result
 }
@@ -1174,6 +1257,60 @@ mod tests {
         assert!(r.output.is_empty());
         assert!(!r.is_error);
         assert!(r.metadata.is_none());
+    }
+
+    #[test]
+    fn unsettled_workspace_effect_preserves_cancellation_and_unknown_outcome() {
+        let mut unknown = ToolResult::error("provider outcome unknown".into());
+        unknown.metadata = Some(Map::from_iter([(
+            "error_kind".into(),
+            Value::String("tool_outcome_unknown".into()),
+        )]));
+        for (result, kind) in [
+            (cancelled_tool_result("bash", true), "cancelled"),
+            (unknown, "tool_outcome_unknown"),
+            (
+                {
+                    let mut result = ToolResult::text("done".into());
+                    result.metadata = Some(Map::from_iter([
+                        ("result_class".into(), Value::String("success".into())),
+                        ("exit_code".into(), Value::from(0)),
+                    ]));
+                    result
+                },
+                "workspace_effect_unsettled",
+            ),
+        ] {
+            let result = workspace_effect_unsettled_tool_result("bash", result);
+            let fields = result.metadata.as_ref().unwrap();
+            assert!(result.is_error);
+            assert_eq!(fields["error_kind"], kind);
+            assert_eq!(fields["result_class"], "execution_error");
+            assert_eq!(fields["retryable"], false);
+            assert_eq!(fields["workspace_effect_settled"], false);
+            assert!(workspace_effect_may_be_unsettled(Some(fields)));
+            assert!(result.output.contains("must not be replayed"));
+            if kind == "cancelled" {
+                let output: Value = serde_json::from_str(&result.output).unwrap();
+                assert_eq!(output["status"], "cancelled");
+                assert_eq!(output["error_kind"], "cancelled");
+                assert!(
+                    output["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("must not be replayed")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_note_preserves_domain_json_bytes() {
+        let original =
+            r#"{ "status": "cancelled", "error_kind": "cancelled", "error": "domain-value" }"#;
+        let mut output = original.to_owned();
+        append_tool_output_note(&mut output, "advisory", false, None);
+        assert_eq!(output, format!("{original}\n\nadvisory"));
     }
 
     #[test]

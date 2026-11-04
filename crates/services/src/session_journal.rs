@@ -1057,6 +1057,9 @@ pub struct ToolCallRecord {
     /// build/test pipeline whose final `tail` command exits successfully.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_class: Option<String>,
+    /// Executor-owned evidence that workspace ownership is not settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_ownership_unsettled: Option<bool>,
     /// Executor-owned post-execution fact that the bound workspace changed.
     /// This is intentionally separate from lexical mutation classification:
     /// an opaque shell command may change files without containing a known

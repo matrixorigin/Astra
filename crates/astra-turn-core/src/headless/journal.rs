@@ -48,17 +48,26 @@ pub fn journal_record_edge_tool_result(
     record.execution_completion = result.execution_completion.clone();
     record.work_attribution = result.work_attribution.clone();
     let fields = result.tool_result_fields.as_ref();
-    record.disposition = Some(
+    record.disposition = Some(ToolCallDisposition::from_execution_metadata(
+        fields.and_then(|fields| fields.get("disposition")),
         fields
-            .and_then(|fields| fields.get("disposition"))
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or(ToolCallDisposition::Executed),
-    );
+            .and_then(|fields| fields.get("execution_started"))
+            .and_then(serde_json::Value::as_bool),
+        ToolCallDisposition::Executed,
+    ));
     record.error_kind = fields
         .and_then(|fields| fields.get("error_kind"))
         .and_then(serde_json::Value::as_str)
         .and_then(astra_core::ErrorKind::parse_tag);
+    if record.error_kind != Some(astra_core::ErrorKind::Cancelled)
+        && fields
+            .and_then(|fields| fields.get("outcome_certainty"))
+            .and_then(serde_json::Value::as_str)
+            == Some("unknown")
+        && record.was_executed()
+    {
+        record.error_kind = Some(astra_core::ErrorKind::ToolOutcomeUnknown);
+    }
     record.exit_semantics = fields
         .and_then(|fields| fields.get("exit_semantics"))
         .and_then(serde_json::Value::as_str)
@@ -67,6 +76,14 @@ pub fn journal_record_edge_tool_result(
         .and_then(|fields| fields.get("result_class"))
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string);
+    record.workspace_ownership_unsettled = (!record.ok
+        && fields
+            .and_then(|fields| {
+                fields.get(astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD)
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true))
+    .then_some(true);
     record
 }
 
@@ -550,6 +567,56 @@ mod tests {
             assert_eq!(local.error, remote.error);
             assert_eq!(local.ok, !failed);
             assert_eq!(local.tool_call_id.as_deref(), Some("call-1"));
+        }
+    }
+
+    #[test]
+    fn callback_audit_preserves_ownership_and_execution_facts() {
+        for (status, fields, disposition, kind, unsettled) in [
+            (
+                "failed",
+                serde_json::json!({"execution_started":false,"workspace_ownership_unsettled":true}),
+                ToolCallDisposition::Rejected,
+                None,
+                Some(true),
+            ),
+            (
+                "failed",
+                serde_json::json!({"outcome_certainty":"unknown","execution_started":true}),
+                ToolCallDisposition::Executed,
+                Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+                None,
+            ),
+            (
+                "cancelled",
+                serde_json::json!({"error_kind":"cancelled","workspace_ownership_unsettled":true}),
+                ToolCallDisposition::Executed,
+                Some(astra_core::ErrorKind::Cancelled),
+                Some(true),
+            ),
+            (
+                "completed",
+                serde_json::json!({"workspace_ownership_unsettled":true}),
+                ToolCallDisposition::Executed,
+                None,
+                None,
+            ),
+        ] {
+            let result = crate::sse_stream_host::EdgeToolExecResult {
+                work_attribution: None,
+                request_id: "call-1".into(),
+                tool: "run_script".into(),
+                args: serde_json::json!({}),
+                output: "result".into(),
+                status: status.into(),
+                duration_ms: 1,
+                tool_result_fields: Some(fields.as_object().unwrap().clone()),
+                execution_completion: None,
+            };
+            let record = journal_record_edge_tool_result(&result);
+            assert_eq!(record.disposition, Some(disposition));
+            assert_eq!(record.error_kind, kind);
+            assert_eq!(record.workspace_ownership_unsettled, unsettled);
         }
     }
 

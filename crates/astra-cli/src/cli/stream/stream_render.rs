@@ -8333,7 +8333,15 @@ where
                     "Tool execution panicked: {}",
                     panic_payload_summary(payload.as_ref())
                 ),
-                tool_result_fields: None,
+                tool_result_fields: Some(serde_json::Map::from_iter([
+                    (
+                        "error_kind".into(),
+                        serde_json::json!(astra_core::ErrorKind::ToolOutcomeUnknown.as_str()),
+                    ),
+                    ("execution_fact".into(), serde_json::json!("unknown")),
+                    ("side_effects_maybe".into(), serde_json::json!(true)),
+                    ("retryable".into(), serde_json::json!(false)),
+                ])),
                 is_error: true,
             },
             t0.elapsed().as_millis() as u64,
@@ -15222,7 +15230,10 @@ mod tests {
         .await;
         assert!(duration_ms >= 10);
         assert!(outcome.output.contains("Tool execution panicked: boom"));
-        assert!(outcome.tool_result_fields.is_none());
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "tool_outcome_unknown");
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
     }
 
     #[test]

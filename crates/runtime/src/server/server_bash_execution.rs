@@ -395,13 +395,6 @@ fn attach_workspace_observation(
             fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
             fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
         }
-        result.is_error = true;
-        if !result.output.is_empty() {
-            result.output.push_str("\n\n");
-        }
-        result.output.push_str(
-            "Error: workspace binding or coordination generation changed during Bash execution; the command may have changed files, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
-        );
         return astra_tools::workspace_effect_unsettled_tool_result("bash", result);
     }
     if execution_started && scope_ownership.is_none() {
@@ -413,13 +406,6 @@ fn attach_workspace_observation(
             fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
             fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
         }
-        result.is_error = true;
-        if !result.output.is_empty() {
-            result.output.push_str("\n\n");
-        }
-        result.output.push_str(
-            "Error: Bash execution started but its descendant ownership did not settle; the workspace is quarantined and no durable mutation receipt was issued.",
-        );
         return astra_tools::workspace_effect_unsettled_tool_result("bash", result);
     }
     let before_available = before.is_some();
@@ -515,10 +501,12 @@ fn attach_source_preimage(
     if let Some(mut plan) = plan {
         let finished = plan.finish();
         if let Some(advisory) = astra_tools::source_preimage::advisory_text(&finished) {
-            if !result.output.is_empty() {
-                result.output.push_str("\n\n");
-            }
-            result.output.push_str(&advisory);
+            astra_tools::append_tool_output_note(
+                &mut result.output,
+                &advisory,
+                result.is_error,
+                result.metadata.as_ref(),
+            );
         }
         result
             .metadata
@@ -908,6 +896,40 @@ mod tests {
             Value::from(0),
         )]));
         result
+    }
+
+    #[test]
+    fn unsettled_server_bash_preserves_structured_cancellation() {
+        for (coordination_valid, ownership) in [
+            (false, Some(astra_sandbox::ScopeOwnership::InvocationCgroup)),
+            (true, None),
+        ] {
+            let result = attach_workspace_observation(
+                astra_tools::cancelled_tool_result("bash", true),
+                None,
+                None,
+                None,
+                true,
+                false,
+                ownership,
+                coordination_valid,
+                false,
+                false,
+                false,
+            );
+            let fields = result.metadata.as_ref().unwrap();
+            assert_eq!(fields["error_kind"], "cancelled");
+            assert_eq!(fields["workspace_effect_settled"], false);
+            assert_eq!(fields["retryable"], false);
+            let content: Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(content["status"], "cancelled");
+            assert!(
+                content["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("must not be replayed")
+            );
+        }
     }
 
     #[test]

@@ -402,9 +402,25 @@ impl DefaultToolExecutor {
                 fields.remove(crate::workspace_observation::SCOPE_FIELD);
                 fields.remove(crate::workspace_observation::RECEIPT_FIELD);
             }
+            let source_is_error = result.is_error;
             result.is_error = true;
-            result.output.push_str(
-                "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
+            result.metadata.get_or_insert_default().insert(
+                "result_class".into(),
+                Value::String(
+                    crate::exit_semantics::CommandResultClass::ExecutionError
+                        .as_str()
+                        .into(),
+                ),
+            );
+            result.metadata.get_or_insert_default().insert(
+                crate::workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+                Value::Bool(true),
+            );
+            crate::append_tool_output_note(
+                &mut result.output,
+                "Error: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
+                source_is_error,
+                result.metadata.as_ref(),
             );
         }
         let desired_state =

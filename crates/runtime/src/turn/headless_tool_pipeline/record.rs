@@ -311,7 +311,7 @@ fn artifact_persistence_failure(
     let failure_kind = "identity_conflict";
     let content = serde_json::json!({
         "status": "failed",
-        "error": "tool execution completed but its durable result evidence could not be persisted",
+        "error": "tool result evidence could not be persisted",
         "reason": failure_kind,
         "error_kind": "durable_result_persistence",
         "retryable": false,
@@ -667,6 +667,40 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             error_kind: source_error_kind,
             executed_ms,
         } = executed;
+        let source = (execution.authoritative_is_error == Some(true)
+            && matches!(
+                terminal_owner,
+                TerminalProjectionOwner::RuntimeRoute | TerminalProjectionOwner::EdgeCallback
+            ))
+        .then_some(execution.tool_result_fields.as_ref())
+        .flatten();
+        let source_ownership_unsettled = source.is_some_and(|fields| {
+            fields
+                .get(astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD)
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
+        let source_ownership_evidence = source_ownership_unsettled.then(|| {
+            let mut facts = Map::new();
+            astra_tools::preserve_workspace_ownership_evidence(
+                source.expect("source ownership fields"),
+                &mut facts,
+            );
+            facts
+        });
+        let source_unsettled_cause = execution_error_kind(source).filter(|kind| {
+            matches!(
+                kind,
+                astra_core::ErrorKind::Cancelled | astra_core::ErrorKind::ToolOutcomeUnknown
+            )
+        });
+        let source_outcome_unknown = source.is_some_and(|fields| {
+            fields.get("outcome_certainty").and_then(Value::as_str) == Some("unknown")
+                && fields.get("execution_started").and_then(Value::as_bool) != Some(false)
+        });
+        let source_not_dispatched = source.is_some_and(|fields| {
+            fields.get("execution_started").and_then(Value::as_bool) == Some(false)
+        });
         let tool_search_produced =
             (execution.name == "tool_search").then(|| execution.result_str.clone());
         let model_catalog_produced =
@@ -950,8 +984,20 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         "durable tool-result artifact persistence failed closed"
                     );
                     let provider_result_was_error = is_err;
-                    let (failure, failure_metadata) =
+                    let (failure, mut failure_metadata) =
                         artifact_persistence_failure(&error, provider_result_was_error);
+                    if let Some(source) = source_ownership_evidence.as_ref() {
+                        astra_tools::preserve_workspace_ownership_evidence(
+                            source,
+                            &mut failure_metadata,
+                        );
+                    }
+                    if source_not_dispatched {
+                        astra_tools::execution_outcome::insert_not_executed_fact(
+                            &mut failure_metadata,
+                        );
+                        failure_metadata.insert("side_effects_maybe".into(), Value::Bool(false));
+                    }
                     execution.result_str = failure.clone();
                     execution.tool_result_fields = Some(failure_metadata);
                     is_err = true;
@@ -1029,7 +1075,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             rec.runtime_args_full = raw_args_full;
             rec.tool_call_id = Some(execution.id.clone());
             rec.result_artifact = journal_result.artifact.clone();
-            rec.error_kind = error_kind;
+            rec.error_kind = source_unsettled_cause
+                .or_else(|| {
+                    source_outcome_unknown.then_some(astra_core::ErrorKind::ToolOutcomeUnknown)
+                })
+                .or(error_kind);
+            rec.workspace_ownership_unsettled = source_ownership_unsettled.then_some(true);
             rec.runtime_advisory_artifact = guidance_artifact;
             rec.runtime_advisories = astra_turn_core::tool::result::advisory::advisories(
                 execution.tool_result_fields.as_ref(),

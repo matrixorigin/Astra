@@ -1660,9 +1660,11 @@ async fn execute_bash_inner(
         } else {
             result = "Error: bash cancelled before any output was captured".into();
         }
+        let mut cancelled = crate::cancelled_tool_result("bash", true);
+        cancelled.output = finish_presentation(result);
         return attach_scope_settled(
             attach_source_preimage(
-                ToolResult::error(finish_presentation(result))
+                cancelled
                     .with_exit_semantics(ExitSemantics::Cancelled)
                     .with_exit_code(output.exit_code),
                 source_preimages,
@@ -7675,6 +7677,9 @@ printf 'probe.txt:1:needle\n'
             result.exit_semantics,
             Some(crate::exit_semantics::ExitSemantics::Cancelled)
         );
+        let fields = result.metadata.as_ref().unwrap();
+        assert_eq!(fields["error_kind"], "cancelled");
+        assert_eq!(fields["execution_started"], true);
     }
 
     #[tokio::test]

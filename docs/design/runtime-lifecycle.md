@@ -875,6 +875,10 @@ subsequent process crash can still release that lock without a durable fence,
 so that combined failure requires external confirmation that the writer stopped.
 Nested script calls preserve in-flight writer and weak-attribution evidence on
 the parent owner; a rejected or never-dispatched call is not a mutation receipt.
+The owner carries an unsettled-ownership fact through the existing tool-call
+record, including from a remote User Runner, so completion does not depend on
+the server being able to read the runner's workspace. Cancellation remains the
+reported cause, and a rejected invocation remains non-executed.
 
 Server-local MCP invocations propagate the admitted run cancellation token to
 both the ordinary MCP client and stateless Agent Binding HTTP calls. Cancellation

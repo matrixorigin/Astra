@@ -4819,8 +4819,23 @@ impl ToolExecutor {
                 fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
                 fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
             }
-            output.push_str(
-                "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
+            tool_result_fields.get_or_insert_default().insert(
+                "result_class".into(),
+                Value::String(
+                    astra_tools::exit_semantics::CommandResultClass::ExecutionError
+                        .as_str()
+                        .into(),
+                ),
+            );
+            tool_result_fields.get_or_insert_default().insert(
+                astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+                Value::Bool(true),
+            );
+            astra_tools::append_tool_output_note(
+                &mut output,
+                "Error: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
+                source_is_error == Some(true),
+                tool_result_fields.as_ref(),
             );
         }
         let direct_writer_applied = coordination_integrity_valid

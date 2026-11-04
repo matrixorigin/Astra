@@ -325,7 +325,7 @@ pub(crate) enum RpcOutcome {
     /// the child before releasing its writer epoch.
     Cancelled,
     /// A nested tool may still have workspace effects in flight.
-    OwnershipUnsettled,
+    OwnershipUnsettled(astra_core::ErrorKind),
     /// An unrecoverable I/O error occurred reading/writing the socket.
     /// The RPC server loop should continue accepting new connections —
     /// the child's own `recv()` returns EOF and the script fails fast.
@@ -533,6 +533,10 @@ pub(crate) async fn handle_rpc_connection(
             .get("workspace_observation_quarantined")
             .and_then(Value::as_bool)
             == Some(true)
+            || fields
+                .get(crate::workspace_observation::OWNERSHIP_UNSETTLED_FIELD)
+                .and_then(Value::as_bool)
+                == Some(true)
             || matches!(
                 fields.get("error_kind").and_then(Value::as_str),
                 Some("ownership_unsettled" | "workspace_effect_unsettled")
@@ -544,7 +548,17 @@ pub(crate) async fn handle_rpc_connection(
     if explicit_unsettled
         || (may_write && crate::workspace_effect_may_be_unsettled(result.metadata.as_ref()))
     {
-        return RpcOutcome::OwnershipUnsettled;
+        let cause = match result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("error_kind"))
+            .and_then(Value::as_str)
+        {
+            Some("cancelled") => astra_core::ErrorKind::Cancelled,
+            Some("tool_outcome_unknown") => astra_core::ErrorKind::ToolOutcomeUnknown,
+            _ => astra_core::ErrorKind::Unknown,
+        };
+        return RpcOutcome::OwnershipUnsettled(cause);
     }
     state.nested_writer.store(false, Ordering::Release);
 
@@ -788,15 +802,33 @@ mod tests {
 
     #[tokio::test]
     async fn nested_unknown_only_fences_potential_workspace_writers() {
-        struct Unknown;
+        struct Unsettled(&'static str);
         #[async_trait]
-        impl ToolExecutor for Unknown {
+        impl ToolExecutor for Unsettled {
             async fn execute(&self, _name: &str, _args: &Value) -> ToolResult {
-                ToolResult::error("unknown".into()).with_failure_evidence(
-                    astra_core::ToolFailureEvidence::from_error_kind(
-                        astra_core::ErrorKind::ToolOutcomeUnknown,
+                let mut result = ToolResult::error("unsettled".into());
+                result.metadata.get_or_insert_default().insert(
+                    "error_kind".into(),
+                    Value::String(
+                        if self.0 == "cancelled_owned" {
+                            "cancelled"
+                        } else {
+                            self.0
+                        }
+                        .into(),
                     ),
-                )
+                );
+                result
+                    .metadata
+                    .get_or_insert_default()
+                    .insert("workspace_effect_settled".into(), Value::Bool(false));
+                if self.0 == "cancelled_owned" {
+                    result.metadata.get_or_insert_default().insert(
+                        crate::workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+                        Value::Bool(true),
+                    );
+                }
+                result
             }
             fn tool_schemas(&self) -> Vec<Value> {
                 vec![]
@@ -807,16 +839,37 @@ mod tests {
         }
         let mut policy = default_policy();
         policy.allowed_tools.insert("write_file".into());
+        policy.allowed_tools.insert("mcp__controlled__write".into());
         let token = AuthToken::from_str_for_test("tok");
         let counter = AtomicUsize::new(0);
-        for (tool, expected) in [
-            ("read_file", RpcOutcome::Ok),
-            ("write_file", RpcOutcome::OwnershipUnsettled),
+        for (kind, tool, expected) in [
+            ("tool_outcome_unknown", "read_file", RpcOutcome::Ok),
+            ("cancelled", "read_file", RpcOutcome::Ok),
+            (
+                "tool_outcome_unknown",
+                "write_file",
+                RpcOutcome::OwnershipUnsettled(astra_core::ErrorKind::ToolOutcomeUnknown),
+            ),
+            (
+                "cancelled",
+                "write_file",
+                RpcOutcome::OwnershipUnsettled(astra_core::ErrorKind::Cancelled),
+            ),
+            (
+                "workspace_effect_unsettled",
+                "write_file",
+                RpcOutcome::OwnershipUnsettled(astra_core::ErrorKind::Unknown),
+            ),
+            (
+                "cancelled_owned",
+                "mcp__controlled__write",
+                RpcOutcome::OwnershipUnsettled(astra_core::ErrorKind::Cancelled),
+            ),
         ] {
             let request = serde_json::json!({"tool":tool,"args":{},"auth_token":"tok"}).to_string();
             let (_, outcome, _) =
-                rpc_roundtrip(&request, &policy, &token, &Unknown, &counter).await;
-            assert_eq!(outcome, expected, "{tool}");
+                rpc_roundtrip(&request, &policy, &token, &Unsettled(kind), &counter).await;
+            assert_eq!(outcome, expected, "{kind} {tool}");
         }
     }
 

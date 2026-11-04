@@ -5370,12 +5370,25 @@ impl RuntimeToolExecutor {
                 fields.remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
                 fields.remove(astra_tools::workspace_observation::OBSERVATION_SCOPE_FIELD);
             }
+            let source_is_error = result.is_error;
             result.is_error = true;
-            if !result.output.is_empty() {
-                result.output.push_str("\n\n");
-            }
-            result.output.push_str(
+            result.metadata.get_or_insert_default().insert(
+                "result_class".into(),
+                Value::String(
+                    astra_tools::exit_semantics::CommandResultClass::ExecutionError
+                        .as_str()
+                        .into(),
+                ),
+            );
+            result.metadata.get_or_insert_default().insert(
+                astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+                Value::Bool(true),
+            );
+            astra_tools::append_tool_output_note(
+                &mut result.output,
                 "Error: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
+                source_is_error,
+                result.metadata.as_ref(),
             );
         }
         let desired_state = match astra_tools::workspace_observation::consume_workspace_desired_state_convergence_marker(
@@ -6193,7 +6206,7 @@ fn durable_result_persistence_failure(
     let mut result = astra_tools::ToolResult::error(
         serde_json::json!({
             "status": "failed",
-            "error": "tool execution completed but its durable result evidence could not be persisted",
+            "error": "tool result evidence could not be persisted",
             "reason": reason,
             "invocationId": identity.invocation_id,
         })
@@ -6216,6 +6229,23 @@ fn durable_result_persistence_failure(
         ),
         ("durable_result_complete".to_string(), Value::Bool(false)),
     ]));
+    if acknowledged_result.is_error
+        && let Some(source) = acknowledged_result.metadata.as_ref()
+    {
+        astra_tools::preserve_workspace_ownership_evidence(
+            source,
+            result.metadata.as_mut().unwrap(),
+        );
+        if source.get("execution_started").and_then(Value::as_bool) == Some(false) {
+            let fields = result.metadata.as_mut().unwrap();
+            astra_tools::execution_outcome::insert_not_executed_fact(fields);
+            fields.insert("side_effects_maybe".into(), Value::Bool(false));
+            if source.get("error_kind").and_then(Value::as_str) == Some("cancelled") {
+                fields.insert("error_kind".into(), Value::String("cancelled".into()));
+                fields.insert("cancelled".into(), Value::Bool(true));
+            }
+        }
+    }
     result
 }
 
@@ -7142,6 +7172,64 @@ pub(crate) mod tests {
             }
         ));
         assert_eq!(outcome.result().metadata["durable_result_complete"], false);
+
+        let unsettled = astra_tools::workspace_effect_unsettled_tool_result(
+            "bash",
+            astra_tools::cancelled_tool_result("bash", true),
+        );
+        let mut unsettled = unsettled;
+        unsettled
+            .output
+            .push_str(&"x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1));
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, unsettled)
+            .await;
+        let metadata = attached.metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata[astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD],
+            true
+        );
+        assert_eq!(metadata["error_kind"], "cancelled");
+        assert_eq!(metadata["workspace_effect_settled"], false);
+        assert!(!metadata.contains_key("durable_result_complete"));
+
+        let mut success = astra_tools::ToolResult::text(
+            "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
+        );
+        success.metadata = Some(Map::from_iter([(
+            astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+            Value::Bool(true),
+        )]));
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, success)
+            .await;
+        assert!(
+            !attached
+                .metadata
+                .unwrap()
+                .contains_key(astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD,)
+        );
+
+        let mut not_started = astra_tools::cancelled_tool_result("bash", false);
+        not_started.metadata.as_mut().unwrap().insert(
+            astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD.into(),
+            Value::Bool(true),
+        );
+        not_started
+            .output
+            .push_str(&"x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1));
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, not_started)
+            .await;
+        let fields = attached.metadata.as_ref().unwrap();
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(fields["disposition"], "rejected");
+        assert_eq!(fields["error_kind"], "cancelled");
+        assert_eq!(
+            fields[astra_tools::workspace_observation::OWNERSHIP_UNSETTLED_FIELD],
+            true
+        );
+        assert_eq!(fields["durable_result_complete"], false);
     }
 
     #[tokio::test]
@@ -15275,10 +15363,9 @@ for line in sys.stdin:
                     .await;
                 if prior_dispatch {
                     assert_eq!(fields["mcp_call_dispatched"], true);
-                    assert_eq!(
-                        fields["error_kind"],
-                        astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
-                    );
+                    assert_eq!(fields["error_kind"], astra_tools::TOOL_ERROR_KIND_CANCELLED);
+                    assert_eq!(fields["workspace_effect_settled"], false);
+                    assert_eq!(fields["retryable"], false);
                     assert!(matches!(writer, Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)));
                 } else {
                     assert_eq!(fields["cancelled"], true);

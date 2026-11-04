@@ -280,7 +280,7 @@ pub enum RunScriptError {
     /// empty at termination. The workspace is quarantined and the result is
     /// never presented as a successful script completion.
     #[error("run_script process ownership did not settle; workspace state is unverified")]
-    OwnershipUnsettled,
+    OwnershipUnsettled(astra_core::ErrorKind),
 
     #[error("run_script output pipes did not settle within {0:?}")]
     OutputDrainTimeout(Duration),
@@ -947,7 +947,9 @@ async fn run_script(
         let _ = child.kill().await;
         let _ = child.wait().await;
         if !settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root) {
-            return Err(RunScriptError::OwnershipUnsettled);
+            return Err(RunScriptError::OwnershipUnsettled(
+                astra_core::ErrorKind::Unknown,
+            ));
         }
         return Err(io_context("cgroup join_child", e).into());
     }
@@ -956,7 +958,9 @@ async fn run_script(
         let _ = child.kill().await;
         let _ = child.wait().await;
         if !settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root) {
-            return Err(RunScriptError::OwnershipUnsettled);
+            return Err(RunScriptError::OwnershipUnsettled(
+                astra_core::ErrorKind::Cancelled,
+            ));
         }
         return Err(RunScriptError::Cancelled);
     }
@@ -970,7 +974,7 @@ async fn run_script(
     let mut stderr_handle = tokio::spawn(async move { collect_stderr_with_notice(stderr).await });
 
     let policy = config.rpc_policy();
-    let mut nested_ownership_unsettled = false;
+    let mut nested_ownership_unsettled = None;
     let mut rpc_state = crate::rpc_bridge::RpcExecutionState::default();
     let timeout_result = tokio::time::timeout(config.timeout, async {
         loop {
@@ -1013,14 +1017,14 @@ async fn run_script(
                                 return if scope_settled {
                                     result
                                 } else {
-                                    nested_ownership_unsettled = true;
+                                    nested_ownership_unsettled = Some(astra_core::ErrorKind::Unknown);
                                     Err(std::io::Error::other(
                                         "run_script process ownership did not settle",
                                     ))
                                 };
                             }
-                            if matches!(outcome, RpcOutcome::OwnershipUnsettled) {
-                                nested_ownership_unsettled = true;
+                            if let RpcOutcome::OwnershipUnsettled(cause) = outcome {
+                                nested_ownership_unsettled = Some(cause);
                                 return Err(std::io::Error::other("nested tool ownership did not settle"));
                             }
                             if matches!(outcome, RpcOutcome::Cancelled) {
@@ -1043,7 +1047,7 @@ async fn run_script(
     .await;
 
     *weak_attribution |= rpc_state.weak_attribution;
-    if nested_ownership_unsettled
+    if nested_ownership_unsettled.is_some()
         || rpc_state
             .nested_writer
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1054,7 +1058,14 @@ async fn run_script(
         settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
         stdout_handle.abort();
         stderr_handle.abort();
-        return Err(RunScriptError::OwnershipUnsettled);
+        let cause = nested_ownership_unsettled.unwrap_or_else(|| {
+            if matches!(&timeout_result, Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted) {
+                astra_core::ErrorKind::Cancelled
+            } else {
+                astra_core::ErrorKind::Unknown
+            }
+        });
+        return Err(RunScriptError::OwnershipUnsettled(cause));
     }
 
     match timeout_result {
@@ -1065,7 +1076,9 @@ async fn run_script(
             let streams = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
 
             if !scope_settled {
-                return Err(RunScriptError::OwnershipUnsettled);
+                return Err(RunScriptError::OwnershipUnsettled(
+                    astra_core::ErrorKind::Unknown,
+                ));
             }
             let (stdout_content, stderr_content) = streams?;
 
@@ -1092,7 +1105,7 @@ async fn run_script(
                 return Err(if settled {
                     RunScriptError::Cancelled
                 } else {
-                    RunScriptError::OwnershipUnsettled
+                    RunScriptError::OwnershipUnsettled(astra_core::ErrorKind::Cancelled)
                 });
             }
             kill_process_group(&child);
@@ -1103,7 +1116,7 @@ async fn run_script(
             Err(if settled {
                 RunScriptError::Io(e)
             } else {
-                RunScriptError::OwnershipUnsettled
+                RunScriptError::OwnershipUnsettled(astra_core::ErrorKind::Unknown)
             })
         }
         Err(_) => {
@@ -1115,7 +1128,7 @@ async fn run_script(
             Err(if settled {
                 RunScriptError::Timeout(config.timeout)
             } else {
-                RunScriptError::OwnershipUnsettled
+                RunScriptError::OwnershipUnsettled(astra_core::ErrorKind::Unknown)
             })
         }
     }
@@ -1474,6 +1487,25 @@ async fn collect_stderr_with_notice(stderr: tokio::process::ChildStderr) -> Stri
 
 // ─── Tool entry point ─────────────────────────────────────────────────────
 
+fn unsettled_run_script_result(cause: astra_core::ErrorKind) -> crate::ToolResult {
+    let error = RunScriptError::OwnershipUnsettled(cause);
+    match cause {
+        astra_core::ErrorKind::Cancelled => crate::workspace_effect_unsettled_tool_result(
+            "run_script",
+            crate::cancelled_tool_result("run_script", true),
+        ),
+        astra_core::ErrorKind::ToolOutcomeUnknown => {
+            let result = crate::ToolResult::error(format!("Error: {error}"))
+                .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(cause));
+            crate::workspace_effect_unsettled_tool_result("run_script", result)
+        }
+        _ => crate::workspace_effect_unsettled_tool_result(
+            "run_script",
+            crate::ToolResult::error(String::new()),
+        ),
+    }
+}
+
 pub async fn handle_run_script(
     args: &Value,
     tool_executor: &dyn ToolExecutor,
@@ -1513,6 +1545,7 @@ pub async fn handle_run_script(
             }
         }
         Err(RunScriptError::Cancelled) => crate::cancelled_tool_result("run_script", true),
+        Err(RunScriptError::OwnershipUnsettled(cause)) => unsettled_run_script_result(cause),
         Err(error @ RunScriptError::OwnershipUnavailable) => {
             let mut result = crate::ToolResult::error(format!("Error: {error}"));
             result.metadata = Some(serde_json::Map::from_iter([
@@ -1522,22 +1555,6 @@ pub async fn handle_run_script(
                 ),
                 ("execution_started".to_string(), Value::Bool(false)),
                 ("retryable".to_string(), Value::Bool(false)),
-            ]));
-            result
-        }
-        Err(error @ RunScriptError::OwnershipUnsettled) => {
-            let mut result = crate::ToolResult::error(format!("Error: {error}"));
-            result.metadata = Some(serde_json::Map::from_iter([
-                (
-                    "error_kind".to_string(),
-                    Value::String("ownership_unsettled".to_string()),
-                ),
-                ("execution_started".to_string(), Value::Bool(true)),
-                ("retryable".to_string(), Value::Bool(false)),
-                (
-                    "workspace_observation_quarantined".to_string(),
-                    Value::Bool(true),
-                ),
             ]));
             result
         }
@@ -2751,6 +2768,30 @@ mod tests {
         assert_eq!(result.metadata.unwrap()["error_kind"], "cancelled");
         assert!(result.output.contains("not executed: run was cancelled"));
         assert_eq!(exec.call_count(), 0);
+    }
+
+    #[test]
+    fn unsettled_script_result_preserves_cancellation_and_unknown_outcome() {
+        for (cause, kind) in [
+            (astra_core::ErrorKind::Cancelled, "cancelled"),
+            (
+                astra_core::ErrorKind::ToolOutcomeUnknown,
+                "tool_outcome_unknown",
+            ),
+            (astra_core::ErrorKind::Unknown, "workspace_effect_unsettled"),
+        ] {
+            let result = unsettled_run_script_result(cause);
+            let fields = result.metadata.as_ref().unwrap();
+            assert!(result.is_error);
+            assert_eq!(fields["error_kind"], kind);
+            assert_eq!(fields["execution_started"], true);
+            assert_eq!(fields["retryable"], false);
+            assert!(crate::workspace_effect_may_be_unsettled(Some(fields)));
+            if cause == astra_core::ErrorKind::Cancelled {
+                let content: Value = serde_json::from_str(&result.output).unwrap();
+                assert_eq!(content["status"], "cancelled");
+            }
+        }
     }
 
     // ── Integration tests (require Python) ───────────────────────────────

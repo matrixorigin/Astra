@@ -149,10 +149,12 @@ fn attach_source_preimage_outcome(
     if let Some(mut plan) = plan {
         let finished = plan.finish();
         if let Some(advisory) = astra_tools::source_preimage::advisory_text(&finished) {
-            if !outcome.output.is_empty() {
-                outcome.output.push_str("\n\n");
-            }
-            outcome.output.push_str(&advisory);
+            astra_tools::append_tool_output_note(
+                &mut outcome.output,
+                &advisory,
+                outcome.is_error,
+                outcome.tool_result_fields.as_ref(),
+            );
         }
         outcome
             .tool_result_fields
@@ -4603,10 +4605,16 @@ impl ToolExecutor {
             } else if !astra_tools::rpc_bridge::is_run_script_rpc_dispatch() {
                 astra_tools::workspace_observation::mark_workspace_observation_unsettled(&quarantine_root);
             }
-            outcome.is_error = true;
-            outcome.tool_result_fields.get_or_insert_default().insert("error_kind".into(), Value::String(astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED.into()));
+            let result = astra_tools::workspace_effect_unsettled_tool_result(
+                "bash",
+                super::tool_result_from_cli_outcome(outcome),
+            );
             return require_explicit_workspace_verification_receipt(
-                outcome,
+                super::ToolExecutionOutcome {
+                    output: result.output,
+                    tool_result_fields: result.metadata,
+                    is_error: result.is_error,
+                },
                 explicit_verification,
                 false,
             );
@@ -5264,14 +5272,28 @@ impl ToolExecutor {
                         .get("background_children_reaped")
                         .unwrap_or(&Value::Bool(false))
                 );
-                outcome.output = receipt.present(&outcome.output, &terminal, output_limit);
+                if outcome.is_error
+                    && fields.get("cancelled").and_then(Value::as_bool) == Some(true)
+                {
+                    let note = receipt.present("", &terminal, output_limit);
+                    astra_tools::append_tool_output_note(
+                        &mut outcome.output,
+                        &note,
+                        true,
+                        Some(fields),
+                    );
+                } else {
+                    outcome.output = receipt.present(&outcome.output, &terminal, output_limit);
+                }
                 fields.extend(receipt.result_fields());
             }
             Ok(None) => {}
             Err(failure) => {
-                outcome.output = format!(
-                    "[bash output capture failed: {failure}; no complete output file]\n{}",
-                    outcome.output
+                astra_tools::append_tool_output_note(
+                    &mut outcome.output,
+                    &format!("[bash output capture failed: {failure}; no complete output file]"),
+                    outcome.is_error,
+                    outcome.tool_result_fields.as_ref(),
                 );
                 mark_bash_capture_unavailable(&mut outcome);
                 outcome.tool_result_fields.get_or_insert_default().insert(
@@ -6518,6 +6540,10 @@ mod tests {
             cancellation["error_kind"],
             astra_tools::TOOL_ERROR_KIND_CANCELLED
         );
+        let content: serde_json::Value =
+            serde_json::from_str(&outcome.output).expect("typed cancellation");
+        assert_eq!(content["status"], "cancelled");
+        assert_eq!(content["error_kind"], "cancelled");
         assert!(outcome.output.contains("cancelled before completion"));
         #[cfg(target_os = "linux")]
         {
@@ -6810,12 +6836,16 @@ mod tests {
 
         assert!(
             outcome.is_error,
-            "workspace ownership is unsettled: {outcome:?}"
+            "workspace effects are unsettled: {outcome:?}"
         );
         let fields = outcome.tool_result_fields.as_ref().unwrap();
         assert_eq!(fields["error_kind"], "workspace_effect_unsettled");
         assert_eq!(fields["execution_started"], true);
-        assert_eq!(fields["exit_code"], 0, "the command completed");
+        assert_eq!(fields["exit_code"], 0, "the business command completed");
+        assert_eq!(fields["result_class"], "execution_error");
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(fields["workspace_effect_settled"], false);
+        assert!(outcome.output.contains("must not be replayed"));
         assert!(dir.path().join("generated.txt").is_file());
         assert!(
             outcome.tool_result_fields.as_ref().is_none_or(|fields| {
@@ -6837,7 +6867,7 @@ mod tests {
         let executor = test_executor_in(dir.path());
         let outcome = executor
             .attach_bash_workspace_observation_async(
-                super::super::ToolExecutionOutcome::error("ownership lost".to_string()),
+                super::super::cancelled_tool_execution_outcome("bash", true),
                 None,
                 true,
                 None,
@@ -6847,6 +6877,10 @@ mod tests {
             .await;
 
         assert!(outcome.is_error);
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["error_kind"], astra_tools::TOOL_ERROR_KIND_CANCELLED);
+        assert_eq!(fields["workspace_effect_settled"], false);
+        assert!(outcome.output.contains("must not be replayed"));
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
             Some(true)

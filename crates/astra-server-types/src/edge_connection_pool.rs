@@ -1285,11 +1285,12 @@ impl EdgeConnectionPool {
         };
         let result = if let Some(token) = cancel_token {
             tokio::select! {
+                biased;
+                result = wait => result,
                 _ = token.cancelled() => {
                     self.request_cancellation(&request_id, delivery_generation);
                     return Err(EdgeInvocationDeliveryError::Unknown("cancelled after enqueue"));
                 }
-                result = wait => result,
             }
         } else {
             wait.await
@@ -2536,6 +2537,61 @@ mod tests {
             "durable-replay",
             "connection replacement must not strand the admitted caller"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivered_result_wins_over_simultaneous_cancellation() {
+        for unsettled in [false, true] {
+            let pool = EdgeConnectionPool::new();
+            let (tx, mut rx) = mpsc::channel(1);
+            pool.register("user-1", "edge-a", None, None, tx);
+            let identity = admitted_identity("ready-before-cancel");
+            let cancel = CancellationToken::new();
+            let worker_cancel = cancel.clone();
+            let worker_pool = pool.clone();
+            let caller = tokio::spawn(async move {
+                worker_pool
+                    .execute_durably_admitted_invocation_with_cancel(
+                        &identity,
+                        "edge-a",
+                        "bash",
+                        &json!({"command":"ls"}),
+                        Some(&worker_cancel),
+                    )
+                    .await
+            });
+            let EdgeServerMessage::ToolRequest {
+                request_id,
+                delivery_generation,
+                ..
+            } = rx.recv().await.unwrap()
+            else {
+                panic!("expected tool request");
+            };
+            let fields = unsettled.then(|| {
+                serde_json::Map::from_iter([(
+                    "workspace_ownership_unsettled".into(),
+                    Value::Bool(true),
+                )])
+            });
+            assert!(pool.deliver_tool_result(
+                "user-1",
+                "edge-a",
+                &request_id,
+                delivery_generation,
+                EdgeToolResult {
+                    output: "owner result".into(),
+                    is_error: unsettled,
+                    duration_ms: Some(1),
+                    tool_result_fields: fields,
+                }
+            ));
+            cancel.cancel();
+            let result = caller.await.unwrap().unwrap();
+            assert_eq!(result.output, "owner result");
+            assert_eq!(result.is_error, unsettled);
+            assert_eq!(result.tool_result_fields.is_some(), unsettled);
+        }
     }
 
     #[test]

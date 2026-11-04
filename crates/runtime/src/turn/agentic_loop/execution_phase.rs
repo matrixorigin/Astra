@@ -1244,7 +1244,7 @@ pub(crate) fn workspace_observation_is_quarantined(state: &AgenticLoopState) -> 
 // unsettled. Its fence is not evidence that a new read-only turn performed a
 // mutation, and must not prevent the user from inspecting or continuing it.
 fn unsettled_workspace_affects_current_execution(state: &AgenticLoopState) -> bool {
-    state
+    let local_ownership_unsettled = state
         .hooks
         .workspace_root_hint
         .as_deref()
@@ -1253,25 +1253,37 @@ fn unsettled_workspace_affects_current_execution(state: &AgenticLoopState) -> bo
                 std::path::Path::new(root),
             )
         })
-        .unwrap_or(false)
-        && state.stall.tool_call_records.iter().any(|record| {
-            (record.was_executed()
+        .unwrap_or(false);
+    state.stall.tool_call_records.iter().any(|record| {
+        if !(local_ownership_unsettled || record.workspace_ownership_unsettled == Some(true))
+            || !(record.was_executed()
                 || (!record.ok
                     && record.effective_disposition()
                         == astra_services::session_journal::ToolCallDisposition::Rejected))
-                && (crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
+        {
+            return false;
+        }
+        let args = super::lifecycle::extract_tool_args(record.authoritative_args_full());
+        matches!(record.name.as_str(), "bash" | "run_script")
+            || crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
+                &record.name,
+                args.as_ref(),
+            )
+            || (record.workspace_ownership_unsettled == Some(true)
+                && crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
                     &record.name,
-                    super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
-                ) || record.workspace_writer_applied_bound == Some(true)
-                    || (record.workspace_mutation_observed == Some(true)
-                        && record.workspace_mutation_scope.as_deref()
-                            == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE))
-                    || record.workspace_mutation_partial == Some(true)
-                    || record
-                        .workspace_mutation_partial_paths
-                        .as_ref()
-                        .is_some_and(|paths| !paths.is_empty()))
-        })
+                    args.as_ref(),
+                ))
+            || record.workspace_writer_applied_bound == Some(true)
+            || (record.workspace_mutation_observed == Some(true)
+                && record.workspace_mutation_scope.as_deref()
+                    == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE))
+            || record.workspace_mutation_partial == Some(true)
+            || record
+                .workspace_mutation_partial_paths
+                .as_ref()
+                .is_some_and(|paths| !paths.is_empty())
+    })
 }
 
 /// Whether the observation state is strong enough to make a user-visible
@@ -2353,10 +2365,11 @@ fn has_unsettled_side_effecting_outcome(state: &AgenticLoopState) -> bool {
                         | astra_core::ErrorKind::ToolOutcomeUnknown
                 )
             )
-            && crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
-                &record.name,
-                super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
-            )
+            && (matches!(record.name.as_str(), "bash" | "run_script")
+                || crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
+                    &record.name,
+                    super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
+                ))
     })
 }
 
@@ -9682,6 +9695,186 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
+    }
+
+    #[tokio::test]
+    async fn remote_unsettled_workspace_result_cannot_complete_successfully() {
+        let rejected = astra_tools::workspace_lease_failure_tool_result(
+            "run_script",
+            astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled,
+        );
+        let interrupted = astra_tools::workspace_effect_unsettled_tool_result(
+            "bash",
+            astra_tools::cancelled_tool_result("bash", true),
+        );
+        let unknown = astra_tools::workspace_effect_unsettled_tool_result(
+            "bash",
+            astra_tools::ToolResult::text("completed".into())
+                .with_exit_semantics(astra_tools::exit_semantics::ExitSemantics::Success)
+                .with_exit_code(0)
+                .with_result_class(astra_tools::exit_semantics::CommandResultClass::Success),
+        );
+        let mcp = astra_tools::workspace_effect_unsettled_tool_result(
+            "mcp__controlled__write",
+            astra_tools::ToolResult::text("completed".into()),
+        );
+        let mut disconnected = astra_tools::ToolResult::error("disconnected".into());
+        disconnected.metadata = Some(serde_json::Map::from_iter([
+            (
+                "error_kind".into(),
+                Value::String("transport_disconnected".into()),
+            ),
+            ("outcome_certainty".into(), Value::String("unknown".into())),
+            ("execution_started".into(), Value::Bool(true)),
+        ]));
+        let mut cancelled_unknown = astra_tools::cancelled_tool_result("bash", true);
+        cancelled_unknown
+            .metadata
+            .as_mut()
+            .unwrap()
+            .insert("outcome_certainty".into(), Value::String("unknown".into()));
+        for (name, args, result, owner_unsettled, cause) in [
+            (
+                "run_script",
+                serde_json::json!({"script":"print('hello')"}),
+                rejected,
+                Some(true),
+                None,
+            ),
+            (
+                "bash",
+                serde_json::json!({"command":"ls"}),
+                interrupted,
+                Some(true),
+                Some(astra_core::ErrorKind::Cancelled),
+            ),
+            (
+                "bash",
+                serde_json::json!({"command":"ls"}),
+                unknown,
+                Some(true),
+                None,
+            ),
+            (
+                "mcp__controlled__write",
+                serde_json::json!({}),
+                mcp,
+                Some(true),
+                None,
+            ),
+            (
+                "bash",
+                serde_json::json!({"command":"ls"}),
+                disconnected,
+                None,
+                Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+            ),
+            (
+                "bash",
+                serde_json::json!({"command":"ls"}),
+                cancelled_unknown,
+                None,
+                Some(astra_core::ErrorKind::Cancelled),
+            ),
+        ] {
+            let mut edge = make_edge_tool(name, &result.output);
+            edge.args = args;
+            edge.status = "failed".into();
+            let mut fields = edge_runtime_environment_fields();
+            if name.starts_with("mcp__") {
+                let registry = astra_runtime_env::ToolRegistry::builtins();
+                let binding = astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+                    astra_runtime_env::WorkspaceBinding::edge_workspace(
+                        "/workspace/project",
+                        astra_runtime_env::WorkspaceAuthority::ReadWrite,
+                    ),
+                    astra_runtime_env::ExecutorBinding {
+                        kind: astra_runtime_env::ExecutorBindingKind::Mcp,
+                        executor_id: "mcp".into(),
+                        display_name: "MCP".into(),
+                        transport: astra_runtime_env::ToolTransportKind::McpHttp,
+                        status: astra_runtime_env::ExecutorStatus::Online,
+                    },
+                    astra_runtime_env::RuntimeBinding::host_process("edge-host"),
+                    astra_runtime_env::PolicyIntent::local_developer(),
+                    &registry,
+                    &[astra_runtime_env::request_scoped_mcp_provider(
+                        "mcp",
+                        [name.to_string()],
+                    )],
+                );
+                assert!(
+                    astra_runtime_env::CapabilityResolver
+                        .check_tool_call_for_surface(
+                            &registry,
+                            name,
+                            &edge.args,
+                            &binding.capabilities,
+                            &binding.tool_surface,
+                        )
+                        .is_ok()
+                );
+                fields.insert(
+                    "runtime_environment_advertisement".into(),
+                    serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+                        binding,
+                    ))
+                    .unwrap(),
+                );
+            }
+            fields.extend(result.metadata.unwrap());
+            edge.tool_result_fields = Some(fields);
+            let mut host = MockHost::new(vec![
+                edge_tool_result(vec![edge], 1, 1, None),
+                text_result("The operation succeeded.", 1, 1, None),
+            ])
+            .with_valid_tools(&[name]);
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some("/edge-only/unavailable-workspace".into());
+            let _ = run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap();
+            assert_eq!(
+                state.stall.tool_call_records[0].workspace_ownership_unsettled, owner_unsettled,
+                "{name}: {:?}",
+                state.stall.tool_call_records[0].error
+            );
+            assert_eq!(state.stall.tool_call_records[0].error_kind, cause);
+            assert_eq!(host.turn_count(), 1, "{name}");
+            assert_eq!(
+                state.interruption.as_ref().map(|record| record.kind),
+                Some(InterruptionKind::ExecutionIncomplete),
+                "{name}"
+            );
+        }
+
+        let mut read = astra_tools::cancelled_tool_result("read_file", true);
+        read.metadata
+            .as_mut()
+            .unwrap()
+            .insert("workspace_effect_settled".into(), Value::Bool(false));
+        let mut edge = make_edge_tool("read_file", &read.output);
+        edge.args = serde_json::json!({"path":"notes.txt"});
+        edge.status = "failed".into();
+        let mut fields = edge_runtime_environment_fields();
+        fields.extend(read.metadata.unwrap());
+        edge.tool_result_fields = Some(fields);
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![edge], 1, 1, None),
+            text_result("The read was cancelled.", 1, 1, None),
+        ])
+        .with_valid_tools(&["read_file"]);
+        let mut state = make_state();
+        state.hooks.workspace_root_hint = Some("/edge-only/unavailable-workspace".into());
+        let _ = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.stall.tool_call_records[0].workspace_ownership_unsettled,
+            None
+        );
+        assert_eq!(host.turn_count(), 2);
+        assert!(state.interruption.is_none());
     }
 
     fn explicit_verification_action(state: &mut AgenticLoopState) -> CompletionAction {
