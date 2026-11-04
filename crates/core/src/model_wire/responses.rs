@@ -264,6 +264,18 @@ fn continuation_calls<'a>(
     Ok(calls)
 }
 
+/// Compare the saved function calls to a canonical group. Callers must also
+/// validate the saved item contents at their trust boundary.
+pub fn continuation_group_matches<'a>(
+    message: &'a Value,
+    following: &[Value],
+    provider_id: impl Fn(&'a Value) -> Option<&'a str>,
+) -> bool {
+    message.get(CONTINUATION_KEY).is_some_and(|saved| {
+        continuation_calls(message, saved, following, provider_id, false).is_ok()
+    })
+}
+
 /// Validate the current human turn before runtime context is projected to user messages.
 pub fn validate_active_continuations<'a>(
     messages: &'a [Value],
@@ -323,18 +335,18 @@ fn replay_continuation(
     Ok(replayed)
 }
 
-pub fn request(
+/// Project the same input items used by a Responses request without retaining
+/// the whole request. A replay group is buffered so a failed replay can fall
+/// back atomically. Callers must discard partial observations on failure.
+pub fn visit_input_items(
     model: &str,
     messages: &[Value],
-    tools: Option<&[Value]>,
     connection: &str,
-    no_tools: bool,
-    max_output_tokens: Option<usize>,
-) -> Result<Value, String> {
+    mut visit: impl FnMut(Value),
+) -> Result<(), String> {
     // Outer None means not yet searched; inner None means no user role was found.
     // Runtime checks the separate human boundary before projection.
     let mut last_user: Option<Option<usize>> = None;
-    let mut input = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         let role = message
             .get("role")
@@ -361,7 +373,7 @@ pub fn request(
         {
             match replay_continuation(message, saved, &messages[index + 1..]) {
                 Ok(items) => {
-                    input.extend(items);
+                    items.into_iter().for_each(&mut visit);
                     continue;
                 }
                 Err(error)
@@ -388,7 +400,7 @@ pub fn request(
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| content.to_string());
-            input.push(json!({"type":"function_call_output","call_id":id,"output":output}));
+            visit(json!({"type":"function_call_output","call_id":id,"output":output}));
             continue;
         }
         let role = match role {
@@ -428,7 +440,7 @@ pub fn request(
             {
                 item["phase"] = phase.clone();
             }
-            input.push(item);
+            visit(item);
         }
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
@@ -441,10 +453,25 @@ pub fn request(
                 let arguments = call["function"]["arguments"]
                     .as_str()
                     .ok_or("Assistant tool arguments are invalid")?;
-                input.push(json!({"type":"function_call","call_id":id,"name":name,"namespace":"astra","arguments":arguments}));
+                visit(
+                    json!({"type":"function_call","call_id":id,"name":name,"namespace":"astra","arguments":arguments}),
+                );
             }
         }
     }
+    Ok(())
+}
+
+pub fn request(
+    model: &str,
+    messages: &[Value],
+    tools: Option<&[Value]>,
+    connection: &str,
+    no_tools: bool,
+    max_output_tokens: Option<usize>,
+) -> Result<Value, String> {
+    let mut input = Vec::new();
+    visit_input_items(model, messages, connection, |item| input.push(item))?;
     let mut body = json!({"model":model,"input":input,"store":false,"stream":true});
     if let Some(limit) = max_output_tokens.filter(|limit| *limit > 0) {
         body["max_output_tokens"] = json!(limit);

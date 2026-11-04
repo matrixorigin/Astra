@@ -341,7 +341,7 @@ pub(crate) fn wire_budget_status_with_metadata(
     requested_output_tokens: usize,
     responses_scope: Option<(&str, &str)>,
 ) -> WireBudgetStatus {
-    let tool_tokens = tools
+    let tool_tokens: usize = tools
         .iter()
         .map(crate::prompts::estimate_json_value_tokens)
         .sum();
@@ -351,55 +351,35 @@ pub(crate) fn wire_budget_status_with_metadata(
         .map(crate::prompts::estimate_json_value_tokens)
         .map(|tokens| tokens.saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD))
         .sum();
-    let mut estimated_input_tokens =
-        crate::prompts::estimate_wire_input_tokens(messages, tool_tokens);
-    if let Some((connection, wire_model)) = responses_scope {
-        for message in messages {
-            let Some(saved) = message.get(astra_core::model_wire::responses::CONTINUATION_KEY)
-            else {
-                continue;
-            };
-            if message["role"] != "assistant" {
-                continue;
-            }
-            let original = crate::prompts::estimate_json_value_tokens(message)
-                .saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD);
-            // A matching scope replays provider items; a changed scope sends
-            // ordinary content. Reuse the codec for both rather than counting
-            // the two representations together.
-            let ordinary = (saved["connection_id"] != connection || saved["model"] != wire_model)
-                .then(|| {
-                    let mut visible = message.clone();
-                    if let Some(object) = visible.as_object_mut() {
-                        object.remove(astra_core::model_wire::responses::CONTINUATION_KEY);
-                    }
-                    visible
-                });
-            let Ok(request) = astra_core::model_wire::responses::request(
-                wire_model,
-                std::slice::from_ref(ordinary.as_ref().unwrap_or(message)),
-                None,
-                connection,
-                false,
-                None,
-            ) else {
-                // Invalid state keeps the conservative estimate; the actual
-                // request preparation still rejects it.
-                continue;
-            };
-            let Some(items) = request["input"].as_array() else {
-                continue;
-            };
-            let replay = items.iter().fold(0_usize, |total, item| {
-                total
-                    .saturating_add(crate::prompts::estimate_json_value_tokens(item))
-                    .saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD)
-            });
-            estimated_input_tokens = estimated_input_tokens
-                .saturating_sub(original)
-                .saturating_add(replay);
-        }
-    }
+    let projected = if let Some((connection, wire_model)) = responses_scope
+        && messages.iter().any(|message| {
+            message
+                .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                .is_some()
+        }) {
+        // Measure the actual request-wide projection, including the tool
+        // results needed to validate replay. Visit one item at a time so a
+        // large history is not copied solely for budget accounting.
+        let mut projected = tool_tokens.saturating_add(crate::prompts::MODEL_FRAMING_TOKENS);
+        astra_core::model_wire::responses::visit_input_items(
+            wire_model,
+            messages,
+            connection,
+            |item| {
+                projected = projected
+                    .saturating_add(crate::prompts::estimate_json_value_tokens(&item))
+                    .saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD);
+            },
+        )
+        .is_ok()
+        .then_some(projected)
+        // Invalid state retains the conservative estimate. The dispatch
+        // boundary independently rejects an invalid active continuation.
+    } else {
+        None
+    };
+    let estimated_input_tokens = projected
+        .unwrap_or_else(|| crate::prompts::estimate_wire_input_tokens(messages, tool_tokens));
     let budget = crate::prompts::budget_for_model_with_metadata(
         Some(model_name),
         context_window,
@@ -4122,6 +4102,85 @@ mod tests {
         assert!(!scoped.hard_limit_exceeded() && !switched.hard_limit_exceeded());
         assert!(unprojected.hard_limit_exceeded());
         assert!(unprojected.estimated_input_tokens > scoped.estimated_input_tokens + 1_000);
+    }
+
+    #[test]
+    fn responses_budget_measures_complete_tool_rounds_and_historical_routes() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let content = "x".repeat(30_000);
+        let make_assistant =
+            |text: &str, ids: &[&str]| {
+                let calls: Vec<_> = ids.iter().map(|id| json!({
+                "id":id, "type":"function", "function":{"name":"lookup", "arguments":"{}"}
+            })).collect();
+                let mut items = vec![json!({"type":"message", "role":"assistant", "content":[
+                    {"type":"output_text", "text":text}
+                ]})];
+                items.extend(
+                    ids.iter()
+                        .map(|id| json!({"type":"function_call", "call_id":id, "name":"lookup"})),
+                );
+                let mut assistant = json!({"role":"assistant", "content":text, "tool_calls":calls});
+                assistant[CONTINUATION_KEY] = ResponseOutput {
+                    items,
+                    ..Default::default()
+                }
+                .continuation(&connection, "wire-model");
+                assistant
+            };
+        let messages = vec![
+            json!({"role":"user", "content":"goal"}),
+            make_assistant(&content, &["c1", "c2"]),
+            json!({"role":"tool", "tool_call_id":"c1", "content":"first"}),
+            json!({"role":"tool", "tool_call_id":"c2", "content":"second"}),
+            make_assistant("next", &["c3"]),
+            json!({"role":"tool", "tool_call_id":"c3", "content":"third"}),
+        ];
+        let tools = vec![json!({"type":"function", "function":{"name":"lookup"}})];
+        let tool_tokens = tools
+            .iter()
+            .map(crate::prompts::estimate_json_value_tokens)
+            .sum();
+        let measure = |messages: &[Value], scope: &str| {
+            let wire = request("wire-model", messages, None, scope, false, None).unwrap();
+            let actual = crate::prompts::estimate_wire_input_tokens(
+                wire["input"].as_array().unwrap(),
+                tool_tokens,
+            );
+            let budget = wire_budget_status_with_metadata(
+                messages,
+                &tools,
+                "display-model",
+                Some(10_000),
+                None,
+                256,
+                Some((scope, "wire-model")),
+            );
+            assert_eq!(budget.estimated_input_tokens, actual);
+            assert!(!budget.hard_limit_exceeded());
+        };
+        measure(&messages, &connection);
+        let mut historical = messages.clone();
+        historical.push(json!({"role":"user", "content":"continue"}));
+        measure(&historical, "another-connection");
+
+        let mut incomplete = messages;
+        incomplete.pop();
+        assert!(request("wire-model", &incomplete, None, &connection, false, None).is_err());
+        let budget = wire_budget_status_with_metadata(
+            &incomplete,
+            &tools,
+            "display-model",
+            Some(10_000),
+            None,
+            256,
+            Some((&connection, "wire-model")),
+        );
+        assert_eq!(
+            budget.estimated_input_tokens,
+            crate::prompts::estimate_wire_input_tokens(&incomplete, tool_tokens)
+        );
     }
 
     #[test]

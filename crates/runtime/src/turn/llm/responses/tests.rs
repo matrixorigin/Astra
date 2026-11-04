@@ -35,6 +35,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         routing::post,
     };
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let wire_requests = Arc::clone(&requests);
     let app = Router::new().route("/responses", post(
         |State(requests): State<Arc<Mutex<Vec<Value>>>>, uri: axum::http::Uri, headers: HeaderMap, Json(body): Json<Value>| async move {
             if body["input"].to_string().contains("look up") {
@@ -254,8 +255,214 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         1,
         "incomplete evidence must fail before provider dispatch"
     );
+    let mut lost_interrupted = interrupted;
+    lost_interrupted
+        .iter_mut()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+    let mut lost_interrupted = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(lost_interrupted).unwrap();
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&lost_interrupted, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let error = call_llm_and_collect_with_stream_callback(
+            attempt,
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("Check their effects"));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "{protocol:?} dispatched an incomplete turn"
+        );
+    }
+    for (provider, protocol) in [
+        ("anthropic", LlmProviderProtocol::AnthropicMessages),
+        ("bedrock", LlmProviderProtocol::BedrockConverse),
+    ] {
+        let mut attempt = call(&lost_interrupted, &tools, &scope, &base, &thinking);
+        attempt.route.provider = provider;
+        attempt.route.inference_protocol = Some(protocol);
+        let error = match prepare_streaming_call(attempt, RuntimeToolChoice::Auto) {
+            Err(error) => error,
+            Ok(_) => panic!("{protocol:?} accepted an incomplete turn"),
+        };
+        assert!(error.message.contains("Check their effects"));
+    }
+    let mut unanchored_call = messages.last().unwrap().clone();
+    unanchored_call
+        .as_object_mut()
+        .unwrap()
+        .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+    let mut unanchored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+        unanchored_call,
+        json!({"role":"system", "content":"compacted", "_compact_boundary":true}),
+        astra_turn_types::runtime_owned_message(
+            "user", "runtime retry", astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+        ),
+    ]).unwrap();
+    let failure = call_llm_and_collect_with_stream_callback(
+        call(&unanchored, &tools, &scope, &base, &thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.message.contains("Check their effects"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    let mut with_runtime_authority = unanchored.clone();
+    with_runtime_authority.push(snapshot("runtime context is not a user turn"));
+    let with_runtime_authority = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(with_runtime_authority).unwrap();
+    assert!(with_runtime_authority.iter().any(|message| {
+        message["role"] == "user"
+            && astra_turn_types::runtime_message_delivery(message)
+                == Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            && !astra_turn_types::is_human_user_message(message)
+    }));
+    let failure = call_llm_and_collect_with_stream_callback(
+        call(&with_runtime_authority, &tools, &scope, &base, &thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.message.contains("Check their effects"));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    unanchored.push(json!({"role":"user", "content":"start again"}));
+    assert!(
+        prepare_streaming_call(
+            call(&unanchored, &tools, &scope, &base, &thinking),
+            RuntimeToolChoice::Auto,
+        )
+        .is_ok()
+    );
+    lost_interrupted.push(json!({"role":"user", "content":"continue in a new turn"}));
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&lost_interrupted, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+        let wire = body.to_string();
+        assert!(!wire.contains(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD));
+        assert!(
+            !wire.contains("call-1"),
+            "an incomplete call reached {protocol:?}"
+        );
+    }
+    for (provider, protocol) in [
+        ("anthropic", LlmProviderProtocol::AnthropicMessages),
+        ("bedrock", LlmProviderProtocol::BedrockConverse),
+    ] {
+        let projected =
+            consolidate_system_messages_for_protocol(&lost_interrupted, provider, None, protocol);
+        let wire = json!(projected).to_string();
+        assert!(!wire.contains(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD));
+        assert!(!wire.contains("call-1"));
+    }
+    let mut ambiguous = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(vec![
+        json!({"role":"user", "content":"inspect"}),
+        json!({"role":"assistant", "content":[
+            {"type":"text", "text":"checking"},
+            {"type":"tool_use", "id":"hidden-call", "name":"hidden_operation", "input":{}}
+        ], "tool_calls":[
+            {"id":"duplicate-call", "type":"function", "function":{"name":"write_file", "arguments":"{}"}},
+            {"id":"duplicate-call", "type":"function", "function":{"name":"delete_file", "arguments":"{}"}},
+            {"id":"alias-call-1", "_astra_provider_tool_call_id":"duplicate-provider-id", "type":"function", "function":{"name":"write_file", "arguments":"{}"}},
+            {"id":"alias-call-2", "_astra_provider_tool_call_id":"duplicate-provider-id", "type":"function", "function":{"name":"delete_file", "arguments":"{}"}},
+            {"id":"safe-call", "type":"function", "function":{"name":"lookup", "arguments":"{}"}}
+        ]}),
+        json!({"role":"tool", "tool_call_id":"duplicate-call", "content":"ambiguous"}),
+        json!({"role":"tool", "tool_call_id":"alias-call-1", "content":"first"}),
+        json!({"role":"tool", "tool_call_id":"alias-call-2", "content":"second"}),
+        json!({"role":"tool", "tool_call_id":"safe-call", "content":"found"}),
+    ]).unwrap();
+    assert_eq!(
+        ambiguous[1][astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD],
+        true
+    );
+    ambiguous.push(json!({"role":"user", "content":"continue in a new turn"}));
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&ambiguous, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+        let wire = body.to_string();
+        assert!(wire.contains("safe-call"));
+        for discarded in [
+            "duplicate-call",
+            "alias-call-1",
+            "alias-call-2",
+            "duplicate-provider-id",
+            "write_file",
+            "delete_file",
+            "hidden-call",
+            "hidden_operation",
+        ] {
+            assert!(
+                !wire.contains(discarded),
+                "{discarded} reached {protocol:?}"
+            );
+        }
+    }
     messages.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
     messages.push(snapshot("updated optional observation"));
+    let mut inconsistent = messages.clone();
+    inconsistent
+        .iter_mut()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .unwrap()[astra_core::model_wire::responses::CONTINUATION_KEY]["items"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"function_call", "call_id":"call-2", "name":"lookup"}));
+    let mut inconsistent = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(inconsistent).unwrap();
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&inconsistent, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let error = match prepare_streaming_call(attempt, RuntimeToolChoice::Auto) {
+            Err(error) => error,
+            Ok(_) => panic!("{protocol:?} accepted inconsistent saved calls"),
+        };
+        assert!(error.message.contains("Check their effects"));
+    }
+    inconsistent.push(json!({"role":"user", "content":"continue in a new turn"}));
+    for protocol in [
+        LlmProviderProtocol::OpenAiResponses,
+        LlmProviderProtocol::OpenAiCompatible,
+    ] {
+        let mut attempt = call(&inconsistent, &tools, &scope, &base, &thinking);
+        attempt.route.inference_protocol = Some(protocol);
+        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+        let wire = body.to_string();
+        assert!(wire.contains("call-1"));
+        assert!(!wire.contains("call-2"));
+    }
     let mut lost = messages.clone();
     lost.iter_mut()
         .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
@@ -514,6 +721,33 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
     assert!(error.message.contains("reasoning_effort"));
     assert!(!format!("{error:?}").contains("secret provider detail"));
+    let before = wire_requests.lock().unwrap().len();
+    let mut resumed = call(&lost_interrupted, &tools, &scope, &base, &thinking);
+    resumed.route = LlmExecutionRoute::from_admitted(&first_execution);
+    call_llm_and_collect_with_stream_callback(
+        resumed,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    let requests = wire_requests.lock().unwrap();
+    assert_eq!(requests.len(), before + 1);
+    assert!(
+        !requests.last().unwrap()["input"]
+            .to_string()
+            .contains("call-1")
+    );
+    assert!(
+        !requests
+            .last()
+            .unwrap()
+            .to_string()
+            .contains(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+    );
     server.abort();
 }
 #[async_trait]

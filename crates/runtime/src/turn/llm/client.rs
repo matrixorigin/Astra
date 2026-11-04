@@ -33,6 +33,9 @@ use tokio_util::sync::CancellationToken;
 #[path = "responses.rs"]
 mod responses;
 
+const INCOMPLETE_TOOL_CONTINUATION_MESSAGE: &str =
+    "Some previous tool results could not be verified. Check their effects, then start a new turn.";
+
 #[cfg(test)]
 use crate::prompts;
 use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
@@ -3524,6 +3527,9 @@ fn build_provider_request_body_with_cache_capability(
         message
             .get(astra_core::model_wire::responses::CONTINUATION_KEY)
             .is_some()
+            || message
+                .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_some()
             || crate::turn::wire_assembly::is_required_runtime_preamble(message)
             || crate::turn::wire_assembly::is_runtime_system_context(message)
             || astra_turn_types::is_runtime_owned_message(message)
@@ -3555,6 +3561,7 @@ fn build_provider_request_body_with_cache_capability(
                 messages,
             );
             let mut cloned = messages.to_vec();
+            cloned.retain(|message| !is_incomplete_marker_only(message));
             strip_internal_runtime_markers(&mut cloned);
             cloned
         };
@@ -4160,6 +4167,17 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
     strip_internal_runtime_markers_with_ids(messages, &provider_ids, false);
 }
 
+fn is_incomplete_marker_only(message: &Value) -> bool {
+    message["role"] == "assistant"
+        && message
+            .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+            .is_some()
+        && message
+            .get("content")
+            .is_none_or(|content| content.is_null() || content.as_str() == Some(""))
+        && message["tool_calls"].as_array().is_none_or(Vec::is_empty)
+}
+
 fn strip_internal_runtime_markers_with_ids(
     messages: &mut [Value],
     provider_ids: &HashMap<String, String>,
@@ -4223,6 +4241,7 @@ fn strip_internal_runtime_markers_with_ids(
             // prompt cache suffix.
             for key in [
                 astra_core::model_wire::responses::CONTINUATION_KEY,
+                astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD,
                 "_round_index",
                 astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
                 "_timestamp",
@@ -4329,12 +4348,13 @@ fn consolidate_system_messages_inner(
         // Keep it in canonical history for same-scope replay, but do not send
         // an empty assistant turn to providers that cannot consume it.
         out.retain(|message| {
-            !(message["role"] == "assistant"
-                && message
-                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
-                    .is_some()
-                && message["content"].as_str().is_some_and(str::is_empty)
-                && message["tool_calls"].as_array().is_none_or(Vec::is_empty))
+            !is_incomplete_marker_only(message)
+                && !(message["role"] == "assistant"
+                    && message
+                        .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                        .is_some()
+                    && message["content"].as_str().is_some_and(str::is_empty)
+                    && message["tool_calls"].as_array().is_none_or(Vec::is_empty))
         });
     }
     if !allow_suffix_dependent_history_repair {
@@ -5130,6 +5150,26 @@ pub(crate) fn prepare_streaming_call(
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::InvalidRequest,
             "The selected inference protocol is incompatible with this provider",
+        ));
+    }
+    if call
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(|message| {
+            message["role"] == "assistant"
+                && message
+                    .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                    .is_some()
+        })
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            INCOMPLETE_TOOL_CONTINUATION_MESSAGE,
+        )
+        .with_details_json(
+            json!({"source":"runtime","code":"tool_continuation_incomplete"}).to_string(),
         ));
     }
     if call

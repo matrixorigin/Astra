@@ -21,9 +21,7 @@ pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::Clas
             "The model configuration changed during this turn. Start a new turn to continue."
                 .to_string()
         }
-        "responses_continuation_incomplete" => {
-            "Some previous tool results could not be verified. Check their effects, then start a new turn.".to_string()
-        }
+        "responses_continuation_incomplete" => INCOMPLETE_TOOL_CONTINUATION_MESSAGE.to_string(),
         _ => format!("Model request failed: {code}"),
     };
     astra_core::ClassifiedError::new(kind, message)
