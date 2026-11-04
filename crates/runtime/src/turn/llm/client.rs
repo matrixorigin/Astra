@@ -12691,6 +12691,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_dsml_orphan_closers_preserve_answer() {
+        let answer = "Mailbox permission is required.";
+        let content =
+            format!("{answer}</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>");
+        let mut frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .collect::<Vec<_>>();
+        frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let result = collect_llm_stream(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect orphan protocol suffix");
+        assert_eq!(result.full_text, answer);
+        assert!(
+            result.tool_calls.is_empty(),
+            "closing tags do not identify a call"
+        );
+        let visible = updates
+            .into_iter()
+            .filter_map(|update| match update {
+                LlmStreamUpdate::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(visible, answer);
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(nonstream.full_text, answer);
+        assert!(nonstream.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_calls_use_the_existing_wire_authority() {
+        let markup = concat!(
+            " Starting.\n<｜DSML｜ calls><｜DSML｜ invoke name=\"search\">",
+            "<｜DSML｜ parameter name=\"query\" string=\"true\">123</｜DSML｜ parameter>",
+            "<｜DSML｜ parameter name=\"count\" string=\"false\">5</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke><｜DSML｜ invoke name=\"undeclared\">{}",
+            "</｜DSML｜ invoke></｜DSML｜ calls>Ready. ",
+        );
+        let allowed = HashSet::from(["search".to_owned()]);
+        for native in [false, true] {
+            let mut delta = json!({"content":markup});
+            if native {
+                delta["tool_calls"] = json!([{
+                    "index":0,"id":"native-search","type":"function",
+                    "function":{"name":"search","arguments":"{\"query\":\"native\",\"count\":1}"},
+                }]);
+            }
+            let event = json!({"choices":[{"delta":delta,"finish_reason":"stop"}]});
+            let mut updates = Vec::new();
+            let mut callback = |update| updates.push(update);
+            let result = collect_llm_stream_for_wire(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {event}\n\ndata: [DONE]\n\n"
+                )))]),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &allowed,
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .expect("collect native or recovered DSML call");
+            assert_eq!(result.full_text, " Starting.\nReady. ");
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":delta,"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("search")]
+            );
+            let arguments: Value = serde_json::from_str(
+                result.tool_calls[0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                arguments,
+                if native {
+                    json!({"query":"native","count":1})
+                } else {
+                    json!({"query":"123","count":5})
+                }
+            );
+            if native {
+                assert_eq!(result.tool_calls[0]["id"], "native-search");
+            }
+            let visible = updates
+                .into_iter()
+                .filter_map(|update| match update {
+                    LlmStreamUpdate::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(visible, result.full_text);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_invalid_input_reaches_strict_admission() {
+        let markup = "<｜DSML｜ calls><｜DSML｜ invoke name=\"search\"><｜DSML｜ parameter name=\"count\" string=\"false\">invalid</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let event = json!({"choices":[{"delta":{"content":markup},"finish_reason":"stop"}]});
+        let allowed = HashSet::from(["search".to_owned()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(format!(
+                "data: {event}\n\ndata: [DONE]\n\n"
+            )))]),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            None,
+            None,
+        )
+        .await
+        .expect("retain failed named tool input");
+        assert_eq!(result.full_text, "");
+        let call = &result.tool_calls[0];
+        assert_eq!(call["function"]["name"], "search");
+        assert_eq!(
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+            Err("arguments contain incomplete or invalid JSON")
+        );
+        let edge =
+            astra_turn_core::stream_events::build_edge_tool_call_event(call.as_object().unwrap());
+        assert_eq!(edge["arguments"]["_parse_error"]["executed"], false);
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_never_publishes_degraded_dsml_markup() {
         let d1 = json!({"choices":[{"delta":{"content":"visible before\n<｜｜DS"}}]});
         let d2 = json!({"choices":[{"delta":{"content":"ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});

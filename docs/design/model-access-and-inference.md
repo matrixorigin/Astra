@@ -974,6 +974,26 @@ handoff checkpoints carry their complete checked continuation without loading a
 provider-attempt WAL. Run/Context commits and tool side-effect admission and
 deduplication keep their independent contracts.
 
+### DSML tool-call decoding
+
+The OpenAI-compatible response boundary uses the existing turn-core tool-call
+decoder for explicit DeepSeek DSML emitted in the text channel. Call recovery
+and streaming/final visible-text projection share one DSML lexer. It recognizes
+`tool_calls`, `function_calls`, and V4.1 `calls` wrappers with the published
+single-delimiter format and the observed doubled-delimiter spelling. Markdown
+code spans and fenced examples remain literal data. Parameter bodies are not
+independent tool-call sources.
+
+Native structured calls take precedence. Recovered calls remain subject to the
+exact request tool surface and the ordinary argument, capability, policy and
+approval boundaries; decoding grants no execution authority. String parameters
+retain their bytes and `string="false"` values require valid JSON. Incomplete or
+undecodable named invocations retain invalid argument evidence for the existing
+pre-execution rejection/model-feedback path, rather than becoming empty calls.
+Orphan protocol closers are removed from visible text without inventing a tool
+call or triggering a model retry. The normalized completion feeds the existing
+canonical history and transcript paths; raw provider diagnostics are unchanged.
+
 ### Provider timeout ownership
 
 Ordinary agent streaming calls use rolling transport-idle and semantic-progress
