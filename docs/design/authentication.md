@@ -206,18 +206,31 @@ retain the previous identity-pinned Edge heartbeat. On completion, the workbench
 stops and joins it before rebinding local execution. Login completion registers
 the current checkout with the new identity before reporting chat readiness,
 then starts its heartbeat; registration failure is reported explicitly and does
-not initialize a ready runtime. Existing transports retain their old generation
+not complete runtime initialization. Existing transports retain their old generation
 binding; they cannot silently adopt another account. Authentication
 changes are refused while local background tasks are running.
 
 In-TUI password login and registration establish the same Edge registration
 and heartbeat boundary after saving credentials. Rejected authentication retains
-the previous heartbeat. A committed login stops and joins it before publishing
-the current account's checkout and starting the replacement heartbeat. If
-registration fails, the saved login and model preference remain available, but
-the new runtime and heartbeat are not initialized as ready; retrying `/login`
-or restarting the CLI retries registration without repeating model-provider
-authorization.
+the previous heartbeat. An account change stops and joins it before registering
+the new account's checkout. Same-account login retains the working heartbeat
+until registration succeeds, then joins it and starts the replacement. The
+registration request has a 15-second deadline, including response-body reads.
+If registration fails, the saved login and model preference remain available;
+queued messages return to the composer for manual review and are not sent
+automatically. Local-state failures ask users to check workspace/state write
+access; transport, timeout and server failures provide the relevant recovery.
+Diagnostics record only failure category and HTTP status, not private paths,
+URLs or response bodies. Retrying `/login` or restarting retries registration
+without repeating model-provider authorization.
+
+An absent agent projection is not a registration-readiness gate: the first turn
+can initialize it lazily. The Server remains the execution admission authority.
+When execution selection rejects a new turn with
+`execution_binding_provider_required` before durable run creation, it includes
+`metadata.admission_state: rejected`. The CLI preserves that code, restores the
+draft and suggests `/login` or restarting to register the checkout. An admitted
+run or resume failure is never relabeled as an unexecuted turn.
 
 At browser re-login the CLI drains and retires its old session-memory service
 before credential publication. Successful completion rebuilds that service with

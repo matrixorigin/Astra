@@ -1887,6 +1887,38 @@ mod tests {
     }
 
     #[test]
+    fn registration_rejection_requires_admission_proof_and_no_existing_run() {
+        use astra_turn_core::chat_turn_sse_dispatch::{
+            ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
+        };
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"error\",\"message\":\"registration required\",\"error_code\":\"execution_binding_provider_required\",\"metadata\":{\"admission_state\":\"rejected\"}}\n\n",
+            &mut accum,
+            &mut vec![],
+        );
+        assert_eq!(
+            accum.error_code.as_deref(),
+            Some("execution_binding_provider_required")
+        );
+        assert!(is_pre_admission_rejection(
+            accum.error_code.as_deref(),
+            accum.error_metadata.as_ref(),
+            None
+        ));
+        assert!(!is_pre_admission_rejection(
+            accum.error_code.as_deref(),
+            None,
+            None
+        ));
+        assert!(!is_pre_admission_rejection(
+            accum.error_code.as_deref(),
+            accum.error_metadata.as_ref(),
+            Some("already-admitted")
+        ));
+    }
+
+    #[test]
     fn sse_admission_error_reaches_typed_settlement_boundary() {
         use astra_turn_core::chat_turn_sse_dispatch::{
             ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,

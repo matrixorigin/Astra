@@ -17836,6 +17836,62 @@ fn native_edge_execution_request(executor_id: &str, root: &str) -> ChatRequestDa
 }
 
 #[tokio::test]
+async fn missing_edge_registration_preserves_code_and_pre_admission_proof_in_sse() {
+    let service = test_service().with_edge_connection_pool(
+        astra_server_types::edge_connection_pool::EdgeConnectionPool::new(),
+    );
+    let request = native_edge_execution_request("unregistered-edge", "/workspace/test");
+    let original = service
+        .authorize_native_edge_execution("owner", &request, &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(
+        original.1.0.metadata.is_none(),
+        "a low-level error is not itself admission proof"
+    );
+    let (status, Json(error)) = execution_selection_admission_rejection(original);
+    assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(
+        error.error_code.as_deref(),
+        Some("execution_binding_provider_required")
+    );
+    assert_eq!(
+        error.metadata.as_ref().unwrap()["admission_state"],
+        "rejected"
+    );
+    let response = crate::server::http_helpers::sse_error_response_from_error_with_context(
+        status,
+        error,
+        crate::server::http_helpers::SseErrorContext::default(),
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    let event = astra_thin_client::classify_stream_event(
+        serde_json::from_str(text.strip_prefix("data: ").unwrap().trim()).unwrap(),
+    )
+    .unwrap();
+    let astra_thin_client::StreamEvent::Error { raw, .. } = event else {
+        panic!("expected rejection event")
+    };
+    assert_eq!(raw["error_code"], "execution_binding_provider_required");
+    assert_eq!(raw["metadata"]["admission_state"], "rejected");
+}
+
+#[test]
+fn unrelated_execution_selection_failure_is_not_reclassified_as_registration() {
+    let original = error_response_coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "execution_binding_unavailable",
+    );
+    let (status, Json(error)) = execution_selection_admission_rejection(original);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(error.metadata.is_none());
+}
+
+#[tokio::test]
 async fn native_edge_execution_reports_capability_schema_errors() {
     let binding = astra_runtime_env::RunBinding::edge_developer(
         "/workspace/schema-test",
