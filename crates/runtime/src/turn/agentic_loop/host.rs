@@ -13732,132 +13732,162 @@ print(json.dumps({'context': 'user said: ' + msg}))
     }
 
     #[tokio::test]
-    async fn skill_with_substantial_output_skips_deferred_calls() {
-        // Regression: session 746b6423 — skill produced a full code review
-        // but 18 deferred tool calls were re-executed in the next iteration,
-        // causing 3x token waste.
-        //
-        // After surgery fix: intercepted non-skill calls are stripped entirely
-        // from the assistant message and tool results — no token cost at all.
-        let mut resolver = StubSkillResolver::new();
-        // Simulate a skill that produces substantial output (like a code review).
-        // The formatted result includes "# Skill: ..." header (~120 chars) + instructions.
-        resolver.skills[0].2 = "x".repeat(500);
-        let turns = vec![
-            // Iteration 1: skill + 2 read_file calls
-            skill_plus_tools_result(
-                "call_skill",
-                r#"{"skill_name": "test-skill"}"#,
-                &[("call_rf1", "read_file"), ("call_rf2", "read_file")],
-                100,
-                50,
+    async fn skill_with_substantial_output_defers_sibling_calls() {
+        use crate::server::runtime_tool_executor::RuntimeToolExecutor;
+        use crate::server::tool_execution_binding::{ExecutorBinding, WorkspaceBinding};
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        );
+        executor.set_current_selected_tool_offers(std::collections::HashMap::from([(
+            "write_file".into(),
+            crate::server::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
+                "write_file",
+                "server-sandbox",
+                crate::server::tool_route_selection::ToolExecutionRouteKind::ServerLocal,
             ),
-            // Iteration 2: LLM sees skill output only, produces final text
+        )]));
+        executor.enable_durable_invocations();
+        let executor = Arc::new(executor);
+        let control_turn = ScriptedTurn {
+            response: HostTurnResult {
+                accum: ChatTurnSseAccum {
+                    has_tool_calls: true,
+                    tool_calls: vec![json!({"id":"control", "type":"function", "function":{
+                        "name":"write_file", "arguments":json!({"path":"control.txt", "content":"ok"}).to_string()
+                    }})],
+                    ..Default::default()
+                },
+                ttft_ms: None,
+                error_kind: None,
+            },
+            edge_tool_round: Vec::new(),
+        };
+        let mut control_host =
+            MockHost::new(vec![control_turn, text_result("Done.", 200, 100, None)])
+                .with_valid_tools(&["write_file"]);
+        let mut control_state = make_state();
+        control_state.owner_user_id = Some("test-user".into());
+        control_state.current_run_id = Some("control-run".into());
+        control_state.canonical_turn_chain_id = Some("control-turn".into());
+        control_state
+            .messages
+            .push(json!({"role":"user", "content":"write"}));
+        control_state.runtime_tool_executor = Some(executor.clone());
+        assert!(
+            run_agentic_loop_with_host(&mut control_host, &mut control_state)
+                .await
+                .is_ok()
+        );
+        assert!(
+            workspace.path().join("control.txt").exists(),
+            "control write missing; messages: {:?}, records: {:?}",
+            control_state.messages,
+            control_state.stall.tool_call_records
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("control.txt")).unwrap(),
+            "ok\n"
+        );
+
+        let mut resolver = StubSkillResolver::new();
+        resolver.skills[0].2 = "x".repeat(600);
+        let mut first_turn = skill_plus_tools_result(
+            "call_skill",
+            r#"{"skill_name": "test-skill"}"#,
+            &[("call_rf1", "read_file"), ("call_write", "write_file")],
+            100,
+            50,
+        );
+        first_turn.response.accum.tool_calls[2]["function"]["arguments"] =
+            json!(json!({"path":"deferred.txt", "content":"must not run"}).to_string());
+        let turns = vec![
+            first_turn,
             text_result("Final answer from skill output.", 200, 100, None),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["read_file", "write_file"]);
         let mut state = make_state();
+        state.owner_user_id = Some("test-user".into());
+        state.current_run_id = Some("skill-run".into());
+        state.canonical_turn_chain_id = Some("skill-turn".into());
         state
             .messages
             .push(json!({"role": "user", "content": "review code"}));
         state.skills.resolver = Some(Arc::new(resolver));
+        state.runtime_tool_executor = Some(executor);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // Surgery: call_rf1 and call_rf2 should NOT appear in messages at all —
-        // not as tool_call objects in the assistant message, and not as tool results.
-        let rf1_msgs: Vec<&Value> = state
-            .messages
+        // The next provider request needs every call and its own result.
+        let next_messages = &host.executed_messages[1];
+        let calls: Vec<_> = next_messages
             .iter()
-            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_rf1"))
+            .filter(|message| message["role"] == "assistant")
+            .filter_map(|message| message["tool_calls"].as_array())
+            .flatten()
             .collect();
-        assert_eq!(
-            rf1_msgs.len(),
-            0,
-            "call_rf1 should be surgically removed from messages, found: {rf1_msgs:?}"
-        );
-        let rf2_msgs: Vec<&Value> = state
-            .messages
+        let results: Vec<_> = next_messages
             .iter()
-            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_rf2"))
+            .filter(|message| message["role"] == "tool")
             .collect();
-        assert_eq!(
-            rf2_msgs.len(),
-            0,
-            "call_rf2 should be surgically removed from messages, found: {rf2_msgs:?}"
-        );
-
-        // The assistant message from iteration 1 should only contain the skill
-        // tool_call — not call_rf1 or call_rf2.
-        let assistant_msgs: Vec<&Value> = state
-            .messages
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-            .filter(|m| m.get("tool_calls").is_some())
-            .collect();
-        for msg in &assistant_msgs {
-            if let Some(tool_calls) = msg["tool_calls"].as_array() {
-                for tc in tool_calls {
-                    let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                    assert!(
-                        id != "call_rf1" && id != "call_rf2",
-                        "assistant message should not contain surgically removed tool_call: {id}"
-                    );
-                }
+        assert_eq!(calls.len(), 3);
+        assert_eq!(results.len(), 3);
+        for id in ["call_skill", "call_rf1", "call_write"] {
+            assert_eq!(calls.iter().filter(|call| call["id"] == id).count(), 1);
+            let matching: Vec<_> = results
+                .iter()
+                .filter(|message| message["tool_call_id"] == id)
+                .collect();
+            assert_eq!(matching.len(), 1, "expected one result for {id}");
+            let content = matching[0]["content"].as_str().unwrap();
+            if id == "call_skill" {
+                assert!(content.contains(&"x".repeat(600)));
+            } else {
+                let tool = if id == "call_rf1" {
+                    "read_file"
+                } else {
+                    "write_file"
+                };
+                assert_eq!(
+                    content,
+                    format!(
+                        "Deferred: skill was invoked in this turn. Read the skill instructions above, then decide whether to call `{tool}` again."
+                    )
+                );
+                let records: Vec<_> = state
+                    .stall
+                    .tool_call_records
+                    .iter()
+                    .filter(|record| record.tool_call_id.as_deref() == Some(id))
+                    .collect();
+                assert_eq!(records.len(), 1);
+                assert_eq!(
+                    records[0].effective_disposition(),
+                    ToolCallDisposition::Suppressed
+                );
+                assert!(records[0].is_synthetic_placeholder());
+                assert!(!records[0].was_executed());
             }
         }
-
-        // The skill result should mention the dropped calls.
-        let skill_result_msgs: Vec<&Value> = state
-            .messages
-            .iter()
-            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_skill"))
-            .collect();
-        assert!(
-            !skill_result_msgs.is_empty(),
-            "skill tool result should exist"
-        );
-        let skill_content = skill_result_msgs[0]["content"].as_str().unwrap_or("");
-        assert!(
-            skill_content.contains("parallel tool call(s) were dropped"),
-            "skill result should note the surgically removed calls, got: {skill_content}"
-        );
-
-        // Stall detector should still have records for the removed calls
-        // (now as synthetic placeholders with ok=true — they are intentional
-        // context optimizations, not failures).
-        let removed_records: Vec<_> = state
-            .stall
-            .tool_call_records
-            .iter()
-            .filter(|r| r.name == SURGICAL_REMOVAL_TOOL_NAME)
-            .collect();
-        assert_eq!(
-            removed_records.len(),
-            2,
-            "expected 2 surgically_removed stall records, got {}",
-            removed_records.len()
-        );
-        for r in &removed_records {
-            assert!(
-                r.ok,
-                "surgically_removed records should have ok=true (they are \
-                 intentional context optimizations, not tool failures)"
-            );
-            assert!(
-                r.is_synthetic_placeholder(),
-                "surgically_removed records must be classified as synthetic \
-                 placeholders so evaluation/analytics skip them"
-            );
-        }
+        assert!(!workspace.path().join("deferred.txt").exists());
         assert!(
             state
                 .tool_ledger_receipt
                 .canonical_aggregate()
                 .is_complete_for(state.total_tool_calls),
-            "calls removed after substantial skill output must also be settled"
+            "deferred calls must also be settled"
         );
 
         // skill_produced_output flag should be set
@@ -13875,8 +13905,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[tokio::test]
     async fn skill_with_short_output_defers_calls() {
-        // When skill output is short (<= 500 bytes), deferred calls should
-        // use the original "Deferred" message that invites re-evaluation.
+        // Short skill output also keeps a terminal result for each sibling.
         let mut resolver = StubSkillResolver::new();
         // Override with a short instruction (< 200 chars)
         resolver.skills[0].2 = "Short.".into();

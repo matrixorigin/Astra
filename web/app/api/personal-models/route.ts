@@ -48,7 +48,7 @@ export async function POST(request: NextRequest) {
     switch (body.action) {
       case 'create':
         result = await auth.client.post('/me/models', { name: body.name, provider: body.provider, model: body.model,
-          api_key: body.api_key ?? '', connection_id: body.connection_id, base_url: body.base_url,
+          api_key: body.api_key ?? '', connection_id: body.connection_id, base_url: body.base_url, inference_protocol: body.inference_protocol,
           context_window: body.context_window, is_default: false });
         break;
       case 'default': result = await auth.client.put(`/me/models/${identifier(body.model_id)}`, { is_default: true }); break;

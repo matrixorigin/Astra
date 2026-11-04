@@ -173,6 +173,14 @@ pub(crate) fn model_form(
         });
         values.push(String::new());
     }
+    let choose_format = !subscription && provider != "anthropic";
+    if choose_format {
+        fields.push(FieldSpec {
+            label: "API format (chat or responses)",
+            kind: FieldKind::Plain,
+        });
+        values.push("chat".into());
+    }
     let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     pane.push_view(Box::new(
         FormView::new(
@@ -192,6 +200,21 @@ pub(crate) fn model_form(
                         connection_id: connection.clone(),
                         name: values[0].trim().into(),
                         provider: provider.clone(),
+                        inference_protocol: if choose_format {
+                            match values
+                                .last()
+                                .map(|value| value.trim().to_ascii_lowercase())
+                                .as_deref()
+                            {
+                                Some("chat") => None,
+                                Some("responses") => Some(
+                                    astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                                ),
+                                _ => return Err("API format must be chat or responses".into()),
+                            }
+                        } else {
+                            None
+                        },
                         model: values[1].trim().into(),
                         context_window,
                         api_key: if subscription {
@@ -372,6 +395,7 @@ pub(crate) async fn run(
             begin_write()?;
             let payload = json!({"name":request.name,"provider":request.provider,"model":request.model,
                 "connection_id":request.connection_id,"api_key":request.api_key,"base_url":request.base_url,
+                "inference_protocol":request.inference_protocol,
                 "context_window":request.context_window,"is_default":false});
             let body = api
                 .post_bearer_path_json_text(&token, astra_thin_client::paths::ME_MODELS, &payload)
@@ -469,6 +493,11 @@ mod tests {
         key(&mut pane, KeyCode::Tab);
         pane.handle_paste("synthetic-private-key");
         pane.handle_paste("rejected\nsecond-line");
+        key(&mut pane, KeyCode::Tab);
+        for _ in 0..4 {
+            key(&mut pane, KeyCode::Backspace);
+        }
+        text(&mut pane, "responses");
         assert_eq!(pane.composer.text(), "unsent conversation");
         let area = ratatui::layout::Rect::new(0, 0, 100, 14);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -486,6 +515,10 @@ mod tests {
         assert_eq!(request.model, "fixture-model");
         assert_eq!(request.api_key, "synthetic-private-key");
         assert_eq!(request.context_window, 128000);
+        assert_eq!(
+            request.inference_protocol,
+            Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+        );
         assert!(!request.is_default);
         assert!(!format!("{request:?}").contains("synthetic-private-key"));
         assert_eq!(pane.composer.text(), "unsent conversation");

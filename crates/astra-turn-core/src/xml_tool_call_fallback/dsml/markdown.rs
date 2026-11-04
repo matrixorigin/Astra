@@ -14,6 +14,7 @@ pub(super) struct Prefix {
     pub containers: Vec<Container>,
     pub continuation_end: usize,
     pub left_context: bool,
+    inherited: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -80,6 +81,7 @@ pub(super) struct Cursor {
     inherited_done: bool,
     continuation_end: usize,
     left_context: bool,
+    inherited: usize,
 }
 
 impl Cursor {
@@ -90,6 +92,7 @@ impl Cursor {
             containers: containers.to_vec(),
             continuation_end: self.continuation_end,
             left_context: self.left_context,
+            inherited: self.inherited,
         }
     }
 
@@ -103,6 +106,7 @@ impl Cursor {
             match self.continue_containers(text, finish, inherited)? {
                 Context::Blank(mut prefix) => {
                     prefix.continuation_end = prefix.end;
+                    prefix.inherited = prefix.containers.len();
                     return Some(prefix);
                 }
                 Context::Left => {
@@ -112,6 +116,7 @@ impl Cursor {
             }
             self.inherited_done = true;
             self.continuation_end = self.at.byte;
+            self.inherited = self.containers.len();
         }
         let bytes = text.as_bytes();
         loop {
@@ -245,38 +250,91 @@ enum Context {
     Blank(Prefix),
 }
 
-/// Use the same CommonMark parser already used by the CLI rather than a second
-/// list of paragraph-interruption rules. Called once per complete ambiguous
-/// continuation line; the streaming owner retains its newline scan cursor.
-pub(super) fn interrupts_paragraph(line: &str) -> bool {
-    use pulldown_cmark::{Event, Parser, Tag};
-    const PREFIX: &str = "paragraph\n";
-    let source = format!("{PREFIX}{line}");
-    !matches!(Parser::new(&source).into_offset_iter().next(),Some((Event::Start(Tag::Paragraph),span)) if span.end>PREFIX.len())
+/// Facts from the canonical CommonMark parser for a complete physical line.
+/// Paragraph continuations (including indented ones) remain distinct from
+/// headings, literal blocks and new nested containers.
+pub(super) struct Boundary {
+    pub interrupts: bool,
+    pub paragraph: bool,
+    containers: Vec<ContainerKind>,
 }
 
-/// ATX headings are single-line blocks; unmatched inline delimiters cannot
-/// extend into the following paragraph. Eight leading bytes suffice to decide
-/// the heading marker (up to six ASCII # characters followed by whitespace).
-pub(super) fn line_is_heading(head: &str) -> bool {
-    use pulldown_cmark::{Event, Parser, Tag};
-    matches!(
-        Parser::new(head).next(),
-        Some(Event::Start(Tag::Heading { .. }))
-    )
+enum ContainerKind {
+    Quote,
+    List,
 }
 
-/// Only CommonMark block-start candidates need complete-line lookahead.
-/// Ordinary prose continues streaming; this is a bounded lexical check, while
-/// the actual block decision stays with `interrupts_paragraph`.
+impl Prefix {
+    pub(super) fn validate_containers(&mut self, boundary: &Boundary) {
+        let mut end = self.inherited;
+        for (container, kind) in self.containers[self.inherited..]
+            .iter()
+            .zip(&boundary.containers)
+        {
+            if matches!(
+                (container, kind),
+                (Container::Quote, ContainerKind::Quote)
+                    | (Container::List(_), ContainerKind::List)
+            ) {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        self.containers.truncate(end);
+    }
+}
+
+pub(super) fn inspect_line(line: &str, previous_paragraph: bool) -> Boundary {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let prefix = if previous_paragraph {
+        "paragraph\n"
+    } else {
+        ""
+    };
+    let source = format!("{prefix}{line}");
+    let mut events = Parser::new(&source).into_offset_iter().peekable();
+    let interrupts = previous_paragraph
+        && !matches!(events.peek(),Some((Event::Start(Tag::Paragraph),span)) if span.end>prefix.len());
+    let mut paragraph = false;
+    let mut containers = Vec::new();
+    let mut literal_block = false;
+    for (event, span) in events {
+        match event {
+            Event::Start(Tag::Heading { .. } | Tag::CodeBlock(_) | Tag::HtmlBlock) => {
+                literal_block = true;
+            }
+            Event::End(TagEnd::Heading(_) | TagEnd::CodeBlock | TagEnd::HtmlBlock) => {
+                literal_block = false;
+            }
+            Event::Start(Tag::Paragraph) if span.end > prefix.len() => paragraph = true,
+            // Tight list items omit Paragraph events, but their inline content
+            // still owns the same paragraph continuation and delimiter lifetime.
+            Event::Text(_) | Event::Code(_) if !literal_block && span.end > prefix.len() => {
+                paragraph = true
+            }
+            Event::Start(Tag::BlockQuote(_)) if span.start >= prefix.len() => {
+                containers.push(ContainerKind::Quote);
+            }
+            Event::Start(Tag::List(_)) if span.start >= prefix.len() => {
+                containers.push(ContainerKind::List);
+            }
+            _ => {}
+        }
+    }
+    Boundary {
+        interrupts,
+        paragraph,
+        containers,
+    }
+}
+
+/// Every punctuation/digit/whitespace prefix is a candidate, rather than a
+/// second enumeration of Markdown markers. Only safe leading letters bypass
+/// complete-line classification; the actual decision remains CommonMark's.
 pub(super) fn may_interrupt(text: &str) -> bool {
     text.chars()
         .take(4)
         .find(|ch| !matches!(ch, ' ' | '\t'))
-        .is_none_or(|ch| {
-            matches!(
-                ch,
-                '#' | '>' | '<' | '`' | '~' | '-' | '_' | '*' | '+' | '0'..='9' | '\r' | '\n'
-            )
-        })
+        .is_none_or(|ch| !ch.is_alphabetic())
 }

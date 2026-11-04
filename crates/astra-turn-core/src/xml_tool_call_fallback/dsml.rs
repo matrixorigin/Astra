@@ -25,6 +25,7 @@ struct Tag {
     span: Range<usize>,
     raw: String,
     literal: bool,
+    literal_block: usize,
 }
 
 enum Fragment {
@@ -43,6 +44,8 @@ struct Lexer {
     line_containers: Arc<[Container]>,
     block_containers: Arc<[Container]>,
     paragraph_open: bool,
+    line_paragraph: bool,
+    literal_block: usize,
     continuation_checked: usize,
     fence_containers: Arc<[Container]>,
     prefix_cursor: markdown::Cursor,
@@ -51,7 +54,6 @@ struct Lexer {
     fence_close_candidate: bool,
     literal: Option<(char, usize, bool)>,
     line_has_text: bool,
-    line_head: String,
     escaped: bool,
     open: Scopes,
 }
@@ -90,6 +92,10 @@ impl Scopes {
             literal,
         });
     }
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.last = [None; 3];
+    }
     fn close(&mut self, kind: Kind) -> Option<bool> {
         let index = self.last[kind as usize]?;
         let literal = self.frames[index].literal;
@@ -112,11 +118,11 @@ impl Lexer {
         while !self.remaining().is_empty() {
             if !self.line_prefix_done {
                 let inline = matches!(self.literal, Some((_, _, false)));
-                let contextual = inline
-                    || (self.paragraph_open
-                        && !self.block_containers.is_empty()
-                        && self.literal.is_none());
-                let classify = contextual && markdown::may_interrupt(self.remaining());
+                let escaped_scope = !self.open.is_empty() && self.open.visible();
+                let contextual = inline || escaped_scope || self.paragraph_open;
+                let classify = self.open.visible()
+                    && self.literal.is_none_or(|(_, _, fence)| !fence)
+                    && markdown::may_interrupt(self.remaining());
                 let line_end = if classify {
                     let tail = &self.remaining()[self.continuation_checked..];
                     if let Some(end) = tail.find('\n') {
@@ -130,7 +136,7 @@ impl Lexer {
                 } else {
                     0
                 };
-                if self.open.is_empty() {
+                if self.open.visible() {
                     let prefix = if matches!(self.literal, Some((_, _, true))) {
                         let Some(prefix) = self.prefix_cursor.fence(
                             &self.pending[self.cursor..],
@@ -147,7 +153,7 @@ impl Lexer {
                     } else {
                         None
                     };
-                    let Some(prefix) = prefix.or_else(|| {
+                    let Some(mut prefix) = prefix.or_else(|| {
                         self.prefix_cursor.normal(
                             &self.pending[self.cursor..],
                             finish,
@@ -157,14 +163,36 @@ impl Lexer {
                         break;
                     };
                     self.prefix_cursor = markdown::Cursor::default();
-                    let interrupts = classify
-                        && markdown::interrupts_paragraph(
+                    let boundary = classify.then(|| {
+                        markdown::inspect_line(
                             &self.remaining()[prefix.continuation_end..line_end],
-                        );
+                            contextual,
+                        )
+                    });
+                    let interrupts = boundary
+                        .as_ref()
+                        .is_some_and(|boundary| boundary.interrupts);
                     if inline && interrupts {
                         self.literal = None;
                     }
-                    self.indented = prefix.indented && !matches!(self.literal, Some((_, _, false)));
+                    if escaped_scope && interrupts {
+                        self.open.clear();
+                        self.literal_block += 1;
+                    }
+                    let continuation = self.paragraph_open && !interrupts;
+                    self.line_paragraph = boundary
+                        .as_ref()
+                        .map(|boundary| boundary.paragraph)
+                        .unwrap_or(!prefix.indented || continuation || inline);
+                    if let Some(boundary) = &boundary {
+                        prefix.validate_containers(boundary);
+                    }
+                    if interrupts {
+                        self.paragraph_open = false;
+                    }
+                    self.indented = prefix.indented
+                        && !continuation
+                        && !matches!(self.literal, Some((_, _, false)));
                     self.line_containers = if contextual && prefix.left_context && !interrupts {
                         self.block_containers.clone()
                     } else {
@@ -176,7 +204,6 @@ impl Lexer {
                         let text = self.remaining()[..end].to_owned();
                         self.consume(end);
                         self.line_has_text = false;
-                        self.line_head.clear();
                         fragments.push(Fragment::Text {
                             text,
                             visible: true,
@@ -240,6 +267,7 @@ impl Lexer {
                         let raw = self.remaining()[..end].to_owned();
                         let span = self.offset..self.offset + end;
                         let escaped = self.escaped;
+                        let literal_block = self.literal_block;
                         let mut literal = if self.open.is_empty() {
                             escaped
                         } else {
@@ -266,6 +294,7 @@ impl Lexer {
                             span,
                             raw,
                             literal,
+                            literal_block,
                         }));
                         continue;
                     }
@@ -346,28 +375,32 @@ impl Lexer {
         for ch in self.pending[self.cursor..self.cursor + end].chars() {
             if ch == '\n' {
                 let blank = !self.line_has_text;
-                if matches!(self.literal, Some((_, _, false)))
-                    && markdown::line_is_heading(&self.line_head)
-                {
-                    self.literal = None;
+                if !self.line_paragraph {
+                    if matches!(self.literal, Some((_, _, false))) {
+                        self.literal = None;
+                    }
+                    if !self.open.is_empty() && self.open.visible() {
+                        self.open.clear();
+                        self.literal_block += 1;
+                    }
                 }
-                self.line_head.clear();
                 self.line_has_text = false;
                 self.line_prefix_done = false;
                 self.indented = false;
                 self.prefix_cursor = markdown::Cursor::default();
                 self.continuation_checked = 0;
-                if blank {
+                if blank || !self.line_paragraph {
                     self.paragraph_open = false;
                 }
             } else {
-                if self.line_head.len() < 8 {
-                    self.line_head.push(ch);
-                }
                 if !ch.is_whitespace() {
                     self.line_has_text = true;
                     self.line_prefix_done = true;
-                    if self.literal.is_none() && self.open.is_empty() {
+                    if self.line_paragraph
+                        && !self.indented
+                        && self.literal.is_none()
+                        && self.open.is_empty()
+                    {
                         self.paragraph_open = true;
                     }
                 }
@@ -449,6 +482,9 @@ pub(super) fn decode(text: &str) -> Decoded {
             tags[index + 1..]
                 .iter()
                 .position(|tag| {
+                    if opener.literal && tag.literal_block != opener.literal_block {
+                        return true;
+                    }
                     if tag.closing {
                         if open.close(tag.kind).is_some() {
                             return open.is_empty();
@@ -464,9 +500,11 @@ pub(super) fn decode(text: &str) -> Decoded {
                 })
                 .map(|offset| index + 1 + offset)
         };
-        let closer = boundary
-            .map(|index| &tags[index])
-            .filter(|tag| tag.kind == Kind::Invoke && tag.closing);
+        let closer = boundary.map(|index| &tags[index]).filter(|tag| {
+            tag.kind == Kind::Invoke
+                && tag.closing
+                && (!opener.literal || tag.literal_block == opener.literal_block)
+        });
         let complete = self_closed || closer.is_some();
         let body_end = if self_closed {
             opener.span.end

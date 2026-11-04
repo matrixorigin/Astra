@@ -1,9 +1,6 @@
 //! Real model service + isolated DB + strict, non-billable provider fixture.
-//! Run with ASTRA_TEST_DB_IT=1, ASTRA_TEST_DATABASE=$ASTRA_DATABASE,
-//! ASTRA_ALLOW_INSECURE_DEFAULTS=1 and ASTRA_BYOK_DEEPSEEK_BASE_URL set to
-//! an unused loopback HTTP origin (e.g. http://127.0.0.1:18994).
-//! Explicitly selected with --features external-contract-tests; ordinary
-//! online lanes do not provide this operator-only endpoint override.
+//! Run with ASTRA_TEST_DB_IT=1 and ASTRA_TEST_DATABASE=$ASTRA_DATABASE.
+//! Explicitly selected with --features external-contract-tests.
 mod common;
 #[path = "common/isolated_database.rs"]
 mod isolated_database;
@@ -12,23 +9,15 @@ use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelService,
     models::{UserModelCreateRequestData, UserModelUpdateRequestData},
 };
-use axum::{Json, Router, http::StatusCode, routing::post};
+use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[tokio::test]
-#[ignore = "requires isolated MatrixOne DB and loopback DeepSeek fixture override"]
+#[ignore = "requires an isolated MatrixOne database"]
 async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     let settings = common::require_db_it_env();
     isolated_database::require_isolated_database(&settings.database);
-    assert_eq!(
-        std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref(),
-        Ok("1")
-    );
-    let base = std::env::var("ASTRA_BYOK_DEEPSEEK_BASE_URL").expect("loopback fixture origin");
-    let url = reqwest::Url::parse(&base).unwrap();
-    assert_eq!(url.scheme(), "http");
-    assert_eq!(url.host_str(), Some("127.0.0.1"));
     let fail_probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     #[derive(Default)]
@@ -40,6 +29,29 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     }
     let hold = Arc::new(ConnectivityHold::default());
     let app = Router::new()
+        .route(
+            "/responses",
+            post(|axum::extract::State((fail, _, hold)): axum::extract::State<(
+                    Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>, Arc<ConnectivityHold>
+                )>, headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                if headers.get("authorization").is_none_or(|v| v != "Bearer valid-key" && v != "Bearer rotated-key")
+                    || body["model"] != "deepseek-chat" || body["stream"] != true || body["store"] != false {
+                    return (StatusCode::BAD_REQUEST, "invalid Responses request").into_response();
+                }
+                if body["reasoning"]["effort"] == "high" && fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (StatusCode::BAD_REQUEST, "high is not supported").into_response();
+                }
+                if body["reasoning"]["effort"] == "high" && hold.next.compare_exchange(4, 0, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
+                    hold.started.notify_one();
+                    hold.release.notified().await;
+                }
+                let event = json!({"type":"response.completed","response":{"id":"fixture","status":"completed","output":[
+                    {"type":"reasoning","id":"reason","summary":[],"encrypted_content":"opaque"},
+                    {"type":"message","id":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"391"}]}
+                ]}});
+                ([("content-type", "text/event-stream")], format!("data: {event}\n\n")).into_response()
+            }),
+        )
         .route(
             "/chat/completions",
             post(
@@ -154,17 +166,22 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             ),
         )
         .with_state((fail_probe.clone(), requests.clone(), hold.clone()));
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", url.port().unwrap()))
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let base = format!("http://{endpoint}");
     let fixture = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (pool, settings) = common::setup_pool_and_settings().await;
     let encryptor = FernetTokenEncryptor::new("provider-wire-test-only-key").unwrap();
     let service = DatabaseModelService::new(settings.clone(), Arc::new(encryptor.clone()))
-        .with_pool(pool.clone());
+        .with_pool(pool.clone())
+        .with_deepseek_test_endpoint(endpoint)
+        .unwrap();
     let owner = uuid::Uuid::new_v4().to_string();
     let make_request = |name: &str, model: &str, key: &str| UserModelCreateRequestData {
         connection_id: None,
+        inference_protocol: None,
         name: name.into(),
         provider: "deepseek".into(),
         model: model.into(),
@@ -198,6 +215,202 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         )
         .await
         .unwrap();
+    // The selected protocol is durable configuration, independent of checks
+    // and key encryption, and route identity follows the actual credential.
+    use astra_core::model_wire::LlmProviderProtocol;
+    let mut responses_request = make_request("responses", "deepseek-chat", "valid-key");
+    responses_request.is_default = false;
+    responses_request.inference_protocol = Some(LlmProviderProtocol::OpenAiResponses);
+    let mut incompatible = responses_request.clone();
+    incompatible.provider = "anthropic".into();
+    assert_eq!(
+        service
+            .create_user_model(owner.clone(), incompatible)
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let responses = service
+        .create_user_model(owner.clone(), responses_request)
+        .await
+        .unwrap();
+    assert_eq!(
+        responses.inference_protocol,
+        Some(LlmProviderProtocol::OpenAiResponses)
+    );
+    let admitted = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    let original_scope = admitted
+        .response_scope
+        .clone()
+        .expect("BYOK Responses route scope");
+    assert_eq!(
+        admitted.inference_protocol,
+        Some(LlmProviderProtocol::OpenAiResponses)
+    );
+    // A query in the persisted route must survive both connectivity and thinking probes.
+    sqlx::query("UPDATE user_llm_models SET base_url = ? WHERE user_id = ? AND model_id = ?")
+        .bind(format!("{base}?workspace=one"))
+        .bind(&owner)
+        .bind(&responses.model_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    fail_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed_check = service
+        .check_user_model(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert!(failed_check.is_active);
+    assert!(failed_check.thinking_probe.unwrap().error.is_some());
+    let unknown = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert!(unknown.thinking_capability.is_none());
+    assert!(unknown.supported_reasoning_efforts.is_none());
+    fail_probe.store(false, std::sync::atomic::Ordering::SeqCst);
+    let checked = service
+        .check_user_model(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        checked.thinking_probe.unwrap().capability,
+        astra_services::models::ThinkingCapability::EffortOnly
+    );
+    let admitted = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert_ne!(
+        admitted.response_scope.as_deref(),
+        Some(original_scope.as_str())
+    );
+    assert!(admitted.supported_reasoning_efforts.is_none());
+    let catalog = service.list_models(owner.clone(), false).await.unwrap();
+    let personal = catalog
+        .iter()
+        .find(|item| item.offering_id == responses.model_id)
+        .unwrap();
+    assert!(personal.supported_reasoning_efforts.is_none());
+    let same_scope = admitted.response_scope.clone();
+    let bad_update = service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                inference_protocol: Some(LlmProviderProtocol::AnthropicMessages),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(bad_update.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        service
+            .get_user_model(owner.clone(), responses.model_id.clone())
+            .await
+            .unwrap()
+            .inference_protocol,
+        Some(LlmProviderProtocol::OpenAiResponses)
+    );
+    service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                api_key: Some("valid-key".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .admit_model_offering(owner.clone(), responses.model_id.clone())
+            .await
+            .unwrap()
+            .response_scope,
+        same_scope
+    );
+    service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                inference_protocol: Some(LlmProviderProtocol::OpenAiCompatible),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let chat = service
+        .check_user_model(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        chat.inference_protocol,
+        Some(LlmProviderProtocol::OpenAiCompatible)
+    );
+    assert!(chat.thinking_probe.is_some());
+    service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .admit_model_offering(owner.clone(), responses.model_id.clone())
+            .await
+            .unwrap()
+            .response_scope,
+        same_scope
+    );
+    hold.next.store(4, std::sync::atomic::Ordering::SeqCst);
+    let stale_check = service.check_user_model(owner.clone(), responses.model_id.clone());
+    let rotation = async {
+        hold.started.notified().await;
+        let rotated = service
+            .update_user_model(
+                owner.clone(),
+                responses.model_id.clone(),
+                UserModelUpdateRequestData {
+                    api_key: Some("rotated-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        hold.release.notify_one();
+        rotated.unwrap();
+    };
+    let (stale, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(stale_check, rotation)
+    })
+    .await
+    .unwrap();
+    assert_eq!(stale.unwrap_err().0, StatusCode::CONFLICT);
+    let rotated = service
+        .admit_model_offering(owner.clone(), responses.model_id.clone())
+        .await
+        .unwrap();
+    assert_ne!(rotated.response_scope, same_scope);
+    assert!(
+        service
+            .get_user_model(owner.clone(), responses.model_id.clone())
+            .await
+            .unwrap()
+            .thinking_probe
+            .is_none()
+    );
     // Fixed official endpoints are not user-overridable. Seed their *test row*
     // with this loopback fixture to exercise the real rotate/probe service paths
     // without adding a production transport bypass or spending a live API key.
@@ -373,6 +586,35 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         .check_model("admin-verified-fixture".into())
         .await
         .unwrap();
+    let mut responses_admin = request.clone();
+    responses_admin.name = "admin-responses-fixture".into();
+    responses_admin.quirks.as_mut().unwrap().inference_protocol =
+        Some(LlmProviderProtocol::OpenAiResponses);
+    service
+        .create_model(owner.clone(), responses_admin)
+        .await
+        .unwrap();
+    service
+        .check_model("admin-responses-fixture".into())
+        .await
+        .unwrap();
+    let catalog = service.list_models(owner.clone(), true).await.unwrap();
+    let admin = catalog
+        .iter()
+        .find(|item| item.name == "admin-responses-fixture")
+        .unwrap();
+    assert_eq!(
+        admin.supported_reasoning_efforts.as_deref(),
+        Some(["high".to_string()].as_slice())
+    );
+    let resolved = service
+        .revalidate_model_offering(admin.offering_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.model.supported_reasoning_efforts,
+        admin.supported_reasoning_efforts
+    );
     let assert_views = |expected, expected_error: Option<bool>| {
         let service = &service;
         let settings = &settings;
@@ -801,6 +1043,10 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
 
     service
         .delete_model("admin-verified-fixture".into())
+        .await
+        .unwrap();
+    service
+        .delete_user_model(owner.clone(), responses.model_id)
         .await
         .unwrap();
     service

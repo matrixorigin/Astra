@@ -934,6 +934,9 @@ mod tests {
         use pulldown_cmark::{Event, Parser, Tag, TagEnd};
         let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
         for text in [
+            format!("Use a ` character\n===\n`{call}`"),
+            format!("Text\n    `example\n{call}`"),
+            format!("Text\n\n    `example\n    {call}`\n"),
             format!("Use a ` character.\n\n`{call}`"),
             format!("Use a ` character.\n# Heading\n`{call}`"),
             format!("# Unmatched ` delimiter\n`{call}`"),
@@ -968,6 +971,67 @@ mod tests {
             }
             visible.push_str(&filter.finish());
             assert_eq!(visible, text);
+        }
+    }
+
+    #[test]
+    fn dsml_paragraph_and_escaped_scope_boundaries_preserve_real_calls() {
+        let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        for (text, visible, executable) in [
+            (
+                format!("Use a ` character\n===\n`{call}`"),
+                format!("Use a ` character\n===\n`{call}`"),
+                false,
+            ),
+            (
+                format!("Use a ` character\n===\n{call}"),
+                "Use a ` character\n===\n".to_owned(),
+                true,
+            ),
+            (
+                format!("Text\n    `example\n{call}`"),
+                format!("Text\n    `example\n{call}`"),
+                false,
+            ),
+            (
+                format!("Text\n\n    `example\n    {call}`\n"),
+                format!("Text\n\n    `example\n    {call}`\n"),
+                false,
+            ),
+            (
+                format!("Example opener: \\<|DSML|calls>\n\n<|DSML|calls>{call}</|DSML|calls>"),
+                "Example opener: \\<|DSML|calls>\n\n".to_owned(),
+                true,
+            ),
+            (
+                format!(
+                    "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n<|DSML|calls>{call}</|DSML|calls>"
+                ),
+                "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n".to_owned(),
+                true,
+            ),
+        ] {
+            let calls = parse_degraded_tool_calls(&text).unwrap_or_default();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                if executable {
+                    vec![Some("read_file")]
+                } else {
+                    vec![]
+                },
+                "{text:?}"
+            );
+            assert_eq!(strip_degraded_tool_calls(&text), visible);
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut published = String::new();
+            for ch in text.chars() {
+                published.push_str(&filter.push(&ch.to_string()));
+            }
+            published.push_str(&filter.finish());
+            assert_eq!(published, visible);
         }
     }
 

@@ -106,13 +106,14 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-02-v119";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-04-v120";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             model_alias VARCHAR(100) NOT NULL,
             model_name VARCHAR(255) NOT NULL,
             provider VARCHAR(50) NOT NULL,
+            inference_protocol VARCHAR(32) NULL,
             api_key_encrypted TEXT NULL,
             connection_id VARCHAR(64) NULL,
             base_url VARCHAR(500) NOT NULL,
@@ -4779,6 +4780,18 @@ async fn verify_core_schema_shape(
                 )));
             }
         }
+        if table == "user_llm_models"
+            && column == "inference_protocol"
+            && (!row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case("varchar")
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(32))
+        {
+            return Err(sqlx::Error::Protocol(
+                "invalid user_llm_models.inference_protocol shape".into(),
+            ));
+        }
         if table == "agent_run_events"
             && column == "invocation_supersession_scope_key"
             && (!row
@@ -4923,7 +4936,12 @@ async fn verify_core_schema_shape(
         ("infra_llm_models", &["thinking_probe_json"][..]),
         (
             "user_llm_models",
-            &["thinking_probe_json", "api_key_encrypted", "connection_id"][..],
+            &[
+                "thinking_probe_json",
+                "api_key_encrypted",
+                "connection_id",
+                "inference_protocol",
+            ][..],
         ),
     ] {
         for column in required {

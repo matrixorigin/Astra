@@ -44,7 +44,7 @@ The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
 backbone, invocation/provider-attempt ledger, tool execution, cancellation,
 canonical history and checkpoint paths as API-key models. `chatgpt` selects
 the shared Responses codec; it does not create another session state machine.
-Administrator-managed API-key Offerings can explicitly select the same Responses
+Administrator-managed and personal API-key Offerings can explicitly select the same Responses
 wire protocol. Protocol selection is independent of credential ownership: API
 keys use their admitted endpoint and headers, while subscriptions retain their
 connection fencing and refresh rules. API-key continuation state is scoped to
@@ -53,6 +53,19 @@ header names are case-insensitive, and invalid or duplicate configured headers
 are rejected at configuration and execution admission. Probe-only and unrelated
 capability changes do not invalidate it. Model checks use
 the selected wire protocol; the ordinary provider default remains unchanged.
+Personal model configuration stores the protocol separately from the optional
+thinking observation. Credential rotation and concurrent checks are fenced by
+the existing model row. A Responses tool group retains its scoped provider
+evidence across canonical projection; incomplete or inconsistent evidence
+stops the current continuation before provider dispatch. A later human turn can
+continue with the completed canonical tool pairs. No separate continuation
+table or per-request database lookup is introduced.
+An effort accepted by one probe is an observation, not a complete provider
+inventory. Personal Responses models can try an unverified effort; a provider
+rejection is reported without silently changing the requested setting. The
+model default sends no effort override. Subscription catalogs retain their
+declared effort lists; administrator routes without a declaration continue to
+limit explicit controls to observed values.
 Explicit request temperatures are not silently discarded. Internal memory
 judgments express a deterministic sampling preference; when Responses sampling
 support is not established they use the provider default and the admitted
@@ -125,10 +138,13 @@ decoding and its connection fences, including cancellation during a stream.
 Responses uses the [shared runtime role projection](context-and-prompt.md#dynamic-blocks)
 before wire encoding, including direct auxiliary calls. Requests send full
 history with `store:false` and `stream:true`.
-Astra functions occupy the `astra` namespace. Completed provider output items,
+Functions use the standard flat Responses tool format. Completed provider output items,
 including encrypted reasoning and message phase, live in private canonical
-assistant-message metadata before tool execution/final checkpoint. Opaque
-provider-encrypted reasoning is base64 encoded for storage so generic text
+assistant-message metadata before tool execution/final checkpoint. Stateless
+Responses return encrypted reasoning without an `include` override. If a tool
+round contains reasoning without replayable encrypted content, Astra stops
+before executing its calls. Opaque provider-encrypted reasoning is base64
+encoded for storage so generic text
 redaction cannot corrupt ciphertext. Function arguments come from the canonical
 assistant tool calls; private metadata retains no second raw argument copy. Resume
 replays them only for the same connection and model; other protocols remove
@@ -988,8 +1004,8 @@ both complete and partial DSML tag recognition; suffixed names such as
 `invoke-example` are ordinary text. A fence consumes only its opening containers;
 blank lines may omit list indentation without ending that fence. Tabs retain
 physical columns and virtual padding; active inline spans ignore block indentation.
-Indented text is treated conservatively as data even where paragraph continuation
-could render it as prose.
+Indented paragraph continuations retain their inline delimiter state; actual
+indented code blocks remain literal.
 Parameter bodies are not independent tool-call sources. Every invocation owns
 its full subtree before name/argument validation, including malformed unnamed
 openers and nested wrappers; nested content cannot escape as another call.
@@ -997,13 +1013,16 @@ Complete-input scans use a cursor and compact once per batch; long indentation,
 delimiter runs, closing-fence whitespace, and unfinished tags do not rescan their
 accumulated prefix on each delta. DSML projection precedes legacy bare-XML cleanup
 so argument markup cannot consume answer text. Escaped tag openers and their
-matching markup are literal scopes, never executable invocations. Per-kind scope
+matching markup are literal scopes within their CommonMark block, never
+executable invocations. An unmatched escaped opener cannot absorb a real call in
+a later block. Per-kind scope
 indexes make unmatched closers constant-time and matching pops amortized linear.
 Physical line-prefix state follows every byte consumed, including newlines inside
 tags. List context survives continuation lines; unmatched inline delimiters end at
 their CommonMark block boundary. The existing CommonMark parser determines
-paragraph interruption rather than a second set of block rules. Only ambiguous
-Markdown continuation lines wait for the line boundary; ordinary prose continues
+paragraph continuation, heading boundaries and new container facts rather than a
+second set of block rules. Lines beginning with punctuation, digits or indentation
+wait for the line boundary for classification; ordinary leading-letter prose continues
 streaming, and this does not change tool dispatch or admission.
 
 Native structured calls take precedence. Recovered calls remain subject to the

@@ -136,7 +136,7 @@ async fn responses_continuation_survives_probe_updates_but_fences_route_changes(
     let scope = original.response_scope.as_deref().unwrap();
     let output = ResponseOutput {
         items: vec![
-            json!({"type":"function_call", "id":"fc-1", "namespace":"astra", "name":"lookup", "call_id":"call-1", "arguments":"{}"}),
+            json!({"type":"function_call", "id":"fc-1",  "name":"lookup", "call_id":"call-1", "arguments":"{}"}),
         ],
         ..Default::default()
     };

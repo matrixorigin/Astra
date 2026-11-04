@@ -33,6 +33,9 @@ use tokio_util::sync::CancellationToken;
 #[path = "responses.rs"]
 mod responses;
 
+const INCOMPLETE_TOOL_CONTINUATION_MESSAGE: &str =
+    "Some previous tool results could not be verified. Check their effects, then start a new turn.";
+
 #[cfg(test)]
 use crate::prompts;
 use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
@@ -2346,7 +2349,7 @@ pub(crate) fn llm_request_url_for_provider(
         }
         LlmProviderProtocol::BedrockConverse => bedrock_converse_url(base, model_name, streaming),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
-            format!("{base}/chat/completions")
+            astra_core::model_wire::endpoint_url(base_url, "chat/completions")
         }
     }
 }
@@ -3524,6 +3527,9 @@ fn build_provider_request_body_with_cache_capability(
         message
             .get(astra_core::model_wire::responses::CONTINUATION_KEY)
             .is_some()
+            || message
+                .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_some()
             || crate::turn::wire_assembly::is_required_runtime_preamble(message)
             || crate::turn::wire_assembly::is_runtime_system_context(message)
             || astra_turn_types::is_runtime_owned_message(message)
@@ -3555,6 +3561,7 @@ fn build_provider_request_body_with_cache_capability(
                 messages,
             );
             let mut cloned = messages.to_vec();
+            cloned.retain(|message| !is_incomplete_marker_only(message));
             strip_internal_runtime_markers(&mut cloned);
             cloned
         };
@@ -3814,8 +3821,7 @@ fn apply_required_tool_choice(
 
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::OpenAiResponses => {
-            body["tool_choice"] =
-                json!({"type":"function","namespace":"astra","name":required_tool_name});
+            body["tool_choice"] = json!({"type":"function","name":required_tool_name});
         }
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
             body["tool_choice"] = json!({
@@ -4160,6 +4166,17 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
     strip_internal_runtime_markers_with_ids(messages, &provider_ids, false);
 }
 
+fn is_incomplete_marker_only(message: &Value) -> bool {
+    message["role"] == "assistant"
+        && message
+            .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+            .is_some()
+        && message
+            .get("content")
+            .is_none_or(|content| content.is_null() || content.as_str() == Some(""))
+        && message["tool_calls"].as_array().is_none_or(Vec::is_empty)
+}
+
 fn strip_internal_runtime_markers_with_ids(
     messages: &mut [Value],
     provider_ids: &HashMap<String, String>,
@@ -4223,6 +4240,7 @@ fn strip_internal_runtime_markers_with_ids(
             // prompt cache suffix.
             for key in [
                 astra_core::model_wire::responses::CONTINUATION_KEY,
+                astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD,
                 "_round_index",
                 astra_turn_core::tool_result_storage::TOOL_RESULT_TOOL_NAME_FIELD,
                 "_timestamp",
@@ -4329,12 +4347,13 @@ fn consolidate_system_messages_inner(
         // Keep it in canonical history for same-scope replay, but do not send
         // an empty assistant turn to providers that cannot consume it.
         out.retain(|message| {
-            !(message["role"] == "assistant"
-                && message
-                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
-                    .is_some()
-                && message["content"].as_str().is_some_and(str::is_empty)
-                && message["tool_calls"].as_array().is_none_or(Vec::is_empty))
+            !is_incomplete_marker_only(message)
+                && !(message["role"] == "assistant"
+                    && message
+                        .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                        .is_some()
+                    && message["content"].as_str().is_some_and(str::is_empty)
+                    && message["tool_calls"].as_array().is_none_or(Vec::is_empty))
         });
     }
     if !allow_suffix_dependent_history_repair {
@@ -5133,12 +5152,44 @@ pub(crate) fn prepare_streaming_call(
         ));
     }
     if call
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(|message| {
+            message["role"] == "assistant"
+                && message
+                    .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                    .is_some()
+        })
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            INCOMPLETE_TOOL_CONTINUATION_MESSAGE,
+        )
+        .with_details_json(
+            json!({"source":"runtime","code":"tool_continuation_incomplete"}).to_string(),
+        ));
+    }
+    if call
         .route
         .inference_protocol
         .unwrap_or_else(|| llm_provider_protocol(call.route.provider))
         == LlmProviderProtocol::OpenAiResponses
     {
         return responses::prepare(call, tool_choice, preparation_started);
+    }
+    if call
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(astra_core::model_wire::responses::has_tool_continuation)
+    {
+        return Err(responses::error(
+            astra_core::ErrorKind::InvalidRequest,
+            "responses_continuation_scope_changed",
+        ));
     }
     if call.route.provider == "typesafe" {
         return Err(astra_core::ClassifiedError::new(
@@ -6296,12 +6347,36 @@ async fn call_prepared_llm_with_total_budget(
                             | "max_output_tokens"
                     )
                 });
-            let message = parameter.map_or_else(
-                || format!("Model provider rejected the request (HTTP {status})"),
-                |parameter| {
-                    format!("Model provider rejected parameter {parameter} (HTTP {status})")
-                },
-            );
+            let rejected_effort = (is_responses
+                && matches!(status, 400 | 422)
+                && matches!(
+                    parameter,
+                    Some("reasoning" | "reasoning.effort" | "reasoning_effort")
+                ))
+            .then(|| serde_json::from_slice::<Value>(&prepared_request.body).ok())
+            .flatten()
+            .and_then(|body| {
+                body.pointer("/reasoning/effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|effort| {
+                astra_core::model_wire::thinking::ThinkingProtocol::supports_responses_effort(
+                    effort,
+                )
+            });
+            let message = if let Some(effort) = rejected_effort {
+                format!(
+                    "The model provider rejected the {effort} reasoning setting. Choose another setting or Model default."
+                )
+            } else {
+                parameter.map_or_else(
+                    || format!("Model provider rejected the request (HTTP {status})"),
+                    |parameter| {
+                        format!("Model provider rejected parameter {parameter} (HTTP {status})")
+                    },
+                )
+            };
             Some(ProviderHttpRejection {
                 classified: astra_core::ClassifiedError::new(
                     if status == 400 && astra_core::is_llm_context_window_error(&text) {
@@ -13151,6 +13226,43 @@ mod tests {
         let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
         for (content, expected, paths) in [
             (
+                format!("Use a ` character\n===\n`{call}`"),
+                format!("Use a ` character\n===\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character\n===\n{call}"),
+                "Use a ` character\n===\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Text\n    `example\n{call}`"),
+                format!("Text\n    `example\n{call}`"),
+                vec![],
+            ),
+            (
+                format!("Text\n\n    `example\n    {call}`\n"),
+                format!("Text\n\n    `example\n    {call}`\n"),
+                vec![],
+            ),
+            (
+                format!("Example opener: \\<|DSML|calls>\n\n<|DSML|calls>{call}</|DSML|calls>"),
+                "Example opener: \\<|DSML|calls>\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!(
+                    "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n<|DSML|calls>{call}</|DSML|calls>"
+                ),
+                "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("# Example opener: \\<|DSML|calls>\n<|DSML|calls>{call}</|DSML|calls>"),
+                "# Example opener: \\<|DSML|calls>\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
                 format!("The literal is: \\{call}"),
                 format!("The literal is: \\{call}"),
                 vec![],
@@ -17819,6 +17931,14 @@ mod tests {
         assert_eq!(
             llm_completions_url("https://api.openai.com/v1/", None, "openai"),
             "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn completions_url_keeps_route_query_after_the_endpoint_path() {
+        assert_eq!(
+            llm_completions_url("https://gateway.example/v1?tenant=one", None, "openai"),
+            "https://gateway.example/v1/chat/completions?tenant=one"
         );
     }
 
