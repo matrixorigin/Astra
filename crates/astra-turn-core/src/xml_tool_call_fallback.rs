@@ -774,6 +774,9 @@ mod tests {
             format!("> - ~~~text\n>   {call}\n>   ~~~"),
             format!("100. ~~~text\n     {call}\n     ~~~"),
             format!("```text\n> ```\n{call}\n```"),
+            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
+            format!("> - ~~~xml\n>\n>   {call}\n>   ~~~\n"),
+            format!(">\t~~~xml\n> {call}\n> ~~~\n"),
             format!("\t{call}\n"),
         ] {
             assert!(
@@ -825,6 +828,73 @@ mod tests {
     fn dsml_parameter_body_is_not_legacy_xml_cleanup_input() {
         let text = r#"Before.<||DSML||tool_calls><||DSML||invoke name="write_file"><||DSML||parameter name="path">example.txt</||DSML||parameter><||DSML||parameter name="content"><parameter=x>hello</||DSML||parameter></||DSML||invoke></||DSML||tool_calls>After."#;
         assert_eq!(strip_degraded_tool_calls(text), "Before.After.");
+    }
+
+    #[test]
+    fn dsml_inline_code_closes_on_an_indented_continuation() {
+        let real = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        let text = format!("Before `foo\n    bar`\n{real}");
+        let calls =
+            parse_degraded_tool_calls(&text).expect("real invocation after closed inline code");
+        assert_eq!(calls[0]["function"]["name"], "bash");
+        assert_eq!(strip_degraded_tool_calls(&text), "Before `foo\n    bar`\n");
+        let mut filter = DsmlToolCallStreamFilter::default();
+        let mut visible = String::new();
+        for ch in text.chars() {
+            visible.push_str(&filter.push(&ch.to_string()));
+        }
+        visible.push_str(&filter.finish());
+        assert_eq!(visible, strip_degraded_tool_calls(&text));
+    }
+
+    #[test]
+    fn dsml_non_protocol_tag_names_remain_text_for_every_chunking() {
+        for text in [
+            r#"<|DSML|invoke-example name="bash">{"command":"pwd"}</|DSML|invoke-example>"#,
+            r#"<|DSML|calls-example><|DSML|parameter-example name="command">pwd</|DSML|parameter-example></|DSML|calls-example>"#,
+        ] {
+            assert!(parse_degraded_tool_calls(text).is_none());
+            assert_eq!(strip_degraded_tool_calls(text), text);
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut visible = String::new();
+            for ch in text.chars() {
+                visible.push_str(&filter.push(&ch.to_string()));
+            }
+            visible.push_str(&filter.finish());
+            assert_eq!(visible, text);
+        }
+    }
+
+    #[test]
+    fn dsml_fragmented_long_prefixes_preserve_their_semantics() {
+        for (text, expected) in [
+            (" ".repeat(512 * 1024), " ".repeat(512 * 1024)),
+            ("> ".repeat(128 * 1024), "> ".repeat(128 * 1024)),
+            ("`".repeat(512 * 1024), "`".repeat(512 * 1024)),
+            (
+                format!("```text\n```{}\n", " ".repeat(512 * 1024)),
+                format!("```text\n```{}\n", " ".repeat(512 * 1024)),
+            ),
+            (
+                format!("<|DSML|invoke name=\"{}", "a".repeat(512 * 1024)),
+                String::new(),
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut visible = String::new();
+            for chunk in text.as_bytes().chunks(16) {
+                visible.push_str(&filter.push(std::str::from_utf8(chunk).unwrap()));
+            }
+            visible.push_str(&filter.finish());
+            assert_eq!(visible, expected);
+            assert_eq!(filter_dsml_tool_call_markup_for_display(&text), expected);
+            eprintln!(
+                "fragmented prefix {} bytes: {:?}",
+                text.len(),
+                started.elapsed()
+            );
+        }
     }
 
     #[test]

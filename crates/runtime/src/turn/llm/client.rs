@@ -12929,6 +12929,9 @@ mod tests {
             format!("> - ~~~text\n>   {call}\n>   ~~~"),
             format!("100. ~~~text\n     {call}\n     ~~~"),
             format!("```text\n> ```\n{call}\n```"),
+            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
+            format!("> - ~~~xml\n>\n>   {call}\n>   ~~~\n"),
+            format!(">\t~~~xml\n> {call}\n> ~~~\n"),
             format!("\t{call}\n"),
         ] {
             for character_chunks in [false, true] {
@@ -12978,6 +12981,165 @@ mod tests {
                 assert_eq!(nonstream.full_text, content);
                 assert!(nonstream.tool_calls.is_empty());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_non_protocol_names_remain_literal() {
+        let content =
+            r#"<|DSML|invoke-example name="bash">{"command":"pwd"}</|DSML|invoke-example>"#;
+        for character_chunks in [false, true] {
+            let chunks = if character_chunks {
+                content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![content.to_owned()]
+            };
+            let mut frames = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                    Ok(Bytes::from(format!("data: {event}\n\n")))
+                })
+                .collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(result.tool_calls.is_empty());
+            assert_eq!(result.full_text, content);
+            assert_eq!(published, content);
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, content);
+            assert!(nonstream.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_inline_code_continuation_resumes_call_recovery() {
+        let content = "Before `foo\n    bar`\n<|DSML|invoke name=\"bash\">{\"command\":\"pwd\"}</|DSML|invoke>";
+        for character_chunks in [false, true] {
+            let chunks = if character_chunks {
+                content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![content.to_owned()]
+            };
+            let mut frames = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                    Ok(Bytes::from(format!("data: {event}\n\n")))
+                })
+                .collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "Before `foo\n    bar`\n");
+            assert_eq!(published, result.full_text);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("bash")]
+            );
+            assert_eq!(
+                astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                    &result.tool_calls[0]
+                )
+                .unwrap(),
+                json!({"command":"pwd"})
+            );
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(nonstream.tool_calls[0]["function"]["name"], "bash");
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_fragmented_long_prefixes_are_preserved_or_hidden() {
+        for (content, expected) in [
+            (" ".repeat(512 * 1024), " ".repeat(512 * 1024)),
+            (
+                format!("<|DSML|invoke name=\"{}", "a".repeat(512 * 1024)),
+                String::new(),
+            ),
+        ] {
+            let mut frames=content.as_bytes().chunks(16).map(|chunk| {
+                let event=json!({"choices":[{"delta":{"content":std::str::from_utf8(chunk).unwrap()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            }).collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, expected);
+            assert_eq!(published, expected);
+            assert!(result.tool_calls.is_empty());
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, expected);
+            assert!(nonstream.tool_calls.is_empty());
         }
     }
 

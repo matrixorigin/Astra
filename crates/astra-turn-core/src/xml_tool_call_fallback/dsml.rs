@@ -3,9 +3,12 @@
 //! tool intent. Raw provider bytes remain available to the existing admission
 //! path, including named calls whose arguments cannot be decoded.
 
-use regex::Regex;
 use serde_json::{Value, json};
-use std::{ops::Range, sync::OnceLock};
+use std::ops::Range;
+
+mod markdown;
+mod tag;
+use markdown::Container;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,215 +41,14 @@ struct Lexer {
     indented: bool,
     line_containers: Vec<Container>,
     fence_containers: Vec<Container>,
+    prefix_cursor: markdown::Cursor,
+    tag_scanner: Option<tag::Scanner>,
+    delimiter_run: usize,
+    fence_close_candidate: bool,
     literal: Option<(char, usize, bool)>,
     line_has_text: bool,
     escaped: bool,
     open: Vec<Kind>,
-}
-
-fn tag_regex() -> &'static Regex {
-    static TAG: OnceLock<Regex> = OnceLock::new();
-    TAG.get_or_init(|| Regex::new(
-        r"(?is)^<\s*(/?)\s*(?:｜DSML｜|｜｜DSML｜｜|\|DSML\||\|\|DSML\|\|)\s*(tool_calls|function_calls|calls|invoke|parameter)\b[^<>]*>"
-    ).expect("valid DSML token grammar"))
-}
-
-/// A prefix is held only while it can still become a supported protocol tag.
-/// This also bounds normal-text latency when a chunk ends with `<`.
-fn tag_prefix(text: &str) -> bool {
-    let Some(tail) = text.strip_prefix('<') else {
-        return false;
-    };
-    let tail = tail.trim_start();
-    let tail = tail.strip_prefix('/').unwrap_or(tail).trim_start();
-    for marker in ["｜DSML｜", "｜｜DSML｜｜", "|DSML|", "||DSML||"] {
-        let mut chars = tail.char_indices();
-        let mut matched = true;
-        let mut end = 0;
-        for expected in marker.chars() {
-            match chars.next() {
-                None => return true,
-                Some((index, actual)) if actual.eq_ignore_ascii_case(&expected) => {
-                    end = index + actual.len_utf8();
-                }
-                _ => {
-                    matched = false;
-                    break;
-                }
-            }
-        }
-        if !matched {
-            continue;
-        }
-        let name = tail[end..].trim_start();
-        return [
-            "tool_calls",
-            "function_calls",
-            "calls",
-            "invoke",
-            "parameter",
-        ]
-        .iter()
-        .any(|tag| {
-            let length = name.len().min(tag.len());
-            name.get(..length)
-                .is_some_and(|prefix| tag[..length].eq_ignore_ascii_case(prefix))
-                && (name.len() <= tag.len()
-                    || matches!(
-                        name.as_bytes()[tag.len()],
-                        b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'
-                    ))
-        });
-    }
-    false
-}
-
-#[derive(Clone, Debug)]
-enum Container {
-    Quote,
-    List(usize),
-}
-
-struct Prefix {
-    end: usize,
-    indented: bool,
-    containers: Vec<Container>,
-}
-
-fn indentation(bytes: &[u8], cursor: &mut usize) -> usize {
-    let mut columns = 0;
-    while let Some(ch) = bytes.get(*cursor) {
-        match ch {
-            b' ' => columns += 1,
-            b'\t' => columns += 4 - columns % 4,
-            _ => break,
-        }
-        *cursor += 1;
-    }
-    columns
-}
-
-/// Consume only Markdown container/indentation prefixes. Holding an unfinished
-/// prefix lets streaming and complete-input decoding make the same decision.
-/// Indented source is conservatively literal even when a paragraph could make
-/// CommonMark interpret it as continuation text: it must never become a call.
-fn markdown_prefix(text: &str, finish: bool) -> Option<Prefix> {
-    let bytes = text.as_bytes();
-    let mut cursor = 0;
-    let mut containers = Vec::new();
-    loop {
-        let indent = indentation(bytes, &mut cursor);
-        if cursor == bytes.len() && !finish {
-            return None;
-        }
-        if indent >= 4 {
-            return Some(Prefix {
-                end: cursor,
-                indented: true,
-                containers,
-            });
-        }
-        if bytes.get(cursor) == Some(&b'>') {
-            cursor += 1;
-            if bytes.get(cursor) == Some(&b' ') {
-                cursor += 1;
-            }
-            containers.push(Container::Quote);
-            continue;
-        }
-        let marker_end = match bytes.get(cursor) {
-            Some(b'-' | b'+' | b'*') => Some(cursor + 1),
-            Some(b'0'..=b'9') => {
-                let end = bytes[cursor..]
-                    .iter()
-                    .take_while(|ch| ch.is_ascii_digit())
-                    .count()
-                    + cursor;
-                if end == bytes.len() && end - cursor <= 9 && !finish {
-                    return None;
-                }
-                (end - cursor <= 9 && matches!(bytes.get(end), Some(b'.' | b')')))
-                    .then_some(end + 1)
-            }
-            _ => None,
-        };
-        if let Some(end) = marker_end {
-            if end == bytes.len() && !finish {
-                return None;
-            }
-            if matches!(bytes.get(end), Some(b' ' | b'\t')) {
-                let mut content = end;
-                let padding = indentation(bytes, &mut content);
-                if content == bytes.len() && !finish {
-                    return None;
-                }
-                // CommonMark list padding is one to four columns. With more
-                // padding, one column belongs to the marker and the remainder
-                // starts an indented code block.
-                let (content, padding) = if padding <= 4 {
-                    (content, padding)
-                } else {
-                    (end + 1, 1)
-                };
-                containers.push(Container::List(indent + end - cursor + padding));
-                cursor = content;
-                continue;
-            }
-        }
-        return Some(Prefix {
-            end: cursor,
-            indented: false,
-            containers,
-        });
-    }
-}
-
-/// A fenced block consumes only the containers that opened it. A new quote or
-/// list-looking line inside code is data, and leaving a container ends its fence.
-/// None waits for more prefix bytes; Some(None) leaves the containing block.
-fn fence_prefix(text: &str, finish: bool, containers: &[Container]) -> Option<Option<Prefix>> {
-    let bytes = text.as_bytes();
-    let mut cursor = 0;
-    for container in containers {
-        match container {
-            Container::Quote => {
-                if indentation(bytes, &mut cursor) > 3 {
-                    return Some(None);
-                }
-                if cursor == bytes.len() && !finish {
-                    return None;
-                }
-                if bytes.get(cursor) != Some(&b'>') {
-                    return Some(None);
-                }
-                cursor += 1;
-                if bytes.get(cursor) == Some(&b' ') {
-                    cursor += 1;
-                }
-            }
-            Container::List(width) => {
-                let mut columns = 0;
-                while columns < *width {
-                    match bytes.get(cursor) {
-                        Some(b' ') => columns += 1,
-                        Some(b'\t') => columns += 4 - columns % 4,
-                        None if !finish => return None,
-                        _ => return Some(None),
-                    }
-                    cursor += 1;
-                }
-            }
-        }
-    }
-    let indent = indentation(bytes, &mut cursor);
-    if cursor == bytes.len() && !finish {
-        return None;
-    }
-    Some(Some(Prefix {
-        end: cursor,
-        indented: indent >= 4,
-        containers: containers.to_vec(),
-    }))
 }
 
 impl Lexer {
@@ -259,24 +61,30 @@ impl Lexer {
         let mut fragments = Vec::new();
         while !self.remaining().is_empty() {
             if !self.line_prefix_done {
-                if self.open.is_empty() {
+                if self.open.is_empty() && !matches!(self.literal, Some((_, _, false))) {
                     let prefix = if matches!(self.literal, Some((_, _, true))) {
-                        let Some(prefix) =
-                            fence_prefix(self.remaining(), finish, &self.fence_containers)
-                        else {
+                        let Some(prefix) = self.prefix_cursor.fence(
+                            &self.pending[self.cursor..],
+                            finish,
+                            &self.fence_containers,
+                        ) else {
                             break;
                         };
                         if prefix.is_none() {
                             self.literal = None;
+                            self.prefix_cursor = markdown::Cursor::default();
                         }
                         prefix
                     } else {
                         None
                     };
-                    let Some(prefix) = prefix.or_else(|| markdown_prefix(self.remaining(), finish))
-                    else {
+                    let Some(prefix) = prefix.or_else(|| {
+                        self.prefix_cursor
+                            .normal(&self.pending[self.cursor..], finish)
+                    }) else {
                         break;
                     };
+                    self.prefix_cursor = markdown::Cursor::default();
                     self.indented = prefix.indented;
                     self.line_containers = prefix.containers;
                     let end = prefix.end;
@@ -296,19 +104,44 @@ impl Lexer {
             if self.remaining().is_empty() {
                 break;
             }
+            // The closing fence line is literal until its remainder is known.
+            // Publish whitespace incrementally instead of rescanning a growing
+            // tail while waiting to decide whether the fence really closes.
+            if self.fence_close_candidate {
+                if first == '\n' {
+                    self.literal = None;
+                } else if matches!(first, ' ' | '\t' | '\r') {
+                    let end = self
+                        .remaining()
+                        .bytes()
+                        .take_while(|ch| matches!(ch, b' ' | b'\t' | b'\r'))
+                        .count();
+                    let text = self.remaining()[..end].to_owned();
+                    self.consume(end);
+                    fragments.push(Fragment::Text {
+                        text,
+                        visible: true,
+                    });
+                    continue;
+                }
+                self.fence_close_candidate = false;
+            }
             if self.literal.is_none() && !self.indented && first == '<' {
-                if let Some(captures) = tag_regex().captures(self.remaining()) {
-                    let end = captures.get(0).unwrap().end();
-                    let closing = &captures[1] == "/";
-                    let kind = match captures[2].to_ascii_lowercase().as_str() {
-                        "invoke" => Kind::Invoke,
-                        "parameter" => Kind::Parameter,
-                        _ => Kind::Calls,
-                    };
-                    // Tags inside a parameter value belong to the argument,
-                    // never to another independently executable invocation.
-                    if self.open.last() != Some(&Kind::Parameter)
-                        || (closing && kind == Kind::Parameter)
+                let mut scanner = self.tag_scanner.take().unwrap_or_default();
+                match scanner.scan(self.remaining(), finish) {
+                    tag::Scan::Pending => {
+                        self.tag_scanner = Some(scanner);
+                        break;
+                    }
+                    tag::Scan::Incomplete => {
+                        let len = self.remaining().len();
+                        self.consume(len);
+                        fragments.push(Fragment::Incomplete);
+                        continue;
+                    }
+                    tag::Scan::Tag { end, kind, closing }
+                        if self.open.last() != Some(&Kind::Parameter)
+                            || (closing && kind == Kind::Parameter) =>
                     {
                         let raw = self.remaining()[..end].to_owned();
                         let span = self.offset..self.offset + end;
@@ -328,21 +161,7 @@ impl Lexer {
                         }));
                         continue;
                     }
-                } else if tag_prefix(self.remaining()) && !self.remaining().contains('>') {
-                    if !finish {
-                        break;
-                    }
-                    let tail = self
-                        .remaining()
-                        .trim_start_matches('<')
-                        .trim_start_matches('/')
-                        .trim_start();
-                    if tail.starts_with(['｜', '|']) {
-                        let len = self.remaining().len();
-                        self.consume(len);
-                        fragments.push(Fragment::Incomplete);
-                        continue;
-                    }
+                    tag::Scan::Ordinary | tag::Scan::Tag { .. } => {}
                 }
             }
             if self.open.is_empty()
@@ -350,34 +169,27 @@ impl Lexer {
                 && matches!(first, '`' | '~')
                 && (!self.escaped || self.literal.is_some())
             {
-                let count = self
-                    .remaining()
-                    .chars()
-                    .take_while(|ch| *ch == first)
-                    .count();
+                let count = self.delimiter_run
+                    + self.remaining()[self.delimiter_run..]
+                        .bytes()
+                        .take_while(|ch| *ch == first as u8)
+                        .count();
                 if count == self.remaining().len() && !finish {
+                    self.delimiter_run = count;
                     break;
                 }
-                let fence_end = if let Some((delimiter, length, true)) = self.literal {
-                    if first == delimiter && !self.line_has_text && count >= length {
-                        let tail = &self.remaining()[count..];
-                        let line = tail.split('\n').next().unwrap_or(tail);
-                        if line.trim().is_empty() && !tail.contains('\n') && !finish {
-                            break;
-                        }
-                        line.trim().is_empty()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+                self.delimiter_run = 0;
+                let fence_end = matches!(self.literal,Some((delimiter,length,true)) if first == delimiter && !self.line_has_text && count >= length);
                 match self.literal {
                     Some((delimiter, length, fence))
                         if first == delimiter
                             && ((!fence && count == length) || (fence && fence_end)) =>
                     {
-                        self.literal = None
+                        if fence_end {
+                            self.fence_close_candidate = true;
+                        } else {
+                            self.literal = None;
+                        }
                     }
                     None if first == '`' || (count >= 3 && !self.line_has_text) => {
                         let fence = count >= 3 && !self.line_has_text;
@@ -427,6 +239,7 @@ impl Lexer {
                 self.line_has_text = false;
                 self.line_prefix_done = false;
                 self.indented = false;
+                self.prefix_cursor = markdown::Cursor::default();
             } else if !ch.is_whitespace() {
                 self.line_has_text = true;
             }

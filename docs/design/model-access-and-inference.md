@@ -982,14 +982,21 @@ and streaming/final visible-text projection share one DSML lexer. It recognizes
 `tool_calls`, `function_calls`, and V4.1 `calls` wrappers with the published
 single-delimiter format and the observed doubled-delimiter spelling. Markdown
 code spans, quote/list-contained fences, and indented code remain literal data.
-Container prefixes and partial delimiters are buffered until their meaning is
-known; a fence consumes only its opening containers. Indented text is treated
-conservatively as data even where paragraph continuation could render it as prose.
+Container prefixes and reserved tags use resumable cursors, with completed
+prefix bytes checkpointed across chunks. One exact incremental grammar owns
+both complete and partial DSML tag recognition; suffixed names such as
+`invoke-example` are ordinary text. A fence consumes only its opening containers;
+blank lines may omit list indentation without ending that fence. Tabs retain
+physical columns and virtual padding; active inline spans ignore block indentation.
+Indented text is treated conservatively as data even where paragraph continuation
+could render it as prose.
 Parameter bodies are not independent tool-call sources. Every invocation owns
 its full subtree before name/argument validation, including malformed unnamed
 openers and nested wrappers; nested content cannot escape as another call.
-Complete-input scans use a cursor and compact once per batch. DSML projection
-precedes legacy bare-XML cleanup so argument markup cannot consume answer text.
+Complete-input scans use a cursor and compact once per batch; long indentation,
+delimiter runs, closing-fence whitespace, and unfinished tags do not rescan their
+accumulated prefix on each delta. DSML projection precedes legacy bare-XML cleanup
+so argument markup cannot consume answer text.
 
 Native structured calls take precedence. Recovered calls remain subject to the
 exact request tool surface and the ordinary argument, capability, policy and
