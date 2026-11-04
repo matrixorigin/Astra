@@ -1,9 +1,5 @@
 use std::sync::Arc;
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::{future::Future, pin::Pin};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -23,36 +19,12 @@ pub trait ServerLocalToolTransport<R = astra_tools::ToolResult>: Send + Sync {
     /// Retain the same executor while a cancelled invocation finishes cleanup.
     fn owned_transport(&self) -> Option<Arc<dyn ServerLocalToolTransport<R>>>;
 
+    /// Workspace effects must be owned by the admitted workspace lease until settled.
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
     ) -> R;
-}
-
-struct PendingLocalCleanup<'a, R> {
-    execution: Pin<Box<dyn Future<Output = R> + Send + 'a>>,
-    workspace: Option<astra_tools::workspace_observation::WorkspaceAttributionState>,
-}
-
-impl<R> Future for PendingLocalCleanup<'_, R> {
-    type Output = R;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
-        let result = self.execution.as_mut().poll(cx);
-        if result.is_ready() {
-            self.workspace = None;
-        }
-        result
-    }
-}
-
-impl<R> Drop for PendingLocalCleanup<'_, R> {
-    fn drop(&mut self) {
-        if let Some(workspace) = &self.workspace {
-            workspace.mark_unsettled();
-        }
-    }
 }
 
 // A dropped caller must cancel the invocation without dropping its live owner.
@@ -61,7 +33,6 @@ impl<R> Drop for PendingLocalCleanup<'_, R> {
 struct LocalExecution<R: Send + 'static> {
     execution: Option<Pin<Box<dyn Future<Output = R> + Send>>>,
     cancel: CancellationToken,
-    workspace: Option<std::path::PathBuf>,
     retain_on_drop: bool,
 }
 
@@ -69,19 +40,9 @@ impl<R: Send + 'static> LocalExecution<R> {
     fn retain_cleanup(&mut self) -> Option<tokio::task::JoinHandle<R>> {
         let execution = self.execution.take()?;
         self.cancel.cancel();
-        let workspace = self
-            .workspace
-            .as_deref()
-            .and_then(astra_tools::workspace_observation::WorkspaceAttributionState::capture);
-        let cleanup = PendingLocalCleanup {
-            execution,
-            workspace,
-        };
-        // If the runtime has already gone away, dropping cleanup installs
-        // the workspace fence before dropping the execution owner.
         tokio::runtime::Handle::try_current()
             .ok()
-            .map(|runtime| runtime.spawn(cleanup))
+            .map(|runtime| runtime.spawn(execution))
     }
 }
 
@@ -89,7 +50,7 @@ impl<R: Send + 'static> Drop for LocalExecution<R> {
     fn drop(&mut self) {
         if self.execution.is_some() {
             self.cancel.cancel();
-            if self.retain_on_drop {
+            if self.retain_on_drop && !std::thread::panicking() {
                 drop(self.retain_cleanup());
             }
         }
@@ -159,20 +120,9 @@ where
     }
     let owner = local_transport.owned_transport();
     if owner.is_none() && cancel_token.is_none() {
-        let workspace = result_workspace
-            .cwd
-            .as_deref()
-            .filter(|_| !is_observation)
-            .and_then(|root| {
-                astra_tools::workspace_observation::WorkspaceAttributionState::capture(
-                    std::path::Path::new(root),
-                )
-            });
-        return PendingLocalCleanup {
-            execution: Box::pin(local_transport.execute_server_local_tool(request, None)),
-            workspace,
-        }
-        .await;
+        return local_transport
+            .execute_server_local_tool(request, None)
+            .await;
     }
     let Some(owner) = owner else {
         return astra_tools::ToolResult::error(
@@ -196,11 +146,6 @@ where
     let mut execution = LocalExecution {
         execution: Some(future),
         cancel: owned_token,
-        workspace: result_workspace
-            .cwd
-            .as_deref()
-            .filter(|_| !is_observation)
-            .map(Into::into),
         retain_on_drop: !is_observation,
     };
     tokio::select! {
@@ -213,6 +158,8 @@ where
                 let Some(mut cleanup) = execution.retain_cleanup() else {
                     return astra_tools::cancelled_tool_result(&request.tool_name, true).into();
                 };
+                let _abort_observation = is_observation
+                    .then(|| tokio_util::task::AbortOnDrop::new(cleanup.abort_handle()));
                 match tokio::time::timeout(LOCAL_OWNER_CLEANUP_TIMEOUT, &mut cleanup).await {
                     Ok(Ok(settled)) => settled,
                     Ok(Err(error)) => {
@@ -232,7 +179,6 @@ where
                         // behind. Its stalled future may be dropped without
                         // fencing unrelated sessions or retaining its resources.
                         if is_observation {
-                            cleanup.abort();
                             return cancelled_runtime_tool_result_for_binding(
                                 result_workspace,
                                 result_executor,
@@ -310,7 +256,7 @@ mod tests {
             _request: &ToolExecutionRequest,
             cancel_token: Option<&CancellationToken>,
         ) -> astra_tools::ToolResult {
-            let _owner = if let Some(root) = &self.workspace_root {
+            let mut owner = if let Some(root) = &self.workspace_root {
                 Some(
                     astra_tools::workspace_observation::begin_workspace_writer_with_options(
                         root,
@@ -323,6 +269,9 @@ mod tests {
             } else {
                 None
             };
+            if let Some(owner) = &mut owner {
+                owner.arm_abandonment_fence();
+            }
             let _drop_witness = DropWitness(self.future_dropped.clone());
             self.started.notify_one();
             if let Some(token) = cancel_token {
@@ -332,6 +281,9 @@ mod tests {
             }
             self.cleanup_started.notify_one();
             self.release.notified().await;
+            if let Some(owner) = &mut owner {
+                owner.disarm_abandonment_fence();
+            }
             astra_tools::cancelled_tool_result("owned-local-tool", true)
         }
     }
@@ -545,6 +497,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn caller_drop_during_read_cleanup_releases_execution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let started = Arc::new(Notify::new());
+        let cleanup_started = Arc::new(Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport = Arc::new(NonCooperativeOwnerTransport {
+            workspace_root: None,
+            started: started.clone(),
+            cleanup_started: cleanup_started.clone(),
+            release: Arc::new(Notify::new()),
+            future_dropped: dropped.clone(),
+        });
+        let request = test_request("read_file", workspace.path());
+        let binding = test_binding();
+        let cancel = CancellationToken::new();
+        let execution_cancel = cancel.clone();
+        let execution = tokio::spawn(async move {
+            execute_local_transport(
+                &request,
+                &binding,
+                (
+                    &request.workspace,
+                    &request.executor,
+                    ToolTransportKind::ServerLocal,
+                ),
+                transport.as_ref(),
+                Some(execution_cancel),
+                true,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), cleanup_started.notified())
+            .await
+            .unwrap();
+        execution.abort();
+        assert!(execution.await.unwrap_err().is_cancelled());
+        let released = tokio::time::timeout(Duration::from_millis(500), async {
+            while !dropped.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "read-only cleanup must not outlive its caller indefinitely"
+        );
+        assert_eq!(
+            astra_tools::workspace_observation::workspace_ownership_is_unsettled(workspace.path()),
+            Some(false)
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum CallerInterruption {
         WaitForDeadline,
@@ -711,32 +720,19 @@ mod tests {
     async fn abandoning_cleanup_fences_before_releasing_the_writer() {
         let workspace = tempfile::tempdir().unwrap();
         let markers =
-            astra_tools::workspace_observation::workspace_coordination_paths_for_diagnostics(
+            astra_tools::workspace_observation::workspace_unsettled_paths_for_diagnostics(
                 workspace.path(),
             )
-            .unwrap()
-            .into_iter()
-            .map(|path| path.with_extension("unsettled"))
-            .collect::<Vec<_>>();
-        let lease = astra_tools::workspace_observation::begin_workspace_writer_with_options(
+            .unwrap();
+        let mut lease = astra_tools::workspace_observation::begin_workspace_writer_with_options(
             workspace.path(),
             None,
             Duration::from_secs(1),
         )
         .await
         .unwrap();
-        let attribution = astra_tools::workspace_observation::WorkspaceAttributionState::capture(
-            workspace.path(),
-        )
-        .unwrap();
-        let execution = Box::pin(async move {
-            let _lease = lease;
-            std::future::pending::<astra_tools::ToolResult>().await
-        });
-        drop(PendingLocalCleanup {
-            execution,
-            workspace: Some(attribution),
-        });
+        lease.arm_abandonment_fence();
+        drop(lease);
         let next = astra_tools::workspace_observation::begin_workspace_writer_with_options(
             workspace.path(),
             None,
@@ -750,6 +746,72 @@ mod tests {
             next,
             Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoned_writer_fences_workspace_admitted_before_retarget() {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("original");
+        let other = parent.path().join("other");
+        let link = parent.path().join("workspace");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        let mut markers = Vec::new();
+        for root in [&original, &other, &link] {
+            markers.extend(
+                astra_tools::workspace_observation::workspace_unsettled_paths_for_diagnostics(root)
+                    .unwrap(),
+            );
+        }
+        let _other_state =
+            astra_tools::workspace_observation::WorkspaceAttributionState::capture(&other).unwrap();
+        let mut lease = astra_tools::workspace_observation::begin_workspace_writer_with_options(
+            &link,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        lease.arm_abandonment_fence();
+        let execution = Box::pin(async move {
+            let _lease = lease;
+            std::future::pending::<astra_tools::ToolResult>().await
+        });
+        let mut owner = LocalExecution {
+            execution: Some(execution),
+            cancel: CancellationToken::new(),
+            retain_on_drop: true,
+        };
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        let cleanup = owner.retain_cleanup().unwrap();
+        cleanup.abort();
+        let _ = cleanup.await;
+        let next = astra_tools::workspace_observation::begin_workspace_writer_with_options(
+            &original,
+            None,
+            Duration::from_millis(50),
+        )
+        .await;
+        let fenced = matches!(
+            next,
+            Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
+        );
+        let other_admitted =
+            astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                &other,
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_ok();
+        for marker in markers {
+            let _ = std::fs::remove_file(marker);
+        }
+        assert!(fenced, "the admitted workspace must remain fenced");
+        assert!(other_admitted, "the unrelated target must remain usable");
     }
 
     #[tokio::test]
@@ -772,13 +834,10 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let markers =
-            astra_tools::workspace_observation::workspace_coordination_paths_for_diagnostics(
+            astra_tools::workspace_observation::workspace_unsettled_paths_for_diagnostics(
                 workspace.path(),
             )
-            .unwrap()
-            .into_iter()
-            .map(|path| path.with_extension("unsettled"))
-            .collect::<Vec<_>>();
+            .unwrap();
         let started = Arc::new(Notify::new());
         let transport = Unowned(NonCooperativeOwnerTransport {
             workspace_root: Some(workspace.path().to_path_buf()),

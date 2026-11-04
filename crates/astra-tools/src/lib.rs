@@ -598,10 +598,22 @@ pub fn mcp_workspace_effect_undeclared_tool_result(name: &str) -> ToolResult {
     }
 }
 
+/// Whether execution evidence leaves workspace effects unresolved.
+pub fn workspace_effect_may_be_unsettled(fields: Option<&Map<String, Value>>) -> bool {
+    fields.is_some_and(|fields| {
+        matches!(
+            fields.get("error_kind").and_then(Value::as_str),
+            Some("tool_outcome_unknown" | "ownership_unsettled" | "workspace_effect_unsettled")
+        ) || fields
+            .get("workspace_observation_quarantined")
+            .and_then(Value::as_bool)
+            == Some(true)
+    })
+}
+
 /// A workspace-capable provider call returned without proving that its
-/// physical effects have settled.  The caller must quarantine the workspace;
-/// this result is deliberately non-retryable because replay could duplicate
-/// an effect that is still in flight.
+/// physical effects have settled. The caller must quarantine the workspace;
+/// replay could duplicate an effect that is still in flight.
 pub fn workspace_effect_unsettled_tool_result(name: &str, mut result: ToolResult) -> ToolResult {
     let message = format!(
         "Tool '{name}' returned before its workspace effects were proven settled; the workspace was quarantined and the call must not be replayed"

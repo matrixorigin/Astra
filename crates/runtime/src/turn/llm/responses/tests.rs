@@ -1321,15 +1321,35 @@ async fn responses_transport_recovery_and_credential_fencing() {
     invalid_state.skills.request_constraints.allowed_tools =
         Some(["write_file".to_owned()].into_iter().collect());
     let outcome = run_agentic_loop_with_host(&mut invalid_host, &mut invalid_state).await;
-    assert!(outcome.is_err() || invalid_state.interruption.is_some());
+    assert!(
+        outcome.is_ok(),
+        "safe recovery should accept the next valid response: {outcome:?}"
+    );
+    assert!(invalid_state.interruption.is_none());
     assert_eq!(invalid_state.total_tool_calls, 0);
     assert!(!workspace.path().join("malformed-effect.txt").exists());
-    assert_eq!(
-        provider.state.requests.lock().unwrap().len(),
-        1,
-        "outcome: {outcome:?}, interruption: {:?}",
-        invalid_state.interruption
+    assert!(invalid_state.pending_provider_continuation.is_none());
+    assert!(invalid_state.messages.iter().all(|message| {
+        message
+            .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+            .is_none()
+    }));
+    let recovery_requests = provider.state.requests.lock().unwrap().clone();
+    assert_eq!(recovery_requests.len(), 2);
+    assert!(
+        recovery_requests[1]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| {
+                !matches!(
+                    item["type"].as_str(),
+                    Some("function_call" | "function_call_output")
+                )
+            }),
+        "invalid tool output must never be replayed"
     );
+    assert_eq!(invalid_ledger.attempt_count(), 2);
     invalid_ledger.assert_quiescent();
 
     provider.state.scripted.store(false, Ordering::SeqCst);

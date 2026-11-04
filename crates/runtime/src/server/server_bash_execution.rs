@@ -133,7 +133,7 @@ pub(crate) async fn execute_server_bash(
     // must neither reacquire that exclusive generation nor mint its own
     // fingerprint receipt.
     let nested_run_script_callback = astra_tools::rpc_bridge::is_run_script_rpc_dispatch();
-    let observation_lease = if !command.trim().is_empty() && !nested_run_script_callback {
+    let mut observation_lease = if !command.trim().is_empty() && !nested_run_script_callback {
         match astra_tools::workspace_observation::acquire_workspace_observation_lease_with_options(
             workspace_root,
             cancel_token,
@@ -155,6 +155,9 @@ pub(crate) async fn execute_server_bash(
     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         return astra_tools::cancelled_tool_result("bash", false);
     }
+    let attribution = observation_lease
+        .as_ref()
+        .map(|lease| lease.attribution_state());
     // Capture only commands outside the strict cache-safe allowlist.  This is
     // an executor-owned observation, not a parser for Python/SQLite/etc.; an
     // unknown or compound command simply enters the bounded snapshot lane.
@@ -173,6 +176,11 @@ pub(crate) async fn execute_server_bash(
         return astra_tools::cancelled_tool_result("bash", false);
     }
     let wrapped_command = wrap_command_with_limits(sandbox_policy, command);
+
+    astra_tools::rpc_bridge::mark_run_script_workspace_effect_started();
+    if let Some(lease) = &mut observation_lease {
+        lease.arm_abandonment_fence();
+    }
 
     let result = match server_bash_execution_mode(sandbox_policy) {
         ServerBashExecutionMode::IsolatedProcess => {
@@ -221,6 +229,23 @@ pub(crate) async fn execute_server_bash(
             }
         }
     };
+    if let Some(lease) = &mut observation_lease {
+        let fields = result.metadata.as_ref();
+        let started = fields
+            .and_then(|m| m.get("_astra_execution_started"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let settled = fields
+            .and_then(|m| m.get("_astra_scope_settled"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if !lease.coordination_integrity_valid() {
+            lease.mark_unsettled();
+        }
+        if !started || settled {
+            lease.disarm_abandonment_fence();
+        }
+    }
     let workspace_after = if observation_lease.is_some() {
         let root = workspace_root.to_path_buf();
         tokio::task::spawn_blocking(move || {
@@ -281,7 +306,7 @@ pub(crate) async fn execute_server_bash(
         );
     let mut result = attach_workspace_observation(
         result,
-        workspace_root,
+        attribution.as_ref(),
         workspace_before,
         workspace_after,
         execution_started,
@@ -298,6 +323,14 @@ pub(crate) async fn execute_server_bash(
         &workdir,
         args,
     );
+    if nested_run_script_callback
+        && astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(scope_ownership)
+    {
+        result.metadata.get_or_insert_default().insert(
+            astra_tools::workspace_observation::WEAK_ATTRIBUTION_FIELD.into(),
+            Value::Bool(true),
+        );
+    }
     attach_source_preimage(result, source_preimages)
 }
 
@@ -342,7 +375,7 @@ impl ScopeSettledResult for astra_tools::ToolResult {
 
 fn attach_workspace_observation(
     mut result: astra_tools::ToolResult,
-    workspace_root: &std::path::Path,
+    attribution: Option<&astra_tools::workspace_observation::WorkspaceAttributionState>,
     before: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
     after: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
     execution_started: bool,
@@ -354,7 +387,9 @@ fn attach_workspace_observation(
     explicit_verification: bool,
 ) -> astra_tools::ToolResult {
     if !coordination_integrity_valid {
-        astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
+        if let Some(attribution) = attribution {
+            attribution.mark_unsettled();
+        }
         if let Some(fields) = result.metadata.as_mut() {
             fields.remove(astra_tools::workspace_observation::OBSERVED_FIELD);
             fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
@@ -367,10 +402,12 @@ fn attach_workspace_observation(
         result.output.push_str(
             "Error: workspace binding or coordination generation changed during Bash execution; the command may have changed files, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
         );
-        return result;
+        return astra_tools::workspace_effect_unsettled_tool_result("bash", result);
     }
     if execution_started && scope_ownership.is_none() {
-        astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
+        if let Some(attribution) = attribution {
+            attribution.mark_unsettled();
+        }
         if let Some(fields) = result.metadata.as_mut() {
             fields.remove(astra_tools::workspace_observation::OBSERVED_FIELD);
             fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
@@ -383,7 +420,7 @@ fn attach_workspace_observation(
         result.output.push_str(
             "Error: Bash execution started but its descendant ownership did not settle; the workspace is quarantined and no durable mutation receipt was issued.",
         );
-        return result;
+        return astra_tools::workspace_effect_unsettled_tool_result("bash", result);
     }
     let before_available = before.is_some();
     let after_available = after.is_some();
@@ -401,13 +438,18 @@ fn attach_workspace_observation(
                 ),
             );
             if !ownership.is_authoritative() {
-                astra_tools::workspace_observation::quarantine_after_weak_receipt(
-                    workspace_root,
-                    Some(ownership.as_str()),
-                );
+                if astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(Some(
+                    ownership,
+                )) {
+                    if let Some(attribution) = attribution {
+                        attribution.quarantine();
+                    }
+                }
             }
         } else {
-            astra_tools::workspace_observation::quarantine_after_weak_receipt(workspace_root, None);
+            if let Some(attribution) = attribution {
+                attribution.mark_unsettled();
+            }
         }
     }
     // Preserve the current chain's truthful post-state before making weak
@@ -415,10 +457,9 @@ fn attach_workspace_observation(
     // out a setsid/double-fork descendant that writes after this function
     // returns, even when the immediate fingerprint delta is empty.
     if quarantine_weak_after_current {
-        astra_tools::workspace_observation::quarantine_after_weak_receipt(
-            workspace_root,
-            scope_ownership.map(astra_sandbox::ScopeOwnership::as_str),
-        );
+        if let Some(attribution) = attribution {
+            attribution.quarantine();
+        }
     }
     let verify_receipt_valid = explicit_verification
         && !result.is_error
@@ -874,7 +915,12 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let result = attach_workspace_observation(
             successful_bash_result(),
-            workspace.path(),
+            Some(
+                &astra_tools::workspace_observation::WorkspaceAttributionState::capture(
+                    workspace.path(),
+                )
+                .unwrap(),
+            ),
             None,
             None,
             false,
@@ -925,7 +971,12 @@ mod tests {
                     .expect("after");
             let result = attach_workspace_observation(
                 successful_bash_result(),
-                workspace.path(),
+                Some(
+                    &astra_tools::workspace_observation::WorkspaceAttributionState::capture(
+                        workspace.path(),
+                    )
+                    .unwrap(),
+                ),
                 Some(before),
                 Some(after),
                 true,
@@ -969,7 +1020,12 @@ mod tests {
             astra_tools::ToolResult::text(
                 "foreground command returned before escaped writer".into(),
             ),
-            workspace.path(),
+            Some(
+                &astra_tools::workspace_observation::WorkspaceAttributionState::capture(
+                    workspace.path(),
+                )
+                .unwrap(),
+            ),
             Some(before),
             Some(after),
             true,
@@ -1023,7 +1079,12 @@ mod tests {
 
         let result = attach_workspace_observation(
             astra_tools::ToolResult::text("supervisor disappeared after spawn".into()),
-            workspace.path(),
+            Some(
+                &astra_tools::workspace_observation::WorkspaceAttributionState::capture(
+                    workspace.path(),
+                )
+                .unwrap(),
+            ),
             Some(before),
             Some(after),
             true,
@@ -1061,7 +1122,12 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let result = attach_workspace_observation(
             astra_tools::ToolResult::error("sandbox preflight refused execution".into()),
-            workspace.path(),
+            Some(
+                &astra_tools::workspace_observation::WorkspaceAttributionState::capture(
+                    workspace.path(),
+                )
+                .unwrap(),
+            ),
             None,
             None,
             false,
@@ -1249,7 +1315,12 @@ mod tests {
 
         let result = attach_workspace_observation(
             astra_tools::ToolResult::error("writer failed after partial output".into()),
-            workspace.path(),
+            Some(
+                &astra_tools::workspace_observation::WorkspaceAttributionState::capture(
+                    workspace.path(),
+                )
+                .unwrap(),
+            ),
             Some(before),
             Some(after),
             true,

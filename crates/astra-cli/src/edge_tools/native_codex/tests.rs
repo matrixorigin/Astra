@@ -57,6 +57,66 @@ fn fixture_execution_ceiling(
     }
 }
 
+#[tokio::test]
+async fn native_writer_rejects_grant_for_a_different_admitted_workspace() {
+    struct NoTaskGate;
+    #[async_trait::async_trait]
+    impl ProviderInteractionGate for NoTaskGate {
+        async fn request_interaction(
+            &self,
+            _: &ProviderInteractionRequest,
+        ) -> ProviderInteractionDecision {
+            panic!("mismatched workspace must be rejected before provider interaction");
+        }
+    }
+    let admitted = tempfile::tempdir().unwrap();
+    let granted = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(granted.path());
+    *astra_core::sync_poison::recover_rwlock_write(&executor.sandbox_policy) = None;
+    let mut ceiling = fixture_execution_ceiling(&executor);
+    ceiling.workspace_write_allowed = true;
+    let mut lease =
+        astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+            admitted.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let invocation = ToolInvocationMetadata {
+        run_id: Some("run"),
+        tool_call_id: Some("call"),
+        admission_source: Some(ToolInvocationAdmissionSource::Policy),
+        ..ToolInvocationMetadata::default()
+    };
+    let result = executor
+        .execute_native_codex(
+            &json!({"task":"Review", "anchor_run_id":"anchor"}),
+            invocation,
+            None,
+            granted.path(),
+            Some(&NoTaskGate),
+            Some(&ceiling),
+            false,
+            None,
+            None,
+            Some(&mut lease),
+        )
+        .await;
+    assert!(result.is_error, "{result:?}");
+    assert!(result.output.contains("grant does not match"), "{result:?}");
+    drop(lease);
+    assert!(
+        astra_tools::workspace_observation::begin_workspace_writer_with_options(
+            admitted.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_ok()
+    );
+}
+
 fn stage() -> Stage {
     Stage::parse(&json!({"task": "Review stage", "anchor_run_id": "anchor"})).unwrap()
 }

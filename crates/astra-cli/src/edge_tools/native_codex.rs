@@ -2651,6 +2651,9 @@ impl ToolExecutor {
         admitted_read_only: bool,
         runtime_approval: Option<&ApprovedNativeRuntime>,
         input_rx: Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>,
+        mut workspace_lease: Option<
+            &mut astra_tools::workspace_observation::WorkspaceObservationLease,
+        >,
     ) -> ToolResult {
         let stage = match Stage::parse(args) {
             Ok(stage) => stage,
@@ -2696,9 +2699,16 @@ impl ToolExecutor {
             || self.plan_mode_authoring_active().await;
         let network =
             ceiling.network_allowed && policy.as_ref().is_some_and(|policy| policy.network_allowed);
-        let cwd = match execution_root.canonicalize() {
-            Ok(cwd) => cwd,
-            Err(_) => return failure("native workspace is unavailable"),
+        let cwd = if let Some(lease) = workspace_lease.as_ref() {
+            if !lease.coordination_integrity_valid() {
+                return failure("native workspace binding changed before dispatch");
+            }
+            lease.admitted_workspace_root().to_path_buf()
+        } else {
+            match execution_root.canonicalize() {
+                Ok(cwd) => cwd,
+                Err(_) => return failure("native workspace is unavailable"),
+            }
         };
         // Do not canonicalize a different grant root into the selected root:
         // the admission owner freezes the canonical path before transport.
@@ -2752,8 +2762,12 @@ impl ToolExecutor {
             policy.max_output_bytes.min(OUTPUT_BYTES)
         });
         let token = cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
-        let Some(attribution) =
-            astra_tools::workspace_observation::WorkspaceAttributionState::capture(&cwd)
+        let Some(attribution) = workspace_lease
+            .as_ref()
+            .map(|lease| lease.attribution_state())
+            .or_else(|| {
+                astra_tools::workspace_observation::WorkspaceAttributionState::capture(&cwd)
+            })
         else {
             return failure("native workspace attribution is unavailable");
         };
@@ -2772,6 +2786,9 @@ impl ToolExecutor {
         // Recheck after preflight/workspace preparation: none of those waits
         // can renew the original whole-job deadline.
         if self.effective_project_root().as_path() != execution_root
+            || workspace_lease
+                .as_ref()
+                .is_some_and(|lease| !lease.coordination_integrity_valid())
             || token.is_cancelled()
             || invocation
                 .admission_deadline
@@ -2793,7 +2810,12 @@ impl ToolExecutor {
             Ok(process) => process,
             Err(_) => return failure("native structured process spawn failed"),
         };
-        let mut unsettled_on_drop = UnsettledOnDrop(Some(attribution));
+        if !read_only {
+            if let Some(lease) = &mut workspace_lease {
+                lease.arm_abandonment_fence();
+            }
+        }
+        let mut unsettled_on_drop = UnsettledOnDrop((!read_only).then_some(attribution));
         let mut evidence = Evidence::default();
         let driven = tokio::select! {
             biased;
@@ -2851,6 +2873,9 @@ impl ToolExecutor {
             .is_some_and(|settlement| settlement.ownership.is_authoritative());
         if settled {
             unsettled_on_drop.0.take();
+            if let Some(lease) = &mut workspace_lease {
+                lease.disarm_abandonment_fence();
+            }
         }
         let transport_ok = outcome.as_ref().is_ok_and(|outcome| {
             (matches!(outcome.end, FramedProcessEnd::Exited)

@@ -631,6 +631,42 @@ enum ServerWorkspaceAuthority {
 }
 
 impl ServerWorkspaceAuthority {
+    fn arm_abandonment_fence(&mut self) {
+        match self {
+            Self::None => {}
+            Self::BoundWorkspace(lease) => lease.arm_abandonment_fence(),
+            Self::OpaqueWriter(guard) => guard.arm_abandonment_fence(),
+        }
+    }
+
+    fn disarm_abandonment_fence(&mut self) {
+        match self {
+            Self::None => {}
+            Self::BoundWorkspace(lease) => lease.disarm_abandonment_fence(),
+            Self::OpaqueWriter(guard) => guard.disarm_abandonment_fence(),
+        }
+    }
+
+    fn mark_unsettled(&self) {
+        match self {
+            Self::None => {}
+            Self::BoundWorkspace(lease) => {
+                lease.mark_unsettled();
+            }
+            Self::OpaqueWriter(guard) => {
+                guard.mark_unsettled();
+            }
+        }
+    }
+
+    fn quarantine_attribution(&self) {
+        match self {
+            Self::None => {}
+            Self::BoundWorkspace(lease) => lease.quarantine_attribution(),
+            Self::OpaqueWriter(guard) => guard.quarantine_attribution(),
+        }
+    }
+
     fn coordination_integrity_valid(&self) -> bool {
         match self {
             Self::None => true,
@@ -1878,6 +1914,7 @@ impl RuntimeToolExecutor {
         request: &ToolExecutionRequest,
         prepared: Option<&astra_mcp::PreparedMcpToolCall>,
         cancel_token: Option<&CancellationToken>,
+        workspace_authority: &mut ServerWorkspaceAuthority,
     ) -> astra_tools::ToolResult {
         let name = request.tool_name.as_str();
         let args = &request.args;
@@ -1935,7 +1972,7 @@ impl RuntimeToolExecutor {
                     .as_ref()
                     .filter(|source| source.owns_selection_shape(name))
                 {
-                    match source.invoke(request, interaction_response.as_ref(), cancel_token).await {
+                    match source.invoke(request, interaction_response.as_ref(), cancel_token, || workspace_authority.arm_abandonment_fence()).await {
                         Ok(result) => Ok(result),
                         Err(super::capability_source::SourceInvocationError::Rpc(error)) => Err(error),
                         Err(super::capability_source::SourceInvocationError::AdmissionDeadlineExpired) => {
@@ -1950,6 +1987,7 @@ impl RuntimeToolExecutor {
                         }
                     }
                 } else {
+                    workspace_authority.arm_abandonment_fence();
                     agent_binding_mcp
                         .call_tool_by_mcp_name(
                             name,
@@ -1966,6 +2004,24 @@ impl RuntimeToolExecutor {
                     .is_err_and(|error| error.is_cancelled_before_dispatch())
                 {
                     return mcp_cancelled_tool_result(name, prior_dispatch);
+                }
+                if let Err(error) = &result
+                    && error.is_rejected_before_dispatch()
+                {
+                    let mut result = mcp_call_error_result(
+                        super::runtime_mcp::redact_mcp_error_text(&format!(
+                            "Agent Binding MCP tool '{name}' failed before dispatch: {error}"
+                        )),
+                        false,
+                        false,
+                    );
+                    if prior_dispatch {
+                        return mark_mcp_call_dispatched(result);
+                    }
+                    astra_tools::execution_outcome::insert_not_executed_fact(
+                        result.metadata.get_or_insert_default(),
+                    );
+                    return result;
                 }
                 result.map_err(|error| {
                     mcp_call_error_result(
@@ -1985,6 +2041,7 @@ impl RuntimeToolExecutor {
                             .expect("provider interaction response must serialize"),
                     )])
                 });
+                workspace_authority.arm_abandonment_fence();
                 let result = prepared
                     .as_ref()
                     .expect("non-Agent-Binding MCP call was prepared before admission")
@@ -2018,9 +2075,15 @@ impl RuntimeToolExecutor {
                 Ok(result) => result,
                 Err(result) => return mark_mcp_call_dispatched(result),
             };
+            if astra_mcp::workspace_effect_is_settled(result.protocol_metadata.as_ref()) {
+                workspace_authority.disarm_abandonment_fence();
+            }
             if let Some(source) = &self.capability_source {
                 if let Err(error) = source.register_result(request, &mut result).await {
-                    return capability_source_error_result(error);
+                    return capability_source_error_after_dispatch(
+                        error,
+                        result.protocol_metadata.as_ref(),
+                    );
                 }
             }
             match result.into_provider_outcome() {
@@ -5144,7 +5207,7 @@ impl RuntimeToolExecutor {
         // and projected the durable receipt. Authenticated run_script RPC
         // callbacks are re-entrant beneath their still-live parent guard;
         // no other caller can skip admission.
-        let workspace_authority = match acquire_server_workspace_authority(
+        let mut workspace_authority = match acquire_server_workspace_authority(
             &self.workspace_root,
             name,
             args,
@@ -5218,6 +5281,12 @@ impl RuntimeToolExecutor {
 
         // The agent handler carries private execution facts through the same
         // local policy, cancellation and workspace authority boundary.
+        if name == "run_script" || astra_tools::executor::is_workspace_mutation_tool(name, args) {
+            if name != "run_script" {
+                astra_tools::rpc_bridge::mark_run_script_workspace_effect_started();
+            }
+            workspace_authority.arm_abandonment_fence();
+        }
         let mut accepted_send = None;
         let mut result = match name {
             "agent" => {
@@ -5291,9 +5360,7 @@ impl RuntimeToolExecutor {
             fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
         }
         if !coordination_integrity_valid {
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                &self.workspace_root,
-            );
+            workspace_authority.mark_unsettled();
             if let Some(fields) = result.metadata.as_mut() {
                 fields.remove("workspace_mutation_applied");
                 astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(fields);
@@ -5402,6 +5469,17 @@ impl RuntimeToolExecutor {
         // Receipt projection is the final operation authorized by these
         // guards. Release before asynchronous lifecycle persistence so an
         // unrelated caller is not held behind database or UI latency.
+        if result.metadata.as_ref().is_some_and(|fields| {
+            fields
+                .get(astra_tools::workspace_observation::WEAK_ATTRIBUTION_FIELD)
+                .and_then(Value::as_bool)
+                == Some(true)
+        }) {
+            workspace_authority.quarantine_attribution();
+        }
+        if !astra_tools::workspace_effect_may_be_unsettled(result.metadata.as_ref()) {
+            workspace_authority.disarm_abandonment_fence();
+        }
         drop(workspace_authority);
         crate::server::tool_local_transport::RuntimeToolExecutionResult {
             result: lifecycle.finish(name, &call_id, result).await,
@@ -5853,7 +5931,7 @@ impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolEx
                 )
                 .into();
             }
-            let workspace_authority = match acquire_server_workspace_authority(
+            let mut workspace_authority = match acquire_server_workspace_authority(
                 &self.workspace_root,
                 &request.tool_name,
                 &request.args,
@@ -5880,16 +5958,21 @@ impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolEx
                 Err(ServerWorkspaceAuthorityError::RecursiveRunScript) => unreachable!(),
             };
             let result = self
-                .execute_mcp_tool(request, prepared.as_ref(), cancel_token)
+                .execute_mcp_tool(
+                    request,
+                    prepared.as_ref(),
+                    cancel_token,
+                    &mut workspace_authority,
+                )
                 .await;
             let result = finalize_mcp_workspace_effect(
-                &self.workspace_root,
                 &request.tool_name,
                 mcp_effect,
                 workspace_bound,
                 &workspace_authority,
                 result,
             );
+            workspace_authority.disarm_abandonment_fence();
             drop(workspace_authority);
             return result.into();
         }
@@ -5968,6 +6051,20 @@ fn capability_source_error_result(
     result
 }
 
+fn capability_source_error_after_dispatch(
+    error: super::capability_source::SourceError,
+    protocol_metadata: Option<&Value>,
+) -> astra_tools::ToolResult {
+    let mut failure = capability_source_error_result(error);
+    if astra_mcp::workspace_effect_is_settled(protocol_metadata) {
+        failure
+            .metadata
+            .get_or_insert_default()
+            .insert("workspace_effect_settled".into(), Value::Bool(true));
+    }
+    mark_mcp_call_dispatched(failure)
+}
+
 fn capability_source_tool_search_error_result(
     error: super::capability_source::SourceError,
 ) -> astra_tools::ToolResult {
@@ -5994,7 +6091,6 @@ fn mcp_cancelled_tool_result(name: &str, prior_dispatch: bool) -> astra_tools::T
 }
 
 fn finalize_mcp_workspace_effect(
-    workspace_root: &Path,
     name: &str,
     effect: ResolvedToolEffect,
     workspace_bound: bool,
@@ -6014,13 +6110,13 @@ fn finalize_mcp_workspace_effect(
         .and_then(|fields| fields.get("mcp_call_dispatched"))
         .and_then(Value::as_bool)
         == Some(true);
-    if !dispatched {
+    if !dispatched && !astra_tools::workspace_effect_may_be_unsettled(result.metadata.as_ref()) {
         return result;
     }
     if !workspace_authority.coordination_integrity_valid()
         || !workspace_authority.receipt_authority_valid()
     {
-        astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
+        workspace_authority.mark_unsettled();
         return astra_tools::workspace_effect_unsettled_tool_result(name, result);
     }
     let settled = result
@@ -6032,7 +6128,7 @@ fn finalize_mcp_workspace_effect(
     if settled {
         return result;
     }
-    astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
+    workspace_authority.mark_unsettled();
     astra_tools::workspace_effect_unsettled_tool_result(name, result)
 }
 
@@ -10548,13 +10644,14 @@ pub(crate) mod tests {
         let task_cancel = cancel.clone();
         let task_executor = executor.clone();
         let waiting = tokio::spawn(async move {
-            ToolExecutor::execute_with_cancel(
-                task_executor.as_ref(),
+            let request = task_executor.tool_execution_request(
                 "run_script",
                 &json!({"script": "print('must not start')"}),
-                Some(&task_cancel),
-            )
-            .await
+            );
+            task_executor
+                .execute_local_with_metadata(&request, Some(&task_cancel))
+                .await
+                .result
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(
@@ -10575,6 +10672,52 @@ pub(crate) mod tests {
         );
         assert!(cancelled_at.elapsed() < Duration::from_millis(500));
         assert!(!workspace.path().join("must-not-start").exists());
+        drop(blocker);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_run_script_invocation_cancels_while_waiting_for_owner() {
+        if !astra_sandbox::process_scope_available() {
+            return;
+        }
+        let (executor, workspace) = test_executor();
+        let cancel = CancellationToken::new();
+        let executor = Arc::new(executor.with_cancel_token(Some(Arc::new(cancel.clone()))));
+        let blocker =
+            astra_tools::workspace_observation::acquire_workspace_observation_lease_with_options(
+                workspace.path(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let worker = executor.clone();
+        let mut waiting = tokio::spawn(async move {
+            worker
+                .execute_invocation_with_metadata(
+                    "run",
+                    "turn",
+                    "call",
+                    "run_script",
+                    &json!({"script":"print('must not start')"}),
+                    None,
+                    None,
+                )
+                .await
+        });
+        tokio::select! {
+            result = &mut waiting => panic!("public invocation did not reach owner wait: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_error && result.output.to_ascii_lowercase().contains("cancel"),
+            "{result:?}"
+        );
         drop(blocker);
     }
 
@@ -10702,7 +10845,6 @@ pub(crate) mod tests {
             ("workspace_effect_settled".to_string(), Value::Bool(true)),
         ]));
         let result = finalize_mcp_workspace_effect(
-            workspace.path(),
             "mcp__demo__mutate",
             ResolvedToolEffect::Mutating,
             true,
@@ -10719,6 +10861,56 @@ pub(crate) mod tests {
             result.metadata.as_ref().unwrap()["workspace_effect_settled"],
             false
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_projection_failure_preserves_provider_settlement() {
+        for settled in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let markers =
+                astra_tools::workspace_observation::workspace_unsettled_paths_for_diagnostics(
+                    workspace.path(),
+                )
+                .unwrap();
+            let mut authority = acquire_server_workspace_authority(
+                workspace.path(),
+                "mcp__demo__discover",
+                &json!({}),
+                true,
+                true,
+                false,
+                false,
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("workspace admission"));
+            authority.arm_abandonment_fence();
+            let metadata = json!({"astra.workspace_effect":{"settled":settled}});
+            let failure = capability_source_error_after_dispatch(
+                crate::server::capability_source::SourceError::InvalidContract,
+                Some(&metadata),
+            );
+            let result = finalize_mcp_workspace_effect(
+                "mcp__demo__discover",
+                ResolvedToolEffect::Mutating,
+                true,
+                &authority,
+                failure,
+            );
+            authority.disarm_abandonment_fence();
+            drop(authority);
+            let next = astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                workspace.path(),
+                None,
+                Duration::from_millis(100),
+            )
+            .await;
+            for marker in markers {
+                let _ = std::fs::remove_file(marker);
+            }
+            assert_eq!(next.is_ok(), settled, "{result:?}");
+        }
     }
 
     fn test_executor_with_agent_context() -> (RuntimeToolExecutor, TempDir) {
@@ -14578,6 +14770,73 @@ pub(crate) mod tests {
             assert_agent_binding_mcp_cancellation_settlement(notification_status, true).await;
             assert_agent_binding_mcp_cancellation_settlement(notification_status, false).await;
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_endpoint_capacity_rejection_does_not_fence_workspace() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut permits = Vec::new();
+        while let Ok(permit) =
+            crate::capability_endpoint_pool::try_acquire_endpoint_permit(&endpoint)
+        {
+            permits.push(permit);
+            assert!(
+                permits.len() <= 4096,
+                "unexpected endpoint test configuration"
+            );
+        }
+        let (mut exec, workspace) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({"type":"function", "function":{"name":"mcp__controlled__write", "parameters":{"type":"object"}}})]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests_at_endpoint(
+                "controlled",
+                &["mcp__controlled__write"],
+                &endpoint,
+            )
+            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::Mutating),
+        ));
+        let mut request = exec.tool_execution_request("mcp__controlled__write", &json!({}));
+        request.tool_call_id = "capacity-test".into();
+        let result = <RuntimeToolExecutor as ServerLocalToolTransport<
+            crate::server::tool_local_transport::RuntimeToolExecutionResult,
+        >>::execute_server_local_tool(&exec, &request, None)
+        .await
+        .result;
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("execution_started"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(
+            astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                workspace.path(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_ok()
+        );
+        drop(permits);
+        server.abort();
     }
 
     async fn assert_agent_binding_mcp_cancellation_settlement(

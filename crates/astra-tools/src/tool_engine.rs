@@ -26,7 +26,14 @@ where
         .await
         .unwrap_or_else(|_| {
             tracing::error!(tool_name = %name, "tool handler panicked; returning error to caller");
-            ToolResult::error(format!("Internal error: tool '{name}' panicked")).into()
+            let mut result = ToolResult::error(format!("Internal error: tool '{name}' panicked"))
+                .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolOutcomeUnknown,
+                ));
+            crate::execution_outcome::insert_started_execution_fact(
+                result.metadata.get_or_insert_default(),
+            );
+            result.into()
         })
 }
 

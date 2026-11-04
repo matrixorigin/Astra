@@ -850,6 +850,7 @@ async fn run_script(
     config: &RunScriptConfig,
     tool_executor: &dyn ToolExecutor,
     cancel_token: Option<&CancellationToken>,
+    weak_attribution: &mut bool,
 ) -> Result<String, RunScriptError> {
     let workspace_root = tool_executor.workspace_root().to_path_buf();
     let tmp_dir = tempfile::tempdir().map_err(|e| io_context("run_script tmpdir", e))?;
@@ -945,14 +946,18 @@ async fn run_script(
     {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+        if !settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root) {
+            return Err(RunScriptError::OwnershipUnsettled);
+        }
         return Err(io_context("cgroup join_child", e).into());
     }
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         kill_process_group(&child);
         let _ = child.kill().await;
         let _ = child.wait().await;
-        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+        if !settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root) {
+            return Err(RunScriptError::OwnershipUnsettled);
+        }
         return Err(RunScriptError::Cancelled);
     }
 
@@ -965,9 +970,12 @@ async fn run_script(
     let mut stderr_handle = tokio::spawn(async move { collect_stderr_with_notice(stderr).await });
 
     let policy = config.rpc_policy();
+    let mut nested_ownership_unsettled = false;
+    let mut rpc_state = crate::rpc_bridge::RpcExecutionState::default();
     let timeout_result = tokio::time::timeout(config.timeout, async {
         loop {
             tokio::select! {
+                biased;
                 _ = async {
                     if let Some(token) = cancel_token {
                         token.cancelled().await;
@@ -990,6 +998,7 @@ async fn run_script(
                                 &policy,
                                 &auth_token,
                                 cancel_token,
+                                &mut rpc_state,
                             )
                             .await;
                             if matches!(outcome, RpcOutcome::ExceededCallLimit) {
@@ -1004,10 +1013,15 @@ async fn run_script(
                                 return if scope_settled {
                                     result
                                 } else {
+                                    nested_ownership_unsettled = true;
                                     Err(std::io::Error::other(
                                         "run_script process ownership did not settle",
                                     ))
                                 };
+                            }
+                            if matches!(outcome, RpcOutcome::OwnershipUnsettled) {
+                                nested_ownership_unsettled = true;
+                                return Err(std::io::Error::other("nested tool ownership did not settle"));
                             }
                             if matches!(outcome, RpcOutcome::Cancelled) {
                                 return Err(std::io::Error::new(
@@ -1028,17 +1042,32 @@ async fn run_script(
     })
     .await;
 
+    *weak_attribution |= rpc_state.weak_attribution;
+    if nested_ownership_unsettled
+        || rpc_state
+            .nested_writer
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        kill_process_group(&child);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+        stdout_handle.abort();
+        stderr_handle.abort();
+        return Err(RunScriptError::OwnershipUnsettled);
+    }
+
     match timeout_result {
         Ok(Ok(status)) => {
             let scope_settled = settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
             // Await both IO tasks concurrently, but never let an inherited
             // pipe from an escaped descendant hold the writer epoch forever.
-            let (stdout_content, stderr_content) =
-                collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await?;
+            let streams = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
 
             if !scope_settled {
                 return Err(RunScriptError::OwnershipUnsettled);
             }
+            let (stdout_content, stderr_content) = streams?;
 
             if !status.success() {
                 let code = status.code().unwrap_or(-1);
@@ -1058,24 +1087,36 @@ async fn run_script(
             if e.kind() == std::io::ErrorKind::Interrupted {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+                let settled = settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
                 let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
-                return Err(RunScriptError::Cancelled);
+                return Err(if settled {
+                    RunScriptError::Cancelled
+                } else {
+                    RunScriptError::OwnershipUnsettled
+                });
             }
             kill_process_group(&child);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            let settled = settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
             let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
-            Err(RunScriptError::Io(e))
+            Err(if settled {
+                RunScriptError::Io(e)
+            } else {
+                RunScriptError::OwnershipUnsettled
+            })
         }
         Err(_) => {
             kill_process_group(&child);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            let settled = settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
             let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
-            Err(RunScriptError::Timeout(config.timeout))
+            Err(if settled {
+                RunScriptError::Timeout(config.timeout)
+            } else {
+                RunScriptError::OwnershipUnsettled
+            })
         }
     }
 }
@@ -1091,10 +1132,9 @@ fn settle_run_script_scope(
 ) -> bool {
     let settled = cgroup_guard.terminate_all_for(leader_pid);
     if !settled {
-        let _ = crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
         tracing::warn!(
             workspace = %workspace_root.display(),
-            "run_script process ownership was not provably settled; workspace observation quarantined"
+            "run_script process ownership was not provably settled"
         );
     }
     settled
@@ -1455,7 +1495,16 @@ pub async fn handle_run_script(
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         return crate::cancelled_tool_result("run_script", false);
     }
-    match run_script(script, &config, tool_executor, cancel_token).await {
+    let mut weak_attribution = false;
+    let mut result = match run_script(
+        script,
+        &config,
+        tool_executor,
+        cancel_token,
+        &mut weak_attribution,
+    )
+    .await
+    {
         Ok(output) => {
             if output.is_empty() {
                 crate::ToolResult::text("(script completed with no output)".into())
@@ -1493,7 +1542,14 @@ pub async fn handle_run_script(
             result
         }
         Err(e) => crate::ToolResult::error(format!("Error: {e}")),
+    };
+    if weak_attribution {
+        result.metadata.get_or_insert_default().insert(
+            crate::workspace_observation::WEAK_ATTRIBUTION_FIELD.into(),
+            Value::Bool(true),
+        );
     }
+    result
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -2721,7 +2777,9 @@ r1 = astra_tools.read_file("a.txt")
 r2 = astra_tools.grep("pattern")
 print(f"{r1}|{r2}")
 "#;
-        let result = run_script(script, &config, &exec, None).await.unwrap();
+        let result = run_script(script, &config, &exec, None, &mut false)
+            .await
+            .unwrap();
         assert!(result.contains("content of a.txt"));
         assert!(result.contains("match: pattern"));
         assert_eq!(exec.call_count(), 2);
@@ -2763,7 +2821,9 @@ print("done")
             mode: ExecutionMode::Strict,
             ..Default::default()
         };
-        let output = run_script(&script, &config, &exec, None).await.unwrap();
+        let output = run_script(&script, &config, &exec, None, &mut false)
+            .await
+            .unwrap();
         assert!(output.contains("done"), "script did not finish: {output}");
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert!(
@@ -2790,7 +2850,9 @@ print("done")
 print("partial_before_raise")
 raise ValueError("boom")
 "#;
-        let err = run_script(script, &config, &exec, None).await.unwrap_err();
+        let err = run_script(script, &config, &exec, None, &mut false)
+            .await
+            .unwrap_err();
         match err {
             RunScriptError::ScriptFailed {
                 code,
@@ -2832,7 +2894,9 @@ raise ValueError("boom")
                 ..Default::default()
             };
             let script = format!("print({label:?})");
-            run_script(&script, &config, &exec, None).await.unwrap()
+            run_script(&script, &config, &exec, None, &mut false)
+                .await
+                .unwrap()
         }
 
         let (a, b) = tokio::join!(run_one("alpha-marker"), run_one("bravo-marker"));
@@ -2862,7 +2926,9 @@ raise ValueError("boom")
             mode: ExecutionMode::Strict,
             ..Default::default()
         };
-        let out = run_script("", &config, &exec, None).await.unwrap();
+        let out = run_script("", &config, &exec, None, &mut false)
+            .await
+            .unwrap();
         assert_eq!(out, "", "run_script should return empty stdout verbatim");
     }
 
@@ -2914,7 +2980,9 @@ from astra_tools import bash
 result = bash("echo ok")
 print(result, end="")
 "#;
-        let result = run_script(script, &config, &exec, None).await.unwrap();
+        let result = run_script(script, &config, &exec, None, &mut false)
+            .await
+            .unwrap();
         assert_eq!(result, "ran: echo ok");
     }
 
@@ -2937,7 +3005,7 @@ import sys
 sys.stderr.write("only-on-stderr\n")
 sys.exit(7)
 "#;
-        match run_script(script, &config, &exec, None).await {
+        match run_script(script, &config, &exec, None, &mut false).await {
             Err(RunScriptError::ScriptFailed {
                 code,
                 stdout,
@@ -2974,7 +3042,7 @@ for i in range(100):
     print(f"line_{i:03d}_" + "x" * 20)
 raise RuntimeError("after noise")
 "#;
-        match run_script(script, &config, &exec, None).await {
+        match run_script(script, &config, &exec, None, &mut false).await {
             Err(RunScriptError::ScriptFailed { stdout, stderr, .. }) => {
                 // stdout got truncated — notice present + first line retained.
                 assert!(
@@ -3008,7 +3076,9 @@ sys.stderr.write("x" * 50000)
 sys.stderr.flush()
 sys.exit(2)
 "#;
-        let err = run_script(script, &config, &exec, None).await.unwrap_err();
+        let err = run_script(script, &config, &exec, None, &mut false)
+            .await
+            .unwrap_err();
         match err {
             RunScriptError::ScriptFailed { stderr, .. } => {
                 // stderr notice carries the [stderr] tag to distinguish
@@ -3061,7 +3131,7 @@ for i in range(20):
 print("LEAK: should not have reached here")
 "#;
         let start = std::time::Instant::now();
-        let _ = run_script(script, &config, &exec, None).await;
+        let _ = run_script(script, &config, &exec, None, &mut false).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -3095,7 +3165,9 @@ print("LEAK: should not have reached here")
 import os
 print(os.environ.get("MY_SUPER_SECRET", "UNSET"))
 "#;
-        let result = run_script(script, &config, &exec, None).await.unwrap();
+        let result = run_script(script, &config, &exec, None, &mut false)
+            .await
+            .unwrap();
         assert!(
             result.contains("UNSET"),
             "secret env var leaked to child: {result}"
@@ -3124,7 +3196,9 @@ print(os.environ.get("MY_SUPER_SECRET", "UNSET"))
 import os
 print(os.environ["HOME"])
 "#;
-        let result = run_script(script, &config, &exec, None).await.unwrap();
+        let result = run_script(script, &config, &exec, None, &mut false)
+            .await
+            .unwrap();
         // Must NOT be the parent sentinel — isolation puts HOME in the
         // per-run tmpdir created by tempfile, whose path starts with /tmp/.
         assert!(
@@ -3164,7 +3238,7 @@ print(os.environ["HOME"])
 data = bytearray(200 * 1024 * 1024)
 print(f"allocated {len(data)} bytes — cgroup did not enforce limit")
 "#;
-        let result = run_script(script, &config, &exec, None).await;
+        let result = run_script(script, &config, &exec, None, &mut false).await;
         match result {
             Ok(out) => {
                 panic!("script completed despite memory cap; cgroup not enforced: {out}");

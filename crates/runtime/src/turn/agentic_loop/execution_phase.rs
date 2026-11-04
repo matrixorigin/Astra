@@ -9555,13 +9555,10 @@ mod tests {
     async fn unsettled_workspace_allows_reads_but_not_rejected_write_completion() {
         let workspace = tempfile::tempdir().unwrap();
         let markers =
-            astra_tools::workspace_observation::workspace_coordination_paths_for_diagnostics(
+            astra_tools::workspace_observation::workspace_unsettled_paths_for_diagnostics(
                 workspace.path(),
             )
-            .unwrap()
-            .into_iter()
-            .map(|path| path.with_extension("unsettled"))
-            .collect::<Vec<_>>();
+            .unwrap();
         assert!(
             astra_tools::workspace_observation::mark_workspace_observation_unsettled(
                 workspace.path()
@@ -9640,6 +9637,49 @@ mod tests {
         assert_eq!(write_host.turn_count(), 1);
         assert_eq!(
             write_state.interruption.as_ref().map(|record| record.kind),
+            Some(InterruptionKind::ExecutionIncomplete)
+        );
+    }
+
+    #[tokio::test]
+    async fn unsettled_workspace_rejected_script_cannot_complete_successfully() {
+        let workspace = tempfile::tempdir().unwrap();
+        let markers =
+            astra_tools::workspace_observation::workspace_unsettled_paths_for_diagnostics(
+                workspace.path(),
+            )
+            .unwrap();
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                workspace.path()
+            )
+        );
+        let mut rejected = make_edge_tool("run_script", "The script was not executed.");
+        rejected.args = serde_json::json!({"script": "print('hello')"});
+        rejected.status = "failed".into();
+        let mut fields = edge_runtime_environment_fields();
+        fields.insert("disposition".into(), serde_json::json!("rejected"));
+        fields.insert("execution_started".into(), serde_json::json!(false));
+        fields.insert(
+            "error_kind".into(),
+            serde_json::json!(astra_tools::TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED),
+        );
+        rejected.tool_result_fields = Some(fields);
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![rejected], 1, 1, None),
+            text_result("The script succeeded.", 1, 1, None),
+        ])
+        .with_valid_tools(&["run_script"]);
+        let mut state = make_state();
+        state.hooks.workspace_root_hint = Some(workspace.path().to_string_lossy().into_owned());
+        let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        for marker in markers {
+            let _ = std::fs::remove_file(marker);
+        }
+        assert!(matches!(result, Ok(AgenticLoopOutcome::Completed)));
+        assert_eq!(host.turn_count(), 1);
+        assert_eq!(
+            state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
     }

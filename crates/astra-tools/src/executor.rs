@@ -250,7 +250,7 @@ impl DefaultToolExecutor {
             args,
             &self.ctx.workspace_root,
         );
-        let _workspace_mutation_lease = if name != "bash"
+        let mut _workspace_mutation_lease = if name != "bash"
             && name != "run_script"
             && (is_workspace_mutation_tool(name, args) || targeted_observer)
             && !nested_run_script_callback
@@ -295,7 +295,7 @@ impl DefaultToolExecutor {
                 .clear_authority(&self.convergence_authority);
             return crate::cancelled_tool_result(name, false);
         }
-        let _recursive_writer_epoch = if name == "run_script" {
+        let mut _recursive_writer_epoch = if name == "run_script" {
             match crate::workspace_observation::begin_workspace_writer_with_options(
                 &self.ctx.workspace_root,
                 self.ctx.cancel_token.as_deref(),
@@ -317,34 +317,51 @@ impl DefaultToolExecutor {
             }
             return result;
         }
+        if is_workspace_mutation_tool(name, args) {
+            crate::rpc_bridge::mark_run_script_workspace_effect_started();
+            if let Some(lease) = &mut _workspace_mutation_lease {
+                lease.arm_abandonment_fence();
+            }
+        }
+        if let Some(guard) = &mut _recursive_writer_epoch {
+            guard.arm_abandonment_fence();
+        }
         let dispatch = self.dispatch(name, args, bash_workdir.as_ref());
         // Bash and run_script own their child timeout/cancellation paths. Do
         // not wrap either in the generic 60s future timeout: dropping one can
         // abandon the post-execution workspace receipt after a partial write.
+        let mut dispatch_settled = true;
         let mut result = if name == "bash" || name == "run_script" {
             dispatch.await
         } else if let Some(token) = self.ctx.cancel_token.as_ref() {
             tokio::select! {
                 _ = token.cancelled() => {
+                    dispatch_settled = false;
                     crate::cancelled_tool_result(name, true)
                 }
                 result = tokio::time::timeout(TOOL_TIMEOUT, dispatch) => match result {
                     Ok(r) => r,
-                    Err(_) => ToolResult::error(format!(
-                        "Tool '{name}' timed out after {}s",
-                        TOOL_TIMEOUT.as_secs()
-                    )),
+                    Err(_) => {
+                        dispatch_settled = false;
+                        ToolResult::error(format!("Tool '{name}' timed out after {}s", TOOL_TIMEOUT.as_secs()))
+                    },
                 },
             }
         } else {
             match tokio::time::timeout(TOOL_TIMEOUT, dispatch).await {
                 Ok(r) => r,
-                Err(_) => ToolResult::error(format!(
-                    "Tool '{name}' timed out after {}s",
-                    TOOL_TIMEOUT.as_secs()
-                )),
+                Err(_) => {
+                    dispatch_settled = false;
+                    ToolResult::error(format!(
+                        "Tool '{name}' timed out after {}s",
+                        TOOL_TIMEOUT.as_secs()
+                    ))
+                }
             }
         };
+        if !dispatch_settled && _workspace_mutation_lease.is_some() {
+            result = crate::workspace_effect_unsettled_tool_result(name, result);
+        }
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
             crate::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
         ) && _recursive_writer_epoch.as_ref().is_none_or(
@@ -370,9 +387,12 @@ impl DefaultToolExecutor {
             fields.remove(crate::workspace_observation::RECEIPT_FIELD);
         }
         if !coordination_integrity_valid {
-            crate::workspace_observation::mark_workspace_observation_unsettled(
-                &self.ctx.workspace_root,
-            );
+            if let Some(lease) = &_workspace_mutation_lease {
+                lease.mark_unsettled();
+            }
+            if let Some(guard) = &_recursive_writer_epoch {
+                guard.mark_unsettled();
+            }
             if let Some(fields) = result.metadata.as_mut() {
                 fields.remove("workspace_mutation_applied");
                 crate::workspace_observation::discard_workspace_desired_state_convergence_marker(
@@ -478,6 +498,27 @@ impl DefaultToolExecutor {
             }
         }
 
+        if result.metadata.as_ref().is_some_and(|fields| {
+            fields
+                .get(crate::workspace_observation::WEAK_ATTRIBUTION_FIELD)
+                .and_then(Value::as_bool)
+                == Some(true)
+        }) {
+            if let Some(lease) = &_workspace_mutation_lease {
+                lease.quarantine_attribution();
+            }
+            if let Some(guard) = &_recursive_writer_epoch {
+                guard.quarantine_attribution();
+            }
+        }
+        if dispatch_settled && !crate::workspace_effect_may_be_unsettled(result.metadata.as_ref()) {
+            if let Some(lease) = &mut _workspace_mutation_lease {
+                lease.disarm_abandonment_fence();
+            }
+            if let Some(guard) = &mut _recursive_writer_epoch {
+                guard.disarm_abandonment_fence();
+            }
+        }
         // This generic dispatch boundary does not establish ownership of a
         // source file. Preserve an existing source-owned marker, but use a
         // display-only redaction for raw output so web/env/error/tool results

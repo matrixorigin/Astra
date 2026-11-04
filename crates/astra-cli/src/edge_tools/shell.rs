@@ -3252,26 +3252,23 @@ struct ShellRunError {
 
 fn finalize_shell_scope_before_lease_transfer(
     result: &Result<ScopedShellOutput, ShellRunError>,
-    command: &str,
-    workspace_root: &std::path::Path,
+    attribution: Option<&astra_tools::workspace_observation::WorkspaceAttributionState>,
 ) {
     let ownership = match result {
         Ok(output) => {
-            if output.scope_ownership.is_none()
-                && !astra_tools::workspace_observation::bash_command_is_detachable_safe(command)
-            {
-                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                    workspace_root,
-                );
+            if output.scope_ownership.is_none() {
+                if let Some(attribution) = attribution {
+                    attribution.mark_unsettled();
+                }
                 return;
             }
             output.scope_ownership
         }
         Err(error) if error.execution_started => {
             if error.ownership_unsettled {
-                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                    workspace_root,
-                );
+                if let Some(attribution) = attribution {
+                    attribution.mark_unsettled();
+                }
                 return;
             }
             error.scope_ownership
@@ -3279,10 +3276,9 @@ fn finalize_shell_scope_before_lease_transfer(
         Err(_) => return,
     };
     if astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(ownership) {
-        astra_tools::workspace_observation::quarantine_after_weak_receipt(
-            workspace_root,
-            ownership.map(|value| value.as_str()),
-        );
+        if let Some(attribution) = attribution {
+            attribution.quarantine();
+        }
     }
 }
 
@@ -4564,18 +4560,23 @@ impl ToolExecutor {
     fn quarantine_after_weak_bash_scope(
         &self,
         scope_ownership: Option<astra_sandbox::ScopeOwnership>,
+        observation_lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
     ) {
         if astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(scope_ownership) {
-            astra_tools::workspace_observation::quarantine_after_weak_receipt(
-                &self.effective_project_root(),
-                scope_ownership.map(|ownership| ownership.as_str()),
-            );
+            if let Some(lease) = observation_lease {
+                lease.quarantine_attribution();
+            } else if !astra_tools::rpc_bridge::is_run_script_rpc_dispatch() {
+                astra_tools::workspace_observation::quarantine_after_weak_receipt(
+                    &self.effective_project_root(),
+                    scope_ownership.map(|ownership| ownership.as_str()),
+                );
+            }
         }
     }
 
     async fn attach_bash_workspace_observation_async(
         &self,
-        outcome: super::ToolExecutionOutcome,
+        mut outcome: super::ToolExecutionOutcome,
         before: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
         ownership_unsettled: bool,
         scope_ownership: Option<astra_sandbox::ScopeOwnership>,
@@ -4584,14 +4585,26 @@ impl ToolExecutor {
     ) -> super::ToolExecutionOutcome {
         let root = self.effective_project_root();
         let quarantine_root = root.clone();
+        if astra_tools::rpc_bridge::is_run_script_rpc_dispatch()
+            && astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(scope_ownership)
+        {
+            outcome.tool_result_fields.get_or_insert_default().insert(
+                astra_tools::workspace_observation::WEAK_ATTRIBUTION_FIELD.into(),
+                Value::Bool(true),
+            );
+        }
         if ownership_unsettled
             || observation_lease.is_some_and(|lease| {
                 !astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid(lease)
             })
         {
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                &quarantine_root,
-            );
+            if let Some(lease) = observation_lease {
+                lease.mark_unsettled();
+            } else if !astra_tools::rpc_bridge::is_run_script_rpc_dispatch() {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(&quarantine_root);
+            }
+            outcome.is_error = true;
+            outcome.tool_result_fields.get_or_insert_default().insert("error_kind".into(), Value::String(astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED.into()));
             return require_explicit_workspace_verification_receipt(
                 outcome,
                 explicit_verification,
@@ -4702,13 +4715,21 @@ impl ToolExecutor {
                         ),
                     );
                 if !ownership.is_authoritative() {
-                    astra_tools::workspace_observation::quarantine_after_weak_receipt(
-                        &root,
-                        Some(ownership.as_str()),
-                    );
+                    if let Some(lease) = observation_lease {
+                        lease.quarantine_attribution();
+                    } else if !astra_tools::rpc_bridge::is_run_script_rpc_dispatch() {
+                        astra_tools::workspace_observation::quarantine_after_weak_receipt(
+                            root,
+                            Some(ownership.as_str()),
+                        );
+                    }
                 }
             } else {
-                astra_tools::workspace_observation::mark_workspace_observation_unsettled(&root);
+                if let Some(lease) = observation_lease {
+                    lease.mark_unsettled();
+                } else if !astra_tools::rpc_bridge::is_run_script_rpc_dispatch() {
+                    astra_tools::workspace_observation::mark_workspace_observation_unsettled(root);
+                }
             }
         }
         outcome
@@ -5032,7 +5053,7 @@ impl ToolExecutor {
         // Bash reuses that authority and must not promote a pre/post delta to
         // durable authority before the parent settles.
         let nested_in_run_script = astra_tools::rpc_bridge::is_run_script_rpc_dispatch();
-        let _observation_lease = if !command.trim().is_empty() && !nested_in_run_script {
+        let mut _observation_lease = if !command.trim().is_empty() && !nested_in_run_script {
             let lease =
                 astra_tools::workspace_observation::acquire_workspace_observation_lease_with_options(
                     &self.effective_project_root(),
@@ -5089,19 +5110,32 @@ impl ToolExecutor {
             Err(message) => return bash_preparation_rejection(message),
         };
         config.output_capture = Some((stdout, stderr));
-        let quarantine_root = self.effective_project_root();
-        let command_for_settlement = command.clone();
+        astra_tools::rpc_bridge::mark_run_script_workspace_effect_started();
+        if let Some(lease) = &mut _observation_lease {
+            lease.arm_abandonment_fence();
+        }
+        let attribution = _observation_lease
+            .as_ref()
+            .map(|lease| lease.attribution_state());
         // The worker owns observation leases until its process group settles,
         // including when the caller is cancelled while awaiting the join.
         let shell_result = tokio::task::spawn_blocking(move || {
             let result = run_shell_output_with_config(config);
+            if let Some(lease) = &mut _observation_lease {
+                let settled = match &result {
+                    Ok(output) => output.scope_ownership.is_some(),
+                    Err(error) => !error.execution_started || !error.ownership_unsettled,
+                };
+                if !lease.coordination_integrity_valid() {
+                    lease.mark_unsettled();
+                }
+                if settled {
+                    lease.disarm_abandonment_fence();
+                }
+            }
             // The worker owns process settlement and the leases. Fence weak or
             // failed scope here, before any async receipt await can be dropped.
-            finalize_shell_scope_before_lease_transfer(
-                &result,
-                &command_for_settlement,
-                &quarantine_root,
-            );
+            finalize_shell_scope_before_lease_transfer(&result, attribution.as_ref());
             (result, _observation_lease)
         })
         .await;
@@ -5116,11 +5150,7 @@ impl ToolExecutor {
         let outcome = match shell_result {
             Ok(Ok(output)) => {
                 let scope_ownership = output.scope_ownership;
-                let ownership_unsettled = coordination_unsettled
-                    || (scope_ownership.is_none()
-                        && !astra_tools::workspace_observation::bash_command_is_detachable_safe(
-                            &command,
-                        ));
+                let ownership_unsettled = coordination_unsettled || scope_ownership.is_none();
                 let outcome = self
                     .attach_bash_workspace_observation_async(
                         self.render_bash_outcome(
@@ -5136,7 +5166,7 @@ impl ToolExecutor {
                         _observation_lease.as_ref(),
                     )
                     .await;
-                self.quarantine_after_weak_bash_scope(scope_ownership);
+                self.quarantine_after_weak_bash_scope(scope_ownership, _observation_lease.as_ref());
                 outcome
             }
             Ok(Err(error)) => {
@@ -5171,7 +5201,10 @@ impl ToolExecutor {
                         _observation_lease.as_ref(),
                     )
                     .await;
-                self.quarantine_after_weak_bash_scope(error.scope_ownership);
+                self.quarantine_after_weak_bash_scope(
+                    error.scope_ownership,
+                    _observation_lease.as_ref(),
+                );
                 outcome
             }
             Err(error) => {
@@ -5196,10 +5229,7 @@ impl ToolExecutor {
                 self.attach_bash_workspace_observation_async(
                     outcome,
                     workspace_before,
-                    coordination_unsettled
-                        || !astra_tools::workspace_observation::bash_command_is_detachable_safe(
-                            &command,
-                        ),
+                    true,
                     None,
                     explicit_verification,
                     _observation_lease.as_ref(),
@@ -5656,7 +5686,13 @@ mod tests {
             astra_core::ErrorKind::ToolOutcomeUnknown,
             None,
         ));
-        super::finalize_shell_scope_before_lease_transfer(&result, "touch marker", dir.path());
+        super::finalize_shell_scope_before_lease_transfer(
+            &result,
+            Some(
+                &astra_tools::workspace_observation::WorkspaceAttributionState::capture(dir.path())
+                    .unwrap(),
+            ),
+        );
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
             Some(true)
@@ -5671,7 +5707,13 @@ mod tests {
             scope_ownership: None,
             descendants_terminated: true,
         });
-        super::finalize_shell_scope_before_lease_transfer(&result, "touch marker", dir.path());
+        super::finalize_shell_scope_before_lease_transfer(
+            &result,
+            Some(
+                &astra_tools::workspace_observation::WorkspaceAttributionState::capture(dir.path())
+                    .unwrap(),
+            ),
+        );
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
             Some(true)
@@ -6654,9 +6696,10 @@ mod tests {
     fn scope_authority_controls_late_attribution() {
         let safe_dir = tempfile::tempdir().unwrap();
         let safe_executor = test_executor_in(safe_dir.path());
-        safe_executor.quarantine_after_weak_bash_scope(Some(
-            astra_sandbox::ScopeOwnership::InvocationCgroup,
-        ));
+        safe_executor.quarantine_after_weak_bash_scope(
+            Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
+            None,
+        );
         assert_eq!(
             astra_tools::workspace_observation::workspace_observation_is_quarantined(
                 safe_dir.path()
@@ -6670,9 +6713,10 @@ mod tests {
         let _before =
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(risky_dir.path())
                 .expect("clean pre-state");
-        risky_executor.quarantine_after_weak_bash_scope(Some(
-            astra_sandbox::ScopeOwnership::ForegroundProcessGroup,
-        ));
+        risky_executor.quarantine_after_weak_bash_scope(
+            Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
+            None,
+        );
         assert_eq!(
             astra_tools::workspace_observation::workspace_observation_is_quarantined(
                 risky_dir.path()

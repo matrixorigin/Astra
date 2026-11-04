@@ -4612,7 +4612,7 @@ impl ToolExecutor {
                 astra_tools::mcp_workspace_effect_undeclared_tool_result(name),
             );
         }
-        let _workspace_mutation_lease = if name != "bash"
+        let mut _workspace_mutation_lease = if name != "bash"
             && name != "run_script"
             // MCP effects are resolved once from the discovered provider
             // declaration; typed tools use the shared built-in predicate.
@@ -4681,7 +4681,7 @@ impl ToolExecutor {
             }
             return cancelled_edge_tool_run(name, false);
         }
-        let _recursive_writer_epoch = if name == "run_script" {
+        let mut _recursive_writer_epoch = if name == "run_script" {
             match astra_tools::workspace_observation::begin_workspace_writer_with_options(
                 &self.project_root,
                 cancel_token,
@@ -4699,7 +4699,31 @@ impl ToolExecutor {
         } else {
             None
         };
+        if native_protocol.is_none()
+            && is_plan_mode_blocked_tool(name, args)
+            && self.plan_mode_authoring_active().await
+        {
+            return EdgeToolRun::error(format!(
+                "Error: Tool '{name}' is blocked while plan mode is active. Use read-only tools to finish the plan, then call `exit_plan_mode(plan='...')` to submit it through the trusted plan-review overlay before write tools can run."
+            ));
+        }
+        if mcp_workspace_effect == Some(astra_turn_types::ResolvedToolEffect::Mutating)
+            || astra_tools::executor::is_workspace_mutation_tool(name, args)
+        {
+            astra_tools::rpc_bridge::mark_run_script_workspace_effect_started();
+            if let Some(lease) = &mut _workspace_mutation_lease {
+                lease.arm_abandonment_fence();
+            }
+        }
+        if let Some(guard) = &mut _recursive_writer_epoch {
+            guard.arm_abandonment_fence();
+        }
         let mut facts = ToolExecutionFacts::default();
+        let native_lease = if native_protocol.is_some() {
+            _workspace_mutation_lease.as_mut()
+        } else {
+            None
+        };
         let mut output = self
             .execute_raw(
                 name,
@@ -4715,6 +4739,7 @@ impl ToolExecutor {
                 native_read_only,
                 runtime_approval,
                 input_rx,
+                native_lease,
             )
             .await;
         let ToolExecutionFacts {
@@ -4748,9 +4773,9 @@ impl ToolExecutor {
                 .and_then(Value::as_bool)
                 == Some(true);
             let result = if dispatched && !settled {
-                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                    &execution_root,
-                );
+                if let Some(lease) = &_workspace_mutation_lease {
+                    lease.mark_unsettled();
+                }
                 astra_tools::workspace_effect_unsettled_tool_result(name, result)
             } else {
                 result
@@ -4781,9 +4806,12 @@ impl ToolExecutor {
             fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
         }
         if !coordination_integrity_valid {
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                &self.project_root,
-            );
+            if let Some(lease) = &_workspace_mutation_lease {
+                lease.mark_unsettled();
+            }
+            if let Some(guard) = &_recursive_writer_epoch {
+                guard.mark_unsettled();
+            }
             if let Some(fields) = tool_result_fields.as_mut() {
                 fields.remove("workspace_mutation_applied");
                 astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(fields);
@@ -4931,6 +4959,27 @@ impl ToolExecutor {
                 ));
             }
         }
+        if tool_result_fields.as_ref().is_some_and(|fields| {
+            fields
+                .get(astra_tools::workspace_observation::WEAK_ATTRIBUTION_FIELD)
+                .and_then(Value::as_bool)
+                == Some(true)
+        }) {
+            if let Some(lease) = &_workspace_mutation_lease {
+                lease.quarantine_attribution();
+            }
+            if let Some(guard) = &_recursive_writer_epoch {
+                guard.quarantine_attribution();
+            }
+        }
+        if !astra_tools::workspace_effect_may_be_unsettled(tool_result_fields.as_ref()) {
+            if let Some(lease) = &mut _workspace_mutation_lease {
+                lease.disarm_abandonment_fence();
+            }
+            if let Some(guard) = &mut _recursive_writer_epoch {
+                guard.disarm_abandonment_fence();
+            }
+        }
         if is_error {
             EdgeToolRun::error(output)
         } else {
@@ -4959,6 +5008,7 @@ impl ToolExecutor {
         native_read_only: bool,
         runtime_approval: Option<&ApprovedNativeRuntime>,
         input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
+        native_lease: Option<&mut astra_tools::workspace_observation::WorkspaceObservationLease>,
     ) -> String {
         let ToolExecutionFacts {
             fields: tool_result_fields,
@@ -4977,6 +5027,7 @@ impl ToolExecutor {
                         native_read_only,
                         runtime_approval,
                         input_rx,
+                        native_lease,
                     )
                     .await
                 }
@@ -4984,13 +5035,6 @@ impl ToolExecutor {
             *source_is_error = Some(result.is_error);
             *tool_result_fields = result.metadata;
             result.output
-        } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
-            format!(
-                "Error: Tool '{name}' is blocked while plan mode is active. \
-                 Use read-only tools to finish the plan, then call \
-                 `exit_plan_mode(plan='...')` to submit it through the trusted \
-                 plan-review overlay before write tools can run."
-            )
         } else {
             match name {
                 "bash" => {
@@ -5189,6 +5233,7 @@ impl ToolExecutor {
                         )
                         .await;
                         *source_is_error = Some(result.is_error);
+                        *tool_result_fields = result.metadata;
                         result.output
                     }
                     #[cfg(not(unix))]
@@ -6231,6 +6276,78 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 #[cfg(test)]
 pub(crate) mod tests {
     use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn dropping_writer_during_plan_check_does_not_fence_workspace() {
+        let (directory, executor) = temp_executor();
+        let executor = std::sync::Arc::new(executor.with_active_session_id("plan-wait-test"));
+        executor.set_current_visible_tool_schemas(&all_tool_schemas());
+        let plan_lock = executor.plan_mode_authoring_cache.write().await;
+        let worker = executor.clone();
+        let waiting = tokio::spawn(async move {
+            worker
+                .execute_with_metadata("write_file", &json!({"path":"never.txt", "content":"x"}))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        assert!(
+            astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                directory.path(),
+                None,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .is_err(),
+            "the invocation must have acquired its lease before blocking on plan state"
+        );
+        waiting.abort();
+        let _ = waiting.await;
+        drop(plan_lock);
+        assert!(
+            astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                directory.path(),
+                None,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(!directory.path().join("never.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_script_dispatch_preserves_process_ownership_failure() {
+        if !astra_tools::run_script::python3_available() || astra_sandbox::process_scope_available()
+        {
+            return;
+        }
+        let (directory, executor) = temp_executor();
+        let mut facts = super::ToolExecutionFacts::default();
+        executor
+            .execute_raw(
+                "run_script",
+                &json!({"script": "print('must not execute')"}),
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                None,
+                &mut facts,
+                None,
+                directory.path(),
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(facts.is_error, Some(true));
+        let fields = facts.fields.unwrap();
+        assert_eq!(fields["error_kind"], "ownership_unavailable");
+        assert_eq!(fields["execution_started"], false);
+    }
     #[tokio::test]
     async fn sandbox_path_refusals_preserve_non_execution_through_dispatch() {
         let (directory, executor) = temp_executor();

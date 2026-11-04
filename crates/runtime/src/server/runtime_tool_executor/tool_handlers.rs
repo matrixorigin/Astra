@@ -1522,7 +1522,14 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
         // fail-closed Agent Binding behavior instead of promoting an identity
         // carried in provider-authored arguments.
         request.tool_call_id.clear();
-        context.execute_mcp_tool(&request, None, cancel_token).await
+        context
+            .execute_mcp_tool(
+                &request,
+                None,
+                cancel_token,
+                &mut super::ServerWorkspaceAuthority::None,
+            )
+            .await
     }
 }
 

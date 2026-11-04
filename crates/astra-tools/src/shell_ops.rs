@@ -1120,7 +1120,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     // The parent script can still write concurrently, so this nested Bash is
     // deliberately ineligible for a fingerprint-derived durable receipt.
     let nested_in_run_script = crate::rpc_bridge::is_run_script_rpc_dispatch();
-    let _observation_lease = if needs_observation && !nested_in_run_script {
+    let mut _observation_lease = if needs_observation && !nested_in_run_script {
         let wait = args
             .get("command")
             .and_then(Value::as_str)
@@ -1148,6 +1148,9 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     } else {
         None
     };
+    let attribution = _observation_lease
+        .as_ref()
+        .map(|lease| lease.attribution_state());
     // A cancellation can race the lease CAS.  Re-check after ownership is
     // acquired so a waiter that was cancelled at the boundary never starts a
     // shell or captures an unowned observation window.
@@ -1179,6 +1182,10 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         return crate::cancelled_tool_result("bash", false);
     }
 
+    crate::rpc_bridge::mark_run_script_workspace_effect_started();
+    if let Some(lease) = &mut _observation_lease {
+        lease.arm_abandonment_fence();
+    }
     let mut result = execute_bash_inner(ctx, args, environment, workdir).await;
     attach_bash_workdir_evidence(&mut result, &ctx.workspace_root, workdir, args);
     let scope_settled = result
@@ -1205,6 +1212,14 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         .and_then(|fields| fields.get(INTERNAL_EXECUTION_STARTED_FIELD))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if let Some(lease) = &mut _observation_lease {
+        if !lease.coordination_integrity_valid() {
+            lease.mark_unsettled();
+        }
+        if !execution_started || scope_settled {
+            lease.disarm_abandonment_fence();
+        }
+    }
     if let Some(fields) = result.metadata.as_mut() {
         fields.remove(INTERNAL_SCOPE_SETTLED_FIELD);
         fields.remove(INTERNAL_SCOPE_OWNERSHIP_FIELD);
@@ -1220,8 +1235,8 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     let coordination_unsettled = _observation_lease
         .as_ref()
         .is_some_and(|lease| !lease.coordination_integrity_valid());
-    if coordination_unsettled {
-        crate::workspace_observation::mark_workspace_observation_unsettled(&ctx.workspace_root);
+    if coordination_unsettled && let Some(attribution) = &attribution {
+        attribution.mark_unsettled();
     }
     if let Some(before) = before.filter(|_| !detached) {
         let root = ctx.workspace_root.clone();
@@ -1344,53 +1359,52 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         }
     }
     finalize_bash_scope_quarantine(
-        &ctx.workspace_root,
+        attribution.as_ref(),
         execution_started,
         scope_quarantined,
         scope_ownership,
-        args.get("command")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
     );
+    if coordination_unsettled || (execution_started && scope_ownership.is_none()) {
+        result = crate::workspace_effect_unsettled_tool_result("bash", result);
+    }
+    if nested_in_run_script && bash_scope_requires_attribution_quarantine(scope_ownership) {
+        result.metadata.get_or_insert_default().insert(
+            crate::workspace_observation::WEAK_ATTRIBUTION_FIELD.into(),
+            Value::Bool(true),
+        );
+    }
     result
 }
 
 fn finalize_bash_scope_quarantine(
-    workspace_root: &Path,
+    attribution: Option<&crate::workspace_observation::WorkspaceAttributionState>,
     execution_started: bool,
     scope_quarantined: bool,
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
-    command: &str,
 ) {
-    if execution_started
-        && scope_ownership.is_none()
-        && !crate::workspace_observation::bash_command_is_detachable_safe(command)
-    {
-        crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
+    if execution_started && scope_ownership.is_none() {
+        if let Some(attribution) = attribution {
+            attribution.mark_unsettled();
+        }
         return;
     }
     // Preserve current-chain evidence before making the weak-ownership
     // quarantine sticky. Quarantining first would make the post fingerprint
     // disappear and erase the only truthful evidence this call can provide.
-    if scope_quarantined {
-        if scope_ownership.is_some() {
-            crate::workspace_observation::quarantine_after_weak_receipt(
-                workspace_root,
-                scope_ownership.as_ref().map(|ownership| ownership.as_str()),
-            );
-        } else {
-            crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-        }
+    if scope_quarantined
+        && scope_ownership.is_none()
+        && let Some(attribution) = attribution
+    {
+        attribution.mark_unsettled();
     }
     // A foreground process group is useful current-call evidence, but it
     // cannot rule out a descendant that escaped with `setsid` and writes
     // later. Quarantine future fingerprint attribution even when the
     // immediate pre/post state is clean.
-    if bash_scope_requires_attribution_quarantine(scope_ownership) {
-        crate::workspace_observation::quarantine_after_weak_receipt(
-            workspace_root,
-            scope_ownership.as_ref().map(|ownership| ownership.as_str()),
-        );
+    if bash_scope_requires_attribution_quarantine(scope_ownership)
+        && let Some(attribution) = attribution
+    {
+        attribution.quarantine();
     }
 }
 
@@ -7547,11 +7561,13 @@ printf 'probe.txt:1:needle\n'
         });
 
         finalize_bash_scope_quarantine(
-            workspace.path(),
+            Some(
+                &crate::workspace_observation::WorkspaceAttributionState::capture(workspace.path())
+                    .unwrap(),
+            ),
             true,
             false,
             None,
-            "setsid sh -c 'write later'",
         );
 
         assert_eq!(

@@ -2443,13 +2443,10 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("progress.txt"), "saved progress").unwrap();
         let markers =
-            astra_tools::workspace_observation::workspace_coordination_paths_for_diagnostics(
+            astra_tools::workspace_observation::workspace_unsettled_paths_for_diagnostics(
                 workspace.path(),
             )
-            .unwrap()
-            .into_iter()
-            .map(|path| path.with_extension("unsettled"))
-            .collect::<Vec<_>>();
+            .unwrap();
         assert!(
             astra_tools::workspace_observation::mark_workspace_observation_unsettled(
                 workspace.path()

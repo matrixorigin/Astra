@@ -86,6 +86,7 @@ static DESIRED_STATE_MARKER_REGISTRY: OnceLock<
 const MAX_LIVE_DESIRED_STATE_MARKERS: usize = 4096;
 pub const OBSERVATION_RECEIPT_FIELD: &str = "workspace_observation_receipt";
 pub const OBSERVATION_SCOPE_FIELD: &str = "workspace_observation_scope";
+pub const WEAK_ATTRIBUTION_FIELD: &str = "_workspace_weak_attribution";
 /// Minimal path for the only external helper allowed in a detached command
 /// (`sleep`). Builtins do not consult PATH, and clearing the inherited
 /// environment removes BASH_ENV, exported functions, LD_PRELOAD, and user
@@ -196,6 +197,24 @@ pub struct WorkspaceWriterGuard {
 }
 
 impl WorkspaceWriterGuard {
+    /// Arm the admitted lease immediately before dispatching the writer.
+    pub fn arm_abandonment_fence(&mut self) {
+        self.lease.arm_abandonment_fence();
+    }
+
+    /// Disarm after the writer has settled or was never dispatched.
+    pub fn disarm_abandonment_fence(&mut self) {
+        self.lease.disarm_abandonment_fence();
+    }
+
+    pub fn mark_unsettled(&self) -> bool {
+        self.lease.mark_unsettled()
+    }
+
+    pub fn quarantine_attribution(&self) {
+        self.lease.quarantine_attribution();
+    }
+
     /// A top-level opaque writer may only publish owner facts while the
     /// stable namespace and the bound workspace still name the generation
     /// admitted before execution.
@@ -221,6 +240,7 @@ impl WorkspaceWriterGuard {
 
 impl Drop for WorkspaceWriterGuard {
     fn drop(&mut self) {
+        self.lease.fence_if_abandoned();
         self.state
             .active
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -233,65 +253,76 @@ impl Drop for WorkspaceWriterGuard {
 fn writer_epoch_state(workspace_root: &Path) -> Option<Arc<WriterEpochState>> {
     let canonical_key = workspace_root.canonicalize().ok();
     let lexical_key = workspace_lexical_key(workspace_root)?;
+    Some(writer_epoch_state_for_keys(
+        canonical_key.as_deref(),
+        &lexical_key,
+    ))
+}
+
+fn writer_epoch_state_for_keys(
+    canonical_key: Option<&Path>,
+    lexical_key: &Path,
+) -> Arc<WriterEpochState> {
     let mut lookup_keys = Vec::with_capacity(2);
-    if let Some(key) = canonical_key.clone() {
-        lookup_keys.push(key);
+    if let Some(key) = canonical_key {
+        lookup_keys.push(key.to_path_buf());
     }
-    if !lookup_keys.iter().any(|key| key == &lexical_key) {
-        lookup_keys.push(lexical_key.clone());
+    if !lookup_keys.iter().any(|key| key == lexical_key) {
+        lookup_keys.push(lexical_key.to_path_buf());
     }
+    let identity_key = canonical_key.unwrap_or(lexical_key);
     let quarantine_map =
         QUARANTINED_WRITER_STATES.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let map = recover_mutex(quarantine_map);
-    if let Some(state) = lookup_keys.iter().find_map(|key| map.get(key).cloned()) {
+    if let Some(state) = map.get(identity_key).cloned() {
         hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
-        return Some(state);
+        return state;
     }
     let epochs = WRITER_EPOCHS.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let mut map = recover_mutex(epochs);
     map.retain(|_, weak| weak.strong_count() > 0);
-    if let Some(state) = lookup_keys
-        .iter()
-        .find_map(|key| map.get(key).and_then(std::sync::Weak::upgrade))
-    {
+    if let Some(state) = map.get(identity_key).and_then(std::sync::Weak::upgrade) {
         hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
-        return Some(state);
+        return state;
     }
     let state = Arc::new(WriterEpochState::default());
     let weak = Arc::downgrade(&state);
-    for key in &lookup_keys {
-        map.insert(key.clone(), weak.clone());
-    }
+    map.insert(identity_key.to_path_buf(), weak);
     // A previous process may have left an unresolved descendant behind. The
     // persistent marker is the cross-process part of the same sticky fence;
     // hydrate it before any fingerprint or lease caller can observe a clean
     // in-process state.
     hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
-    Some(state)
-}
-
-fn effective_uid() -> u32 {
-    #[cfg(unix)]
-    {
-        unsafe { libc::geteuid() }
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    }
+    state
 }
 
 fn ownership_unsettled_marker_path(key: &Path) -> Option<PathBuf> {
     let root = stable_coordination_root()?;
     let digest = coordination_key_digest(key);
-    Some(root.join(format!(
-        ".astra-workspace-{digest}-observation-uid-{}.unsettled",
-        effective_uid()
-    )))
+    Some(root.join(format!(".astra-workspace-{digest}-observation.unsettled")))
 }
 
 fn ownership_unsettled_marker_exists(key: &Path) -> bool {
-    ownership_unsettled_marker_path(key).is_some_and(|path| path.is_file())
+    let Some(path) = ownership_unsettled_marker_path(key) else {
+        return true;
+    };
+    let present_or_unknown = |path: &Path| !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+    if present_or_unknown(&path) {
+        return true;
+    }
+    // A fence left by this running user's previous process is live safety
+    // state, not a cache entry that an upgrade may discard.
+    #[cfg(unix)]
+    {
+        let digest = coordination_key_digest(key);
+        let uid = unsafe { libc::geteuid() };
+        let previous = path.with_file_name(format!(
+            ".astra-workspace-{digest}-observation-uid-{uid}.unsettled"
+        ));
+        present_or_unknown(&previous)
+    }
+    #[cfg(not(unix))]
+    false
 }
 
 fn hydrate_persistent_ownership_quarantine(state: &Arc<WriterEpochState>, keys: &[PathBuf]) {
@@ -322,19 +353,47 @@ fn persist_ownership_unsettled_markers(keys: &[PathBuf]) -> bool {
         let mut options = fs::OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        match options.open(&path) {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
+        let written = match options.open(&path) {
             Ok(mut file) => {
-                if file
-                    .write_all(b"astra workspace ownership unsettled\n")
-                    .and_then(|_| file.sync_all())
-                    .is_err()
-                {
-                    all_persisted = false;
-                }
+                #[cfg(unix)]
+                let permissions = {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(fs::Permissions::from_mode(0o644))
+                };
+                #[cfg(not(unix))]
+                let permissions = Ok(());
+                permissions.and_then(|_| {
+                    file.write_all(b"astra workspace ownership unsettled\n")
+                        .and_then(|_| file.sync_all())
+                })
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => all_persisted = false,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut existing = fs::OpenOptions::new();
+                existing.read(true);
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::custom_flags(
+                    &mut existing,
+                    libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                );
+                existing.open(&path).and_then(|file| {
+                    if !file.metadata()?.is_file() {
+                        return Err(std::io::Error::other("ownership marker is not a file"));
+                    }
+                    file.sync_all()
+                })
+            }
+            Err(error) => Err(error),
+        };
+        if written
+            .and_then(|_| {
+                path.parent()
+                    .ok_or_else(|| std::io::Error::other("ownership marker has no parent"))
+            })
+            .and_then(|parent| fs::File::open(parent).and_then(|directory| directory.sync_all()))
+            .is_err()
+        {
+            all_persisted = false;
         }
     }
     all_persisted
@@ -398,36 +457,33 @@ pub struct WorkspaceAttributionState {
 }
 impl WorkspaceAttributionState {
     pub fn capture(root: &Path) -> Option<Self> {
-        let mut aliases = vec![workspace_binding_key(root)?];
-        if let Some(key) = workspace_lexical_key(root)
-            && !aliases.contains(&key)
-        {
-            aliases.push(key);
+        let key = workspace_binding_key(root)?;
+        let lexical = workspace_lexical_key(root)?;
+        let state = writer_epoch_state_for_keys(Some(&key), &lexical);
+        let mut aliases = vec![key];
+        if !aliases.contains(&lexical) {
+            aliases.push(lexical);
         }
-        Some(Self {
-            state: writer_epoch_state(root)?,
-            aliases,
-        })
+        Some(Self { state, aliases })
     }
     pub fn quarantine(&self) {
         quarantine_observation_state(&self.state, self.aliases.clone(), false);
     }
-    pub fn mark_unsettled(&self) {
-        quarantine_observation_state(&self.state, self.aliases.clone(), true);
+    pub fn mark_unsettled(&self) -> bool {
+        quarantine_observation_state(&self.state, self.aliases.clone(), true)
     }
 }
 fn mark_workspace_observation_quarantine(root: &Path, unsettled: bool) -> bool {
     let Some(handle) = WorkspaceAttributionState::capture(root) else {
         return false;
     };
-    quarantine_observation_state(&handle.state, handle.aliases, unsettled);
-    true
+    quarantine_observation_state(&handle.state, handle.aliases, unsettled)
 }
 fn quarantine_observation_state(
     state: &Arc<WriterEpochState>,
     mut aliases: Vec<PathBuf>,
     ownership_unsettled: bool,
-) {
+) -> bool {
     let was_quarantined = state
         .quarantined
         .swap(true, std::sync::atomic::Ordering::AcqRel);
@@ -475,7 +531,8 @@ fn quarantine_observation_state(
             }
         }
     }
-    if ownership_unsettled && !persist_ownership_unsettled_markers(&aliases) {
+    let persisted = !ownership_unsettled || persist_ownership_unsettled_markers(&aliases);
+    if !persisted {
         tracing::error!(
             component = "workspace_observation",
             operation = "persistent_quarantine",
@@ -488,6 +545,7 @@ fn quarantine_observation_state(
     for alias in aliases {
         quarantined.insert(alias, state.clone());
     }
+    persisted
 }
 
 /// A settled foreground process group is sufficient to close the current
@@ -606,22 +664,18 @@ pub async fn begin_workspace_writer_with_options(
     let lease =
         acquire_workspace_mutation_lease_with_options(workspace_root, cancel_token, max_wait)
             .await?;
-    begin_workspace_writer_after_lease(workspace_root, lease)
-        .ok_or(WorkspaceLeaseFailure::BindingUnavailable)
+    Ok(begin_workspace_writer_after_lease(lease))
 }
 
-fn begin_workspace_writer_after_lease(
-    workspace_root: &Path,
-    lease: WorkspaceObservationLease,
-) -> Option<WorkspaceWriterGuard> {
-    let state = writer_epoch_state(workspace_root)?;
+fn begin_workspace_writer_after_lease(lease: WorkspaceObservationLease) -> WorkspaceWriterGuard {
+    let state = lease.writer_state.clone();
     state
         .active
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     state
         .epoch
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    Some(WorkspaceWriterGuard { state, lease })
+    WorkspaceWriterGuard { state, lease }
 }
 
 pub struct WorkspaceObservationLease {
@@ -630,9 +684,72 @@ pub struct WorkspaceObservationLease {
     binding_identity: WorkspaceBindingIdentity,
     writer_state: Arc<WriterEpochState>,
     tamper_watch: GenerationTamperWatch,
+    abandonment_fence_armed: bool,
 }
 
 impl WorkspaceObservationLease {
+    /// The canonical workspace generation admitted with this lease.
+    pub fn admitted_workspace_root(&self) -> &Path {
+        &self.binding_identity.canonical
+    }
+
+    /// Arm only immediately before dispatching a workspace effect.
+    pub fn arm_abandonment_fence(&mut self) {
+        self.abandonment_fence_armed = true;
+    }
+
+    /// Disarm only after the effect owner proves settlement or non-dispatch.
+    pub fn disarm_abandonment_fence(&mut self) {
+        if !self
+            .writer_state
+            .ownership_unsettled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.abandonment_fence_armed = false;
+        }
+    }
+
+    /// Fence the identity that this lease admitted, even if its path changed.
+    pub fn mark_unsettled(&self) -> bool {
+        self.quarantine(true)
+    }
+
+    pub fn attribution_state(&self) -> WorkspaceAttributionState {
+        let mut aliases = vec![self.binding_identity.canonical.clone()];
+        if self.binding_identity.lexical != self.binding_identity.canonical {
+            aliases.push(self.binding_identity.lexical.clone());
+        }
+        WorkspaceAttributionState {
+            state: self.writer_state.clone(),
+            aliases,
+        }
+    }
+
+    /// Quarantine weak attribution for the identity admitted by this lease.
+    pub fn quarantine_attribution(&self) {
+        self.quarantine(false);
+    }
+
+    fn quarantine(&self, unsettled: bool) -> bool {
+        let attribution = self.attribution_state();
+        quarantine_observation_state(&attribution.state, attribution.aliases, unsettled)
+    }
+
+    fn fence_if_abandoned(&mut self) {
+        let must_fence = std::mem::take(&mut self.abandonment_fence_armed)
+            || self
+                .writer_state
+                .ownership_unsettled
+                .load(std::sync::atomic::Ordering::Acquire);
+        if must_fence && !self.mark_unsettled() {
+            // Without a durable fence, retain the kernel locks for the life
+            // of this process rather than admit another writer unsafely.
+            for lock in self.locks.drain(..) {
+                std::mem::forget(lock);
+            }
+        }
+    }
+
     /// Verify that the external coordination paths, kernel event history, and
     /// bound workspace components still name the generation admitted before
     /// execution. Sticky attribution quarantine is deliberately not part of
@@ -1651,21 +1768,34 @@ fn generation_watch_registry() -> std::io::Result<Arc<GenerationWatchRegistry>> 
 
 impl Drop for WorkspaceObservationLease {
     fn drop(&mut self) {
+        self.fence_if_abandoned();
         self.gate.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
-fn observation_gate(workspace_root: &Path) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-    let key = workspace_root.canonicalize().ok()?;
+fn observation_gate(key: &Path) -> Option<Arc<std::sync::atomic::AtomicBool>> {
     let gates = OBSERVATION_GATES.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let mut map = gates.lock().ok()?;
     map.retain(|_, weak| weak.strong_count() > 0);
-    if let Some(gate) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+    if let Some(gate) = map.get(key).and_then(std::sync::Weak::upgrade) {
         return Some(gate);
     }
     let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    map.insert(key, Arc::downgrade(&gate));
+    map.insert(key.to_path_buf(), Arc::downgrade(&gate));
     Some(gate)
+}
+
+// Lease admission contains awaits after claiming the in-process gate. A
+// cancelled admission must release that claim, including while a blocking
+// watcher setup is still finishing.
+struct ObservationGateReservation(Option<Arc<std::sync::atomic::AtomicBool>>);
+
+impl Drop for ObservationGateReservation {
+    fn drop(&mut self) {
+        if let Some(gate) = self.0.take() {
+            gate.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1772,6 +1902,7 @@ impl WorkspacePathIdentity {
 /// replacement races which a final `canonicalize()` check alone misses.
 #[derive(Debug)]
 struct WorkspaceBindingIdentity {
+    lexical: PathBuf,
     canonical: PathBuf,
     path_components: Vec<WorkspacePathIdentity>,
 }
@@ -1794,15 +1925,18 @@ impl WorkspaceBindingIdentity {
             }
         }
         Some(Self {
+            lexical,
             canonical,
             path_components,
         })
     }
 
     fn is_unchanged(&self) -> bool {
-        self.path_components
-            .iter()
-            .all(WorkspacePathIdentity::is_unchanged)
+        self.lexical.canonicalize().ok().as_ref() == Some(&self.canonical)
+            && self
+                .path_components
+                .iter()
+                .all(WorkspacePathIdentity::is_unchanged)
             && self
                 .path_components
                 .last()
@@ -1925,8 +2059,7 @@ fn workspace_coordination_lock_specs_for_uid(
 ) -> Option<(Vec<CoordinationLockSpec>, WorkspaceBindingIdentity)> {
     let coordination_root = stable_coordination_root()?;
     let binding_identity = WorkspaceBindingIdentity::capture(workspace_root)?;
-    let lexical = workspace_lexical_key(workspace_root)?;
-    let mut keys = vec![lexical];
+    let mut keys = vec![binding_identity.lexical.clone()];
     if !keys.iter().any(|key| key == &binding_identity.canonical) {
         keys.push(binding_identity.canonical.clone());
     }
@@ -1983,6 +2116,18 @@ fn workspace_coordination_lock_paths(
 pub fn workspace_coordination_paths_for_diagnostics(workspace_root: &Path) -> Option<Vec<PathBuf>> {
     workspace_coordination_lock_paths(workspace_root, CoordinationLockKind::Observation)
         .map(|(paths, _)| paths)
+}
+
+/// Persistent ownership fences for the currently bound workspace identities.
+pub fn workspace_unsettled_paths_for_diagnostics(workspace_root: &Path) -> Option<Vec<PathBuf>> {
+    let binding = WorkspaceBindingIdentity::capture(workspace_root)?;
+    let mut keys = vec![binding.canonical];
+    if !keys.contains(&binding.lexical) {
+        keys.push(binding.lexical);
+    }
+    keys.iter()
+        .map(|key| ownership_unsettled_marker_path(key))
+        .collect()
 }
 
 fn open_coordination_lock(path: &Path) -> Option<std::fs::File> {
@@ -2425,20 +2570,21 @@ async fn acquire_workspace_lease_attempt(
     deadline: tokio::time::Instant,
 ) -> Result<WorkspaceObservationLease, WorkspaceLeaseFailure> {
     validate_workspace_coordination_host()?;
+    let (lock_specifications, binding_identity) =
+        workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)
+            .ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     let writer_state =
-        writer_epoch_state(workspace_root).ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
+        writer_epoch_state_for_keys(Some(&binding_identity.canonical), &binding_identity.lexical);
     if writer_state
         .ownership_unsettled
         .load(std::sync::atomic::Ordering::Acquire)
     {
         return Err(WorkspaceLeaseFailure::OwnershipUnsettled);
     }
-    let (lock_specifications, binding_identity) =
-        workspace_coordination_lock_specs(workspace_root, CoordinationLockKind::Observation)
-            .ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     let trusted_coordination_root =
         stable_coordination_root().ok_or(WorkspaceLeaseFailure::CoordinationHostUnsupported)?;
-    let gate = observation_gate(workspace_root).ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
+    let gate = observation_gate(&binding_identity.canonical)
+        .ok_or(WorkspaceLeaseFailure::BindingUnavailable)?;
     loop {
         if cancel_token.is_some_and(CancellationToken::is_cancelled)
             || tokio::time::Instant::now() >= deadline
@@ -2500,6 +2646,7 @@ async fn acquire_workspace_lease_attempt(
             delay.await;
         }
     }
+    let mut reservation = ObservationGateReservation(Some(gate.clone()));
     let mut locks = Vec::with_capacity(lock_specifications.len());
     for specification in lock_specifications {
         let lock = acquire_cross_process_lock_async(
@@ -2510,7 +2657,6 @@ async fn acquire_workspace_lease_attempt(
         )
         .await;
         let Some(lock) = lock else {
-            gate.store(false, std::sync::atomic::Ordering::Release);
             return Err(
                 if cancel_token.is_some_and(CancellationToken::is_cancelled) {
                     WorkspaceLeaseFailure::Cancelled
@@ -2531,7 +2677,15 @@ async fn acquire_workspace_lease_attempt(
         .cloned()
         .collect::<Vec<_>>();
     let watcher_cancel = cancel_token.cloned();
+    let admitted_writer_state = writer_state.clone();
+    let admitted_keys = [
+        binding_identity.canonical.clone(),
+        binding_identity.lexical.clone(),
+    ];
     let tamper_watch = tokio::task::spawn_blocking(move || {
+        // Another process may have fenced this generation while we waited
+        // for its locks. Read the persistent fence again under those locks.
+        hydrate_persistent_ownership_quarantine(&admitted_writer_state, &admitted_keys);
         let tamper_watch =
             GenerationTamperWatch::arm(&locks, watch_binding_paths, watcher_cancel.as_ref())?;
         if !tamper_watch.is_untampered() {
@@ -2553,7 +2707,6 @@ async fn acquire_workspace_lease_attempt(
                 "workspace generation watcher refused receipt authority"
                 );
             }
-            gate.store(false, std::sync::atomic::Ordering::Release);
             return Err(failure);
         }
         Err(error) => {
@@ -2562,7 +2715,6 @@ async fn acquire_workspace_lease_attempt(
                 error = %error,
                 "workspace generation watcher worker join failed; no receipt authority granted"
             );
-            gate.store(false, std::sync::atomic::Ordering::Release);
             return Err(WorkspaceLeaseFailure::WatcherUnavailable);
         }
     };
@@ -2574,19 +2726,20 @@ async fn acquire_workspace_lease_attempt(
         .ownership_unsettled
         .load(std::sync::atomic::Ordering::Acquire);
     if !binding_unchanged || !tamper_untampered || ownership_unsettled {
-        gate.store(false, std::sync::atomic::Ordering::Release);
         return Err(if ownership_unsettled {
             WorkspaceLeaseFailure::OwnershipUnsettled
         } else {
             WorkspaceLeaseFailure::BindingUnavailable
         });
     }
+    drop(reservation.0.take());
     Ok(WorkspaceObservationLease {
         gate,
         locks,
         binding_identity,
         writer_state,
         tamper_watch,
+        abandonment_fence_armed: false,
     })
 }
 
@@ -4583,6 +4736,96 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn retargeted_alias_does_not_reuse_the_previous_workspace_state() {
+        let parent = tempfile::tempdir().unwrap();
+        let a = parent.path().join("a");
+        let b = parent.path().join("b");
+        let link = parent.path().join("workspace");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let previous = WorkspaceAttributionState::capture(&link).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        let current = WorkspaceAttributionState::capture(&link).unwrap();
+        assert!(!Arc::ptr_eq(&previous.state, &current.state));
+        previous.quarantine();
+        assert!(
+            !current
+                .state
+                .quarantined
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn any_existing_ownership_marker_fences_the_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = ownership_unsettled_marker_path(&root).unwrap();
+        fs::create_dir(&marker).unwrap();
+        assert!(ownership_unsettled_marker_exists(&root));
+        assert!(!persist_ownership_unsettled_markers(std::slice::from_ref(
+            &root
+        )));
+        fs::remove_dir(&marker).unwrap();
+        #[cfg(unix)]
+        {
+            let digest = coordination_key_digest(&root);
+            let uid = unsafe { libc::geteuid() };
+            let previous = marker.with_file_name(format!(
+                ".astra-workspace-{digest}-observation-uid-{uid}.unsettled"
+            ));
+            fs::write(&previous, "unsettled").unwrap();
+            assert!(ownership_unsettled_marker_exists(&root));
+            fs::remove_file(previous).unwrap();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn failed_persistent_fence_keeps_the_cross_process_lock() {
+        for disarmed_before_failure in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let markers = workspace_unsettled_paths_for_diagnostics(temp.path()).unwrap();
+            let marker =
+                ownership_unsettled_marker_path(&temp.path().canonicalize().unwrap()).unwrap();
+            let mut lease = acquire_workspace_mutation_lease_with_options(
+                temp.path(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            // A directory prevents the marker from being durably written or
+            // verified. Remove it after Drop so only the retained kernel lock can
+            // prevent the fresh process from acquiring this workspace.
+            fs::create_dir(&marker).unwrap();
+            lease.arm_abandonment_fence();
+            if disarmed_before_failure {
+                lease.disarm_abandonment_fence();
+                assert!(!lease.mark_unsettled());
+            }
+            drop(lease);
+            fs::remove_dir(marker).unwrap();
+            for marker in markers {
+                let _ = fs::remove_file(marker);
+            }
+            let child_marker = temp.path().join("child-blocked");
+            let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("workspace_observation::tests::cross_process_workspace_observation_lease_helper")
+            .arg("--exact").arg("--nocapture")
+            .env(CROSS_PROCESS_LEASE_HELPER_ENV, temp.path())
+            .env(CROSS_PROCESS_LEASE_MARKER_ENV, &child_marker)
+            .env(CROSS_PROCESS_LEASE_MODE_ENV, "mutation-must-remain-blocked")
+            .spawn().unwrap();
+            assert!(child.wait().unwrap().success());
+            assert_eq!(fs::read_to_string(child_marker).unwrap(), "blocked");
+        }
+    }
+
     #[tokio::test]
     async fn cross_process_workspace_observation_lease_helper() {
         let Some(root) = std::env::var_os(CROSS_PROCESS_LEASE_HELPER_ENV) else {
@@ -4612,6 +4855,17 @@ mod tests {
                 .await
                 .expect("child acquires mutation lease");
                 fs::write(marker, "owned by mutation").expect("child write");
+            }
+            "mutation-must-remain-blocked" => {
+                let result = acquire_workspace_mutation_lease_with_options(
+                    Path::new(&root),
+                    None,
+                    Duration::from_millis(150),
+                )
+                .await;
+                let failure = result.err().expect("the other process must remain blocked");
+                assert_eq!(failure, WorkspaceLeaseFailure::Contended);
+                fs::write(marker, "blocked").expect("child marker");
             }
             "recursive-writer" => {
                 let _writer = begin_workspace_writer_with_options(
@@ -5914,6 +6168,112 @@ mod tests {
             .await
             .is_ok(),
             "cancellation must release the in-process gate for a later clean acquisition"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn dropping_admission_during_kernel_wait_releases_the_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let (specifications, _) =
+            workspace_coordination_lock_specs(temp.path(), CoordinationLockKind::Observation)
+                .unwrap();
+        let blocker =
+            try_acquire_kernel_coordination_namespace(&specifications[0].kernel_namespace_key)
+                .unwrap()
+                .unwrap();
+        let gate = observation_gate(&temp.path().canonicalize().unwrap()).unwrap();
+        let root = temp.path().to_path_buf();
+        let waiting = tokio::spawn(async move {
+            acquire_workspace_lease_attempt(
+                &root,
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        waiting.abort();
+        let _ = waiting.await;
+        assert!(!gate.load(std::sync::atomic::Ordering::Acquire));
+        drop(blocker);
+        assert!(
+            acquire_workspace_observation_lease_with_options(
+                temp.path(),
+                None,
+                Duration::from_secs(1)
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn waiting_admission_observes_fence_written_by_another_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (specifications, _) =
+            workspace_coordination_lock_specs(&root, CoordinationLockKind::Observation).unwrap();
+        let blocker =
+            try_acquire_kernel_coordination_namespace(&specifications[0].kernel_namespace_key)
+                .unwrap()
+                .unwrap();
+        let gate = observation_gate(&root).unwrap();
+        let waiting_root = root.clone();
+        let waiting = tokio::spawn(async move {
+            acquire_workspace_lease_attempt(
+                &waiting_root,
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(3),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Write only the shared marker, as a different process would; this
+        // intentionally does not modify the waiter's in-process state.
+        assert!(persist_ownership_unsettled_markers(std::slice::from_ref(
+            &root
+        )));
+        drop(blocker);
+        let result = waiting.await.unwrap();
+        let _ = fs::remove_file(ownership_unsettled_marker_path(&root).unwrap());
+        assert!(matches!(
+            result,
+            Err(WorkspaceLeaseFailure::OwnershipUnsettled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn undispatched_and_settled_writers_do_not_fence_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut writer =
+            begin_workspace_writer_with_options(temp.path(), None, Duration::from_secs(1))
+                .await
+                .unwrap();
+        drop(writer);
+        writer = begin_workspace_writer_with_options(temp.path(), None, Duration::from_secs(1))
+            .await
+            .unwrap();
+        writer.arm_abandonment_fence();
+        writer.disarm_abandonment_fence();
+        drop(writer);
+        assert!(
+            begin_workspace_writer_with_options(temp.path(), None, Duration::from_secs(1))
+                .await
+                .is_ok()
         );
     }
 

@@ -25,7 +25,10 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -38,7 +41,7 @@ tokio::task_local! {
     /// RPC request.  The marker is scoped to the dispatch future rather than
     /// stored on a shared executor, so concurrent top-level calls cannot
     /// inherit the parent's re-entrant writer privilege accidentally.
-    static RUN_SCRIPT_RPC_DISPATCH: ();
+    static RUN_SCRIPT_RPC_DISPATCH: Arc<AtomicBool>;
 }
 
 /// Whether the current tool call is executing inside `run_script`'s RPC
@@ -49,7 +52,18 @@ tokio::task_local! {
 /// must still avoid minting a fingerprint receipt because its parent Python
 /// process can access the workspace concurrently.
 pub fn is_run_script_rpc_dispatch() -> bool {
-    RUN_SCRIPT_RPC_DISPATCH.try_with(|()| ()).is_ok()
+    RUN_SCRIPT_RPC_DISPATCH.try_with(|_| ()).is_ok()
+}
+
+/// Mark physical workspace dispatch on the authenticated parent RPC owner.
+pub fn mark_run_script_workspace_effect_started() {
+    let _ = RUN_SCRIPT_RPC_DISPATCH.try_with(|started| started.store(true, Ordering::Release));
+}
+
+#[derive(Default)]
+pub(crate) struct RpcExecutionState {
+    pub(crate) nested_writer: Arc<AtomicBool>,
+    pub(crate) weak_attribution: bool,
 }
 
 // ─── AuthToken ────────────────────────────────────────────────────────────
@@ -310,6 +324,8 @@ pub(crate) enum RpcOutcome {
     /// framed, dispatched, or replied to. The run-script owner must terminate
     /// the child before releasing its writer epoch.
     Cancelled,
+    /// A nested tool may still have workspace effects in flight.
+    OwnershipUnsettled,
     /// An unrecoverable I/O error occurred reading/writing the socket.
     /// The RPC server loop should continue accepting new connections —
     /// the child's own `recv()` returns EOF and the script fails fast.
@@ -417,6 +433,7 @@ pub(crate) async fn handle_rpc_connection(
     policy: &RpcPolicy,
     auth_token: &AuthToken,
     cancel_token: Option<&CancellationToken>,
+    state: &mut RpcExecutionState,
 ) -> RpcOutcome {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader.take(MAX_RPC_REQUEST_BYTES));
@@ -506,10 +523,30 @@ pub(crate) async fn handle_rpc_connection(
     // Dispatch through the real executor so tool_health/dedup/compression apply.
     let result = RUN_SCRIPT_RPC_DISPATCH
         .scope(
-            (),
+            state.nested_writer.clone(),
             tool_executor.execute_with_cancel(&request.tool, &request.args, cancel_token),
         )
         .await;
+
+    let explicit_unsettled = result.metadata.as_ref().is_some_and(|fields| {
+        fields
+            .get("workspace_observation_quarantined")
+            .and_then(Value::as_bool)
+            == Some(true)
+            || matches!(
+                fields.get("error_kind").and_then(Value::as_str),
+                Some("ownership_unsettled" | "workspace_effect_unsettled")
+            )
+    });
+    let may_write = crate::executor::is_workspace_mutation_tool(&request.tool, &request.args)
+        || request.tool == "patch"
+        || request.tool == "bash";
+    if explicit_unsettled
+        || (may_write && crate::workspace_effect_may_be_unsettled(result.metadata.as_ref()))
+    {
+        return RpcOutcome::OwnershipUnsettled;
+    }
+    state.nested_writer.store(false, Ordering::Release);
 
     // Cap response size BEFORE serializing — prevents an unbounded tool
     // result from flooding the sandbox and triggering an OOM inside it.
@@ -520,7 +557,12 @@ pub(crate) async fn handle_rpc_connection(
     } else {
         RpcResponse::success(capped)
     };
-
+    state.weak_attribution |= result.metadata.as_ref().is_some_and(|fields| {
+        fields
+            .get(crate::workspace_observation::WEAK_ATTRIBUTION_FIELD)
+            .and_then(Value::as_bool)
+            == Some(true)
+    });
     reply_with_cancel(&mut writer, response, cancel_token).await
 }
 
@@ -695,7 +737,7 @@ mod tests {
         token: &AuthToken,
         executor: &dyn ToolExecutor,
         call_count: &AtomicUsize,
-    ) -> (String, RpcOutcome) {
+    ) -> (String, RpcOutcome, bool) {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("t.sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -708,6 +750,7 @@ mod tests {
         writer.shutdown().await.unwrap();
 
         let cancel_token = CancellationToken::new();
+        let mut state = RpcExecutionState::default();
         let outcome = handle_rpc_connection(
             stream,
             executor,
@@ -715,12 +758,17 @@ mod tests {
             policy,
             token,
             Some(&cancel_token),
+            &mut state,
         )
         .await;
 
         let mut resp = Vec::new();
         let _ = reader.read_to_end(&mut resp).await;
-        (String::from_utf8_lossy(&resp).into_owned(), outcome)
+        (
+            String::from_utf8_lossy(&resp).into_owned(),
+            outcome,
+            state.weak_attribution,
+        )
     }
 
     // ── Core RPC behavior ────────────────────────────────────────────────
@@ -732,10 +780,163 @@ mod tests {
         let exec = MockExecutor::new();
         let counter = AtomicUsize::new(0);
         let req = r#"{"tool":"read_file","args":{"path":"x"},"auth_token":"tok"}"#;
-        let (resp, outcome) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
+        let (resp, outcome, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
         assert!(matches!(outcome, RpcOutcome::Ok));
         assert!(resp.contains("ok: read_file"), "resp: {resp}");
         assert_eq!(exec.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn nested_unknown_only_fences_potential_workspace_writers() {
+        struct Unknown;
+        #[async_trait]
+        impl ToolExecutor for Unknown {
+            async fn execute(&self, _name: &str, _args: &Value) -> ToolResult {
+                ToolResult::error("unknown".into()).with_failure_evidence(
+                    astra_core::ToolFailureEvidence::from_error_kind(
+                        astra_core::ErrorKind::ToolOutcomeUnknown,
+                    ),
+                )
+            }
+            fn tool_schemas(&self) -> Vec<Value> {
+                vec![]
+            }
+            fn project_root(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        let mut policy = default_policy();
+        policy.allowed_tools.insert("write_file".into());
+        let token = AuthToken::from_str_for_test("tok");
+        let counter = AtomicUsize::new(0);
+        for (tool, expected) in [
+            ("read_file", RpcOutcome::Ok),
+            ("write_file", RpcOutcome::OwnershipUnsettled),
+        ] {
+            let request = serde_json::json!({"tool":tool,"args":{},"auth_token":"tok"}).to_string();
+            let (_, outcome, _) =
+                rpc_roundtrip(&request, &policy, &token, &Unknown, &counter).await;
+            assert_eq!(outcome, expected, "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_weak_attribution_is_not_reported_as_unsettled_ownership() {
+        struct Weak;
+        #[async_trait]
+        impl ToolExecutor for Weak {
+            async fn execute(&self, _name: &str, _args: &Value) -> ToolResult {
+                let mut result = ToolResult::text("completed".into());
+                result.metadata.get_or_insert_default().insert(
+                    crate::workspace_observation::WEAK_ATTRIBUTION_FIELD.into(),
+                    Value::Bool(true),
+                );
+                result
+            }
+            fn tool_schemas(&self) -> Vec<Value> {
+                vec![]
+            }
+            fn project_root(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        let mut policy = default_policy();
+        policy.allowed_tools.insert("bash".into());
+        let token = AuthToken::from_str_for_test("tok");
+        let counter = AtomicUsize::new(0);
+        let request = r#"{"tool":"bash","args":{"command":"touch file"},"auth_token":"tok"}"#;
+        let (response, outcome, weak) =
+            rpc_roundtrip(request, &policy, &token, &Weak, &counter).await;
+        assert_eq!(outcome, RpcOutcome::Ok);
+        assert!(weak);
+        assert!(response.contains("completed"));
+    }
+
+    #[tokio::test]
+    async fn dropping_nested_rpc_retains_only_started_writer_evidence() {
+        struct Pending(bool);
+        #[async_trait]
+        impl ToolExecutor for Pending {
+            async fn execute(&self, _name: &str, _args: &Value) -> ToolResult {
+                if self.0 {
+                    mark_run_script_workspace_effect_started();
+                }
+                std::future::pending().await
+            }
+            fn tool_schemas(&self) -> Vec<Value> {
+                vec![]
+            }
+            fn project_root(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        let mut policy = default_policy();
+        policy.allowed_tools.insert("write_file".into());
+        let token = AuthToken::from_str_for_test("tok");
+        for started in [false, true] {
+            let (stream, mut client) = tokio::net::UnixStream::pair().unwrap();
+            client
+                .write_all(b"{\"tool\":\"write_file\",\"args\":{},\"auth_token\":\"tok\"}\n")
+                .await
+                .unwrap();
+            let mut state = RpcExecutionState::default();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                handle_rpc_connection(
+                    stream,
+                    &Pending(started),
+                    &AtomicUsize::new(0),
+                    &policy,
+                    &token,
+                    None,
+                    &mut state,
+                ),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(state.nested_writer.load(Ordering::Acquire), started);
+            assert!(!state.weak_attribution);
+        }
+    }
+
+    #[tokio::test]
+    async fn weak_nested_result_does_not_override_cancellation() {
+        struct WeakThenCancel;
+        #[async_trait]
+        impl ToolExecutor for WeakThenCancel {
+            async fn execute(&self, _name: &str, _args: &Value) -> ToolResult {
+                unreachable!()
+            }
+            async fn execute_with_cancel(
+                &self,
+                _name: &str,
+                _args: &Value,
+                cancel: Option<&CancellationToken>,
+            ) -> ToolResult {
+                let mut result = ToolResult::text("finished".into());
+                result.metadata.get_or_insert_default().insert(
+                    crate::workspace_observation::WEAK_ATTRIBUTION_FIELD.into(),
+                    Value::Bool(true),
+                );
+                cancel.unwrap().cancel();
+                result
+            }
+            fn tool_schemas(&self) -> Vec<Value> {
+                vec![]
+            }
+            fn project_root(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        let mut policy = default_policy();
+        policy.allowed_tools.insert("bash".into());
+        let token = AuthToken::from_str_for_test("tok");
+        let counter = AtomicUsize::new(0);
+        let request = r#"{"tool":"bash","args":{"command":"touch file"},"auth_token":"tok"}"#;
+        let (_, outcome, weak) =
+            rpc_roundtrip(request, &policy, &token, &WeakThenCancel, &counter).await;
+        assert_eq!(outcome, RpcOutcome::Cancelled);
+        assert!(weak);
     }
 
     #[tokio::test]
@@ -792,17 +993,26 @@ mod tests {
             r#"{"tool":"bash","args":{"command":"printf nested > nested.txt"},"auth_token":"tok"}"#;
 
         assert!(!is_run_script_rpc_dispatch());
-        let (response, outcome) = tokio::time::timeout(
+        let (response, outcome, weak) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             rpc_roundtrip(request, &policy, &token, &executor, &counter),
         )
         .await
         .expect("nested Bash must not wait on a shared-to-exclusive upgrade");
         assert!(!is_run_script_rpc_dispatch(), "RPC context must not leak");
-        assert!(matches!(outcome, RpcOutcome::Ok), "{response}");
+        let metadata_weak = executor
+            .metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|fields| fields.get(crate::workspace_observation::WEAK_ATTRIBUTION_FIELD))
+            .and_then(Value::as_bool)
+            == Some(true);
+        assert_eq!(outcome, RpcOutcome::Ok, "{response}");
+        assert_eq!(weak, metadata_weak);
         assert!(temp.path().join("nested.txt").is_file(), "{response}");
         let typed_request = r#"{"tool":"write_file","args":{"path":"typed.txt","content":"nested typed"},"auth_token":"tok"}"#;
-        let (typed_response, typed_outcome) = tokio::time::timeout(
+        let (typed_response, typed_outcome, _) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             rpc_roundtrip(typed_request, &policy, &token, &executor, &counter),
         )
@@ -844,6 +1054,7 @@ mod tests {
                 &policy,
                 &auth_token,
                 Some(&cancel_token),
+                &mut RpcExecutionState::default(),
             ),
         )
         .await
@@ -863,7 +1074,7 @@ mod tests {
         let exec = MockExecutor::new();
         let counter = AtomicUsize::new(0);
         let req = r#"{"tool":"read_file","args":{"path":"x"},"auth_token":"WRONG"}"#;
-        let (resp, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
+        let (resp, _, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
         assert!(resp.contains("auth"), "resp: {resp}");
         assert_eq!(exec.call_count(), 0);
     }
@@ -876,7 +1087,7 @@ mod tests {
         let counter = AtomicUsize::new(0);
         // No auth_token field → deserialize error before allowlist/executor run.
         let req = r#"{"tool":"read_file","args":{"path":"x"}}"#;
-        let (resp, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
+        let (resp, _, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
         assert!(
             resp.contains("Invalid JSON") || resp.contains("auth"),
             "resp: {resp}"
@@ -891,7 +1102,7 @@ mod tests {
         let exec = MockExecutor::new();
         let counter = AtomicUsize::new(0);
         let req = r#"{"tool":"unknown_tool","args":{},"auth_token":"tok"}"#;
-        let (resp, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
+        let (resp, _, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
         assert!(resp.contains("not allowed"), "resp: {resp}");
         assert_eq!(exec.call_count(), 0);
     }
@@ -904,7 +1115,7 @@ mod tests {
         let exec = MockExecutor::new();
         let counter = AtomicUsize::new(0);
         let req = r#"{"tool":"","args":{},"auth_token":"tok"}"#;
-        let (resp, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
+        let (resp, _, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
         assert!(resp.contains("not allowed"), "resp: {resp}");
         assert_eq!(exec.call_count(), 0);
     }
@@ -917,7 +1128,7 @@ mod tests {
         let exec = MockExecutor::new();
         let counter = AtomicUsize::new(1); // already at the limit
         let req = r#"{"tool":"read_file","args":{"path":"x"},"auth_token":"tok"}"#;
-        let (resp, outcome) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
+        let (resp, outcome, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
         assert!(matches!(outcome, RpcOutcome::ExceededCallLimit));
         assert!(resp.contains("limit"), "resp: {resp}");
     }
@@ -931,7 +1142,7 @@ mod tests {
         let exec = MockExecutor::with_payload(50_000);
         let counter = AtomicUsize::new(0);
         let req = r#"{"tool":"read_file","args":{},"auth_token":"tok"}"#;
-        let (resp, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
+        let (resp, _, _) = rpc_roundtrip(req, &policy, &token, &exec, &counter).await;
         assert!(
             resp.len() < 3_000,
             "response not capped: {} bytes",

@@ -45,6 +45,10 @@ const DIRECT_WORKSPACE_MUTATION_TOOLS: &[&str] = &[
 /// them read-only. Consolidated git actions use their argument-aware category.
 /// Control-plane and external-state writes remain outside this boundary.
 pub fn tool_call_may_mutate_workspace(name: &str, args: Option<&Value>) -> bool {
+    // The script can modify the workspace directly or through its RPC tools.
+    if name == "run_script" {
+        return true;
+    }
     if DIRECT_WORKSPACE_MUTATION_TOOLS.contains(&name) {
         return true;
     }

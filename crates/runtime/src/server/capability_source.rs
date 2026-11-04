@@ -810,6 +810,7 @@ impl CapabilitySourceRuntime {
         request: &super::tool_execution_binding::ToolExecutionRequest,
         interaction: Option<&astra_turn_types::ProviderInteractionResponse>,
         cancel_token: Option<&CancellationToken>,
+        before_dispatch: impl FnOnce() + Send,
     ) -> Result<astra_mcp::McpToolCallResult, SourceInvocationError> {
         let invalid = |error: SourceError| {
             SourceInvocationError::Rpc(super::runtime_mcp::capability_source_rpc_error(
@@ -850,6 +851,7 @@ impl CapabilitySourceRuntime {
         if request.policy.dispatch_deadline_rejection().is_some() {
             return Err(SourceInvocationError::AdmissionDeadlineExpired);
         }
+        before_dispatch();
         let response = self
             .transport
             .capability_rpc(
@@ -1695,7 +1697,7 @@ pub(crate) mod tests {
         invocation.policy.admission_deadline =
             Some((tokio::time::Instant::now() + std::time::Duration::from_secs(5)).into_std());
         assert!(invocation.policy.dispatch_deadline_rejection().is_none());
-        let execution = source.invoke(&invocation, None, None);
+        let execution = source.invoke(&invocation, None, None, || {});
         tokio::pin!(execution);
         assert!(futures_util::poll!(&mut execution).is_pending());
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
@@ -1721,7 +1723,10 @@ pub(crate) mod tests {
         let resolution = source.resolution.lock().await;
         let invocation = request(&fixture.scope, &key, json!({}));
         let cancel = CancellationToken::new();
-        let execution = source.invoke(&invocation, None, Some(&cancel));
+        let armed = std::sync::atomic::AtomicBool::new(false);
+        let execution = source.invoke(&invocation, None, Some(&cancel), || {
+            armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
         tokio::pin!(execution);
         assert!(futures_util::poll!(&mut execution).is_pending());
         cancel.cancel();
@@ -1732,6 +1737,7 @@ pub(crate) mod tests {
             result,
             Err(SourceInvocationError::CancelledBeforeDispatch)
         ));
+        assert!(!armed.load(std::sync::atomic::Ordering::SeqCst));
         drop(resolution);
         assert!(source.resolution.try_lock().is_ok());
         assert_eq!(
@@ -1750,7 +1756,7 @@ pub(crate) mod tests {
         source.materialize(&key, true).await.unwrap();
         let invocation = request(&fixture.scope, &key, json!({}));
         let cancel = CancellationToken::new();
-        let execution = source.invoke(&invocation, None, Some(&cancel));
+        let execution = source.invoke(&invocation, None, Some(&cancel), || {});
         tokio::pin!(execution);
         tokio::select! {
             _ = gate.started.notified() => {},
@@ -2033,7 +2039,7 @@ pub(crate) mod tests {
         );
         drop(_resolution);
         source
-            .invoke(&request(&fixture.scope, &key, json!({})), None, None)
+            .invoke(&request(&fixture.scope, &key, json!({})), None, None, || {})
             .await
             .unwrap();
         let reopened =
@@ -2041,7 +2047,7 @@ pub(crate) mod tests {
         reopened.bind_scope(fixture.scope.clone(), None).unwrap();
         reopened.materialize(&key, false).await.unwrap();
         reopened
-            .invoke(&request(&fixture.scope, &key, json!({})), None, None)
+            .invoke(&request(&fixture.scope, &key, json!({})), None, None, || {})
             .await
             .unwrap();
         assert_eq!(
@@ -2060,7 +2066,7 @@ pub(crate) mod tests {
         );
         let mut wrong = request(&fixture.scope, &key, json!({}));
         wrong.session_id = "other-session".into();
-        assert!(reopened.invoke(&wrong, None, None).await.is_err());
+        assert!(reopened.invoke(&wrong, None, None, || {}).await.is_err());
         assert_eq!(fixture.calls.lock().unwrap().len(), 3);
     }
 

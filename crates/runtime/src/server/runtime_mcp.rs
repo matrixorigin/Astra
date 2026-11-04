@@ -374,11 +374,16 @@ pub(crate) struct AgentBindingMcpRpcError {
     timed_out: bool,
     provider_acknowledged: bool,
     cancelled_before_dispatch: bool,
+    rejected_before_dispatch: bool,
 }
 
 impl AgentBindingMcpRpcError {
     pub(crate) fn is_cancelled_before_dispatch(&self) -> bool {
         self.cancelled_before_dispatch
+    }
+
+    pub(crate) fn is_rejected_before_dispatch(&self) -> bool {
+        self.rejected_before_dispatch
     }
 
     pub(crate) fn side_effects_maybe(&self) -> bool {
@@ -434,11 +439,14 @@ fn agent_binding_mcp_rpc_error(detail: impl Into<String>) -> AgentBindingMcpRpcE
         timed_out: false,
         provider_acknowledged: false,
         cancelled_before_dispatch: false,
+        rejected_before_dispatch: false,
     }
 }
 
 pub(crate) fn capability_source_rpc_error(detail: String) -> AgentBindingMcpRpcError {
-    agent_binding_mcp_rpc_error(detail)
+    let mut error = agent_binding_mcp_rpc_error(detail);
+    error.rejected_before_dispatch = true;
+    error
 }
 
 fn agent_binding_mcp_provider_error(detail: impl Into<String>) -> AgentBindingMcpRpcError {
@@ -448,6 +456,7 @@ fn agent_binding_mcp_provider_error(detail: impl Into<String>) -> AgentBindingMc
         timed_out: false,
         provider_acknowledged: true,
         cancelled_before_dispatch: false,
+        rejected_before_dispatch: false,
     }
 }
 
@@ -458,6 +467,7 @@ fn agent_binding_mcp_timeout_error(detail: impl Into<String>) -> AgentBindingMcp
         timed_out: true,
         provider_acknowledged: false,
         cancelled_before_dispatch: false,
+        rejected_before_dispatch: false,
     }
 }
 
@@ -1015,7 +1025,11 @@ async fn post_agent_binding_mcp_rpc_with_risk(
         .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
         .ok_or_else(|| agent_binding_mcp_rpc_error("Agent Binding MCP request missing valid id"))?;
     let _permit = crate::capability_endpoint_pool::try_acquire_endpoint_permit(endpoint_url)
-        .map_err(agent_binding_mcp_rpc_error)?;
+        .map_err(|reason| {
+            let mut error = agent_binding_mcp_rpc_error(reason);
+            error.rejected_before_dispatch = true;
+            error
+        })?;
 
     let (status, body) = tokio::time::timeout(timeout, async {
         let mut response = agent_binding_mcp_http_client()
