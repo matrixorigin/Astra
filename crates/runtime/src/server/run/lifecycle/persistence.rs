@@ -3195,6 +3195,26 @@ mod tests {
     }
 
     #[test]
+    fn server_loop_observer_never_exports_provider_reasoning() {
+        let mut state = observer_test_state();
+        state.messages[1][astra_core::model_wire::responses::CONTINUATION_KEY] = json!({
+            "items":[{"type":"reasoning", "content":[
+                {"type":"reasoning_text", "text":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}
+            ]}]
+        });
+        let request = build_server_loop_observer_request("user-1", "session-1", &state).unwrap();
+        let payload = serde_json::to_string(&request.messages).unwrap();
+        assert!(!payload.contains("_astra_responses"));
+        assert!(!payload.contains("reasoning_text"));
+        assert!(!payload.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(
+            state.messages[1]
+                .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn server_loop_observer_excludes_structured_memory_operation_turns() {
         let mut state = observer_test_state();
         state.messages = vec![

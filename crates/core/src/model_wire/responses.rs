@@ -12,6 +12,22 @@ pub const REASONING_CONTINUATION_MISSING: &str = "responses_reasoning_continuati
 pub const INVALID_OUTPUT: &str = "responses_invalid_output";
 const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
 const MAX_CONTINUATION_ITEMS: usize = 4096;
+const MAX_REASONING_PARTS: usize = 4096;
+const MAX_REASONING_BYTES: usize = 16 * 1024 * 1024;
+
+/// Project a conversation message for consumers that do not own replay.
+pub fn without_continuation(message: &Value) -> Value {
+    match message.as_object() {
+        Some(object) if object.contains_key(CONTINUATION_KEY) => Value::Object(
+            object
+                .iter()
+                .filter(|(key, _)| key.as_str() != CONTINUATION_KEY)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        _ => message.clone(),
+    }
+}
 
 /// Whether a saved Responses item belongs to a tool round.
 pub fn has_tool_continuation(message: &Value) -> bool {
@@ -56,6 +72,7 @@ pub fn validated_continuation(message: &Value) -> Option<Value> {
     if raw.is_empty() || raw.len() > MAX_CONTINUATION_ITEMS {
         return None;
     }
+    validate_reasoning_budget(raw.iter()).ok()?;
     let items = raw
         .iter()
         .map(|item| replay_item(item, true))
@@ -109,6 +126,56 @@ impl ResponsesStreamError {
     }
 }
 
+fn reasoning_size(item: &Value) -> Result<(usize, usize), &'static str> {
+    if item["type"] != "reasoning" {
+        return Ok((0, 0));
+    }
+    let Some(content) = item.get("content").filter(|content| !content.is_null()) else {
+        return Ok((0, 0));
+    };
+    let parts = content
+        .as_array()
+        .ok_or("Invalid Responses reasoning content")?;
+    if parts.len() > MAX_REASONING_PARTS {
+        return Err("Responses reasoning limit exceeded");
+    }
+    let mut bytes = 0usize;
+    for part in parts {
+        if part["type"] != "reasoning_text" {
+            return Err("Invalid Responses reasoning part");
+        }
+        let text = part["text"]
+            .as_str()
+            .ok_or("Invalid Responses reasoning part")?;
+        bytes = bytes
+            .checked_add(text.len())
+            .filter(|bytes| *bytes <= MAX_REASONING_BYTES)
+            .ok_or("Responses reasoning limit exceeded")?;
+    }
+    Ok((parts.len(), bytes))
+}
+
+fn validate_reasoning_budget<'a>(
+    items: impl Iterator<Item = &'a Value>,
+) -> Result<(), &'static str> {
+    let mut total = (0usize, 0usize);
+    for item in items {
+        let size = reasoning_size(item)?;
+        total.0 = total
+            .0
+            .checked_add(size.0)
+            .ok_or("Responses reasoning limit exceeded")?;
+        total.1 = total
+            .1
+            .checked_add(size.1)
+            .ok_or("Responses reasoning limit exceeded")?;
+        if total.0 > MAX_REASONING_PARTS || total.1 > MAX_REASONING_BYTES {
+            return Err("Responses reasoning limit exceeded");
+        }
+    }
+    Ok(())
+}
+
 fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, String> {
     if item
         .get("status")
@@ -121,6 +188,33 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
     {
         return Err("Provider function call has an unexpected namespace".into());
     }
+    validate_reasoning_budget(std::iter::once(item))?;
+    // Reasoning text is ordinary provider content, not an opaque encrypted
+    // token. Validate its wire shape before copying it into the continuation.
+    let reasoning_content = if item["type"] == "reasoning" {
+        item.get("content")
+            .filter(|content| !content.is_null())
+            .map(|content| {
+                let parts = content
+                    .as_array()
+                    .ok_or("Invalid Responses reasoning content")?;
+                parts
+                    .iter()
+                    .map(|part| {
+                        if part["type"] != "reasoning_text" {
+                            return Err("Invalid Responses reasoning part");
+                        }
+                        let text = part["text"]
+                            .as_str()
+                            .ok_or("Invalid Responses reasoning part")?;
+                        Ok(json!({"type":"reasoning_text", "text":text}))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let keys: &[&str] = match item["type"].as_str() {
         Some("message") => &["id", "type", "role", "status", "phase", "content"],
         Some("reasoning") => &["id", "type", "status", "summary", "encrypted_content"],
@@ -134,6 +228,9 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
         if let Some(value) = item.get(*key).filter(|value| !value.is_null()) {
             object.insert((*key).into(), value.clone());
         }
+    }
+    if let Some(content) = reasoning_content {
+        object.insert("content".into(), Value::Array(content));
     }
     if decode_stored_reasoning
         && item["type"] == "reasoning"
@@ -185,6 +282,12 @@ fn has_replayable_reasoning(item: &Value) -> bool {
         || item[ENCODED_REASONING]
             .as_str()
             .is_some_and(|content| !content.is_empty())
+        || item["content"].as_array().is_some_and(|parts| {
+            !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|part| part["type"] == "reasoning_text" && part["text"].is_string())
+        })
 }
 
 fn continuation_calls<'a>(
@@ -203,6 +306,7 @@ fn continuation_calls<'a>(
     {
         return Err(CONTINUATION_INCOMPLETE.into());
     }
+    validate_reasoning_budget(items.iter())?;
     let mut calls = HashMap::new();
     let mut pending = HashSet::new();
     for call in message
@@ -551,6 +655,8 @@ impl ResponseOutput {
 pub struct ResponseAccumulator {
     pub output: ResponseOutput,
     items: BTreeMap<u64, Value>,
+    reasoning_parts: usize,
+    reasoning_bytes: usize,
     text_ranges: BTreeMap<(u64, u64), Vec<std::ops::Range<usize>>>,
     range_count: usize,
     unindexed_text: bool,
@@ -645,6 +751,13 @@ impl ResponseAccumulator {
                 self.output.reasoning.push_str(delta);
                 return Ok(Some((delta.into(), true)));
             }
+            "response.reasoning_text.delta" => {
+                // Raw reasoning is private. It counts as stream progress, but
+                // only the completed item can authorize a later replay.
+                event["delta"].as_str().ok_or(ResponsesStreamError::Codec(
+                    "Invalid Responses reasoning text delta",
+                ))?;
+            }
             "response.output_item.done" => {
                 let index = event["output_index"]
                     .as_u64()
@@ -654,7 +767,33 @@ impl ResponseAccumulator {
                         "Too many Responses output items",
                     ));
                 }
+                let size = reasoning_size(&event["item"]).map_err(ResponsesStreamError::Codec)?;
+                let previous = self
+                    .items
+                    .get(&index)
+                    .map(reasoning_size)
+                    .transpose()
+                    .map_err(ResponsesStreamError::Codec)?
+                    .unwrap_or_default();
+                let parts = self
+                    .reasoning_parts
+                    .checked_sub(previous.0)
+                    .and_then(|count| count.checked_add(size.0))
+                    .filter(|count| *count <= MAX_REASONING_PARTS)
+                    .ok_or(ResponsesStreamError::Codec(
+                        "Responses reasoning limit exceeded",
+                    ))?;
+                let bytes = self
+                    .reasoning_bytes
+                    .checked_sub(previous.1)
+                    .and_then(|count| count.checked_add(size.1))
+                    .filter(|count| *count <= MAX_REASONING_BYTES)
+                    .ok_or(ResponsesStreamError::Codec(
+                        "Responses reasoning limit exceeded",
+                    ))?;
                 self.items.insert(index, event["item"].clone());
+                self.reasoning_parts = parts;
+                self.reasoning_bytes = bytes;
             }
             "response.completed" => {
                 let response = &event["response"];
@@ -820,11 +959,13 @@ impl ResponseAccumulator {
                     "Too many Responses output items",
                 ));
             }
+            validate_reasoning_budget(items.iter()).map_err(ResponsesStreamError::Codec)?;
             items
                 .iter()
                 .map(|item| replay_item(item, false))
                 .collect::<Result<Vec<_>, _>>()
         } else {
+            validate_reasoning_budget(self.items.values()).map_err(ResponsesStreamError::Codec)?;
             self.items
                 .values()
                 .map(|item| replay_item(item, false))

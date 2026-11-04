@@ -901,6 +901,44 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_reasoning_is_redacted_and_replayed_after_canonical_restore() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
+        let connection = uuid::Uuid::new_v4().to_string();
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let output = ResponseOutput {
+            items: vec![
+                json!({"type":"reasoning", "id":"rs", "summary":[], "content":[
+                    {"type":"reasoning_text", "text":format!("inspect {secret}")}
+                ]}),
+                json!({"type":"function_call", "id":"fc", "call_id":"c1", "name":"read_file"}),
+            ],
+            ..Default::default()
+        };
+        let mut assistant = json!({"role":"assistant", "content":"", "tool_calls":[
+            {"id":"c1", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}
+        ]});
+        assistant[CONTINUATION_KEY] = output.continuation(&connection, "model");
+        let messages = vec![
+            json!({"role":"user", "content":"inspect"}),
+            assistant,
+            json!({"role":"tool", "tool_call_id":"c1", "content":"done"}),
+        ];
+        let committed = sanitize_canonical_turn_delta_with_turn_semantics(messages, false).unwrap();
+        assert!(!json!(committed).to_string().contains(secret));
+        let restored =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+        let wire = request("model", &restored, None, &connection, false, None).unwrap();
+        let reasoning = &wire["input"][1]["content"][0]["text"];
+        assert!(reasoning.as_str().unwrap().contains("[REDACTED:"));
+        assert!(!wire.to_string().contains(secret));
+        assert!(
+            !json!(sanitize_user_visible_messages(restored))
+                .to_string()
+                .contains("reasoning_text")
+        );
+    }
+
+    #[test]
     fn canonical_history_replays_reasoning_only_responses_after_restore() {
         use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
         let connection = uuid::Uuid::new_v4().to_string();

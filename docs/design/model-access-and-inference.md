@@ -144,13 +144,17 @@ conversation prefixes without dropping optional or required context. Custom
 OpenAI-compatible gateways retain their existing provider defaults because their
 message and caching semantics are not established by the API format alone.
 Functions use the standard flat Responses tool format. Completed provider output items,
-including encrypted reasoning and message phase, live in private canonical
-assistant-message metadata before tool execution/final checkpoint. Stateless
-Responses return encrypted reasoning without an `include` override. If a tool
-round contains reasoning without replayable encrypted content, Astra stops
-before executing its calls. Opaque provider-encrypted reasoning is base64
-encoded for storage so generic text
-redaction cannot corrupt ciphertext. Function arguments come from the canonical
+including reasoning and message phase, live in private canonical assistant-message
+metadata before tool execution/final checkpoint. Stateless OpenAI Responses
+returns encrypted reasoning without an `include` override; compatible endpoints
+can instead return replayable `reasoning_text` content. A tool round containing
+a reasoning item without replayable content stops before executing its calls.
+Opaque provider-encrypted reasoning is base64 encoded for storage so generic
+text redaction cannot corrupt ciphertext; plaintext reasoning uses the normal
+credential-redaction boundary. Raw reasoning is omitted from user-visible streams,
+observers and diagnostic artifacts. Owner-authenticated canonical resume and
+segment APIs retain the redacted continuation so clients can restore the same
+conversation. Function arguments come from the canonical
 assistant tool calls; private metadata retains no second raw argument copy. Resume
 replays them only for the same connection and model; other protocols remove
 that metadata at the existing internal-marker projection boundary. No

@@ -523,6 +523,14 @@ pub(super) async fn collect(
                             },
                         }
                     })?;
+                    if event["type"] == "response.reasoning_text.delta"
+                        && event["delta"]
+                            .as_str()
+                            .is_some_and(|delta| !delta.trim().is_empty())
+                    {
+                        idle_deadline =
+                            tokio::time::Instant::now() + stream_idle_timeout_after_progress();
+                    }
                     if let Some((delta, reasoning)) = delta {
                         if !delta.trim().is_empty() {
                             idle_deadline =

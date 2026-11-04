@@ -17551,6 +17551,11 @@ mod tests {
             state
                 .messages
                 .push(serde_json::json!({"role":"user","content":"current request"}));
+            if condition == "success" {
+                state.messages[1][astra_core::model_wire::responses::CONTINUATION_KEY] = serde_json::json!({
+                    "items":[{"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}]
+                });
+            }
             let original = state.messages.clone();
             if condition == "cancel" || condition == "late-cancel" {
                 let token = Arc::new(tokio_util::sync::CancellationToken::new());
@@ -17568,7 +17573,16 @@ mod tests {
                 assert_eq!(state.messages.last(), original.last());
                 let stored: Vec<serde_json::Value> =
                     serde_json::from_str(&host.history_artifacts[0].transcript_json).unwrap();
-                assert_eq!(stored, original[..stored.len()]);
+                let expected: Vec<_> = original[..stored.len()]
+                    .iter()
+                    .map(astra_core::model_wire::responses::without_continuation)
+                    .collect();
+                assert_eq!(stored, expected);
+                assert!(
+                    !host.history_artifacts[0]
+                        .transcript_json
+                        .contains("reasoning_text")
+                );
             } else {
                 assert!(result.is_none(), "{condition}");
                 assert_eq!(state.messages, original, "{condition}");
@@ -21007,7 +21021,11 @@ async fn spill_old_messages_to_artifact(
     }
     let session_id = state.current_session_id.as_deref()?;
     let run_id = state.current_run_id.as_deref()?;
-    let transcript = serde_json::to_string(&state.messages[..count]).ok()?;
+    let transcript: Vec<_> = state.messages[..count]
+        .iter()
+        .map(astra_core::model_wire::responses::without_continuation)
+        .collect();
+    let transcript = serde_json::to_string(&transcript).ok()?;
     let history =
         astra_turn_types::ContextHistoryArtifactV1::new(session_id, run_id, count, transcript)
             .ok()?;

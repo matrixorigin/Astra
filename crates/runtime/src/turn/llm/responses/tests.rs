@@ -25,6 +25,94 @@ struct Attempts {
     snapshots: Mutex<Vec<super::UsageSnapshot>>,
 }
 
+#[tokio::test(start_paused = true)]
+async fn raw_reasoning_is_private_but_keeps_the_stream_alive() {
+    use futures_util::{StreamExt, stream};
+    use std::collections::HashSet;
+
+    struct Timeouts;
+    impl Drop for Timeouts {
+        fn drop(&mut self) {
+            super::super::TEST_STREAM_IDLE_TIMEOUT.with(|value| *value.borrow_mut() = None);
+            super::super::TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS
+                .with(|value| *value.borrow_mut() = None);
+        }
+    }
+    super::super::TEST_STREAM_IDLE_TIMEOUT
+        .with(|value| *value.borrow_mut() = Some(Duration::from_millis(100)));
+    super::super::TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS
+        .with(|value| *value.borrow_mut() = Some(Duration::from_millis(100)));
+    let _timeouts = Timeouts;
+    let terminal = json!({"type":"response.completed", "response":{
+        "status":"completed", "output":[{"type":"message", "role":"assistant", "content":[
+            {"type":"output_text", "text":"done"}
+        ]}]
+    }});
+    for (delta, budget, should_succeed) in [
+        (json!("private reasoning"), None, true),
+        (json!("  "), None, false),
+        (json!(12), None, false),
+        (
+            json!("private reasoning"),
+            Some(Duration::from_millis(250)),
+            false,
+        ),
+    ] {
+        let raw = json!({"type":"response.reasoning_text.delta", "delta":delta});
+        let events = vec![raw.clone(), raw.clone(), raw, terminal.clone()];
+        let stream = stream::iter(events).then(|event| async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok::<_, std::io::Error>(format!("data: {event}\n\n"))
+        });
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(200)
+                .body(reqwest::Body::wrap_stream(stream))
+                .unwrap(),
+        );
+        let route = LlmExecutionRoute {
+            inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+            response_scope: Some("scope"),
+            subscription: None,
+            fixed_temperature: None,
+            supported_reasoning_efforts: None,
+            thinking_protocol: None,
+            model_name: "model",
+            wire_model_name: None,
+            api_key: "key",
+            base_url: "http://localhost",
+            provider: "openai",
+            header_overrides: None,
+            request_body_overrides: None,
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let result = collect(
+            response,
+            route,
+            &HashSet::new(),
+            LlmCancel::None,
+            Some(&mut callback),
+            tokio::time::Instant::now().into_std(),
+            budget,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.is_ok(), should_succeed);
+        if let Ok(result) = result {
+            assert_eq!(result.full_text, "done");
+            assert!(result.reasoning.is_empty());
+        }
+        assert!(
+            updates.is_empty(),
+            "raw reasoning must not reach user callbacks"
+        );
+    }
+}
+
 #[tokio::test]
 async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     use axum::{
@@ -70,6 +158,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             }
             let malformed = body["input"].to_string().contains("malformed terminal");
             let oversized = body["input"].to_string().contains("oversized terminal");
+            let plaintext = body["input"].to_string().contains("plaintext case");
             let fresh_turn = body["input"].to_string().contains("start a new turn");
             let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
             requests.lock().unwrap().push(body);
@@ -82,6 +171,9 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
                 json!(items)
             } else if continued || fresh_turn {
                 json!([{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}])
+            } else if plaintext {
+                json!([{"type":"reasoning","id":"rs-plain","summary":[],"content":[{"type":"reasoning_text","text":"check the file"}]},
+                    {"type":"function_call","id":"fn-1","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             } else {
                 json!([{"type":"reasoning","id":"reason-1","encrypted_content":"ciphertext","summary":[]},
                     {"type":"function_call","id":"fn-1","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
@@ -904,6 +996,58 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             .unwrap()
             .to_string()
             .contains("missing-call")
+    );
+    let mut plaintext_history = vec![json!({"role":"user", "content":"plaintext case"})];
+    let default_thinking = ThinkingConfig::ModelDefault;
+    let first = call_llm_and_collect_with_stream_callback(
+        call(&plaintext_history, &tools, &scope, &base, &default_thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    plaintext_history.push(
+        json!({"role":"assistant", "content":"", "tool_calls":first.tool_calls,
+        astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}),
+    );
+    plaintext_history.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
+    let committed =
+        astra_turn_core::prompt_facing::sanitize_canonical_turn_delta_with_turn_semantics(
+            plaintext_history,
+            false,
+        )
+        .unwrap();
+    let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+    let second = call_llm_and_collect_with_stream_callback(
+        call(&restored, &tools, &scope, &base, &default_thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.full_text, "done");
+    let requests = wire_requests.lock().unwrap();
+    let input = &requests.last().unwrap()["input"];
+    assert!(
+        input
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning"
+                && item["content"][0]["text"] == "check the file")
+    );
+    assert!(
+        input
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call-1")
     );
     server.abort();
 }
