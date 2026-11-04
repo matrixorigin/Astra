@@ -30,6 +30,9 @@ request. Only positively supported thinking suppression uses the short recovery
 slice; low effort, mandatory thinking and preserved exact controls retain the
 ordinary provider budget, always clamped by the run's original deadline. A
 recovery cannot start host continuations or silently switch models.
+An empty response interrupted before any text or tool call is delivery evidence
+too; it does not prove the provider never received or billed the request. The
+prior attempt retains its unknown delivery status before the new attempt starts.
 
 Scheduling the recovery publishes a lifecycle observation before the next
 provider wait. If that bounded recovery also fails, the interruption retains
@@ -853,6 +856,17 @@ Cancellation is a state transition with cleanup obligations:
 - expose resumability status.
 
 Hard stop is reserved for safety or consistency boundaries. Prefer precise degraded states when possible.
+
+An unsettled workspace owner does not prevent a later turn from answering or
+reading the workspace. The workspace executor continues to reject conflicting
+writes until ownership is settled; an earlier unknown outcome is not
+automatically replayed or promoted to a verified result by the later turn.
+Canceling a stalled, side-effect-free observation does not quarantine the
+workspace.
+When a cancelled local operation is still cleaning up, its existing executor
+continues to own the workspace until it stops. Other writers wait on that
+same ownership; cleanup delay alone does not make the workspace permanently
+unavailable.
 
 Server-local MCP invocations propagate the admitted run cancellation token to
 both the ordinary MCP client and stateless Agent Binding HTTP calls. Cancellation

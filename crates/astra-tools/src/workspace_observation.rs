@@ -900,22 +900,12 @@ impl MacOsGenerationTamperWatch {
     }
 
     fn is_untampered_before_poll(&self, before_poll: impl FnOnce()) -> bool {
+        self.is_untampered_with_poll(before_poll, || self.poll_event())
+    }
+
+    fn poll_event(&self) -> std::io::Result<bool> {
         use std::os::fd::AsRawFd;
 
-        if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-        before_poll();
-        let Ok(_poll_guard) = self.poll_gate.lock() else {
-            self.tampered
-                .store(true, std::sync::atomic::Ordering::Release);
-            return false;
-        };
-        // Another validator may have consumed the event while we waited.
-        // EV_CLEAR's empty queue must never undo permanent revocation.
-        if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
         let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
         let timeout = libc::timespec {
             tv_sec: 0,
@@ -931,12 +921,46 @@ impl MacOsGenerationTamperWatch {
                 &raw const timeout,
             )
         };
-        if event_count != 0 {
+        if event_count < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(event_count != 0)
+        }
+    }
+
+    fn is_untampered_with_poll(
+        &self,
+        before_poll: impl FnOnce(),
+        mut poll: impl FnMut() -> std::io::Result<bool>,
+    ) -> bool {
+        if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        before_poll();
+        let Ok(_poll_guard) = self.poll_gate.lock() else {
             self.tampered
                 .store(true, std::sync::atomic::Ordering::Release);
             return false;
+        };
+        // Another validator may have consumed the event while we waited.
+        // EV_CLEAR's empty queue must never undo permanent revocation.
+        if self.tampered.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
         }
-        true
+        loop {
+            match poll() {
+                Ok(false) => return true,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "workspace generation watch failed");
+                    }
+                    self.tampered
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -7228,6 +7252,71 @@ mod tests {
         .expect("independent workspace generation");
         assert!(first.integrity_valid());
         assert!(second.integrity_valid());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_interrupted_watch_poll_retries_without_losing_tamper_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let lease = acquire_workspace_observation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let watch = &lease.tamper_watch.watcher;
+        let mut attempts = 0;
+        assert!(watch.is_untampered_with_poll(
+            || {},
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    watch.poll_event()
+                }
+            }
+        ));
+        assert_eq!(attempts, 2);
+        assert!(lease.coordination_integrity_valid());
+
+        fs::write(&lease.locks[0].path, "tamper").unwrap();
+        let mut attempts = 0;
+        assert!(!watch.is_untampered_with_poll(
+            || {},
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    watch.poll_event()
+                }
+            }
+        ));
+        assert_eq!(attempts, 2);
+        assert!(!watch.is_untampered(), "real tampering remains sticky");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_watch_poll_failure_still_revokes_integrity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let lease = acquire_workspace_observation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let watch = &lease.tamper_watch.watcher;
+        assert!(
+            !watch.is_untampered_with_poll(
+                || {},
+                || Err(std::io::Error::from_raw_os_error(libc::EIO))
+            )
+        );
+        assert!(!watch.is_untampered());
     }
 
     #[cfg(target_os = "macos")]

@@ -334,6 +334,10 @@ mod tests {
 
     #[async_trait]
     impl ServerLocalToolTransport for NoopLocalTransport {
+        fn owned_transport(&self) -> Option<Arc<dyn ServerLocalToolTransport>> {
+            Some(Arc::new(NoopLocalTransport))
+        }
+
         async fn execute_server_local_tool(
             &self,
             request: &ToolExecutionRequest,

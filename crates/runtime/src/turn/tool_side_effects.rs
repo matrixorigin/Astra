@@ -49,6 +49,10 @@ pub fn tool_call_may_mutate_workspace(name: &str, args: Option<&Value>) -> bool 
         return true;
     }
 
+    if name == "lsp" {
+        return args.is_none_or(astra_runtime_env::lsp_action_requires_write);
+    }
+
     if astra_turn_core::cloud_approval_policy::is_cloud_execute_tool(name) {
         return args
             .and_then(astra_turn_core::tool_argument_hints::command_hint_from_args)
@@ -157,6 +161,9 @@ pub(crate) fn tool_name_invalidates_read_cache(name: &str) -> bool {
 /// True when a successful tool call should evict read-only idempotency cache
 /// entries. Argument-classified tools require their mutating argument form.
 pub fn tool_call_invalidates_read_cache(name: &str, args: Option<&Value>) -> bool {
+    if name == "lsp" {
+        return tool_call_may_mutate_workspace(name, args);
+    }
     if tool_name_invalidates_read_cache(name) {
         return true;
     }
@@ -199,6 +206,26 @@ pub fn tool_call_may_mutate_any_state(name: &str, args: Option<&Value>) -> bool 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lsp_applied_edits_are_workspace_side_effects() {
+        for (dry_run, may_write) in [(true, false), (false, true)] {
+            let args = serde_json::json!({"operation": "rename", "dry_run": dry_run});
+            assert_eq!(
+                super::tool_call_may_mutate_workspace("lsp", Some(&args)),
+                may_write
+            );
+            assert_eq!(
+                super::tool_call_may_mutate_any_state("lsp", Some(&args)),
+                may_write
+            );
+            assert_eq!(
+                super::tool_call_invalidates_read_cache("lsp", Some(&args)),
+                may_write
+            );
+        }
+        assert!(super::tool_call_may_mutate_workspace("lsp", None));
+    }
+
     #[test]
     fn session_worktree_switches_invalidate_workspace_reads() {
         for action in ["enter", "exit"] {

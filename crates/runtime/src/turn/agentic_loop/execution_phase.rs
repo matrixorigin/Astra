@@ -1240,6 +1240,40 @@ pub(crate) fn workspace_observation_is_quarantined(state: &AgenticLoopState) -> 
             .unwrap_or(false)
 }
 
+// The workspace executor prevents conflicting writes while an owner is
+// unsettled. Its fence is not evidence that a new read-only turn performed a
+// mutation, and must not prevent the user from inspecting or continuing it.
+fn unsettled_workspace_affects_current_execution(state: &AgenticLoopState) -> bool {
+    state
+        .hooks
+        .workspace_root_hint
+        .as_deref()
+        .and_then(|root| {
+            astra_tools::workspace_observation::workspace_ownership_is_unsettled(
+                std::path::Path::new(root),
+            )
+        })
+        .unwrap_or(false)
+        && state.stall.tool_call_records.iter().any(|record| {
+            (record.was_executed()
+                || (!record.ok
+                    && record.effective_disposition()
+                        == astra_services::session_journal::ToolCallDisposition::Rejected))
+                && (crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
+                    &record.name,
+                    super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
+                ) || record.workspace_writer_applied_bound == Some(true)
+                    || (record.workspace_mutation_observed == Some(true)
+                        && record.workspace_mutation_scope.as_deref()
+                            == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE))
+                    || record.workspace_mutation_partial == Some(true)
+                    || record
+                        .workspace_mutation_partial_paths
+                        .as_ref()
+                        .is_some_and(|paths| !paths.is_empty()))
+        })
+}
+
 /// Whether the observation state is strong enough to make a user-visible
 /// completion claim impossible.
 ///
@@ -1254,16 +1288,7 @@ pub(crate) fn workspace_observation_is_quarantined(state: &AgenticLoopState) -> 
 pub(crate) fn workspace_observation_requires_terminal_incomplete(state: &AgenticLoopState) -> bool {
     state.stall.workspace_observation_quarantine.as_ref().is_some_and(|q| {
         q.reason != astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::WEAK_PROCESS_OWNERSHIP_REASON
-    }) || state
-        .hooks
-        .workspace_root_hint
-        .as_deref()
-        .and_then(|root| {
-            astra_tools::workspace_observation::workspace_ownership_is_unsettled(
-                std::path::Path::new(root),
-            )
-        })
-        .unwrap_or(false)
+    }) || unsettled_workspace_affects_current_execution(state)
 }
 
 /// A volatile scratch mutation may be ignored by the workspace observation
@@ -2363,7 +2388,10 @@ fn mark_workspace_completion_incomplete(
     state.final_text_streamed = false;
     state.interruption = Some(InterruptionRecord::new(
         InterruptionKind::ExecutionIncomplete,
-        ResumeAction::ContinueImmediately,
+        ResumeAction::RequiresIntervention {
+            description:
+                "Check whether the interrupted operation has stopped and review its changes.".into(),
+        },
         interruption_state_summary(state, Some(detail.to_string())),
     ));
 }
@@ -3089,7 +3117,8 @@ fn record_repeated_transport_success_empty_completion(
 /// A partial provider delivery is never replayed blindly. Visible text can be
 /// an externally observable deliverable, and a selected tool can be a pending
 /// side effect, so either one makes a new provider attempt unsafe. The only
-/// recoverable shape is provisional reasoning with no text and no tool call.
+/// recoverable shape has no delivered text or tool call, including a failure
+/// before the provider starts its response.
 fn schedule_safe_provider_recovery(
     state: &mut AgenticLoopState,
     error: &astra_core::ClassifiedError,
@@ -3154,24 +3183,19 @@ fn schedule_safe_provider_recovery(
     if state.remaining_turns == 0 && !terminal_text_only_recovery {
         return false;
     }
-    // A semantic-progress deadline is a known safe convergence boundary even
-    // when the provider did not expose reasoning. Transport/idle failures need
-    // affirmative partial-attempt evidence: otherwise an error from before
-    // delivery must remain fail-closed rather than becoming a retry loop.
+    // Transport/idle failures require typed delivery evidence; an error with
+    // missing evidence must not be treated as an empty response.
     let transport_or_idle = matches!(
         error.kind,
         astra_core::ErrorKind::StreamTransport | astra_core::ErrorKind::StreamIdle
     );
-    let recovery_evidence = observed_provisional_reasoning
+    let recovery_evidence = (transport_or_idle && explicit_transport_partial)
         || (error.kind == astra_core::ErrorKind::ProviderDeadline
-            && (semantic_progress_deadline
+            && (observed_provisional_reasoning
+                || semantic_progress_deadline
                 || provider_completed_without_delivery
                 || transport_success_empty_completion));
-    if !no_visible_text
-        || !no_selected_tool
-        || !recovery_evidence
-        || (transport_or_idle && !explicit_transport_partial)
-    {
+    if !no_visible_text || !no_selected_tool || !recovery_evidence {
         return false;
     }
 
@@ -7208,7 +7232,8 @@ mod tests {
     use crate::observability::ObservabilityHub;
     use crate::server::run::engine::RunEngine;
     use crate::turn::agentic_loop::host::tests::{
-        MockHost, edge_tool_result, make_edge_tool, make_state, server_tool_result, text_result,
+        MockHost, edge_runtime_environment_fields, edge_tool_result, make_edge_tool, make_state,
+        server_tool_result, text_result,
     };
     use crate::turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, AppliedUserIntent, VolatileKind,
@@ -9520,6 +9545,103 @@ mod tests {
             state.interruption.as_ref().unwrap().kind,
             InterruptionKind::ExecutionIncomplete
         );
+        assert!(matches!(
+            state.interruption.as_ref().unwrap().resume_action,
+            ResumeAction::RequiresIntervention { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsettled_workspace_allows_reads_but_not_rejected_write_completion() {
+        let workspace = tempfile::tempdir().unwrap();
+        let markers =
+            astra_tools::workspace_observation::workspace_coordination_paths_for_diagnostics(
+                workspace.path(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|path| path.with_extension("unsettled"))
+            .collect::<Vec<_>>();
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                workspace.path()
+            )
+        );
+
+        let mut state = make_state();
+        state.hooks.workspace_root_hint = Some(workspace.path().to_string_lossy().into_owned());
+        state
+            .hooks
+            .stop_hooks
+            .push(explicit_verification_hook("quality", "./quality-gate"));
+        state.messages.extend([
+            serde_json::json!({"role": "user", "content": "Run the checks."}),
+            serde_json::json!({"role": "assistant", "tool_calls": [{
+                "id": "previous-call",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{\"command\":\"cargo test\"}"}
+            }]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "previous-call", "content": "The command timed out; its outcome is unverified."}),
+            serde_json::json!({"role": "user", "content": "Continue by inspecting the saved progress."}),
+        ]);
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "saved progress")],
+                1,
+                1,
+                None,
+            ),
+            text_result("The prior operation is unverified.", 1, 1, None),
+        ])
+        .with_valid_tools(&["read_file"]);
+        let result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        let blocked_write =
+            astra_tools::workspace_observation::acquire_workspace_observation_lease_with_options(
+                workspace.path(),
+                None,
+                std::time::Duration::from_millis(20),
+            )
+            .await;
+        let mut rejected = make_edge_tool("write_file", "The write was not executed.");
+        rejected.args = serde_json::json!({"path": "new.txt", "content": "change"});
+        rejected.status = "failed".into();
+        let mut fields = edge_runtime_environment_fields();
+        fields.insert("disposition".into(), serde_json::json!("rejected"));
+        fields.insert("execution_started".into(), serde_json::json!(false));
+        fields.insert(
+            "error_kind".into(),
+            serde_json::json!(astra_tools::TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED),
+        );
+        rejected.tool_result_fields = Some(fields);
+        let mut write_host = MockHost::new(vec![
+            edge_tool_result(vec![rejected], 1, 1, None),
+            text_result("The write succeeded.", 1, 1, None),
+        ])
+        .with_valid_tools(&["write_file"]);
+        let mut write_state = make_state();
+        write_state.hooks.workspace_root_hint =
+            Some(workspace.path().to_string_lossy().into_owned());
+        let write_result = run_agentic_loop_with_host(&mut write_host, &mut write_state).await;
+        for marker in markers {
+            let _ = std::fs::remove_file(marker);
+        }
+
+        assert!(matches!(result, Ok(AgenticLoopOutcome::Completed)));
+        assert_eq!(host.turn_count(), 2);
+        assert_eq!(state.final_text, "The prior operation is unverified.");
+        assert!(state.interruption.is_none());
+        assert_eq!(state.stall.tool_call_records.len(), 1);
+        assert_eq!(state.stall.tool_call_records[0].name, "read_file");
+        assert!(matches!(
+            blocked_write,
+            Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
+        ));
+        assert!(matches!(write_result, Ok(AgenticLoopOutcome::Completed)));
+        assert_eq!(write_host.turn_count(), 1);
+        assert_eq!(
+            write_state.interruption.as_ref().map(|record| record.kind),
+            Some(InterruptionKind::ExecutionIncomplete)
+        );
     }
 
     fn explicit_verification_action(state: &mut AgenticLoopState) -> CompletionAction {
@@ -10843,6 +10965,17 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
+
+        let mut lsp_state = make_state();
+        lsp_state.hooks.workspace_root_hint = Some(temp.path().to_string_lossy().into_owned());
+        lsp_state.stall.tool_call_records.push(executed_record(
+            "lsp",
+            true,
+            Some(r#"{"operation":"rename","dry_run":false}"#),
+        ));
+        assert!(workspace_observation_requires_terminal_incomplete(
+            &lsp_state
+        ));
     }
 
     #[test]
@@ -15481,6 +15614,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_before_response_continues_same_turn() {
+        let mut state = make_state();
+        state.remaining_turns = 3;
+        let mut failed = DirectErrorHost::new(
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::StreamTransport,
+                "provider disconnected before its response",
+            )
+            .with_details_json(
+                serde_json::json!({
+                    "partial_full_text": "",
+                    "partial_reasoning": "",
+                    "tool_calls": []
+                })
+                .to_string(),
+            ),
+        );
+        let prep = || TurnIterationPrep {
+            quiet: true,
+            turn_start_time: Instant::now(),
+        };
+        assert!(matches!(
+            execute_turn_and_ingest_phase(&mut failed, &mut state, 0, prep())
+                .await
+                .unwrap(),
+            TurnExecutionControl::ContinueLoop
+        ));
+
+        let mut resumed = MockHost::new(vec![text_result("finished", 12, 3, None)]);
+        let next = execute_turn_and_ingest_phase(&mut resumed, &mut state, 1, prep())
+            .await
+            .expect("the existing turn can complete after the connection recovers");
+        assert!(!matches!(next, TurnExecutionControl::ContinueLoop));
+        assert_eq!(state.final_text, "finished");
+        assert!(state.interruption.is_none());
+        assert!(state.stall.tool_call_records.is_empty());
+    }
+
+    #[tokio::test]
     async fn direct_provider_admission_rejection_records_interruption_without_provider_cooldown() {
         let mut state = make_state();
         let mut host = DirectErrorHost::new(
@@ -16868,6 +17040,25 @@ mod tests {
             "the recovery boundary must be consumed exactly once"
         );
 
+        let mut provider_deadline = make_state();
+        provider_deadline.remaining_turns = 3;
+        let reasoning_only = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "provider work deadline",
+        )
+        .with_details_json(
+            serde_json::json!({
+                "partial_full_text": "",
+                "partial_reasoning": "provisional",
+                "tool_calls": []
+            })
+            .to_string(),
+        );
+        assert!(schedule_safe_provider_recovery(
+            &mut provider_deadline,
+            &reasoning_only
+        ));
+
         let mut whitespace_state = make_state();
         whitespace_state.remaining_turns = 3;
         let whitespace_error = astra_core::ClassifiedError::new(
@@ -17396,7 +17587,7 @@ mod tests {
 
     #[test]
     fn safe_provider_recovery_never_supersedes_visible_or_tool_output() {
-        for details in [
+        let partials = [
             serde_json::json!({
                 "deadline": {"phase": "semantic_progress"},
                 "partial_full_text": "visible partial",
@@ -17409,16 +17600,20 @@ mod tests {
                 "partial_reasoning": "thinking",
                 "tool_calls": [{"function": {"name": "read_file", "arguments": "{}"}}]
             }),
+        ];
+        for kind in [
+            astra_core::ErrorKind::ProviderDeadline,
+            astra_core::ErrorKind::StreamTransport,
+            astra_core::ErrorKind::StreamIdle,
         ] {
-            let mut state = make_state();
-            state.remaining_turns = 3;
-            let error = astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ProviderDeadline,
-                "action deadline",
-            )
-            .with_details_json(details.to_string());
-            assert!(!schedule_safe_provider_recovery(&mut state, &error));
-            assert!(!state.provider_adaptation.safe_recovery_pending);
+            for details in &partials {
+                let mut state = make_state();
+                state.remaining_turns = 3;
+                let error = astra_core::ClassifiedError::new(kind, "interrupted provider response")
+                    .with_details_json(details.to_string());
+                assert!(!schedule_safe_provider_recovery(&mut state, &error));
+                assert!(!state.provider_adaptation.safe_recovery_pending);
+            }
         }
     }
 
@@ -17457,7 +17652,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_transport_without_partial_attempt_evidence_fails_closed() {
+    fn stream_transport_with_no_delivery_recovers_once() {
         let mut state = make_state();
         state.remaining_turns = 3;
         let error = astra_core::ClassifiedError::new(
@@ -17473,8 +17668,9 @@ mod tests {
             .to_string(),
         );
 
+        assert!(schedule_safe_provider_recovery(&mut state, &error));
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(!schedule_safe_provider_recovery(&mut state, &error));
-        assert!(!state.provider_adaptation.safe_recovery_pending);
     }
 
     #[test]

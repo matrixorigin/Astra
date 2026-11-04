@@ -456,6 +456,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
+    if let Some(executor) = state.runtime_tool_executor.as_ref() {
+        executor.bind_shared();
+    }
     host.on_turn_started(state);
     // Owned before the first await so task cancellation and panic unwinding
     // settle the same producer queue as normal and error returns.

@@ -1474,7 +1474,8 @@ fn dynamic_tool_spec(name: &str) -> Option<ToolSpec> {
     None
 }
 
-fn lsp_action_requires_write(args: &Value) -> bool {
+/// LSP operations apply workspace edits only when dry-run is explicitly disabled.
+pub fn lsp_action_requires_write(args: &Value) -> bool {
     matches!(args.get("dry_run").and_then(Value::as_bool), Some(false))
 }
 

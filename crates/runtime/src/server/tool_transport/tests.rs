@@ -12,14 +12,15 @@ use super::super::tool_transport_metadata::{
 use super::super::tool_transport_plan::{EdgeBoundExecutionPlan, edge_executor_id};
 use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
 
+#[derive(Clone)]
 struct CountingLocalTransport {
-    calls: AtomicUsize,
+    calls: Arc<AtomicUsize>,
 }
 
 impl CountingLocalTransport {
     fn new() -> Self {
         Self {
-            calls: AtomicUsize::new(0),
+            calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -30,6 +31,10 @@ impl CountingLocalTransport {
 
 #[async_trait]
 impl ServerLocalToolTransport for CountingLocalTransport {
+    fn owned_transport(&self) -> Option<Arc<dyn ServerLocalToolTransport>> {
+        Some(Arc::new(self.clone()))
+    }
+
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
@@ -40,14 +45,15 @@ impl ServerLocalToolTransport for CountingLocalTransport {
     }
 }
 
+#[derive(Clone)]
 struct CapturingLocalTransport {
-    args: Mutex<Option<Value>>,
+    args: Arc<Mutex<Option<Value>>>,
 }
 
 impl CapturingLocalTransport {
     fn new() -> Self {
         Self {
-            args: Mutex::new(None),
+            args: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -62,6 +68,10 @@ impl CapturingLocalTransport {
 
 #[async_trait]
 impl ServerLocalToolTransport for CapturingLocalTransport {
+    fn owned_transport(&self) -> Option<Arc<dyn ServerLocalToolTransport>> {
+        Some(Arc::new(self.clone()))
+    }
+
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
@@ -72,16 +82,17 @@ impl ServerLocalToolTransport for CapturingLocalTransport {
     }
 }
 
+#[derive(Clone)]
 struct PendingLocalTransport {
-    calls: AtomicUsize,
-    execute_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    calls: Arc<AtomicUsize>,
+    execute_started: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl PendingLocalTransport {
     fn new(execute_started: tokio::sync::oneshot::Sender<()>) -> Self {
         Self {
-            calls: AtomicUsize::new(0),
-            execute_started: Mutex::new(Some(execute_started)),
+            calls: Arc::new(AtomicUsize::new(0)),
+            execute_started: Arc::new(Mutex::new(Some(execute_started))),
         }
     }
 
@@ -92,6 +103,10 @@ impl PendingLocalTransport {
 
 #[async_trait]
 impl ServerLocalToolTransport for PendingLocalTransport {
+    fn owned_transport(&self) -> Option<Arc<dyn ServerLocalToolTransport>> {
+        Some(Arc::new(self.clone()))
+    }
+
     async fn execute_server_local_tool(
         &self,
         _request: &ToolExecutionRequest,
@@ -1260,7 +1275,7 @@ async fn boundary_execution_uses_frozen_route_without_recomputing() {
     let boundary = ToolRouteBoundary::new(request, ToolExecutionRouteKind::Unsupported);
 
     let result = service
-        .execute_boundary_with_cancel(&boundary, &local, None)
+        .execute_boundary_with_cancel(&boundary, &local, None, false)
         .await;
 
     assert!(result.is_error, "{result:?}");
@@ -4237,7 +4252,7 @@ async fn selected_offer_route_mismatch_blocks_execution_without_provider_fallbac
         ToolExecutionRouteKind::ServerRuntime,
     );
     let result = service
-        .execute_boundary_with_cancel(&boundary, &local, None)
+        .execute_boundary_with_cancel(&boundary, &local, None, false)
         .await;
 
     assert!(result.is_error, "{result:?}");

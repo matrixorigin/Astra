@@ -1217,7 +1217,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 &subrun_session_id,
                 invocation_ledger.clone(),
             )?;
-            state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
+            state.runtime_tool_executor = Some(executor.into_shared());
         }
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;

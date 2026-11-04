@@ -733,6 +733,8 @@ pub(crate) enum DelegationPreparationError {
 }
 
 pub struct RuntimeToolExecutor {
+    /// Weak handle to the same shared executor, for retaining in-flight cleanup.
+    execution_owner: std::sync::OnceLock<std::sync::Weak<RuntimeToolExecutor>>,
     // ── Identity ──────────────────────────────────────────────────────────────
     /// Workspace root for this session.
     pub(super) workspace_root: PathBuf,
@@ -946,6 +948,16 @@ pub struct RuntimeToolExecutor {
 }
 
 impl RuntimeToolExecutor {
+    pub(crate) fn into_shared(self) -> Arc<Self> {
+        let owner = Arc::new(self);
+        owner.bind_shared();
+        owner
+    }
+
+    pub(crate) fn bind_shared(self: &Arc<Self>) {
+        let _ = self.execution_owner.set(Arc::downgrade(self));
+    }
+
     pub(crate) fn clear_desired_state_convergence_authority(
         &self,
         run_id: &str,
@@ -993,6 +1005,7 @@ impl RuntimeToolExecutor {
         let tool_engine = tool_handlers::runtime_tool_engine();
 
         Self {
+            execution_owner: std::sync::OnceLock::new(),
             workspace_root: workspace_root.clone(),
             user_id,
             session_id: session_id.clone(),
@@ -4528,6 +4541,7 @@ impl RuntimeToolExecutor {
             work_surface_events: &self.work_surface_events,
             binding_fields: route_binding_fields,
             cancel_token: cancel_token.clone(),
+            is_observation,
             route_observer,
         };
         let route = durable_invocation
@@ -5734,6 +5748,21 @@ mod runtime_environment_denial_tests {
 impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolExecutionResult>
     for RuntimeToolExecutor
 {
+    fn owned_transport(
+        &self,
+    ) -> Option<
+        Arc<
+            dyn ServerLocalToolTransport<
+                crate::server::tool_local_transport::RuntimeToolExecutionResult,
+            >,
+        >,
+    > {
+        self.execution_owner
+            .get()?
+            .upgrade()
+            .map(|owner| owner as _)
+    }
+
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,

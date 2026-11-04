@@ -1954,14 +1954,18 @@ pub(crate) mod tests {
             &astra_runtime_env::ToolRegistry::default(),
         );
         let cancel = CancellationToken::new();
+        let executor = executor.into_shared();
         let execution = execute_local_transport(
             &invocation,
             &binding,
-            &invocation.workspace,
-            &invocation.executor,
-            ToolTransportKind::ServerLocal,
-            &executor,
+            (
+                &invocation.workspace,
+                &invocation.executor,
+                ToolTransportKind::ServerLocal,
+            ),
+            executor.as_ref(),
             Some(cancel.clone()),
+            false,
         );
         tokio::pin!(execution);
         tokio::select! {

@@ -684,8 +684,15 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let route = self.routing_decision(&request);
-        self.execute_with_route_and_cancel(request, route, local_transport, cancel_token)
-            .await
+        let is_observation = self.is_run_observation(&request).unwrap_or(false);
+        self.execute_with_route_and_cancel(
+            request,
+            route,
+            local_transport,
+            cancel_token,
+            is_observation,
+        )
+        .await
     }
 
     pub(crate) async fn execute_boundary_with_cancel<L, R>(
@@ -693,6 +700,7 @@ impl ToolExecutionService {
         boundary: &ToolRouteBoundary,
         local_transport: &L,
         cancel_token: Option<Arc<CancellationToken>>,
+        is_observation: bool,
     ) -> R
     where
         L: ServerLocalToolTransport<R> + ?Sized,
@@ -703,6 +711,7 @@ impl ToolExecutionService {
             boundary.route_kind(),
             local_transport,
             cancel_token,
+            is_observation,
         )
         .await
     }
@@ -713,6 +722,7 @@ impl ToolExecutionService {
         route: ToolExecutionRouteKind,
         local_transport: &L,
         cancel_token: Option<Arc<CancellationToken>>,
+        is_observation: bool,
     ) -> R
     where
         L: ServerLocalToolTransport<R> + ?Sized,
@@ -946,6 +956,7 @@ impl ToolExecutionService {
                     route,
                     local_transport,
                     cancel_token.map(|t| (*t).clone()),
+                    is_observation,
                 )
                 .await
             }
@@ -956,6 +967,7 @@ impl ToolExecutionService {
                     route,
                     local_transport,
                     cancel_token.map(|t| (*t).clone()),
+                    is_observation,
                 )
                 .await;
                 append_route_binding_metadata(result.result_mut(), route, &transport_request);
@@ -1117,6 +1129,7 @@ async fn execute_local_route<L, R>(
     route: ToolExecutionRouteKind,
     local_transport: &L,
     cancel_token: Option<CancellationToken>,
+    is_observation: bool,
 ) -> R
 where
     L: ServerLocalToolTransport<R> + ?Sized,
@@ -1127,11 +1140,10 @@ where
     execute_local_transport(
         request,
         binding,
-        &result_workspace,
-        &result_executor,
-        result_transport,
+        (&result_workspace, &result_executor, result_transport),
         local_transport,
         cancel_token,
+        is_observation,
     )
     .await
 }
@@ -1310,6 +1322,21 @@ mod tests {
         assert!(
             !service.is_run_observation(&request).unwrap(),
             "a provider cannot borrow builtin semantics through local-looking routing"
+        );
+        let mut provider_read = ExecutionBindingState::none().tool_execution_request(
+            "owner",
+            "session",
+            "read_file",
+            &serde_json::json!({"path":"file.txt"}),
+        );
+        provider_read.selected_offer = Some(SelectedToolOfferSnapshot::new_with_route(
+            "read_file",
+            "mcp:lookalike",
+            ToolExecutionRouteKind::RequestScopedMcp,
+        ));
+        assert!(
+            !service.is_run_observation(&provider_read).unwrap(),
+            "an external provider named like a read tool does not inherit its cleanup contract"
         );
         request.selected_offer.as_mut().unwrap().provider_id = "server-control-plane".into();
         request.runtime_edge_dispatch_authorization_required = true;
@@ -1621,12 +1648,17 @@ mod tests {
 
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[derive(Clone)]
     struct RecordingLocalTransport {
-        called: AtomicBool,
+        called: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
     impl ServerLocalToolTransport for RecordingLocalTransport {
+        fn owned_transport(&self) -> Option<Arc<dyn ServerLocalToolTransport>> {
+            Some(Arc::new(self.clone()))
+        }
+
         async fn execute_server_local_tool(
             &self,
             _request: &ToolExecutionRequest,
@@ -1641,7 +1673,7 @@ mod tests {
     async fn execution_does_not_bypass_admission_when_runtime_provider_is_not_safe() {
         let service = ToolExecutionService::new_for_test();
         let transport = RecordingLocalTransport {
-            called: AtomicBool::new(false),
+            called: Arc::new(AtomicBool::new(false)),
         };
         let mut runtime = astra_runtime_env::RuntimeBinding::host_process("runtime-no-isolation");
         runtime.isolation_backend = astra_runtime_env::RuntimeIsolationBackend::None;

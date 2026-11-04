@@ -44,6 +44,7 @@ where
     pub(crate) work_surface_events: &'a WorkSurfaceEventEmitter,
     pub(crate) binding_fields: Map<String, Value>,
     pub(crate) cancel_token: Option<Arc<CancellationToken>>,
+    pub(crate) is_observation: bool,
     pub(crate) route_observer: Option<Arc<dyn ToolRouteObserver>>,
 }
 
@@ -95,6 +96,7 @@ where
             &boundary,
             context.local_transport,
             context.cancel_token.clone(),
+            context.is_observation,
         )
         .await;
     annotate_default_executor_cancel_if_needed(&boundary.request().tool_name, &mut result);

@@ -455,7 +455,7 @@ pub fn workspace_lease_failure_tool_result(
         workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled => workspace_lease_result(
             TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED,
             format!(
-                "Tool '{name}' was not executed because a previous workspace owner did not settle; inspect or re-bind the workspace before continuing, and do not replay the call"
+                "Tool '{name}' was not executed because an earlier operation may still be changing this workspace. Inspect that operation and its changes."
             ),
             false,
         ),

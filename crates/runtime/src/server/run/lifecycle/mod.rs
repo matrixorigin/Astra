@@ -1757,7 +1757,7 @@ fn wire_executor_into_state(
     state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
 ) {
     executor.set_reply_obligations(Arc::clone(&state.messaging.reply_obligations));
-    let executor = std::sync::Arc::new(executor);
+    let executor = executor.into_shared();
     state.runtime_tool_executor = Some(executor);
 }
 

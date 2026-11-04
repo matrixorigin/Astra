@@ -1691,9 +1691,6 @@ fn llm_result_has_partial_signal(result: &LlmCallResult) -> bool {
 }
 
 fn llm_result_details_json(result: &LlmCallResult) -> Option<String> {
-    if !llm_result_has_partial_signal(result) {
-        return None;
-    }
     serde_json::to_string(&json!({
         "partial_full_text": result.full_text,
         "partial_reasoning": result.reasoning,
@@ -5661,7 +5658,12 @@ async fn call_prepared_llm_with_total_budget(
                         ),
                     )
                 };
-                let error = astra_core::ClassifiedError::new(kind, message);
+                // No response has arrived, so no text or tool call could
+                // have been delivered even though provider billing is unknown.
+                let error = attach_llm_result_details(
+                    astra_core::ClassifiedError::new(kind, message),
+                    &LlmCallResult::default(),
+                );
                 finish_observed_provider_delivery_unknown(
                     attempt_observer,
                     observed_attempt,
@@ -5704,6 +5706,9 @@ async fn call_prepared_llm_with_total_budget(
                             request_deadline.as_millis()
                         ),
                     );
+                }
+                if !retry_safe {
+                    error = attach_llm_result_details(error, &LlmCallResult::default());
                 }
                 if retry_safe {
                     finish_observed_provider_error(attempt_observer, observed_attempt, &error)
@@ -12063,6 +12068,69 @@ mod tests {
         assert_eq!(
             provider_attempt_terminal_from_error(&classified).status,
             astra_services::InferenceTerminalStatus::DeliveryUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_disconnect_before_headers_retains_empty_delivery_evidence() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            // The request reached the provider, but no response was delivered.
+        });
+        let messages = [json!({"role": "user", "content": "continue"})];
+        let base = format!("http://{address}");
+        let observer = RecordingAttemptObserver::default();
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+                    response_scope: Some("test-route"),
+                    subscription: None,
+                    fixed_temperature: None,
+                    supported_reasoning_efforts: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                thinking: &ThinkingConfig::ModelDefault,
+            },
+            LlmCancel::None,
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("disconnect must end the provider attempt");
+        server.await.unwrap();
+
+        assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
+        let details: Value = serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["partial_full_text"], "");
+        assert_eq!(details["partial_reasoning"], "");
+        assert_eq!(details["tool_calls"], json!([]));
+        assert_eq!(
+            *observer.finished.lock().unwrap(),
+            vec![(0, astra_services::InferenceTerminalStatus::DeliveryUnknown)]
         );
     }
 

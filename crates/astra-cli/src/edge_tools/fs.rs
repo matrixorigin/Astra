@@ -2438,6 +2438,45 @@ mod tests {
         ToolExecutor::new(dir)
     }
 
+    #[tokio::test]
+    async fn unsettled_workspace_allows_reads_but_rejects_writes() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("progress.txt"), "saved progress").unwrap();
+        let markers =
+            astra_tools::workspace_observation::workspace_coordination_paths_for_diagnostics(
+                workspace.path(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|path| path.with_extension("unsettled"))
+            .collect::<Vec<_>>();
+        assert!(
+            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                workspace.path()
+            )
+        );
+
+        let executor = test_executor_in(workspace.path());
+        let read = executor
+            .execute_with_metadata("read_file", &json!({"path":"progress.txt"}))
+            .await;
+        let write = executor
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path":"new.txt", "content":"must not be written"}),
+            )
+            .await;
+        let was_written = workspace.path().join("new.txt").exists();
+        for marker in markers {
+            let _ = std::fs::remove_file(marker);
+        }
+
+        assert!(!read.is_error, "{}", read.output);
+        assert!(read.output.contains("saved progress"));
+        assert!(write.is_error, "{}", write.output);
+        assert!(!was_written);
+    }
+
     /// Create a file large enough (>16KB) to avoid auto-expand on ranged reads.
     /// Returns known content lines like "line 1", "line 2", etc.
     fn write_large_file(dir: &std::path::Path, name: &str, num_lines: usize) {
