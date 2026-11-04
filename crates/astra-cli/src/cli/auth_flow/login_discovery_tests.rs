@@ -9,6 +9,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 async fn browser_login_completion_requires_registered_checkout_before_runtime_ready() {
     let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
     let _credentials = crate::tests::isolate_credentials();
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+    let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+    let _period = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_HEARTBEAT_SECS");
     let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
         "default",
         Some("browser-user"),
@@ -40,7 +44,11 @@ async fn browser_login_completion_requires_registered_checkout_before_runtime_re
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
-        let result = finish_browser_session_login(&api, None, false, &mut state).await;
+        let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+        let old_heartbeat = heartbeat.as_ref().unwrap().abort_handle();
+        let result =
+            finish_browser_session_login(&api, None, false, &mut state, &mut heartbeat).await;
+        assert!(old_heartbeat.is_finished());
         if status == 503 {
             assert!(
                 result
@@ -49,9 +57,11 @@ async fn browser_login_completion_requires_registered_checkout_before_runtime_re
                     .contains("local execution registration failed")
             );
             assert!(state.agent_spawner.is_none());
+            assert!(heartbeat.is_none());
         } else {
             assert!(result.is_ok());
             assert!(state.agent_spawner.is_some());
+            assert!(heartbeat.is_some());
             let requests = server.received_requests().await.unwrap();
             let registered = requests
                 .iter()
@@ -62,6 +72,7 @@ async fn browser_login_completion_requires_registered_checkout_before_runtime_re
             assert!(!body["worktree_path"].as_str().unwrap().is_empty());
             retire_auth_runtime(&mut state).await;
         }
+        crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
     }
 }
 
