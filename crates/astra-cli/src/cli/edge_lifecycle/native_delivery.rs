@@ -2217,12 +2217,16 @@ for line in sys.stdin:
             .filter(|request| request.url.path() == "/agents/edge")
             .map(|request| serde_json::from_slice(&request.body).unwrap())
             .collect();
-        assert!(registrations.len() >= 3);
+        assert!(registrations.len() >= 2);
         assert_eq!(registrations[0]["edge_agent_id"], config.edge_agent_id);
         assert_eq!(registrations[1]["edge_agent_id"], config.edge_agent_id);
-        assert_eq!(
-            registrations[1]["capabilities"]["provider_discovery"],
-            json!([])
+        assert!(
+            registrations.iter().all(|registration| {
+                registration["capabilities"]["provider_discovery"]
+                    .as_array()
+                    .is_some_and(|snapshots| !snapshots.is_empty())
+            }),
+            "native mode must never dispatch a generic advertisement that can arrive late"
         );
         let last = registrations.last().unwrap();
         assert_eq!(
