@@ -867,6 +867,14 @@ When a cancelled local operation is still cleaning up, its existing executor
 continues to own the workspace until it stops. Other writers wait on that
 same ownership; cleanup delay alone does not make the workspace permanently
 unavailable.
+The lease retains the admitted workspace identity even if its path is rebound.
+A writer whose effects cannot be settled fences that identity before releasing
+its cross-process lock; a waiter checks the durable fence again after acquiring
+the lock. If the fence cannot be persisted, the process retains the lock. A
+subsequent process crash can still release that lock without a durable fence,
+so that combined failure requires external confirmation that the writer stopped.
+Nested script calls preserve in-flight writer and weak-attribution evidence on
+the parent owner; a rejected or never-dispatched call is not a mutation receipt.
 
 Server-local MCP invocations propagate the admitted run cancellation token to
 both the ordinary MCP client and stateless Agent Binding HTTP calls. Cancellation
