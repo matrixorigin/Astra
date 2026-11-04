@@ -3721,6 +3721,8 @@ pub struct DatabaseModelService {
     catalog_revision_cache: Arc<Mutex<HashMap<bool, CachedCatalogRevision>>>,
     uc_provider: Option<crate::auth::uc::UcNativeProvider>,
     subscriptions: Arc<crate::chatgpt::ChatgptConnections>,
+    #[cfg(any(test, feature = "e2e-hooks", feature = "external-contract-tests"))]
+    deepseek_test_endpoint: Option<std::net::SocketAddr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3758,6 +3760,19 @@ where
 }
 
 impl DatabaseModelService {
+    /// Confine synthetic DeepSeek providers to one test service and loopback.
+    #[cfg(any(test, feature = "e2e-hooks", feature = "external-contract-tests"))]
+    pub fn with_deepseek_test_endpoint(
+        mut self,
+        endpoint: std::net::SocketAddr,
+    ) -> Result<Self, &'static str> {
+        if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+            return Err("test endpoint must be a nonzero loopback address");
+        }
+        self.deepseek_test_endpoint = Some(endpoint);
+        Ok(self)
+    }
+
     #[cfg(any(test, feature = "e2e-hooks"))]
     pub fn with_chatgpt_config(mut self, config: crate::chatgpt::ChatgptConfig) -> Self {
         self.subscriptions = Arc::new(crate::chatgpt::ChatgptConnections::new(
@@ -3876,6 +3891,8 @@ impl DatabaseModelService {
             pool: None,
             catalog_revision_cache: Arc::new(Mutex::new(HashMap::new())),
             uc_provider: None,
+            #[cfg(any(test, feature = "e2e-hooks", feature = "external-contract-tests"))]
+            deepseek_test_endpoint: None,
         }
     }
 
@@ -4590,6 +4607,11 @@ impl ModelService for DatabaseModelService {
         )
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         let base_url = user_byok_base_url(&provider, request.base_url.as_deref())?;
+        #[cfg(any(test, feature = "e2e-hooks", feature = "external-contract-tests"))]
+        let base_url = match (provider.as_str(), self.deepseek_test_endpoint) {
+            ("deepseek", Some(endpoint)) => format!("http://{endpoint}"),
+            _ => base_url,
+        };
         validate_context_window_value(request.context_window, "context_window")
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         validate_user_model_api_key(&request.api_key)?;
@@ -5928,57 +5950,16 @@ fn user_byok_base_url(
             StatusCode::BAD_REQUEST,
             "Use provider openai-compatible to configure a custom base_url",
         )),
-        (_, None) => user_byok_provider_base_url(provider),
+        ("openai", None) => Ok("https://api.openai.com/v1".into()),
+        ("anthropic", None) => Ok("https://api.anthropic.com".into()),
+        ("deepseek", None) => Ok("https://api.deepseek.com".into()),
+        (_, None) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Unsupported BYOK provider '{provider}'. Supported providers: openai, anthropic, deepseek, openai-compatible"
+            ),
+        )),
     }
-}
-
-fn user_byok_provider_base_url(
-    provider: &str,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    if std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref() == Ok("1")
-        && provider == "deepseek"
-        && let Ok(base_url) = std::env::var("ASTRA_BYOK_DEEPSEEK_BASE_URL")
-    {
-        let parsed = reqwest::Url::parse(&base_url).map_err(|_| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ASTRA_BYOK_DEEPSEEK_BASE_URL is invalid",
-            )
-        })?;
-        let loopback = parsed.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
-        if parsed.scheme() != "http"
-            || !loopback
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ASTRA_BYOK_DEEPSEEK_BASE_URL must be an unauthenticated loopback HTTP origin",
-            ));
-        }
-        return Ok(base_url.trim_end_matches('/').to_string());
-    }
-    let base_url = match provider {
-        "openai" => "https://api.openai.com/v1",
-        "anthropic" => "https://api.anthropic.com",
-        "deepseek" => "https://api.deepseek.com",
-        _ => {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Unsupported BYOK provider '{provider}'. Supported providers: openai, anthropic, deepseek, openai-compatible"
-                ),
-            ));
-        }
-    };
-    Ok(base_url.to_string())
 }
 
 fn validate_user_model_identifier(
@@ -11039,17 +11020,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_byok_accepts_only_fixed_provider_endpoints() {
-        assert_eq!(
-            user_byok_provider_base_url("deepseek").unwrap(),
-            "https://api.deepseek.com"
-        );
-        let error = user_byok_provider_base_url("custom").unwrap_err();
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(error.1.detail.contains("Unsupported BYOK provider"));
-    }
-
-    #[test]
     fn empty_cloud_byok_access_projects_a_user_configuration_action() {
         let projection = project_model_access(
             vec![DeclaredModelAccess {
@@ -11088,6 +11058,13 @@ mod tests {
             user_byok_base_url("anthropic", None).unwrap(),
             "https://api.anthropic.com"
         );
+        assert_eq!(
+            user_byok_base_url("deepseek", None).unwrap(),
+            "https://api.deepseek.com"
+        );
+        let error = user_byok_base_url("custom", None).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.detail.contains("Unsupported BYOK provider"));
         for provider in ["openai", "anthropic", "deepseek", "unknown"] {
             assert!(user_byok_base_url(provider, Some("https://gateway.example/v1")).is_err());
         }
@@ -11097,5 +11074,24 @@ mod tests {
             user_byok_base_url("openai-compatible", Some("https://gateway.example/v1/")).unwrap(),
             "https://gateway.example/v1"
         );
+    }
+
+    #[test]
+    fn deepseek_test_endpoint_requires_a_nonzero_loopback_address() {
+        let service = DatabaseModelService::new(
+            MatrixOneSettings::from_env(),
+            Arc::new(FernetTokenEncryptor::new("fixture-key").unwrap()),
+        );
+        for address in ["127.0.0.1:0", "192.0.2.1:8000", "0.0.0.0:8000"] {
+            assert!(
+                service
+                    .clone()
+                    .with_deepseek_test_endpoint(address.parse().unwrap())
+                    .is_err()
+            );
+        }
+        let address = "127.0.0.1:8000".parse().unwrap();
+        let service = service.with_deepseek_test_endpoint(address).unwrap();
+        assert_eq!(service.deepseek_test_endpoint, Some(address));
     }
 }

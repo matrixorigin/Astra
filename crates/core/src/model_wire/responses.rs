@@ -272,13 +272,24 @@ pub fn validate_active_continuations<'a>(
     provider_id: impl Fn(&'a Value) -> Option<&'a str>,
 ) -> Result<(), String> {
     for (index, message) in messages.iter().enumerate() {
-        let Some(saved) = message
-            .get(CONTINUATION_KEY)
-            .filter(|_| message["role"] == "assistant")
-        else {
+        if message["role"] != "assistant" {
+            continue;
+        }
+        let has_calls = match message.get("tool_calls") {
+            None | Some(Value::Null) => false,
+            Some(Value::Array(calls)) => !calls.is_empty(),
+            Some(_) => return Err(CONTINUATION_INCOMPLETE.into()),
+        };
+        let Some(saved) = message.get(CONTINUATION_KEY) else {
+            if has_calls {
+                return Err(CONTINUATION_INCOMPLETE.into());
+            }
             continue;
         };
-        if saved["invalid"] == true {
+        if saved["invalid"] == true
+            || saved["connection_id"].as_str().is_none_or(str::is_empty)
+            || saved["model"].as_str().is_none_or(str::is_empty)
+        {
             return Err(CONTINUATION_INCOMPLETE.into());
         }
         let has_calls = has_tool_continuation(message);
@@ -1086,6 +1097,44 @@ mod tests {
         assert_eq!(
             validate_active_continuations(&messages[..1], "model", "old", provider_id).unwrap_err(),
             CONTINUATION_INCOMPLETE
+        );
+    }
+
+    #[test]
+    fn active_tool_calls_require_provider_continuation() {
+        let assistant = json!({"role":"assistant", "tool_calls":[
+            {"id":"c1", "function":{"name":"lookup", "arguments":"{}"}}
+        ]});
+        let result = json!({"role":"tool", "tool_call_id":"c1", "content":"found"});
+        for saved in [
+            None,
+            Some(Value::Null),
+            Some(json!({})),
+            Some(json!({"invalid":true})),
+        ] {
+            let mut call = assistant.clone();
+            if let Some(saved) = saved {
+                call[CONTINUATION_KEY] = saved;
+            }
+            for messages in [vec![call.clone()], vec![call, result.clone()]] {
+                assert_eq!(
+                    validate_active_continuations(&messages, "model", "scope", |_| None)
+                        .unwrap_err(),
+                    CONTINUATION_INCOMPLETE
+                );
+            }
+        }
+        // A tool's payload is data, not a top-level assistant tool call.
+        let message = json!({"role":"tool", "content":{"role":"assistant", "tool_calls":[{}]}});
+        assert!(validate_active_continuations(&[message], "model", "scope", |_| None).is_ok());
+        assert!(
+            validate_active_continuations(
+                &[json!({"role":"assistant", "content":"done"})],
+                "model",
+                "scope",
+                |_| None
+            )
+            .is_ok()
         );
     }
 

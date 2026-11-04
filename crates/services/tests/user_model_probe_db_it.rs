@@ -1,9 +1,6 @@
 //! Real model service + isolated DB + strict, non-billable provider fixture.
-//! Run with ASTRA_TEST_DB_IT=1, ASTRA_TEST_DATABASE=$ASTRA_DATABASE,
-//! ASTRA_ALLOW_INSECURE_DEFAULTS=1 and ASTRA_BYOK_DEEPSEEK_BASE_URL set to
-//! an unused loopback HTTP origin (e.g. http://127.0.0.1:18994).
-//! Explicitly selected with --features external-contract-tests; ordinary
-//! online lanes do not provide this operator-only endpoint override.
+//! Run with ASTRA_TEST_DB_IT=1 and ASTRA_TEST_DATABASE=$ASTRA_DATABASE.
+//! Explicitly selected with --features external-contract-tests.
 mod common;
 #[path = "common/isolated_database.rs"]
 mod isolated_database;
@@ -17,18 +14,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[tokio::test]
-#[ignore = "requires isolated MatrixOne DB and loopback DeepSeek fixture override"]
+#[ignore = "requires an isolated MatrixOne database"]
 async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     let settings = common::require_db_it_env();
     isolated_database::require_isolated_database(&settings.database);
-    assert_eq!(
-        std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref(),
-        Ok("1")
-    );
-    let base = std::env::var("ASTRA_BYOK_DEEPSEEK_BASE_URL").expect("loopback fixture origin");
-    let url = reqwest::Url::parse(&base).unwrap();
-    assert_eq!(url.scheme(), "http");
-    assert_eq!(url.host_str(), Some("127.0.0.1"));
     let fail_probe = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     #[derive(Default)]
@@ -174,14 +163,18 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             ),
         )
         .with_state((fail_probe.clone(), requests.clone(), hold.clone()));
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", url.port().unwrap()))
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let base = format!("http://{endpoint}");
     let fixture = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (pool, settings) = common::setup_pool_and_settings().await;
     let encryptor = FernetTokenEncryptor::new("provider-wire-test-only-key").unwrap();
     let service = DatabaseModelService::new(settings.clone(), Arc::new(encryptor.clone()))
-        .with_pool(pool.clone());
+        .with_pool(pool.clone())
+        .with_deepseek_test_endpoint(endpoint)
+        .unwrap();
     let owner = uuid::Uuid::new_v4().to_string();
     let make_request = |name: &str, model: &str, key: &str| UserModelCreateRequestData {
         connection_id: None,

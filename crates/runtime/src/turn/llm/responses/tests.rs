@@ -250,6 +250,55 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     );
     messages.push(json!({"role":"tool","tool_call_id":"call-1","content":"found"}));
     messages.push(snapshot("updated optional observation"));
+    let mut lost = messages.clone();
+    lost.iter_mut()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove(astra_core::model_wire::responses::CONTINUATION_KEY);
+    let mut lost = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(lost)
+        .unwrap();
+    let changed_scope = format!("sha256:{}", "b".repeat(64));
+    for route_scope in [&scope, &changed_scope] {
+        let failure = call_llm_and_collect_with_stream_callback(
+            call(&lost, &tools, route_scope, &base, &thinking),
+            LlmCancel::None,
+            None,
+            None,
+            RuntimeToolChoice::Auto,
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            failure
+                .details_json
+                .unwrap()
+                .contains("responses_continuation_incomplete")
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "missing state must stop before dispatch"
+        );
+    }
+    lost.push(json!({"role":"user", "content":"continue in a new turn"}));
+    let mut historical_call = call(&lost, &tools, &changed_scope, &base, &thinking);
+    historical_call.route = LlmExecutionRoute::from_admitted(&second_execution);
+    historical_call.route.response_scope = Some(&changed_scope);
+    let historical = call_llm_and_collect_with_stream_callback(
+        historical_call,
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(historical.full_text, "done");
+    assert_eq!(requests.lock().unwrap().len(), 2);
     let mut switched = call(&messages, &tools, &scope, &base, &thinking);
     switched.route = LlmExecutionRoute::from_admitted(&second_execution);
     switched.route.inference_protocol = Some(LlmProviderProtocol::OpenAiCompatible);
@@ -280,27 +329,27 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     assert_eq!(requests[0]["reasoning"]["effort"], "max");
     assert_eq!(requests[0]["include"][0], "reasoning.encrypted_content");
     assert!(
-        requests[1]["input"]
+        requests[2]["input"]
             .as_array()
             .unwrap()
             .starts_with(requests[0]["input"].as_array().unwrap()),
         "Responses must preserve the complete preceding request, including all runtime context"
     );
-    assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+    assert_eq!(requests[0]["tools"], requests[2]["tools"]);
     assert!(
-        requests[1]["input"]
+        requests[2]["input"]
             .to_string()
             .contains("updated optional observation")
     );
     assert!(
-        requests[1]["input"]
+        requests[2]["input"]
             .as_array()
             .unwrap()
             .iter()
             .any(|item| item["type"] == "reasoning")
     );
     assert!(
-        requests[1]["input"]
+        requests[2]["input"]
             .as_array()
             .unwrap()
             .iter()
@@ -505,7 +554,7 @@ async fn infer_with_budget(
 }
 
 #[tokio::test]
-#[ignore = "requires an isolated MatrixOne database and loopback BYOK provider override"]
+#[ignore = "requires an isolated MatrixOne database"]
 async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
     use astra_services::UserModelUpdateRequestData;
     use axum::{
@@ -517,13 +566,6 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
     };
     let settings = astra_core::MatrixOneSettings::from_env();
     crate::isolated_database::require_isolated_database(&settings.database);
-    assert_eq!(
-        std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref(),
-        Ok("1")
-    );
-    let base = std::env::var("ASTRA_BYOK_DEEPSEEK_BASE_URL").unwrap();
-    let url = reqwest::Url::parse(&base).unwrap();
-    assert_eq!(url.host_str(), Some("127.0.0.1"));
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let app = Router::new().route("/responses", post(
         |State(requests): State<Arc<Mutex<Vec<Value>>>>, headers: HeaderMap, Json(body): Json<Value>| async move {
@@ -544,16 +586,20 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
             ([("content-type", "text/event-stream")], format!("data: {event}\n\n")).into_response()
         }
     )).with_state(requests.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", url.port().unwrap()))
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
+    let endpoint = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     astra_services::storage::ensure_core_schema(&settings, "mysql")
         .await
         .unwrap();
     let pool = astra_core::SharedPool::new(&settings).await.unwrap();
     let key = Arc::new(FernetTokenEncryptor::new("byok-responses-fixture-key").unwrap());
-    let service = DatabaseModelService::new(settings, key).with_pool(pool);
+    let service = DatabaseModelService::new(settings, key)
+        .with_pool(pool)
+        .with_deepseek_test_endpoint(endpoint)
+        .unwrap();
     let owner = format!("byok-{}", uuid::Uuid::new_v4());
     let model = service
         .create_user_model(
