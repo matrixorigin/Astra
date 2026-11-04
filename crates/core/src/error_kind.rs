@@ -662,16 +662,26 @@ impl From<String> for ClassifiedError {
 /// not emit structured envelopes.
 #[must_use]
 pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
+    structured_llm_error_code(body).map(|(kind, _)| kind)
+}
+
+/// The whitelisted `error.code` of a provider error envelope, for surfacing
+/// in user-visible failure messages. Only codes that
+/// [`structured_llm_error_kind`] classifies are returned — they are fixed
+/// protocol tokens, never free-text provider diagnostics, so they are safe to
+/// show to users. Returns the classified kind alongside the code.
+#[must_use]
+pub fn structured_llm_error_code(body: &str) -> Option<(ErrorKind, &'static str)> {
     let error = llm_error_envelope_error(body)?;
     let code = error
         .get("code")
         .or_else(|| error.get("type"))
         .and_then(serde_json::Value::as_str)?;
     match code {
-        "context_length_exceeded" => Some(ErrorKind::ContextWindow),
-        "request_body_too_large" | "invalid_request" | "provider_schema_error" => {
-            Some(ErrorKind::InvalidRequest)
-        }
+        "context_length_exceeded" => Some((ErrorKind::ContextWindow, "context_length_exceeded")),
+        "request_body_too_large" => Some((ErrorKind::InvalidRequest, "request_body_too_large")),
+        "invalid_request" => Some((ErrorKind::InvalidRequest, "invalid_request")),
+        "provider_schema_error" => Some((ErrorKind::InvalidRequest, "provider_schema_error")),
         _ => None,
     }
 }
@@ -1547,6 +1557,46 @@ mod tests {
             None
         );
         assert_eq!(structured_llm_error_request_id("not json"), None);
+    }
+
+    #[test]
+    fn structured_llm_error_code_is_whitelisted() {
+        // Only fixed protocol tokens are surfaced for user-visible messages;
+        // unrecognized codes yield None so free-text diagnostics never leak.
+        let cases: &[(&str, Option<&str>)] = &[
+            (
+                r#"{"error":{"code":"request_body_too_large","message":"request body too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            (
+                r#"{"error":{"code":"invalid_request","message":"bad param"}}"#,
+                Some("invalid_request"),
+            ),
+            (
+                r#"{"error":{"code":"provider_schema_error","message":"bad shape"}}"#,
+                Some("provider_schema_error"),
+            ),
+            (
+                r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            // type fallback carries the same whitelist.
+            (
+                r#"{"error":{"type":"request_body_too_large","message":"too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            (
+                r#"{"error":{"code":"internal_error: db conn 10.0.0.1 refused","message":"x"}}"#,
+                None,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                structured_llm_error_code(input).map(|(_, code)| code),
+                *expected,
+                "structured_llm_error_code({input:?}) should be {expected:?}"
+            );
+        }
     }
 
     #[test]

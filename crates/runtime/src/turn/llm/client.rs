@@ -6453,12 +6453,17 @@ async fn call_prepared_llm_with_total_budget(
         // Structured provider error envelopes (e.g. TaaS) carry an
         // authoritative code: a 413 gateway byte limit is a request-size
         // problem, never model context overflow. Keep the raw body out of
-        // non-context-window messages, matching the 4xx suppression above.
-        if let Some(kind) = astra_core::structured_llm_error_kind(&text) {
+        // non-context-window messages, matching the 4xx suppression above —
+        // but surface the whitelisted envelope code (a fixed protocol token)
+        // and the request id so the user-visible failure names the real
+        // cause and stays correlatable with provider-side logs (#19075).
+        if let Some((kind, code)) = astra_core::structured_llm_error_code(&text) {
             let message = if kind == astra_core::ErrorKind::ContextWindow {
                 format!("LLM error {status}: {text}")
+            } else if let Some(request_id) = body_request_id.as_deref() {
+                format!("{last_err} ({code}, request_id={request_id})")
             } else {
-                last_err.clone()
+                format!("{last_err} ({code})")
             };
             let error = astra_core::ClassifiedError::new(kind, message);
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
@@ -16895,8 +16900,13 @@ mod tests {
         // The gateway byte limit must never be attributed to the model
         // context window (which would trigger the compaction funnel).
         assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
-        // 4xx bodies stay suppressed; the envelope code only drives the kind.
-        assert_eq!(err.message, "LLM request rejected: 413");
+        // The raw 4xx body stays suppressed; the whitelisted envelope code
+        // and request id still name the real cause and correlate the failure
+        // with provider-side logs (#19075).
+        assert_eq!(
+            err.message,
+            "LLM request rejected: 413 (request_body_too_large, request_id=req_0123456789abcdef)"
+        );
     }
 
     #[tokio::test]
