@@ -10,6 +10,7 @@
 //! ```
 
 mod capacity_provider;
+mod managed_background;
 mod runtime_process_authorization;
 mod token_manager;
 mod token_renewal;
@@ -697,6 +698,19 @@ fn edge_ws_request(
 
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
+fn managed_ready_sender() -> Option<tokio::sync::oneshot::Sender<()>> {
+    if !managed_background::is_managed_child() {
+        return None;
+    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if receiver.await.is_ok() {
+            managed_background::signal_ready();
+        }
+    });
+    Some(sender)
+}
+
 async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let url = config.server_url.clone();
 
@@ -732,40 +746,48 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     // Snapshot the live token per connection attempt: the renewal task may
     // have replaced it since the previous (re)connect.
     let token_snapshot = config.token_manager.snapshot().await;
-    let ws_stream = if let Some(ref proxy_url) = proxy {
-        connect_via_proxy(&url, proxy_url, &token_snapshot)
+    let shutdown = managed_background::connection_shutdown();
+    let ws_stream = match managed_background::until_cancelled(&shutdown, async {
+        if let Some(ref proxy_url) = proxy {
+            connect_via_proxy(&url, proxy_url, &token_snapshot)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        target: "astra.edge",
+                        edge_id = %config.edge_id,
+                        url = %url,
+                        proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
+                        error = %error,
+                        "WebSocket connect via proxy failed"
+                    );
+                    error
+                })
+        } else {
+            let request = edge_ws_request(&url, &token_snapshot)?;
+            let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
+            )
             .await
-            .map_err(|e| {
+            .map_err(|error| {
                 tracing::error!(
                     target: "astra.edge",
                     edge_id = %config.edge_id,
                     url = %url,
-                    proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
-                    error = %e,
-                    "WebSocket connect via proxy failed"
+                    error = %error,
+                    "WebSocket connect failed"
                 );
-                e
-            })?
-    } else {
-        let request = edge_ws_request(&url, &token_snapshot)?;
-        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "astra.edge",
-                edge_id = %config.edge_id,
-                url = %url,
-                error = %e,
-                "WebSocket connect failed"
-            );
-            e
-        })?;
-        ws
+                Box::new(error) as Box<dyn std::error::Error>
+            })?;
+            Ok(ws)
+        }
+    })
+    .await
+    {
+        Err(()) => return Err("runner stopping".into()),
+        Ok(result) => result?,
     };
     let (write, read) = ws_stream.split();
 
@@ -800,8 +822,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         .reunite(read)
         .map_err(|_| "Edge socket halves could not be reunited")?;
     let (socket, authenticated_account, _authenticated_edge_id) =
-        astra_edge::authenticate_connection(socket, auth_msg, None, &CancellationToken::new())
-            .await?;
+        astra_edge::authenticate_connection(socket, auth_msg, None, &shutdown).await?;
     // Only the token snapshot proven by this connection may advance persistence.
     config.token_manager.mark_proven(&token_snapshot).await;
 
@@ -825,13 +846,13 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 &workspace,
                 config.invocation_journal_root.clone(),
             ),
-            ready: None,
+            ready: managed_ready_sender(),
         },
         Arc::new(DefaultInvocationExecutor(
             executor,
             config.capacity_providers.clone(),
         )),
-        CancellationToken::new(),
+        shutdown,
     )
     .await
     .map_err(|error| error as Box<dyn std::error::Error>)
@@ -901,15 +922,8 @@ impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
-    // The release builds CLI and Edge together, unifying ring and aws-lc
-    // features. Select the Edge provider before constructing any TLS client.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Edge installs its TLS provider before any TLS client");
-    // Image-managed runners have no MOI installation marker and remain outside
-    // the local update lifecycle. Local managed Edge holds a lease until exit.
+fn main() {
+    // Protocol probes stay ahead of the runtime and of background startup.
     let executable = std::env::current_exe().expect("current executable");
     let args: Vec<String> = std::env::args().skip(1).collect();
     match astra_core::client_installation::early_command(&executable, &args, false) {
@@ -919,6 +933,41 @@ async fn main() {
             eprintln!("{error}");
             std::process::exit(1);
         }
+    }
+    let state_root = astra_core::local_state::local_state_root();
+    if let Some(code) = managed_background::management_exit_code(&args, &state_root) {
+        std::process::exit(code);
+    }
+    if managed_background::is_managed_child() {
+        if let Err(error) = managed_background::prepare_child() {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    } else if managed_background::should_detach(
+        &args,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    ) {
+        std::process::exit(managed_background::supervise(
+            &executable,
+            &args,
+            &state_root,
+        ));
+    }
+    runtime();
+}
+
+#[tokio::main]
+async fn runtime() {
+    // The release builds CLI and Edge together, unifying ring and aws-lc
+    // features. Select the Edge provider before constructing any TLS client.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Edge installs its TLS provider before any TLS client");
+    // Image-managed runners have no MOI installation marker and remain outside
+    // the local update lifecycle. Local managed Edge holds a lease until exit.
+    let executable = std::env::current_exe().expect("current executable");
+    if managed_background::is_managed_child() {
+        managed_background::install_shutdown_listener();
     }
     let _installation_lease = match astra_core::client_installation::acquire(&executable) {
         Ok(lease) => lease,
@@ -967,6 +1016,9 @@ async fn main() {
     let mut reconnect_delay_secs: u64 = 1;
     let max_reconnect_delay_secs: u64 = 60;
     loop {
+        if managed_background::shutdown_requested() {
+            break;
+        }
         let edge_span = tracing::info_span!(
             "edge.agent",
             edge_id = %config.edge_id,
@@ -975,15 +1027,19 @@ async fn main() {
         match run_edge_connection(&config).instrument(edge_span).await {
             Ok(()) => {
                 reconnect_delay_secs = 1; // reset on clean disconnect
-                if !config.reconnect {
+                if !config.reconnect || managed_background::shutdown_requested() {
                     break;
                 }
+                managed_background::note_phase("reconnecting");
                 tracing::info!(
                     delay = reconnect_delay_secs,
                     "Disconnected, reconnecting..."
                 );
             }
             Err(e) => {
+                if managed_background::shutdown_requested() {
+                    break;
+                }
                 if is_permanent_connection_error(e.as_ref()) {
                     // The chosen startup token may be revoked (e.g. a renewal
                     // rotated it away but the persist was lost). Before giving
@@ -1000,6 +1056,7 @@ async fn main() {
                         error = %e,
                         "Permanent authentication failure — not retrying"
                     );
+                    managed_background::note_phase("authentication-failure");
                     exit_with_error = true;
                     break;
                 }
@@ -1008,13 +1065,22 @@ async fn main() {
                     exit_with_error = true;
                     break;
                 }
+                managed_background::note_phase("reconnecting");
                 tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
             }
         }
         // Exponential backoff with jitter
         // jitter in [0.5*delay, 1.5*delay) — spreads out thundering herd
         let jitter = reconnect_delay_secs as f64 * (0.5 + fastrand::f64());
-        tokio::time::sleep(Duration::from_secs_f64(jitter)).await;
+        if managed_background::until_cancelled(
+            &managed_background::connection_shutdown(),
+            tokio::time::sleep(Duration::from_secs_f64(jitter)),
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
         reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay_secs);
     }
 

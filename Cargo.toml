@@ -78,7 +78,7 @@ hmac = "0.12.1"
 # Reuse AWS-LC: the RustCrypto backend pins crypto-bigint 0.5, affected by
 # RUSTSEC-2026-0387 with no compatible patched release.
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs"] }
-nix = { version = "0.31.2", features = ["fs", "signal", "term"] }
+nix = { version = "0.31.2", features = ["fs", "process", "signal", "term"] }
 regex = "1.12.2"
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "socks"] }
 serde = { version = "1.0.228", features = ["derive"] }
