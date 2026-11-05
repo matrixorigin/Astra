@@ -3336,8 +3336,15 @@ async fn execute_cli_command_impl(
             let body = api
                 .post_bearer_path_json_text(&token, paths::ME_MODELS, &payload)
                 .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
+                .map_err(crate::cli::cli_config::cli_utils::model_creation_error)?;
+            if interactive {
+                stdout_println!(
+                    "{} Personal model '{name}' added; provider check passed.",
+                    theme::icon_ok()
+                );
+            } else {
+                print_json_or_raw(&body);
+            }
             Ok(ExitCode::Success)
         }
 

@@ -922,6 +922,18 @@ pub(crate) fn status_hint(status: u16) -> Option<&'static str> {
 /// Error-code-aware hint. Human-readable detail is presentation and must not
 /// be parsed to recover a failure category.
 pub(crate) fn status_hint_for(status: u16, error_code: Option<&str>) -> Option<&'static str> {
+    match error_code {
+        Some("model_probe_credentials_or_access") => {
+            return Some("Check the API key and the account's access to this model.");
+        }
+        Some("model_probe_request_rejected" | "model_probe_configuration") => {
+            return Some("Check the model ID, API format and endpoint.");
+        }
+        Some("model_probe_network") => {
+            return Some("Check the Astra Server's network, DNS, proxy and TLS settings.");
+        }
+        _ => {}
+    }
     if status == 503 {
         match error_code {
             Some("chatgpt_subscription_disabled") => {
@@ -1033,6 +1045,24 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::AdmissionDeadlineExpired => {
             "Execution deadline expired before Server admission".to_string()
         }
+    }
+}
+
+pub(crate) fn model_creation_error(error: astra_thin_client::ThinClientError) -> String {
+    let rejected_probe = match &error {
+        astra_thin_client::ThinClientError::Api { body, .. } => {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| value.get("error_code")?.as_str().map(str::to_owned))
+                .is_some_and(|code| code.starts_with("model_probe_"))
+        }
+        _ => false,
+    };
+    let detail = map_thin_err(error);
+    if rejected_probe {
+        format!("Model setup failed; the model was not saved. {detail}")
+    } else {
+        format!("Could not confirm model setup. {detail}\nCheck your model list before retrying.")
     }
 }
 
@@ -1677,6 +1707,32 @@ mod tests {
             assert!(!error.contains('{'));
         }
         assert!(read_api_error(503, "upstream unavailable").contains("try again shortly"));
+    }
+
+    #[test]
+    fn model_setup_reports_rejected_probe_and_uncertain_delivery_distinctly() {
+        let rejected = super::model_creation_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: serde_json::json!({
+                "detail": "Could not connect",
+                "error_code": "model_probe_network",
+                "request_id": "test-request"
+            })
+            .to_string(),
+        });
+        assert!(rejected.contains("model was not saved"), "{rejected}");
+        assert!(rejected.contains("DNS, proxy and TLS"), "{rejected}");
+        assert!(rejected.contains("test-request"), "{rejected}");
+        let uncertain = super::model_creation_error(astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body: "unexpected server error".into(),
+        });
+        assert!(
+            uncertain.contains("Could not confirm model setup"),
+            "{uncertain}"
+        );
+        assert!(uncertain.contains("Check your model list"), "{uncertain}");
+        assert!(!uncertain.contains("model was not saved"), "{uncertain}");
     }
 
     #[test]

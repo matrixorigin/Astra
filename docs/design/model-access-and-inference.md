@@ -53,6 +53,15 @@ header names are case-insensitive, and invalid or duplicate configured headers
 are rejected at configuration and execution admission. Probe-only and unrelated
 capability changes do not invalidate it. Model checks use
 the selected wire protocol; the ordinary provider default remains unchanged.
+Personal and administrator model creation validates connectivity before storing
+the model. Credential updates are also checked before committing. A failed
+check returns a coded error and leaves existing model configuration and
+activation unchanged; a successful administrator check can activate it.
+Authentication/access, rejected requests, rate limits, upstream failures,
+timeouts and network failures have distinct error codes across both wire
+protocols. Probes do not automatically repeat potentially billable requests
+after uncertain delivery. A Chat Completions 2xx response must be bounded JSON
+without an error; an HTML page or embedded error is not a successful check.
 Personal model configuration stores the protocol separately from the optional
 thinking observation. Credential rotation and concurrent checks are fenced by
 the existing model row. A Responses tool group retains its scoped provider
@@ -449,22 +458,15 @@ their own provider account.
   existing administrator registry; a host-only entry admits port 443 only.
   The default is `public-https`; invalid configuration fails closed.
 - Custom endpoint policy is rechecked at create, credential rotation, probe,
-  activation, and inference admission. Each outbound attempt pins a freshly
-  validated public DNS address set and forbids redirects. DNS queries go directly
-  to system-configured nameservers instead of OS synthetic-address caches;
-  `ASTRA_BYOK_DNS_SERVERS` optionally selects comma-separated DNS IPs (ports
-  optional); prefix an entry with `tcp://` for TCP-only DNS without a UDP
-  attempt or UDP fallback. This is an explicit operator route, not automatic
-  retry of rejected private/Fake-IP answers. Nameserver priority is preserved
-  instead of racing answers from different DNS servers. There is no hardcoded
-  public DNS or OS resolver fallback.
-  Direct egress is the default. Operators may set `ASTRA_BYOK_PROXY_URL` to an
-  HTTP/HTTPS CONNECT or SOCKS5/SOCKS5h proxy. A request-owned authenticated
-  loopback adapter sends only validated public IP targets to that proxy,
-  retaining the origin hostname for end-to-end TLS, SNI and Host. SOCKS5h does
-  not delegate target DNS. Dropping the client cancels its tunnel tasks.
-  Ambient proxy variables cannot override this route; proxy failure never
-  falls back to direct access. Private/Fake-IP DNS answers remain rejected.
+  activation, and inference admission. Each outbound attempt resolves with the
+  Server's system DNS, validates every address as public, pins the result, and
+  forbids redirects. `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` select the same
+  Server egress configuration as other providers. For proxied requests, a
+  request-owned tunnel sends only validated IP targets to the proxy while
+  retaining the origin hostname for TLS, SNI and Host. Dropping the client
+  cancels the tunnel. Proxy failure never falls back to direct access. If system
+  DNS returns private or Fake-IP addresses, the operator must configure it to
+  return public addresses; proxy DNS cannot bypass validation.
 - Authenticated `POST /me/models/validate-endpoint` accepts only `base_url` and
   returns `204` after URL, policy, and DNS checks, without provider HTTP traffic,
   credentials, or stored model state. CLI runs it immediately after custom URL

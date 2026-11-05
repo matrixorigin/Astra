@@ -136,6 +136,13 @@ public roots remain available. Configure them only in the selected CLI, User
 Runner, or Server process environment. They do not transfer a user machine’s
 trust store to the Server. Restart the process after changing its trust settings.
 
+Model probes and inference use the Server's system DNS and its `HTTPS_PROXY`,
+`ALL_PROXY` and `NO_PROXY` settings. User-configured `openai-compatible`
+endpoints require public DNS answers, which are pinned even through a proxy.
+If DNS returns Fake-IP or private addresses, configure the Server's DNS or
+proxy exclusions to return public addresses. Configure the Server process,
+not the CLI, and do not include proxy credentials in diagnostic reports.
+
 ### Auth secrets (REQUIRED in production)
 
 - `ASTRA_JWT_SECRET`

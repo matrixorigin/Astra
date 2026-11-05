@@ -401,7 +401,7 @@ pub(crate) async fn run(
             let body = api
                 .post_bearer_path_json_text(&token, astra_thin_client::paths::ME_MODELS, &payload)
                 .await
-                .map_err(map_thin_err)?;
+                .map_err(crate::cli::cli_config::cli_utils::model_creation_error)?;
             let created: Value =
                 serde_json::from_str(&body).map_err(|_| "Invalid model creation response")?;
             let id = created["model_id"]

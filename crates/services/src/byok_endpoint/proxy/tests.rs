@@ -409,7 +409,6 @@ async fn private_addresses_are_rejected_before_a_proxy_tunnel_is_created() {
 #[test]
 fn proxy_configuration_errors_do_not_echo_secrets_or_allow_ambiguous_urls() {
     for raw in [
-        "proxy:8080",
         "ftp://user:secret@proxy",
         "http://user:secret@proxy/path",
         "http://proxy?key=secret",
@@ -422,6 +421,7 @@ fn proxy_configuration_errors_do_not_echo_secrets_or_allow_ambiguous_urls() {
     assert!(EgressProxy::parse(None).unwrap().is_none());
     assert!(EgressProxy::parse(Some("")).unwrap().is_none());
     for raw in [
+        "proxy:8080",
         "http://localhost:8080",
         "https://proxy.example",
         "socks5://[::1]:1080",

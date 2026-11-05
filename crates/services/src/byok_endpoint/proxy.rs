@@ -14,7 +14,6 @@ use tokio::{
     task::JoinSet,
 };
 
-pub(super) const PROXY_ENV: &str = "ASTRA_BYOK_PROXY_URL";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEAD: usize = 8192;
 
@@ -31,7 +30,7 @@ pub(super) struct EgressProxy {
 }
 
 fn invalid() -> String {
-    "Invalid ASTRA_BYOK_PROXY_URL; use an explicit http://, https:// or socks5:// proxy URL".into()
+    "Invalid Server proxy URL; use an http://, https:// or socks5:// proxy".into()
 }
 fn failed(reason: &'static str) -> io::Error {
     io::Error::other(reason)
@@ -45,7 +44,12 @@ impl EgressProxy {
         if raw.len() > 2048 || raw.chars().any(char::is_control) {
             return Err(invalid());
         }
-        let url = reqwest::Url::parse(raw).map_err(|_| invalid())?;
+        let normalized = if raw.contains("://") {
+            std::borrow::Cow::Borrowed(raw)
+        } else {
+            std::borrow::Cow::Owned(format!("http://{raw}"))
+        };
+        let url = reqwest::Url::parse(&normalized).map_err(|_| invalid())?;
         if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
             || url.host_str().is_none()
             || url.port() == Some(0)

@@ -8339,6 +8339,7 @@ pub(crate) async fn run_tui_session(
                                 if current_usable {
                                     chat_widget.commit_system(history_cell::system::SystemCell::response("Model change saved. Your current model is unchanged; choose another with /model."));
                                 } else if bottom_pane.current_model_catalog().iter().any(|row| row.offering_id == model_id && crate::cli::session::session_runtime::model_list_entry_is_active(row)) {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response("Personal model saved."));
                                     slash_dispatch::apply_model_picker_result(&bottom_pane::view::ViewResult::Model { name: model_id }, &mut state, &mut bottom_pane, &mut chat_widget);
                                 } else {
                                     chat_widget.commit_system(history_cell::system::SystemCell::response("Model change saved. The model is unavailable in the current catalog; reopen /model to choose a usable model."));

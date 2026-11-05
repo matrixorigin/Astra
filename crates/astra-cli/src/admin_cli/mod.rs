@@ -111,6 +111,7 @@ async fn load_models(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut judgment_available = false;
+    let mut failed_checks = Vec::new();
     for (model_name, metadata_only_update, payload, update) in prepared {
         let needs_check = if metadata_only_update {
             let body = api
@@ -161,17 +162,21 @@ async fn load_models(
                 .await
             {
                 Ok(body) => {
-                    let checked = serde_json::from_str::<serde_json::Value>(&body).ok();
+                    let checked = match setup::validate_model_probe_response(model_name, &body) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            eprintln!("  model check failed for {model_name}: {error}");
+                            failed_checks.push(model_name.to_string());
+                            continue;
+                        }
+                    };
                     if judgment_default == Some(model_name) {
-                        judgment_available = checked
-                            .as_ref()
-                            .and_then(|v| v.get("is_active"))
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(true);
+                        judgment_available = true;
                     }
-                    let cap = checked
-                        .and_then(|v| v.get("thinking_capability")?.as_str().map(String::from));
-                    match cap.as_deref() {
+                    match checked
+                        .get("thinking_capability")
+                        .and_then(serde_json::Value::as_str)
+                    {
                         Some("both") => {
                             stdout_println!("  thinking: both (Normal/Thinking picker) ✓")
                         }
@@ -188,6 +193,7 @@ async fn load_models(
                 }
                 Err(e) => {
                     eprintln!("  model check failed for {model_name}: {e}");
+                    failed_checks.push(model_name.to_string());
                 }
             }
         }
@@ -201,7 +207,11 @@ async fn load_models(
             );
         }
     }
-    Ok(())
+    if failed_checks.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Model checks failed: {}", failed_checks.join(", ")))
+    }
 }
 
 /// Parse `POST /models` or `PUT /models/{name}` JSON and print `is_active` / `connectivity`.
@@ -233,18 +243,6 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
         stdout_println!("  context_window: {context_window}");
     } else {
         eprintln!("  warning: response did not include a positive context_window");
-    }
-    let thinking_cap = value
-        .get("thinking_capability")
-        .and_then(serde_json::Value::as_str);
-    if let Some(cap) = thinking_cap {
-        match cap {
-            "both" => stdout_println!("  thinking: both (Normal/Thinking picker enabled) ✓"),
-            "effort_only" => stdout_println!("  thinking: effort_only (Low/High/Max effort) ✓"),
-            "native_only" => stdout_println!("  thinking: native_only (model always thinks)"),
-            "none" => stdout_println!("  thinking: none"),
-            other => stdout_println!("  thinking: {other}"),
-        }
     }
     if active != Some(true) {
         eprintln!(
@@ -947,10 +945,10 @@ mod tests {
         for (default, check_status, active, binding_status, expected_ok) in [
             (true, 200, Some(true), 200, true),
             (false, 200, Some(true), 200, true),
-            (true, 503, Some(true), 200, true),
+            (true, 503, Some(true), 200, false),
             (true, 200, Some(true), 400, false),
-            (true, 200, Some(false), 200, true),
-            (true, 200, None, 200, true),
+            (true, 200, Some(false), 200, false),
+            (true, 200, None, 200, false),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("PUT"))
@@ -1061,10 +1059,11 @@ mod tests {
                 path: "unused.yaml".into(),
                 update_existing: false,
             };
-            assert!(
+            assert_eq!(
                 load_models(&api, "fake-token", doc.as_sequence().unwrap(), &args)
                     .await
-                    .is_ok()
+                    .is_ok(),
+                active
             );
             assert_eq!(
                 server.received_requests().await.unwrap().len(),

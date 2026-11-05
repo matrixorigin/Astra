@@ -4389,6 +4389,44 @@ const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provide
     context_window, is_default, is_active, \
     CAST(created_at AS CHAR) AS created_at_text, CAST(updated_at AS CHAR) AS updated_at_text";
 
+async fn ensure_probed_admin_model_is_current(
+    pool: &sqlx::MySqlPool,
+    row: &sqlx::mysql::MySqlRow,
+    model_name: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let model_id: String = row.try_get("model_id").map_err(internal_error)?;
+    let provider: String = row.try_get("provider").map_err(internal_error)?;
+    let base_url: Option<String> = row.try_get("base_url").map_err(internal_error)?;
+    let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
+    let quirks: String = row.try_get("quirks_json").map_err(internal_error)?;
+    let updated_at: String = row
+        .try_get("configuration_updated_at")
+        .map_err(internal_error)?;
+    let current = query(astra_core::matrixone_statement_with_null_shape(
+        "SELECT 1 FROM infra_llm_models WHERE model_id = ? AND model_name = ? \
+         AND provider = ? AND base_url <=> ? AND api_key_encrypted <=> ? \
+         AND CAST(quirks AS CHAR) = ? AND CAST(updated_at AS CHAR) = ?",
+        [base_url.is_some(), encrypted.is_some()],
+    ))
+    .bind(model_id)
+    .bind(model_name)
+    .bind(provider)
+    .bind(base_url)
+    .bind(encrypted)
+    .bind(quirks)
+    .bind(updated_at)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?;
+    if current.is_none() {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Model changed during connectivity check; check again",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ModelService for DatabaseModelService {
     async fn model_connection_operation(
@@ -4703,7 +4741,7 @@ impl ModelService for DatabaseModelService {
             .encryptor
             .encrypt(&request.api_key)
             .map_err(internal_error)?;
-        let connectivity = validate_connectivity_for_protocol(
+        validate_connectivity_for_protocol(
             &provider,
             &model,
             &request.api_key,
@@ -4712,13 +4750,8 @@ impl ModelService for DatabaseModelService {
             None,
             request.inference_protocol,
         )
-        .await;
-        if let Some(reason) = connectivity {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                format!("Model credential or endpoint check failed: {reason}"),
-            ));
-        }
+        .await
+        .map_err(|error| error.response(&provider, Some(&base_url)))?;
 
         let model_id = Uuid::new_v4().to_string();
         let mut tx = pool.begin().await.map_err(internal_error)?;
@@ -4898,7 +4931,7 @@ impl ModelService for DatabaseModelService {
                     )
                     .map_err(internal_error)?,
             };
-            if let Some(reason) = validate_connectivity_for_protocol(
+            validate_connectivity_for_protocol(
                 &provider,
                 &model,
                 &api_key,
@@ -4908,12 +4941,7 @@ impl ModelService for DatabaseModelService {
                 inference_protocol,
             )
             .await
-            {
-                return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Model credential or endpoint check failed: {reason}"),
-                ));
-            }
+            .map_err(|error| error.response(&provider, Some(&base_url)))?;
             Some(if request.api_key.is_some() {
                 self.encryptor.encrypt(&api_key).map_err(internal_error)?
             } else {
@@ -5081,7 +5109,7 @@ impl ModelService for DatabaseModelService {
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
-        if let Some(reason) = validate_connectivity_for_protocol(
+        validate_connectivity_for_protocol(
             &provider,
             &model,
             &api_key,
@@ -5091,12 +5119,7 @@ impl ModelService for DatabaseModelService {
             inference_protocol,
         )
         .await
-        {
-            return Err(error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Model credential or endpoint check failed: {reason}"),
-            ));
-        }
+        .map_err(|error| error.response(&provider, Some(&base_url)))?;
         let protocol = model_thinking_protocol(inference_protocol, &provider, &base_url, &model);
         let result = probe_thinking_behavior_with_protocol(
             &provider,
@@ -5316,7 +5339,7 @@ impl ModelService for DatabaseModelService {
             .as_ref()
             .and_then(|q| q.wire_model_name.as_deref())
             .unwrap_or(&request.name);
-        let conn_result = validate_connectivity_for_protocol(
+        validate_connectivity_for_protocol(
             &request.provider,
             probe_name,
             &request.api_key,
@@ -5331,8 +5354,8 @@ impl ModelService for DatabaseModelService {
                 .and_then(|q| q.probe_endpoint.as_deref()),
             request.quirks.as_ref().and_then(|q| q.inference_protocol),
         )
-        .await;
-        let is_active: i16 = if conn_result.is_none() { 1 } else { 0 };
+        .await
+        .map_err(|error| error.response(&request.provider, base_url.as_deref()))?;
 
         let input_mod = serde_json::to_string(&request.input_modalities)
             .unwrap_or_else(|_| r#"["text"]"#.to_string());
@@ -5368,7 +5391,7 @@ impl ModelService for DatabaseModelService {
         .bind(&encrypted_key)
         .bind(&base_url)
         .bind(&request.description)
-        .bind(is_active)
+        .bind(1_i16)
         .bind(context_window)
         .bind(request.max_completion_tokens)
         .bind(&input_mod)
@@ -5400,7 +5423,7 @@ impl ModelService for DatabaseModelService {
             .map_err(internal_error)?;
 
         let mut record = Self::model_record_from_row(row)?;
-        record.connectivity = Some(conn_result.unwrap_or_else(|| "ok".to_string()));
+        record.connectivity = Some("ok".to_string());
         Ok(record)
     }
 
@@ -5656,8 +5679,6 @@ impl ModelService for DatabaseModelService {
         }
         let base_url = request.base_url.as_deref().or(stored_base_url.as_deref());
         let probe_name = quirks.wire_model_name.as_deref().unwrap_or(&model_name);
-        let mut connectivity = None;
-        let mut active = request.is_active.map(i16::from);
         let encrypted = if let Some(api_key) = request.api_key.as_deref() {
             let encrypted = match stored_encrypted.as_deref() {
                 Some(ciphertext)
@@ -5667,20 +5688,6 @@ impl ModelService for DatabaseModelService {
                 }
                 _ => self.encryptor.encrypt(api_key).map_err(internal_error)?,
             };
-            let check = validate_connectivity_for_protocol(
-                provider,
-                probe_name,
-                api_key,
-                base_url,
-                quirks.probe_headers.as_ref(),
-                quirks.probe_endpoint.as_deref(),
-                quirks.inference_protocol,
-            )
-            .await;
-            if active.is_none() {
-                active = Some(i16::from(check.is_none()));
-            }
-            connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
             Some(encrypted)
         } else {
             None
@@ -5705,6 +5712,28 @@ impl ModelService for DatabaseModelService {
                 !unchanged_probe_endpoint(&stored_provider, stored_base_url.as_deref(), value)
             })
             || replacement_quirks.is_some();
+        let connectivity = if let Some(api_key) = request.api_key.as_deref() {
+            if let Err(error) = validate_connectivity_for_protocol(
+                provider,
+                probe_name,
+                api_key,
+                base_url,
+                quirks.probe_headers.as_ref(),
+                quirks.probe_endpoint.as_deref(),
+                quirks.inference_protocol,
+            )
+            .await
+            {
+                ensure_probed_admin_model_is_current(&pool, &existing, &model_name).await?;
+                return Err(error.response(provider, base_url));
+            }
+            Some("ok".to_string())
+        } else {
+            None
+        };
+        // Activation is an explicit configuration decision. A probe is an
+        // observation and must not disable (or reactivate) an existing model.
+        let active = request.is_active.map(i16::from);
         let mut update = QueryBuilder::<sqlx::MySql>::new("UPDATE infra_llm_models SET ");
         let mut changed = false;
         {
@@ -5883,7 +5912,7 @@ impl ModelService for DatabaseModelService {
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
 
         // Phase 1: connectivity probe
-        let check = validate_connectivity_for_protocol(
+        if let Err(error) = validate_connectivity_for_protocol(
             &provider,
             &probe_name,
             &api_key,
@@ -5892,9 +5921,14 @@ impl ModelService for DatabaseModelService {
             quirks.probe_endpoint.as_deref(),
             quirks.inference_protocol,
         )
-        .await;
+        .await
+        {
+            // A failure belongs to the checked configuration and must not
+            // change activation or blame a newer route.
+            ensure_probed_admin_model_is_current(&pool, &row, &model_name).await?;
+            return Err(error.response(&provider, base_url.as_deref()));
+        }
 
-        let is_active: i16 = if check.is_none() { 1 } else { 0 };
         // A network result belongs to the row and configuration checked, not
         // whatever configuration is installed when the request completes.
         let updated = query(
@@ -5902,7 +5936,7 @@ impl ModelService for DatabaseModelService {
              AND model_name = ? AND provider = ? AND base_url <=> ? \
              AND api_key_encrypted = ? AND CAST(quirks AS CHAR) = ? AND CAST(updated_at AS CHAR) = ?",
         )
-        .bind(is_active)
+        .bind(1_i16)
         .bind(&model_id)
         .bind(&model_name)
         .bind(&provider)
@@ -5924,7 +5958,7 @@ impl ModelService for DatabaseModelService {
         self.invalidate_catalog_revision_cache();
 
         // Phase 2: two-phase thinking behavior probe (only when connected)
-        if check.is_none() {
+        {
             let protocol = offering_thinking_protocol(
                 &quirks,
                 &provider,
@@ -6013,7 +6047,7 @@ impl ModelService for DatabaseModelService {
             })?;
 
         let mut record = Self::model_record_from_row(result_row)?;
-        record.connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
+        record.connectivity = Some("ok".to_string());
         invalidate_active_llm_model_resolution_cache();
         self.invalidate_catalog_revision_cache();
         Ok(record)
@@ -6127,6 +6161,129 @@ fn bedrock_converse_probe_url(base_url: &str, model_name: &str) -> Result<String
     Ok(url.to_string())
 }
 
+#[derive(Debug)]
+enum ModelProbeError {
+    Configuration(String),
+    Network(String),
+    Timeout,
+    Response(&'static str),
+    Http(StatusCode),
+}
+
+impl ModelProbeError {
+    fn transport(error: reqwest::Error) -> Self {
+        // URLs, proxy credentials and provider errors must not escape through
+        // reqwest's Display or its source chain.
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut io_kind = None;
+        let mut tls = false;
+        for _ in 0..16 {
+            let Some(cause) = source else { break };
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                io_kind = Some(io.kind());
+                if let Some(inner) = io.get_ref() {
+                    source = Some(inner);
+                    continue;
+                }
+            }
+            tls |= cause.downcast_ref::<rustls::Error>().is_some();
+            source = cause.source();
+        }
+        tracing::warn!(
+            timeout = error.is_timeout(),
+            connect = error.is_connect(),
+            tls_detected = tls,
+            ?io_kind,
+            "model probe transport failed"
+        );
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_builder() {
+            Self::Configuration("Invalid model endpoint or request configuration".into())
+        } else if tls {
+            Self::Network("TLS connection failed; check the Server's certificates and proxy".into())
+        } else if io_kind == Some(std::io::ErrorKind::ConnectionRefused) {
+            Self::Network("Connection refused; check the Server's network and proxy".into())
+        } else if error.is_connect() {
+            Self::Network("Could not connect (check DNS, proxy, network and TLS)".into())
+        } else {
+            Self::Network("Connection or response stream was interrupted".into())
+        }
+    }
+
+    fn response(self, provider: &str, base_url: Option<&str>) -> (StatusCode, Json<ErrorResponse>) {
+        let (status, code) = match &self {
+            Self::Configuration(_) => (StatusCode::BAD_REQUEST, "model_probe_configuration"),
+            Self::Network(_) => (StatusCode::BAD_GATEWAY, "model_probe_network"),
+            Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout"),
+            Self::Response(_) => (StatusCode::BAD_GATEWAY, "model_probe_response"),
+            Self::Http(status) if *status == StatusCode::TOO_MANY_REQUESTS => {
+                (StatusCode::TOO_MANY_REQUESTS, "model_probe_rate_limited")
+            }
+            Self::Http(status) if *status == StatusCode::REQUEST_TIMEOUT => {
+                (StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout")
+            }
+            Self::Http(status)
+                if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
+            {
+                (StatusCode::BAD_REQUEST, "model_probe_credentials_or_access")
+            }
+            Self::Http(status) if status.is_client_error() => {
+                (StatusCode::BAD_REQUEST, "model_probe_request_rejected")
+            }
+            Self::Http(_) => (StatusCode::BAD_GATEWAY, "model_probe_upstream"),
+        };
+        let mut detail = self.to_string();
+        if matches!(self, Self::Network(_) | Self::Timeout) {
+            if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+                let route = base_url
+                    .and_then(|url| reqwest::Url::parse(url).ok())
+                    .and_then(|url| astra_core::net::configured_https_proxy_url_for(&url).ok());
+                if let Some(proxy) = route {
+                    detail.push_str(if proxy.is_some() {
+                        ". Server route: configured HTTPS proxy"
+                    } else {
+                        ". Server route: direct connection"
+                    });
+                }
+            } else {
+                detail.push_str(
+                    ". Server route follows its HTTPS_PROXY/ALL_PROXY and NO_PROXY settings",
+                );
+            }
+        }
+        error_response_coded(status, detail, code)
+    }
+}
+
+impl std::fmt::Display for ModelProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(message) | Self::Network(message) => f.write_str(message),
+            Self::Timeout => f.write_str("Model check timed out"),
+            Self::Response(message) => f.write_str(message),
+            Self::Http(status)
+                if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
+            {
+                write!(
+                    f,
+                    "HTTP {status}: provider rejected credentials or model access"
+                )
+            }
+            Self::Http(status) if *status == StatusCode::NOT_FOUND => {
+                write!(
+                    f,
+                    "HTTP {status}: provider could not find the model or endpoint"
+                )
+            }
+            Self::Http(status) if *status == StatusCode::TOO_MANY_REQUESTS => {
+                write!(f, "HTTP {status}: provider rate limit; try again later")
+            }
+            Self::Http(status) => write!(f, "HTTP {status}: provider rejected the model check"),
+        }
+    }
+}
+
 async fn probe_responses(
     client: &reqwest::Client,
     url: &str,
@@ -6134,7 +6291,7 @@ async fn probe_responses(
     api_key: &str,
     headers: Option<&Map<String, Value>>,
     effort: Option<&str>,
-) -> Result<astra_core::model_wire::responses::ResponseOutput, String> {
+) -> Result<astra_core::model_wire::responses::ResponseOutput, ModelProbeError> {
     use futures_util::StreamExt;
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut body = astra_core::model_wire::responses::request(
@@ -6145,7 +6302,7 @@ async fn probe_responses(
             true,
             Some(1024),
         )
-        .map_err(|_| "Could not prepare model check".to_string())?;
+        .map_err(|_| ModelProbeError::Configuration("Could not prepare model check".into()))?;
         ThinkingProtocol::ResponsesReasoning.apply(&mut body, true, effort);
         let mut request = client.post(url).bearer_auth(api_key).json(&body);
         if let Some(headers) = headers {
@@ -6155,32 +6312,30 @@ async fn probe_responses(
                 }
             }
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| "Model check could not reach the provider".to_string())?;
+        let response = request.send().await.map_err(ModelProbeError::transport)?;
         if !response.status().is_success() {
-            return Err(format!(
-                "HTTP {}: check the model and endpoint configuration",
-                response.status().as_u16()
-            ));
+            return Err(ModelProbeError::Http(response.status()));
         }
         let mut stream = response.bytes_stream();
         let mut frames = astra_core::sse_blocks::SseBlankLineUtf8Buf::new();
         let mut accumulator = astra_core::model_wire::responses::ResponseAccumulator::default();
         let mut size = 0usize;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| "Model check response interrupted".to_string())?;
+            let chunk = chunk.map_err(ModelProbeError::transport)?;
             size = size.saturating_add(chunk.len());
             if size > 1024 * 1024 {
-                return Err("Model check response exceeded its size limit".into());
+                return Err(ModelProbeError::Response(
+                    "Model check response exceeded its size limit",
+                ));
             }
-            let blocks = frames
-                .push_bytes(&chunk)
-                .map_err(|_| "Model check response has invalid encoding".to_string())?;
+            let blocks = frames.push_bytes(&chunk).map_err(|_| {
+                ModelProbeError::Response("Model check response has invalid encoding")
+            })?;
             for block in blocks {
                 astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &block)
-                    .map_err(|_| "Model check did not produce a complete response".to_string())?;
+                    .map_err(|_| {
+                        ModelProbeError::Response("Model check did not produce a complete response")
+                    })?;
                 if accumulator.completed() {
                     return finish_response_probe(accumulator);
                 }
@@ -6188,21 +6343,22 @@ async fn probe_responses(
         }
         let tail = frames
             .take_buf()
-            .map_err(|_| "Model check response has invalid encoding".to_string())?;
-        astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail)
-            .map_err(|_| "Model check did not produce a complete response".to_string())?;
+            .map_err(|_| ModelProbeError::Response("Model check response has invalid encoding"))?;
+        astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail).map_err(
+            |_| ModelProbeError::Response("Model check did not produce a complete response"),
+        )?;
         finish_response_probe(accumulator)
     })
     .await
-    .map_err(|_| "Model check timed out".to_string())?
+    .map_err(|_| ModelProbeError::Timeout)?
 }
 
 fn finish_response_probe(
     accumulator: astra_core::model_wire::responses::ResponseAccumulator,
-) -> Result<astra_core::model_wire::responses::ResponseOutput, String> {
-    let output = accumulator
-        .finish()
-        .map_err(|_| "Model check did not produce a complete response".to_string())?;
+) -> Result<astra_core::model_wire::responses::ResponseOutput, ModelProbeError> {
+    let output = accumulator.finish().map_err(|_| {
+        ModelProbeError::Response("Model check did not produce a complete response")
+    })?;
     if output.text.trim().is_empty()
         || output.finish_reason.as_deref() == Some("length")
         || output.items.iter().any(|item| {
@@ -6212,29 +6368,11 @@ fn finish_response_probe(
                     .is_some_and(|parts| parts.iter().any(|part| part["type"] == "refusal"))
         })
     {
-        return Err("Model check did not produce a complete response".into());
+        return Err(ModelProbeError::Response(
+            "Model check did not produce a complete response",
+        ));
     }
     Ok(output)
-}
-
-pub async fn validate_connectivity(
-    provider: &str,
-    model_name: &str,
-    api_key: &str,
-    base_url: Option<&str>,
-    probe_headers: Option<&Map<String, Value>>,
-    probe_endpoint: Option<&str>,
-) -> Option<String> {
-    validate_connectivity_for_protocol(
-        provider,
-        model_name,
-        api_key,
-        base_url,
-        probe_headers,
-        probe_endpoint,
-        None,
-    )
-    .await
 }
 
 async fn validate_connectivity_for_protocol(
@@ -6245,9 +6383,9 @@ async fn validate_connectivity_for_protocol(
     probe_headers: Option<&Map<String, Value>>,
     probe_endpoint: Option<&str>,
     inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
-) -> Option<String> {
+) -> Result<(), ModelProbeError> {
     if provider == "mock" {
-        return None;
+        return Ok(());
     }
 
     // Connectivity probes reach external provider endpoints (Anthropic, Bedrock,
@@ -6255,20 +6393,19 @@ async fn validate_connectivity_for_protocol(
     // Native providers share the LLM client's ambient proxy policy. User-owned
     // OpenAI-compatible endpoints instead use the pinned BYOK egress transport
     // below, matching their runtime path without delegating destination DNS.
-    let probe_builder = astra_core::net::apply_env_proxy(
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
-    );
     let client_result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
         crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
     } else {
-        probe_builder
-            .build()
-            .map(crate::byok_endpoint::EndpointClient::from)
-            .map_err(|e| e.to_string())
+        astra_core::net::apply_env_proxy(
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+        )
+        .build()
+        .map(crate::byok_endpoint::EndpointClient::from)
+        .map_err(|_| "Unable to create model HTTP client".to_string())
     };
     let client = match client_result {
         Ok(c) => c,
-        Err(e) => return Some(format!("Client error: {}", e)),
+        Err(e) => return Err(ModelProbeError::Network(e)),
     };
 
     if inference_protocol == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses) {
@@ -6285,23 +6422,24 @@ async fn validate_connectivity_for_protocol(
             None,
         )
         .await
-        .err();
+        .map(|_| ());
     }
 
     let result = if provider == "typesafe" {
         if api_key.trim().is_empty() {
-            return Some("TypeSafe API key is not configured".into());
+            return Err(ModelProbeError::Configuration(
+                "TypeSafe API key is not configured".into(),
+            ));
         }
         let base = base_url
             .unwrap_or("https://api.typesafe.ai")
             .trim_end_matches('/')
             .trim_end_matches("/v1");
         let probe = format!("{base}/v1/systemone");
-        let send_result = client.post(&probe).bearer_auth(api_key).json(&serde_json::json!({
+        client.post(&probe).bearer_auth(api_key).json(&serde_json::json!({
             "model": model_name, "state": "Astra connectivity probe",
             "questions": {"connected": {"type": "noul", "instructions": "Does the state mention Astra?"}}
-        })).send().await;
-        (send_result, probe)
+        })).send().await
     } else if provider == "anthropic" {
         let probe = anthropic_messages_probe_url(base_url);
         let mut req = client
@@ -6321,19 +6459,18 @@ async fn validate_connectivity_for_protocol(
             "messages": [{"role": "user", "content": "hi"}]
         });
         astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
-        let send_result = req.json(&body).send().await;
-        (send_result, probe)
+        req.json(&body).send().await
     } else if provider == "bedrock" {
         let Some(base_url_value) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
-            return Some(
+            return Err(ModelProbeError::Configuration(
                 "No base_url for provider 'bedrock'. Set base_url to your Bedrock runtime root, e.g. https://bedrock-runtime.us-east-1.amazonaws.com."
                     .to_string(),
-            );
+            ));
         };
         let Ok(probe) = bedrock_converse_probe_url(base_url_value, model_name) else {
-            return Some(format!(
-                "Invalid base_url for provider 'bedrock': '{}'. Set base_url to your Bedrock runtime root, e.g. https://bedrock-runtime.us-east-1.amazonaws.com.",
-                base_url_value
+            return Err(ModelProbeError::Configuration(
+                "Invalid base_url for provider 'bedrock'. Set it to your Bedrock runtime root."
+                    .into(),
             ));
         };
         let mut req = client
@@ -6347,19 +6484,17 @@ async fn validate_connectivity_for_protocol(
                 }
             }
         }
-        let send_result = req
-            .json(&serde_json::json!({
-                "messages": [{
-                    "role": "user",
-                    "content": [{"text": "hi"}]
-                }],
-                "inferenceConfig": {
-                    "maxTokens": 1
-                }
-            }))
-            .send()
-            .await;
-        (send_result, probe)
+        req.json(&serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"text": "hi"}]
+            }],
+            "inferenceConfig": {
+                "maxTokens": 1
+            }
+        }))
+        .send()
+        .await
     } else {
         let base_trim = base_url.map(str::trim).filter(|s| !s.is_empty());
         let url = match base_trim {
@@ -6370,10 +6505,10 @@ async fn validate_connectivity_for_protocol(
             // This aligns with the runtime's guarantee that base_url is always set
             // from the DB row before calling llm_completions_url_for_provider.
             None => {
-                return Some(format!(
+                return Err(ModelProbeError::Configuration(format!(
                     "No base_url for provider '{provider}'. \
                          Set base_url (e.g. DashScope/Moonshot compatible-mode /v1 root).",
-                ));
+                )));
             }
         };
         let endpoint = probe_endpoint.unwrap_or("/chat/completions");
@@ -6397,44 +6532,35 @@ async fn validate_connectivity_for_protocol(
         if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
             req = req.timeout(Duration::from_secs(360));
         }
-        let send_result = req.json(&body).send().await;
-        (send_result, probe)
+        req.json(&body).send().await
     };
 
     match result {
-        (Ok(resp), _) if resp.status().is_success() => None,
-        (Ok(resp), _) => {
-            let status = resp.status().as_u16();
-            if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-                // Arbitrary compatible endpoints may reflect credentials in
-                // their error body. Return status without forwarding that body.
-                return Some(format!(
-                    "HTTP {status}: check the model ID, API key and endpoint"
-                ));
-            }
-            let text = resp.text().await.unwrap_or_default();
-            let detail = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")?
-                        .get("message")?
-                        .as_str()
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| text.chars().take(200).collect());
-            Some(format!("HTTP {}: {}", status, detail))
-        }
-        (Err(e), probe) => {
-            let mut msg = format!("Connection failed for {probe}: {e}");
-            if provider != "anthropic" {
-                msg.push_str(
-                    " — host unreachable (firewall/DNS/TLS) or region blocks; \
-                     point base_url at an API gateway you can reach, or fix outbound HTTPS/proxy.",
-                );
-            }
-            Some(msg)
-        }
+        Ok(resp) if resp.status().is_success() => validate_probe_response(resp).await,
+        Ok(resp) => Err(ModelProbeError::Http(resp.status())),
+        Err(error) => Err(ModelProbeError::transport(error)),
     }
+}
+
+async fn validate_probe_response(mut response: reqwest::Response) -> Result<(), ModelProbeError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(ModelProbeError::transport)? {
+        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err(ModelProbeError::Response(
+                "Model check response exceeded its size limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        ModelProbeError::Response("Model check returned an invalid provider response")
+    })?;
+    if !value.is_object() || value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(ModelProbeError::Response(
+            "Model check returned an invalid provider response",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6498,16 +6624,15 @@ async fn probe_thinking_behavior_with_protocol_inner(
         };
     }
 
-    let probe_builder = astra_core::net::apply_env_proxy(
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
-    );
     let client_result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
         crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
     } else {
-        probe_builder
-            .build()
-            .map(crate::byok_endpoint::EndpointClient::from)
-            .map_err(|e| e.to_string())
+        astra_core::net::apply_env_proxy(
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+        )
+        .build()
+        .map(crate::byok_endpoint::EndpointClient::from)
+        .map_err(|e| e.to_string())
     };
     let client = match client_result {
         Ok(c) => c,
@@ -6566,7 +6691,7 @@ async fn probe_thinking_behavior_with_protocol_inner(
             },
             Err(error) => ThinkingProbeResult {
                 capability: ThinkingCapability::None,
-                error: Some(error),
+                error: Some(error.to_string()),
             },
         };
     }
@@ -7947,6 +8072,148 @@ mod tests {
         assert_eq!(observation.capability, ThinkingCapability::EffortOnly);
         assert!(observation.error.is_none());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_probe_reports_safe_actionable_errors_for_both_wire_protocols() {
+        use astra_core::model_wire::LlmProviderProtocol;
+        use axum::{Router, extract::Path, routing::post};
+
+        async fn reject(Path(status): Path<u16>) -> (StatusCode, &'static str) {
+            (StatusCode::from_u16(status).unwrap(), "provider-secret")
+        }
+        let app = Router::new()
+            .route("/{status}/responses", post(reject))
+            .route("/{status}/chat/completions", post(reject))
+            .route(
+                "/embedded/chat/completions",
+                post(|| async { Json(serde_json::json!({"error":{"message":"provider-secret"}})) }),
+            )
+            .route(
+                "/oversize/chat/completions",
+                post(|| async { "x".repeat(1024 * 1024 + 1) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for protocol in [None, Some(LlmProviderProtocol::OpenAiResponses)] {
+            for (upstream, expected_status, expected_code) in [
+                (
+                    401,
+                    StatusCode::BAD_REQUEST,
+                    "model_probe_credentials_or_access",
+                ),
+                (
+                    403,
+                    StatusCode::BAD_REQUEST,
+                    "model_probe_credentials_or_access",
+                ),
+                (404, StatusCode::BAD_REQUEST, "model_probe_request_rejected"),
+                (408, StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout"),
+                (
+                    429,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "model_probe_rate_limited",
+                ),
+                (503, StatusCode::BAD_GATEWAY, "model_probe_upstream"),
+            ] {
+                let base = format!("http://{address}/{upstream}?token=url-secret");
+                let failure = validate_connectivity_for_protocol(
+                    "openai",
+                    "model",
+                    "credential-secret",
+                    Some(&base),
+                    None,
+                    None,
+                    protocol,
+                )
+                .await
+                .expect_err("provider must reject probe");
+                let (status, Json(error)) = failure.response("openai", None);
+                assert_eq!(status, expected_status, "{protocol:?} {upstream}");
+                assert_eq!(error.error_code.as_deref(), Some(expected_code));
+                assert!(error.detail.contains(&format!("HTTP {upstream}")));
+                for secret in ["provider-secret", "credential-secret", "url-secret"] {
+                    assert!(!error.detail.contains(secret), "{}", error.detail);
+                }
+            }
+        }
+        for path in ["200", "embedded", "oversize"] {
+            let failure = validate_connectivity_for_protocol(
+                "openai",
+                "model",
+                "credential-secret",
+                Some(&format!("http://{address}/{path}")),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("an invalid 2xx response must not count as a successful probe");
+            let (status, Json(error)) = failure.response("openai", None);
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(error.error_code.as_deref(), Some("model_probe_response"));
+            assert!(!error.detail.contains("provider-secret"));
+        }
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = probe_responses(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &format!("http://{address}/responses?token=url-secret"),
+            "model",
+            "credential-secret",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let (status, Json(error)) = error.response("openai", None);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.error_code.as_deref(), Some("model_probe_network"));
+        assert!(!error.detail.contains("url-secret"));
+        assert!(!error.detail.contains("credential-secret"));
+
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key)
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+                .accept(tcp)
+                .await;
+        });
+        let error = probe_responses(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &format!("https://{address}/responses"),
+            "model",
+            "credential-secret",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let (status, Json(error)) = error.response("openai", None);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            error.detail.contains("TLS connection failed"),
+            "{}",
+            error.detail
+        );
+        assert!(!error.detail.contains("credential-secret"));
+        server.await.unwrap();
     }
 
     #[test]
@@ -10661,49 +10928,67 @@ mod tests {
 
     #[tokio::test]
     async fn validate_connectivity_mock_provider_skips_network() {
-        let result =
-            super::validate_connectivity("mock", "any-model", "key", None, None, None).await;
+        let result = super::validate_connectivity_for_protocol(
+            "mock",
+            "any-model",
+            "key",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(
-            result.is_none(),
+            result.is_ok(),
             "mock provider should short-circuit to success"
         );
     }
 
     #[tokio::test]
     async fn validate_connectivity_unknown_provider_no_base_url_errors() {
-        let result =
-            super::validate_connectivity("dashscope", "qwen-plus", "key", None, None, None).await;
-        let msg = result.expect("should return an error");
+        let result = super::validate_connectivity_for_protocol(
+            "dashscope",
+            "qwen-plus",
+            "key",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let msg = result.expect_err("should return an error").to_string();
         assert!(msg.contains("No base_url"), "got: {msg}");
     }
 
     #[tokio::test]
     async fn validate_connectivity_bedrock_no_base_url_errors() {
-        let result = super::validate_connectivity(
+        let result = super::validate_connectivity_for_protocol(
             "bedrock",
             "anthropic.claude-3-5-sonnet-v1:0",
             "key",
             None,
             None,
             None,
+            None,
         )
         .await;
-        let msg = result.expect("should return an error");
+        let msg = result.expect_err("should return an error").to_string();
         assert!(msg.contains("No base_url"), "got: {msg}");
     }
 
     #[tokio::test]
     async fn validate_connectivity_bedrock_invalid_base_url_errors() {
-        let result = super::validate_connectivity(
+        let result = super::validate_connectivity_for_protocol(
             "bedrock",
             "anthropic.claude-3-5-sonnet-v1:0",
             "key",
             Some("not a url"),
             None,
             None,
+            None,
         )
         .await;
-        let msg = result.expect("should return an error");
+        let msg = result.expect_err("should return an error").to_string();
         assert!(msg.contains("Invalid base_url"), "got: {msg}");
     }
 
@@ -10833,7 +11118,7 @@ mod tests {
     // ── Provider-aware probe regression tests ─────────────────────────
 
     #[tokio::test]
-    async fn connectivity_probe_uses_native_token_budget_and_preserves_provider_errors() {
+    async fn connectivity_probe_uses_native_token_budget_and_classifies_provider_failures() {
         use axum::{Json, Router, http::HeaderMap, routing::post};
         for (provider, model, path, token_field, wrong_field) in [
             (
@@ -10896,27 +11181,45 @@ mod tests {
                         } else {
                             StatusCode::OK
                         };
-                        (
-                            status,
-                            Json(serde_json::json!({"error":{"message":"fixture rejection"}})),
-                        )
+                        let response = if status == StatusCode::OK {
+                            serde_json::json!({"choices":[{"message":{"content":"ok"}}]})
+                        } else {
+                            serde_json::json!({"error":{"message":"fixture rejection"}})
+                        };
+                        (status, Json(response))
                     }
                 }),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let result =
-                validate_connectivity(provider, model, "valid-key", Some(&base), None, None).await;
-            assert!(result.is_none(), "{provider}/{model}: {result:?}");
+            let result = validate_connectivity_for_protocol(
+                provider,
+                model,
+                "valid-key",
+                Some(&base),
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(result.is_ok(), "{provider}/{model}: {result:?}");
             for (key, model_id, expected) in [
                 ("invalid-key", model, "HTTP 401"),
                 ("valid-key", "missing-model", "HTTP 404"),
             ] {
-                let result =
-                    validate_connectivity(provider, model_id, key, Some(&base), None, None)
-                        .await
-                        .unwrap();
+                let result = validate_connectivity_for_protocol(
+                    provider,
+                    model_id,
+                    key,
+                    Some(&base),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
                 assert!(result.contains(expected), "{provider}: {result}");
             }
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);

@@ -6,7 +6,6 @@ use std::time::Duration;
 
 pub const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 pub const ENDPOINT_POLICY_ENV: &str = "ASTRA_BYOK_ENDPOINT_POLICY";
-mod dns;
 mod proxy;
 
 /// Keeps any private CONNECT tunnel alive for the entire response/stream lifetime.
@@ -33,14 +32,6 @@ impl Drop for EndpointClient {
         if let Some(task) = &self.tunnel {
             task.abort();
         }
-    }
-}
-
-fn configured_value(name: &str) -> Result<Option<String>, String> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(_) => Err(format!("Invalid {name}")),
     }
 }
 
@@ -234,7 +225,7 @@ fn transport_builder() -> reqwest::ClientBuilder {
 
 fn validate_addresses(addresses: &[SocketAddr]) -> Result<(), String> {
     if addresses.is_empty() || addresses.iter().any(|addr| !public_ip(addr.ip())) {
-        return Err("Astra Server DNS returned non-public model addresses (possibly proxy Fake-IP). Configure ASTRA_BYOK_DNS_SERVERS to return real public addresses; the model API key is not the cause.".into());
+        return Err("Astra Server DNS returned non-public model addresses (possibly proxy Fake-IP). Configure the Server's DNS to return public addresses; the model API key is not the cause.".into());
     }
     Ok(())
 }
@@ -253,8 +244,9 @@ fn pinned_client(url: &reqwest::Url, addresses: &[SocketAddr]) -> Result<reqwest
 /// TLS still validates the original hostname. Redirects never forward keys.
 pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, String> {
     let url = parse_endpoint(raw)?;
-    let proxy = proxy::EgressProxy::parse(configured_value(proxy::PROXY_ENV)?.as_deref())?;
-    let addresses = dns::resolve(&url, configured_value(dns::DNS_SERVERS_ENV)?.as_deref()).await?;
+    let proxy_url = astra_core::net::configured_https_proxy_url_for(&url)?;
+    let proxy = proxy::EgressProxy::parse(proxy_url.as_deref())?;
+    let addresses = resolve_addresses(&url).await?;
     validate_addresses(&addresses)?;
     match proxy {
         Some(proxy) => proxy::client(&url, &addresses, proxy, transport_builder()).await,
@@ -262,9 +254,42 @@ pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, String> {
     }
 }
 
+async fn resolve_addresses(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
+    let host = url
+        .host_str()
+        .expect("validated endpoint host")
+        .trim_matches(['[', ']']);
+    let port = url
+        .port_or_known_default()
+        .expect("validated endpoint port");
+    let addresses = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| "Astra Server DNS lookup timed out; check its system DNS")?
+        .map_err(|error| {
+            tracing::warn!(kind = ?error.kind(), "model endpoint DNS lookup failed");
+            "Astra Server could not resolve the model endpoint; check its system DNS and the provider hostname"
+        })?;
+    Ok(addresses.collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn system_dns_results_are_checked_before_use() {
+        let public = resolve_addresses(&reqwest::Url::parse("https://8.8.8.8:8443").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(public, vec!["8.8.8.8:8443".parse().unwrap()]);
+        assert!(validate_addresses(&public).is_ok());
+        let local = resolve_addresses(&reqwest::Url::parse("https://localhost").unwrap())
+            .await
+            .unwrap();
+        assert!(validate_addresses(&local).is_err());
+        assert!(validate_addresses(&[public[0], "198.18.4.197:443".parse().unwrap()]).is_err());
+        assert!(validate_addresses(&[]).is_err());
+    }
 
     #[tokio::test]
     async fn transport_has_no_implicit_body_deadline_but_honors_request_timeout() {

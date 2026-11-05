@@ -4376,23 +4376,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writes_do_not_publish_when_the_parent_cannot_be_bound_for_recovery() {
-        use std::os::unix::fs::PermissionsExt;
-
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
         let tmp = TempDir::new().unwrap();
         let restricted = tmp.path().join("restricted");
         std::fs::create_dir(&restricted).unwrap();
         let first = tmp.path().join("first.txt");
         let second = restricted.join("second.txt");
+        let single_path = restricted.join("single.txt");
         std::fs::write(&first, "alpha").unwrap();
         std::fs::write(&second, "beta").unwrap();
+        std::fs::write(&single_path, "old").unwrap();
         let single = PreparedWriteFile::from_authorized_preimage(
-            restricted.join("new.txt"),
-            "new.txt",
+            single_path,
+            "single.txt",
             "new",
-            None,
+            Some(b"old".to_vec()),
         );
         let multi = prepare_multi_path_edit(
             tmp.path(),
@@ -4402,16 +4399,26 @@ mod tests {
             ]}),
         )
         .unwrap();
-        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o300)).unwrap();
+        // The directory can disappear after preparation. Unlike read permission,
+        // this prevents binding on both Linux (which can use O_PATH) and macOS.
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&restricted, &moved).unwrap();
         let single_result = single.apply();
         let multi_result = multi.apply();
-        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(single_result.is_error, "{single_result:?}");
         assert!(multi_result.is_error, "{multi_result:?}");
-        assert!(!restricted.join("new.txt").exists());
+        assert!(single_result.output.contains("Cannot bind file directory"));
+        assert!(multi_result.output.contains("Cannot bind file directory"));
         assert_eq!(std::fs::read_to_string(first).unwrap(), "alpha");
-        assert_eq!(std::fs::read_to_string(second).unwrap(), "beta");
+        assert_eq!(
+            std::fs::read_to_string(moved.join("second.txt")).unwrap(),
+            "beta"
+        );
+        assert_eq!(
+            std::fs::read_to_string(moved.join("single.txt")).unwrap(),
+            "old"
+        );
     }
 
     #[test]

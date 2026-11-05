@@ -59,7 +59,7 @@ pub fn build_internal_http_client(
 ///
 /// Malformed or empty proxy URLs are logged at warn level and skipped; the
 /// returned builder is always usable.
-pub fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+fn configured_env_proxy() -> Option<(reqwest::Proxy, String)> {
     let no_proxy = reqwest::NoProxy::from_env();
     for var in &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
         let Ok(proxy_url) = std::env::var(var) else {
@@ -82,24 +82,59 @@ pub fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBu
                 tracing::info!(
                     target: "astra_core::net",
                     env_var = *var,
-                    proxy = %proxy_url,
-                    "applying proxy from environment"
+                    "proxy configured from environment"
                 );
-                builder = builder.proxy(proxy);
-                return builder;
+                return Some((proxy, proxy_url));
             }
-            Err(e) => {
+            Err(_) => {
                 tracing::warn!(
                     target: "astra_core::net",
                     env_var = *var,
-                    proxy = %proxy_url,
-                    error = %e,
                     "failed to parse proxy URL; ignoring"
                 );
             }
         }
     }
-    builder
+    None
+}
+
+pub fn apply_env_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    match configured_env_proxy() {
+        Some((proxy, _)) => builder.proxy(proxy),
+        None => builder,
+    }
+}
+
+/// The same configured proxy used for HTTPS provider traffic. The returned
+/// URL may contain credentials and must never be logged or returned to users.
+pub fn configured_https_proxy_url_for(url: &reqwest::Url) -> Result<Option<String>, &'static str> {
+    let (_, proxy_url) = match configured_env_proxy() {
+        Some(proxy) => proxy,
+        None if ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty())) =>
+        {
+            return Err("Invalid Server HTTPS proxy configuration");
+        }
+        None => return Ok(None),
+    };
+    let no_proxy = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    let matcher = hyper_util::client::proxy::matcher::Matcher::builder()
+        .https("http://127.0.0.1")
+        .no(no_proxy)
+        .build();
+    if url
+        .as_str()
+        .parse::<axum::http::Uri>()
+        .ok()
+        .is_some_and(|uri| matcher.intercept(&uri).is_none())
+    {
+        Ok(None)
+    } else {
+        Ok(Some(proxy_url))
+    }
 }
 
 /// Returns `true` when `url` targets the local host (`localhost`,
@@ -179,7 +214,7 @@ mod client_builder_for_target_tests {
 
 #[cfg(test)]
 mod apply_env_proxy_tests {
-    use super::apply_env_proxy;
+    use super::{apply_env_proxy, configured_https_proxy_url_for};
 
     /// All four recognized env var names must be cleared for isolation, since
     /// `apply_env_proxy` reads them in precedence order.
@@ -250,6 +285,55 @@ mod apply_env_proxy_tests {
             || {
                 let builder = apply_env_proxy(reqwest::Client::builder());
                 assert!(builder.build().is_ok());
+            },
+        );
+    }
+
+    #[test]
+    fn provider_proxy_selection_uses_the_same_environment_and_no_proxy_rules() {
+        temp_env::with_vars(
+            [
+                (
+                    "HTTPS_PROXY",
+                    Some("http://test-user:test-password@127.0.0.1:9999"),
+                ),
+                ("https_proxy", None),
+                ("ALL_PROXY", Some("http://127.0.0.1:8888")),
+                ("all_proxy", None),
+                ("NO_PROXY", Some(".example.org,10.0.0.0/8")),
+                ("no_proxy", None),
+            ],
+            || {
+                let selected = |url| {
+                    configured_https_proxy_url_for(&reqwest::Url::parse(url).unwrap()).unwrap()
+                };
+                assert_eq!(
+                    selected("https://provider.test/v1").as_deref(),
+                    Some("http://test-user:test-password@127.0.0.1:9999")
+                );
+                assert!(selected("https://api.example.org/v1").is_none());
+                assert!(selected("https://10.4.3.2/v1").is_none());
+                assert!(selected("https://other-example.org/v1").is_some());
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_proxy_configuration_does_not_silently_route_direct() {
+        temp_env::with_vars(
+            [
+                ("HTTPS_PROXY", Some("http://invalid proxy")),
+                ("https_proxy", None),
+                ("ALL_PROXY", None),
+                ("all_proxy", None),
+            ],
+            || {
+                assert!(
+                    configured_https_proxy_url_for(
+                        &reqwest::Url::parse("https://provider.test").unwrap()
+                    )
+                    .is_err()
+                );
             },
         );
     }

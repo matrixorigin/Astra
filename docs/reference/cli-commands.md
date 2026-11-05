@@ -71,17 +71,11 @@ Public HTTPS endpoints do not require individual administrator registration by
 default. Operators can opt into strict host/port approval by setting
 `ASTRA_BYOK_ENDPOINT_POLICY=trusted-domains` on every Server replica and using
 `PUT /admin/llm/trusted-domains`. Both modes block private/metadata addresses,
-validate and pin DNS results, and disable redirects. Custom BYOK uses direct
-queries to the Server's configured DNS servers, not OS Fake-IP caches. Operators
-may override DNS IPs with `ASTRA_BYOK_DNS_SERVERS` and select an HTTP(S) CONNECT
-or SOCKS5 proxy with `ASTRA_BYOK_PROXY_URL`. Proxies connect to validated public
-IPs, retaining origin TLS verification; ambient proxy variables are not used.
-Direct UDP DNS can still be intercepted by a VPN/proxy. Use an explicit
-TCP-only entry such as `ASTRA_BYOK_DNS_SERVERS=tcp://10.0.0.53:53` when a
-reachable DNS server supports TCP. TCP-only entries never fall back to UDP;
-private/Fake-IP answers remain rejected. DNS failures retain resolver diagnostics
-in Server logs without exposing them in public API errors.
-These are Server settings, not options ordinary CLI users need to fill in.
+validate and pin DNS results, and disable redirects. The Server uses its normal
+system DNS and HTTPS proxy settings; proxies connect to validated public IPs
+while retaining origin TLS verification. A Server using Fake-IP DNS must be
+configured to return public addresses for model providers. These are Server
+settings, not options ordinary CLI users need to fill in.
 The default policy is `public-https`; invalid values fail closed. Upgrade the
 Server together with the CLI to provide `/me/models/validate-endpoint`.
 
@@ -390,6 +384,11 @@ fields and quirks: supplying quirks replaces the complete stored object.
 the observation and diagnostics. An `effort_only` result allows effort selection,
 not thinking Off. An inconclusive check establishes no new capability. A matching
 prior capability may remain available while diagnostics record the latest error.
+An unsuccessful connectivity check returns a nonzero exit status and does not
+disable an existing model. A successful administrator check activates it. Model
+loading reports failed checks with a nonzero exit status while retaining any
+other models already loaded. A lost response can leave a creation outcome
+unknown; check the model list before retrying.
 
 For an administrator-managed API-key model that requires the OpenAI Responses
 API, set `inference_protocol: openai_responses` in its YAML entry and reload it
