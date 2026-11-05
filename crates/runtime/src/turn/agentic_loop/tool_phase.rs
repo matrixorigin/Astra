@@ -84,10 +84,20 @@ fn validate_tool_group_storage_budget(
     {
         return Err("Tool batch is too large to save safely; no requested tool ran".into());
     }
-    // The round owner canonicalizes provider call shapes before recording
-    // them. Count that exact representation before any edge dispatch too.
+    // Admission records malformed calls with a canonical rejection carrier.
+    // Budget that same carrier rather than rejecting recoverable arguments
+    // before the admission owner can return its per-call error to the model.
+    let carriers = calls
+        .iter()
+        .map(|call| {
+            let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+            let name =
+                astra_turn_core::tool::args::shape::tool_call_name(call).unwrap_or("unknown");
+            crate::turn::agentic::tool_interception::canonical_rejection_placeholder(call, id, name)
+        })
+        .collect::<Vec<_>>();
     let canonical_calls =
-        astra_turn_core::headless_tool_assembly::canonicalize_provider_tool_batch(calls)
+        astra_turn_core::headless_tool_assembly::canonicalize_provider_tool_batch(&carriers)
             .map_err(|error| format!("provider tool-call protocol violation: {error}"))?;
     let mut opening =
         astra_turn_core::headless_tool_assembly::begin_headless_tool_round_opening_ext(

@@ -1260,8 +1260,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     .as_ref()
                     .is_some_and(astra_tools::workspace_observation::is_changed_receipt)
         });
+        // A failed or timed-out writer may already have changed what earlier
+        // reads observed. Invalidation is conservative; it does not claim the
+        // operation succeeded or attribute a particular change to it.
         if observed_workspace_mutation
-            || (execution_ok_on_delivery_error.unwrap_or(!is_err)
+            || (disposition == Some(ToolCallDisposition::Executed)
                 && crate::turn::tool_side_effects::tool_call_invalidates_read_cache(
                     &execution.name,
                     Some(&execution.args),

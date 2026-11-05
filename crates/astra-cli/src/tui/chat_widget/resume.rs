@@ -469,7 +469,8 @@ mod tests {
             .flat_map(|line| line.spans)
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(text.contains("1 command request"), "{text}");
+        assert!(text.contains("Could not confirm Bash"), "{text}");
+        assert!(!text.contains("Ran Bash"), "{text}");
         assert!(text.contains("request rejected"), "{text}");
         let events = canonical_root_turn_events(
             session_journal::read_journal(session_id).unwrap(),

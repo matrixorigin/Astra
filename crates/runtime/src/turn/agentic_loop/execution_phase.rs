@@ -4792,10 +4792,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // to overwrite it.
     capture_latest_provider_text(state, &turn_result);
     capture_deferred_candidate_text(state, &turn_result);
+    state.record_appended_prompt_history_from(transcript_append_start);
     if !turn_result.accum.has_tool_calls && turn_result.accum.tool_calls.is_empty() {
         super::finalization::bound_ingested_terminal_message(state, transcript_append_start);
     }
-    state.record_appended_prompt_history_from(transcript_append_start);
     if let Some(session_id) = state.current_session_id.as_deref() {
         if let Some(buffer) = state.turn_event_buffer.as_mut()
             && let Err(error) = buffer.bind_session_id(session_id)
@@ -5253,6 +5253,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 }
             }
 
+            // Even error kinds without a resumable interruption mapping may
+            // have delivered a partial answer before this checkpoint.
+            super::finalization::bound_current_terminal_message(state);
             finalize_turn_trace(state).await;
             try_write_heavy_checkpoint(state);
             return Err(e);

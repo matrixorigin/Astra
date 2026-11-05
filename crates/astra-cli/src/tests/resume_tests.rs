@@ -322,6 +322,13 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
         );
         let old_file = temp.path().join(format!("historical-{local_turn}.txt"));
         let new_file = temp.path().join(format!("current-{local_turn}.txt"));
+        let workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            &sid,
+            "mock-model",
+            &std::env::current_dir().unwrap().display().to_string(),
+            None,
+        );
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         if local_turn > 0 {
             let local = ActiveConversation::empty(owner, &sid)

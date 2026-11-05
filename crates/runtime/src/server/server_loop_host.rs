@@ -46742,7 +46742,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+        let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
             committed,
         ).unwrap();
         assert!(restored.iter().any(|message| {
@@ -46751,6 +46751,8 @@ mod tests {
                     .get(astra_core::model_wire::responses::CONTINUATION_KEY)
                     .is_some()
         }));
+        host.open_private_responses(&mut restored, &scope, "gpt-5-mini")
+            .expect("the owning session can open its restored private reasoning");
         let replay = astra_core::model_wire::responses::request(
             "gpt-5-mini",
             &restored,

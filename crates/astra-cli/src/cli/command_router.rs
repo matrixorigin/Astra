@@ -5564,7 +5564,7 @@ mod exit_code_tests {
     }
 
     #[test]
-    fn read_delivery_failure_is_not_masked_by_an_unrelated_success() {
+    fn read_delivery_failure_does_not_block_an_alternative_observation() {
         let mut sr = empty_stream_result();
         sr.tool_call_records
             .push(astra_services::session_journal::ToolCallRecord {
@@ -5581,6 +5581,14 @@ mod exit_code_tests {
                 args_full: Some(r#"{"path":"two.txt"}"#.into()),
                 ..Default::default()
             });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+
+        // A lost mutation outcome cannot be recovered by an unrelated read.
+        sr.tool_call_records[0].name = "write_file".into();
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
         assert!(
             super::one_shot_completion_warning(&sr, ExitCode::ToolFailure)

@@ -3097,6 +3097,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_started_writer_invalidates_observations_but_rejected_writer_does_not() {
+        for started in [false, true] {
+            let mut harness = PipelineHarness::new();
+            begin_recorded_turn(&mut harness, 1);
+            let read_args = json!({"path":"a.txt"});
+            let output = "the previous observed file content";
+            harness.semantic_dedup.check_and_record_with_generation(
+                "read_file",
+                &read_args,
+                output,
+                0,
+                0,
+            );
+            let mut pipeline = harness.pipeline();
+            pipeline
+                .record_execution(ExecutedExecution {
+                    execution: HeadlessResolvedExecution {
+                        id: "call-timeout".into(),
+                        name: "bash".into(),
+                        args: json!({"command":"printf changed > a.txt; sleep 1"}),
+                        result_str: "command timed out".into(),
+                        tool_result_fields: Some(serde_json::Map::from_iter([(
+                            "execution_started".into(),
+                            json!(started),
+                        )])),
+                        authoritative_is_error: Some(true),
+                        pending_runtime_completion: None,
+                        accepted_send: None,
+                        confirmed_invocation: None,
+                        edge_duration_ms: 1,
+                        is_edge_tool: true,
+                        edge_result_missing: false,
+                        edge_terminal_authority: true,
+                        early_exit_ms: 0,
+                    },
+                    idem_key: None,
+                    pre_tool_context: None,
+                    is_err: true,
+                    error_kind: None,
+                    executed_ms: 1,
+                })
+                .await;
+            drop(pipeline);
+
+            assert_eq!(harness.turn_guard.workspace_epoch(), u64::from(started));
+            let duplicate = harness
+                .semantic_dedup
+                .near_duplicate_hint_for_observation_with_generation(
+                    output,
+                    "read_file",
+                    &read_args,
+                    1,
+                    0,
+                );
+            assert_eq!(duplicate.is_none(), started);
+            assert!(!harness.tool_call_records[0].ok);
+        }
+    }
+
+    #[tokio::test]
     async fn semantic_dedup_observation_does_not_replace_a_new_read_invocation() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();

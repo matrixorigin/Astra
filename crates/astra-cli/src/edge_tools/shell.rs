@@ -6830,6 +6830,24 @@ mod tests {
         ToolExecutor::new(dir)
     }
 
+    fn assert_bash_execution_without_attributed_mutation(
+        outcome: &super::super::ToolExecutionOutcome,
+    ) {
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("execution facts");
+        assert_eq!(fields["execution_started"], true);
+        assert_eq!(fields["side_effects_maybe"], true);
+        for field in [
+            astra_tools::workspace_observation::OBSERVED_FIELD,
+            astra_tools::workspace_observation::RECEIPT_FIELD,
+            astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD,
+        ] {
+            assert!(!fields.contains_key(field), "{outcome:?}");
+        }
+    }
+
     #[cfg(all(unix, not(target_os = "linux")))]
     async fn assert_settled_shell_without_receipt(
         root: &std::path::Path,
@@ -6882,25 +6900,7 @@ mod tests {
             )
             .await;
         assert!(!outcome.is_error, "{outcome:?}");
-        #[cfg(target_os = "linux")]
-        {
-            let fields = outcome.tool_result_fields.expect("workspace receipt");
-            assert_eq!(
-                fields[astra_tools::workspace_observation::OBSERVED_FIELD],
-                serde_json::Value::Bool(true)
-            );
-            assert_eq!(
-                fields[astra_tools::workspace_observation::SCOPE_FIELD],
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE
-            );
-            assert!(matches!(
-                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
-                Some(
-                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP
-                        | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
-                )
-            ));
-        }
+        assert_bash_execution_without_attributed_mutation(&outcome);
         #[cfg(all(unix, not(target_os = "linux")))]
         assert_settled_shell_without_receipt(dir.path(), &outcome).await;
         assert_eq!(
@@ -6925,24 +6925,11 @@ mod tests {
             )
             .await;
         assert!(outcome.is_error, "timeout must remain an error");
-        #[cfg(target_os = "linux")]
-        {
-            let fields = outcome
-                .tool_result_fields
-                .as_ref()
-                .expect("partial timeout still gets an authoritative receipt");
-            assert_eq!(
-                fields[astra_tools::workspace_observation::OBSERVED_FIELD],
-                serde_json::Value::Bool(true)
-            );
-            assert!(matches!(
-                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
-                Some(
-                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP
-                        | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
-                )
-            ));
-        }
+        assert_bash_execution_without_attributed_mutation(&outcome);
+        assert_eq!(
+            outcome.tool_result_fields.as_ref().unwrap()["retryable"],
+            false
+        );
         #[cfg(all(unix, not(target_os = "linux")))]
         assert_settled_shell_without_receipt(dir.path(), &outcome).await;
         assert_eq!(
@@ -7432,24 +7419,11 @@ mod tests {
             outcome.is_error,
             "timeout must remain an error: {outcome:?}"
         );
-        #[cfg(target_os = "linux")]
-        {
-            let fields = outcome
-                .tool_result_fields
-                .as_ref()
-                .expect("error projection must retain executor receipt");
-            assert_eq!(
-                fields[astra_tools::workspace_observation::OBSERVED_FIELD],
-                serde_json::Value::Bool(true)
-            );
-            assert!(matches!(
-                fields[astra_tools::workspace_observation::OWNERSHIP_FIELD].as_str(),
-                Some(
-                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP
-                        | astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP
-                )
-            ));
-        }
+        assert_bash_execution_without_attributed_mutation(&outcome);
+        assert_eq!(
+            outcome.tool_result_fields.as_ref().unwrap()["retryable"],
+            false
+        );
         #[cfg(all(unix, not(target_os = "linux")))]
         assert_settled_shell_without_receipt(dir.path(), &outcome).await;
         assert_eq!(

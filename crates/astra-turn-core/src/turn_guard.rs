@@ -263,9 +263,9 @@ impl TurnGuard {
         self.workspace_epoch
     }
 
-    /// Advance the workspace observation epoch after a successful mutation.
-    ///
-    /// A real mutation invalidates observations tied to the previous epoch.
+    /// Advance the observation epoch when an operation may have changed state.
+    /// A failed or uncertain writer can also invalidate earlier observations;
+    /// advancing the epoch is not proof that it actually changed anything.
     pub fn record_workspace_mutation(&mut self) {
         self.workspace_epoch = self.workspace_epoch.saturating_add(1);
     }
