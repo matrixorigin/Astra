@@ -438,3 +438,11 @@ Unknown or ambiguous single-slash actions still report a command error.
 
 Older clients that always send a completion temperature must be upgraded before
 using an API-key Responses Offering.
+
+## Workspace recovery
+
+If a previous command could not be stopped reliably, check that it has stopped.
+The TUI can then confirm and retry in the current session. For a non-interactive
+session, run `astra workspace confirm-stopped` in the indicated workspace and
+resume from that workspace before retrying. Confirmation does not delete files
+or worktrees.

@@ -4544,6 +4544,7 @@ mod tests {
             &state.messages,
             None,
             false,
+            None,
             &run_id,
         )
         .unwrap()

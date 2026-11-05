@@ -4792,6 +4792,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // to overwrite it.
     capture_latest_provider_text(state, &turn_result);
     capture_deferred_candidate_text(state, &turn_result);
+    if !turn_result.accum.has_tool_calls && turn_result.accum.tool_calls.is_empty() {
+        super::finalization::bound_ingested_terminal_message(state, transcript_append_start);
+    }
     state.record_appended_prompt_history_from(transcript_append_start);
     if let Some(session_id) = state.current_session_id.as_deref() {
         if let Some(buffer) = state.turn_event_buffer.as_mut()
@@ -6335,17 +6338,22 @@ fn record_rejected_work_validation_state(
     }
 }
 
-/// A repair may share a provider batch with a rejected delivery request. Only
-/// an executed, successful mutation from a typed builtin writer, a strong
-/// executor receipt can advance that batch to revalidation. Weak receipts,
-/// failed writers and lexical shell guesses remain insufficient.
+/// A successful repair attempt can advance to revalidation. An opaque shell
+/// cannot prove it changed a file, so its result only schedules the actual
+/// validation; it is not evidence that the repair succeeded.
 fn record_is_effective_workspace_repair(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
-    record.was_executed()
-        && record.ok
-        && (record_has_trusted_workspace_mutation_receipt(record)
-            || super::lifecycle::record_has_typed_workspace_tool_receipt(record))
+    record.execution_succeeded()
+        && (super::lifecycle::record_has_typed_workspace_tool_receipt(record)
+            || (record.name == "bash"
+                && super::lifecycle::extract_tool_args(record.authoritative_args_full())
+                    .is_some_and(|args| {
+                        crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
+                            &record.name,
+                            Some(&args),
+                        )
+                    })))
 }
 
 /// Project the one completion action that is already justified by typed
@@ -12818,10 +12826,10 @@ mod tests {
             workspace_mutation_receipt: Some(weak_receipt),
             ..ToolCallRecord::default()
         };
-        assert!(!record_is_effective_workspace_repair(&weak_repair));
+        assert!(record_is_effective_workspace_repair(&weak_repair));
         let mut restored_weak_repair = weak_repair.clone();
         restored_weak_repair.runtime_args_full = None;
-        assert!(!record_is_effective_workspace_repair(&restored_weak_repair));
+        assert!(record_is_effective_workspace_repair(&restored_weak_repair));
         state.stall.tool_call_records = vec![
             ToolCallRecord {
                 name: "run_next_work_item".into(),

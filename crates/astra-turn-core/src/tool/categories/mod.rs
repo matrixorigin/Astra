@@ -335,6 +335,13 @@ impl ToolRegistry {
         self.category_for(name, args).is_read_only()
     }
 
+    /// Whether repeating a call is safe when its result was lost. SQL and the
+    /// consolidated LSP tool include writers despite their display categories.
+    pub fn is_read_only_for_recovery(&self, name: &str, args: Option<&serde_json::Value>) -> bool {
+        let flags = self.flags(name);
+        self.is_read_only_for(name, args) && !flags.contains(ToolFlags::MATRIXONE) && name != "lsp"
+    }
+
     pub fn is_mutating_for(&self, name: &str, args: Option<&serde_json::Value>) -> bool {
         self.category_for(name, args).is_mutating()
     }

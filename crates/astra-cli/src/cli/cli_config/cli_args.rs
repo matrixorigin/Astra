@@ -167,6 +167,9 @@ pub(crate) enum Command {
     #[command(alias = "sessions")]
     #[command(subcommand)]
     Session(SessionCmd),
+    /// Recover local workspace operations after checking that commands stopped
+    #[command(subcommand)]
+    Workspace(WorkspaceCmd),
     /// Introspect persistent agent state
     #[command(name = "self")]
     #[command(subcommand)]
@@ -260,7 +263,7 @@ impl Command {
         use crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission;
 
         match self {
-            Self::Login(_) | Self::Register(_) => {
+            Self::Login(_) | Self::Register(_) | Self::Workspace(_) => {
                 CliProfileIdentityAdmission::AuthenticationBootstrap
             }
             Self::Admin(args) if args.is_authentication_bootstrap() => {
@@ -269,6 +272,12 @@ impl Command {
             _ => CliProfileIdentityAdmission::RequireBoundAccount,
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum WorkspaceCmd {
+    /// Confirm that earlier commands have stopped and allow file rollback
+    ConfirmStopped,
 }
 
 impl Cli {

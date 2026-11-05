@@ -262,6 +262,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "data-encoding",
  "dirs",
  "dotenvy",
  "fs2",

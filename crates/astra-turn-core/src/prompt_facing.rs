@@ -396,6 +396,13 @@ fn canonical_provider_continuation(message: &Value) -> Option<Value> {
         // untrusted content. The active turn must not silently resume without it.
         return Some(json!({"invalid":true}));
     };
+    if saved["items"].as_array()?.iter().any(|item| {
+        item["type"] == "reasoning" && item.get("content").is_some_and(|value| !value.is_null())
+    }) {
+        // Raw reasoning must be sealed by the inference owner before it can
+        // become recoverable canonical state.
+        return Some(json!({"invalid":true}));
+    }
     // Provider-encrypted state and IDs are opaque protocol fields. Free text
     // follows the existing credential-redaction boundary before persistence.
     for item in saved["items"].as_array_mut()? {
@@ -604,6 +611,23 @@ fn project_tool_result(tool: &Value, tool_call_id: &str) -> Value {
         && !name.is_empty()
     {
         projected.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    // Keep only the existing identity-bound recovery metadata. A descriptor
+    // from another call or run must not become a recovery authority.
+    if let Some(run_id) = crate::tool_result_storage::tool_result_run_id(tool) {
+        projected.insert(
+            crate::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD.into(),
+            Value::String(run_id.to_string()),
+        );
+        if let Some(descriptor) = crate::tool_result_storage::tool_result_artifact_descriptor(tool)
+            && descriptor.call_id == tool_call_id
+            && let Ok(value) = serde_json::to_value(descriptor)
+        {
+            projected.insert(
+                crate::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD.into(),
+                value,
+            );
+        }
     }
     if let Some(target) = duplicate_output_reference(tool) {
         projected.insert("_synthetic".to_string(), Value::Bool(true));
@@ -871,6 +895,42 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
+    fn canonical_tool_results_keep_only_identity_bound_recovery_metadata() {
+        use crate::tool_result_storage::{
+            mark_tool_result_artifact_descriptor, mark_tool_result_run_id,
+            persist_tool_result_with_descriptor, tool_result_artifact_descriptor,
+            tool_result_run_id,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-1",
+            "call-1",
+            "read_file",
+            "large result",
+        )
+        .unwrap();
+        let mut result =
+            json!({"role":"tool", "tool_call_id":"call-1", "content":"result retained"});
+        mark_tool_result_run_id(&mut result, Some("run-1")).unwrap();
+        mark_tool_result_artifact_descriptor(&mut result, Some(&artifact.descriptor)).unwrap();
+        let messages = vec![
+            json!({"role":"user", "content":"inspect"}),
+            json!({"role":"assistant", "tool_calls":[{"id":"call-1", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}),
+            result.clone(),
+        ];
+        let committed = sanitize_canonical_turn_delta_with_turn_semantics(messages, false).unwrap();
+        assert_eq!(tool_result_run_id(&committed[2]), Some("run-1"));
+        assert_eq!(
+            tool_result_artifact_descriptor(&committed[2]),
+            Some(artifact.descriptor)
+        );
+        result["tool_call_id"] = json!("different-call");
+        let projected = super::project_tool_result(&result, "different-call");
+        assert!(tool_result_artifact_descriptor(&projected).is_none());
+    }
+
+    #[test]
     fn canonical_history_preserves_scoped_provider_state_and_phase() {
         use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
         let connection = uuid::Uuid::new_v4().to_string();
@@ -901,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_reasoning_is_redacted_and_replayed_after_canonical_restore() {
+    fn unsealed_plaintext_reasoning_is_not_committed() {
         use astra_core::model_wire::responses::{CONTINUATION_KEY, ResponseOutput, request};
         let connection = uuid::Uuid::new_v4().to_string();
         let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
@@ -927,10 +987,8 @@ mod tests {
         assert!(!json!(committed).to_string().contains(secret));
         let restored =
             super::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
-        let wire = request("model", &restored, None, &connection, false, None).unwrap();
-        let reasoning = &wire["input"][1]["content"][0]["text"];
-        assert!(reasoning.as_str().unwrap().contains("[REDACTED:"));
-        assert!(!wire.to_string().contains(secret));
+        assert_eq!(restored[1][CONTINUATION_KEY], json!({"invalid":true}));
+        assert!(request("model", &restored, None, &connection, false, None).is_err());
         assert!(
             !json!(sanitize_user_visible_messages(restored))
                 .to_string()

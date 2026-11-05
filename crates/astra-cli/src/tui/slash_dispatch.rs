@@ -4946,6 +4946,7 @@ mod model_catalog_loading_tests {
         let result = model_setup::run(
             Action::Create(astra_services::UserModelCreateRequestData {
                 connection_id: None,
+                responses_reasoning_history: None,
                 name: "mine".into(),
                 provider: "openai".into(),
                 inference_protocol: Some(

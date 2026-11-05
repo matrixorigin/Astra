@@ -198,6 +198,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     let mut offering = astra_services::ResolvedModelOffering {
         offering_id: "offering".into(),
         model: astra_services::ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
             response_scope_key: Some(astra_services::models::ResponseScopeKey::for_model(
                 &FernetTokenEncryptor::new("test-scope-secret").unwrap(),
@@ -1009,9 +1010,13 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     )
     .await
     .unwrap();
+    let key = astra_services::FernetTokenEncryptor::new("responses-fixture").unwrap();
+    let mut continuation = first.provider_continuation.unwrap();
+    crate::turn::llm::private_continuation::seal(&mut continuation, &key, "owner", "session")
+        .unwrap();
     plaintext_history.push(
         json!({"role":"assistant", "content":"", "tool_calls":first.tool_calls,
-        astra_core::model_wire::responses::CONTINUATION_KEY:first.provider_continuation.unwrap()}),
+        astra_core::model_wire::responses::CONTINUATION_KEY:continuation}),
     );
     plaintext_history.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
     let committed =
@@ -1020,7 +1025,17 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             false,
         )
         .unwrap();
-    let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+    assert!(!json!(committed).to_string().contains("check the file"));
+    let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+    crate::turn::llm::private_continuation::open(
+        &mut restored,
+        &key,
+        "owner",
+        &HashSet::from(["session".to_string()]),
+        &scope,
+        "model",
+    )
+    .unwrap();
     let second = call_llm_and_collect_with_stream_callback(
         call(&restored, &tools, &scope, &base, &default_thinking),
         LlmCancel::None,
@@ -1153,6 +1168,7 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
             let probe = body["input"].to_string().contains("Calculate 17 * 23");
             let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
             let plain = body["input"].to_string().contains("plain lookup");
+            let private_journey = body["input"].to_string().contains("private journey");
             let missing_reasoning = body["input"].to_string().contains("missing reasoning");
             let private_encoding = body["input"].to_string().contains("private encoding");
             let unexpected_namespace = body["input"].to_string().contains("unexpected namespace");
@@ -1161,11 +1177,14 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
                 json!([{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}])
             } else if plain {
                 json!([{"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else if private_journey {
+                json!([{"type":"reasoning","id":"reason","summary":[],"content":[{"type":"reasoning_text","text":"private-journey-sentinel"}]},
+                    {"type":"function_call","id":"function","name":"read_file","call_id":"call-1","arguments":"{\"path\":\"fixture.txt\"}","status":"completed"}])
             } else if missing_reasoning {
                 json!([{"type":"reasoning","id":"reason","summary":[]},
                     {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             } else if private_encoding {
-                json!([{"type":"reasoning","_astra_encrypted_content_b64":"b3BhcXVl","summary":[]},
+                json!([{"type":"reasoning","_astra_encrypted_content_b32":"n5ygc4lvmu","summary":[]},
                     {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             } else if unexpected_namespace {
                 json!([{"type":"function_call","namespace":"other","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
@@ -1187,7 +1206,7 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
         .unwrap();
     let pool = astra_core::SharedPool::new(&settings).await.unwrap();
     let key = Arc::new(FernetTokenEncryptor::new("byok-responses-fixture-key").unwrap());
-    let service = DatabaseModelService::new(settings, key)
+    let service = DatabaseModelService::new(settings.clone(), key.clone())
         .with_pool(pool)
         .with_deepseek_test_endpoint(endpoint)
         .unwrap();
@@ -1197,6 +1216,7 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
             owner.clone(),
             UserModelCreateRequestData {
                 connection_id: None,
+                responses_reasoning_history: None,
                 name: "fixture".into(),
                 provider: "deepseek".into(),
                 inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
@@ -1213,6 +1233,63 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
         .admit_model_offering(owner.clone(), model.model_id.clone())
         .await
         .unwrap();
+    // Exercise the admitted personal route through the real host, not only
+    // the wire codec. The tool result must be replayed with its private state
+    // while canonical history contains no plaintext copy of that state.
+    use crate::server::provider_test_support::{
+        ProviderObservationsFixture, bind_server_workspace, loop_state,
+    };
+    use crate::server::tool_transport::{
+        ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+    };
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("fixture.txt"), "fixture contents").unwrap();
+    let session = format!("byok-journey-{}", uuid::Uuid::new_v4());
+    let mut host = crate::server::server_loop_host::ServerAgenticLoopHostBuilder::new(
+        settings.clone(),
+        key.clone(),
+        owner.clone(),
+        session.clone(),
+    )
+    .with_provider_observations(ProviderObservationsFixture::default())
+    .with_model_service(Some(Arc::new(service.clone())))
+    .with_admitted_model_execution(Some(admitted.clone()))
+    .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
+    .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
+    .with_static_tool_catalog_admissible(true)
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    ))
+    .build();
+    let mut state = loop_state(&session, Vec::new(), "private journey: read fixture.txt");
+    state.thinking = ThinkingConfig::ModelDefault;
+    state.owner_user_id = Some(owner.clone());
+    bind_server_workspace(&mut state, workspace.path()).await;
+    state.skills.request_constraints.allowed_tools =
+        Some(["read_file".to_owned()].into_iter().collect());
+    requests.lock().unwrap().clear();
+    crate::turn::agentic_loop::finalization::run_agentic_loop_with_host(&mut host, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(state.total_tool_calls, 1);
+    assert!(
+        !json!(state.messages)
+            .to_string()
+            .contains("private-journey-sentinel")
+    );
+    let journey_requests = requests.lock().unwrap().clone();
+    assert_eq!(journey_requests.len(), 2);
+    assert!(
+        journey_requests[1]["input"]
+            .to_string()
+            .contains("private-journey-sentinel")
+    );
+    assert!(
+        journey_requests[1]["input"]
+            .to_string()
+            .contains("fixture contents")
+    );
     let tools = vec![
         json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}),
     ];
@@ -1327,6 +1404,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
             owner.clone(),
             UserModelCreateRequestData {
                 inference_protocol: None,
+                responses_reasoning_history: None,
                 name: "coding".into(),
                 provider: "chatgpt".into(),
                 model: "fixture-model".into(),

@@ -1985,6 +1985,7 @@ fn record_full_llm_response_event(
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
     inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     response_scope: Option<String>,
     subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     model_name: String,
@@ -3267,6 +3268,7 @@ fn resolve_llm_model_for_turn(
     }
     Ok(ResolvedTurnLlmConfig {
         inference_protocol: execution.inference_protocol,
+        responses_reasoning_history: execution.responses_reasoning_history,
         response_scope: execution.response_scope.clone(),
         subscription: execution.subscription.clone(),
         model_name: execution.model_name.clone(),
@@ -3610,6 +3612,7 @@ pub struct ServerAgenticLoopHost {
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
+    private_reasoning_origins: Option<HashSet<String>>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     provider_observations:
         Option<crate::server::provider_test_support::ProviderObservationsFixture>,
@@ -4381,6 +4384,88 @@ impl RuntimeExecutionHandoff {
 }
 
 impl ServerAgenticLoopHost {
+    pub(crate) fn set_private_reasoning_origins(&mut self, mut origins: HashSet<String>) {
+        origins.insert(self.session_id.clone());
+        self.private_reasoning_origins = Some(origins);
+    }
+
+    pub(crate) fn completed_responses_reasoning_scope(&self) -> Option<(&str, &str)> {
+        let config = self.resolved_llm_config.as_ref()?;
+        (config.responses_reasoning_history
+            == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn))
+        .then(|| config.responses_budget_scope())
+        .flatten()
+    }
+
+    fn authorize_private_responses(
+        &self,
+        messages: &[Value],
+        scope: &str,
+        model: &str,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        use crate::turn::llm::private_continuation;
+        let projected = if self.resolved_llm_config.as_ref().is_some_and(|config| {
+            config.responses_reasoning_history
+                == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+                && config.responses_budget_scope() == Some((scope, model))
+        }) {
+            let start = messages
+                .iter()
+                .rposition(astra_turn_types::is_human_user_message)
+                .map_or(0, |index| index + 1);
+            &messages[start..]
+        } else {
+            messages
+        };
+        let requested = private_continuation::origins(projected, scope, model);
+        if requested.iter().all(|origin| {
+            origin == &self.session_id
+                || self
+                    .private_reasoning_origins
+                    .as_ref()
+                    .is_some_and(|allowed| allowed.contains(origin))
+        }) {
+            Ok(())
+        } else {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "Model continuation is unavailable; start a new turn",
+            ))
+        }
+    }
+
+    fn open_authorized_private_responses(
+        &self,
+        messages: &mut [Value],
+        scope: &str,
+        model: &str,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let fallback = HashSet::from([self.session_id.clone()]);
+        crate::turn::llm::private_continuation::open(
+            messages,
+            &self.encryptor,
+            &self.user_id,
+            self.private_reasoning_origins.as_ref().unwrap_or(&fallback),
+            scope,
+            model,
+        )
+        .map_err(|_| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "Model continuation is unavailable; start a new turn",
+            )
+        })
+    }
+
+    fn open_private_responses(
+        &self,
+        messages: &mut [Value],
+        scope: &str,
+        model: &str,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        self.authorize_private_responses(messages, scope, model)?;
+        self.open_authorized_private_responses(messages, scope, model)
+    }
     pub(crate) fn edge_provider_tool_schemas(&self) -> &[Value] {
         &self.edge_provider_tool_schemas
     }
@@ -5375,6 +5460,7 @@ fn fit_physical_retry_wire_budget(
     config: &ResolvedTurnLlmConfig,
     requested_output_tokens: usize,
     state: &AgenticLoopState,
+    prepare_budget_view: impl Fn(&mut [Value]) -> Result<(), astra_core::ClassifiedError>,
 ) -> Result<
     (
         crate::turn::wire_assembly::WireBudgetStatus,
@@ -5383,26 +5469,35 @@ fn fit_physical_retry_wire_budget(
     ),
     astra_core::ClassifiedError,
 > {
-    let measure = |messages: &[Value]| {
+    let measure = |messages: &[Value]| -> Result<_, astra_core::ClassifiedError> {
+        let budget_view = if config.responses_budget_scope().is_some() {
+            let mut view = messages.to_vec();
+            prepare_budget_view(&mut view)?;
+            Some(view)
+        } else {
+            None
+        };
         let provider_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
-            messages,
+            budget_view.as_deref().unwrap_or(messages),
             &config.provider,
             config.cache_capability,
             config
                 .inference_protocol
                 .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&config.provider)),
         );
-        crate::turn::wire_assembly::wire_budget_status_with_metadata(
-            &provider_messages,
-            tools,
-            &config.model_name,
-            config.context_window,
-            config.max_completion_tokens,
-            requested_output_tokens,
-            config.responses_budget_scope(),
+        Ok(
+            crate::turn::wire_assembly::wire_budget_status_with_metadata(
+                &provider_messages,
+                tools,
+                &config.model_name,
+                config.context_window,
+                config.max_completion_tokens,
+                requested_output_tokens,
+                config.responses_budget_scope(),
+            ),
         )
     };
-    let initial = measure(messages);
+    let initial = measure(messages)?;
     if !initial.hard_limit_exceeded() {
         return Ok((initial, requested_output_tokens, None));
     }
@@ -5499,7 +5594,7 @@ fn fit_physical_retry_wire_budget(
         let status = if pass == 0 {
             initial
         } else {
-            measure(&candidate)
+            measure(&candidate)?
         };
         let available = status
             .model_limit
@@ -6374,6 +6469,7 @@ impl ServerAgenticLoopHostBuilder {
             matrixone: self.matrixone,
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
+            private_reasoning_origins: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
             provider_observations: self.provider_observations,
             model_override: self.model_override,
@@ -17726,8 +17822,48 @@ impl ServerAgenticLoopHost {
             model_context_window,
         );
         let cache_cfg = PromptCacheConfig::from_cache_capability(cache_capability, provider);
+        let planning_messages = if let Some(config) = self.resolved_llm_config.as_ref()
+            && let Some((scope, wire_model)) = config.responses_budget_scope()
+            && state.messages.iter().any(|message| {
+                message
+                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                    .is_some()
+            }) {
+            let mut history = state.messages.clone();
+            if config.responses_reasoning_history
+                == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+            {
+                crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
+                    &mut history,
+                );
+            }
+            self.open_authorized_private_responses(&mut history, scope, wire_model)?;
+            let wire = crate::turn::llm::client::consolidate_system_messages_for_protocol(
+                &history,
+                provider,
+                cache_capability,
+                astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+            );
+            let mut items = Vec::new();
+            astra_core::model_wire::responses::visit_input_items(
+                wire_model,
+                &wire,
+                scope,
+                |item| items.push(item),
+            )
+            .map_err(|_| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::InvalidRequest,
+                    "Model continuation is unavailable; start a new turn",
+                )
+            })?;
+            Some(items)
+        } else {
+            None
+        };
         crate::turn::llm::context::assemble_context_pipeline(
             crate::turn::llm::context::LlmContextAssemblyInput {
+                planning_messages: planning_messages.as_deref(),
                 state,
                 session_id: &self.session_id,
                 tool_surface: crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
@@ -17752,6 +17888,10 @@ impl ServerAgenticLoopHost {
                 context_window: model_context_window,
                 max_completion_tokens: model_max_completion_tokens,
                 cache_capability,
+                responses_reasoning_history: self
+                    .resolved_llm_config
+                    .as_ref()
+                    .and_then(|config| config.responses_reasoning_history),
                 user_content,
                 query_source: "agentic_loop",
             },
@@ -17895,8 +18035,22 @@ impl ServerAgenticLoopHost {
             .inspect_err(|_| {
                 state.restore_volatile_attempt_lease();
             })?;
+            let mut budget_source = None;
+            if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+                let mut opened = candidate.messages.clone();
+                if llm_cfg.responses_reasoning_history
+                    == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+                {
+                    crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
+                        &mut opened,
+                    );
+                }
+                self.open_authorized_private_responses(&mut opened, scope, model)
+                    .inspect_err(|_| state.restore_volatile_attempt_lease())?;
+                budget_source = Some(opened);
+            }
             let wire_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
-                &candidate.messages,
+                budget_source.as_deref().unwrap_or(&candidate.messages),
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
                 llm_cfg.inference_protocol.unwrap_or_else(|| {
@@ -20303,6 +20457,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Runtime no longer re-derives any of these.
         let context_assembly_node_id =
             self.start_explain_analyze_context_assembly(state, Instant::now());
+        if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+            self.authorize_private_responses(&state.messages, scope, model)?;
+        }
         let turn_pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             context_tool_surface,
@@ -20608,13 +20765,28 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // provider-visible projection. Keep the canonical messages separate
         // so artifact metadata remains available for recovery and audit; the
         // provider projection strips it at the wire boundary.
-        let (canonical_llm_messages, provider_budget_messages) =
+        let (canonical_llm_messages, mut provider_budget_messages) =
             split_canonical_and_provider_budget_messages(
                 llm_messages,
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
                 llm_cfg.inference_protocol,
             );
+        if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+            let mut budget_source = canonical_llm_messages.clone();
+            if llm_cfg.responses_reasoning_history
+                == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+            {
+                crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
+                    &mut budget_source,
+                );
+            }
+            self.open_private_responses(&mut budget_source, scope, model)?;
+            provider_budget_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
+                &budget_source, &llm_cfg.provider, llm_cfg.cache_capability,
+                astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+            );
+        }
         let final_wire_budget_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
             &provider_budget_messages,
             &final_tools,
@@ -20847,6 +21019,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else {
                 let budget = fit_physical_retry_wire_budget(
                     &mut llm_messages, &final_tools, &llm_cfg, effective_max_output, state,
+                    |view| {
+                        if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+                            if llm_cfg.responses_reasoning_history == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn) {
+                                crate::turn::llm::private_continuation::discard_completed_turn_reasoning(view);
+                            }
+                            self.open_authorized_private_responses(view, scope, model)?;
+                        }
+                        Ok(())
+                    },
                 ).and_then(|(status, output, boundary)| {
                     primary_thinking.validate_output_budget(output as u64).map_err(|message| {
                         astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, message)
@@ -21021,7 +21202,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // providers, durably staged the execution deadline.  Keep this
             // exact vector immutable through provider dispatch; only the
             // timeout is sampled at the dispatch boundary.
-            let attempt_llm_messages_owned = llm_messages.clone();
+            let mut attempt_llm_messages_owned = llm_messages.clone();
+            if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+                if llm_cfg.responses_reasoning_history
+                    == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+                {
+                    crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
+                        &mut attempt_llm_messages_owned,
+                    );
+                }
+                self.open_private_responses(&mut attempt_llm_messages_owned, scope, model)?;
+            }
             let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
             let execution_route = llm_cfg.execution_route();
             let prepared_call = match prepare_streaming_call(
@@ -21632,6 +21823,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
             };
 
+            if let Some(continuation) = r.provider_continuation.as_mut() {
+                crate::turn::llm::private_continuation::seal(
+                    continuation,
+                    &self.encryptor,
+                    &self.user_id,
+                    &self.session_id,
+                )
+                .map_err(|_| astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::InvalidRequest,
+                    "Model continuation exceeds the supported limit or could not be protected",
+                ))?;
+            }
             let raw_provider_finish_reason = r.finish_reason.clone();
             let will_retry_for_length;
             {
@@ -22644,6 +22847,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 config.cache_capability,
                 &config.provider,
             );
+        if let Some((scope, model)) = config.responses_budget_scope()
+            && self
+                .authorize_private_responses(&state.messages, scope, model)
+                .is_err()
+        {
+            tracing::warn!(
+                "skipping pre-turn compaction because continuation authorization failed"
+            );
+            return None;
+        }
         let pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             &visible_tools,
@@ -24470,6 +24683,137 @@ mod tests {
     }
 
     #[test]
+    fn retry_budget_measures_opened_responses_without_rewriting_history() {
+        let host = test_host_builder("budget-owner", "budget-session").build();
+        let scope = uuid::Uuid::new_v4().to_string();
+        let mut cfg = summary_test_config(String::new());
+        cfg.inference_protocol = Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses);
+        cfg.response_scope = Some(scope.clone());
+        cfg.context_window = Some(1_000_000);
+        cfg.max_completion_tokens = Some(256);
+        let mut continuation = json!({"connection_id":scope, "model":cfg.model_name, "items":[
+            {"type":"reasoning", "id":"r", "summary":[], "content":[{"type":"reasoning_text", "text":"reasoning ".repeat(5000)}]},
+            {"type":"message", "id":"m", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut continuation,
+            &host.encryptor,
+            "budget-owner",
+            "budget-session",
+        )
+        .unwrap();
+        let mut wire = vec![
+            json!({"role":"user", "content":"question"}),
+            json!({"role":"assistant", "content":"answer", astra_core::model_wire::responses::CONTINUATION_KEY:continuation}),
+            json!({"role":"user", "content":"continue"}),
+        ];
+        let original = wire.clone();
+        let mut opened = wire.clone();
+        host.open_authorized_private_responses(&mut opened, &scope, &cfg.model_name)
+            .unwrap();
+        let expected = crate::turn::wire_assembly::wire_budget_status_with_metadata(
+            &opened,
+            &[],
+            &cfg.model_name,
+            cfg.context_window,
+            cfg.max_completion_tokens,
+            256,
+            cfg.responses_budget_scope(),
+        );
+        let (actual, _, _) = fit_physical_retry_wire_budget(
+            &mut wire,
+            &[],
+            &cfg,
+            256,
+            &create_test_state(),
+            |view| host.open_authorized_private_responses(view, &scope, &cfg.model_name),
+        )
+        .unwrap();
+        assert_eq!(
+            actual.estimated_input_tokens,
+            expected.estimated_input_tokens
+        );
+        assert_eq!(
+            wire, original,
+            "budgeting must retain sealed canonical bytes"
+        );
+    }
+
+    #[test]
+    fn private_reasoning_uses_materialized_lineage_without_database_reads() {
+        let mut host = test_host_builder("owner", "current").build();
+        host.set_private_reasoning_origins((0..100).map(|n| format!("ancestor-{n}")).collect());
+        let scope = uuid::Uuid::new_v4().to_string();
+        let mut continuation = json!({"connection_id":scope, "model":"model", "items":[
+            {"type":"reasoning", "id":"r", "summary":[], "content":[{"type":"reasoning_text", "text":"private"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut continuation,
+            &host.encryptor,
+            "owner",
+            "ancestor-0",
+        )
+        .unwrap();
+        let unopened = continuation.clone();
+        let mut messages = vec![
+            json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:continuation}),
+        ];
+        host.open_private_responses(&mut messages, &scope, "model")
+            .unwrap();
+        assert_eq!(
+            messages[0][astra_core::model_wire::responses::CONTINUATION_KEY]["items"][0]["content"]
+                [0]["text"],
+            "private"
+        );
+        let fresh = test_host_builder("owner", "current").build();
+        let mut messages = vec![
+            json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:unopened}),
+        ];
+        assert!(
+            fresh
+                .open_private_responses(&mut messages, &scope, "model")
+                .is_err()
+        );
+
+        let mut own = json!({"connection_id":scope, "model":"model", "items":[
+            {"type":"reasoning", "id":"own", "summary":[], "content":[{"type":"reasoning_text", "text":"private"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut own,
+            &fresh.encryptor,
+            "owner",
+            "current",
+        )
+        .unwrap();
+        let mut messages = vec![
+            json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:own}),
+        ];
+        assert!(
+            fresh
+                .open_private_responses(&mut messages, &scope, "model")
+                .is_ok()
+        );
+
+        let mut foreign = json!({"connection_id":scope, "model":"model", "items":[
+            {"type":"reasoning", "id":"r2", "summary":[], "content":[{"type":"reasoning_text", "text":"private"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut foreign,
+            &host.encryptor,
+            "owner",
+            "unrelated",
+        )
+        .unwrap();
+        let mut messages = vec![
+            json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:foreign}),
+        ];
+        assert!(
+            host.open_private_responses(&mut messages, &scope, "model")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn final_wire_budget_includes_deadline_authority_once_for_append_only_provider() {
         let capability = append_only_test_cache_capability();
         let mut host = test_host_builder("u-budget-wire", "s-budget-wire")
@@ -24885,9 +25229,15 @@ mod tests {
                 )
                 .unwrap();
                 let original_len = wire.len();
-                let (status, output, boundary) =
-                    fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
-                        .unwrap();
+                let (status, output, boundary) = fit_physical_retry_wire_budget(
+                    &mut wire,
+                    &[],
+                    &cfg,
+                    256,
+                    &create_test_state(),
+                    |_| Ok(()),
+                )
+                .unwrap();
                 assert!(!status.hard_limit_exceeded());
                 assert_eq!(
                     output,
@@ -24916,7 +25266,10 @@ mod tests {
             json!({"role":"assistant", "content":"partial"}),
         ];
         let original = wire.clone();
-        let error = fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
+        let error =
+            fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state(), |_| {
+                Ok(())
+            })
             .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
         assert_eq!(wire, original);
@@ -24956,8 +25309,10 @@ mod tests {
         )
         .unwrap();
         let (status, output, boundary) =
-            fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
-                .unwrap();
+            fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state(), |_| {
+                Ok(())
+            })
+            .unwrap();
         assert!(!status.hard_limit_exceeded());
         assert_eq!(output, 256);
         assert!(boundary.is_some());
@@ -25021,7 +25376,8 @@ mod tests {
             }
             let original = candidate.clone();
             let (status, output, boundary) =
-                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state).unwrap();
+                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state, |_| Ok(()))
+                    .unwrap();
             assert!(!status.hard_limit_exceeded());
             assert_eq!(output, 256);
             assert!(boundary.is_some());
@@ -25062,7 +25418,8 @@ mod tests {
         oversized = projected;
         let original = oversized.clone();
         let error =
-            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state).unwrap_err();
+            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state, |_| Ok(()))
+                .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
         assert_eq!(oversized, original);
     }
@@ -29718,6 +30075,7 @@ mod tests {
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
             inference_protocol: None,
+            responses_reasoning_history: None,
             response_scope: None,
             subscription: None,
             model_name: "gpt-4o-mini".to_string(),
@@ -50338,6 +50696,7 @@ mod tests {
         astra_services::ResolvedModelOffering {
             offering_id: "offer-primary".to_string(),
             model: astra_services::ResolvedActiveLlmModel {
+                responses_reasoning_history: None,
                 inference_protocol: None,
                 response_scope_key: None,
                 supported_reasoning_efforts: None,

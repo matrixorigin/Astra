@@ -1513,13 +1513,11 @@ pub fn all_tool_schemas() -> Vec<Value> {
 /// that actually implements it. Shared/server executors remain foreground-
 /// only, so models cannot send fields those executors would ignore.
 pub const fn managed_background_bash_supported() -> bool {
-    cfg!(unix)
+    cfg!(target_os = "linux")
 }
 
 pub fn enable_managed_background_bash_schema(schemas: &mut [Value]) {
-    // The Edge managed-service executor relies on Unix process/session
-    // primitives. Do not advertise arguments which the Windows executor
-    // rejects at runtime.
+    // Only Linux can currently prove ownership of escaped descendants.
     if !managed_background_bash_supported() {
         return;
     }
@@ -1899,7 +1897,7 @@ fn agent_parameters_schema() -> Value {
             "get_result": "action+returned agent_id; completed result: inline child output, not an artifact handle. Use sufficient output directly; follow only explicit artifact/window references. Use list for status; do not busy-poll",
             "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
             "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
-            "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
+            "run_chain": "local fixed pipeline with action+name+description+steps; run dependent or approval-required actions individually",
             "send_message": "action+to+message; active mailbox only; child asks parent via message_type=question (not ask_user); parent answers request_id; completed provider follow-up uses spawn+exact collaborator_id"
         },
         "x-astra-discovery-summary": DELEGATION_DISCOVERY_SUMMARY,
@@ -1909,7 +1907,7 @@ fn agent_parameters_schema() -> Value {
             "steps": {
                 "type": "array",
                 "minItems": 1,
-                "description": "run_chain steps.",
+                "description": "run_chain steps with arguments known in advance. Run steps that depend on earlier results or require individual approval separately.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1931,7 +1929,6 @@ fn agent_parameters_schema() -> Value {
             "collaborator_id": collaborator_identity_schema(),
             "name": {"type": "string", "description": "Action label when accepted by the selected action."},
             "input": {"type": "object", "description": "Optional run_chain template input."},
-            "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
             "initial_turns": {"type": "integer", "minimum": 1, "description": CHILD_INITIAL_TURNS_DESCRIPTION},
             "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first internal child request output-token ceiling. Current provider-owned native execution cannot honor this limit and rejects it before launch; omit it for that execution, or report that a required limit is unsupported.", "x-astra-discovery-summary": "Internal; native:no caps."},
             "inherit_prefix": {
@@ -1977,7 +1974,7 @@ fn agent_parameters_schema() -> Value {
             "get_result": ["action", "agent_id"],
             "list": ["action", "agent_id"],
             "wait": ["action", "timeout_ms"],
-            "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
+            "run_chain": ["action", "name", "description", "steps", "input"],
             "send_message": ["action", "to", "message", "message_type", "request_id"]
         }
     })
@@ -2135,7 +2132,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "rollback_file_edits",
-                "description": "List or restore file edits recorded by write_file and str_replace. Use scope=current_turn to undo this turn's recorded file edits, scope=file with path to restore the latest recorded edit for one file, scope=turn with turn_index to restore a previous turn, scope=list to inspect file edit entries, or scope=source_receipt with receipt_id to restore an executor-retained source preimage.",
+                "description": "List or restore file edits recorded by write_file and str_replace. Use scope=current_turn to undo this turn's recorded file edits, scope=file with path to restore the latest recorded edit for one file, scope=turn with turn_index to restore a previous turn, scope=list to inspect file edit entries, or scope=source_receipt with receipt_id to restore an executor-retained source preimage. A source preimage is a snapshot, not proof of who changed a file; inspect current content before restoring it.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2309,13 +2306,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "worktree",
-                "description": "Enter or exit a session-scoped Git worktree. Enter changes this session's working workspace; exit restores it. Use bash for ordinary git commands.",
+                "description": "Enter or exit a session-scoped Git worktree. Enter selects the workspace for shell, files and searches; exit restores it. A worktree made with bash does not select the session workspace. Use bash for ordinary git commands.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["enter", "exit"]},
                         "branch": {"type": "string", "description": "New branch name; required for enter."},
-                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep."},
+                        "start_point": {"type": "string", "minLength": 1, "description": "Optional existing Git commit or ref for enter; defaults to the current HEAD."},
+                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep. On macOS the worktree is always kept."},
                         "discard_changes": {"type": "boolean", "description": "Allow discarding changes when exiting with remove; defaults to false."}
                     },
                     "required": ["action"],
@@ -3846,7 +3844,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn managed_background_bash_contract_is_executor_projected() {
         let mut schemas = all_tool_schemas();
@@ -3887,7 +3885,7 @@ mod tests {
         assert!(description.contains("Loops via python3"));
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn managed_background_bash_contract_is_not_projected_when_unsupported() {
         let mut schemas = all_tool_schemas();

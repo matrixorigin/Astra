@@ -1,6 +1,6 @@
 use crate::cli::cli_config::cli_args::{
     Cli, Command, ConfigCmd, McpCmd, PermissionsSubcommand, ServeMode, SessionCaptureCmd,
-    SessionCmd,
+    SessionCmd, WorkspaceCmd,
 };
 use crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission;
 use crate::cli::session::session_state::ExplainMode;
@@ -26,6 +26,20 @@ fn cli_no_args_gives_no_command() {
     assert!(!cli.yes);
     assert!(cli.model.is_none());
     assert!(cli.resume.is_none());
+}
+
+#[test]
+fn workspace_recovery_is_a_local_command() {
+    let cli = Cli::try_parse_from(["astra", "workspace", "confirm-stopped"]).unwrap();
+    let command = cli.command.unwrap();
+    assert!(matches!(
+        &command,
+        Command::Workspace(WorkspaceCmd::ConfirmStopped)
+    ));
+    assert_eq!(
+        command.profile_identity_admission(),
+        CliProfileIdentityAdmission::AuthenticationBootstrap
+    );
 }
 
 #[test]

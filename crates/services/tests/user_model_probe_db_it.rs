@@ -182,6 +182,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     let make_request = |name: &str, model: &str, key: &str| UserModelCreateRequestData {
         connection_id: None,
         inference_protocol: None,
+        responses_reasoning_history: None,
         name: name.into(),
         provider: "deepseek".into(),
         model: model.into(),
@@ -336,6 +337,38 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         .find(|item| item.offering_id == responses.model_id)
         .unwrap();
     assert!(personal.supported_reasoning_efforts.is_none());
+    let probe_before: Option<String> = sqlx::query_scalar(
+        "SELECT CAST(thinking_probe_json AS CHAR) FROM user_llm_models WHERE user_id = ? AND model_id = ?",
+    )
+    .bind(&owner)
+    .bind(&responses.model_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert!(probe_before.is_some());
+    let history_update = service
+        .update_user_model(
+            owner.clone(),
+            responses.model_id.clone(),
+            UserModelUpdateRequestData {
+                responses_reasoning_history: Some(
+                    astra_core::model_wire::responses::ReasoningHistory::CurrentTurn,
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(history_update.thinking_probe.is_some());
+    let probe_after: Option<String> = sqlx::query_scalar(
+        "SELECT CAST(thinking_probe_json AS CHAR) FROM user_llm_models WHERE user_id = ? AND model_id = ?",
+    )
+    .bind(&owner)
+    .bind(&responses.model_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(probe_after, probe_before);
     let same_scope = admitted.response_scope.clone();
     let bad_update = service
         .update_user_model(
@@ -357,7 +390,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             .inference_protocol,
         Some(LlmProviderProtocol::OpenAiResponses)
     );
-    service
+    let rotated = service
         .update_user_model(
             owner.clone(),
             responses.model_id.clone(),
@@ -368,6 +401,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         )
         .await
         .unwrap();
+    assert!(rotated.thinking_probe.is_none());
     assert_eq!(
         service
             .admit_model_offering(owner.clone(), responses.model_id.clone())

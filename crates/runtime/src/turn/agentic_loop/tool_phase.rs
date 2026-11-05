@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 
 use crate::orchestration::agent_tool::MAX_FANOUT_TARGET_COUNT;
 use crate::server::tool_database_snapshots;
-use crate::server::tool_file_runtime;
 use crate::server::tool_route_runtime::committed_work_task_board_event;
 use crate::server::tool_session_state_rollback;
 use crate::server::tool_transport::{
@@ -46,6 +45,94 @@ use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
 use astra_turn_core::orchestration::agent_result_wire::agent_fanout_result_has_recoverable_issue;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_result_semantics::ToolResultStatus;
+
+/// Reserve a bounded canonical result for every call before any call can act.
+fn validate_tool_group_storage_budget(
+    calls: &[Value],
+    reasoning: &str,
+    signature: &str,
+    continuation: Option<&Value>,
+    pending_messages: &[Value],
+) -> Result<u64, String> {
+    use astra_core::runtime_limits::{
+        CANONICAL_TOOL_RESULT_PROVENANCE_BYTES as RESULT_PROVENANCE_BYTES,
+        MAX_CANONICAL_TOOL_RESULT_BYTES as MAX_RESULT_BYTES,
+        MIN_CANONICAL_TOOL_RESULT_BYTES as MIN_RESULT_BYTES,
+    };
+    const FRAME_OVERHEAD: u64 = 8192;
+    let limit = astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES;
+    let count = u64::try_from(calls.len()).unwrap_or(u64::MAX);
+    if count == 0 {
+        return Ok(MAX_RESULT_BYTES);
+    }
+    let minimum = count.saturating_mul(MIN_RESULT_BYTES + RESULT_PROVENANCE_BYTES);
+    let available = limit
+        .checked_sub(minimum.saturating_add(FRAME_OVERHEAD))
+        .ok_or_else(|| {
+            "Tool batch is too large to save safely; no requested tool ran".to_string()
+        })?;
+    for value in [Some(calls), continuation.map(std::slice::from_ref)]
+        .into_iter()
+        .flatten()
+    {
+        if !astra_turn_types::json_serialized_fits(value, available).unwrap_or(false) {
+            return Err("Tool batch is too large to save safely; no requested tool ran".into());
+        }
+    }
+    if !astra_turn_types::json_serialized_fits(reasoning, available).unwrap_or(false)
+        || !astra_turn_types::json_serialized_fits(signature, available).unwrap_or(false)
+    {
+        return Err("Tool batch is too large to save safely; no requested tool ran".into());
+    }
+    // The round owner canonicalizes provider call shapes before recording
+    // them. Count that exact representation before any edge dispatch too.
+    let canonical_calls =
+        astra_turn_core::headless_tool_assembly::canonicalize_provider_tool_batch(calls)
+            .map_err(|error| format!("provider tool-call protocol violation: {error}"))?;
+    let mut opening =
+        astra_turn_core::headless_tool_assembly::begin_headless_tool_round_opening_ext(
+            canonical_calls.as_ref(),
+            reasoning,
+            signature,
+            false,
+        )
+        .assistant_message;
+    if let Some(continuation) = continuation {
+        opening[astra_core::model_wire::responses::CONTINUATION_KEY] = continuation.clone();
+    }
+    let opening_bytes = astra_turn_types::canonical_conversation_serialized_len(&[opening]);
+    if opening_bytes > available {
+        return Err("Tool batch is too large to save safely; no requested tool ran".into());
+    }
+    let pending_budget = astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_BATCH_BYTES
+        .checked_sub(
+            minimum
+                .saturating_add(opening_bytes)
+                .saturating_add(FRAME_OVERHEAD)
+                .saturating_add(astra_core::runtime_limits::CANONICAL_TERMINAL_RESERVE_BYTES),
+        )
+        .ok_or_else(|| {
+            "Tool batch is too large to save safely; no requested tool ran".to_string()
+        })?;
+    if !astra_turn_types::json_serialized_fits(pending_messages, pending_budget).unwrap_or(false) {
+        return Err("Tool batch is too large to save safely; no requested tool ran".into());
+    }
+    let pending_bytes = astra_turn_types::json_serialized_len(pending_messages)
+        .map_err(|_| "Tool batch is too large to save safely; no requested tool ran".to_string())?;
+    let segment_remaining = limit
+        .saturating_sub(opening_bytes)
+        .saturating_sub(FRAME_OVERHEAD);
+    let batch_remaining = astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_BATCH_BYTES
+        .saturating_sub(opening_bytes)
+        .saturating_sub(pending_bytes)
+        .saturating_sub(FRAME_OVERHEAD)
+        .saturating_sub(astra_core::runtime_limits::CANONICAL_TERMINAL_RESERVE_BYTES);
+    let total_results = segment_remaining.min(batch_remaining);
+    if total_results < minimum {
+        return Err("Tool batch is too large to save safely; no requested tool ran".into());
+    }
+    Ok(total_results)
+}
 
 /// Persist schema-addressed deferred selections at the tool-result boundary.
 ///
@@ -1017,7 +1104,6 @@ const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 struct ServerRollbackBoundary {
     session_turn: u32,
     agentic_step: u32,
-    file_checkpoint: Option<u64>,
     database_checkpoint: Option<u64>,
 
     session_state_checkpoint: Option<u64>,
@@ -1056,15 +1142,6 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
 
 fn tool_record_is_server_mutator(record: &ToolCallRecord) -> bool {
     is_server_mutator_tool_name(&record.name)
-}
-
-fn server_file_mutator_in_round(tool_calls: &[Value]) -> bool {
-    tool_calls.iter().any(|tool_call| {
-        matches!(
-            tool_call_name(tool_call),
-            Some("write_file" | "str_replace" | "multi_edit" | "delete_file")
-        )
-    })
 }
 
 fn server_database_mutator_in_round(tool_calls: &[Value]) -> bool {
@@ -1112,9 +1189,6 @@ fn append_session_journal_event(
 
 fn server_boundary_surfaces(boundary: &ServerRollbackBoundary) -> Vec<&'static str> {
     let mut surfaces = Vec::new();
-    if boundary.file_checkpoint.is_some() {
-        surfaces.push("file_edits");
-    }
     if boundary.database_checkpoint.is_some() {
         surfaces.push("database_snapshots");
     }
@@ -1150,12 +1224,6 @@ fn server_boundary_checkpoints(boundary: &ServerRollbackBoundary) -> Value {
             Value::String((*surface).to_string()),
         );
     }
-    if let Some(file_checkpoint) = boundary.file_checkpoint {
-        checkpoints.insert(
-            "file_after_sequence".to_string(),
-            Value::Number(serde_json::Number::from(file_checkpoint)),
-        );
-    }
     if let Some(database_checkpoint) = boundary.database_checkpoint {
         checkpoints.insert(
             "database_after_sequence".to_string(),
@@ -1174,7 +1242,6 @@ fn server_boundary_checkpoints(boundary: &ServerRollbackBoundary) -> Value {
 fn server_boundary_commit_detail(
     boundary: &ServerRollbackBoundary,
     executed_requests: usize,
-    file_entries_added: u64,
     database_entries_added: u64,
 
     session_state_entries_added: u64,
@@ -1207,12 +1274,6 @@ fn server_boundary_commit_detail(
             Value::String((*surface).to_string()),
         );
     }
-    if boundary.file_checkpoint.is_some() {
-        detail.insert(
-            "file_entries_recorded".to_string(),
-            Value::Number(serde_json::Number::from(file_entries_added)),
-        );
-    }
     if boundary.database_checkpoint.is_some() {
         detail.insert(
             "database_entries_recorded".to_string(),
@@ -1241,28 +1302,17 @@ fn parse_server_rollback_output(tool_name: &str, output: String) -> Value {
 
 fn combine_server_rollback_outputs(
     turn_index: u32,
-    file_edits: Option<Value>,
     database_snapshots: Option<Value>,
 
     session_state: Option<Value>,
 ) -> Option<Value> {
-    if file_edits.is_none() && database_snapshots.is_none() && session_state.is_none() {
+    if database_snapshots.is_none() && session_state.is_none() {
         return None;
     }
 
     let mut success = true;
     let mut summaries = Vec::new();
     let mut rollback = serde_json::Map::new();
-    if let Some(file_edits) = file_edits {
-        success &= file_edits
-            .get("success")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if let Some(summary) = file_edits.get("summary").and_then(Value::as_str) {
-            summaries.push(summary.to_string());
-        }
-        rollback.insert("file_edits".to_string(), file_edits);
-    }
     if let Some(database_snapshots) = database_snapshots {
         success &= database_snapshots
             .get("success")
@@ -1303,19 +1353,16 @@ fn open_server_rollback_boundary(
     agentic_step: u32,
     tool_calls: &[Value],
 ) -> Option<ServerRollbackBoundary> {
-    let has_file_mutator = server_file_mutator_in_round(tool_calls);
     let has_database_mutator = server_database_mutator_in_round(tool_calls);
 
     let has_session_state_mutator = server_session_state_mutator_in_round(tool_calls);
-    if !has_file_mutator && !has_database_mutator && !has_session_state_mutator {
+    if !has_database_mutator && !has_session_state_mutator {
         return None;
     }
 
     let active = ServerRollbackBoundary {
         session_turn,
         agentic_step,
-        file_checkpoint: has_file_mutator
-            .then(|| tool_file_runtime::file_journal_checkpoint(executor.file_journal.as_ref())),
         database_checkpoint: has_database_mutator.then(|| {
             tool_database_snapshots::journal_checkpoint(executor.database_snapshot_journal.as_ref())
         }),
@@ -1344,10 +1391,6 @@ async fn finalize_server_rollback_boundary(
     active: &ServerRollbackBoundary,
     new_records: &[ToolCallRecord],
 ) {
-    let file_entries_added = active.file_checkpoint.map_or(0, |checkpoint| {
-        tool_file_runtime::file_journal_checkpoint(executor.file_journal.as_ref())
-            .saturating_sub(checkpoint)
-    });
     let database_entries_added = active.database_checkpoint.map_or(0, |checkpoint| {
         tool_database_snapshots::journal_checkpoint(executor.database_snapshot_journal.as_ref())
             .saturating_sub(checkpoint)
@@ -1363,27 +1406,13 @@ async fn finalize_server_rollback_boundary(
     // mutations. This prevents "one cognitive error trashes the whole round"
     // behavior that otherwise makes model action-history diverge from disk.
     let failed_mutator_record = new_records.iter().find(|record| {
-        record.was_executed() && !record.ok && tool_record_is_server_mutator(record)
+        record.was_executed()
+            && !record.execution_succeeded()
+            && tool_record_is_server_mutator(record)
     });
     if let Some(failed_record) = failed_mutator_record {
-        let file_rollback = if let Some(file_checkpoint) = active.file_checkpoint {
-            (file_entries_added > 0).then(|| {
-                parse_server_rollback_output(
-                    "rollback_file_edits",
-                    tool_file_runtime::execute_rollback_file_edits(
-                        executor.workspace_root(),
-                        &serde_json::json!({
-                            "scope": "current_turn",
-                            "file_after_sequence": file_checkpoint,
-                        }),
-                        executor.journal_turn_index.load(Ordering::Relaxed),
-                        executor.file_journal.as_ref(),
-                    ),
-                )
-            })
-        } else {
-            None
-        };
+        // A failed round may already have produced useful files. Leave them
+        // in place so recovery cannot overwrite later work in the workspace.
         let database_snapshot_rollback =
             if let Some(database_checkpoint) = active.database_checkpoint {
                 (database_entries_added > 0).then(|| {
@@ -1436,7 +1465,6 @@ async fn finalize_server_rollback_boundary(
         };
         let rollback = combine_server_rollback_outputs(
             active.session_turn,
-            file_rollback,
             database_snapshot_rollback,
             session_state_rollback,
         );
@@ -1464,7 +1492,6 @@ async fn finalize_server_rollback_boundary(
             Some(server_boundary_commit_detail(
                 active,
                 new_records.len(),
-                file_entries_added,
                 database_entries_added,
                 session_state_entries_added,
             )),
@@ -1740,6 +1767,13 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             &turn_result.accum.tool_calls,
         )
         .map_err(|error| format!("provider tool-call protocol violation: {error}"))?;
+        let canonical_result_budget = validate_tool_group_storage_budget(
+            &turn_result.accum.tool_calls,
+            &turn_result.accum.reasoning_content,
+            &turn_result.accum.reasoning_signature,
+            state.pending_provider_continuation.as_ref(),
+            state.pending_canonical_messages_for_commit(),
+        )?;
         let provider_tool_attempts =
             ToolLedgerAttemptBatch::from_validated_provider_calls(&turn_result.accum.tool_calls);
         let (provider_tool_calls_returned, provider_tool_call_names) =
@@ -2033,6 +2067,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             reasoning_content: turn_result.accum.reasoning_content.as_str(),
             reasoning_signature: turn_result.accum.reasoning_signature.as_str(),
             provider_continuation: state.pending_provider_continuation.as_ref(),
+            canonical_result_budget,
             messages: &mut state.messages,
             tool_results: &mut state.tool_results,
             valid_tool_names: &valid_tool_names,
@@ -2631,14 +2666,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             }
         }
 
-        if let Some(payload) =
-            super::source_recovery::active_source_recovery_advisory(&state.stall.tool_call_records)
-        {
-            state.push_volatile_payload(super::host::VolatileKind::SourceRecoveryAdvisory, payload);
-        } else {
-            state.clear_volatile(super::host::VolatileKind::SourceRecoveryAdvisory);
-        }
-
         let owns_session_composite_snapshot = state.owns_session_composite_snapshot();
         apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             owns_session_composite_snapshot,
@@ -2812,6 +2839,60 @@ mod tests {
         MockHost, make_edge_tool, make_state, text_result,
     };
     use crate::turn::agentic_loop::host::{build_introspect_snapshot, introspect_token_pressure};
+
+    #[test]
+    fn tool_group_budget_counts_json_expansion_and_reserves_results() {
+        let call = json!({"id":"call", "type":"function", "function":{"name":"read_file", "arguments":"{}"}});
+        assert!(
+            validate_tool_group_storage_budget(std::slice::from_ref(&call), "", "", None, &[])
+                .is_ok()
+        );
+        let escaped = "\0".repeat(1_400_000);
+        assert!(
+            validate_tool_group_storage_budget(
+                std::slice::from_ref(&call),
+                &escaped,
+                "",
+                None,
+                &[]
+            )
+            .is_err()
+        );
+        let batch: Vec<_> = (0..50)
+            .map(|index| {
+                let mut call = call.clone();
+                call["id"] = json!(format!("call-{index}"));
+                call
+            })
+            .collect();
+        let budget = validate_tool_group_storage_budget(&batch, "", "", None, &[]).unwrap();
+        assert!(budget >= 8 * 1024);
+        assert!(budget < astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES);
+        let pending = vec![json!({"role":"user", "content":"x".repeat(32 * 1024 * 1024)})];
+        let call = json!({"id":"call", "type":"function", "function":{"name":"read_file", "arguments":"{}"}});
+        assert!(validate_tool_group_storage_budget(&[call], "", "", None, &pending).is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_provider_group_is_rejected_before_tool_admission() {
+        let mut response = text_result("", 1, 1, None);
+        response.accum.has_tool_calls = true;
+        response.accum.reasoning_content = "\0".repeat(1_400_000);
+        response.accum.tool_calls = vec![json!({"id":"call-1", "type":"function",
+            "function":{"name":"write_file", "arguments":"{\"path\":\"effect\",\"content\":\"x\"}"}})];
+        let mut host = MockHost::new(vec![response]);
+        host.valid_tools.insert("write_file".into());
+        let mut state = make_state();
+        let outcome = super::super::host::run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(
+            outcome.is_err() || state.interruption.is_some(),
+            "{outcome:?}"
+        );
+        assert!(host.admitted_tool_call_batches.is_empty());
+        // This counter tracks the provider's requested calls, not execution.
+        assert_eq!(state.total_tool_calls, 1);
+        assert!(state.stall.tool_call_records.is_empty());
+    }
 
     #[tokio::test]
     async fn tool_health_projection_is_session_owned_and_clears_recovered_failures() {
@@ -5307,131 +5388,43 @@ esac
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn server_file_boundary_commits_successful_turn() {
+    async fn server_failed_round_preserves_file_edits() {
         let journal_dir = tempfile::TempDir::new().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
-        let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
-        executor.set_turn_index(5);
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            5,
-            17,
-            &[json!({"function": {"name": "write_file", "arguments": "{}"}})],
-        )
-        .expect("boundary should open for write_file");
-
-        let write_out = executor
-            .execute("write_file", &json!({"path": "ok.txt", "content": "hello"}))
-            .await;
-        assert!(write_out.contains("Successfully wrote"));
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[tool_record("write_file", true)],
-        )
-        .await;
-
-        let events = read_boundary_events(&session_id);
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
-        assert_eq!(
-            events[1].event_type,
-            JournalEventType::ExecutionBoundaryCommitted
-        );
-        assert_eq!(events[0].turn, Some(5));
-        assert_eq!(events[1].turn, Some(5));
-        assert_eq!(events[0].agentic_step, Some(17));
-        assert_eq!(events[1].agentic_step, Some(17));
-        let detail = events[1].metadata.as_ref().unwrap()["execution_boundary"]["detail"].clone();
-        assert_eq!(detail["executed_requests"].as_u64(), Some(1));
-        assert_eq!(detail["file_entries_recorded"].as_u64(), Some(1));
-        assert!(dir.path().join("ok.txt").exists());
-
-        let all_events = read_journal_events(&session_id);
-        assert_eq!(
-            all_events.len(),
-            3,
-            "expected session_start + open + commit"
-        );
-        assert_eq!(all_events[0].event_type, JournalEventType::SessionStart);
-        assert_eq!(
-            all_events[1].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
-        assert_eq!(
-            all_events[2].event_type,
-            JournalEventType::ExecutionBoundaryCommitted
-        );
-
-        append_session_journal_event(
-            "test-user",
-            &session_id,
-            astra_services::session_journal::JournalEvent::execution_boundary_committed(
-                Some(&session_id),
-                6,
-                EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK,
-                None,
-                None,
-            ),
-        );
-        let replay_events = read_journal_events(&session_id);
-        assert_eq!(
-            replay_events
-                .iter()
-                .filter(|event| event.event_type == JournalEventType::SessionStart)
-                .count(),
-            1,
-            "subsequent boundary writes must not duplicate SessionStart"
-        );
-        assert_eq!(
-            replay_events.last().map(|event| &event.event_type),
-            Some(&JournalEventType::ExecutionBoundaryCommitted)
-        );
-
-        cleanup_session_artifacts(&session_id);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn server_file_boundary_aborts_and_rolls_back_failed_turn() {
-        let journal_dir = tempfile::TempDir::new().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
-        let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
+        let session_id = format!("server-preserve-file-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = server_executor_for_test_workspace(dir.path(), &session_id);
         executor.set_turn_index(7);
 
+        let file_call = json!({"function": {"name": "write_file", "arguments": "{}"}});
+        assert!(
+            open_server_rollback_boundary(
+                Some(&session_id),
+                &executor,
+                7,
+                7,
+                std::slice::from_ref(&file_call)
+            )
+            .is_none()
+        );
         let active = open_server_rollback_boundary(
             Some(&session_id),
             &executor,
             7,
             7,
             &[
-                json!({"function": {"name": "write_file", "arguments": "{}"}}),
-                json!({"function": {"name": "str_replace", "arguments": "{}"}}),
+                file_call,
+                json!({"function": {"name": "mo_query", "arguments": "{}"}}),
             ],
         )
-        .expect("boundary should open for write_file");
-
-        let write_out = executor
+        .expect("database compensation remains available");
+        let output = executor
             .execute(
                 "write_file",
-                &json!({"path": "turn.txt", "content": "hello"}),
+                &json!({"path": "turn.txt", "content": "keep"}),
             )
             .await;
-        assert!(write_out.contains("Successfully wrote"));
-        assert!(dir.path().join("turn.txt").exists());
-
-        // A mutator (str_replace) fails in the round alongside a successful
-        // write_file → rollback MUST fire and revert the write.
+        assert!(output.contains("Successfully wrote"), "{output}");
         finalize_server_rollback_boundary(
             Some(&session_id),
             &executor,
@@ -5442,95 +5435,18 @@ esac
             ],
         )
         .await;
-
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("turn.txt")).unwrap(),
+            "keep\n"
+        );
         let events = read_boundary_events(&session_id);
         assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
         assert_eq!(
             events[1].event_type,
             JournalEventType::ExecutionBoundaryAborted
         );
         let boundary = &events[1].metadata.as_ref().unwrap()["execution_boundary"];
-        assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("str_replace"));
-        assert_eq!(
-            boundary["rollback"]["file_edits"]["reverted"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-        assert!(!dir.path().join("turn.txt").exists());
-
-        cleanup_session_artifacts(&session_id);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn server_file_boundary_aborts_and_rolls_back_when_multi_edit_fails() {
-        let journal_dir = tempfile::TempDir::new().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
-        let session_id = format!("server-file-boundary-multi-edit-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
-        executor.set_turn_index(15);
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            15,
-            15,
-            &[
-                json!({"function": {"name": "write_file", "arguments": "{}"}}),
-                json!({"function": {"name": "multi_edit", "arguments": "{}"}}),
-            ],
-        )
-        .expect("boundary should open for file mutators");
-
-        let write_out = executor
-            .execute(
-                "write_file",
-                &json!({"path": "turn.txt", "content": "hello"}),
-            )
-            .await;
-        assert!(write_out.contains("Successfully wrote"));
-        assert!(dir.path().join("turn.txt").exists());
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[
-                tool_record("write_file", true),
-                tool_record("multi_edit", false),
-            ],
-        )
-        .await;
-
-        let events = read_boundary_events(&session_id);
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
-        assert_eq!(
-            events[1].event_type,
-            JournalEventType::ExecutionBoundaryAborted
-        );
-        let boundary = &events[1].metadata.as_ref().unwrap()["execution_boundary"];
-        assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("multi_edit"));
-        assert_eq!(
-            boundary["rollback"]["file_edits"]["reverted"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-        assert!(!dir.path().join("turn.txt").exists());
-
+        assert!(boundary["rollback"].get("file_edits").is_none());
         cleanup_session_artifacts(&session_id);
     }
 
@@ -5566,127 +5482,6 @@ esac
                 "{name} should not be a mutator"
             );
         }
-    }
-
-    /// The round contains a successful `write_file` alongside a failing
-    /// read-only tool. The read-only failure has no side effects, so the
-    /// mutator's success must be committed — NOT rolled back.
-    ///
-    /// This is the central regression test for the rollback scoping rule:
-    /// before the fix, a `grep` returning `!ok` would blow away the
-    /// `write_file` it was scheduled next to and leave the model's action
-    /// history diverged from disk state.
-    #[tokio::test(flavor = "current_thread")]
-    async fn server_file_boundary_commits_when_only_read_only_tool_fails() {
-        let journal_dir = tempfile::TempDir::new().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
-        let session_id = format!("server-scope-readonly-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
-        executor.set_turn_index(13);
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            13,
-            13,
-            &[
-                json!({"function": {"name": "write_file", "arguments": "{}"}}),
-                json!({"function": {"name": "grep",        "arguments": "{}"}}),
-            ],
-        )
-        .expect("boundary should open for write_file");
-
-        let write_out = executor
-            .execute(
-                "write_file",
-                &json!({"path": "kept.txt", "content": "survives"}),
-            )
-            .await;
-        assert!(write_out.contains("Successfully wrote"));
-        assert!(dir.path().join("kept.txt").exists());
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[
-                tool_record("write_file", true),
-                // Read-only grep failure must NOT trigger rollback.
-                tool_record("grep", false),
-            ],
-        )
-        .await;
-
-        let events = read_boundary_events(&session_id);
-        assert_eq!(events.len(), 2, "expected open + committed, got {events:?}");
-        assert_eq!(
-            events[0].event_type,
-            JournalEventType::ExecutionBoundaryOpened
-        );
-        assert_eq!(
-            events[1].event_type,
-            JournalEventType::ExecutionBoundaryCommitted,
-            "read-only failure must commit, not abort"
-        );
-        assert!(
-            dir.path().join("kept.txt").exists(),
-            "write_file must survive a co-scheduled read-only failure"
-        );
-
-        cleanup_session_artifacts(&session_id);
-    }
-
-    /// Multiple read-only tools all fail in a mutator round. Still commits —
-    /// no number of read-only errors should cascade into a rollback.
-    #[tokio::test(flavor = "current_thread")]
-    async fn server_file_boundary_commits_when_multiple_read_only_tools_fail() {
-        let journal_dir = tempfile::TempDir::new().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
-        let session_id = format!("server-scope-multi-readonly-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        let executor = server_executor_for_test_workspace(dir.path(), &session_id);
-        executor.set_turn_index(14);
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            14,
-            14,
-            &[json!({"function": {"name": "write_file", "arguments": "{}"}})],
-        )
-        .expect("boundary should open for write_file");
-
-        let write_out = executor
-            .execute(
-                "write_file",
-                &json!({"path": "persist.txt", "content": "data"}),
-            )
-            .await;
-        assert!(write_out.contains("Successfully wrote"));
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[
-                tool_record("write_file", true),
-                tool_record("grep", false),
-                tool_record("read_file", false),
-                tool_record_with_args("git", json!({"action": "diff"}), false),
-            ],
-        )
-        .await;
-
-        let events = read_boundary_events(&session_id);
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[1].event_type,
-            JournalEventType::ExecutionBoundaryCommitted
-        );
-        assert!(dir.path().join("persist.txt").exists());
-
-        cleanup_session_artifacts(&session_id);
     }
 
     // ── Observation Plane integration tests ──────────────────────────

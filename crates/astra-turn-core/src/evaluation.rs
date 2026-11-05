@@ -1277,6 +1277,21 @@ fn active_failure_keys<K: Ord>(
     unresolved
 }
 
+/// A lost mutation result remains unresolved because repeating a mutation
+/// cannot establish the first outcome. Reads can be retried or replaced by
+/// another observation; leave that choice to the agent.
+pub fn has_unresolved_tool_result_delivery_failure(records: &[ToolCallRecord]) -> bool {
+    records.iter().any(|record| {
+        if !record.was_executed() || record.ok || record.execution_ok.is_none() {
+            return false;
+        }
+        let args = record
+            .authoritative_args_full()
+            .and_then(|args| serde_json::from_str(args).ok());
+        !crate::tool::categories::registry().is_read_only_for_recovery(&record.name, args.as_ref())
+    })
+}
+
 pub fn active_execution_failure_fact_keys(
     facts: &[ToolEvaluationFact],
 ) -> std::collections::BTreeSet<EvaluationIdentity> {
@@ -4810,6 +4825,50 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn read_delivery_failure_does_not_permanently_block_the_turn() {
+        let mut failed = journal_ok_call("read_file");
+        failed.ok = false;
+        failed.execution_ok = Some(true);
+        failed.args_full = Some(r#"{"path":"one.txt"}"#.into());
+        let mut other = journal_ok_call("read_file");
+        other.args_full = Some(r#"{"path":"two.txt"}"#.into());
+        assert!(!has_unresolved_tool_result_delivery_failure(&[
+            failed.clone(),
+            other
+        ]));
+        let mut recovered = journal_ok_call("read_file");
+        recovered.args_full = failed.args_full.clone();
+        assert!(!has_unresolved_tool_result_delivery_failure(&[
+            failed.clone(),
+            recovered.clone()
+        ]));
+        failed.name = "write_file".into();
+        recovered.name = "write_file".into();
+        assert!(has_unresolved_tool_result_delivery_failure(&[
+            failed,
+            recovered.clone()
+        ]));
+        assert!(!has_unresolved_tool_result_delivery_failure(&[recovered]));
+
+        let mut database_write = journal_ok_call("mo_query");
+        database_write.ok = false;
+        database_write.execution_ok = Some(true);
+        database_write.args_full = Some(r#"{"sql":"DELETE FROM example"}"#.into());
+        assert!(has_unresolved_tool_result_delivery_failure(&[
+            database_write
+        ]));
+        let mut rename = journal_ok_call("lsp");
+        rename.ok = false;
+        rename.execution_ok = Some(true);
+        rename.args_full = Some(r#"{"action":"rename","dry_run":false}"#.into());
+        assert!(has_unresolved_tool_result_delivery_failure(&[rename]));
+        let mut symbols = journal_ok_call("symbols");
+        symbols.ok = false;
+        symbols.execution_ok = Some(true);
+        assert!(!has_unresolved_tool_result_delivery_failure(&[symbols]));
     }
 
     #[test]

@@ -1,13 +1,11 @@
-use astra_turn_core::cloud_approval_policy::{
-    CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind_with_args,
-};
+use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
 use astra_turn_core::stall::{
     SERVER_STALL_WINDOW, detect_server_stall, record_server_tool_signatures,
 };
 use astra_turn_core::tool_registry_chain::ToolChain;
 use serde_json::{Value, json};
 
-pub(crate) const MAX_RUN_CHAIN_STEPS: usize = 16;
+pub(crate) use astra_turn_core::tool_registry_chain::MAX_RUN_CHAIN_STEPS;
 pub(crate) const MAX_RUN_CHAIN_MUTATING_STEPS: usize = 8;
 pub(crate) use astra_turn_core::safety_middleware::check_sql_safety;
 
@@ -85,20 +83,6 @@ impl ToolSafetyGuard {
             ));
         }
 
-        if chain.rollback_on_failure
-            && let Some(command) = chain.steps.iter().find_map(|step| {
-                (step.tool == "bash")
-                    .then(|| step.args.get("command").and_then(Value::as_str))
-                    .flatten()
-                    .map(str::trim)
-                    .filter(|command| !command.is_empty() && !bash_command_is_read_only(command))
-            })
-        {
-            return Err(format!(
-                "Error: run_chain rollback_on_failure only supports read-only bash steps. `{command}` is mutating. Use structured mutation tools (write_file, git_*, rollback-aware editors), run project-native build/test commands through visible tools after the transaction, or keep bash read-only inside the chain."
-            ));
-        }
-
         let mut tool_sigs = Vec::new();
         for step in &chain.steps {
             let tool_call = json!({
@@ -173,26 +157,6 @@ mod tests {
 
         let error = ToolSafetyGuard::check_chain(&chain).unwrap_err();
         assert!(error.contains("write/execute steps"));
-    }
-
-    #[test]
-    fn chain_guard_blocks_mutating_bash_inside_rollback_on_failure_chain() {
-        let chain = ToolChain::new("rollback-bash", "rollback bash")
-            .with_rollback_on_failure(true)
-            .step("bash", json!({"command": "mkdir unsafe-dir"}));
-
-        let error = ToolSafetyGuard::check_chain(&chain).unwrap_err();
-        assert!(error.contains("rollback_on_failure only supports read-only bash steps"));
-        assert!(error.contains("mkdir unsafe-dir"));
-    }
-
-    #[test]
-    fn chain_guard_allows_read_only_bash_inside_rollback_on_failure_chain() {
-        let chain = ToolChain::new("rollback-bash-ro", "rollback bash ro")
-            .with_rollback_on_failure(true)
-            .step("bash", json!({"command": "pwd"}));
-
-        ToolSafetyGuard::check_chain(&chain).expect("read-only bash should be allowed");
     }
 
     #[test]

@@ -149,12 +149,13 @@ metadata before tool execution/final checkpoint. Stateless OpenAI Responses
 returns encrypted reasoning without an `include` override; compatible endpoints
 can instead return replayable `reasoning_text` content. A tool round containing
 a reasoning item without replayable content stops before executing its calls.
-Opaque provider-encrypted reasoning is base64 encoded for storage so generic
-text redaction cannot corrupt ciphertext; plaintext reasoning uses the normal
-credential-redaction boundary. Raw reasoning is omitted from user-visible streams,
-observers and diagnostic artifacts. Owner-authenticated canonical resume and
-segment APIs retain the redacted continuation so clients can restore the same
-conversation. Function arguments come from the canonical
+Provider reasoning, including provider-supplied opaque state, is sealed by the
+Server before canonical storage. The capsule is authenticated against the owner,
+session lineage, admitted route, model, item and tool calls; its encoded bytes
+survive credential sanitization. The inference owner opens it only for an
+authorized continuation. Raw reasoning is omitted from user-visible streams,
+observers and diagnostic artifacts; resume and segment APIs retain only the
+sealed capsule. Function arguments come from the canonical
 assistant tool calls; private metadata retains no second raw argument copy. Resume
 replays them only for the same connection and model; other protocols remove
 that metadata at the existing internal-marker projection boundary. No
@@ -167,6 +168,13 @@ model discovery, exact admission and delegation consume that same inventory.
 Inference performs no catalog fetch. The shared `responses_reasoning` adapter
 emits `reasoning.effort`; Model default omits the field. Unsupported effort,
 binary suppression and token-budget requests fail before provider dispatch.
+
+For a personal API-key model using Responses, the model create/update API also
+accepts `responses_reasoning_history`: `current_turn` only for an endpoint whose
+contract has been verified to need reasoning within the active human turn, or
+`all_turns` to retain it across turns. Omission is conservative. This is a route
+capability, not a setting inferred from the provider's name; changing it adds no
+per-turn database query.
 
 Only completed responses authorize tool dispatch and replayable provider state.
 A typed `max_output_tokens` truncation retains partial text, response identity,

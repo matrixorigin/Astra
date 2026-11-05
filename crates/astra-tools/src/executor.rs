@@ -5,7 +5,7 @@
 //! (e.g., `ServerToolExecutor` adds resource governance and process isolation,
 //! `CliToolExecutor` adds terminal UI and MCP dispatch).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -554,8 +554,8 @@ impl ToolExecutor for DefaultToolExecutor {
         &self.ctx.project_root
     }
 
-    fn workspace_root(&self) -> &Path {
-        &self.ctx.workspace_root
+    fn workspace_root(&self) -> PathBuf {
+        self.ctx.workspace_root.clone()
     }
 }
 

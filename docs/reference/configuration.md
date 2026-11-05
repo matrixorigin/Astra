@@ -142,7 +142,7 @@ trust store to the Server. Restart the process after changing its trust settings
 - `ASTRA_JWT_ALGORITHM` (default `HS256`)
 - `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `10080` in code; production should override)
 - `ASTRA_JWT_REFRESH_TTL_DAYS` (code default `30`; `.env.example` selects `7`)
-- `ASTRA_TOKEN_ENCRYPTION_KEY` (shared high-entropy secret for stored provider and browser session credentials and request-signed Session scope bindings; changing it makes provider credentials undecryptable, requires browser sign-in again, and invalidates existing Session scope bindings)
+- `ASTRA_TOKEN_ENCRYPTION_KEY` (shared high-entropy secret for stored provider and browser session credentials, private Responses continuation state, and request-signed Session scope bindings; changing it makes existing encrypted credentials and continuations unreadable, requires browser sign-in again, and invalidates existing Session scope bindings)
 - `ASTRA_RUNTIME_ROOT_SECRET`
 
 ### Provider Request Auth

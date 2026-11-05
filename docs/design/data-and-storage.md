@@ -734,8 +734,8 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
-Fresh schema contract `2026-11-04-v120` adds personal model protocol selection to
-the existing model row. It rejects earlier databases under the existing
+Fresh schema contract `2026-11-05-v121` adds the declared Responses reasoning
+history policy to the existing personal model row. It rejects earlier databases under the existing
 fresh-database contract; no implicit migration runs. Operators must make an
 explicit data and deployment decision before moving an existing database.
 

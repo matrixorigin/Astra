@@ -2071,6 +2071,21 @@ pub(crate) enum ResumeSessionResponse {
     },
 }
 
+fn ensure_private_continuation_is_sealed(
+    messages: &[Value],
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if messages
+        .iter()
+        .any(astra_core::model_wire::responses::has_unsealed_reasoning)
+    {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Session contains unprotected model continuation state",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn resume_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -2105,6 +2120,7 @@ pub(crate) async fn resume_session_handler(
         .materialize(&head)
         .await
         .map_err(session_context_http_error)?;
+    ensure_private_continuation_is_sealed(&materialized.messages)?;
     let materialized_root = astra_turn_types::canonical_conversation_root(&materialized.messages);
     let bundle = astra_turn_types::select_resume_bundle(
         Some(&head.cursor),
@@ -2904,6 +2920,9 @@ pub(crate) async fn get_session_segments_handler(
         )
         .await
         .map_err(session_context_http_error)?;
+    for segment in &segments {
+        ensure_private_continuation_is_sealed(&segment.messages)?;
+    }
     Ok(Json(SessionSegmentBatchResponse { segments }))
 }
 
@@ -4017,6 +4036,22 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::{AppState, HealthChecker, ServiceInfo};
+
+    #[test]
+    fn session_reads_reject_unsealed_private_reasoning() {
+        let key = astra_core::model_wire::responses::CONTINUATION_KEY;
+        let raw = json!({"role":"assistant", key:{"items":[
+            {"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}
+        ]}});
+        let error = ensure_private_continuation_is_sealed(&[raw]).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(!error.1.0.detail.contains("private"));
+        let sealed = json!({"role":"assistant", key:{"items":[
+            {"type":"reasoning", astra_core::model_wire::responses::SEALED_REASONING:
+                {"origin":"session", "ciphertext":"opaque"}}
+        ]}});
+        assert!(ensure_private_continuation_is_sealed(&[sealed]).is_ok());
+    }
 
     #[test]
     fn session_cancel_wire_requires_explicit_convergence_even_with_no_active_runs() {

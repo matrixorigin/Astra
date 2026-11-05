@@ -1146,7 +1146,7 @@ mod tests {
 
     #[test]
     fn model_load_preserves_responses_protocol() {
-        let entry: serde_yaml_ng::Value = serde_yaml_ng::from_str("name: test\nprovider: openai\ncontext_window: 128000\ninference_protocol: openai_responses\n").unwrap();
+        let entry: serde_yaml_ng::Value = serde_yaml_ng::from_str("name: test\nprovider: openai\ncontext_window: 128000\ninference_protocol: openai_responses\nresponses_reasoning_history: current_turn\n").unwrap();
         let payload = build_model_create_payload(
             &entry,
             "test",
@@ -1156,6 +1156,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payload["quirks"]["inference_protocol"], "openai_responses");
+        assert_eq!(
+            payload["quirks"]["responses_reasoning_history"],
+            "current_turn"
+        );
     }
 
     #[test]

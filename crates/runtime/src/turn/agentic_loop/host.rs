@@ -2967,10 +2967,6 @@ pub enum VolatileKind {
     /// errors, redundant reads, cache waste, or exploration-family churn.
     /// It never carries execution authority.
     BehaviorAdvisory,
-    /// Executor-authored notice that a command changed or deleted a source
-    /// artifact whose original bytes were retained. Advisory-only: it never
-    /// authorizes rollback, retry, budget extension, or terminal settlement.
-    SourceRecoveryAdvisory,
     /// Mailbox / agent-to-agent drop-offs. Multiple batches accumulate until
     /// one provider attempt consumes them; later drains must not erase earlier
     /// acknowledged messages.
@@ -3080,7 +3076,6 @@ impl VolatileKind {
                 | Self::PolicyAdvisory
                 | Self::RuntimeInputBoundary
                 | Self::BehaviorAdvisory
-                | Self::SourceRecoveryAdvisory
                 | Self::ActiveTurnFrame
                 | Self::ActiveWorkSnapshot
                 | Self::CanonicalWorkState
@@ -3111,7 +3106,7 @@ impl VolatileKind {
             | Self::SessionHookContext
             | Self::PlanModeMarker
             | Self::HarnessBoundary => VolatileDeliveryClass::RequiredContext,
-            Self::PolicyAdvisory | Self::BehaviorAdvisory | Self::SourceRecoveryAdvisory => {
+            Self::PolicyAdvisory | Self::BehaviorAdvisory => {
                 VolatileDeliveryClass::DecisionFeedback
             }
             Self::ToolBatchCoaching
@@ -4276,6 +4271,21 @@ impl AgenticLoopState {
     pub(crate) fn initialize_provider_canonical_wal_base(&mut self, durable_prefix: &[Value]) {
         self.provider_canonical_wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(durable_prefix).ok();
+    }
+
+    pub(crate) fn pending_canonical_messages_for_commit(&self) -> &[Value] {
+        let committed_prefix = self
+            .provider_canonical_wal_base
+            .as_ref()
+            .filter(|_| {
+                !self
+                    .canonical_rewrite_proof()
+                    .is_some_and(|proof| proof.requires_full_commit_budget())
+            })
+            .and_then(|base| usize::try_from(base.canonical.message_count).ok())
+            .filter(|count| *count <= self.messages.len())
+            .unwrap_or(0);
+        &self.messages[committed_prefix..]
     }
 
     pub(crate) fn canonical_rewrite_proof(
@@ -14494,34 +14504,6 @@ mod parallel_execution_tests {
         assert_eq!(value[0]["kind"], "behavior_advisory");
         assert_eq!(value[0]["delivery_class"], "decision_feedback");
         assert_eq!(value[0]["payload"]["evidence"], "latest");
-    }
-
-    #[test]
-    fn source_recovery_advisory_is_independent_singleton_decision_feedback() {
-        let mut state = make_state();
-        assert!(VolatileKind::SourceRecoveryAdvisory.is_singleton());
-        assert_eq!(
-            VolatileKind::SourceRecoveryAdvisory.delivery_class(),
-            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback,
-        );
-
-        state.push_volatile(VolatileKind::BehaviorAdvisory, "batch calls");
-        state.push_volatile_payload(
-            VolatileKind::SourceRecoveryAdvisory,
-            json!({"signal": "source_preimage_recovery_pending"}),
-        );
-        assert_eq!(
-            state.volatile_pending.len(),
-            2,
-            "source recovery must not overwrite unrelated behavioral feedback"
-        );
-        let value = super::runtime_volatile_injections_edge_profile_value(&state.volatile_pending)
-            .expect("source recovery advisory should serialize");
-        assert!(value.as_array().unwrap().iter().any(|entry| {
-            entry["kind"] == "source_recovery_advisory"
-                && entry["delivery_class"] == "decision_feedback"
-                && entry["payload"]["signal"] == "source_preimage_recovery_pending"
-        }));
     }
 
     // ═══════════════════════════════════════════════════════════════════

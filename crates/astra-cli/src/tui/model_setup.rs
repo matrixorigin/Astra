@@ -198,6 +198,7 @@ pub(crate) fn model_form(
                 Ok(ViewResult::ModelSetup(Action::Create(
                     UserModelCreateRequestData {
                         connection_id: connection.clone(),
+                        responses_reasoning_history: None,
                         name: values[0].trim().into(),
                         provider: provider.clone(),
                         inference_protocol: if choose_format {
@@ -395,7 +396,7 @@ pub(crate) async fn run(
             begin_write()?;
             let payload = json!({"name":request.name,"provider":request.provider,"model":request.model,
                 "connection_id":request.connection_id,"api_key":request.api_key,"base_url":request.base_url,
-                "inference_protocol":request.inference_protocol,
+                "inference_protocol":request.inference_protocol,"responses_reasoning_history":request.responses_reasoning_history,
                 "context_window":request.context_window,"is_default":false});
             let body = api
                 .post_bearer_path_json_text(&token, astra_thin_client::paths::ME_MODELS, &payload)

@@ -442,6 +442,7 @@ impl ModelService for TestModelService {
         let record = UserModelRecord {
             thinking_probe: None,
             inference_protocol: request.inference_protocol,
+            responses_reasoning_history: request.responses_reasoning_history,
             model_id: model_id.clone(),
             name: request.name,
             provider: request.provider,
@@ -506,6 +507,9 @@ impl ModelService for TestModelService {
         }
         if let Some(protocol) = request.inference_protocol {
             row.inference_protocol = Some(protocol);
+        }
+        if let Some(history) = request.responses_reasoning_history {
+            row.responses_reasoning_history = Some(history);
         }
         Ok(row.clone())
     }

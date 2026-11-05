@@ -948,9 +948,13 @@ pub struct ToolCallRecord {
     pub tool_call_id: Option<String>,
     /// Tool name.
     pub name: String,
-    /// Whether the observed outcome is successful. For execution accounting,
-    /// consult `disposition`: reused/deferred/suppressed calls did not execute.
+    /// Whether the observed result was successfully delivered and accepted.
+    /// For execution accounting, consult `disposition` as well.
     pub ok: bool,
+    /// Execution outcome when it differs from result delivery. This prevents
+    /// a delivery failure from hiding a completed side effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ok: Option<bool>,
     /// Execution time in milliseconds.
     pub ms: u64,
     /// Error message if the call failed (first 500 chars).
@@ -1086,11 +1090,6 @@ pub struct ToolCallRecord {
     pub workspace_mutation_partial: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mutation_partial_paths: Option<Vec<String>>,
-    /// Validated executor-authored fact that a best-effort inferred source was
-    /// modified or deleted.  This is advisory recovery state, not proof that
-    /// the tool failed and not authority to roll the change back implicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_preimage_recovery: Option<serde_json::Value>,
     /// Source-authored error classification. This remains typed across
     /// runtime, journal, ingestion, and reflection boundaries so downstream
     /// systems never need to infer control semantics from error prose.
@@ -1267,6 +1266,11 @@ impl ToolCallRecord {
 
     pub fn was_executed(&self) -> bool {
         self.effective_disposition() == ToolCallDisposition::Executed
+    }
+
+    /// A result can fail delivery after the underlying operation succeeded.
+    pub fn execution_succeeded(&self) -> bool {
+        self.was_executed() && self.execution_ok.unwrap_or(self.ok)
     }
 
     /// Canonical terminal lifecycle event for this record.

@@ -398,6 +398,18 @@ impl SandboxPolicy {
         }
     }
 
+    /// Paths added beyond the defaults for this isolation mode.
+    pub fn non_default_allowed_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        let defaults = match self.isolation {
+            IsolationLevel::Permissive => Vec::new(),
+            IsolationLevel::Standard => Self::for_project(&self.project_root).allowed_paths,
+            IsolationLevel::Strict => Self::strict(&self.project_root).allowed_paths,
+        };
+        self.allowed_paths
+            .iter()
+            .filter(move |path| !defaults.contains(path))
+    }
+
     /// Create a policy based on the skill's trust tier.
     ///
     /// Maps trust tiers to isolation levels:

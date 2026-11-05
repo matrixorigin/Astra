@@ -189,6 +189,9 @@ fn canonical_root_turn_events(
     events: Vec<astra_services::session_journal::JournalEvent>,
     mut explain_by_run: HashMap<String, RestoredExplainAnalyze>,
 ) -> Vec<TurnEvent> {
+    use crate::tui::history_cell::{HistoryCell, turn_summary::TurnSummaryCell};
+
+    let tool_names = super::super::event_loop::local_transcript_tool_names(&events, None);
     let mut last_item_seq_by_run = HashMap::new();
     for item in events
         .iter()
@@ -202,6 +205,7 @@ fn canonical_root_turn_events(
     }
 
     let mut seen_source_ids = HashSet::new();
+    let mut runs_with_tools = HashSet::new();
     let mut out = Vec::new();
     for event in events {
         let Some(item) = event.transcript_item else {
@@ -260,6 +264,7 @@ fn canonical_root_turn_events(
                 }
             }
             Some("tool") => {
+                runs_with_tools.insert(run_id.clone());
                 let content = message
                     .get("content")
                     .and_then(serde_json::Value::as_str)
@@ -270,13 +275,20 @@ fn canonical_root_turn_events(
                     name: message
                         .get("name")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or("tool")
-                        .to_string(),
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            let id = message
+                                .get("tool_call_id")
+                                .or_else(|| message.get("call_id"))?
+                                .as_str()?;
+                            tool_names.get(&(run_id.clone(), id.to_string())).cloned()
+                        })
+                        .unwrap_or_else(|| "tool".to_string()),
                     description: String::new(),
                     status: match message.get("status").and_then(serde_json::Value::as_str) {
-                        Some("uncertain") => ToolStatus::Uncertain,
-                        Some("failed" | "error") => ToolStatus::Failed,
-                        _ => ToolStatus::Success,
+                        Some("success" | "completed" | "ok") => ToolStatus::Success,
+                        Some("failed" | "error" | "rejected") => ToolStatus::Failed,
+                        _ => ToolStatus::Uncertain,
                     },
                     duration_ms: message
                         .get("duration_ms")
@@ -287,6 +299,12 @@ fn canonical_root_turn_events(
                 });
             }
             _ => {}
+        }
+        if is_last_run_item
+            && runs_with_tools.remove(&run_id)
+            && let Some(summary) = TurnSummaryCell::default().to_persist()
+        {
+            out.push(summary);
         }
         if is_last_run_item && let Some(restored) = explain_by_run.remove(&run_id) {
             if !restored.events.is_empty() {
@@ -418,6 +436,81 @@ mod tests {
         assert!(!text.contains("child-only"), "{text}");
         assert!(!text.contains("retry must not win"), "{text}");
         session_journal::set_journal_content_redact_override(None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn canonical_journal_restores_activity_without_claiming_execution() {
+        session_journal::set_journal_content_redact_override(Some(false));
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess_resume_activity";
+        let event = |seq, message| {
+            JournalEvent::transcript_item(session_id, "root-run", "root", seq, &message)
+                .expect("valid transcript message")
+        };
+        session_journal::JournalWriter::new(session_id)
+            .unwrap()
+            .append_bulk(&[
+                event(1, serde_json::json!({"role":"user", "content":"run the checks"})),
+                event(2, serde_json::json!({"role":"assistant", "content":"", "tool_calls":[
+                    {"id":"call-1", "type":"function", "function":{"name":"bash", "arguments":"{}"}}
+                ]})),
+                event(3, serde_json::json!({"role":"tool", "tool_call_id":"call-1", "content":"request rejected"})),
+                event(4, serde_json::json!({"role":"assistant", "content":"No commands ran."})),
+            ])
+            .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let widget = load(session_id, &api, None, false).await;
+        let text = widget
+            .history()
+            .iter()
+            .flat_map(|cell| cell.display_lines(120))
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(text.contains("1 command request"), "{text}");
+        assert!(text.contains("request rejected"), "{text}");
+        let events = canonical_root_turn_events(
+            session_journal::read_journal(session_id).unwrap(),
+            HashMap::new(),
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnEvent::Tool {
+                status: ToolStatus::Uncertain,
+                ..
+            }
+        )));
+        session_journal::set_journal_content_redact_override(None);
+    }
+
+    #[test]
+    fn journal_tool_status_requires_explicit_evidence() {
+        let events = [
+            serde_json::json!({"role":"tool", "tool_call_id":"a", "content":"rejected"}),
+            serde_json::json!({"role":"tool", "tool_call_id":"b", "content":"failed"}),
+            serde_json::json!({"role":"tool", "tool_call_id":"c", "content":"succeeded"}),
+            serde_json::json!({"role":"tool", "tool_call_id":"d", "status":"completed", "content":"ok"}),
+            serde_json::json!({"role":"tool", "tool_call_id":"e", "status":"rejected", "content":"no"}),
+        ].into_iter().enumerate().map(|(n, message)| JournalEvent::transcript_item("session", "run", "root", n as u64 + 1, &message).unwrap()).collect();
+        let statuses: Vec<_> = canonical_root_turn_events(events, HashMap::new())
+            .into_iter()
+            .filter_map(|event| match event {
+                TurnEvent::Tool { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ToolStatus::Uncertain,
+                ToolStatus::Uncertain,
+                ToolStatus::Uncertain,
+                ToolStatus::Success,
+                ToolStatus::Failed
+            ]
+        );
     }
 
     #[test]

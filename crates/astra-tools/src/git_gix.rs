@@ -316,6 +316,13 @@ impl BoundGitCommand {
             .map(|out| out.output)
     }
 
+    /// Preserve the process-ownership result for worktree lifecycle operations.
+    pub fn output_with_ownership(
+        &mut self,
+    ) -> Result<astra_sandbox::SyncProcessOutput, astra_sandbox::SyncProcessError> {
+        self.run_sync(&self.args, true, 16 * 1024 * 1024, None)
+    }
+
     fn run_sync(
         &self,
         args: &[String],
@@ -329,7 +336,7 @@ impl BoundGitCommand {
             GIT_SUBPROCESS_TIMEOUT,
             output_limit,
             cancel,
-            |cmd| self.configure(cmd, force_worktree),
+            |cmd, _| self.configure(cmd, force_worktree),
         );
         self.finish_sync_result(result)
     }
@@ -545,6 +552,19 @@ pub fn prepare_bound_git_command_with_cancel(
             args: Vec::new(),
         })
     }
+}
+
+/// Inspect an exact Git worktree using the shared bounded process owner.
+pub fn inspect_bound_git_worktree(
+    project_root: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, GitProcessError> {
+    let mut command =
+        prepare_bound_git_command(project_root).map_err(GitProcessError::RepositoryBinding)?;
+    command
+        .args(args)
+        .output()
+        .map_err(GitProcessError::Execution)
 }
 
 /// Return the current branch name (like `git branch --show-current`).

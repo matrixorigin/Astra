@@ -5678,7 +5678,7 @@ fn local_transcript_tool_result(
 
 /// Recover an omitted result name from the same journal lane before applying
 /// pagination. Tool-call IDs are run-scoped; no additional storage read is needed.
-fn local_transcript_tool_names(
+pub(super) fn local_transcript_tool_names(
     events: &[astra_services::session_journal::JournalEvent],
     target_run_id: Option<&str>,
 ) -> std::collections::HashMap<(String, String), String> {

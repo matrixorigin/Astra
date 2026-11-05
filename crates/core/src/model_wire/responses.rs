@@ -1,6 +1,5 @@
 //! The Responses wire codec shared by subscription probes and runtime calls.
 //! It owns no conversation, tool execution, credential, or retry lifecycle.
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -10,10 +9,41 @@ pub const CONTINUATION_SCOPE_CHANGED: &str =
 pub const CONTINUATION_INCOMPLETE: &str = "Tool continuation is incomplete; start a new turn";
 pub const REASONING_CONTINUATION_MISSING: &str = "responses_reasoning_continuation_missing";
 pub const INVALID_OUTPUT: &str = "responses_invalid_output";
-const ENCODED_REASONING: &str = "_astra_encrypted_content_b64";
+/// Provider-declared retention policy for completed human turns.
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningHistory {
+    CurrentTurn,
+    AllTurns,
+}
+impl ReasoningHistory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentTurn => "current_turn",
+            Self::AllTurns => "all_turns",
+        }
+    }
+}
+/// Server-sealed private reasoning, opened only by the trusted inference owner.
+pub const SEALED_REASONING: &str = "_astra_sealed_reasoning";
+pub const ENCODED_REASONING: &str = "_astra_encrypted_content_b32";
 const MAX_CONTINUATION_ITEMS: usize = 4096;
 const MAX_REASONING_PARTS: usize = 4096;
 const MAX_REASONING_BYTES: usize = 16 * 1024 * 1024;
+
+/// Encode opaque provider state without credential-shaped substrings that a
+/// generic durable text sanitizer could otherwise rewrite.
+pub fn encode_opaque_reasoning(bytes: &[u8]) -> String {
+    data_encoding::BASE32_NOPAD
+        .encode(bytes)
+        .to_ascii_lowercase()
+}
+
+pub fn decode_opaque_reasoning(encoded: &str) -> Result<Vec<u8>, &'static str> {
+    data_encoding::BASE32_NOPAD
+        .decode(encoded.to_ascii_uppercase().as_bytes())
+        .map_err(|_| "Invalid opaque reasoning encoding")
+}
 
 /// Project a conversation message for consumers that do not own replay.
 pub fn without_continuation(message: &Value) -> Value {
@@ -27,6 +57,20 @@ pub fn without_continuation(message: &Value) -> Value {
         ),
         _ => message.clone(),
     }
+}
+
+/// Detect unsealed private reasoning before returning canonical history to a client.
+pub fn has_unsealed_reasoning(message: &Value) -> bool {
+    message[CONTINUATION_KEY]["items"]
+        .as_array()
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "reasoning"
+                    && ["content", "encrypted_content", ENCODED_REASONING]
+                        .iter()
+                        .any(|key| item.get(*key).is_some_and(|value| !value.is_null()))
+            })
+        })
 }
 
 /// Whether a saved Responses item belongs to a tool round.
@@ -130,6 +174,16 @@ fn reasoning_size(item: &Value) -> Result<(usize, usize), &'static str> {
     if item["type"] != "reasoning" {
         return Ok((0, 0));
     }
+    if let Some(sealed) = item.get(SEALED_REASONING) {
+        let size = sealed["ciphertext"]
+            .as_str()
+            .ok_or("Invalid sealed Responses reasoning")?
+            .len();
+        if size > MAX_REASONING_BYTES {
+            return Err("Responses reasoning limit exceeded");
+        }
+        return Ok((1, size));
+    }
     let Some(content) = item.get("content").filter(|content| !content.is_null()) else {
         return Ok((0, 0));
     };
@@ -177,6 +231,11 @@ fn validate_reasoning_budget<'a>(
 }
 
 fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, String> {
+    if !decode_stored_reasoning
+        && (item.get(SEALED_REASONING).is_some() || item.get(ENCODED_REASONING).is_some())
+    {
+        return Err("Provider output contains reserved continuation metadata".into());
+    }
     if item
         .get("status")
         .is_some_and(|status| !status.is_null() && status != "completed")
@@ -215,9 +274,38 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
     } else {
         None
     };
+    if item.get(SEALED_REASONING).is_some()
+        && (item["type"] != "reasoning"
+            || item.get("content").is_some_and(|value| !value.is_null())
+            || item
+                .get("encrypted_content")
+                .is_some_and(|value| !value.is_null())
+            || item
+                .get(ENCODED_REASONING)
+                .is_some_and(|value| !value.is_null())
+            || item[SEALED_REASONING].as_object().is_none_or(|value| {
+                value
+                    .get("origin")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                    || value
+                        .get("ciphertext")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+            }))
+    {
+        return Err("Invalid sealed Responses reasoning".into());
+    }
     let keys: &[&str] = match item["type"].as_str() {
         Some("message") => &["id", "type", "role", "status", "phase", "content"],
-        Some("reasoning") => &["id", "type", "status", "summary", "encrypted_content"],
+        Some("reasoning") => &[
+            "id",
+            "type",
+            "status",
+            "summary",
+            "encrypted_content",
+            SEALED_REASONING,
+        ],
         Some("function_call") => &["id", "type", "status", "name", "arguments", "call_id"],
         _ => return Err("Unsupported provider continuation item".into()),
     };
@@ -237,9 +325,7 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
         && object.get("encrypted_content").is_none()
         && let Some(encoded) = item.get(ENCODED_REASONING).and_then(Value::as_str)
     {
-        let bytes = STANDARD
-            .decode(encoded)
-            .map_err(|_| "Invalid encrypted reasoning encoding")?;
+        let bytes = decode_opaque_reasoning(encoded)?;
         let value = String::from_utf8(bytes).map_err(|_| "Invalid encrypted reasoning encoding")?;
         object.insert("encrypted_content".into(), json!(value));
     }
@@ -282,6 +368,7 @@ fn has_replayable_reasoning(item: &Value) -> bool {
         || item[ENCODED_REASONING]
             .as_str()
             .is_some_and(|content| !content.is_empty())
+        || item[SEALED_REASONING].is_object()
         || item["content"].as_array().is_some_and(|parts| {
             !parts.is_empty()
                 && parts
@@ -428,6 +515,9 @@ fn replay_continuation(
     let items = saved["items"].as_array().ok_or(CONTINUATION_INCOMPLETE)?;
     let mut replayed = Vec::with_capacity(items.len());
     for item in items {
+        if item.get(SEALED_REASONING).is_some() {
+            return Err(CONTINUATION_INCOMPLETE.into());
+        }
         let mut replay = replay_item(item, true)?;
         if replay["type"] == "function_call" {
             let id = replay["call_id"].as_str().ok_or(CONTINUATION_INCOMPLETE)?;
@@ -636,7 +726,7 @@ impl ResponseOutput {
                     .and_then(|object| object.remove("encrypted_content"))
                     && let Some(value) = value.as_str()
                 {
-                    item[ENCODED_REASONING] = json!(STANDARD.encode(value));
+                    item[ENCODED_REASONING] = json!(encode_opaque_reasoning(value.as_bytes()));
                 }
             } else if item["type"] == "function_call" {
                 // Canonical tool arguments own normalization/redaction. Replay
@@ -1120,6 +1210,16 @@ mod tests {
         json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":items,
             "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}})
     }
+    #[test]
+    fn provider_cannot_supply_server_sealed_reasoning() {
+        let forged = json!({"type":"reasoning", "id":"r", "summary":[], SEALED_REASONING:{
+            "origin":"session", "ciphertext":"provider-controlled-plaintext"
+        }});
+        let call = json!({"type":"function_call", "id":"f", "call_id":"c", "name":"write_file", "arguments":"{}"});
+        assert!(decode_sse(&sse(&[completion(json!([forged.clone(), call]))])).is_err());
+        let done = json!({"type":"response.output_item.done", "output_index":0, "item":forged});
+        assert!(decode_sse(&sse(&[done, completion(json!([]))])).is_err());
+    }
     fn sse(events: &[Value]) -> String {
         events
             .iter()
@@ -1226,13 +1326,10 @@ mod tests {
             ));
         }
         let items = json!([
-            {"type":"reasoning", "_astra_encrypted_content_b64":"b3BhcXVl", "summary":[]},
+            {"type":"reasoning", "_astra_encrypted_content_b32":"n5ygc4lvmu", "summary":[]},
             call
         ]);
-        assert!(matches!(
-            decode_sse(&sse(&[completion(items)])),
-            Err(ResponsesStreamError::Codec(REASONING_CONTINUATION_MISSING))
-        ));
+        assert!(decode_sse(&sse(&[completion(items)])).is_err());
         let mut namespaced = call.clone();
         namespaced["namespace"] = json!("other");
         assert!(decode_sse(&sse(&[completion(json!([namespaced]))])).is_err());
@@ -1246,7 +1343,6 @@ mod tests {
             json!({"type":"reasoning", "summary":[]}),
             json!({"type":"reasoning", "encrypted_content":null, "summary":[]}),
             json!({"type":"reasoning", "encrypted_content":"", "summary":[]}),
-            json!({"type":"reasoning", "_astra_encrypted_content_b64":"b3BhcXVl", "summary":[]}),
         ] {
             let output = decode_sse(&sse(&[completion(json!([
                 reasoning,

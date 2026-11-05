@@ -315,12 +315,10 @@ administrator provision the required root-owned sticky directory.
   gate.
 - macOS watcher admission atomically reserves the kqueue descriptor and every
   duplicated witness or opened binding descriptor before opening any watcher
-  files. The process-wide budget is the minimum of 1,024 descriptors, one
-  quarter of the current `RLIMIT_NOFILE` soft limit, and the soft limit minus
-  64 descriptors of headroom. Watched paths consume that same budget; there is
-  no unbounded path subscription pool. The 1,024 ceiling normally binds on
-  hosts with a soft limit of at least 4,096; the other terms protect low-limit
-  processes. Transient capacity shortage releases admission locks and waits
+  files. The process-wide budget is the smaller of one quarter of the current
+  `RLIMIT_NOFILE` soft limit and the soft limit minus 64 descriptors of
+  headroom. Watched paths consume that same budget. Transient capacity shortage
+  releases admission locks and waits
   within the caller's remaining monotonic deadline. Exhaustion returns typed
   `WorkspaceLeaseFailure::WatcherCapacity` facts with active/requested/limit
   counts, carried into tool result fields as `reason: watcher_capacity` and
@@ -482,6 +480,23 @@ alias. Ordinary worktree Git commands remain shell operations. Generic Server
 executors cannot silently create a local session owner. Typed commit/stash tool
 journals and their automatic compensation are removed along with their producers;
 shell side effects retain the existing shell observation and recovery contract.
+Ordinary shell commands return their execution outcome without scanning the
+workspace before and after execution. A changed snapshot cannot identify the
+writer when another session or editor is active; only explicitly requested
+verification uses a bounded workspace comparison.
+
+The session-selected worktree applies to file, search and shell tools across
+turns and local resume. If the saved checkout no longer belongs to the original
+repository, local tools wait for the user to restore it or explicitly leave it;
+they do not silently run in a different directory. `start_point` can select an existing commit or ref; the new branch is
+created at its resolved commit. Switching is rejected while workspace work is
+still active, and removal without `discard_changes` also preserves ignored files.
+Background work uses the existing invocation owner. An executor that cannot
+prove descendant settlement rejects managed background work before starting it;
+this currently includes macOS. If a started process cannot be settled, the
+workspace remains fenced. Background stdout and stderr are each capped at
+4 MiB and marked when truncated. A checkout is retained when its owner is
+known to be unsettled.
 Every worktree lifecycle action requires explicit user approval before local or
 Edge execution. In particular, `exit_action=remove` is destructive, and
 `discard_changes=true` records requested behavior but does not grant consent.
@@ -514,6 +529,26 @@ scope ownership quarantines receipt attribution without disabling a settled
 call's successor. This shared process owner does not itself grant the full Bash
 filesystem/network sandbox to legacy typed helpers: existing provider admission,
 managed-filesystem denial, mutation leases and isolation remain their owners.
+
+On macOS, a Git checkout hook can leave a process behind even before Astra runs
+a command in the new worktree. Exiting therefore preserves the checkout and
+restores the original workspace. After checking for processes, the user may
+remove it with Git. A genuinely unsettled owner keeps the affected workspace
+fenced; after checking that its work stopped, the user can confirm and retry in
+the TUI or use `astra workspace confirm-stopped` from that workspace. A human
+confirmation is an explicit recovery decision, not proof that unrelated
+external processes stopped.
+
+Before a local tool chain starts, the shared permission engine evaluates each
+step using its resolved input. Steps requiring individual approval or depending
+on a previous result must be called separately, so a chain cannot bypass a
+tool-specific denial or approve an action whose arguments are not yet known.
+Failed or cancelled chains and plan subtasks retain effects already produced,
+stop remaining dependent work, and report the failure. Automatic filesystem
+rollback cannot cover arbitrary tools and might overwrite later edits, so it
+is not a chain or batch guarantee. An explicit file undo checks the recorded
+post-state and reports conflicts or partial results; it is not atomic against
+concurrent writes from external programs.
 
 On Linux, the invocation subreaper settles ownership only after kernel
 `waitpid(-1, WNOHANG)` reports `ECHILD`. Enumerating its own proc children is an

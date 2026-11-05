@@ -414,6 +414,91 @@ pub fn evaluate_permission_with_provider_policy(
     provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
     source_discovery_tool: Option<&str>,
 ) -> DecisionEnvelope {
+    let outer =
+        evaluate_permission_once(tool_name, args, ctx, provider_policy, source_discovery_tool);
+    if provider_policy.is_some()
+        || tool_name != "agent"
+        || args.get("action").and_then(Value::as_str) != Some("run_chain")
+        || matches!(&outer.decision, HardDecision::Deny { .. })
+    {
+        return outer;
+    }
+    let Some(steps) = args.get("steps").and_then(Value::as_array) else {
+        return outer; // Argument validation owns malformed calls.
+    };
+    let reject = |reason: String| {
+        let mut result = outer.clone();
+        result.decision = HardDecision::Deny {
+            reason: reason.clone(),
+        };
+        result.source = DecisionSource::SafetyMiddleware {
+            reason: reason.clone(),
+        };
+        if let Some(step) = result
+            .trace
+            .iter_mut()
+            .find(|step| step.step == EvaluationStep::SafetyMiddleware)
+        {
+            step.outcome = TraceOutcome::Matched(result.decision.clone());
+            step.note = reason;
+        }
+        result.will_save = None;
+        result
+    };
+    if steps.len() > crate::tool_registry_chain::MAX_RUN_CHAIN_STEPS {
+        return reject("This chain has too many steps; split it into smaller calls.".into());
+    }
+    fn depends_on_previous_step(value: &Value) -> bool {
+        match value {
+            Value::String(value) => value.contains("$prev") || value.contains("$step."),
+            Value::Array(values) => values.iter().any(depends_on_previous_step),
+            Value::Object(values) => values.values().any(depends_on_previous_step),
+            _ => false,
+        }
+    }
+    let chain_context = crate::tool_registry_chain::ChainContext::new(
+        args.get("input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    );
+    for step in steps {
+        let Some(name) = step.get("tool").and_then(Value::as_str) else {
+            return reject("This chain contains an invalid step.".into());
+        };
+        let step_args = step.get("args").unwrap_or(&Value::Null);
+        if depends_on_previous_step(step_args) {
+            return reject("This chain depends on an earlier result; run its steps separately so each can be authorized.".into());
+        }
+        let resolved = crate::tool_registry_chain::resolve_args(step_args, &chain_context);
+        if name == "run_chain"
+            || (name == "agent"
+                && resolved.get("action").and_then(Value::as_str) == Some("run_chain"))
+        {
+            return reject("Nested chains are unavailable; run the steps separately.".into());
+        }
+        let child = evaluate_permission_once(name, &resolved, ctx, None, None);
+        match child.decision {
+            HardDecision::Allow => {}
+            HardDecision::Deny { reason } => {
+                return reject(format!("Chain step '{name}' was denied: {reason}"));
+            }
+            HardDecision::NeedExternal { .. } => {
+                return reject(format!(
+                    "Chain step '{name}' needs approval; run it separately so approval can be requested."
+                ));
+            }
+        }
+    }
+    outer
+}
+
+fn evaluate_permission_once(
+    tool_name: &str,
+    args: &Value,
+    ctx: &PermissionSyncContext,
+    provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
+) -> DecisionEnvelope {
     let mut trace = Vec::with_capacity(EVALUATION_ORDER.len());
     let mut risk_tags = risk_tags_for_request(tool_name, args);
     if let Some(policy) = provider_policy {
@@ -2292,6 +2377,66 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn chain_requests_individual_approval_for_worktree_in_prompt_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let args = serde_json::json!({"action":"run_chain", "name":"example", "steps":[
+            {"tool":"worktree", "args":{"action":"exit", "exit_action":"remove", "discard_changes":true}}
+        ]});
+        let decision = evaluate_permission("agent", &args, &ctx);
+        assert!(
+            matches!(decision.decision, HardDecision::Deny { ref reason } if reason.contains("run it separately")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn chain_respects_child_denies_and_allowlist() {
+        use crate::permission::types::{PermissionMode, PermissionRule, PermissionSyncContext};
+        let args = serde_json::json!({"action":"run_chain", "steps":[
+            {"tool":"worktree", "args":{"action":"exit", "exit_action":"remove"}}
+        ]});
+        let mut denied = PermissionSyncContext::root(PermissionMode::Auto);
+        denied.inherited.add_deny(PermissionRule::tool("worktree"));
+        assert!(
+            matches!(evaluate_permission("agent", &args, &denied).decision,
+            HardDecision::Deny { ref reason } if reason.contains("worktree"))
+        );
+        let mut allowlisted = PermissionSyncContext::root(PermissionMode::Auto);
+        allowlisted.inherited.allowed_tools = Some(["agent".to_string()].into_iter().collect());
+        assert!(
+            matches!(evaluate_permission("agent", &args, &allowlisted).decision,
+            HardDecision::Deny { ref reason } if reason.contains("worktree"))
+        );
+        let unrestricted = PermissionSyncContext::root(PermissionMode::Auto);
+        assert!(matches!(
+            evaluate_permission("agent", &args, &unrestricted).decision,
+            HardDecision::Allow
+        ));
+    }
+
+    #[test]
+    fn chain_checks_input_and_rejects_unresolved_step_arguments() {
+        use crate::permission::types::{PermissionMode, PermissionSyncContext};
+        let ctx = PermissionSyncContext::root(PermissionMode::Auto);
+        let dynamic = serde_json::json!({"action":"run_chain", "steps":[
+            {"tool":"bash", "args":{"command":"$prev"}}
+        ]});
+        assert!(
+            matches!(evaluate_permission("agent", &dynamic, &ctx).decision,
+            HardDecision::Deny { ref reason } if reason.contains("run its steps separately"))
+        );
+        let input = serde_json::json!({"action":"run_chain", "input":{"cmd":"rm -rf /"}, "steps":[
+            {"tool":"bash", "args":{"command":"$input.cmd"}}
+        ]});
+        assert!(matches!(
+            evaluate_permission("agent", &input, &ctx).decision,
+            HardDecision::Deny { .. }
+        ));
     }
 
     #[test]

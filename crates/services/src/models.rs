@@ -252,6 +252,9 @@ pub struct QuirksData {
     /// Explicit transport for this offering; credentials remain independent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    /// Declared Responses reasoning history requirement; absent is conservative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     /// Administrator-declared reasoning controls for this deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_reasoning_efforts: Option<Vec<String>>,
@@ -362,6 +365,17 @@ fn user_model_inference_protocol(
         .transpose()
 }
 
+fn user_model_reasoning_history(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<Option<astra_core::model_wire::responses::ReasoningHistory>, String> {
+    row.try_get::<Option<String>, _>("responses_reasoning_history")
+        .map_err(|error| error.to_string())?
+        .map(|value| {
+            serde_json::from_value(Value::String(value)).map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
 fn declared_reasoning_capability(quirks: &QuirksData) -> Option<ThinkingCapability> {
     quirks.supported_reasoning_efforts.as_ref().map(|efforts| {
         if efforts.iter().any(|effort| effort == "none") {
@@ -382,6 +396,11 @@ fn unchanged_probe_endpoint(provider: &str, stored: Option<&str>, supplied: &str
 fn validate_inference_config(provider: &str, quirks: &QuirksData) -> Result<(), String> {
     use astra_core::model_wire::{LlmProviderProtocol, llm_provider_protocol};
     let default = llm_provider_protocol(provider);
+    if quirks.responses_reasoning_history.is_some()
+        && quirks.inference_protocol != Some(LlmProviderProtocol::OpenAiResponses)
+    {
+        return Err("Responses reasoning history requires the Responses protocol".into());
+    }
     if quirks.supported_reasoning_efforts.is_some()
         && quirks.inference_protocol != Some(LlmProviderProtocol::OpenAiResponses)
     {
@@ -894,6 +913,7 @@ impl std::fmt::Debug for ResponseScopeKey {
 #[derive(Clone, PartialEq)]
 pub struct ResolvedActiveLlmModel {
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     /// Secret, domain-separated key used to bind Responses continuations.
     /// Like `api_key`, this is execution material and must not be logged or serialized.
     pub response_scope_key: Option<ResponseScopeKey>,
@@ -1204,6 +1224,7 @@ impl RuntimeModelReasoningControl {
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub response_scope: Option<String>,
     pub subscription: Option<crate::chatgpt::ExecutionCredential>,
     /// Completion time of the trusted admission that produced this material.
@@ -1340,6 +1361,7 @@ impl AdmittedModelExecution {
         let scope_key = offering.model.response_scope_key.clone();
         let mut execution = Self {
             inference_protocol: offering.model.inference_protocol,
+            responses_reasoning_history: offering.model.responses_reasoning_history,
             response_scope: None,
             subscription: None,
             admitted_at: Instant::now(),
@@ -1386,6 +1408,7 @@ impl AdmittedModelExecution {
     ) -> Self {
         Self {
             inference_protocol: None,
+            responses_reasoning_history: None,
             response_scope: None,
             subscription: None,
             admitted_at: Instant::now(),
@@ -2035,6 +2058,7 @@ fn build_resolved_active_llm_from_row(
 
     Ok(ResolvedActiveLlmModel {
         inference_protocol: quirks.inference_protocol,
+        responses_reasoning_history: quirks.responses_reasoning_history,
         response_scope_key,
         supported_reasoning_efforts,
         price_snapshot: row
@@ -2497,7 +2521,7 @@ async fn revalidate_admitted_model_executions_with_access(
         .map_err(ModelOfferingResolutionError::Backend)?,
     };
     let mut query = QueryBuilder::<sqlx::MySql>::new(
-        "SELECT model_id, model_alias, model_name, provider, inference_protocol, api_key_encrypted, base_url, connection_id,
+        "SELECT model_id, model_alias, model_name, provider, inference_protocol, responses_reasoning_history, api_key_encrypted, base_url, connection_id,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 NULL AS configuration_updated_at, NULL AS quirks_json, NULL AS pricing_json,
                 NULL AS tags_json, CAST(NULL AS INT) AS max_completion_tokens, 1 AS personal
@@ -2511,7 +2535,7 @@ async fn revalidate_admitted_model_executions_with_access(
         }
     }
     query.push(") UNION ALL
-         SELECT model_id, model_name AS model_alias, model_name, provider, CAST(NULL AS CHAR(32)) AS inference_protocol, api_key_encrypted, base_url, CAST(NULL AS CHAR(64)) AS connection_id,
+         SELECT model_id, model_name AS model_alias, model_name, provider, CAST(NULL AS CHAR(32)) AS inference_protocol, CAST(NULL AS CHAR(16)) AS responses_reasoning_history, api_key_encrypted, base_url, CAST(NULL AS CHAR(64)) AS connection_id,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 CAST(updated_at AS CHAR) AS configuration_updated_at,
                 CAST(quirks AS CHAR) AS quirks_json, CAST(pricing AS CHAR) AS pricing_json,
@@ -2736,10 +2760,13 @@ fn admitted_user_model_from_row(
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
     let inference_protocol =
         user_model_inference_protocol(row).map_err(ModelOfferingResolutionError::Backend)?;
+    let responses_reasoning_history =
+        user_model_reasoning_history(row).map_err(ModelOfferingResolutionError::Backend)?;
     validate_inference_config(
         &provider,
         &QuirksData {
             inference_protocol,
+            responses_reasoning_history,
             ..Default::default()
         },
     )
@@ -2763,6 +2790,7 @@ fn admitted_user_model_from_row(
     let cache_capability =
         personal_model_cache_capability(&provider, &base_url, inference_protocol);
     let mut execution = AdmittedModelExecution {
+        responses_reasoning_history,
         inference_protocol,
         response_scope: None,
         subscription: None,
@@ -3332,6 +3360,7 @@ pub struct UserModelRecord {
     pub name: String,
     pub provider: String,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub model: String,
     pub base_url: String,
     pub context_window: i32,
@@ -3348,6 +3377,7 @@ pub struct UserModelCreateRequestData {
     pub name: String,
     pub provider: String,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub model: String,
     pub base_url: Option<String>,
     pub api_key: String,
@@ -3372,6 +3402,7 @@ impl std::fmt::Debug for UserModelCreateRequestData {
 pub struct UserModelUpdateRequestData {
     pub api_key: Option<String>,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub context_window: Option<i32>,
     pub is_default: Option<bool>,
     pub is_active: Option<bool>,
@@ -3843,6 +3874,7 @@ impl DatabaseModelService {
         if request.provider != crate::chatgpt::PROVIDER
             || !request.api_key.is_empty()
             || request.base_url.is_some()
+            || request.responses_reasoning_history.is_some()
             || request.inference_protocol.is_some_and(|protocol| {
                 protocol != astra_core::model_wire::LlmProviderProtocol::OpenAiResponses
             })
@@ -4102,6 +4134,8 @@ impl DatabaseModelService {
         let raw: Option<String> = row.try_get("thinking_probe_json").map_err(internal_error)?;
         let connection: Option<String> = row.try_get("connection_id").map_err(internal_error)?;
         let inference_protocol = user_model_inference_protocol(row).map_err(internal_error)?;
+        let responses_reasoning_history =
+            user_model_reasoning_history(row).map_err(internal_error)?;
         let thinking_probe = raw
             .as_deref()
             .and_then(|value| serde_json::from_str::<ThinkingProbeSnapshot>(value).ok())
@@ -4123,6 +4157,7 @@ impl DatabaseModelService {
             name: row.try_get("model_alias").map_err(internal_error)?,
             provider,
             inference_protocol,
+            responses_reasoning_history,
             model,
             base_url: base,
             context_window,
@@ -4349,7 +4384,7 @@ const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name > ?) \
      OR (provider = ? AND model_name = ? AND model_id > ?))";
 const MODEL_LIST_ORDER_SQL: &str = " ORDER BY provider ASC, model_name ASC, model_id ASC LIMIT ?";
-const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, inference_protocol, base_url, \
+const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, inference_protocol, responses_reasoning_history, base_url, \
     api_key_encrypted, connection_id, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, \
     context_window, is_default, is_active, \
     CAST(created_at AS CHAR) AS created_at_text, CAST(updated_at AS CHAR) AS updated_at_text";
@@ -4628,6 +4663,7 @@ impl ModelService for DatabaseModelService {
             &provider,
             &QuirksData {
                 inference_protocol: request.inference_protocol,
+                responses_reasoning_history: request.responses_reasoning_history,
                 ..Default::default()
             },
         )
@@ -4697,10 +4733,10 @@ impl ModelService for DatabaseModelService {
         }
         query(astra_core::matrixone_statement_with_null_shape(
             "INSERT INTO user_llm_models \
-             (model_id, user_id, model_alias, model_name, provider, inference_protocol, api_key_encrypted, base_url, \
+             (model_id, user_id, model_alias, model_name, provider, inference_protocol, responses_reasoning_history, api_key_encrypted, base_url, \
               context_window, is_default, is_active, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
-             [request.inference_protocol.is_some()],
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
+             [request.inference_protocol.is_some(), request.responses_reasoning_history.is_some()],
         ))
         .bind(&model_id)
         .bind(&user_id)
@@ -4708,6 +4744,7 @@ impl ModelService for DatabaseModelService {
         .bind(&model)
         .bind(&provider)
         .bind(request.inference_protocol.map(|protocol| protocol.as_str()))
+        .bind(request.responses_reasoning_history.map(|history| history.as_str()))
         .bind(&encrypted_key)
         .bind(&base_url)
         .bind(request.context_window)
@@ -4756,6 +4793,7 @@ impl ModelService for DatabaseModelService {
     ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
         if request.api_key.is_none()
             && request.inference_protocol.is_none()
+            && request.responses_reasoning_history.is_none()
             && request.context_window.is_none()
             && request.is_default.is_none()
             && request.is_active.is_none()
@@ -4784,11 +4822,20 @@ impl ModelService for DatabaseModelService {
         let model: String = existing.try_get("model_name").map_err(internal_error)?;
         let base_url: String = existing.try_get("base_url").map_err(internal_error)?;
         let previous_protocol = user_model_inference_protocol(&existing).map_err(internal_error)?;
+        let previous_history = user_model_reasoning_history(&existing).map_err(internal_error)?;
         let inference_protocol = request.inference_protocol.or(previous_protocol);
+        let responses_reasoning_history = if inference_protocol
+            == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+        {
+            request.responses_reasoning_history.or(previous_history)
+        } else {
+            request.responses_reasoning_history
+        };
         validate_inference_config(
             &provider,
             &QuirksData {
                 inference_protocol,
+                responses_reasoning_history,
                 ..Default::default()
             },
         )
@@ -4811,6 +4858,12 @@ impl ModelService for DatabaseModelService {
         }
         let mut subscription_binding = None;
         if provider == crate::chatgpt::PROVIDER {
+            if request.responses_reasoning_history.is_some() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Subscription model reasoning history is provider-managed",
+                ));
+            }
             if request.api_key.is_some() {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
@@ -4888,17 +4941,39 @@ impl ModelService for DatabaseModelService {
             .await
             .map_err(internal_error)?;
         }
-        if let Some(encrypted_key) = encrypted_key {
-            let updated = query(astra_core::matrixone_statement_with_null_shape("UPDATE user_llm_models SET api_key_encrypted = ?, inference_protocol = ?, thinking_probe_json = NULL, updated_at = NOW(6) WHERE user_id = ? AND model_id = ? AND api_key_encrypted <=> ? AND inference_protocol <=> ?", [inference_protocol.is_some(), previous_key.is_some(), previous_protocol.is_some()]))
-                .bind(encrypted_key)
-                .bind(inference_protocol.map(|protocol| protocol.as_str()))
-                .bind(&user_id)
-                .bind(&model_id)
-                .bind(&previous_key)
-                .bind(previous_protocol.map(|protocol| protocol.as_str()))
-                .execute(&mut *tx)
-                .await
-                .map_err(internal_error)?;
+        if encrypted_key.is_some() || responses_reasoning_history != previous_history {
+            // MatrixOne cannot type a CASE expression combining NULL and a
+            // JSON column. Only touch the probe when the route changes.
+            let probe_update = if encrypted_key.is_some() {
+                "thinking_probe_json = NULL, "
+            } else {
+                ""
+            };
+            let statement = format!(
+                "UPDATE user_llm_models SET api_key_encrypted = ?, inference_protocol = ?, responses_reasoning_history = ?, {probe_update}updated_at = NOW(6) WHERE user_id = ? AND model_id = ? AND api_key_encrypted <=> ? AND inference_protocol <=> ? AND responses_reasoning_history <=> ?"
+            );
+            let updated = query(astra_core::matrixone_statement_with_null_shape(
+                sqlx::AssertSqlSafe(statement),
+                [
+                    encrypted_key.as_ref().or(previous_key.as_ref()).is_some(),
+                    inference_protocol.is_some(),
+                    responses_reasoning_history.is_some(),
+                    previous_key.is_some(),
+                    previous_protocol.is_some(),
+                    previous_history.is_some(),
+                ],
+            ))
+            .bind(encrypted_key.as_ref().or(previous_key.as_ref()))
+            .bind(inference_protocol.map(|protocol| protocol.as_str()))
+            .bind(responses_reasoning_history.map(|history| history.as_str()))
+            .bind(&user_id)
+            .bind(&model_id)
+            .bind(&previous_key)
+            .bind(previous_protocol.map(|protocol| protocol.as_str()))
+            .bind(previous_history.map(|history| history.as_str()))
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
             if updated.rows_affected() == 0 {
                 return Err(error_response(
                     StatusCode::CONFLICT,
@@ -6796,6 +6871,7 @@ pub struct UserModelCreateRequest {
     pub name: String,
     pub provider: String,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub model: String,
     pub base_url: Option<String>,
     #[serde(default)]
@@ -6822,6 +6898,7 @@ impl std::fmt::Debug for UserModelCreateRequest {
 pub struct UserModelUpdateRequest {
     pub api_key: Option<String>,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub context_window: Option<i32>,
     pub is_default: Option<bool>,
     pub is_active: Option<bool>,
@@ -8099,6 +8176,7 @@ mod tests {
         .expect("unchanged catalog identity is admitted");
 
         let changed_name = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             model_name: "different-model".to_string(),
@@ -8114,6 +8192,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::CONFLICT);
 
         let changed_source = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             source_identity: Some(ResolvedModelSourceIdentity {
@@ -8450,6 +8529,7 @@ mod tests {
 
     fn sample_resolved_active_model(name: &str) -> ResolvedActiveLlmModel {
         ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,
@@ -8552,6 +8632,7 @@ mod tests {
         .expect("admitted execution");
 
         let refreshed_material = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             api_key: "rotated-secret".to_string(),
@@ -8562,6 +8643,7 @@ mod tests {
         assert!(selected.has_same_execution_identity(&refreshed_material));
 
         let changed_upstream = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             wire_model_name: Some("upstream-model-b".to_string()),
@@ -8570,6 +8652,7 @@ mod tests {
         assert!(!selected.has_same_execution_identity(&changed_upstream));
 
         let changed_provider = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             provider: "anthropic".to_string(),
@@ -8578,6 +8661,7 @@ mod tests {
         assert!(!selected.has_same_execution_identity(&changed_provider));
 
         let changed_source = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             source_identity: Some(ResolvedModelSourceIdentity {
@@ -9295,6 +9379,7 @@ mod tests {
     #[test]
     fn resolved_upstream_name_prefers_wire_model_name_when_set() {
         let r = ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,
@@ -9322,6 +9407,7 @@ mod tests {
     #[test]
     fn resolved_upstream_name_falls_back_to_local_name_when_unset() {
         let r = ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,
@@ -9486,6 +9572,7 @@ mod tests {
     fn quirks_data_serialization_roundtrip() {
         let q = QuirksData {
             inference_protocol: None,
+            responses_reasoning_history: None,
             supported_reasoning_efforts: None,
             fixed_temperature: Some(0.7),
             thinking_protocol: None,
@@ -11063,6 +11150,7 @@ mod tests {
         let create = UserModelCreateRequestData {
             connection_id: None,
             inference_protocol: None,
+            responses_reasoning_history: None,
             name: "deepseek".into(),
             provider: "deepseek".into(),
             model: "deepseek-chat".into(),

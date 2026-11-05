@@ -519,6 +519,7 @@ impl ModelService for TestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                responses_reasoning_history: None,
                 inference_protocol: None,
                 response_scope_key: None,
                 supported_reasoning_efforts: None,
@@ -6114,16 +6115,39 @@ mod subscription_isolated_database;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn chatgpt_subscription_agent_uses_catalog_and_continues_persisted_session() {
-    responses_agent_uses_catalog_and_continues_persisted_session(false).await;
+    responses_agent_uses_catalog_and_continues_persisted_session(false, false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
 async fn api_key_responses_agent_continues_persisted_session() {
-    responses_agent_uses_catalog_and_continues_persisted_session(true).await;
+    responses_agent_uses_catalog_and_continues_persisted_session(true, false, false, false).await;
 }
 
-async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_public_journey_preserves_private_continuation() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_current_turn_prunes_completed_reasoning() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1 and an explicitly isolated MatrixOne database"]
+async fn personal_byok_responses_fork_replays_authorized_parent_continuation() {
+    responses_agent_uses_catalog_and_continues_persisted_session(false, true, false, true).await;
+}
+
+async fn responses_agent_uses_catalog_and_continues_persisted_session(
+    api_key: bool,
+    personal_byok: bool,
+    current_turn_only: bool,
+    forked: bool,
+) {
     use astra_services::chatgpt::ChatgptConfig;
     use astra_services::{DatabaseModelService, DatabaseSessionService};
     init_env();
@@ -6145,13 +6169,29 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: b
     let config = ChatgptConfig::for_test(&provider.base);
     let key = test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!");
     let make_app = || {
+        let context = Arc::new(astra_services::DatabaseSessionContextCoordinator::new(
+            pool.clone(),
+        ));
+        let forks = Arc::new(astra_services::DatabaseSessionForkCoordinator::new(
+            pool.clone(),
+            context.clone(),
+        ));
         let models = Arc::new(
             DatabaseModelService::new(settings.clone(), key.clone())
                 .with_pool(pool.clone())
-                .with_chatgpt_config(config.clone()),
+                .with_chatgpt_config(config.clone())
+                .with_deepseek_test_endpoint(
+                    provider.base.trim_start_matches("http://").parse().unwrap(),
+                )
+                .unwrap(),
         );
         let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
             .with_shared_pool(pool.clone())
+            .with_session_context_authority(
+                context,
+                Arc::new(astra_services::ExecutionGrantSigner::new([7_u8; 32]).unwrap()),
+            )
+            .with_session_fork_coordinator(forks)
             .with_auth_service(Arc::new(StubAuth))
             .with_session_service(Arc::new(
                 DatabaseSessionService::new(settings.clone()).with_pool(pool.clone()),
@@ -6200,7 +6240,66 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: b
     }
     let (base, lifecycle) = make_app();
     let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
-    let model = if api_key {
+    let model = if personal_byok {
+        provider
+            .state
+            .allow_test_api_key
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        provider
+            .state
+            .plaintext_reasoning
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let model = post(
+            &app,
+            "/me/models",
+            json!({
+                "name":format!("public-byok-{}",uuid::Uuid::new_v4()),
+                "provider":"deepseek", "model":"fixture-model", "api_key":"fixture-api-key",
+                "inference_protocol":"openai_responses", "context_window":128000, "is_default":false,
+                "responses_reasoning_history":"all_turns"
+            }),
+        )
+        .await;
+        assert_eq!(model["responses_reasoning_history"], "all_turns");
+        if current_turn_only {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/me/models/{}",
+                            model["model_id"].as_str().unwrap()
+                        ))
+                        .header("authorization", TOKEN)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"responses_reasoning_history":"current_turn"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(
+                status.is_success(),
+                "{status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let updated: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(updated["responses_reasoning_history"], "current_turn");
+        }
+        post(
+            &app,
+            &format!("/me/models/{}/check", model["model_id"].as_str().unwrap()),
+            json!({}),
+        )
+        .await;
+        model
+    } else if api_key {
         provider
             .state
             .allow_test_api_key
@@ -6327,7 +6426,7 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: b
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let lifecycle = Arc::new(lifecycle);
     let app = build_app(base.with_run_lifecycle_service(lifecycle.clone()));
-    let payload = |message: &str| {
+    let payload = |session_id: &str, message: &str| {
         let mut value = json!({"message":message,"session_id":session_id,"model_selection":{"offering_id":model["model_id"]},"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
         if api_key {
             value["context"] = json!({"thinking":{"mode":"adaptive","effort":"max"}});
@@ -6336,7 +6435,10 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: b
     };
     let first = chat_stream_collect(
         &app,
-        payload("subscription-public-first: List the models I can use."),
+        payload(
+            session_id,
+            "subscription-public-first: List the models I can use.",
+        ),
     )
     .await;
     assert!(
@@ -6398,6 +6500,54 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: b
         persisted > 0,
         "provider continuation was not written to canonical database history"
     );
+    let mut continuation_session = session_id.to_owned();
+    if personal_byok || api_key {
+        let private = if personal_byok {
+            "private-journey-sentinel"
+        } else {
+            "sk-fixtureciphertextciphertextciphertext"
+        };
+        let encoded =
+            astra_core::model_wire::responses::encode_opaque_reasoning(private.as_bytes());
+        let resumed = post(
+            &app,
+            &format!("/sessions/{session_id}/resume?continuation_only=true"),
+            json!({}),
+        )
+        .await;
+        assert!(!resumed.to_string().contains(private));
+        assert!(!resumed.to_string().contains(&encoded));
+        let bundle: astra_turn_types::ResumeBundleV1 =
+            serde_json::from_value(resumed["resume_bundle"].clone()).unwrap();
+        assert!(bundle.validates_root());
+        let segments = post(
+            &app,
+            &format!("/sessions/{session_id}/context/segments:batchGet"),
+            json!({"manifest_root":bundle.cursor.canonical_root_hash.clone()}),
+        )
+        .await;
+        assert!(!segments.to_string().contains(private));
+        assert!(!segments.to_string().contains(&encoded));
+        if forked {
+            let manifest = post(
+                &app,
+                &format!("/sessions/{session_id}/forks"),
+                json!({"idempotency_key":"byok-fork", "expected_parent_cursor":bundle.cursor, "reason":"continue in a fork"}),
+            )
+            .await;
+            let fork_id = manifest["fork_id"].as_str().unwrap();
+            post(
+                &app,
+                &format!("/sessions/{session_id}/forks/{fork_id}/activate-for-continuation"),
+                json!({}),
+            )
+            .await;
+            continuation_session = manifest["child_key"]["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+    }
     drop(app);
     drop(lifecycle);
     // A new local journal root also rules out recovering the first turn from
@@ -6412,7 +6562,10 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: b
     let before = provider.state.requests.lock().unwrap().len();
     let second = chat_stream_collect(
         &app,
-        payload("subscription-public-second: Continue using the former session."),
+        payload(
+            &continuation_session,
+            "subscription-public-second: Continue using the former session.",
+        ),
     )
     .await;
     assert!(
@@ -6428,13 +6581,20 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(api_key: b
     .unwrap();
     let requests = provider.state.requests.lock().unwrap();
     let continued = &requests[before..];
-    assert!(
-        continued.iter().any(|request| request["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["encrypted_content"] == "sk-fixtureciphertextciphertextciphertext")),
-        "provider reasoning was lost after rebuilding Server services"
+    let prior_reasoning_replayed = continued.iter().any(|request| {
+        request["input"].as_array().unwrap().iter().any(|item| {
+            if personal_byok {
+                item["content"]
+                    .to_string()
+                    .contains("private-journey-sentinel")
+            } else {
+                item["encrypted_content"] == "sk-fixtureciphertextciphertextciphertext"
+            }
+        })
+    });
+    assert_eq!(
+        prior_reasoning_replayed, !current_turn_only,
+        "completed-turn reasoning must follow the declared route policy"
     );
     assert!(
         continued.iter().any(|request| request["input"]

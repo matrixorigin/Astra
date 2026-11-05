@@ -640,6 +640,23 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     if !state.final_output_ready_notified {
         super::execution_phase::fence_direct_child_finalization(host, state).await;
     }
+    if state.interruption.is_none()
+        && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
+            &state.stall.tool_call_records,
+        )
+    {
+        use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+        let mut interruption = InterruptionRecord::new(
+            InterruptionKind::ExecutionIncomplete,
+            ResumeAction::ContinueImmediately,
+            interruption_state_summary(
+                state,
+                Some("A tool result could not be saved or delivered.".into()),
+            ),
+        );
+        interruption.user_message = "A tool result could not be saved or delivered. Check what completed before continuing; do not repeat an action just to recover its output.".into();
+        state.interruption = Some(interruption);
+    }
     // The answer itself belongs to the interactive critical path. Everything
     // below this boundary is durable/derived settlement and must never keep a
     // displayed answer looking live just because a database, workspace, or
@@ -695,7 +712,64 @@ fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
         {
             message[astra_core::model_wire::responses::CONTINUATION_KEY] = continuation.clone();
         }
+        bound_terminal_message(state, &mut message);
         state.push_prompt_history_message(message);
+    }
+}
+
+/// The ingest path may already have materialized a text-only answer. Check it
+/// at that boundary too, before it is copied into the canonical transcript.
+pub(crate) fn bound_ingested_terminal_message(state: &mut AgenticLoopState, start: usize) {
+    let Some(index) = (start..state.messages.len()).rev().find(|&index| {
+        state.messages[index]["role"] == "assistant"
+            && state.messages[index].get("tool_calls").is_none()
+    }) else {
+        return;
+    };
+    let mut message = std::mem::take(&mut state.messages[index]);
+    bound_terminal_message(state, &mut message);
+    state.messages[index] = message;
+}
+
+fn bound_terminal_message(state: &mut AgenticLoopState, message: &mut serde_json::Value) {
+    // A terminal answer is a separate segment, but it shares the same
+    // commit frame as earlier tool results. Do not lose already-executed
+    // actions because the model produced an uncommittable final message.
+    let message_bytes = astra_turn_types::json_serialized_len(message).unwrap_or(u64::MAX);
+    let pending_bytes =
+        astra_turn_types::json_serialized_len(state.pending_canonical_messages_for_commit())
+            .unwrap_or(u64::MAX);
+    let fits_segment = message_bytes.saturating_add(2048)
+        <= astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES;
+    let fits_batch = pending_bytes
+        .saturating_add(message_bytes)
+        .saturating_add(2048)
+        <= astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_BATCH_BYTES;
+    if !fits_segment || !fits_batch {
+        let detail = "The response was too large to save safely. Earlier actions may have completed; inspect their results before retrying.";
+        if state.interruption.is_none() {
+            let summary = interruption_state_summary(state, Some(detail.to_string()));
+            state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+                astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                summary,
+            ));
+        }
+        state.final_text = detail.to_string();
+        state.final_text_model_item_id = None;
+        state.final_text_streamed = false;
+        state.pending_provider_continuation = None;
+        state.hooks.completion_settlement.latest_provider_text = None;
+        state
+            .hooks
+            .completion_settlement
+            .latest_provider_text_model_item_id = None;
+        state.hooks.completion_settlement.deferred_candidate_text = None;
+        state
+            .hooks
+            .completion_settlement
+            .deferred_candidate_model_item_id = None;
+        *message = serde_json::json!({"role":"assistant", "content":detail});
     }
 }
 
@@ -945,6 +1019,109 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn oversized_terminal_response_preserves_prior_tool_results() {
+        for ingested in [false, true] {
+            let mut state = make_state();
+            let user = serde_json::json!({"role":"user", "content":"perform the action"});
+            state.messages = vec![
+                user.clone(),
+                serde_json::json!({"role":"assistant", "tool_calls":[{"id":"call-1", "type":"function", "function":{"name":"write_file", "arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool", "tool_call_id":"call-1", "content":"written"}),
+            ];
+            state.initialize_provider_canonical_wal_base(std::slice::from_ref(&user));
+            state.final_text = "x".repeat(5 * 1024 * 1024);
+            state.final_text_model_item_id = Some("item-1".into());
+            state.current_model_item_id = Some("item-1".into());
+            state.pending_provider_continuation = Some(
+                serde_json::json!({"items":[{"type":"message", "content":[{"type":"output_text", "text":state.final_text}]}]}),
+            );
+            if ingested {
+                let mut message = serde_json::json!({"role":"assistant", "content":state.final_text,
+                astra_core::model_wire::responses::CONTINUATION_KEY:state.pending_provider_continuation});
+                astra_turn_types::mark_model_message(&mut message, Some("item-1"));
+                let start = state.messages.len();
+                state.messages.push(message);
+                bound_ingested_terminal_message(&mut state, start);
+            } else {
+                materialize_terminal_text_message(&mut state);
+            }
+            assert!(state.interruption.is_some());
+            assert!(state.final_text.contains("too large to save"));
+            assert_eq!(state.messages[2]["content"], "written");
+            assert!(state.pending_provider_continuation.is_none());
+            let (_, segments) = crate::turn::canonical_commit::canonical_commit_delta(
+                &[user],
+                true,
+                &state.messages,
+                None,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(segments.iter().all(|segment| {
+                astra_turn_types::json_serialized_fits(
+                    segment,
+                    astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES,
+                )
+                .unwrap()
+            }));
+            assert!(
+                astra_turn_types::json_serialized_fits(
+                    &segments,
+                    astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_BATCH_BYTES
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_after_tool_round_remains_recoverable() {
+        let oversized =
+            "x".repeat(astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES as usize);
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("write_file", "written")],
+                20,
+                10,
+                Some(1),
+            ),
+            text_result(&oversized, 20, 10, Some(1)),
+        ])
+        .with_valid_tools(&["write_file"]);
+        let mut state = make_state();
+        let user = serde_json::json!({"role":"user", "content":"perform the action"});
+        state.messages.push(user.clone());
+        state.initialize_provider_canonical_wal_base(std::slice::from_ref(&user));
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(state.interruption.is_some());
+        assert!(state.final_text.contains("too large to save"));
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| { message["role"] == "tool" && message["content"] == "written" })
+        );
+        let (_, segments) = crate::turn::canonical_commit::canonical_commit_delta(
+            &[user],
+            true,
+            &state.messages,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(segments.iter().all(|segment| {
+            astra_turn_types::json_serialized_fits(
+                segment,
+                astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES,
+            )
+            .unwrap()
+        }));
+    }
 
     fn attach_pipeline_session(state: &mut AgenticLoopState) {
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
@@ -1348,6 +1525,37 @@ mod tests {
         assert!(host.rendered_final_text.is_empty());
         assert_eq!(state.messages, before);
         assert!(state.take_run_transcript_capture().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_result_delivery_prevents_a_false_completed_terminal() {
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        state.final_text = "Finished.".into();
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                args_full: Some(r#"{"path":"data.txt"}"#.into()),
+                ..Default::default()
+            });
+        finalize_and_render(&mut host, &mut state).await;
+        let interruption = state
+            .interruption
+            .expect("delivery failure must be visible");
+        assert_eq!(
+            interruption.kind,
+            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
+        );
+        assert!(
+            interruption
+                .user_message
+                .contains("result could not be saved or delivered")
+        );
+        assert_eq!(state.final_text, "Finished.");
     }
 
     #[tokio::test]
