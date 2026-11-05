@@ -6503,7 +6503,7 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(
     let mut continuation_session = session_id.to_owned();
     if personal_byok || api_key {
         let private = if personal_byok {
-            "private-journey-sentinel"
+            "private-journey-sentinel AKIAIOSFODNN7EXAMPLE"
         } else {
             "sk-fixtureciphertextciphertextciphertext"
         };
@@ -6586,7 +6586,7 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(
             if personal_byok {
                 item["content"]
                     .to_string()
-                    .contains("private-journey-sentinel")
+                    .contains("private-journey-sentinel AKIAIOSFODNN7EXAMPLE")
             } else {
                 item["encrypted_content"] == "sk-fixtureciphertextciphertextciphertext"
             }

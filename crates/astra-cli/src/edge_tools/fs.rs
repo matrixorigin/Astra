@@ -2621,7 +2621,6 @@ mod tests {
             serde_json::json!({"path": "missing.txt", "start_line": -1}),
             serde_json::json!({"path": "missing.txt", "start_line": 1.5}),
             serde_json::json!({"path": "missing.txt", "end_line": "2"}),
-            serde_json::json!({"path": "missing.txt", "start_line": 3, "end_line": 1}),
             serde_json::json!({"path": "missing.txt", "outline": 1}),
         ] {
             let result = executor.read_file_with_metadata(&args);
@@ -2685,16 +2684,6 @@ mod tests {
         }));
         assert!(result.contains("`outline`"), "{result}");
         assert!(result.contains("boolean"), "{result}");
-
-        let result = executor.read_file(&serde_json::json!({
-            "path": "test.txt",
-            "start_line": 3,
-            "end_line": 1
-        }));
-        assert!(
-            result.contains("must not exceed"),
-            "reversed range must be rejected, got: {result}"
-        );
     }
 
     #[test]
@@ -2717,11 +2706,9 @@ mod tests {
             "end_line": 300
         }));
 
-        // Structural validation runs before small-file auto-expansion: a
-        // reversed range is malformed even when the file has one line.
         assert!(
-            result.contains("must not exceed"),
-            "reversed range must be rejected before auto-expand, got: {result}"
+            result.contains("start_line 300 exceeds file length 1"),
+            "the ordered range remains past EOF, got: {result}"
         );
         assert!(
             !result.contains("Auto-expanded"),

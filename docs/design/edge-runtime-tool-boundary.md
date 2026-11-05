@@ -76,6 +76,12 @@ Edge/CLI local runtime may expose local capabilities only within declared author
 
 Path authority must be checked before execution. A model-provided path is not authority by itself.
 
+`read_file` uses inclusive, one-based line bounds. When both bounds are
+positive but reversed, both local and Server executors read the ordered range;
+missing bounds and invalid values keep their usual meaning. Tool status and
+deduplication use the same ordered range while the original arguments remain
+available for audit.
+
 ### Foreground Bash output
 
 The local CLI and Edge foreground Bash executors share the output-capture owner

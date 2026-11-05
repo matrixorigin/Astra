@@ -4016,12 +4016,13 @@ fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
         // Prefer JSON parsing — `read_file` args_full is always JSON.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
             let path = v.get("path").and_then(|p| p.as_str())?.to_string();
-            let s = v
-                .get("start_line")
-                .and_then(|n| n.as_u64())
-                .map(|n| n as u32);
-            let e = v.get("end_line").and_then(|n| n.as_u64()).map(|n| n as u32);
-            let range = s.zip(e);
+            let (s, e) = astra_text_utils::line_range::ordered_bounds(
+                v.get("start_line").and_then(|n| n.as_u64()),
+                v.get("end_line").and_then(|n| n.as_u64()),
+            );
+            let range = s
+                .zip(e)
+                .and_then(|(s, e)| Some((u32::try_from(s).ok()?, u32::try_from(e).ok()?)));
             return Some(ReadRange { file: path, range });
         }
         return None;
@@ -8047,6 +8048,26 @@ mod tests {
             count_active_redundant_overlapping_reads(&failed_reads),
             0,
             "failed reads never become online behavioral evidence"
+        );
+    }
+
+    #[test]
+    fn reversed_read_ranges_use_ordered_coverage() {
+        let narrow = r#"{"path":"src/lib.rs","start_line":300,"end_line":400}"#;
+        let wide_reversed = r#"{"path":"src/lib.rs","start_line":600,"end_line":200}"#;
+        let records = |first, second| {
+            vec![
+                record_with_args("read_file", 0, first),
+                record_with_args("read_file", 1, second),
+            ]
+        };
+        assert_eq!(
+            count_redundant_overlapping_reads(&records(narrow, wide_reversed)),
+            0
+        );
+        assert_eq!(
+            count_redundant_overlapping_reads(&records(wide_reversed, narrow)),
+            1
         );
     }
 

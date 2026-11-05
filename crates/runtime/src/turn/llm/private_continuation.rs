@@ -54,12 +54,9 @@ pub(crate) fn seal(
             return Err("missing reasoning owner");
         }
         let object = item.as_object_mut().ok_or("invalid item")?;
-        let mut content = object.remove("content");
-        if content.as_mut().is_some_and(|content| {
-            astra_text_utils::credential_redaction::redact_credentials_in_json(content) > 0
-        }) {
-            return Err("private reasoning contains credentials");
-        }
+        // Preserve the exact provider state inside the authenticated capsule.
+        // Redacting it before replay would silently change the continuation.
+        let content = object.remove("content");
         let encoded = object.remove(ENCODED_REASONING);
         let raw = object.remove("encrypted_content");
         if encoded.is_some() && raw.is_some() {
@@ -242,6 +239,33 @@ pub(crate) fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_shaped_reasoning_is_sealed_and_replayed_without_disclosure() {
+        let key = FernetTokenEncryptor::new("fixture-key").unwrap();
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let mut continuation = json!({"connection_id":"route", "model":"model", "items":[
+            {"type":"reasoning", "id":"r", "content":[{"type":"reasoning_text", "text":secret}]},
+            {"type":"function_call", "call_id":"call-1", "name":"read_file"}
+        ]});
+        seal(&mut continuation, &key, "owner", "session").unwrap();
+        assert!(!continuation.to_string().contains(secret));
+        let mut messages = vec![json!({"role":"assistant", CONTINUATION_KEY:continuation})];
+        let original = messages.clone();
+        let sanitized =
+            astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(messages.clone());
+        assert_eq!(sanitized, original);
+        open(
+            &mut messages,
+            &key,
+            "owner",
+            &HashSet::from(["session".into()]),
+            "route",
+            "model",
+        )
+        .unwrap();
+        assert!(messages[0].to_string().contains(secret));
+    }
+
     #[test]
     fn provider_opaque_reasoning_survives_credential_sanitization() {
         use astra_core::model_wire::responses::{ResponseOutput, request};

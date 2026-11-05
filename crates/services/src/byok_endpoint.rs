@@ -2,6 +2,7 @@
 //! Public HTTPS is the default; optional strict mode uses the administrator registry.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 pub const COMPATIBLE_PROVIDER: &str = "openai-compatible";
@@ -254,6 +255,48 @@ pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, String> {
     }
 }
 
+async fn resolve_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    static DNS_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let slots = DNS_SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+        .clone();
+    let host = host.to_owned();
+    bounded_dns_lookup(slots, Duration::from_secs(5), move || {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+    })
+    .await
+}
+
+async fn bounded_dns_lookup<T, F>(
+    slots: Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+    lookup: F,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    tokio::time::timeout(timeout, async move {
+        let permit = slots.acquire_owned().await.map_err(std::io::Error::other)?;
+        tokio::task::spawn_blocking(move || {
+            // A timed-out caller cannot cancel getaddrinfo. Hold the slot
+            // until the actual system lookup exits, including after timeout.
+            let _permit = permit;
+            lookup()
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS lookup timed out"))?
+}
+
 async fn resolve_addresses(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
     let host = url
         .host_str()
@@ -262,19 +305,125 @@ async fn resolve_addresses(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String
     let port = url
         .port_or_known_default()
         .expect("validated endpoint port");
-    let addresses = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port)))
-        .await
-        .map_err(|_| "Astra Server DNS lookup timed out; check its system DNS")?
-        .map_err(|error| {
+    let addresses = resolve_host(host, port).await.map_err(|error| {
             tracing::warn!(kind = ?error.kind(), "model endpoint DNS lookup failed");
-            "Astra Server could not resolve the model endpoint; check its system DNS and the provider hostname"
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                "Astra Server DNS lookup timed out; check its system DNS"
+            } else {
+                "Astra Server could not resolve the model endpoint; check its system DNS and the provider hostname"
+            }
         })?;
-    Ok(addresses.collect())
+    Ok(addresses)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_dns_work_remains_bounded_until_it_really_exits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slots = Arc::new(tokio::sync::Semaphore::new(8));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..1000 {
+            let (slots, gate, started) = (slots.clone(), gate.clone(), started.clone());
+            tasks.spawn(async move {
+                bounded_dns_lookup(slots, Duration::from_millis(200), move || {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let (lock, wake) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .await
+            });
+        }
+        let mut all_timed_out = true;
+        while let Some(result) = tasks.join_next().await {
+            all_timed_out &=
+                matches!(result, Ok(Err(error)) if error.kind() == std::io::ErrorKind::TimedOut);
+        }
+        let count = started.load(Ordering::SeqCst);
+        let remaining = slots.available_permits();
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slots.available_permits() != 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(all_timed_out);
+        assert!((1..=8).contains(&count), "started {count}");
+        assert!(remaining + count <= 8);
+        assert!(
+            started.load(Ordering::SeqCst) <= 8,
+            "timed-out semaphore waiters must not start later"
+        );
+        for _ in 0..1000 {
+            let slots = slots.clone();
+            tasks.spawn(async move {
+                bounded_dns_lookup(slots, Duration::from_secs(5), || {
+                    std::thread::sleep(Duration::from_millis(1));
+                    Ok(())
+                })
+                .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(
+                result.unwrap().is_ok(),
+                "healthy lookups should recover after saturation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_dns_caller_keeps_the_slot_until_lookup_exits() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let (slots, gate) = (slots.clone(), gate.clone());
+            async move {
+                bounded_dns_lookup(slots, Duration::from_secs(5), move || {
+                    let _ = started.send(());
+                    let (lock, wake) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .await
+            }
+        });
+        running.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let permits_after_cancel = slots.available_permits();
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(permits_after_cancel, 0);
+    }
 
     #[tokio::test]
     async fn system_dns_results_are_checked_before_use() {

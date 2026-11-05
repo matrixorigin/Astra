@@ -433,7 +433,7 @@ async fn responses(
         let index = state.responses_calls.load(Ordering::SeqCst);
         let reasoning = if state.plaintext_reasoning.load(Ordering::SeqCst) {
             json!({"type":"reasoning","id":format!("reasoning-{index}"),"summary":[],
-                "content":[{"type":"reasoning_text","text":"private-journey-sentinel"}]})
+                "content":[{"type":"reasoning_text","text":"private-journey-sentinel AKIAIOSFODNN7EXAMPLE"}]})
         } else {
             json!({"type":"reasoning","id":format!("reasoning-{index}"),"encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]})
         };

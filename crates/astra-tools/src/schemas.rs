@@ -2036,7 +2036,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents. Fields: path,start_line,end_line,outline; ranges are inclusive 1-based; omit end_line to read through EOF; outline=true returns signatures. Complete source-read opaque markers may be copied unchanged to the corresponding editor; never recover hidden text.",
+                "description": "Read file contents. Fields: path,start_line,end_line,outline; ranges are inclusive 1-based and reversed bounds are reordered; omit end_line to read through EOF; outline=true returns signatures. Complete source-read opaque markers may be copied unchanged to the corresponding editor; never recover hidden text.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,

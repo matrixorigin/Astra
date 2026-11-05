@@ -89,7 +89,8 @@ impl EgressProxy {
         let host = self.url.host_str().unwrap().trim_matches(['[', ']']);
         let port = self.url.port_or_known_default().unwrap_or(1080);
         // The proxy is operator-owned configuration, not a user-selected endpoint.
-        let tcp = TcpStream::connect((host, port)).await?;
+        let addresses = super::resolve_host(host, port).await?;
+        let tcp = TcpStream::connect(addresses.as_slice()).await?;
         tcp.set_nodelay(true)?;
         let mut stream: Stream = if self.url.scheme() == "https" {
             let name = rustls::pki_types::ServerName::try_from(host.to_owned())

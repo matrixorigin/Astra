@@ -161,7 +161,9 @@ a reasoning item without replayable content stops before executing its calls.
 Provider reasoning, including provider-supplied opaque state, is sealed by the
 Server before canonical storage. The capsule is authenticated against the owner,
 session lineage, admitted route, model, item and tool calls; its encoded bytes
-survive credential sanitization. The inference owner opens it only for an
+survive credential sanitization. It can contain credential-shaped provider
+reasoning in encrypted form so replay preserves the provider's exact state;
+plaintext remains excluded from public history and diagnostic captures. The inference owner opens it only for an
 authorized continuation. Raw reasoning is omitted from user-visible streams,
 observers and diagnostic artifacts; resume and segment APIs retain only the
 sealed capsule. Function arguments come from the canonical

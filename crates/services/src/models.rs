@@ -6167,6 +6167,7 @@ enum ModelProbeError {
     Network(String),
     Timeout,
     Response(&'static str),
+    Truncated,
     Http(StatusCode),
 }
 
@@ -6216,7 +6217,9 @@ impl ModelProbeError {
             Self::Configuration(_) => (StatusCode::BAD_REQUEST, "model_probe_configuration"),
             Self::Network(_) => (StatusCode::BAD_GATEWAY, "model_probe_network"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout"),
-            Self::Response(_) => (StatusCode::BAD_GATEWAY, "model_probe_response"),
+            Self::Response(_) | Self::Truncated => {
+                (StatusCode::BAD_GATEWAY, "model_probe_response")
+            }
             Self::Http(status) if *status == StatusCode::TOO_MANY_REQUESTS => {
                 (StatusCode::TOO_MANY_REQUESTS, "model_probe_rate_limited")
             }
@@ -6262,6 +6265,7 @@ impl std::fmt::Display for ModelProbeError {
             Self::Configuration(message) | Self::Network(message) => f.write_str(message),
             Self::Timeout => f.write_str("Model check timed out"),
             Self::Response(message) => f.write_str(message),
+            Self::Truncated => f.write_str("Model check did not produce a complete response"),
             Self::Http(status)
                 if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
             {
@@ -6360,6 +6364,7 @@ fn finish_response_probe(
         ModelProbeError::Response("Model check did not produce a complete response")
     })?;
     if output.text.trim().is_empty()
+        || !output.tool_calls.is_empty()
         || output.finish_reason.as_deref() == Some("length")
         || output.items.iter().any(|item| {
             item["type"] == "message"
@@ -6393,22 +6398,22 @@ async fn validate_connectivity_for_protocol(
     // Native providers share the LLM client's ambient proxy policy. User-owned
     // OpenAI-compatible endpoints instead use the pinned BYOK egress transport
     // below, matching their runtime path without delegating destination DNS.
-    let client_result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-        crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
-    } else {
-        astra_core::net::apply_env_proxy(
-            reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
-        )
-        .build()
-        .map(crate::byok_endpoint::EndpointClient::from)
-        .map_err(|_| "Unable to create model HTTP client".to_string())
-    };
-    let client = match client_result {
-        Ok(c) => c,
-        Err(e) => return Err(ModelProbeError::Network(e)),
+    let make_client = async || {
+        let result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+            crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
+        } else {
+            astra_core::net::apply_env_proxy(
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+            )
+            .build()
+            .map(crate::byok_endpoint::EndpointClient::from)
+            .map_err(|_| "Unable to create model HTTP client".to_string())
+        };
+        result.map_err(ModelProbeError::Network)
     };
 
     if inference_protocol == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses) {
+        let client = make_client().await?;
         let base = base_url
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("https://api.openai.com/v1");
@@ -6425,124 +6430,169 @@ async fn validate_connectivity_for_protocol(
         .map(|_| ());
     }
 
-    let result = if provider == "typesafe" {
-        if api_key.trim().is_empty() {
-            return Err(ModelProbeError::Configuration(
-                "TypeSafe API key is not configured".into(),
-            ));
-        }
-        let base = base_url
-            .unwrap_or("https://api.typesafe.ai")
-            .trim_end_matches('/')
-            .trim_end_matches("/v1");
-        let probe = format!("{base}/v1/systemone");
-        client.post(&probe).bearer_auth(api_key).json(&serde_json::json!({
-            "model": model_name, "state": "Astra connectivity probe",
-            "questions": {"connected": {"type": "noul", "instructions": "Does the state mention Astra?"}}
-        })).send().await
-    } else if provider == "anthropic" {
-        let probe = anthropic_messages_probe_url(base_url);
-        let mut req = client
-            .post(&probe)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json");
-        if let Some(headers) = probe_headers {
-            for (k, v) in headers {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+    let custom_messages = !matches!(provider, "anthropic" | "bedrock" | "typesafe")
+        && probe_endpoint.is_some_and(|path| path.trim_matches('/') == "messages");
+    // Retry only when the provider explicitly says the small response was truncated.
+    let probe = async |output_tokens| {
+        // A retry is a new outbound attempt: re-resolve and pin BYOK each time.
+        let client = make_client().await?;
+        let result = if provider == "typesafe" {
+            if api_key.trim().is_empty() {
+                return Err(ModelProbeError::Configuration(
+                    "TypeSafe API key is not configured".into(),
+                ));
+            }
+            let base = base_url
+                .unwrap_or("https://api.typesafe.ai")
+                .trim_end_matches('/')
+                .trim_end_matches("/v1");
+            let probe = format!("{base}/v1/systemone");
+            let contract = typesafe_probe_contract();
+            client
+                .post(&probe)
+                .bearer_auth(api_key)
+                .json(&serde_json::json!({
+                    "model": model_name, "state": contract.state, "questions": contract.questions
+                }))
+                .send()
+                .await
+        } else if provider == "anthropic" {
+            let probe = anthropic_messages_probe_url(base_url);
+            let mut req = client
+                .post(&probe)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json");
+            if let Some(headers) = probe_headers {
+                for (k, v) in headers {
+                    if let Some(s) = v.as_str() {
+                        req = req.header(k, s);
+                    }
                 }
             }
-        }
-        let mut body = serde_json::json!({
-            "model": model_name,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
-        req.json(&body).send().await
-    } else if provider == "bedrock" {
-        let Some(base_url_value) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
-            return Err(ModelProbeError::Configuration(
-                "No base_url for provider 'bedrock'. Set base_url to your Bedrock runtime root, e.g. https://bedrock-runtime.us-east-1.amazonaws.com."
-                    .to_string(),
-            ));
-        };
-        let Ok(probe) = bedrock_converse_probe_url(base_url_value, model_name) else {
-            return Err(ModelProbeError::Configuration(
-                "Invalid base_url for provider 'bedrock'. Set it to your Bedrock runtime root."
-                    .into(),
-            ));
-        };
-        let mut req = client
-            .post(&probe)
-            .header("authorization", format!("Bearer {}", api_key))
-            .header("content-type", "application/json");
-        if let Some(headers) = probe_headers {
-            for (k, v) in headers {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+            let mut body = serde_json::json!({
+                "model": model_name,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            astra_core::model_wire::apply_chat_output_token_limit(
+                &mut body,
+                provider,
+                output_tokens,
+            );
+            req.json(&body).send().await
+        } else if provider == "bedrock" {
+            let Some(base_url_value) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
+                return Err(ModelProbeError::Configuration(
+                    "No base_url for provider 'bedrock'. Set base_url to your Bedrock runtime root, e.g. https://bedrock-runtime.us-east-1.amazonaws.com."
+                        .to_string(),
+                ));
+            };
+            let Ok(probe) = bedrock_converse_probe_url(base_url_value, model_name) else {
+                return Err(ModelProbeError::Configuration(
+                    "Invalid base_url for provider 'bedrock'. Set it to your Bedrock runtime root."
+                        .into(),
+                ));
+            };
+            let mut req = client
+                .post(&probe)
+                .header("authorization", format!("Bearer {}", api_key))
+                .header("content-type", "application/json");
+            if let Some(headers) = probe_headers {
+                for (k, v) in headers {
+                    if let Some(s) = v.as_str() {
+                        req = req.header(k, s);
+                    }
                 }
             }
-        }
-        req.json(&serde_json::json!({
-            "messages": [{
-                "role": "user",
-                "content": [{"text": "hi"}]
-            }],
-            "inferenceConfig": {
-                "maxTokens": 1
-            }
-        }))
-        .send()
-        .await
-    } else {
-        let base_trim = base_url.map(str::trim).filter(|s| !s.is_empty());
-        let url = match base_trim {
-            Some(b) => b.trim_end_matches('/').to_string(),
-            None if provider == "openai" => "https://api.openai.com/v1".to_string(),
-            // Deliberately refuse to guess for unknown providers with no base_url —
-            // the admin must specify base_url for any non-OpenAI provider.
-            // This aligns with the runtime's guarantee that base_url is always set
-            // from the DB row before calling llm_completions_url_for_provider.
-            None => {
-                return Err(ModelProbeError::Configuration(format!(
-                    "No base_url for provider '{provider}'. \
-                         Set base_url (e.g. DashScope/Moonshot compatible-mode /v1 root).",
-                )));
-            }
-        };
-        let endpoint = probe_endpoint.unwrap_or("/chat/completions");
-        let probe = astra_core::model_wire::endpoint_url(&url, endpoint);
-        let mut req = client
-            .post(&probe)
-            .header("authorization", format!("Bearer {}", api_key))
-            .header("content-type", "application/json");
-        if let Some(headers) = probe_headers {
-            for (k, v) in headers {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+            req.json(&serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{"text": "hi"}]
+                }],
+                "inferenceConfig": {
+                    "maxTokens": output_tokens
+                }
+            }))
+            .send()
+            .await
+        } else {
+            let base_trim = base_url.map(str::trim).filter(|s| !s.is_empty());
+            let url = match base_trim {
+                Some(b) => b.trim_end_matches('/').to_string(),
+                None if provider == "openai" => "https://api.openai.com/v1".to_string(),
+                // Deliberately refuse to guess for unknown providers with no base_url —
+                // the admin must specify base_url for any non-OpenAI provider.
+                // This aligns with the runtime's guarantee that base_url is always set
+                // from the DB row before calling llm_completions_url_for_provider.
+                None => {
+                    return Err(ModelProbeError::Configuration(format!(
+                        "No base_url for provider '{provider}'. \
+                             Set base_url (e.g. DashScope/Moonshot compatible-mode /v1 root).",
+                    )));
+                }
+            };
+            let endpoint = probe_endpoint.unwrap_or("/chat/completions");
+            let probe = astra_core::model_wire::endpoint_url(&url, endpoint);
+            let mut req = client
+                .post(&probe)
+                .header("authorization", format!("Bearer {}", api_key))
+                .header("content-type", "application/json");
+            if let Some(headers) = probe_headers {
+                for (k, v) in headers {
+                    if let Some(s) = v.as_str() {
+                        req = req.header(k, s);
+                    }
                 }
             }
-        }
-        let mut body = serde_json::json!({
-            "model": model_name,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
-        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-            req = req.timeout(Duration::from_secs(360));
-        }
-        req.json(&body).send().await
-    };
+            let mut body = serde_json::json!({
+                "model": model_name,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            astra_core::model_wire::apply_chat_output_token_limit(
+                &mut body,
+                if custom_messages {
+                    "anthropic"
+                } else {
+                    provider
+                },
+                output_tokens,
+            );
+            if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+                req = req.timeout(Duration::from_secs(360));
+            }
+            req.json(&body).send().await
+        };
 
-    match result {
-        Ok(resp) if resp.status().is_success() => validate_probe_response(resp).await,
-        Ok(resp) => Err(ModelProbeError::Http(resp.status())),
-        Err(error) => Err(ModelProbeError::transport(error)),
-    }
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                validate_probe_response(resp, provider, custom_messages).await
+            }
+            Ok(resp) => Err(ModelProbeError::Http(resp.status())),
+            Err(error) => Err(ModelProbeError::transport(error)),
+        }
+    };
+    let timeout = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+        Duration::from_secs(360)
+    } else {
+        Duration::from_secs(15)
+    };
+    tokio::time::timeout(timeout, async {
+        let result = probe(32).await;
+        if matches!(result, Err(ModelProbeError::Truncated)) {
+            probe(1024).await
+        } else {
+            result
+        }
+    })
+    .await
+    .map_err(|_| ModelProbeError::Timeout)?
 }
 
-async fn validate_probe_response(mut response: reqwest::Response) -> Result<(), ModelProbeError> {
+async fn validate_probe_response(
+    mut response: reqwest::Response,
+    provider: &str,
+    custom_messages: bool,
+) -> Result<(), ModelProbeError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(ModelProbeError::transport)? {
         if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
@@ -6552,15 +6602,107 @@ async fn validate_probe_response(mut response: reqwest::Response) -> Result<(), 
         }
         bytes.extend_from_slice(&chunk);
     }
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        ModelProbeError::Response("Model check returned an invalid provider response")
-    })?;
-    if !value.is_object() || value.get("error").is_some_and(|error| !error.is_null()) {
+    let value: Value = if provider == "typesafe" {
+        astra_turn_types::parse_unique_json(&bytes)
+    } else {
+        serde_json::from_slice(&bytes)
+    }
+    .map_err(|_| ModelProbeError::Response("Model check returned an invalid provider response"))?;
+    if probe_response_truncated(provider, &value)
+        || (custom_messages && probe_response_truncated("anthropic", &value))
+    {
+        return Err(ModelProbeError::Truncated);
+    }
+    if !valid_probe_response(provider, &value)
+        && !(custom_messages && valid_probe_response("anthropic", &value))
+    {
         return Err(ModelProbeError::Response(
             "Model check returned an invalid provider response",
         ));
     }
     Ok(())
+}
+
+fn probe_response_truncated(provider: &str, value: &Value) -> bool {
+    match provider {
+        "anthropic" => value["stop_reason"] == "max_tokens",
+        "bedrock" => value["stopReason"] == "max_tokens",
+        "typesafe" => false,
+        _ => value["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .is_some_and(|choice| choice["finish_reason"] == "length"),
+    }
+}
+
+fn valid_probe_response(provider: &str, value: &Value) -> bool {
+    if !value.is_object() || value.get("error").is_some_and(|error| !error.is_null()) {
+        return false;
+    }
+    let text = |value: &Value| value.as_str().is_some_and(|text| !text.trim().is_empty());
+    match provider {
+        "anthropic" => {
+            value["stop_reason"] != "max_tokens"
+                && value["content"].as_array().is_some_and(|parts| {
+                    parts.iter().all(|part| part["type"] != "tool_use")
+                        && parts
+                            .iter()
+                            .any(|part| part["type"] == "text" && text(&part["text"]))
+                })
+        }
+        "bedrock" => {
+            value["stopReason"] != "max_tokens"
+                && value["output"]["message"]["content"]
+                    .as_array()
+                    .is_some_and(|parts| {
+                        parts.iter().all(|part| part.get("toolUse").is_none())
+                            && parts.iter().any(|part| text(&part["text"]))
+                    })
+        }
+        "typesafe" => value["model"].as_str().is_some_and(|model| {
+            let native = serde_json::json!({
+                "schema_version": astra_turn_types::JUDGMENT_SCHEMA_VERSION,
+                "model": model,
+                "answers": value["answers"],
+            });
+            astra_turn_types::normalize_judgment_response(
+                &typesafe_probe_contract(),
+                &native.to_string(),
+                model,
+                Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability),
+            )
+            .is_ok()
+        }),
+        _ => value["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .is_some_and(|choice| {
+                let message = &choice["message"];
+                choice["finish_reason"] != "length"
+                    && choice["finish_reason"] != "tool_calls"
+                    && message.is_object()
+                    && message.get("tool_calls").is_none_or(|calls| {
+                        calls.is_null() || calls.as_array().is_some_and(Vec::is_empty)
+                    })
+                    && text(&message["content"])
+            }),
+    }
+}
+
+fn typesafe_probe_contract() -> astra_turn_types::JudgmentRequest {
+    use astra_turn_types::{JUDGMENT_SCHEMA_VERSION, JudgmentQuestion, JudgmentRequest};
+    JudgmentRequest {
+        schema_version: JUDGMENT_SCHEMA_VERSION,
+        state: serde_json::json!("Astra connectivity probe"),
+        questions: [(
+            "connected".into(),
+            JudgmentQuestion::Noul {
+                instructions: "Does the state mention Astra?".into(),
+                criteria: None,
+            },
+        )]
+        .into(),
+    }
 }
 
 #[cfg(test)]
@@ -8074,6 +8216,117 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn successful_model_probe_requires_the_selected_protocol_shape() {
+        for (provider, valid) in [
+            (
+                "openai",
+                serde_json::json!({"choices":[{"message":{"content":"ok"}}]}),
+            ),
+            (
+                "anthropic",
+                serde_json::json!({"content":[{"type":"text","text":"ok"}]}),
+            ),
+            (
+                "bedrock",
+                serde_json::json!({"output":{"message":{"content":[{"text":"ok"}]}}}),
+            ),
+            (
+                "typesafe",
+                serde_json::json!({"model":"model","answers":{"connected":{"type":"noul","noul":0.9}}}),
+            ),
+        ] {
+            assert!(valid_probe_response(provider, &valid), "{provider}");
+            for invalid in [
+                serde_json::json!({}),
+                serde_json::json!({"status":"ok"}),
+                serde_json::json!({"error":{"message":"no"}}),
+            ] {
+                assert!(
+                    !valid_probe_response(provider, &invalid),
+                    "{provider}: {invalid}"
+                );
+            }
+        }
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"content":[]}}]})
+        ));
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"content":[{"type":"text","text":"ok"}]}}]})
+        ));
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"tool_calls":[{}]}}]})
+        ));
+        assert!(!valid_probe_response(
+            "bedrock",
+            &serde_json::json!({"output":{"message":{"content":[{"reasoningContent":{}}]}}})
+        ));
+        for content in [Value::Null, serde_json::json!("hello")] {
+            assert!(!valid_probe_response(
+                "openai",
+                &serde_json::json!({
+                    "choices":[{"message":{"content":content,"tool_calls":[{"id":"1","function":{"name":"bash","arguments":"{}"}}]}}]
+                })
+            ));
+        }
+        let later_choice_is_valid = serde_json::json!({"choices":[
+            {"message":{"tool_calls":[{"id":"1","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"},
+            {"message":{"content":"ok"},"finish_reason":"stop"}
+        ]});
+        assert!(!valid_probe_response("openai", &later_choice_is_valid));
+        let first_choice_is_truncated = serde_json::json!({"choices":[
+            {"message":{"content":"partial"},"finish_reason":"length"},
+            {"message":{"content":"ok"},"finish_reason":"stop"}
+        ]});
+        assert!(probe_response_truncated(
+            "openai",
+            &first_choice_is_truncated
+        ));
+        assert!(!valid_probe_response("openai", &first_choice_is_truncated));
+        for parts in [
+            serde_json::json!([{"toolUse":{"toolUseId":"1","name":"bash","input":{}}}]),
+            serde_json::json!([{"text":"hello"},{"toolUse":{"toolUseId":"1","name":"bash","input":{}}}]),
+        ] {
+            assert!(!valid_probe_response(
+                "bedrock",
+                &serde_json::json!({"output":{"message":{"content":parts}}})
+            ));
+        }
+        assert!(!valid_probe_response(
+            "anthropic",
+            &serde_json::json!({
+                "content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"1","name":"bash","input":{}}]
+            })
+        ));
+        for invalid in [
+            serde_json::json!({"model":" ","answers":{"connected":{"type":"noul","noul":0.9}}}),
+            serde_json::json!({"model":"m","answers":{"connected":{"type":"noul","noul":0.9},"extra":{"type":"noul","noul":0.9}}}),
+            serde_json::json!({"model":"m","answers":{"connected":{"type":"noul","noul":0.9,"extra":true}}}),
+            serde_json::json!({"model":"m","answers":{"connected":{"type":"noul","noul":1.1}}}),
+        ] {
+            assert!(!valid_probe_response("typesafe", &invalid), "{invalid}");
+        }
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"content":"  "}}]})
+        ));
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]})
+        ));
+        assert!(!valid_probe_response(
+            "anthropic",
+            &serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"})
+        ));
+        assert!(!valid_probe_response(
+            "bedrock",
+            &serde_json::json!({"output":{"message":{"content":[{"text":"partial"}]}},"stopReason":"max_tokens"})
+        ));
+    }
+
     #[tokio::test]
     async fn model_probe_reports_safe_actionable_errors_for_both_wire_protocols() {
         use astra_core::model_wire::LlmProviderProtocol;
@@ -8092,6 +8345,14 @@ mod tests {
             .route(
                 "/oversize/chat/completions",
                 post(|| async { "x".repeat(1024 * 1024 + 1) }),
+            )
+            .route(
+                "/empty/chat/completions",
+                post(|| async { Json(serde_json::json!({})) }),
+            )
+            .route(
+                "/unrelated/chat/completions",
+                post(|| async { Json(serde_json::json!({"status":"ok"})) }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -8138,7 +8399,7 @@ mod tests {
                 }
             }
         }
-        for path in ["200", "embedded", "oversize"] {
+        for path in ["200", "embedded", "oversize", "empty", "unrelated"] {
             let failure = validate_connectivity_for_protocol(
                 "openai",
                 "model",
@@ -11181,7 +11442,9 @@ mod tests {
                         } else {
                             StatusCode::OK
                         };
-                        let response = if status == StatusCode::OK {
+                        let response = if status == StatusCode::OK && provider == "anthropic" {
+                            serde_json::json!({"content":[{"type":"text","text":"ok"}]})
+                        } else if status == StatusCode::OK {
                             serde_json::json!({"choices":[{"message":{"content":"ok"}}]})
                         } else {
                             serde_json::json!({"error":{"message":"fixture rejection"}})
@@ -11225,6 +11488,175 @@ mod tests {
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn connectivity_probe_retries_only_explicit_truncation() {
+        use axum::{Json, Router, extract::ConnectInfo, routing::post};
+        for (provider, path, endpoint, truncated, complete) in [
+            (
+                "openai",
+                "/chat/completions",
+                None,
+                serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}),
+                serde_json::json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}),
+            ),
+            (
+                "anthropic",
+                "/v1/messages",
+                None,
+                serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}),
+                serde_json::json!({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}),
+            ),
+            (
+                "bedrock",
+                "/model/model/converse",
+                None,
+                serde_json::json!({"output":{"message":{"content":[{"text":"partial"}]}},"stopReason":"max_tokens"}),
+                serde_json::json!({"output":{"message":{"content":[{"text":"ok"}]}},"stopReason":"end_turn"}),
+            ),
+            (
+                "openai",
+                "/messages",
+                Some("/messages"),
+                serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}),
+                serde_json::json!({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}),
+            ),
+        ] {
+            for mode in ["complete", "truncated", "invalid", "rate_limit"] {
+                let captured = Arc::new(Mutex::new(Vec::<(Value, std::net::SocketAddr)>::new()));
+                let app = Router::new().route(
+                    path,
+                    post({
+                        let (captured, truncated, complete) =
+                            (captured.clone(), truncated.clone(), complete.clone());
+                        move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+                              Json(body): Json<Value>| {
+                            let (captured, truncated, complete) =
+                                (captured.clone(), truncated.clone(), complete.clone());
+                            async move {
+                                let mut requests =
+                                    astra_core::sync_poison::recover_mutex_lock(&captured);
+                                requests.push((body, peer));
+                                let response = match mode {
+                                    "rate_limit" => (
+                                        StatusCode::TOO_MANY_REQUESTS,
+                                        serde_json::json!({"error":"rate limit"}),
+                                    ),
+                                    "invalid" => {
+                                        (StatusCode::OK, serde_json::json!({"status":"ok"}))
+                                    }
+                                    "truncated" => (StatusCode::OK, truncated),
+                                    _ if requests.len() == 1 => (StatusCode::OK, truncated),
+                                    _ => (StatusCode::OK, complete),
+                                };
+                                (response.0, Json(response.1))
+                            }
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let task = tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .await
+                    .unwrap()
+                });
+                if provider == "openai" && endpoint.is_none() && mode == "complete" {
+                    // Prove the fixture keeps connections alive: a single client
+                    // should reuse the connection that a fresh retry must not.
+                    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                    for _ in 0..2 {
+                        client
+                            .post(format!("{base}{path}"))
+                            .json(&serde_json::json!({}))
+                            .send()
+                            .await
+                            .unwrap()
+                            .bytes()
+                            .await
+                            .unwrap();
+                    }
+                    let mut requests = astra_core::sync_poison::recover_mutex_lock(&captured);
+                    assert_eq!(requests[0].1, requests[1].1);
+                    requests.clear();
+                }
+                let result = validate_connectivity_for_protocol(
+                    provider,
+                    "model",
+                    "key",
+                    Some(&base),
+                    None,
+                    endpoint,
+                    None,
+                )
+                .await;
+                match mode {
+                    "complete" => assert!(result.is_ok(), "{provider}/{path}: {result:?}"),
+                    "truncated" => assert!(matches!(result, Err(ModelProbeError::Truncated))),
+                    "invalid" => assert!(matches!(result, Err(ModelProbeError::Response(_)))),
+                    _ => assert!(matches!(
+                        result,
+                        Err(ModelProbeError::Http(StatusCode::TOO_MANY_REQUESTS))
+                    )),
+                }
+                let requests = astra_core::sync_poison::recover_mutex_lock(&captured);
+                assert_eq!(
+                    requests.len(),
+                    if matches!(mode, "complete" | "truncated") {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                if provider == "openai" && endpoint.is_none() && mode == "complete" {
+                    assert_ne!(requests[0].1, requests[1].1);
+                }
+                for (index, (request, _)) in requests.iter().enumerate() {
+                    if endpoint.is_some() {
+                        assert!(request.get("max_completion_tokens").is_none());
+                    }
+                    let tokens = if provider == "bedrock" {
+                        &request["inferenceConfig"]["maxTokens"]
+                    } else if provider == "openai" && endpoint.is_none() {
+                        &request["max_completion_tokens"]
+                    } else {
+                        &request["max_tokens"]
+                    };
+                    assert_eq!(*tokens, if index == 0 { 32 } else { 1024 });
+                }
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typesafe_probe_rejects_duplicate_json_keys() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route(
+            "/v1/systemone",
+            post(|| async {
+                r#"{"model":"m","answers":{"connected":{"type":"noul","noul":0.1,"noul":0.9}}}"#
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = validate_connectivity_for_protocol(
+            "typesafe",
+            "m",
+            "key",
+            Some(&base),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(ModelProbeError::Response(_))));
+        task.abort();
     }
     //
     // Based on real API recordings from 2026-05-04.

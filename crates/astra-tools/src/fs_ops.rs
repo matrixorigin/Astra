@@ -88,16 +88,6 @@ pub fn validate_read_file_args(args: &Value) -> Result<(), String> {
     }?;
     validate_read_file_line_arg(object, "start_line")?;
     validate_read_file_line_arg(object, "end_line")?;
-    if let (Some(start), Some(end)) = (
-        object.get("start_line").and_then(Value::as_u64),
-        object.get("end_line").and_then(Value::as_u64),
-    ) && start > end
-    {
-        return Err(
-            "Error: `start_line` must not exceed `end_line` for read_file. Use an inclusive 1-based range, or omit `end_line` to read through the end of the file."
-                .to_string(),
-        );
-    }
     if let Some(value) = object.get("outline")
         && !value.is_boolean()
     {
@@ -145,6 +135,7 @@ pub fn normalize_read_file_line_range(
     end_line: Option<usize>,
     total_lines: usize,
 ) -> ReadLineRange {
+    let (start_line, end_line) = astra_text_utils::line_range::ordered_bounds(start_line, end_line);
     let start = start_line.unwrap_or(1);
     let end = end_line.unwrap_or(total_lines);
     ReadLineRange {
@@ -705,11 +696,17 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 
     let lines: Vec<&str> = raw_content.lines().collect();
+    let range = normalize_read_file_line_range(start_line, end_line, lines.len());
     if lines.is_empty() {
+        if has_range {
+            return ToolResult::error(format!(
+                "Error: start_line {} exceeds file length 0",
+                range.start_line
+            ));
+        }
         return ToolResult::text("(empty file)".to_string());
     }
 
-    let range = normalize_read_file_line_range(start_line, end_line, lines.len());
     let start = range.start_line.saturating_sub(1).min(lines.len());
     let end = range.end_line.min(lines.len());
 
@@ -3701,6 +3698,36 @@ mod tests {
     }
 
     #[test]
+    fn read_file_reorders_reversed_range() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("lines.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        let read = |start, end| {
+            read_file(
+                dir.path(),
+                &serde_json::json!({
+                    "path": "lines.txt", "start_line": start, "end_line": end
+                }),
+            )
+        };
+        let reversed = read(4, 2);
+        let ordered = read(2, 4);
+        assert!(!reversed.is_error, "{:?}", reversed);
+        assert_eq!(reversed.output, ordered.output);
+        assert!(reversed.output.contains("2\tb"));
+        assert!(read(0, 2).is_error);
+        assert!(read(9, 7).is_error);
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let empty = read_file(
+            dir.path(),
+            &serde_json::json!({"path":"empty.txt", "start_line":4, "end_line":2}),
+        );
+        assert!(
+            empty.is_error && empty.output.contains("start_line 2"),
+            "{empty:?}"
+        );
+    }
+
+    #[test]
     fn read_file_argument_failures_preserve_recovery_evidence() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3717,7 +3744,6 @@ mod tests {
             serde_json::json!({"path": "missing.txt", "start_line": -1}),
             serde_json::json!({"path": "missing.txt", "start_line": 1.5}),
             serde_json::json!({"path": "missing.txt", "end_line": "2"}),
-            serde_json::json!({"path": "missing.txt", "start_line": 3, "end_line": 1}),
             serde_json::json!({"path": "missing.txt", "outline": 1}),
         ] {
             let result = read_file(dir.path(), &args);

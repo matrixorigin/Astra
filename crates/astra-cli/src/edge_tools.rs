@@ -1527,7 +1527,7 @@ pub struct ToolExecutor {
     /// bottom-pane overlay.
     ask_user_request_tx: std::sync::Mutex<Option<crate::cli::chat_stream::AskUserRequestTx>>,
     /// Avoid presenting the same recovery prompt for parallel tool calls.
-    workspace_recovery_prompt: tokio::sync::Mutex<()>,
+    workspace_recovery_prompt: tokio::sync::Mutex<Option<PathBuf>>,
     /// Per-turn plan-review channel — installed by the host before
     /// each turn so `exit_plan_mode` can surface the dedicated
     /// plan-review overlay (scrollable plan body + 4-way radio).
@@ -1663,7 +1663,7 @@ impl ToolExecutor {
             .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),
-            workspace_recovery_prompt: tokio::sync::Mutex::new(()),
+            workspace_recovery_prompt: tokio::sync::Mutex::new(None),
             plan_review_request_tx: std::sync::Mutex::new(None),
             pending_permission_mode_change: std::sync::Mutex::new(None),
             pending_round_tool_boost: std::sync::Mutex::new(None),
@@ -1722,8 +1722,21 @@ impl ToolExecutor {
         else {
             return false;
         };
-        let Ok(_prompt_guard) = self.workspace_recovery_prompt.try_lock() else {
-            return false;
+        let root_key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let (mut prompt_guard, waited) = match self.workspace_recovery_prompt.try_lock() {
+            Ok(guard) => (guard, false),
+            Err(_) => {
+                let guard = if let Some(cancel) = cancel {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return false,
+                        guard = self.workspace_recovery_prompt.lock() => guard,
+                    }
+                } else {
+                    self.workspace_recovery_prompt.lock().await
+                };
+                (guard, true)
+            }
         };
         let recovery = if let Some(cancel) = cancel {
             tokio::select! {
@@ -1740,6 +1753,10 @@ impl ToolExecutor {
         if !recovery.ownership_is_unsettled() {
             return true;
         }
+        if waited && prompt_guard.as_ref() == Some(&root_key) {
+            return false;
+        }
+        *prompt_guard = None;
         let prompt = astra_tools::AskUserPrompt {
             context: Some(format!("Workspace: {}", root.display())),
             questions: vec![astra_tools::AskUserQuestion {
@@ -1787,6 +1804,7 @@ impl ToolExecutor {
             answer.id.as_deref() == Some("workspace_recovery")
                 && answer.answers.as_slice() == ["It has stopped"]
         }) {
+            *prompt_guard = Some(root_key);
             return false;
         }
         recovery.confirm().await.is_ok()

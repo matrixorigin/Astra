@@ -1142,32 +1142,86 @@ async fn interactive_workspace_recovery_resumes_the_same_executor() {
         .await
         .expect("recovery prompt was not shown")
         .unwrap();
-    let parallel = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        exe.execute_with_metadata(
-            "write_file",
-            &json!({"path":"second.txt", "content":"second"}),
-        ),
-    )
-    .await
-    .expect("parallel work must not wait for the prompt");
+    let second = exe.clone();
+    let parallel = tokio::spawn(async move {
+        second
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path":"second.txt", "content":"second"}),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
     assert!(
-        parallel.is_error,
-        "parallel work must not open a duplicate prompt"
+        !parallel.is_finished(),
+        "parallel work should wait for the decision"
     );
     assert!(rx.try_recv().is_err());
     answer_workspace_recovery(prompt, "It has stopped");
     let result = first.await.unwrap();
     assert!(!result.is_error, "{result:?}");
     assert!(dir.path().join("first.txt").exists());
-    let retried = exe
-        .execute_with_metadata(
-            "write_file",
-            &json!({"path":"second.txt", "content":"second"}),
-        )
-        .await;
-    assert!(!retried.is_error, "{retried:?}");
+    let parallel = parallel.await.unwrap();
+    assert!(!parallel.is_error, "{parallel:?}");
     assert!(dir.path().join("second.txt").exists());
+}
+
+#[tokio::test]
+async fn concurrent_recovery_waits_cancellably_and_keeps_distinct_roots_separate() {
+    let first_root = tempfile::tempdir().unwrap();
+    let second_root = tempfile::tempdir().unwrap();
+    let exe = std::sync::Arc::new(ToolExecutor::new(first_root.path()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    exe.set_ask_user_request_tx(Some(tx));
+    assert!(
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(first_root.path())
+    );
+    assert!(
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+            second_root.path()
+        )
+    );
+    let worker = exe.clone();
+    let root = first_root.path().to_path_buf();
+    let first =
+        tokio::spawn(async move { worker.confirm_workspace_recovery_in_tui(&root, None).await });
+    let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker = exe.clone();
+    let root = first_root.path().to_path_buf();
+    let child_cancel = cancel.clone();
+    let cancelled = tokio::spawn(async move {
+        worker
+            .confirm_workspace_recovery_in_tui(&root, Some(&child_cancel))
+            .await
+    });
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    assert!(!cancelled.await.unwrap());
+    let worker = exe.clone();
+    let root = second_root.path().to_path_buf();
+    let second =
+        tokio::spawn(async move { worker.confirm_workspace_recovery_in_tui(&root, None).await });
+    tokio::task::yield_now().await;
+    answer_workspace_recovery(prompt, "It has stopped");
+    assert!(first.await.unwrap());
+    let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        prompt
+            .prompt
+            .context
+            .as_deref()
+            .unwrap()
+            .contains(&second_root.path().display().to_string())
+    );
+    answer_workspace_recovery(prompt, "It has stopped");
+    assert!(second.await.unwrap());
 }
 
 #[tokio::test]
@@ -1191,8 +1245,28 @@ async fn declined_workspace_recovery_keeps_files_and_allows_reading() {
         .await
         .expect("recovery prompt was not shown")
         .unwrap();
+    let other = exe.clone();
+    let mut parallel = tokio::spawn(async move {
+        other
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path":"other.txt", "content":"changed"}),
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut parallel)
+            .await
+            .is_err()
+    );
     answer_workspace_recovery(prompt, "Not sure");
     assert!(attempt.await.unwrap().is_error);
+    assert!(parallel.await.unwrap().is_error);
+    assert!(
+        rx.try_recv().is_err(),
+        "the same decline must not trigger another prompt"
+    );
+    assert!(!dir.path().join("other.txt").exists());
     assert_eq!(
         std::fs::read_to_string(dir.path().join("existing.txt")).unwrap(),
         "keep"

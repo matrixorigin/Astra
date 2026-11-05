@@ -1774,7 +1774,7 @@ mod tests {
         let subject = work_subject("item-1");
         let records = vec![ToolCallRecord {
             name: "read_file".to_string(),
-            args_full: Some(r#"{"path":"src/lib.rs","start_line":9,"end_line":2}"#.to_string()),
+            args_full: Some(r#"{"path":"src/lib.rs","start_line":0,"end_line":2}"#.to_string()),
             round: Some(1),
             disposition: Some(ToolCallDisposition::Rejected),
             ok: false,
@@ -1807,7 +1807,7 @@ mod tests {
 
         continued.push(ToolCallRecord {
             name: "read_file".to_string(),
-            args_full: Some(r#"{"path":"src/lib.rs","start_line":9,"end_line":2}"#.to_string()),
+            args_full: Some(r#"{"path":"src/lib.rs","start_line":0,"end_line":2}"#.to_string()),
             round: Some(3),
             disposition: Some(ToolCallDisposition::Rejected),
             ok: false,

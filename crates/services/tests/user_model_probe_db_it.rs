@@ -92,6 +92,10 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
                             hold.next.store(0, std::sync::atomic::Ordering::SeqCst);
                             return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"fixture failure"})));
                         }
+                        if body[limit] == 32 && outcome == 6 {
+                            hold.next.store(0, std::sync::atomic::Ordering::SeqCst);
+                            return (StatusCode::OK, Json(json!({"status":"ok"})));
+                        }
                         let matches = (body[limit] == 32 && matches!(outcome, 1 | 2))
                             || (body[limit] == 1024 && outcome == 3);
                         if matches
@@ -234,6 +238,25 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     assert_eq!(
         failure.1.0.error_code.as_deref(),
         Some("model_probe_upstream")
+    );
+    assert!(
+        service
+            .list_user_models(owner.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    hold.next.store(6, std::sync::atomic::Ordering::SeqCst);
+    let failure = service
+        .create_user_model(
+            owner.clone(),
+            make_request("invalid-response", "deepseek-chat", "valid-key"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_response")
     );
     assert!(
         service
@@ -723,6 +746,16 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     assert_eq!(
         failure.1.0.error_code.as_deref(),
         Some("model_probe_upstream")
+    );
+    hold.next.store(6, std::sync::atomic::Ordering::SeqCst);
+    let failure = service
+        .create_model(owner.clone(), rejected.clone())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        failure.1.0.error_code.as_deref(),
+        Some("model_probe_response")
     );
     assert_eq!(
         service
