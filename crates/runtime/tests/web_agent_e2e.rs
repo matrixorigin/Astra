@@ -1592,6 +1592,7 @@ async fn post_unmatched_tool_result(
         output,
         status,
         unmatched_tool_result_identity(),
+        None,
     )
     .await
 }
@@ -1604,7 +1605,7 @@ async fn post_tool_result_from_event(
 ) -> StatusCode {
     let (request_id, identity) =
         tool_request_identity_from_event(event).expect("tool_request event must carry identity");
-    post_tool_result_with_identity(app, &request_id, output, status, identity).await
+    post_tool_result_with_identity(app, &request_id, output, status, identity, None).await
 }
 
 async fn post_tool_result_with_identity(
@@ -1613,6 +1614,7 @@ async fn post_tool_result_with_identity(
     output: &str,
     status: &str,
     identity: ToolResultIdentity,
+    tool_result_fields: Option<Map<String, Value>>,
 ) -> StatusCode {
     let body = astra_thin_client::ToolResultRequest::new_with_hash(
         astra_thin_client::ToolResultRequestParts {
@@ -1624,7 +1626,7 @@ async fn post_tool_result_with_identity(
             status: status.to_string(),
             output: output.to_string(),
             duration_ms: 10,
-            tool_result_fields: None,
+            tool_result_fields,
         },
     );
     let body: Value = serde_json::to_value(body).unwrap();
@@ -3102,6 +3104,111 @@ async fn run_tool_scenario(case: EdgeCallbackScenario) {
             1
         );
     }
+}
+
+#[tokio::test]
+async fn unknown_edge_outcome_reaches_model_before_it_inspects_the_result() {
+    const MESSAGE: &str = "Write notes and inspect the result.";
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new(
+        "unknown edge outcome",
+        |request| primary_request_for(request, MESSAGE),
+        vec![
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"", "tool_calls":[tool_call(
+                    "write-unknown", "write_file", json!({"path":"notes.txt", "content":"hello"})
+                )]}, "finish_reason":"tool_calls"}]})),
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"", "tool_calls":[tool_call(
+                    "inspect-notes", "read_file", json!({"path":"notes.txt"})
+                )]}, "finish_reason":"tool_calls"}]})),
+            ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{
+                "role":"assistant", "content":"The write could not be confirmed."
+            }, "finish_reason":"stop"}]})),
+        ],
+    )])
+    .await;
+    let response = chat_stream_start(
+        &app,
+        json!({
+            "message": MESSAGE,
+            "interactive_client": true,
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
+            "context": {"edge_tools": [tool_schema("write_file"), tool_schema("read_file")]}
+        }),
+    )
+    .await;
+    let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
+    let approval_identity = wait_for_approval_identity(&mut rx).await;
+    let approval = wait_for_sse(&mut rx, "approval_required", E2E_WAIT_TIMEOUT_SECS).await;
+    let approval_id = approval["request_id"].as_str().unwrap();
+    assert_eq!(
+        post_approval_respond(&app, &approval_identity, approval_id, "allow").await,
+        StatusCode::OK
+    );
+    let write = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(write["tool"], "write_file");
+    assert_eq!(
+        write["args"],
+        json!({"path":"notes.txt", "content":"hello"})
+    );
+    let (request_id, identity) = tool_request_identity_from_event(&write).unwrap();
+    assert_eq!(request_id, approval_id);
+    assert_eq!(
+        post_tool_result_with_identity(
+            &app,
+            &request_id,
+            "The write acknowledgement was lost.",
+            "failed",
+            identity,
+            Some(Map::from_iter([
+                ("error_kind".into(), json!("tool_outcome_unknown")),
+                ("execution_fact".into(), json!("unknown")),
+                ("side_effects_maybe".into(), json!(true)),
+                ("retryable".into(), json!(false)),
+            ])),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let read = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(read["tool"], "read_file");
+    assert_eq!(read["args"], json!({"path":"notes.txt"}));
+    assert_eq!(
+        post_tool_result_from_event(&app, &read, "hello", "completed").await,
+        StatusCode::OK
+    );
+    wait_for_sse(&mut rx, "turn_complete", E2E_WAIT_TIMEOUT_SECS).await;
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(find_events(&events, "tool_request").len(), 2);
+    let answer: String = find_events(&events, "text_delta")
+        .iter()
+        .filter_map(|event| event["content"].as_str())
+        .collect();
+    assert_eq!(answer, "The write could not be confirmed.");
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    assert!(find_events(&events, "error").is_empty());
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    let tool_message = |request: &ProviderRequest, call_id: &str| {
+        request.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == call_id)
+            .and_then(|message| message["content"].as_str())
+            .unwrap()
+            .to_string()
+    };
+    let unknown = tool_message(&requests[1], "write-unknown");
+    assert!(unknown.contains("tool_outcome_unknown"));
+    assert!(unknown.contains("Inspect the outcome before repeating it"));
+    assert!(tool_message(&requests[2], "inspect-notes").contains("hello"));
+    drop(requests);
+    gateway.assert_complete();
+    inference.assert_quiescent();
 }
 
 /// Poll run status until it reaches the expected value (with timeout).
