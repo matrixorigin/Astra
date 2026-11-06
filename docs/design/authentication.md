@@ -232,8 +232,10 @@ without repeating model-provider authorization.
 Registration rejects an active `ASTRA_ACCESS_TOKEN` before the non-idempotent
 account-creation POST. Users must unset it and restart before creating a new
 account; no later identity lookup can turn a remotely created account into an
-apparent registration failure. A registration timeout reports an unknown outcome
-and directs users to try `/login` before registering again.
+apparent registration failure. A registration timeout, lost/truncated response,
+invalid successful credential response, or server-side failure reports an unknown
+outcome and directs users to try `/login` before registering again. Known
+connector failures and authoritative client-error rejections remain failures.
 
 When a valid `ASTRA_ACCESS_TOKEN` controls turn authentication, password sign-in
 checks its authenticated account against the password response before saving
@@ -262,8 +264,11 @@ When execution selection rejects a new turn with
 `execution_binding_provider_required` before durable run creation, it includes
 `metadata.attempt_admission_state: rejected`. The CLI preserves that code, restores the
 draft and suggests `/login` or restarting only when no earlier dispatched
-attempt remains ambiguous. The thin transport returns sticky retry provenance
-alongside the final response. Connector failures known to precede HTTP request
+attempt remains ambiguous. The thin transport updates the admission owner's live
+dispatch evidence before sending and settles each attempt on a complete response
+or a proven connector failure. This preserves uncertainty on retry exhaustion,
+authentication errors, cancellation, and admission-deadline expiry as well as on
+successful response returns. Connector failures known to precede HTTP request
 dispatch (including a refused connection) do not create ambiguity; they also
 cannot clear ambiguity from an earlier attempt that may have reached the Server.
 Older clients ignore this new attempt-only field

@@ -1503,6 +1503,7 @@ async fn chat_turn_post_payload_after_prepare(
         token,
         CHAT_TURN_POST_MAX_RETRIES,
         quiet,
+        prior_admission_ambiguous,
         || {
             // The thin client invokes this after asynchronous credential
             // preparation, immediately before sending. Retain an already-issued
@@ -1552,8 +1553,6 @@ async fn chat_turn_post_payload_after_prepare(
         }
         other => other.to_string(),
     })?;
-    *prior_admission_ambiguous |= resp.prior_dispatch_ambiguous;
-    let resp = resp.response;
     if ui.timing {
         eprintln!(
             "{}",

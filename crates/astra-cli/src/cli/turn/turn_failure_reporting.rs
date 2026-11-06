@@ -172,7 +172,7 @@ pub(crate) fn report_turn_failure(
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
     if failure.partial.prior_admission_ambiguous {
-        ui.show_error("  Server execution state is unknown: an earlier request lost its response. A later rejection does not cancel that possible run. Inspect the session before retrying; do not resend the message until its execution state is confirmed.");
+        ui.show_error("  Server execution state is unknown: a dispatched request may have run without a confirmed outcome. Inspect the session before retrying; do not resend the message until its execution state is confirmed.");
     } else if is_llm_provider_auth_error(&failure.error) {
         ui.show_error("  LLM provider credentials invalid — check model API key configuration.");
     } else if is_auth_error(&failure.error) {

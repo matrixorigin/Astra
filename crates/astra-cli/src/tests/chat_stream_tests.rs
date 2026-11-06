@@ -21,6 +21,22 @@ const TEST_SSE_HEADERS: [(&str, &str); 2] = [
 #[tokio::test]
 #[serial_test::serial]
 async fn admitted_attempt_with_lost_headers_then_rejection_retains_uncertainty() {
+    assert_lost_admission("rejected").await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn admitted_attempt_with_lost_headers_then_retry_exhaustion_retains_uncertainty() {
+    assert_lost_admission("lost").await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn admitted_attempt_with_lost_headers_then_deadline_retains_uncertainty() {
+    assert_lost_admission("deadline").await;
+}
+
+async fn assert_lost_admission(terminal: &'static str) {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -79,6 +95,13 @@ async fn admitted_attempt_with_lost_headers_then_rejection_retains_uncertainty()
                     socket.shutdown().await.unwrap();
                     continue;
                 }
+                if terminal == "lost" {
+                    socket.shutdown().await.unwrap();
+                    continue;
+                }
+                if terminal == "deadline" {
+                    std::future::pending::<()>().await;
+                }
                 ("text/event-stream",concat!(
                     "data: {\"type\":\"error\",\"error_kind\":\"invalid_request\",\"message\":\"registration required\",",
                     "\"error_code\":\"execution_binding_provider_required\",\"metadata\":{\"attempt_admission_state\":\"rejected\"}}\n\n",
@@ -111,16 +134,26 @@ async fn admitted_attempt_with_lost_headers_then_rejection_retains_uncertainty()
     params.session_state_journal = Some(Arc::new(std::sync::Mutex::new(
         crate::edge_tools::SessionStateRollbackJournal::default(),
     )));
+    if terminal == "deadline" {
+        params.execution_time_budget =
+            Some(crate::cli::chat_stream::ExecutionTimeBudgetClock::new(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            ));
+    }
     let failure = tokio::time::timeout(std::time::Duration::from_secs(20), stream_chat_sse(params))
         .await
         .unwrap()
         .expect_err("last physical request is rejected");
     assert_eq!(admitted.load(Ordering::SeqCst), 1);
-    assert_eq!(post_count.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        failure.partial.error_code.as_deref(),
-        Some("execution_binding_provider_required")
-    );
+    assert!(post_count.load(Ordering::SeqCst) >= 2);
+    if terminal == "rejected" {
+        assert_eq!(
+            failure.partial.error_code.as_deref(),
+            Some("execution_binding_provider_required")
+        );
+    }
     assert!(failure.partial.prior_admission_ambiguous);
     assert!(
         !failure.partial.admission_rejected && !failure.partial.server_admission_not_dispatched
@@ -130,6 +163,20 @@ async fn admitted_attempt_with_lost_headers_then_rejection_retains_uncertainty()
         failure.partial.last_heavy_checkpoint.is_some(),
         "do not discard recovery evidence because only the last attempt was rejected"
     );
+    let mut state = crate::cli::session::session_state::SessionState::default();
+    let mut ui = crate::tests::TestUi::default();
+    crate::cli::turn::turn_failure_reporting::report_turn_failure(
+        &mut state,
+        None,
+        "possibly executed message",
+        &failure,
+        std::time::Instant::now(),
+        &mut ui,
+    );
+    assert!(ui.restored_inputs.is_empty());
+    let shown = ui.errors.join("\n");
+    assert!(shown.contains("unknown") && shown.contains("do not resend"));
+    assert!(!shown.contains("No model or tool ran"));
     server.abort();
     let _ = server.await;
 }
