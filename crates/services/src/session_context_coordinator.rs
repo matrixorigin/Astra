@@ -88,8 +88,10 @@ impl SessionExecutionBlocker {
 }
 const COORDINATOR_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_SEGMENT_BATCH: usize = 256;
-const MAX_CONTEXT_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CONTEXT_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CONTEXT_SEGMENT_BYTES: u64 =
+    astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_SEGMENT_BYTES;
+const MAX_CONTEXT_CONTENT_BYTES: u64 =
+    astra_core::runtime_limits::MAX_CANONICAL_CONTEXT_BATCH_BYTES;
 const MAX_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_RESERVATION_TTL: Duration = Duration::from_secs(15 * 60);
 // Execution-binding generations are strictly positive in durable rows. Zero
@@ -503,6 +505,8 @@ pub enum TransferWriterOutcome {
 pub struct MaterializedConversationV1 {
     pub head: SessionContextHeadV1,
     pub messages: Vec<Value>,
+    /// Session owners whose validated manifests contributed to this view.
+    pub authorized_session_ids: HashSet<String>,
     pub logical_segment_count: u64,
     pub canonical_segment_bytes: u64,
 }
@@ -2545,7 +2549,12 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .await?;
             scope = prefix.parent_key;
         }
-        materialize_nodes(head, order_manifest_chain(head, nodes)?)
+        let authorized_session_ids = visited.into_iter().map(|key| key.session_id).collect();
+        materialize_nodes(
+            head,
+            order_manifest_chain(head, nodes)?,
+            authorized_session_ids,
+        )
     }
 
     async fn load_manifest_delta(
@@ -4210,6 +4219,7 @@ fn manifest_delta(
 fn materialize_nodes(
     head: &SessionContextHeadV1,
     nodes: Vec<StoredManifestContent>,
+    authorized_session_ids: HashSet<String>,
 ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
     let mut messages = Vec::new();
     let mut logical_segment_count = 0_u64;
@@ -4251,6 +4261,7 @@ fn materialize_nodes(
     Ok(MaterializedConversationV1 {
         head: head.clone(),
         messages,
+        authorized_session_ids,
         logical_segment_count,
         canonical_segment_bytes,
     })

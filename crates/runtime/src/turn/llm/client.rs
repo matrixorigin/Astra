@@ -1853,6 +1853,28 @@ pub(crate) async fn wait_llm_cancel(cancel: LlmCancel<'_>) {
     }
 }
 
+async fn prepare_compatible_endpoint(
+    url: &str,
+    remaining: std::time::Duration,
+    cancel: LlmCancel<'_>,
+) -> Result<astra_services::byok_endpoint::EndpointClient, astra_core::ClassifiedError> {
+    if remaining.is_zero() {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "LLM provider deadline reached while preparing the connection",
+        ));
+    }
+    tokio::select! {
+        biased;
+        _ = wait_llm_cancel(cancel) => Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Cancelled, "LLM call cancelled")),
+        result = tokio::time::timeout(remaining, astra_services::byok_endpoint::endpoint_client(url)) => {
+            result.map_err(|_| astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline, "LLM provider deadline reached while preparing the connection"))?
+        }
+    }
+}
+
 /// Sleep for rate-limit / cooldown delays unless [`LlmCancel`] fires first (cooperative abort).
 pub(crate) async fn sleep_ms_or_llm_cancel(
     delay_ms: u64,
@@ -5575,16 +5597,23 @@ async fn call_prepared_llm_with_total_budget(
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
         let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
-            Some(
-                astra_services::byok_endpoint::endpoint_client(&url)
-                    .await
-                    .map_err(|error| {
-                        astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::InvalidRequest,
-                            error,
-                        )
-                    })?,
+            match prepare_compatible_endpoint(
+                &url,
+                total_budget.saturating_sub(started.elapsed()),
+                cancel,
             )
+            .await
+            {
+                Ok(client) => Some(client),
+                Err(error)
+                    if error.kind == astra_core::ErrorKind::Network && attempt < max_retries =>
+                {
+                    last_err = error.message;
+                    last_kind = error.kind;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -8234,13 +8263,29 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
-        Some(
-            astra_services::byok_endpoint::endpoint_client(&url)
-                .await
-                .map_err(|error| {
-                    astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
-                })?,
-        )
+        let mut attempt = 0;
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            match prepare_compatible_endpoint(&url, remaining, LlmCancel::None).await {
+                Ok(client) => break Some(client),
+                Err(error)
+                    if error.kind == astra_core::ErrorKind::Network
+                        && attempt < LLM_MAX_RETRIES =>
+                {
+                    attempt += 1;
+                    let delay = std::time::Duration::from_millis(retry_backoff_ms(attempt));
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if delay >= remaining {
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ProviderDeadline,
+                            "LLM non-stream total budget exhausted while preparing the connection",
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     } else {
         None
     };
@@ -8930,6 +8975,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn compatible_endpoint_preparation_respects_policy_deadline_and_cancellation() {
+        let budget = std::time::Duration::from_secs(1);
+        for url in ["http://provider.example/v1", "https://127.0.0.1/v1"] {
+            let error = prepare_compatible_endpoint(url, budget, LlmCancel::None)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = prepare_compatible_endpoint(
+            "https://provider.example/v1",
+            budget,
+            LlmCancel::Token(&cancel),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        let error = prepare_compatible_endpoint(
+            "https://provider.example/v1",
+            std::time::Duration::ZERO,
+            LlmCancel::None,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, astra_core::ErrorKind::ProviderDeadline);
+    }
 
     #[tokio::test]
     async fn primary_streaming_and_nonstreaming_preserve_admitted_protocol_and_sampling() {
@@ -15531,6 +15608,14 @@ mod tests {
             ..Default::default()
         }
         .continuation(&connection, "model");
+        let key = astra_services::FernetTokenEncryptor::new("responses-fixture").unwrap();
+        crate::turn::llm::private_continuation::seal(
+            &mut assistant[CONTINUATION_KEY],
+            &key,
+            "owner",
+            "session",
+        )
+        .unwrap();
         let control = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
             "retry required Work",
             crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
@@ -15548,7 +15633,17 @@ mod tests {
                 history.push(json!({"role":"user", "content":"new question"}));
             }
             let canonical = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(history).unwrap();
-            let replay = request("model", &canonical, None, &connection, false, None).unwrap();
+            let mut opened = canonical.clone();
+            crate::turn::llm::private_continuation::open(
+                &mut opened,
+                &key,
+                "owner",
+                &HashSet::from(["session".to_string()]),
+                &connection,
+                "model",
+            )
+            .unwrap();
+            let replay = request("model", &opened, None, &connection, false, None).unwrap();
             assert!(
                 replay["input"]
                     .as_array()

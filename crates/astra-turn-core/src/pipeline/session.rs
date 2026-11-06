@@ -46,6 +46,8 @@ pub struct AdaptiveTurnInput<'a> {
     pub agent: &'a AgentContext,
     pub session: &'a SessionContext,
     pub turn: &'a TurnState,
+    /// Disposable provider-visible history used only for pressure planning.
+    pub planning_messages: Option<&'a [serde_json::Value]>,
     pub external: &'a ExternalSources,
     pub model_id: &'a str,
     pub query_source: &'a str,
@@ -209,6 +211,7 @@ impl PipelineSession {
 
         let run_input = PipelineRunInput {
             sources: &sources,
+            planning_messages: None,
             tokens: &input.turn.tokens,
             model_limit: input.session.model_limit,
             recovery: &self.recovery,
@@ -253,6 +256,7 @@ impl PipelineSession {
         };
         let run_input = AdaptivePipelineRunInput {
             sources: &sources,
+            planning_messages: input.planning_messages,
             tokens: &input.turn.tokens,
             model_limit: input.session.model_limit,
             recovery: &self.recovery,
@@ -993,6 +997,7 @@ mod tests {
 
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &statics,
                 agent: &agent,
                 session: &session,
@@ -1399,6 +1404,7 @@ mod tests {
         let external = test_external();
 
         let input = AdaptiveTurnInput {
+            planning_messages: None,
             statics: &statics,
             agent: &agent,
             session: &session,
@@ -1425,6 +1431,39 @@ mod tests {
     }
 
     #[test]
+    fn planning_uses_provider_projection_without_replacing_canonical_history() {
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let mut turn = test_turn_state(1);
+        turn.messages.push(serde_json::json!({"role":"assistant", "content":"answer", "private_storage":"x".repeat(1_000_000)}));
+        let original = turn.messages.clone();
+        let provider_view = vec![
+            serde_json::json!({"role":"user", "content":"hello"}),
+            serde_json::json!({"role":"assistant", "content":"answer"}),
+        ];
+        let external = test_external();
+        let mut pipeline = PipelineSession::new(PipelineConfig::default());
+        let output = pipeline
+            .run_turn_adaptive_with_history_owner(
+                AdaptiveTurnInput {
+                    statics: &statics,
+                    agent: &agent,
+                    session: &session,
+                    turn: &turn,
+                    planning_messages: Some(&provider_view),
+                    external: &external,
+                    model_id: "model",
+                    query_source: "runtime",
+                },
+                HistoryOptimizationOwner::DownstreamSemanticCompactor,
+            )
+            .unwrap();
+        assert_eq!(output.plan.compact_tier, CompactionTier::Normal);
+        assert_eq!(output.optimized.messages, original);
+    }
+
+    #[test]
     fn downstream_semantic_compactor_is_the_only_lossy_history_owner() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         let statics = test_statics();
@@ -1447,6 +1486,7 @@ mod tests {
         let output = sess
             .run_turn_adaptive_with_history_owner(
                 AdaptiveTurnInput {
+                    planning_messages: None,
                     statics: &statics,
                     agent: &agent,
                     session: &session,
@@ -1479,6 +1519,7 @@ mod tests {
         let external = test_external();
 
         let input = AdaptiveTurnInput {
+            planning_messages: None,
             statics: &statics,
             agent: &agent,
             session: &session,

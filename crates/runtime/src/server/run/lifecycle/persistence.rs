@@ -3195,6 +3195,26 @@ mod tests {
     }
 
     #[test]
+    fn server_loop_observer_never_exports_provider_reasoning() {
+        let mut state = observer_test_state();
+        state.messages[1][astra_core::model_wire::responses::CONTINUATION_KEY] = json!({
+            "items":[{"type":"reasoning", "content":[
+                {"type":"reasoning_text", "text":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}
+            ]}]
+        });
+        let request = build_server_loop_observer_request("user-1", "session-1", &state).unwrap();
+        let payload = serde_json::to_string(&request.messages).unwrap();
+        assert!(!payload.contains("_astra_responses"));
+        assert!(!payload.contains("reasoning_text"));
+        assert!(!payload.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(
+            state.messages[1]
+                .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn server_loop_observer_excludes_structured_memory_operation_turns() {
         let mut state = observer_test_state();
         state.messages = vec![
@@ -4314,6 +4334,315 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn current_turn_reasoning_cleanup_survives_replace_and_next_admission() {
+        use super::super::{AgenticRunLifecycleService, RootTurnStartParticipant};
+        use astra_services::{SessionContextCoordinator, runs::RunLifecycleService};
+        use astra_turn_types::{
+            ActorContextV1, ActorKindV1, AuthorityEpochsV1, CanonicalDeltaModeV1,
+            CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
+        };
+
+        let pool = setup_pool().await;
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        for completed in [true, false] {
+            let user = Uuid::new_v4().to_string();
+            let session = Uuid::new_v4().to_string();
+            let run_id = Uuid::new_v4().to_string();
+            let route = Uuid::new_v4().to_string();
+            let other_route = Uuid::new_v4().to_string();
+            crate::server::run::insert_active_run_session_fixture(&pool, &user, &session).await;
+            let key = SessionKeyV1::owner_session("server", &user, &session, "main");
+            let actor = ActorContextV1::owner_user(
+                &user,
+                "fixture",
+                ActorKindV1::Server,
+                SessionSurfaceV1::Server,
+                None,
+                AuthorityEpochsV1::default(),
+            );
+            let reservation = match coordinator
+                .acquire_writer_and_reserve_turn(
+                    &key,
+                    None,
+                    &actor,
+                    Duration::from_secs(60),
+                    "fixture-writer",
+                    "fixture-turn",
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                astra_services::AcquireWriterAndReserveTurnOutcome::Ready {
+                    reservation, ..
+                } => reservation,
+                other => panic!("unexpected admission: {other:?}"),
+            };
+            let encryptor = astra_services::FernetTokenEncryptor::new("fixture-key").unwrap();
+            let mut history = vec![
+                json!({"role":"user", "content":"old request ".repeat(1000)}),
+                json!({"role":"assistant", "content":"old answer ".repeat(1000)}),
+            ];
+            for scope in [&route, &other_route] {
+                let mut saved = json!({"connection_id":scope, "model":"model", "items":[
+                    {"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]},
+                    {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]}
+                ]});
+                crate::turn::llm::private_continuation::seal(
+                    &mut saved, &encryptor, &user, &session,
+                )
+                .unwrap();
+                history.push(json!({"role":"user", "content":"request"}));
+                history.push(json!({"role":"assistant", "content":"done", astra_core::model_wire::responses::CONTINUATION_KEY:saved}));
+            }
+            let delta = CanonicalTurnDeltaV1 {
+                schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                completed_turn: 1,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                compaction_generation: 0,
+                config_version_id: None,
+                mode: CanonicalDeltaModeV1::Append,
+                logical_segments: vec![history],
+            };
+            coordinator
+                .commit_turn_and_release_writer(&reservation, delta, "fixture-commit")
+                .await
+                .unwrap();
+
+            let owner = "reasoning-replace-owner";
+            let service = super::super::tests::db_backed_test_service(&pool, owner);
+            let request = super::super::tests::prepared_test_request("continue");
+            let mut participant = RootTurnStartParticipant {
+                service: &service,
+                user_id: &user,
+                session_id: &session,
+                run_id: &run_id,
+                request: &request,
+                admission: None,
+                prepared: None,
+                rejection: None,
+                full_llm_capture: None,
+            };
+            service
+                .run_engine
+                .admit_run_with_context(
+                    &run_id,
+                    &user,
+                    &session,
+                    Some(&session),
+                    crate::server::run::engine::RunStartContext {
+                        original_input: Some(request.message.clone()),
+                        ..Default::default()
+                    },
+                    true,
+                    &mut participant,
+                )
+                .await
+                .unwrap();
+            let mut admitted = participant.admission.take().unwrap();
+            let materialized = coordinator
+                .materialize(admitted.authority.base_head.as_ref().unwrap())
+                .await
+                .unwrap();
+            admitted.prior_messages = materialized.messages;
+            admitted.authorized_session_ids = Some(materialized.authorized_session_ids);
+            let cursor = &admitted.authority.base_head.as_ref().unwrap().cursor;
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            state.initialize_provider_canonical_wal_base(&admitted.prior_messages);
+            state.initialize_canonical_rewrite_proof(
+                &admitted.prior_messages,
+                &cursor.canonical_root_hash,
+                cursor.compaction_generation,
+            );
+            state.messages = admitted.prior_messages.clone();
+            state
+                .messages
+                .push(json!({"role":"user", "content":request.message}));
+            state
+                .messages
+                .push(json!({"role":"assistant", "content":"answer"}));
+            state.final_text = "answer".into();
+            let permit = state.begin_canonical_rewrite();
+            state.messages = crate::turn::cloud::compaction::prepare_prefix_summary(
+                &state.messages,
+                2,
+                astra_turn_core::cloud::history_summary::history_summary_message("summary".into()),
+                0,
+                128_000,
+                None,
+            )
+            .unwrap()
+            .messages;
+            state.finish_canonical_rewrite(permit);
+            let context = AgenticRunLifecycleService::prepare_canonical_turn_commit(
+                Some(&admitted),
+                &state.messages,
+                state.canonical_rewrite_proof(),
+                false,
+                completed.then_some((route.as_str(), "model")),
+                &run_id,
+            )
+            .unwrap()
+            .unwrap();
+            let settlement = CanonicalTerminalSettlement {
+                expected_owner_pod_id: owner,
+                expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
+                expected_owner_generation: admitted.authority.generation,
+                status: if completed {
+                    astra_core::STATUS_COMPLETED
+                } else {
+                    STATUS_FAILED
+                },
+                waiting_for: None,
+                error_message: (!completed).then_some("provider disconnected"),
+                error_code: (!completed).then_some("provider_connection_lost"),
+                error_kind: (!completed).then_some(astra_core::ErrorKind::Network),
+                error_metadata: None,
+                cancellation_origin: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                context_commit: Some(&context),
+            };
+            persist_server_loop_canonical_terminal_settlement(
+                &pool,
+                CanonicalLoopAppend {
+                    user_id: &user,
+                    session_id: &session,
+                    run_id: &run_id,
+                    expected_owner_generation: Some(admitted.authority.generation),
+                    owner_lease_duration: Some(Duration::from_secs(45)),
+                    trace_context: None,
+                    user_message: &request.message,
+                    include_terminal_assistant: true,
+                },
+                &state,
+                settlement,
+                None,
+            )
+            .await
+            .unwrap();
+            let head = coordinator.load_head(&key).await.unwrap().unwrap();
+            let restored = coordinator.materialize(&head).await.unwrap().messages;
+            let has_reasoning = |scope: &str| {
+                restored.iter().any(|message| {
+                    message[astra_core::model_wire::responses::CONTINUATION_KEY]["connection_id"]
+                        == scope
+                        && astra_core::model_wire::responses::has_reasoning_continuation(message)
+                })
+            };
+            assert_eq!(has_reasoning(&route), !completed);
+            assert!(has_reasoning(&other_route));
+            for (scope, expected) in [(&route, !completed), (&other_route, true)] {
+                let mut projected = restored.clone();
+                projected.push(json!({"role":"user", "content":"continue"}));
+                crate::turn::llm::private_continuation::open(
+                    &mut projected,
+                    &encryptor,
+                    &user,
+                    &HashSet::from([session.clone()]),
+                    scope,
+                    "model",
+                )
+                .unwrap();
+                let request = astra_core::model_wire::responses::request(
+                    "model", &projected, None, scope, false, None,
+                )
+                .unwrap();
+                assert_eq!(
+                    request["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["type"] == "reasoning"),
+                    expected
+                );
+            }
+
+            let next_run = Uuid::new_v4().to_string();
+            let next_request = super::super::tests::prepared_test_request("next turn");
+            let mut next = RootTurnStartParticipant {
+                service: &service,
+                user_id: &user,
+                session_id: &session,
+                run_id: &next_run,
+                request: &next_request,
+                admission: None,
+                prepared: None,
+                rejection: None,
+                full_llm_capture: None,
+            };
+            service
+                .run_engine
+                .admit_run_with_context(
+                    &next_run,
+                    &user,
+                    &session,
+                    Some(&session),
+                    crate::server::run::engine::RunStartContext {
+                        original_input: Some(next_request.message.clone()),
+                        ..Default::default()
+                    },
+                    true,
+                    &mut next,
+                )
+                .await
+                .unwrap();
+            let mut next_admitted = next.admission.take().unwrap();
+            let materialized = coordinator
+                .materialize(next_admitted.authority.base_head.as_ref().unwrap())
+                .await
+                .unwrap();
+            next_admitted.prior_messages = materialized.messages;
+            next_admitted.authorized_session_ids = Some(materialized.authorized_session_ids);
+            assert_eq!(next_admitted.prior_messages, restored);
+            let mut next_state = crate::turn::agentic_loop::host::make_test_loop_state();
+            next_state.initialize_provider_canonical_wal_base(&next_admitted.prior_messages);
+            let mut predecessor = restored.clone();
+            predecessor.push(json!({"role":"user", "content":"next turn"}));
+            let transition =
+                astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
+                    None,
+                    next_state.provider_canonical_wal_base.unwrap(),
+                    &predecessor,
+                    vec![],
+                )
+                .unwrap();
+            let mut replayed = restored.clone();
+            transition.apply_to(&mut replayed).unwrap();
+            assert_eq!(replayed, predecessor);
+            for table in [
+                "conversation_manifest_nodes",
+                "session_context_heads",
+                "session_context_operation_receipts",
+                "session_context_authority_events",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE owner_user_id = ? AND session_id = ?"
+                )))
+                .bind(&user)
+                .bind(&session)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            }
+            for table in ["agent_run_events", "agent_runs"] {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+                )))
+                .bind(&user)
+                .bind(&session)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            }
+            cleanup_core_persist_fixture_for_owner(pool.get(), &session, &user).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn canonical_terminal_rejects_colliding_evidence_before_settlement() {
         assert_canonical_terminal(TerminalCase::RawCollision).await;
     }
@@ -4524,6 +4853,7 @@ mod tests {
             &state.messages,
             None,
             false,
+            None,
             &run_id,
         )
         .unwrap()

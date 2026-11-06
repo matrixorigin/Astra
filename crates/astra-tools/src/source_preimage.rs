@@ -76,6 +76,7 @@ pub enum SourcePreimageStatus {
     Unchanged,
     Modified,
     Deleted,
+    Unknown,
 }
 
 impl SourcePreimageStatus {
@@ -84,6 +85,7 @@ impl SourcePreimageStatus {
             Self::Unchanged => "unchanged",
             Self::Modified => "modified",
             Self::Deleted => "deleted",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -173,9 +175,16 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         Uuid::new_v4()
     ));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        // Captured source can contain private data, regardless of the
+        // caller's umask or the permissions on its data directory.
+        let mut file = options
             .open(&temp)
             .map_err(|error| format!("cannot create source preimage temporary file: {error}"))?;
         file.write_all(bytes)
@@ -200,6 +209,24 @@ fn ensure_blob(store_root: &Path, hash: &str, bytes: &[u8]) -> Result<String, St
         .join(&hash[..2])
         .join(hash);
     if blob_path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&blob_path)
+                .map_err(|error| format!("cannot inspect retained source: {error}"))?;
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return Err("retained source has an unsafe owner or file type".into());
+            }
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("cannot protect retained source: {error}"))?;
+        }
         return Ok(blob_id);
     }
     atomic_write(&blob_path, bytes)?;
@@ -318,6 +345,9 @@ fn prepare_sources(
     let Some(raw_paths) = validate_source_artifact_args(args)? else {
         return Ok(None);
     };
+    if crate::rpc_bridge::is_run_script_rpc_dispatch() {
+        return Err("source_artifacts requires a separate foreground command; the parent script can modify the same files concurrently".into());
+    }
     if scope.trim().is_empty() {
         return Err(
             "source_artifacts requires an active owner/session execution identity; command was not run"
@@ -448,6 +478,9 @@ pub fn prepare_inferred(
     command: &str,
     scope: &str,
 ) -> Result<Option<PreparedSourcePreimages>, String> {
+    if crate::rpc_bridge::is_run_script_rpc_dispatch() {
+        return Ok(None);
+    }
     #[cfg(unix)]
     {
         let inspection =
@@ -477,6 +510,9 @@ pub fn prepare_inferred_with_inspection(
     command: &str,
     scope: &str,
 ) -> Result<Option<PreparedSourcePreimages>, String> {
+    if crate::rpc_bridge::is_run_script_rpc_dispatch() {
+        return Ok(None);
+    }
     let opened = std::cell::RefCell::new(std::collections::HashMap::new());
     let paths = infer_source_artifacts_with(
         command,
@@ -831,15 +867,15 @@ fn infer_source_artifacts_with(
     paths
 }
 
-/// Restore a completed receipt for the current owner/session. The caller
+/// Load a completed receipt for the current owner/session. The caller
 /// supplies only its stable owner scope (not another call's full invocation
 /// scope); the receipt store is namespaced by that stable prefix and the
 /// receipt itself still records the original full binding for audit.
-pub fn restore_receipt(
+pub fn prepare_receipt_restore(
     workspace_root: &Path,
     owner_scope: &str,
     receipt_id: &str,
-) -> Result<(), String> {
+) -> Result<PreparedSourcePreimages, String> {
     if owner_scope.trim().is_empty() {
         return Err("source receipt restore requires an active owner/session identity".into());
     }
@@ -859,7 +895,15 @@ pub fn restore_receipt(
     if scope_namespace(&receipt.scope) != scope_namespace(owner_scope) {
         return Err("source receipt belongs to a different owner/session".into());
     }
-    PreparedSourcePreimages {
+    if receipt.entries.iter().any(|entry| {
+        !matches!(
+            entry.status.as_deref(),
+            Some("unchanged" | "modified" | "deleted")
+        )
+    }) {
+        return Err("source receipt was not completed; no files were restored".into());
+    }
+    Ok(PreparedSourcePreimages {
         #[cfg(unix)]
         inspection: astra_sandbox::PinnedWorkspaceInspection::from_paths(&root, &root)
             .map_err(|error| error.to_string())?,
@@ -868,8 +912,7 @@ pub fn restore_receipt(
         receipt_path,
         mode: SourcePreimageMode::Declared,
         receipt,
-    }
-    .restore()
+    })
 }
 
 /// Produce a concise model-facing advisory only when best-effort inference
@@ -877,6 +920,11 @@ pub fn restore_receipt(
 /// opaque receipt id is consumed by the receipt-aware rollback surface.
 pub fn advisory_text(metadata: &Map<String, Value>) -> Option<String> {
     let preimage = metadata.get("source_preimage")?.as_object()?;
+    if preimage.get("restore_available").and_then(Value::as_bool) == Some(false) {
+        return Some(
+            "Source recovery could not be verified; automatic restoration is unavailable.".into(),
+        );
+    }
     if preimage.get("mode").and_then(Value::as_str) != Some("inferred_advisory")
         || preimage.get("status").and_then(Value::as_str) != Some("changed")
     {
@@ -903,70 +951,22 @@ pub fn advisory_text(metadata: &Map<String, Value>) -> Option<String> {
         return None;
     }
     Some(format!(
-        "[source preimage advisory: inferred source changed ({}) — original bytes were retained; if they are needed, restore receipt_id={} with rollback_file_edits(scope=source_receipt) before continuing. This was best-effort, not an explicit source_artifacts guarantee.]",
+        "[A pre-command copy was retained for {} (receipt {}). The current files differ, but the cause is unknown; inspect them before deciding whether to restore the copy.]",
         changed_paths.join(", "),
         receipt_id
     ))
 }
 
-/// Return the compact, executor-authored recovery fact carried by an inferred
-/// source-preimage receipt.  Consumers must use this validator instead of
-/// treating an arbitrary `source_preimage` object as runtime authority.
-///
-/// This is deliberately narrower than [`advisory_text`]: declared source
-/// artifacts may be changed intentionally, while an inferred source change is
-/// only an advisory that the original evidence may need recovery.
-pub fn inferred_recovery_fact(metadata: &Map<String, Value>) -> Option<Value> {
-    let preimage = metadata.get("source_preimage")?.as_object()?;
-    if preimage.get("schema_version").and_then(Value::as_u64) != Some(1)
-        || preimage.get("source").and_then(Value::as_str) != Some("astra_source_preimage_store")
-        || preimage.get("mode").and_then(Value::as_str) != Some("inferred_advisory")
-        || preimage.get("guarantee").and_then(Value::as_bool) != Some(false)
-        || preimage.get("status").and_then(Value::as_str) != Some("changed")
-        || preimage.get("restore_available").and_then(Value::as_bool) != Some(true)
-    {
-        return None;
-    }
-    let receipt_id = preimage.get("receipt_id").and_then(Value::as_str)?;
-    Uuid::parse_str(receipt_id).ok()?;
-    let changed_paths = preimage
-        .get("entries")?
-        .as_array()?
-        .iter()
-        .filter(|entry| {
-            matches!(
-                entry.get("status").and_then(Value::as_str),
-                Some("modified" | "deleted")
-            )
-        })
-        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
-        .filter(|path| {
-            let path = Path::new(path);
-            !path.as_os_str().is_empty()
-                && !path.is_absolute()
-                && !path.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::ParentDir
-                            | std::path::Component::RootDir
-                            | std::path::Component::Prefix(_)
-                    )
-                })
-        })
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if changed_paths.is_empty() {
-        return None;
-    }
-    Some(json!({
-        "schema_version": 1,
-        "source": "astra_source_preimage_store",
-        "receipt_id": receipt_id,
-        "changed_paths": changed_paths,
-    }))
-}
-
 impl PreparedSourcePreimages {
+    /// Paths that a completed receipt would restore.
+    pub fn restore_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.receipt
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.status.as_deref(), Some("modified" | "deleted")))
+            .map(|entry| self.root.join(&entry.path))
+    }
+
     /// Compare the declared sources after command execution and persist the
     /// terminal receipt. The returned object is safe to expose as tool
     /// metadata: it contains no host storage paths or copied bytes.
@@ -978,14 +978,14 @@ impl PreparedSourcePreimages {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     SourcePreimageStatus::Deleted
                 }
-                Err(_) => SourcePreimageStatus::Modified,
+                Err(_) => SourcePreimageStatus::Unknown,
                 Ok(source)
                     if entry
                         .parent_identity
                         .as_deref()
                         .is_some_and(|expected| expected != source.parent_identity) =>
                 {
-                    SourcePreimageStatus::Modified
+                    SourcePreimageStatus::Unknown
                 }
                 Ok(source) => {
                     match hash_opened_source(source.file, &entry.path, MAX_SOURCE_ARTIFACT_BYTES) {
@@ -994,7 +994,7 @@ impl PreparedSourcePreimages {
                             entry.post_sha256 = Some(hash);
                             SourcePreimageStatus::Modified
                         }
-                        Err(_) => SourcePreimageStatus::Modified,
+                        Err(_) => SourcePreimageStatus::Unknown,
                     }
                 }
             };
@@ -1003,19 +1003,19 @@ impl PreparedSourcePreimages {
                 let path = self.root.join(Path::new(&entry.path));
                 let status = match fs::symlink_metadata(&path) {
                     Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                        SourcePreimageStatus::Modified
+                        SourcePreimageStatus::Unknown
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         SourcePreimageStatus::Deleted
                     }
-                    Err(_) => SourcePreimageStatus::Modified,
+                    Err(_) => SourcePreimageStatus::Unknown,
                     Ok(_) => match hash_file(&path) {
                         Ok((_, hash)) if hash == entry.sha256 => SourcePreimageStatus::Unchanged,
                         Ok((_, hash)) => {
                             entry.post_sha256 = Some(hash);
                             SourcePreimageStatus::Modified
                         }
-                        Err(_) => SourcePreimageStatus::Modified,
+                        Err(_) => SourcePreimageStatus::Unknown,
                     },
                 };
                 status
@@ -1030,9 +1030,17 @@ impl PreparedSourcePreimages {
                 "post_sha256": entry.post_sha256,
             }));
         }
-        if let Ok(manifest) = serde_json::to_vec_pretty(&self.receipt) {
-            let _ = atomic_write(&self.receipt_path, &manifest);
-        }
+        let postimages_known = self.receipt.entries.iter().all(|entry| {
+            matches!(
+                entry.status.as_deref(),
+                Some("unchanged" | "modified" | "deleted")
+            )
+        });
+        let persisted = serde_json::to_vec_pretty(&self.receipt)
+            .map_err(|error| error.to_string())
+            .and_then(|manifest| atomic_write(&self.receipt_path, &manifest))
+            .is_ok();
+        let restore_available = persisted && postimages_known;
         let changed = statuses.iter().any(|status| {
             matches!(
                 status.get("status").and_then(Value::as_str),
@@ -1048,9 +1056,9 @@ impl PreparedSourcePreimages {
                 "receipt_id": self.receipt.receipt_id,
                 "mode": self.mode.as_str(),
                 "guarantee": matches!(self.mode, SourcePreimageMode::Declared),
-                "status": if changed { "changed" } else { "unchanged" },
+                "status": if !postimages_known { "unknown" } else if changed { "changed" } else { "unchanged" },
                 "entries": statuses,
-                "restore_available": true,
+                "restore_available": restore_available,
             }),
         );
         result
@@ -1060,6 +1068,14 @@ impl PreparedSourcePreimages {
     /// current file still matches the recorded post-image. A third-party edit
     /// after the command therefore fails closed instead of being overwritten.
     pub fn restore(&self) -> Result<(), String> {
+        if self.receipt.entries.iter().any(|entry| {
+            !matches!(
+                entry.status.as_deref(),
+                Some("unchanged" | "modified" | "deleted")
+            )
+        }) {
+            return Err("source receipt was not completed; no files were restored".into());
+        }
         #[cfg(unix)]
         if !self
             .inspection
@@ -1068,6 +1084,7 @@ impl PreparedSourcePreimages {
         {
             return Err("restore conflict: workspace binding changed".into());
         }
+        let mut restored = Vec::new();
         for entry in &self.receipt.entries {
             let Some(status) = entry.status.as_deref() else {
                 continue;
@@ -1075,70 +1092,154 @@ impl PreparedSourcePreimages {
             if !matches!(status, "modified" | "deleted") {
                 continue;
             }
-            let blob_hash = entry
-                .blob_id
-                .strip_prefix("sha256:")
-                .ok_or_else(|| "invalid source preimage blob id".to_string())?;
-            let blob = self
-                .store_root
-                .join("blobs")
-                .join("sha256")
-                .join(&blob_hash[..2])
-                .join(blob_hash);
-            let bytes = fs::read(&blob)
-                .map_err(|error| format!("cannot read source preimage blob: {error}"))?;
-            #[cfg(unix)]
-            {
-                use std::io::{Seek, SeekFrom};
-                let mut file = self
-                    .inspection
-                    .open_for_restore(
-                        Path::new(&entry.path),
-                        entry.post_sha256.is_none(),
-                        entry.parent_identity.as_deref(),
+            let result = (|| -> Result<(), String> {
+                let blob_hash = entry
+                    .blob_id
+                    .strip_prefix("sha256:")
+                    .filter(|hash| hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()))
+                    .ok_or_else(|| "invalid source preimage blob id".to_string())?;
+                let blob = self
+                    .store_root
+                    .join("blobs")
+                    .join("sha256")
+                    .join(&blob_hash[..2])
+                    .join(blob_hash);
+                let bytes = fs::read(&blob)
+                    .map_err(|error| format!("cannot read source preimage blob: {error}"))?;
+                if hash_bytes(&bytes) != blob_hash || entry.sha256 != blob_hash {
+                    return Err("source preimage blob is corrupted".into());
+                }
+                #[cfg(unix)]
+                {
+                    let parent_id = entry.parent_identity.as_deref().ok_or_else(|| {
+                        format!("restore conflict: `{}` has no parent identity", entry.path)
+                    })?;
+                    let relative = Path::new(&entry.path);
+                    let (parent, name) = self
+                        .inspection
+                        .open_restore_parent(relative, Some(parent_id))
+                        .map_err(|error| format!("restore conflict: `{}`: {error}", entry.path))?;
+                    let current = if status == "modified" {
+                        let expected = entry.post_sha256.as_deref().ok_or_else(|| {
+                            format!(
+                                "restore conflict: `{}` has no recorded post-image",
+                                entry.path
+                            )
+                        })?;
+                        let source =
+                            self.inspection
+                                .open_source(relative, true)
+                                .map_err(|error| {
+                                    format!("restore conflict: `{}`: {error}", entry.path)
+                                })?;
+                        if source.parent_identity != parent_id {
+                            return Err(format!(
+                                "restore conflict: `{}` parent changed",
+                                entry.path
+                            ));
+                        }
+                        let (current, hash) = hash_opened_source(
+                            source.file,
+                            &entry.path,
+                            MAX_SOURCE_ARTIFACT_BYTES,
+                        )?;
+                        // A previous attempt may already have restored this
+                        // path before a later path conflicted.
+                        if hash == blob_hash {
+                            return Ok(());
+                        }
+                        if hash != expected {
+                            return Err(format!(
+                                "restore conflict: `{}` changed after the command",
+                                entry.path
+                            ));
+                        }
+                        Some(current)
+                    } else if entry.post_sha256.is_none() {
+                        match self.inspection.open_source(relative, true) {
+                            Ok(source) if source.parent_identity == parent_id => {
+                                let (_, hash) = hash_opened_source(
+                                    source.file,
+                                    &entry.path,
+                                    MAX_SOURCE_ARTIFACT_BYTES,
+                                )?;
+                                if hash == blob_hash {
+                                    return Ok(());
+                                }
+                                return Err(format!(
+                                    "restore conflict: `{}` was recreated",
+                                    entry.path
+                                ));
+                            }
+                            Ok(_) => {
+                                return Err(format!(
+                                    "restore conflict: `{}` parent changed",
+                                    entry.path
+                                ));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(error) => {
+                                return Err(format!("restore conflict: `{}`: {error}", entry.path));
+                            }
+                        }
+                    } else {
+                        return Err(format!(
+                            "restore conflict: `{}` has inconsistent post-image",
+                            entry.path
+                        ));
+                    };
+                    crate::fs_ops::restore_file_in_open_parent(
+                        &parent,
+                        Path::new(&name),
+                        current.as_deref(),
+                        Some(&bytes),
                     )
                     .map_err(|error| format!("restore conflict: `{}`: {error}", entry.path))?;
-                if let Some(expected_post) = entry.post_sha256.as_deref() {
-                    let (_, current) = hash_opened_source(
-                        file.try_clone().map_err(|error| error.to_string())?,
-                        &entry.path,
-                        MAX_SOURCE_ARTIFACT_BYTES,
-                    )?;
-                    if current != expected_post {
-                        return Err(format!(
-                            "restore conflict: `{}` changed after the command",
-                            entry.path
-                        ));
-                    }
                 }
-                file.seek(SeekFrom::Start(0))
-                    .map_err(|error| error.to_string())?;
-                file.set_len(0).map_err(|error| error.to_string())?;
-                file.write_all(&bytes)
-                    .map_err(|error| format!("cannot restore `{}`: {error}", entry.path))?;
-            }
-            #[cfg(not(unix))]
-            {
-                let path = self.root.join(Path::new(&entry.path));
-                if let Some(expected_post) = entry.post_sha256.as_deref() {
-                    let current = hash_file(&path).map(|(_, hash)| hash).map_err(|_| {
-                        format!("restore conflict: `{}` is no longer readable", entry.path)
-                    })?;
-                    if current != expected_post {
-                        return Err(format!(
-                            "restore conflict: `{}` changed after the command",
-                            entry.path
-                        ));
+                #[cfg(not(unix))]
+                {
+                    let path = self.root.join(Path::new(&entry.path));
+                    if status == "modified" {
+                        let expected = entry.post_sha256.as_deref().ok_or_else(|| {
+                            format!(
+                                "restore conflict: `{}` has no recorded post-image",
+                                entry.path
+                            )
+                        })?;
+                        let current = hash_file(&path).map(|(_, hash)| hash).map_err(|_| {
+                            format!("restore conflict: `{}` is no longer readable", entry.path)
+                        })?;
+                        if current == blob_hash {
+                            return Ok(());
+                        }
+                        if current != expected {
+                            return Err(format!(
+                                "restore conflict: `{}` changed after the command",
+                                entry.path
+                            ));
+                        }
+                    } else if path.exists() {
+                        if hash_file(&path).is_ok_and(|(_, hash)| hash == blob_hash) {
+                            return Ok(());
+                        }
+                        return Err(format!("restore conflict: `{}` was recreated", entry.path));
                     }
-                } else if path.exists() {
-                    return Err(format!(
-                        "restore conflict: `{}` has no recorded post-image",
-                        entry.path
-                    ));
+                    fs::write(&path, bytes)
+                        .map_err(|error| format!("cannot restore `{}`: {error}", entry.path))?;
                 }
-                fs::write(&path, bytes)
-                    .map_err(|error| format!("cannot restore `{}`: {error}", entry.path))?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                return if restored.is_empty() {
+                    Err(error)
+                } else {
+                    Err(format!(
+                        "{error}; already restored: {}",
+                        restored.join(", ")
+                    ))
+                };
             }
+            restored.push(entry.path.as_str());
         }
         Ok(())
     }
@@ -1162,6 +1263,123 @@ mod tests {
         let result = f(&store);
         unsafe { std::env::remove_var("_ASTRA_SOURCE_PREIMAGE_ROOT") };
         result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(source_preimage_env)]
+    fn source_restore_reports_partial_results_and_refuses_hardlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        with_store(|_| {
+            let workspace = TempDir::new().unwrap();
+            let first = workspace.path().join("first");
+            let second = workspace.path().join("second");
+            let linked = workspace.path().join("linked");
+            fs::write(&first, b"first before").unwrap();
+            fs::write(&second, b"second before").unwrap();
+            let mut plan = prepare(workspace.path(), &args(&["first", "second"]), "cli:test")
+                .unwrap()
+                .unwrap();
+            fs::write(&first, b"first after").unwrap();
+            fs::write(&second, b"second after").unwrap();
+            plan.finish();
+            fs::hard_link(&second, &linked).unwrap();
+
+            let error = plan.restore().unwrap_err();
+            assert!(error.contains("already restored: first"), "{error}");
+            assert_eq!(fs::read(&first).unwrap(), b"first before");
+            assert_eq!(fs::read(&second).unwrap(), b"second after");
+            assert_eq!(fs::read(&linked).unwrap(), b"second after");
+            fs::remove_file(&linked).unwrap();
+            plan.restore().unwrap();
+            assert_eq!(fs::read(&first).unwrap(), b"first before");
+            assert_eq!(fs::read(&second).unwrap(), b"second before");
+            let hash = plan.receipt.entries[0]
+                .blob_id
+                .strip_prefix("sha256:")
+                .unwrap();
+            let blob = plan
+                .store_root
+                .join("blobs/sha256")
+                .join(&hash[..2])
+                .join(hash);
+            assert_eq!(
+                fs::metadata(blob).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(source_preimage_env)]
+    fn deleted_private_source_stays_private_when_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        with_store(|_| {
+            let workspace = TempDir::new().unwrap();
+            let path = workspace.path().join("private");
+            fs::write(&path, b"private data").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let mut plan = prepare(workspace.path(), &args(&["private"]), "cli:test")
+                .unwrap()
+                .unwrap();
+            assert!(plan.restore().is_err());
+            fs::remove_file(&path).unwrap();
+            plan.finish();
+            plan.restore().unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(source_preimage_env)]
+    fn incomplete_or_unpersisted_receipt_never_claims_restore_is_available() {
+        with_store(|_| {
+            let workspace = TempDir::new().unwrap();
+            let path = workspace.path().join("input");
+            fs::write(&path, b"before").unwrap();
+            let mut plan = prepare(workspace.path(), &args(&["input"]), "cli:test")
+                .unwrap()
+                .unwrap();
+            let id = plan.receipt.receipt_id.clone();
+            assert!(prepare_receipt_restore(workspace.path(), "cli:test", &id).is_err());
+            fs::write(&path, b"after").unwrap();
+            fs::remove_file(&plan.receipt_path).unwrap();
+            fs::remove_dir(plan.receipt_path.parent().unwrap()).unwrap();
+            fs::write(plan.receipt_path.parent().unwrap(), b"not a directory").unwrap();
+            let metadata = plan.finish();
+            assert_eq!(metadata["source_preimage"]["restore_available"], false);
+            assert!(advisory_text(&metadata).is_some());
+            assert!(prepare_receipt_restore(workspace.path(), "cli:test", &id).is_err());
+            assert_eq!(fs::read(path).unwrap(), b"after");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(source_preimage_env)]
+    fn unknown_postimage_preserves_snapshot_but_cannot_be_restored() {
+        with_store(|_| {
+            let workspace = TempDir::new().unwrap();
+            let path = workspace.path().join("input");
+            fs::write(&path, b"before").unwrap();
+            let mut plan = prepare(workspace.path(), &args(&["input"]), "cli:test")
+                .unwrap()
+                .unwrap();
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let metadata = plan.finish();
+            assert_eq!(metadata["source_preimage"]["status"], "unknown");
+            assert_eq!(metadata["source_preimage"]["restore_available"], false);
+            assert!(
+                prepare_receipt_restore(workspace.path(), "cli:test", &plan.receipt.receipt_id)
+                    .is_err()
+            );
+            assert!(path.is_dir());
+            assert!(plan.store_root.join("blobs/sha256").exists());
+        });
     }
 
     #[cfg(unix)]
@@ -1402,61 +1620,17 @@ mod tests {
     }
 
     #[test]
-    fn inferred_recovery_fact_requires_executor_schema_and_changed_relative_paths() {
-        let receipt = "00000000-0000-4000-8000-000000000001";
-        let valid = Map::from_iter([(
+    fn source_snapshot_advisory_does_not_attribute_another_writer_or_direct_a_restore() {
+        let fields = Map::from_iter([(
             "source_preimage".into(),
             json!({
-                "schema_version": 1,
-                "source": "astra_source_preimage_store",
-                "receipt_id": receipt,
-                "mode": "inferred_advisory",
-                "guarantee": false,
-                "status": "changed",
-                "entries": [{"path": "input.bin", "status": "deleted"}],
-                "restore_available": true,
+                "mode": "inferred_advisory", "status": "changed", "restore_available": true,
+                "receipt_id": "snapshot", "entries": [{"path": "input.bin", "status": "modified"}],
             }),
         )]);
-        assert_eq!(
-            inferred_recovery_fact(&valid).unwrap()["changed_paths"][0],
-            "input.bin"
-        );
-
-        for invalid in [
-            json!({
-                "schema_version": 1,
-                "source": "external_tool",
-                "receipt_id": receipt,
-                "mode": "inferred_advisory",
-                "guarantee": false,
-                "status": "changed",
-                "entries": [{"path": "input.bin", "status": "deleted"}],
-                "restore_available": true,
-            }),
-            json!({
-                "schema_version": 1,
-                "source": "astra_source_preimage_store",
-                "receipt_id": receipt,
-                "mode": "declared",
-                "guarantee": true,
-                "status": "changed",
-                "entries": [{"path": "input.bin", "status": "deleted"}],
-                "restore_available": true,
-            }),
-            json!({
-                "schema_version": 1,
-                "source": "astra_source_preimage_store",
-                "receipt_id": receipt,
-                "mode": "inferred_advisory",
-                "guarantee": false,
-                "status": "changed",
-                "entries": [{"path": "../outside", "status": "deleted"}],
-                "restore_available": true,
-            }),
-        ] {
-            let fields = Map::from_iter([("source_preimage".into(), invalid)]);
-            assert!(inferred_recovery_fact(&fields).is_none());
-        }
+        let advisory = advisory_text(&fields).unwrap();
+        assert!(advisory.contains("cause is unknown"));
+        assert!(!advisory.contains("before continuing"));
     }
 
     #[cfg(target_os = "linux")]
@@ -1499,9 +1673,14 @@ mod tests {
             fs::remove_file(workspace.path().join("a")).unwrap();
             let receipt_id = plan.receipt.receipt_id.clone();
             plan.finish();
-            restore_receipt(workspace.path(), "cli:session-1", &receipt_id).unwrap();
+            prepare_receipt_restore(workspace.path(), "cli:session-1", &receipt_id)
+                .unwrap()
+                .restore()
+                .unwrap();
             assert_eq!(fs::read(workspace.path().join("a")).unwrap(), b"before");
-            assert!(restore_receipt(workspace.path(), "cli:session-2", &receipt_id).is_err());
+            assert!(
+                prepare_receipt_restore(workspace.path(), "cli:session-2", &receipt_id).is_err()
+            );
         });
     }
 }

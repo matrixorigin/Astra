@@ -293,6 +293,13 @@ async fn stream_chat_sse_inner(
         let ex = edge_tools::ToolExecutor::new(&project_root)
             .with_cloud(p.api.api_origin(), p.token)
             .with_memory_attribution_id(parent_turn_run_id.clone());
+        // Bind the shared owner before restoring the session so a selected
+        // checkout is validated once per session, not once per turn.
+        let ex = if let Some(ref journal) = p.git_worktree_journal {
+            ex.with_shared_git_worktree_journal(journal.clone())
+        } else {
+            ex
+        };
         let ex = if let Some(session_id) = p.session_id {
             ex.with_active_session_id(session_id.to_string())
         } else {
@@ -316,11 +323,6 @@ async fn stream_chat_sse_inner(
             ex
         };
 
-        let ex = if let Some(ref journal) = p.git_worktree_journal {
-            ex.with_shared_git_worktree_journal(journal.clone())
-        } else {
-            ex
-        };
         let ex = if let Some(ref journal) = p.session_state_journal {
             ex.with_shared_session_state_journal(journal.clone())
         } else {

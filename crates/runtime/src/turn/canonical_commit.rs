@@ -59,6 +59,12 @@ pub(crate) fn sanitize_provider_canonical_wal_snapshot(
 }
 
 impl CanonicalRewriteProof {
+    /// A rewrite requires the whole replacement, not just the appended
+    /// suffix, to fit the next canonical commit.
+    pub(crate) fn requires_full_commit_budget(&self) -> bool {
+        self.rewritten || !self.valid
+    }
+
     /// Binds a rewrite proof to history materialized from the admitted manifest.
     ///
     /// The caller must pass the messages returned by coordinator materialization

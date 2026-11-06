@@ -671,14 +671,17 @@ fn prepared_workspace_restore_from_workspace(
 fn load_prepared_workspace_restore(
     restored: &RestoredSession,
     state: &SessionState,
+    local_journal_exists: bool,
 ) -> Result<PreparedWorkspaceRestore, String> {
-    if let Some(workspace) = restored.workspace.clone() {
-        return prepared_workspace_restore_from_workspace(Some(workspace), state);
-    }
-    match session_workspace::read_workspace(&restored.session_id) {
-        Ok(ws) => prepared_workspace_restore_from_workspace(Some(ws), state),
+    let mut lost_selection = None;
+    let local = match session_workspace::read_workspace(&restored.session_id) {
+        Ok(ws) => Some(ws),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            prepared_workspace_restore_from_workspace(None, state)
+            if local_journal_exists {
+                lost_selection =
+                    Some("local workspace metadata was missing during resume".to_string());
+            }
+            None
         }
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             let backup = session_workspace::backup_invalid_workspace_file(&restored.session_id)
@@ -694,19 +697,30 @@ fn load_prepared_workspace_restore(
                 backup_path = ?backup,
                 "workspace metadata unreadable during resume; rebuilding from restored session"
             );
-            let model_for_new = restored.model.as_deref().unwrap_or("default");
-            let mut workspace =
-                session_workspace::WorkspaceMetadata::new(&restored.session_id, model_for_new);
-            workspace.last_persistence_error = Some(format!(
+            lost_selection = Some(format!(
                 "workspace metadata unreadable during resume; rebuilt from journal/checkpoint ({e})"
             ));
-            prepared_workspace_restore_from_workspace(Some(workspace), state)
+            None
         }
-        Err(e) => Err(format!(
-            "read workspace state for session {}: {e}",
-            restored.session_id
-        )),
+        Err(e) => {
+            return Err(format!(
+                "read workspace state for session {}: {e}",
+                restored.session_id
+            ));
+        }
+    };
+    let mut workspace = restored.workspace.clone().or(local);
+    if let Some(reason) = lost_selection {
+        let workspace = workspace.get_or_insert_with(|| {
+            session_workspace::WorkspaceMetadata::new(
+                &restored.session_id,
+                restored.model.as_deref().unwrap_or("default"),
+            )
+        });
+        workspace.selected_worktree = Some(session_workspace::SelectedWorktree::Unknown);
+        workspace.last_persistence_error = Some(reason);
     }
+    prepared_workspace_restore_from_workspace(workspace, state)
 }
 
 fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &PreparedWorkspaceRestore) {
@@ -1063,7 +1077,8 @@ async fn apply_restored_session(
     let total_cache_creation_tokens = restored
         .total_cache_creation_tokens
         .max(local_state.total_cache_creation_tokens);
-    let prepared_workspace = load_prepared_workspace_restore(&restored, state)?;
+    let prepared_workspace =
+        load_prepared_workspace_restore(&restored, state, local_journal.exists)?;
     let prepared_history = prepare_session_history(&restored.session_id).await?;
     let use_typed_continuation = match (
         prepared_history.resume.as_ref(),
@@ -2280,6 +2295,10 @@ mod resume_tests {
             .expect("resume should rewrite readable workspace metadata");
         assert_eq!(rebuilt.session_id, session_id);
         assert_eq!(rebuilt.turn_count, 2);
+        assert_eq!(
+            rebuilt.selected_worktree,
+            Some(session_workspace::SelectedWorktree::Unknown)
+        );
         assert!(
             rebuilt
                 .last_persistence_error
@@ -2298,6 +2317,54 @@ mod resume_tests {
             })
             .count();
         assert_eq!(backup_count, 1, "corrupt workspace should be preserved");
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("file.txt"), "current workspace").unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(project.path())
+            .with_active_session_id(&session_id);
+        let blocked = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path":"file.txt"}))
+            .await;
+        assert!(
+            blocked.is_error && blocked.output.contains("workspace selection was lost"),
+            "{blocked:?}"
+        );
+        let exit = serde_json::json!({"action":"exit", "exit_action":"keep"});
+        let unconfirmed = executor.execute_with_metadata("worktree", &exit).await;
+        assert!(
+            unconfirmed.is_error && unconfirmed.output.contains("confirm"),
+            "{unconfirmed:?}"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::cli::chat_stream::AskUserRequest>(1);
+        executor.set_ask_user_request_tx(Some(tx));
+        let answer = async {
+            let request = rx.recv().await.unwrap();
+            let question = &request.prompt.questions[0];
+            request
+                .response_tx
+                .send(crate::cli::chat_stream::AskUserResponse::Submitted(
+                    astra_tools::AskUserAnswers {
+                        answers: vec![astra_tools::AskUserQuestionAnswer {
+                            id: question.id.clone(),
+                            question: question.question.clone(),
+                            answers: vec!["Use this directory".into()],
+                            multi_select: false,
+                            annotation: None,
+                        }],
+                    },
+                ))
+                .unwrap();
+        };
+        let (confirmed, ()) =
+            tokio::join!(executor.execute_with_metadata("worktree", &exit), answer);
+        assert!(!confirmed.is_error, "{confirmed:?}");
+        let read = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path":"file.txt"}))
+            .await;
+        assert!(
+            !read.is_error && read.output.contains("current workspace"),
+            "{read:?}"
+        );
     }
 
     #[test]

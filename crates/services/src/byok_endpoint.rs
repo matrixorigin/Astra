@@ -2,23 +2,23 @@
 //! Public HTTPS is the default; optional strict mode uses the administrator registry.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 pub const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 pub const ENDPOINT_POLICY_ENV: &str = "ASTRA_BYOK_ENDPOINT_POLICY";
-mod dns;
 mod proxy;
 
 /// Keeps any private CONNECT tunnel alive for the entire response/stream lifetime.
 pub struct EndpointClient {
     client: reqwest::Client,
-    tunnel: Option<tokio::task::JoinHandle<()>>,
+    _tunnel: Option<proxy::RouteLease>,
 }
 impl From<reqwest::Client> for EndpointClient {
     fn from(client: reqwest::Client) -> Self {
         Self {
             client,
-            tunnel: None,
+            _tunnel: None,
         }
     }
 }
@@ -28,22 +28,6 @@ impl std::ops::Deref for EndpointClient {
         &self.client
     }
 }
-impl Drop for EndpointClient {
-    fn drop(&mut self) {
-        if let Some(task) = &self.tunnel {
-            task.abort();
-        }
-    }
-}
-
-fn configured_value(name: &str) -> Result<Option<String>, String> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(_) => Err(format!("Invalid {name}")),
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointPolicy {
     PublicHttps,
@@ -234,7 +218,7 @@ fn transport_builder() -> reqwest::ClientBuilder {
 
 fn validate_addresses(addresses: &[SocketAddr]) -> Result<(), String> {
     if addresses.is_empty() || addresses.iter().any(|addr| !public_ip(addr.ip())) {
-        return Err("Astra Server DNS returned non-public model addresses (possibly proxy Fake-IP). Configure ASTRA_BYOK_DNS_SERVERS to return real public addresses; the model API key is not the cause.".into());
+        return Err("Astra Server DNS returned non-public model addresses (possibly proxy Fake-IP). Configure the Server's DNS to return public addresses; the model API key is not the cause.".into());
     }
     Ok(())
 }
@@ -251,20 +235,211 @@ fn pinned_client(url: &reqwest::Url, addresses: &[SocketAddr]) -> Result<reqwest
 
 /// Resolve and pin a fresh public address set for each outbound attempt.
 /// TLS still validates the original hostname. Redirects never forward keys.
-pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, String> {
-    let url = parse_endpoint(raw)?;
-    let proxy = proxy::EgressProxy::parse(configured_value(proxy::PROXY_ENV)?.as_deref())?;
-    let addresses = dns::resolve(&url, configured_value(dns::DNS_SERVERS_ENV)?.as_deref()).await?;
-    validate_addresses(&addresses)?;
+pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, astra_core::ClassifiedError> {
+    use astra_core::{ClassifiedError, ErrorKind};
+    let invalid = |message| ClassifiedError::new(ErrorKind::InvalidRequest, message);
+    let network = |message| ClassifiedError::new(ErrorKind::Network, message);
+    let url = parse_endpoint(raw).map_err(invalid)?;
+    let proxy_url = astra_core::net::configured_https_proxy_url_for(&url)
+        .map_err(|message| invalid(message.to_owned()))?;
+    let proxy = proxy::EgressProxy::parse(proxy_url.as_deref()).map_err(invalid)?;
+    let addresses = resolve_addresses(&url).await.map_err(network)?;
+    validate_addresses(&addresses)
+        .map_err(|message| ClassifiedError::new(ErrorKind::PolicyDenied, message))?;
     match proxy {
-        Some(proxy) => proxy::client(&url, &addresses, proxy, transport_builder()).await,
-        None => pinned_client(&url, &addresses).map(EndpointClient::from),
+        Some(proxy) => proxy::client(&url, &addresses, proxy, transport_builder())
+            .await
+            .map_err(network),
+        None => pinned_client(&url, &addresses)
+            .map(EndpointClient::from)
+            .map_err(network),
     }
+}
+
+async fn resolve_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    static DNS_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let slots = DNS_SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+        .clone();
+    let host = host.to_owned();
+    bounded_dns_lookup(slots, Duration::from_secs(5), move || {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+    })
+    .await
+}
+
+async fn bounded_dns_lookup<T, F>(
+    slots: Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+    lookup: F,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    tokio::time::timeout(timeout, async move {
+        let permit = slots.acquire_owned().await.map_err(std::io::Error::other)?;
+        tokio::task::spawn_blocking(move || {
+            // A timed-out caller cannot cancel getaddrinfo. Hold the slot
+            // until the actual system lookup exits, including after timeout.
+            let _permit = permit;
+            lookup()
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS lookup timed out"))?
+}
+
+async fn resolve_addresses(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
+    let host = url
+        .host_str()
+        .expect("validated endpoint host")
+        .trim_matches(['[', ']']);
+    let port = url
+        .port_or_known_default()
+        .expect("validated endpoint port");
+    let addresses = resolve_host(host, port).await.map_err(|error| {
+            tracing::warn!(kind = ?error.kind(), "model endpoint DNS lookup failed");
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                "Astra Server DNS lookup timed out; check its system DNS"
+            } else {
+                "Astra Server could not resolve the model endpoint; check its system DNS and the provider hostname"
+            }
+        })?;
+    Ok(addresses)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_dns_work_remains_bounded_until_it_really_exits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slots = Arc::new(tokio::sync::Semaphore::new(8));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..1000 {
+            let (slots, gate, started) = (slots.clone(), gate.clone(), started.clone());
+            tasks.spawn(async move {
+                bounded_dns_lookup(slots, Duration::from_millis(200), move || {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let (lock, wake) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .await
+            });
+        }
+        let mut all_timed_out = true;
+        while let Some(result) = tasks.join_next().await {
+            all_timed_out &=
+                matches!(result, Ok(Err(error)) if error.kind() == std::io::ErrorKind::TimedOut);
+        }
+        let count = started.load(Ordering::SeqCst);
+        let remaining = slots.available_permits();
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slots.available_permits() != 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(all_timed_out);
+        assert!((1..=8).contains(&count), "started {count}");
+        assert!(remaining + count <= 8);
+        assert!(
+            started.load(Ordering::SeqCst) <= 8,
+            "timed-out semaphore waiters must not start later"
+        );
+        for _ in 0..1000 {
+            let slots = slots.clone();
+            tasks.spawn(async move {
+                bounded_dns_lookup(slots, Duration::from_secs(5), || {
+                    std::thread::sleep(Duration::from_millis(1));
+                    Ok(())
+                })
+                .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(
+                result.unwrap().is_ok(),
+                "healthy lookups should recover after saturation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_dns_caller_keeps_the_slot_until_lookup_exits() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let (slots, gate) = (slots.clone(), gate.clone());
+            async move {
+                bounded_dns_lookup(slots, Duration::from_secs(5), move || {
+                    let _ = started.send(());
+                    let (lock, wake) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .await
+            }
+        });
+        running.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let permits_after_cancel = slots.available_permits();
+        {
+            let (lock, wake) = &*gate;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(permits_after_cancel, 0);
+    }
+
+    #[tokio::test]
+    async fn system_dns_results_are_checked_before_use() {
+        let public = resolve_addresses(&reqwest::Url::parse("https://8.8.8.8:8443").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(public, vec!["8.8.8.8:8443".parse().unwrap()]);
+        assert!(validate_addresses(&public).is_ok());
+        let local = resolve_addresses(&reqwest::Url::parse("https://localhost").unwrap())
+            .await
+            .unwrap();
+        assert!(validate_addresses(&local).is_err());
+        assert!(validate_addresses(&[public[0], "198.18.4.197:443".parse().unwrap()]).is_err());
+        assert!(validate_addresses(&[]).is_err());
+    }
 
     #[tokio::test]
     async fn transport_has_no_implicit_body_deadline_but_honors_request_timeout() {

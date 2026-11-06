@@ -27,6 +27,7 @@ pub(crate) struct FormView {
     title: &'static str,
     fields: Vec<FieldSpec>,
     submit_result: Box<FormSubmit>,
+    valid: Option<Box<dyn Fn() -> bool + Send>>,
     pub(super) values: Vec<String>,
     pub(super) focus: usize,
     pub(super) error: Option<String>,
@@ -46,6 +47,7 @@ impl FormView {
             values: fields.iter().map(|_| String::new()).collect(),
             fields,
             submit_result: Box::new(submit_result),
+            valid: None,
             focus: 0,
             error: None,
             submitted: None,
@@ -56,6 +58,15 @@ impl FormView {
         assert_eq!(values.len(), self.fields.len());
         self.values = values;
         self
+    }
+
+    pub fn while_valid(mut self, valid: impl Fn() -> bool + Send + 'static) -> Self {
+        self.valid = Some(Box::new(valid));
+        self
+    }
+
+    fn is_valid(&self) -> bool {
+        self.valid.as_ref().is_none_or(|valid| valid())
     }
 
     pub(super) fn fields(&self) -> &[FieldSpec] {
@@ -151,6 +162,9 @@ impl BottomPaneView for FormView {
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
+        if !self.is_valid() {
+            return true;
+        }
         // Every paste belongs to this modal, including rejected input. Never
         // let a credential fall through into the conversation composer.
         if text.chars().any(char::is_control) {
@@ -163,6 +177,9 @@ impl BottomPaneView for FormView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if !self.is_valid() {
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
                 self.cancelled = true;
@@ -212,10 +229,13 @@ impl BottomPaneView for FormView {
     }
 
     fn is_complete(&self) -> bool {
-        self.cancelled || self.submitted.is_some()
+        !self.is_valid() || self.cancelled || self.submitted.is_some()
     }
 
     fn completion(&self) -> Option<ViewCompletion> {
+        if !self.is_valid() {
+            return None;
+        }
         if self.cancelled {
             return Some(ViewCompletion {
                 result: None,

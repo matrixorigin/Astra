@@ -455,7 +455,7 @@ pub fn workspace_lease_failure_tool_result(
         workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled => workspace_lease_result(
             TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED,
             format!(
-                "Tool '{name}' was not executed because a previous workspace owner did not settle; inspect or re-bind the workspace before continuing, and do not replay the call"
+                "Tool '{name}' was not executed because earlier work may still be using this workspace. Stop that work and confirm workspace recovery before continuing."
             ),
             false,
         ),
@@ -679,8 +679,8 @@ pub trait ToolExecutor: Send + Sync {
     /// Most executors use the project root, but a server/edge binding may
     /// expose a project container while executing inside a narrower session
     /// workspace.  Observation and completion receipts must use the latter.
-    fn workspace_root(&self) -> &Path {
-        self.project_root()
+    fn workspace_root(&self) -> PathBuf {
+        self.project_root().to_path_buf()
     }
 
     /// Execute a tool and return extended metadata (e.g., rollback journal entries).

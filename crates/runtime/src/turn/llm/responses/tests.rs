@@ -25,6 +25,94 @@ struct Attempts {
     snapshots: Mutex<Vec<super::UsageSnapshot>>,
 }
 
+#[tokio::test(start_paused = true)]
+async fn raw_reasoning_is_private_but_keeps_the_stream_alive() {
+    use futures_util::{StreamExt, stream};
+    use std::collections::HashSet;
+
+    struct Timeouts;
+    impl Drop for Timeouts {
+        fn drop(&mut self) {
+            super::super::TEST_STREAM_IDLE_TIMEOUT.with(|value| *value.borrow_mut() = None);
+            super::super::TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS
+                .with(|value| *value.borrow_mut() = None);
+        }
+    }
+    super::super::TEST_STREAM_IDLE_TIMEOUT
+        .with(|value| *value.borrow_mut() = Some(Duration::from_millis(100)));
+    super::super::TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS
+        .with(|value| *value.borrow_mut() = Some(Duration::from_millis(100)));
+    let _timeouts = Timeouts;
+    let terminal = json!({"type":"response.completed", "response":{
+        "status":"completed", "output":[{"type":"message", "role":"assistant", "content":[
+            {"type":"output_text", "text":"done"}
+        ]}]
+    }});
+    for (delta, budget, should_succeed) in [
+        (json!("private reasoning"), None, true),
+        (json!("  "), None, false),
+        (json!(12), None, false),
+        (
+            json!("private reasoning"),
+            Some(Duration::from_millis(250)),
+            false,
+        ),
+    ] {
+        let raw = json!({"type":"response.reasoning_text.delta", "delta":delta});
+        let events = vec![raw.clone(), raw.clone(), raw, terminal.clone()];
+        let stream = stream::iter(events).then(|event| async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok::<_, std::io::Error>(format!("data: {event}\n\n"))
+        });
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(200)
+                .body(reqwest::Body::wrap_stream(stream))
+                .unwrap(),
+        );
+        let route = LlmExecutionRoute {
+            inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
+            response_scope: Some("scope"),
+            subscription: None,
+            fixed_temperature: None,
+            supported_reasoning_efforts: None,
+            thinking_protocol: None,
+            model_name: "model",
+            wire_model_name: None,
+            api_key: "key",
+            base_url: "http://localhost",
+            provider: "openai",
+            header_overrides: None,
+            request_body_overrides: None,
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let result = collect(
+            response,
+            route,
+            &HashSet::new(),
+            LlmCancel::None,
+            Some(&mut callback),
+            tokio::time::Instant::now().into_std(),
+            budget,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.is_ok(), should_succeed);
+        if let Ok(result) = result {
+            assert_eq!(result.full_text, "done");
+            assert!(result.reasoning.is_empty());
+        }
+        assert!(
+            updates.is_empty(),
+            "raw reasoning must not reach user callbacks"
+        );
+    }
+}
+
 #[tokio::test]
 async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     use axum::{
@@ -73,6 +161,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             }
             let malformed = body["input"].to_string().contains("malformed terminal");
             let oversized = body["input"].to_string().contains("oversized terminal");
+            let plaintext = body["input"].to_string().contains("plaintext case");
             let fresh_turn = body["input"].to_string().contains("start a new turn");
             let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
             requests.lock().unwrap().push(body);
@@ -85,6 +174,9 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
                 json!(items)
             } else if continued || fresh_turn {
                 json!([{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}])
+            } else if plaintext {
+                json!([{"type":"reasoning","id":"rs-plain","summary":[],"content":[{"type":"reasoning_text","text":"check the file"}]},
+                    {"type":"function_call","id":"fn-1","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             } else {
                 json!([{"type":"reasoning","id":"reason-1","encrypted_content":"ciphertext","summary":[]},
                     {"type":"function_call","id":"fn-1","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
@@ -109,6 +201,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     let mut offering = astra_services::ResolvedModelOffering {
         offering_id: "offering".into(),
         model: astra_services::ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
             response_scope_key: Some(astra_services::models::ResponseScopeKey::for_model(
                 &FernetTokenEncryptor::new("test-scope-secret").unwrap(),
@@ -278,11 +371,35 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     // A result without a matching call in the same group can be the only
     // surviving evidence of an already executed tool.
     let mut extra_result = messages.clone();
+    let replay_key = FernetTokenEncryptor::new("responses-replay-fixture").unwrap();
+    let seal_history = |history: &mut [Value]| {
+        let saved = history
+            .iter_mut()
+            .find_map(|message| {
+                message.get_mut(astra_core::model_wire::responses::CONTINUATION_KEY)
+            })
+            .unwrap();
+        crate::turn::llm::private_continuation::seal(saved, &replay_key, "owner", "session")
+            .unwrap();
+    };
+    let open_history = |history: &mut [Value]| {
+        crate::turn::llm::private_continuation::open(
+            history,
+            &replay_key,
+            "owner",
+            &HashSet::from(["session".to_string()]),
+            &scope,
+            "model",
+        )
+        .unwrap();
+    };
+    seal_history(&mut extra_result);
     extra_result.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
     extra_result
         .push(json!({"role":"tool", "tool_call_id":"missing-call", "content":"effect occurred"}));
     let mut extra_result = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(extra_result).unwrap();
     extra_result = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(extra_result).unwrap();
+    open_history(&mut extra_result);
     for protocol in [
         LlmProviderProtocol::OpenAiResponses,
         LlmProviderProtocol::OpenAiCompatible,
@@ -538,7 +655,9 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         .as_array_mut()
         .unwrap()
         .push(json!({"type":"function_call", "call_id":"call-2", "name":"lookup"}));
+    seal_history(&mut inconsistent);
     let mut inconsistent = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(inconsistent).unwrap();
+    open_history(&mut inconsistent);
     for protocol in [
         LlmProviderProtocol::OpenAiResponses,
         LlmProviderProtocol::OpenAiCompatible,
@@ -558,7 +677,21 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     ] {
         let mut attempt = call(&inconsistent, &tools, &scope, &base, &thinking);
         attempt.route.inference_protocol = Some(protocol);
-        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto).unwrap();
+        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto);
+        if protocol == LlmProviderProtocol::OpenAiResponses {
+            let error = match prepared {
+                Err(error) => error,
+                Ok(_) => panic!("Responses silently discarded inconsistent reasoning"),
+            };
+            assert!(
+                error
+                    .details_json
+                    .unwrap()
+                    .contains("responses_continuation_history_incomplete")
+            );
+            continue;
+        }
+        let prepared = prepared.unwrap();
         let body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
         let wire = body.to_string();
         assert!(wire.contains("call-1"));
@@ -939,6 +1072,72 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             .to_string()
             .contains("missing-call")
     );
+    let mut plaintext_history = vec![json!({"role":"user", "content":"plaintext case"})];
+    let default_thinking = ThinkingConfig::ModelDefault;
+    let first = call_llm_and_collect_with_stream_callback(
+        call(&plaintext_history, &tools, &scope, &base, &default_thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    let key = astra_services::FernetTokenEncryptor::new("responses-fixture").unwrap();
+    let mut continuation = first.provider_continuation.unwrap();
+    crate::turn::llm::private_continuation::seal(&mut continuation, &key, "owner", "session")
+        .unwrap();
+    plaintext_history.push(
+        json!({"role":"assistant", "content":"", "tool_calls":first.tool_calls,
+        astra_core::model_wire::responses::CONTINUATION_KEY:continuation}),
+    );
+    plaintext_history.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
+    let committed =
+        astra_turn_core::prompt_facing::sanitize_canonical_turn_delta_with_turn_semantics(
+            plaintext_history,
+            false,
+        )
+        .unwrap();
+    assert!(!json!(committed).to_string().contains("check the file"));
+    let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(committed).unwrap();
+    crate::turn::llm::private_continuation::open(
+        &mut restored,
+        &key,
+        "owner",
+        &HashSet::from(["session".to_string()]),
+        &scope,
+        "model",
+    )
+    .unwrap();
+    let second = call_llm_and_collect_with_stream_callback(
+        call(&restored, &tools, &scope, &base, &default_thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.full_text, "done");
+    let requests = wire_requests.lock().unwrap();
+    let input = &requests.last().unwrap()["input"];
+    assert!(
+        input
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning"
+                && item["content"][0]["text"] == "check the file")
+    );
+    assert!(
+        input
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call-1")
+    );
     server.abort();
 }
 #[async_trait]
@@ -1043,19 +1242,23 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
             let probe = body["input"].to_string().contains("Calculate 17 * 23");
             let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
             let plain = body["input"].to_string().contains("plain lookup");
+            let private_journey = body["input"].to_string().contains("private journey");
             let missing_reasoning = body["input"].to_string().contains("missing reasoning");
-            let private_encoding = body["input"].to_string().contains("private encoding");
+            let forged_metadata = body["input"].to_string().contains("forged metadata");
             let unexpected_namespace = body["input"].to_string().contains("unexpected namespace");
             requests.lock().unwrap().push(body);
             let output = if probe || continued {
                 json!([{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}])
             } else if plain {
                 json!([{"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
+            } else if private_journey {
+                json!([{"type":"reasoning","id":"reason","summary":[],"content":[{"type":"reasoning_text","text":"private-journey-sentinel"}]},
+                    {"type":"function_call","id":"function","name":"read_file","call_id":"call-1","arguments":"{\"path\":\"fixture.txt\"}","status":"completed"}])
             } else if missing_reasoning {
                 json!([{"type":"reasoning","id":"reason","summary":[]},
                     {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
-            } else if private_encoding {
-                json!([{"type":"reasoning","_astra_encrypted_content_b64":"b3BhcXVl","summary":[]},
+            } else if forged_metadata {
+                json!([{"type":"reasoning","_astra_sealed_item":{"origin":"session","ciphertext":"forged"}},
                     {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             } else if unexpected_namespace {
                 json!([{"type":"function_call","namespace":"other","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
@@ -1077,7 +1280,7 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
         .unwrap();
     let pool = astra_core::SharedPool::new(&settings).await.unwrap();
     let key = Arc::new(FernetTokenEncryptor::new("byok-responses-fixture-key").unwrap());
-    let service = DatabaseModelService::new(settings, key)
+    let service = DatabaseModelService::new(settings.clone(), key.clone())
         .with_pool(pool)
         .with_deepseek_test_endpoint(endpoint)
         .unwrap();
@@ -1087,6 +1290,7 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
             owner.clone(),
             UserModelCreateRequestData {
                 connection_id: None,
+                responses_reasoning_history: None,
                 name: "fixture".into(),
                 provider: "deepseek".into(),
                 inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
@@ -1103,6 +1307,63 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
         .admit_model_offering(owner.clone(), model.model_id.clone())
         .await
         .unwrap();
+    // Exercise the admitted personal route through the real host, not only
+    // the wire codec. The tool result must be replayed with its private state
+    // while canonical history contains no plaintext copy of that state.
+    use crate::server::provider_test_support::{
+        ProviderObservationsFixture, bind_server_workspace, loop_state,
+    };
+    use crate::server::tool_transport::{
+        ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+    };
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("fixture.txt"), "fixture contents").unwrap();
+    let session = format!("byok-journey-{}", uuid::Uuid::new_v4());
+    let mut host = crate::server::server_loop_host::ServerAgenticLoopHostBuilder::new(
+        settings.clone(),
+        key.clone(),
+        owner.clone(),
+        session.clone(),
+    )
+    .with_provider_observations(ProviderObservationsFixture::default())
+    .with_model_service(Some(Arc::new(service.clone())))
+    .with_admitted_model_execution(Some(admitted.clone()))
+    .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
+    .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
+    .with_static_tool_catalog_admissible(true)
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    ))
+    .build();
+    let mut state = loop_state(&session, Vec::new(), "private journey: read fixture.txt");
+    state.thinking = ThinkingConfig::ModelDefault;
+    state.owner_user_id = Some(owner.clone());
+    bind_server_workspace(&mut state, workspace.path()).await;
+    state.skills.request_constraints.allowed_tools =
+        Some(["read_file".to_owned()].into_iter().collect());
+    requests.lock().unwrap().clear();
+    crate::turn::agentic_loop::finalization::run_agentic_loop_with_host(&mut host, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(state.total_tool_calls, 1);
+    assert!(
+        !json!(state.messages)
+            .to_string()
+            .contains("private-journey-sentinel")
+    );
+    let journey_requests = requests.lock().unwrap().clone();
+    assert_eq!(journey_requests.len(), 2);
+    assert!(
+        journey_requests[1]["input"]
+            .to_string()
+            .contains("private-journey-sentinel")
+    );
+    assert!(
+        journey_requests[1]["input"]
+            .to_string()
+            .contains("fixture contents")
+    );
     let tools = vec![
         json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}),
     ];
@@ -1137,7 +1398,7 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
     );
     for content in [
         "missing reasoning",
-        "private encoding",
+        "forged metadata",
         "unexpected namespace",
     ] {
         let before = requests.lock().unwrap().len();
@@ -1217,6 +1478,7 @@ async fn responses_transport_recovery_and_credential_fencing() {
             owner.clone(),
             UserModelCreateRequestData {
                 inference_protocol: None,
+                responses_reasoning_history: None,
                 name: "coding".into(),
                 provider: "chatgpt".into(),
                 model: "fixture-model".into(),

@@ -904,7 +904,7 @@ pub fn resolve_bash_workdir(
     }
     if !resolved.starts_with(&canonical_root) {
         return Err(format!(
-            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run",
+            "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run. A Git worktree created by a shell command is not the selected session workspace. Use the worktree tool to enter an isolated workspace when available.",
             workspace_root.display()
         ));
     }
@@ -928,7 +928,7 @@ pub fn resolve_bash_workdir(
             })?;
         let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
             format!(
-                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run",
+                "SANDBOX_DENIED: bash `workdir` `{requested}` is outside workspace root '{}'; no command was run. A Git worktree created by a shell command is not the selected session workspace. Use the worktree tool to enter an isolated workspace when available.",
                 workspace_root.display()
             )
         })?;
@@ -1158,7 +1158,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     {
         return crate::cancelled_tool_result("bash", false);
     }
-    let before = if needs_observation && !nested_in_run_script {
+    let before = if explicit_verification && !nested_in_run_script {
         let root = ctx.workspace_root.clone();
         tokio::task::spawn_blocking(move || {
             crate::workspace_observation::WorkspaceFingerprint::capture(&root)
@@ -1233,8 +1233,6 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         .flatten();
         let after_captured = after.is_some();
         let comparison = before.compare_with(after.as_ref());
-        let workspace_changed =
-            comparison == crate::workspace_observation::WorkspaceFingerprintComparison::Changed;
         // The pre-execution check cannot authorize a receipt after a slow
         // fingerprint capture: binding/lease integrity must still hold at the
         // exact mint boundary.
@@ -1286,29 +1284,8 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
                 );
             }
         }
-        if receipt_authority_valid_at_mint && scope_settled && workspace_changed {
-            if let Some(ownership) = scope_ownership {
-                result
-                    .metadata
-                    .get_or_insert_with(serde_json::Map::new)
-                    .extend(
-                        crate::workspace_observation::changed_receipt_with_ownership(
-                            ownership.as_str(),
-                        ),
-                    );
-                if !ownership.is_authoritative() {
-                    crate::workspace_observation::quarantine_after_weak_receipt(
-                        &ctx.workspace_root,
-                        Some(ownership.as_str()),
-                    );
-                }
-            } else {
-                crate::workspace_observation::quarantine_after_weak_receipt(
-                    &ctx.workspace_root,
-                    None,
-                );
-            }
-        }
+        // A pre/post difference can include another writer's changes; it
+        // cannot establish that this shell wrote the workspace.
     }
     if explicit_verification
         && !result.is_error
@@ -1369,9 +1346,6 @@ fn finalize_bash_scope_quarantine(
         crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
         return;
     }
-    // Preserve current-chain evidence before making the weak-ownership
-    // quarantine sticky. Quarantining first would make the post fingerprint
-    // disappear and erase the only truthful evidence this call can provide.
     if scope_quarantined {
         if scope_ownership.is_some() {
             crate::workspace_observation::quarantine_after_weak_receipt(
@@ -4898,7 +4872,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(source_preimage_env)]
-    async fn bash_inferred_change_surfaces_recovery_advisory_to_model() {
+    async fn bash_inferred_change_reports_a_snapshot_without_attributing_it() {
         let store = tempdir().unwrap();
         unsafe { std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
         let workspace = tempdir().unwrap();
@@ -4909,9 +4883,9 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(
-            result.output.contains("source preimage advisory")
-                && result.output.contains("receipt_id="),
-            "changed inferred sources need a model-visible recovery path: {}",
+            result.output.contains("pre-command copy")
+                && result.output.contains("cause is unknown"),
+            "snapshot differences must not be attributed to the shell: {}",
             result.output
         );
         assert_eq!(
@@ -7567,16 +7541,8 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_timeout_keeps_partial_workspace_receipt_when_scope_settles() {
+    async fn bash_timeout_preserves_partial_files_without_attributing_a_snapshot() {
         let dir = tempdir().unwrap();
-        let scope_guaranteed = astra_sandbox::apply_process_scope().ownership_guaranteed();
-        let expected_ownership = if scope_guaranteed {
-            Some(crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP)
-        } else if cfg!(unix) {
-            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
-        } else {
-            None
-        };
         let ctx = crate::ToolContext::test(dir.path());
 
         let result = execute_bash(
@@ -7591,28 +7557,9 @@ printf 'probe.txt:1:needle\n'
         assert!(result.is_error, "timed out bash should remain an error");
         assert!(dir.path().join("partial.txt").is_file());
         let fields = result.metadata.as_ref();
-        assert_eq!(
-            fields
-                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
-                .and_then(serde_json::Value::as_bool),
-            expected_ownership.map(|_| true),
-            "partial mutation receipt must be published only after settled ownership"
-        );
-        assert_eq!(
-            fields
-                .and_then(|fields| fields.get(crate::workspace_observation::OWNERSHIP_FIELD))
-                .and_then(serde_json::Value::as_str),
-            expected_ownership,
-        );
-        if expected_ownership
-            == Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
-        {
-            assert_eq!(
-                crate::workspace_observation::workspace_observation_is_quarantined(dir.path()),
-                Some(true),
-                "weak current-chain receipt must be published before future captures are quarantined"
-            );
-        }
+        assert!(fields.is_none_or(|fields| {
+            !fields.contains_key(crate::workspace_observation::RECEIPT_FIELD)
+        }));
     }
 
     #[tokio::test]
@@ -7662,16 +7609,8 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_cancellation_keeps_partial_workspace_receipt_when_scope_settles() {
+    async fn bash_cancellation_preserves_partial_files_without_attributing_a_snapshot() {
         let dir = tempdir().unwrap();
-        let scope_guaranteed = astra_sandbox::apply_process_scope().ownership_guaranteed();
-        let expected_ownership = if scope_guaranteed {
-            Some(crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP)
-        } else if cfg!(unix) {
-            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
-        } else {
-            None
-        };
         let token = Arc::new(CancellationToken::new());
         let trigger = token.clone();
         let marker = dir.path().join("cancelled.txt");
@@ -7700,19 +7639,9 @@ printf 'probe.txt:1:needle\n'
         assert!(result.is_error, "cancelled bash should remain an error");
         assert!(marker.is_file());
         let fields = result.metadata.as_ref();
-        assert_eq!(
-            fields
-                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
-                .and_then(serde_json::Value::as_bool),
-            expected_ownership.map(|_| true),
-            "partial cancellation receipt must be published only after settled ownership"
-        );
-        assert_eq!(
-            fields
-                .and_then(|fields| fields.get(crate::workspace_observation::OWNERSHIP_FIELD))
-                .and_then(serde_json::Value::as_str),
-            expected_ownership,
-        );
+        assert!(fields.is_none_or(|fields| {
+            !fields.contains_key(crate::workspace_observation::RECEIPT_FIELD)
+        }));
     }
 
     #[tokio::test]

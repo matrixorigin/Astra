@@ -5678,7 +5678,7 @@ fn local_transcript_tool_result(
 
 /// Recover an omitted result name from the same journal lane before applying
 /// pagination. Tool-call IDs are run-scoped; no additional storage read is needed.
-fn local_transcript_tool_names(
+pub(super) fn local_transcript_tool_names(
     events: &[astra_services::session_journal::JournalEvent],
     target_run_id: Option<&str>,
 ) -> std::collections::HashMap<(String, String), String> {
@@ -8339,10 +8339,15 @@ pub(crate) async fn run_tui_session(
                                 if current_usable {
                                     chat_widget.commit_system(history_cell::system::SystemCell::response("Model change saved. Your current model is unchanged; choose another with /model."));
                                 } else if bottom_pane.current_model_catalog().iter().any(|row| row.offering_id == model_id && crate::cli::session::session_runtime::model_list_entry_is_active(row)) {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response("Personal model saved."));
                                     slash_dispatch::apply_model_picker_result(&bottom_pane::view::ViewResult::Model { name: model_id }, &mut state, &mut bottom_pane, &mut chat_widget);
                                 } else {
                                     chat_widget.commit_system(history_cell::system::SystemCell::response("Model change saved. The model is unavailable in the current catalog; reopen /model to choose a usable model."));
                                 }
+                            }
+                            Ok(super::model_setup::Outcome::CreateRejected { request, message }) => {
+                                chat_widget.commit_system(history_cell::system::SystemCell::error(message));
+                                super::model_setup::retry_model_form(&mut bottom_pane, request, owner);
                             }
                             Ok(super::model_setup::Outcome::Removed) => {
                                 bottom_pane.clear_model_catalog();
@@ -11994,7 +11999,10 @@ pub(crate) async fn run_tui_session(
                                             action => {
                                                 model_setup_phase.reset();
                                                 model_setup_cancel = tokio_util::sync::CancellationToken::new();
-                                                let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                                                let owner = match &action {
+                                                    Action::Create { owner, .. } => owner.clone(),
+                                                    _ => crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                                                };
                                                 let epoch = state.session_attachment_epoch;
                                                 let api = api.clone();
                                                 let cancel = model_setup_cancel.clone();

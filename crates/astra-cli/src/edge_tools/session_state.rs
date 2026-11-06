@@ -69,10 +69,6 @@ impl SessionStateRollbackJournal {
             .collect()
     }
 
-    fn checkpoint(&self) -> u64 {
-        self.next_sequence
-    }
-
     fn settle_restored_sequence(
         &mut self,
         sequence: u64,
@@ -110,6 +106,13 @@ fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
 }
 
 impl ToolExecutor {
+    pub(crate) fn session_state_checkpoint(&self) -> u64 {
+        self.session_state_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_sequence
+    }
+
     fn record_session_state_rollback(&self, label: String, action: SessionStateRollbackAction) {
         let turn_index = self
             .journal_turn_index
@@ -178,13 +181,6 @@ impl ToolExecutor {
             Err(poisoned) => poisoned
                 .into_inner()
                 .restore_plan_for_turn_since(turn_index, checkpoint),
-        }
-    }
-
-    pub(crate) fn session_state_journal_checkpoint(&self) -> u64 {
-        match self.session_state_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
         }
     }
 

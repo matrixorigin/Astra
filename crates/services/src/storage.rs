@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-04-v120";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-05-v121";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -114,6 +114,7 @@ const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_mo
             model_name VARCHAR(255) NOT NULL,
             provider VARCHAR(50) NOT NULL,
             inference_protocol VARCHAR(32) NULL,
+            responses_reasoning_history VARCHAR(16) NULL,
             api_key_encrypted TEXT NULL,
             connection_id VARCHAR(64) NULL,
             base_url VARCHAR(500) NOT NULL,
@@ -4781,16 +4782,24 @@ async fn verify_core_schema_shape(
             }
         }
         if table == "user_llm_models"
-            && column == "inference_protocol"
+            && matches!(
+                column.as_str(),
+                "inference_protocol" | "responses_reasoning_history"
+            )
             && (!row
                 .try_get::<String, _>("DATA_TYPE")?
                 .eq_ignore_ascii_case("varchar")
                 || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
-                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(32))
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")?
+                    != Some(if column == "inference_protocol" {
+                        32
+                    } else {
+                        16
+                    }))
         {
-            return Err(sqlx::Error::Protocol(
-                "invalid user_llm_models.inference_protocol shape".into(),
-            ));
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid user_llm_models.{column} shape"
+            )));
         }
         if table == "agent_run_events"
             && column == "invocation_supersession_scope_key"
@@ -4939,6 +4948,7 @@ async fn verify_core_schema_shape(
             &[
                 "thinking_probe_json",
                 "api_key_encrypted",
+                "responses_reasoning_history",
                 "connection_id",
                 "inference_protocol",
             ][..],

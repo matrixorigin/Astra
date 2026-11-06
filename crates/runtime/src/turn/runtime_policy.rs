@@ -890,16 +890,6 @@ fn record_args_value(record: &ToolCallRecord) -> Option<serde_json::Value> {
 /// therefore covers directory, Git, shell, network, and code-intelligence
 /// readers without a second scenario vocabulary.
 fn record_is_observation_only(record: &ToolCallRecord) -> bool {
-    // Execution-owned outcome evidence outranks the admission-time command
-    // classifier. Some otherwise observational command families have
-    // argument forms that write; a bound, validated changed receipt proves
-    // this invocation crossed a task-state boundary without teaching the
-    // policy engine a second shell vocabulary.
-    if crate::turn::agentic_loop::execution_phase::record_has_trusted_workspace_mutation_receipt(
-        record,
-    ) {
-        return false;
-    }
     if matches!(record.name.as_str(), "introspect" | "reflect") {
         return true;
     }
@@ -925,10 +915,7 @@ fn record_is_decisive_transition(record: &ToolCallRecord) -> bool {
     if !record.was_executed() || !record.ok {
         return false;
     }
-    if crate::turn::agentic_loop::execution_phase::record_has_trusted_workspace_mutation_receipt(
-        record,
-    ) || crate::turn::agentic_loop::lifecycle::record_has_typed_workspace_tool_receipt(record)
-    {
+    if crate::turn::agentic_loop::lifecycle::record_has_typed_workspace_tool_receipt(record) {
         return true;
     }
     if matches!(record.name.as_str(), "introspect" | "reflect") {
@@ -1787,7 +1774,7 @@ mod tests {
         let subject = work_subject("item-1");
         let records = vec![ToolCallRecord {
             name: "read_file".to_string(),
-            args_full: Some(r#"{"path":"src/lib.rs","start_line":9,"end_line":2}"#.to_string()),
+            args_full: Some(r#"{"path":"src/lib.rs","start_line":0,"end_line":2}"#.to_string()),
             round: Some(1),
             disposition: Some(ToolCallDisposition::Rejected),
             ok: false,
@@ -1820,7 +1807,7 @@ mod tests {
 
         continued.push(ToolCallRecord {
             name: "read_file".to_string(),
-            args_full: Some(r#"{"path":"src/lib.rs","start_line":9,"end_line":2}"#.to_string()),
+            args_full: Some(r#"{"path":"src/lib.rs","start_line":0,"end_line":2}"#.to_string()),
             round: Some(3),
             disposition: Some(ToolCallDisposition::Rejected),
             ok: false,
@@ -2644,44 +2631,14 @@ mod tests {
     }
 
     #[test]
-    fn trusted_changed_receipt_clears_active_search_watch() {
-        let mut state = RuntimePolicyEvaluationState {
-            search_converged_followup_inspections: Some(1),
-            ..Default::default()
-        };
-        let record = ToolCallRecord {
-            name: "bash".to_string(),
-            args_full: Some(r#"{"command":"head -n 20 src/lib.rs"}"#.to_string()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ok: true,
-            round: Some(1),
-            workspace_mutation_observed: Some(true),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.to_string(),
-            ),
-            workspace_mutation_receipt: Some(
+    fn untrusted_changed_receipt_cannot_clear_active_search_watch() {
+        for (scope, receipt) in [
+            (
+                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE,
                 astra_tools::workspace_observation::changed_receipt()
                     .remove(astra_tools::workspace_observation::RECEIPT_FIELD)
                     .expect("changed receipt"),
             ),
-            ..Default::default()
-        };
-
-        assert!(!record_is_observation_only(&record));
-        assert!(record_is_decisive_transition(&record));
-        let feedback =
-            evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &[record], 1).unwrap();
-        assert!(state.search_converged_followup_inspections.is_none());
-        assert!(
-            feedback
-                .as_ref()
-                .is_none_or(|set| !feedback_has_persistent_round_activity(set))
-        );
-    }
-
-    #[test]
-    fn untrusted_changed_receipt_cannot_clear_active_search_watch() {
-        for (scope, receipt) in [
             (
                 "external",
                 astra_tools::workspace_observation::changed_receipt()

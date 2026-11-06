@@ -1,6 +1,6 @@
 //! Explicit opt-in network smoke: no database, model key or inference request.
 //! Set ASTRA_TEST_BYOK_MODELS_URL to a provider's public /models endpoint that
-//! requires authentication, plus the Server's ASTRA_BYOK_DNS_SERVERS/proxy settings.
+//! requires authentication and the Server's system DNS/proxy settings.
 
 #[tokio::test]
 #[ignore = "requires explicit public provider URL and working outbound DNS/HTTPS"]

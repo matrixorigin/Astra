@@ -3097,6 +3097,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_started_writer_invalidates_observations_but_rejected_writer_does_not() {
+        for started in [false, true] {
+            let mut harness = PipelineHarness::new();
+            begin_recorded_turn(&mut harness, 1);
+            let read_args = json!({"path":"a.txt"});
+            let output = "the previous observed file content";
+            harness.semantic_dedup.check_and_record_with_generation(
+                "read_file",
+                &read_args,
+                output,
+                0,
+                0,
+            );
+            let mut pipeline = harness.pipeline();
+            pipeline
+                .record_execution(ExecutedExecution {
+                    execution: HeadlessResolvedExecution {
+                        id: "call-timeout".into(),
+                        name: "bash".into(),
+                        args: json!({"command":"printf changed > a.txt; sleep 1"}),
+                        result_str: "command timed out".into(),
+                        tool_result_fields: Some(serde_json::Map::from_iter([(
+                            "execution_started".into(),
+                            json!(started),
+                        )])),
+                        authoritative_is_error: Some(true),
+                        pending_runtime_completion: None,
+                        accepted_send: None,
+                        confirmed_invocation: None,
+                        edge_duration_ms: 1,
+                        is_edge_tool: true,
+                        edge_result_missing: false,
+                        edge_terminal_authority: true,
+                        early_exit_ms: 0,
+                    },
+                    idem_key: None,
+                    pre_tool_context: None,
+                    is_err: true,
+                    error_kind: None,
+                    executed_ms: 1,
+                })
+                .await;
+            drop(pipeline);
+
+            assert_eq!(harness.turn_guard.workspace_epoch(), u64::from(started));
+            let duplicate = harness
+                .semantic_dedup
+                .near_duplicate_hint_for_observation_with_generation(
+                    output,
+                    "read_file",
+                    &read_args,
+                    1,
+                    0,
+                );
+            assert_eq!(duplicate.is_none(), started);
+            assert!(!harness.tool_call_records[0].ok);
+        }
+    }
+
+    #[tokio::test]
     async fn semantic_dedup_observation_does_not_replace_a_new_read_invocation() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();
@@ -4137,6 +4197,155 @@ mod tests {
             )
             .unwrap();
         assert!(!tool_result_storage::tool_results_dir(&session_dir).exists());
+    }
+
+    #[tokio::test]
+    async fn source_bounded_result_stays_inline_until_final_budgeting() {
+        use astra_turn_core::tool_result_storage;
+
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        begin_recorded_turn(&mut harness, 1);
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let content = json!({"observation":"fixture", "data":"evidence ".repeat(700)}).to_string();
+        assert!(content.len() < tool_result_storage::PERSIST_THRESHOLD_CHARS);
+        let (_, mut executed) = catalog_record_fixture();
+        executed.execution.id = "budgeted-result".into();
+        executed.execution.name = "introspect".into();
+        executed.execution.result_str = content.clone();
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+        pipeline.record_execution(executed).await;
+        assert_eq!(pipeline.ctx.messages.last().unwrap()["content"], content);
+        assert!(pipeline.ctx.tool_call_records[0].result_artifact.is_none());
+        let (_, mut fitting) = catalog_record_fixture();
+        fitting.execution.id = "fitting-result".into();
+        fitting.execution.name = "introspect".into();
+        fitting.execution.result_str = json!({"data":"ok ".repeat(1000)}).to_string();
+        pipeline.record_execution(fitting).await;
+        assert!(
+            pipeline.ctx.tool_call_records[1].result_artifact.is_none(),
+            "a result that fits alongside empty guidance should remain inline"
+        );
+        let (_, mut generic) = catalog_record_fixture();
+        generic.execution.id = "generic-fitting-result".into();
+        generic.execution.name = "grep".into();
+        generic.execution.tool_result_fields = None;
+        generic.execution.result_str = "x".repeat(7000);
+        pipeline.record_execution(generic).await;
+        assert_eq!(
+            pipeline.ctx.messages.last().unwrap()["content"],
+            "x".repeat(7000)
+        );
+        assert!(pipeline.ctx.tool_call_records[2].result_artifact.is_none());
+    }
+
+    #[tokio::test]
+    async fn artifact_conflict_preserves_successful_writer_evidence() {
+        use astra_services::SessionArtifactStore;
+        use astra_turn_core::tool_result_storage;
+
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        begin_recorded_turn(&mut harness, 1);
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(
+                &astra_services::OwnerScope::user("test-user").unwrap(),
+                &harness.session_id,
+            )
+            .unwrap();
+        tool_result_storage::persist_tool_result_with_descriptor(
+            &session_dir,
+            "test-run",
+            "conflicting-write",
+            "write_file",
+            "previous result",
+        )
+        .unwrap();
+        let (_, mut executed) = catalog_record_fixture();
+        executed.execution.id = "conflicting-write".into();
+        executed.execution.name = "write_file".into();
+        executed.execution.args = json!({"path":"file.txt", "content":"new"});
+        executed.execution.result_str = "new result ".repeat(5000);
+        executed.execution.is_edge_tool = true;
+        executed.execution.edge_terminal_authority = true;
+        executed.execution.tool_result_fields = Some(serde_json::Map::from_iter([
+            (
+                astra_tools::workspace_observation::WRITER_APPLIED_BOUND_FIELD.to_string(),
+                json!(true),
+            ),
+            ("execution_started".to_string(), json!(true)),
+        ]));
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+        let epoch = pipeline.ctx.turn_guard.workspace_epoch();
+        pipeline.record_execution(executed).await;
+        let record = &pipeline.ctx.tool_call_records[0];
+        assert!(!record.ok, "delivery failed");
+        assert_eq!(record.execution_ok, Some(true));
+        assert_eq!(record.workspace_writer_applied_bound, Some(true));
+        assert_eq!(pipeline.ctx.turn_guard.workspace_epoch(), epoch + 1);
+        assert!(
+            pipeline.ctx.messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("durable")
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_io_failure_reports_delivery_without_undoing_execution() {
+        use astra_services::SessionArtifactStore;
+        use astra_turn_core::tool_result_storage;
+
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        begin_recorded_turn(&mut harness, 1);
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(
+                &astra_services::OwnerScope::user("test-user").unwrap(),
+                &harness.session_id,
+            )
+            .unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            tool_result_storage::tool_results_dir(&session_dir),
+            "not a directory",
+        )
+        .unwrap();
+        let (_, mut executed) = catalog_record_fixture();
+        executed.execution.id = "write-io-failure".into();
+        executed.execution.name = "write_file".into();
+        executed.execution.args = json!({"path":"file.txt", "content":"new"});
+        executed.execution.result_str = "large result ".repeat(5000);
+        executed.execution.tool_result_fields = Some(serde_json::Map::from_iter([(
+            "execution_started".to_string(),
+            json!(true),
+        )]));
+        let mut pipeline = harness.pipeline();
+        pipeline.record_execution(executed).await;
+        let record = &pipeline.ctx.tool_call_records[0];
+        assert!(!record.ok);
+        assert_eq!(record.execution_ok, Some(true));
+        assert!(record.error.as_deref().unwrap().contains("delivered"));
+        let message = pipeline.ctx.messages.last().unwrap();
+        assert_eq!(
+            pipeline.ctx.tool_results.last().unwrap()["status"],
+            "failed"
+        );
+        assert!(
+            message["content"]
+                .as_str()
+                .unwrap()
+                .contains("result_delivery_unavailable")
+        );
     }
 
     #[tokio::test]

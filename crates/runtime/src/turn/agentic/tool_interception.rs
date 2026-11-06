@@ -225,7 +225,7 @@ pub(crate) fn admit_tool_calls(
 /// never guessed from prose; this placeholder only gives downstream journal
 /// and partition code a canonical value to carry for a call that cannot be
 /// executed.
-fn canonical_rejection_placeholder(tool_call: &Value, id: &str, name: &str) -> Value {
+pub(crate) fn canonical_rejection_placeholder(tool_call: &Value, id: &str, name: &str) -> Value {
     // A call that can be normalized keeps its exact canonical representation.
     // Only malformed calls use the typed empty-arguments
     // placeholder below.

@@ -78,12 +78,14 @@ pub fn sanitize_durable_message_values(mut messages: Vec<Value>) -> Vec<Value> {
     for message in &mut messages {
         sanitize_embedded_assistant_tool_arguments(message);
         let assistant_frame = message.get("role").and_then(Value::as_str) == Some("assistant");
+        let response_calls = response_call_bindings(message);
         sanitize_json_except_assistant_tool_arguments(
             message,
             assistant_frame,
             AssistantToolPath::None,
             true,
             None,
+            &response_calls,
         );
     }
     messages
@@ -101,6 +103,50 @@ enum AssistantToolPath {
     ToolCallsArray,
     ToolCallObject,
     FunctionObject,
+    ResponseContinuation,
+    ResponseItems,
+    ResponseItem,
+}
+
+fn valid_protocol_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 512 && id.trim() == id && !id.chars().any(char::is_control)
+}
+
+// A nested Responses call ID is protocol identity only when it refers to one
+// already-admitted root tool call. Other nested strings remain ordinary data.
+fn response_call_bindings(
+    message: &Value,
+) -> std::collections::HashMap<String, (String, usize, usize)> {
+    let mut calls = std::collections::HashMap::<String, (String, usize, usize)>::new();
+    if message["role"] != "assistant"
+        || !message
+            .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+            .is_some_and(Value::is_object)
+    {
+        return calls;
+    }
+    for call in message["tool_calls"].as_array().into_iter().flatten() {
+        let id = crate::tool::args::shape::provider_tool_call_id(call)
+            .or_else(|| call["id"].as_str().filter(|id| valid_protocol_id(id)));
+        let name = call["function"]["name"].as_str();
+        if let (Some(id), Some(name)) = (id, name) {
+            calls
+                .entry(id.to_string())
+                .and_modify(|entry| entry.1 += 1)
+                .or_insert_with(|| (name.to_string(), 1, 0));
+        }
+    }
+    for item in message[astra_core::model_wire::responses::CONTINUATION_KEY]["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "function_call")
+    {
+        if let Some(entry) = item["call_id"].as_str().and_then(|id| calls.get_mut(id)) {
+            entry.2 += 1;
+        }
+    }
+    calls
 }
 
 fn sanitize_json_except_assistant_tool_arguments(
@@ -109,6 +155,7 @@ fn sanitize_json_except_assistant_tool_arguments(
     path: AssistantToolPath,
     at_message_root: bool,
     object_key: Option<&str>,
+    response_calls: &std::collections::HashMap<String, (String, usize, usize)>,
 ) {
     match value {
         Value::String(_) => {
@@ -124,10 +171,14 @@ fn sanitize_json_except_assistant_tool_arguments(
         }
         Value::Array(values) => {
             for child in values {
-                let child_path = if path == AssistantToolPath::ToolCallsArray && child.is_object() {
-                    AssistantToolPath::ToolCallObject
-                } else {
-                    AssistantToolPath::None
+                let child_path = match path {
+                    AssistantToolPath::ToolCallsArray if child.is_object() => {
+                        AssistantToolPath::ToolCallObject
+                    }
+                    AssistantToolPath::ResponseItems if child.is_object() => {
+                        AssistantToolPath::ResponseItem
+                    }
+                    _ => AssistantToolPath::None,
                 };
                 sanitize_json_except_assistant_tool_arguments(
                     child,
@@ -135,10 +186,20 @@ fn sanitize_json_except_assistant_tool_arguments(
                     child_path,
                     false,
                     None,
+                    response_calls,
                 );
             }
         }
         Value::Object(values) => {
+            let response_call_name = (path == AssistantToolPath::ResponseItem
+                && values.get("type").and_then(Value::as_str) == Some("function_call"))
+            .then(|| {
+                values
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten();
             // These fields are only protocol metadata when they occur at the
             // root of a canonical tool message.  The same names inside user
             // content, tool output, or an unknown nested object remain
@@ -176,13 +237,18 @@ fn sanitize_json_except_assistant_tool_arguments(
                         && path == AssistantToolPath::ToolCallObject
                         && (key == "id"
                             || key == crate::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD));
-                if protocol_id
+                let bound_response_id = key == "call_id"
                     && child.as_str().is_some_and(|id| {
-                        !id.is_empty()
-                            && id.len() <= 512
-                            && id.trim() == id
-                            && !id.chars().any(char::is_control)
-                    })
+                        response_call_name.as_deref().is_some_and(|name| {
+                            response_calls
+                                .get(id)
+                                .is_some_and(|(expected, roots, items)| {
+                                    *roots == 1 && *items == 1 && expected == name
+                                })
+                        })
+                    });
+                if (protocol_id || bound_response_id)
+                    && child.as_str().is_some_and(valid_protocol_id)
                 {
                     continue;
                 }
@@ -230,6 +296,17 @@ fn sanitize_json_except_assistant_tool_arguments(
                     && child.is_array()
                 {
                     AssistantToolPath::ToolCallsArray
+                } else if at_message_root
+                    && assistant_frame
+                    && key == astra_core::model_wire::responses::CONTINUATION_KEY
+                    && child.is_object()
+                {
+                    AssistantToolPath::ResponseContinuation
+                } else if path == AssistantToolPath::ResponseContinuation
+                    && key == "items"
+                    && child.is_array()
+                {
+                    AssistantToolPath::ResponseItems
                 } else if path == AssistantToolPath::ToolCallObject
                     && key == "function"
                     && child.is_object()
@@ -244,6 +321,7 @@ fn sanitize_json_except_assistant_tool_arguments(
                     next_path,
                     false,
                     Some(key),
+                    response_calls,
                 );
             }
         }
@@ -684,5 +762,29 @@ mod tests {
                 .is_none(),
             "a descriptor bound to another call/run must not survive durable sanitization"
         );
+    }
+
+    #[test]
+    fn responses_call_id_is_preserved_only_for_a_unique_root_call() {
+        let id = "AKIAIOSFODNN7EXAMPLE";
+        let key = astra_core::model_wire::responses::CONTINUATION_KEY;
+        let message = json!({"role":"assistant", "content":format!("credential {id}"),
+            "tool_calls":[{"id":id, "function":{"name":"read_file", "arguments":"{}"}}],
+            key:{"items":[{"type":"function_call", "name":"read_file", "call_id":id}]}});
+        let safe = sanitize_durable_message_values(vec![message.clone()]);
+        assert_eq!(safe[0][key]["items"][0]["call_id"], id);
+        assert!(!safe[0]["content"].as_str().unwrap().contains(id));
+
+        let mut duplicate = message.clone();
+        let item = duplicate[key]["items"][0].clone();
+        duplicate[key]["items"].as_array_mut().unwrap().push(item);
+        let safe = sanitize_durable_message_values(vec![duplicate]);
+        assert_ne!(safe[0][key]["items"][0]["call_id"], id);
+        assert_ne!(safe[0][key]["items"][1]["call_id"], id);
+
+        let mut mismatch = message;
+        mismatch[key]["items"][0]["name"] = json!("other");
+        let safe = sanitize_durable_message_values(vec![mismatch]);
+        assert_ne!(safe[0][key]["items"][0]["call_id"], id);
     }
 }

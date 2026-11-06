@@ -64,6 +64,10 @@ pub(crate) fn build_capture_request_json(
     tools: &[Value],
     max_output_tokens: Option<usize>,
 ) -> Value {
+    let messages: Vec<_> = messages
+        .iter()
+        .map(astra_core::model_wire::responses::without_continuation)
+        .collect();
     json!({
         "message_count": messages.len(),
         "tool_count": tools.len(),
@@ -475,6 +479,19 @@ mod tests {
     use astra_services::{StoredSessionArtifact, session_journal::JournalDirGuard};
     use async_trait::async_trait;
     use tempfile::tempdir;
+
+    #[test]
+    fn capture_does_not_export_private_continuation() {
+        let messages = vec![
+            json!({"role":"assistant", "content":"working", "_astra_responses":{
+                "items":[{"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}]
+            }}),
+        ];
+        let capture = build_capture_request_json(&messages, &[], None);
+        assert_eq!(capture["messages"][0]["content"], "working");
+        assert!(!capture.to_string().contains("reasoning_text"));
+        assert!(messages[0].get("_astra_responses").is_some());
+    }
 
     #[derive(Default)]
     struct RecordingArtifactStore {
