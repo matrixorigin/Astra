@@ -171,53 +171,43 @@ pub(crate) async fn execute_server_bash(
     }
     let wrapped_command = wrap_command_with_limits(sandbox_policy, command);
 
-    let result = match server_bash_execution_mode(sandbox_policy) {
+    let mode = server_bash_execution_mode(sandbox_policy);
+    let mut config = match mode {
         ServerBashExecutionMode::IsolatedProcess => {
             let mut config = IsolationConfig::strict(workspace_root.to_path_buf());
-            workdir.install_on_isolation_config(&mut config);
-            apply_policy_limits_to_isolation_config(&mut config, sandbox_policy, timeout_secs);
             config.net_namespace = !sandbox_policy.network_allowed;
-            let env = server_process_environment(sandbox_policy, workspace_root);
-            let output = crate::tool_sandbox::execute_isolated_with_cancel(
-                &wrapped_command,
-                &env,
-                &config,
-                cancel_token,
-            )
-            .await;
-            let execution_started = output.execution_started;
-            let scope_ownership = output.scope_ownership;
-            if output.cancelled {
-                astra_tools::cancelled_tool_result("bash", execution_started)
-                    .with_metadata_scope_settled(scope_ownership, execution_started)
-            } else {
-                tool_result_from_server_bash_output(command, output, timeout_secs)
-                    .with_metadata_scope_settled(scope_ownership, execution_started)
-            }
+            config
         }
         ServerBashExecutionMode::SandboxedProcess => {
-            let mut config = IsolationConfig::sandboxed(workspace_root.to_path_buf());
-            workdir.install_on_isolation_config(&mut config);
-            apply_policy_limits_to_isolation_config(&mut config, sandbox_policy, timeout_secs);
-            let env = server_process_environment(sandbox_policy, workspace_root);
-            let output = crate::tool_sandbox::execute_isolated_with_cancel(
-                &wrapped_command,
-                &env,
-                &config,
-                cancel_token,
-            )
-            .await;
-            let execution_started = output.execution_started;
-            let scope_ownership = output.scope_ownership;
-            if output.cancelled {
-                astra_tools::cancelled_tool_result("bash", execution_started)
-                    .with_metadata_scope_settled(scope_ownership, execution_started)
-            } else {
-                tool_result_from_server_bash_output(command, output, timeout_secs)
-                    .with_metadata_scope_settled(scope_ownership, execution_started)
-            }
+            IsolationConfig::sandboxed(workspace_root.to_path_buf())
         }
     };
+    workdir.install_on_isolation_config(&mut config);
+    apply_policy_limits_to_isolation_config(&mut config, sandbox_policy, timeout_secs);
+    let env = server_process_environment(sandbox_policy, workspace_root);
+    let output = crate::tool_sandbox::execute_isolated_with_cancel(
+        &wrapped_command,
+        &env,
+        &config,
+        cancel_token,
+    )
+    .await;
+    let execution_started = output.execution_started;
+    let scope_ownership = output.scope_ownership;
+    let result = if output.cancelled {
+        let partial = format_server_bash_output(&output, timeout_secs);
+        let mut result = astra_tools::cancelled_tool_result("bash", execution_started);
+        if execution_started {
+            result.output.push_str("\n\nThe command was interrupted; earlier effects may remain. Inspect the current state before retrying.");
+        }
+        if !partial.is_empty() {
+            let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(&partial).0;
+            result.output.push_str(&format!("\n\nOutput before interruption:\n{safe}"));
+        }
+        result
+    } else {
+        tool_result_from_server_bash_output(command, output, timeout_secs)
+    }.with_metadata_scope_settled(scope_ownership, execution_started);
     let workspace_after = if workspace_before.is_some() {
         let root = workspace_root.to_path_buf();
         tokio::task::spawn_blocking(move || {
@@ -270,8 +260,6 @@ pub(crate) async fn execute_server_bash(
     let receipt_authority_valid = observation_lease.as_ref().is_none_or(
         astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
     );
-    let quarantine_weak_after_current = !nested_run_script_callback
-        && astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(scope_ownership);
     let mut result = attach_workspace_observation(
         result,
         workspace_root,
@@ -282,7 +270,6 @@ pub(crate) async fn execute_server_bash(
         scope_ownership,
         coordination_integrity_valid,
         receipt_authority_valid,
-        quarantine_weak_after_current,
         explicit_verification,
     );
     astra_tools::shell_ops::attach_bash_workdir_evidence(
@@ -343,7 +330,6 @@ fn attach_workspace_observation(
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
     coordination_integrity_valid: bool,
     receipt_authority_valid: bool,
-    quarantine_weak_after_current: bool,
     explicit_verification: bool,
 ) -> astra_tools::ToolResult {
     if !coordination_integrity_valid {
@@ -360,10 +346,9 @@ fn attach_workspace_observation(
         result.output.push_str(
             "Error: workspace binding or coordination generation changed during Bash execution; the command may have changed files, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
         );
-        return result;
+        return result.with_execution_outcome_unknown();
     }
     if execution_started && scope_ownership.is_none() {
-        astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
         if let Some(fields) = result.metadata.as_mut() {
             fields.remove(astra_tools::workspace_observation::OBSERVED_FIELD);
             fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
@@ -374,9 +359,9 @@ fn attach_workspace_observation(
             result.output.push_str("\n\n");
         }
         result.output.push_str(
-            "Error: Bash execution started but its descendant ownership did not settle; the workspace is quarantined and no durable mutation receipt was issued.",
+            "Error: Bash execution started but its final outcome could not be confirmed. Child processes may still be running; inspect the current state before retrying.",
         );
-        return result;
+        return result.with_execution_outcome_unknown();
     }
     let before_available = before.is_some();
     let after_available = after.is_some();
@@ -388,12 +373,6 @@ fn attach_workspace_observation(
     // group also cannot rule
     // out a setsid/double-fork descendant that writes after this function
     // returns, even when the immediate fingerprint delta is empty.
-    if quarantine_weak_after_current {
-        astra_tools::workspace_observation::quarantine_after_weak_receipt(
-            workspace_root,
-            scope_ownership.map(astra_sandbox::ScopeOwnership::as_str),
-        );
-    }
     let verify_receipt_valid = explicit_verification
         && !result.is_error
         && result
@@ -539,12 +518,18 @@ pub(crate) fn tool_result_from_server_bash_output(
             body.push('\n');
         }
         body.push_str(
-            "\n⚠ Live descendant processes were terminated when this foreground bash call ended; \
-             they are not running now. This executor provides no process-persistence guarantee.",
+            "\n⚠ Live processes observed in this Bash execution scope were terminated when the call ended. \
+             Processes that escaped the scope may still run. This executor provides no process-persistence guarantee.",
         );
     }
     if output.timed_out {
         return tool_timeout_tool_result(format!("Error: {body}"));
+    }
+    if output.execution_started && output.exit_code.is_none() {
+        return astra_tools::ToolResult::error(format!(
+            "Error: the Bash exit status could not be determined. {body}"
+        ))
+        .with_execution_outcome_unknown();
     }
     let semantics = output.exit_code.map(|code| classify_exit(command, code));
     let result_class =
@@ -572,7 +557,6 @@ pub(crate) fn tool_result_from_server_bash_output(
     if descendants_terminated {
         let metadata = result.metadata.get_or_insert_with(serde_json::Map::new);
         metadata.insert("background_children_reaped".to_string(), Value::Bool(true));
-        metadata.insert("descendant_persistence".to_string(), Value::Bool(false));
     }
     result
 }
@@ -612,7 +596,7 @@ pub(crate) fn format_server_bash_output(output: &IsolatedOutput, timeout_secs: f
             body.push('\n');
         }
         body.push_str(&format!(
-            "[bash timed out after {}; partial output shown]",
+            "[bash timed out after {}; partial output shown; earlier effects may remain]",
             format_timeout_seconds(timeout_secs)
         ));
     }
@@ -745,6 +729,60 @@ mod tests {
                 .display()
                 .to_string()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_bash_cancellation_keeps_safe_partial_output() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path().to_path_buf();
+        let policy = SandboxPolicy::permissive(&root);
+        let binding = WorkspaceBinding::server_sandbox(&root);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run_root = root.clone();
+        let run = tokio::spawn(async move {
+            execute_server_bash(&policy, &run_root, &binding, None,
+                &serde_json::json!({"command":"printf 'checkpoint\\n'; printf 'ghp_abcdefghijklmnopqrst'; printf ready > started; sleep 5", "timeout": 5}),
+                Some(&run_cancel)).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("command started");
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(8), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.output.contains("checkpoint"), "{}", result.output);
+        assert!(!result.output.contains("ghp_"));
+        assert!(result.output.contains("effects may remain"));
+        assert_eq!(result.metadata.unwrap()["cancelled"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_bash_signal_is_reported_as_failure() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // Test the process owner directly; the public tool policy correctly
+        // rejects an explicit process-control command before execution.
+        let config = IsolationConfig::sandboxed(workspace.path().to_path_buf());
+        let output = crate::tool_sandbox::execute_isolated_with_cancel(
+            "printf 'started\\n'; kill -9 $$",
+            &HashMap::new(),
+            &config,
+            None,
+        )
+        .await;
+        let result = tool_result_from_server_bash_output("signal test", output, 5.0);
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("started"), "{}", result.output);
+        assert_eq!(result.metadata.unwrap()["exit_code"], 137);
     }
 
     #[cfg(unix)]
@@ -915,7 +953,6 @@ mod tests {
             Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
             true,
             true,
-            false,
             true,
         );
         assert!(result.is_error);
@@ -966,7 +1003,6 @@ mod tests {
                 Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
                 true,
                 true,
-                false,
                 true,
             );
             assert_eq!(result.is_error, writer_intervened);
@@ -983,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn weak_mutation_capable_no_delta_quarantines_future_attribution() {
+    fn weak_process_group_does_not_claim_a_workspace_receipt() {
         let workspace = tempfile::tempdir().expect("workspace");
         let before =
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
@@ -1010,7 +1046,6 @@ mod tests {
             Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
             true,
             true,
-            true,
             false,
         );
 
@@ -1026,20 +1061,20 @@ mod tests {
             astra_tools::workspace_observation::workspace_observation_is_quarantined(
                 workspace.path(),
             ),
-            Some(true),
-            "weak mutation-capable ownership must quarantine after the current observation even when its immediate delta is empty"
+            Some(false),
+            "weak process ownership alone must not block later work"
         );
         delayed_writer.join().expect("delayed writer thread");
         assert!(workspace.path().join("escaped-late.txt").is_file());
         assert!(
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                .is_none(),
-            "a later invocation must not misattribute an escaped post-return write to its own observation window"
+                .is_some(),
+            "later work can inspect the current workspace despite the escaped writer"
         );
     }
 
     #[test]
-    fn started_server_bash_without_settled_ownership_quarantines_before_delayed_daemon_write() {
+    fn started_server_bash_without_settled_ownership_reports_unknown() {
         let workspace = tempfile::tempdir().expect("workspace");
         let before =
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
@@ -1065,7 +1100,6 @@ mod tests {
             true,
             true,
             false,
-            false,
         );
 
         assert!(
@@ -1078,14 +1112,18 @@ mod tests {
         );
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(workspace.path()),
-            Some(true),
-            "a started process with no settled ownership must be terminally quarantined even before any delta"
+            Some(false),
+            "unknown execution should not permanently block later work"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_fact"],
+            "unknown"
         );
         delayed_daemon.join().expect("delayed daemon");
         assert!(
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                .is_none(),
-            "the daemon's delayed write cannot be attributed to a later invocation"
+                .is_some(),
+            "later work can inspect the current workspace"
         );
     }
 
@@ -1102,7 +1140,6 @@ mod tests {
             None,
             true,
             true,
-            false,
             false,
         );
 
@@ -1259,7 +1296,7 @@ mod tests {
         assert!(result.output.contains("no process-persistence guarantee"));
         let metadata = result.metadata.expect("typed descendant settlement");
         assert_eq!(metadata["background_children_reaped"], true);
-        assert_eq!(metadata["descendant_persistence"], false);
+        assert!(!metadata.contains_key("descendant_persistence"));
     }
 
     #[test]
@@ -1290,7 +1327,6 @@ mod tests {
             Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
             true,
             true,
-            false,
             false,
         );
         assert!(result.is_error);

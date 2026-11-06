@@ -213,6 +213,16 @@ mod runtime_tool_result_tests {
     }
 
     #[test]
+    fn unknown_outcome_cannot_be_hidden_by_a_successful_exit_code() {
+        let fields = Map::from_iter([
+            ("execution_fact".into(), json!("unknown")),
+            ("exit_semantics".into(), json!("success")),
+            ("result_class".into(), json!("success")),
+        ]);
+        assert!(execution_result_is_error(Some(&fields), Some(false)));
+    }
+
+    #[test]
     fn runtime_tool_success_metadata_is_preserved() {
         let mut execution = execution();
         let mut metadata = Map::new();
@@ -268,6 +278,11 @@ pub(super) fn execution_result_is_error(
     authoritative_is_error: Option<bool>,
 ) -> bool {
     let fields = tool_result_fields;
+
+    // Unknown delivery or execution state outranks an earlier process exit.
+    if astra_tools::execution_outcome::outcome_is_unknown(fields) {
+        return true;
+    }
 
     // Producer-owned executor failures outrank generic status fields. Result
     // prose is never execution authority: it is arbitrary tool/user content.

@@ -9,6 +9,18 @@ use crate::StreamResult;
 use crate::cli::session::session_state::SessionState;
 use crossterm::style::Stylize;
 
+pub(crate) fn cancelled_context_notice(not_saved: Option<bool>) -> Option<&'static str> {
+    match not_saved {
+        Some(true) => Some(
+            "This turn's conversation history could not be saved. Check tool results and current state before continuing.",
+        ),
+        None => Some(
+            "Could not confirm whether this turn's conversation history was saved. Check tool results and current state before continuing.",
+        ),
+        Some(false) => None,
+    }
+}
+
 #[allow(clippy::result_large_err)]
 pub(crate) fn fabricate_user_cancel_failure(
     reason: &str,
@@ -94,6 +106,11 @@ pub(crate) async fn apply_user_cancelled_turn(
     state.last_turn_interrupted = true;
     match result {
         Ok(stream_result) => {
+            if let Some(observation) = stream_result.cancel_context_not_saved
+                && let Some(notice) = cancelled_context_notice(observation)
+            {
+                ui.show_warning(notice);
+            }
             apply_turn_success_async(
                 state,
                 api,
@@ -121,6 +138,12 @@ pub(crate) async fn apply_user_cancelled_turn(
                 failure.error.push(' ');
                 failure.error.push_str(&notice);
                 ui.show_warning(&notice);
+            } else if let Some(observation) = failure.partial.cancel_context_not_saved
+                && let Some(notice) = cancelled_context_notice(observation)
+            {
+                failure.error.push(' ');
+                failure.error.push_str(notice);
+                ui.show_warning(notice);
             }
             reconcile_and_report_turn_failure(
                 state,
@@ -196,6 +219,74 @@ mod tests {
                 .unwrap()
                 .contains("could not be confirmed")
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_turn_reports_context_loss_or_uncertainty_to_user() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        for (observation, expected) in [
+            (Some(true), Some("history could not be saved")),
+            (Some(false), None),
+            (None, Some("Could not confirm")),
+        ] {
+            let mut state = SessionState::default();
+            let mut ui = crate::tests::TestUi::default();
+            let failure = crate::TurnFailure {
+                error: "cancelled".into(),
+                partial: crate::PartialTurnData {
+                    run_id: Some("run-owned".into()),
+                    cancel_context_not_saved: Some(observation),
+                    ..Default::default()
+                },
+            };
+            apply_user_cancelled_turn(
+                &mut state,
+                &api,
+                None,
+                "request",
+                Err(failure),
+                Instant::now(),
+                &mut ui,
+                None,
+            )
+            .await;
+            match expected {
+                Some(expected) => {
+                    assert!(ui.warnings.iter().any(|message| message.contains(expected)))
+                }
+                None => assert!(ui.warnings.is_empty()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_turn_with_success_still_reports_unknown_context() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        let mut ui = crate::tests::TestUi::default();
+        let mut result = crate::tests::stub_stream_result("completed");
+        result.cancel_context_not_saved = Some(None);
+        apply_user_cancelled_turn(
+            &mut state,
+            &api,
+            None,
+            "request",
+            Ok(result),
+            Instant::now(),
+            &mut ui,
+            None,
+        )
+        .await;
+        assert!(
+            ui.warnings
+                .iter()
+                .any(|message| message.contains("Could not confirm"))
+        );
+        assert!(!state.last_turn_interrupted);
     }
 
     #[serial_test::serial]

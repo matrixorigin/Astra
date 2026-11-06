@@ -343,7 +343,8 @@ where
                     "status": "rejected",
                     "error_kind": "deferred_tool_descriptor_stale",
                     "retryable": true,
-                    "error": "The selected deferred tool is no longer bound to the same provider descriptor; select it again before invoking it.",
+                    "executed": false,
+                    "error": "The tool was not executed because its selected provider binding changed. Search for and select the tool again before making a new call.",
                 })
                 .to_string(),
             }),

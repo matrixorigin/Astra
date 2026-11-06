@@ -326,23 +326,23 @@ impl DefaultToolExecutor {
         } else if let Some(token) = self.ctx.cancel_token.as_ref() {
             tokio::select! {
                 _ = token.cancelled() => {
-                    crate::cancelled_tool_result(name, true)
+                    crate::cancelled_tool_result(name, true).with_execution_outcome_unknown()
                 }
                 result = tokio::time::timeout(TOOL_TIMEOUT, dispatch) => match result {
                     Ok(r) => r,
                     Err(_) => ToolResult::error(format!(
-                        "Tool '{name}' timed out after {}s",
+                        "Tool '{name}' timed out after {}s; its outcome is unknown and it may still have changed state. Inspect the current state before retrying.",
                         TOOL_TIMEOUT.as_secs()
-                    )),
+                    )).with_execution_outcome_unknown(),
                 },
             }
         } else {
             match tokio::time::timeout(TOOL_TIMEOUT, dispatch).await {
                 Ok(r) => r,
                 Err(_) => ToolResult::error(format!(
-                    "Tool '{name}' timed out after {}s",
+                    "Tool '{name}' timed out after {}s; its outcome is unknown and it may still have changed state. Inspect the current state before retrying.",
                     TOOL_TIMEOUT.as_secs()
-                )),
+                )).with_execution_outcome_unknown(),
             }
         };
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
@@ -386,6 +386,7 @@ impl DefaultToolExecutor {
             result.output.push_str(
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
+            result = result.with_execution_outcome_unknown();
         }
         let desired_state =
             match crate::workspace_observation::consume_workspace_desired_state_convergence_marker(
@@ -985,11 +986,7 @@ mod tests {
         let visible = <DefaultToolExecutor as ToolExecutor>::tool_schemas(&exec)
             .iter()
             .any(|schema| astra_core::tool_schema::tool_schema_name(schema) == Some("run_script"));
-        assert_eq!(
-            visible,
-            astra_sandbox::process_scope_available(),
-            "run_script must not be advertised when its ownership capability is unavailable"
-        );
+        assert_eq!(visible, astra_sandbox::process_scope_available());
     }
 
     #[test]

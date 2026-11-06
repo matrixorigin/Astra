@@ -375,6 +375,13 @@ mod invocation_identity_tests {
             !terminal.contains_key("executed"),
             "arbitrary output is not producer execution evidence"
         );
+        let mut transport_unknown = astra_tools::ToolResult::error("disconnected".into());
+        transport_unknown.metadata = Some(Map::from_iter([(
+            "outcome_certainty".into(),
+            json!("unknown"),
+        )]));
+        let terminal = tool_call_end_event(&request, &transport_unknown, 5).unwrap();
+        assert_eq!(terminal.get("executed"), Some(&Value::Null));
     }
 
     #[test]
@@ -564,6 +571,10 @@ pub(crate) fn copy_result_routing_metadata(
 // The executor owns this fact. Copy it before transport success is reduced to
 // a boolean; result text is arbitrary tool content and is not an audit schema.
 fn copy_result_execution_fact(event: &mut Map<String, Value>, result: &astra_tools::ToolResult) {
+    if astra_tools::execution_outcome::outcome_is_unknown(result.metadata.as_ref()) {
+        event.entry("executed".to_string()).or_insert(Value::Null);
+        return;
+    }
     let fact = result
         .metadata
         .as_ref()

@@ -556,14 +556,23 @@ is not a chain or batch guarantee. An explicit file undo checks the recorded
 post-state and reports conflicts or partial results; it is not atomic against
 concurrent writes from external programs.
 
-On Linux, the invocation subreaper settles ownership only after kernel
+When the Linux invocation supervisor is used for Bash, its subreaper settles
+its child ownership only after kernel
 `waitpid(-1, WNOHANG)` reports `ECHILD`. Enumerating its own proc children is an
 auxiliary means to kill adopted descendants. If that enumeration is unavailable,
 the same bounded loop continues waiting and reaping under its original deadline.
 Neither an unavailable or empty scan nor deadline expiry proves settlement; a
 live child at expiry or an unexpected wait error retains unsettled ownership.
-The helper's non-dumpable boundary and nonce-bound terminal receipt remain
-required, and Server run settlement cannot replace this local scope proof.
+The helper's non-dumpable boundary and nonce-bound terminal receipt apply to
+that path; Server run settlement cannot replace this local scope proof.
+
+Other Bash paths may execute directly in a cgroup or process group without the
+supervisor; `run_script` retains its cgroup prerequisite. Group cleanup cannot
+prove that a descendant which created a new session has stopped, and a same-user
+process may be able to move between delegated cgroups. When a script explicitly
+requests memory or CPU limits, it is rejected before starting if those limits
+cannot be enforced.
+`run_script` does not itself add filesystem or network isolation.
 
 The optional asynchronous `check-ignore` adapter retains startup binding checks;
 it does not inherit synchronous invocation ownership or post-execution binding

@@ -16,6 +16,19 @@
 
 import type { ToolStatus } from "./types";
 
+/** A receipt is evidence; absence must never be presented as a saved Context. */
+export function cancelledContextObservation(event: { status?: unknown; context_not_saved?: unknown }): boolean | null | undefined {
+  return event.status === "cancelled"
+    ? typeof event.context_not_saved === "boolean" ? event.context_not_saved : null
+    : undefined;
+}
+
+export function contextSaveWarning(observation: boolean | null | undefined): string | undefined {
+  if (observation === true) return "This turn's context was not saved. Review the current state before continuing.";
+  if (observation === null) return "Context saving could not be confirmed. Review the current state before continuing.";
+  return undefined;
+}
+
 export const EXECUTION_BOUNDARY_WAIT_REASONS = new Set([
   "executor_offline",
   "transport_disconnected",

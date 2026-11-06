@@ -1932,8 +1932,7 @@ impl RuntimeToolExecutor {
                             return if prior_dispatch { mark_mcp_call_dispatched(result) } else { result };
                         }
                         Err(super::capability_source::SourceInvocationError::CancelledBeforeDispatch) => {
-                            let result = astra_tools::cancelled_tool_result(name, prior_dispatch);
-                            return if prior_dispatch { mark_mcp_call_dispatched(result) } else { result };
+                            return mcp_cancelled_tool_result(name, prior_dispatch);
                         }
                     }
                 } else {
@@ -1960,7 +1959,8 @@ impl RuntimeToolExecutor {
                             "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
                             agent_binding_mcp.server_name()
                         )),
-                        error.side_effects_maybe(),
+                        error.side_effects_maybe()
+                            || (prior_dispatch && !error.provider_acknowledged()),
                         error.is_timeout(),
                     )
                 })
@@ -1996,7 +1996,8 @@ impl RuntimeToolExecutor {
                             super::runtime_mcp::redact_mcp_error_text(&format!(
                                 "MCP tool '{name}' failed: {error}"
                             )),
-                            error.side_effects_maybe(),
+                            error.side_effects_maybe()
+                                || (prior_dispatch && !error.provider_acknowledged()),
                             error.is_timeout(),
                         )
                     })
@@ -2005,29 +2006,38 @@ impl RuntimeToolExecutor {
                 Ok(result) => result,
                 Err(result) => return mark_mcp_call_dispatched(result),
             };
+            let requires_interaction = result.requires_interaction();
             if let Some(source) = &self.capability_source {
                 if let Err(error) = source.register_result(request, &mut result).await {
-                    return capability_source_error_result(error);
+                    let mut failure = capability_source_error_result(error);
+                    if requires_interaction {
+                        failure = failure.with_execution_outcome_unknown();
+                    } else {
+                        let fields = failure.metadata.get_or_insert_default();
+                        astra_tools::execution_outcome::insert_started_execution_fact(fields);
+                        fields.insert("provider_outcome_acknowledged".into(), Value::Bool(true));
+                    }
+                    return mark_mcp_call_dispatched(failure);
                 }
             }
             match result.into_provider_outcome() {
                 ProviderCallOutcome::InteractionRequired(request) => {
                     if !seen_interaction_ids.insert(request.request_id.clone()) {
-                        return mark_mcp_call_dispatched(astra_tools::ToolResult::error(format!(
+                        return mcp_interaction_error_result(format!(
                             "Provider repeated already-resolved interaction request '{}'; the tool call was stopped because it made no progress.",
                             request.request_id
-                        )));
+                        ));
                     }
                     if seen_interaction_ids.len() > MAX_PROVIDER_INTERACTION_ROUNDS_PER_TOOL_CALL {
-                        return mark_mcp_call_dispatched(astra_tools::ToolResult::error(format!(
+                        return mcp_interaction_error_result(format!(
                             "Provider exceeded the maximum of {MAX_PROVIDER_INTERACTION_ROUNDS_PER_TOOL_CALL} sequential interactions for one tool call."
-                        )));
+                        ));
                     }
                     let Some(gate) = self.provider_interaction_gate.as_ref() else {
-                        return mark_mcp_call_dispatched(astra_tools::ToolResult::error(
+                        return mcp_interaction_error_result(
                             "Provider requested user interaction, but no provider interaction gate is configured."
                                 .to_string(),
-                        ));
+                        );
                     };
                     interaction_response = Some(match gate.request_interaction(&request).await {
                         ProviderInteractionDecision::Submitted(payload) => {
@@ -2038,25 +2048,35 @@ impl RuntimeToolExecutor {
                             }
                         }
                         ProviderInteractionDecision::Cancelled => {
-                            return mark_mcp_call_dispatched(astra_tools::ToolResult::error(
-                                "Provider interaction was cancelled by the user.".to_string(),
-                            ));
+                            let mut result = mcp_cancelled_tool_result(name, true);
+                            result.output =
+                                "Provider interaction was cancelled by the user.".into();
+                            return result;
                         }
                         ProviderInteractionDecision::Timeout => {
-                            return mark_mcp_call_dispatched(astra_tools::ToolResult::error(
+                            return mark_mcp_call_dispatched(mcp_call_error_result(
                                 "Provider interaction timed out before the user responded."
                                     .to_string(),
+                                true,
+                                true,
                             ));
                         }
                         ProviderInteractionDecision::Error(error) => {
-                            return mark_mcp_call_dispatched(astra_tools::ToolResult::error(
-                                format!("Provider interaction failed: {error}"),
+                            return mcp_interaction_error_result(format!(
+                                "Provider interaction failed: {error}"
                             ));
                         }
                     });
                 }
                 outcome => {
-                    return mark_mcp_call_dispatched(tool_result_from_provider_outcome(outcome));
+                    let result = tool_result_from_provider_outcome(outcome);
+                    return mark_mcp_call_dispatched(if requires_interaction {
+                        // Invalid interaction metadata is a local protocol failure,
+                        // not a provider-authored terminal tool failure.
+                        result.with_execution_outcome_unknown()
+                    } else {
+                        result
+                    });
                 }
             }
         }
@@ -4735,13 +4755,7 @@ impl RuntimeToolExecutor {
         identity: &astra_turn_types::ToolInvocationIdentity,
         mut result: astra_tools::ToolResult,
     ) -> astra_tools::ToolResult {
-        if result
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("side_effects_maybe"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
+        if crate::server::tool_invocation_runtime::result_outcome_unknown(&result) {
             return result;
         }
         let exit_semantics = result.exit_semantics.and_then(|semantics| {
@@ -5296,6 +5310,7 @@ impl RuntimeToolExecutor {
             result.output.push_str(
                 "Error: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
+            result = result.with_execution_outcome_unknown();
         }
         let desired_state = match astra_tools::workspace_observation::consume_workspace_desired_state_convergence_marker(
             &mut result.metadata,
@@ -5958,10 +5973,16 @@ fn mark_mcp_call_dispatched(mut result: astra_tools::ToolResult) -> astra_tools:
 fn mcp_cancelled_tool_result(name: &str, prior_dispatch: bool) -> astra_tools::ToolResult {
     let result = astra_tools::cancelled_tool_result(name, prior_dispatch);
     if prior_dispatch {
-        mark_mcp_call_dispatched(result)
+        mark_mcp_call_dispatched(result.with_execution_outcome_unknown())
     } else {
         result
     }
+}
+
+fn mcp_interaction_error_result(message: String) -> astra_tools::ToolResult {
+    mark_mcp_call_dispatched(
+        astra_tools::ToolResult::error(message).with_execution_outcome_unknown(),
+    )
 }
 
 fn finalize_mcp_workspace_effect(
@@ -5988,23 +6009,13 @@ fn finalize_mcp_workspace_effect(
     if !dispatched {
         return result;
     }
-    if !workspace_authority.coordination_integrity_valid()
-        || !workspace_authority.receipt_authority_valid()
-    {
+    if !workspace_authority.coordination_integrity_valid() {
         astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
         return astra_tools::workspace_effect_unsettled_tool_result(name, result);
     }
-    let settled = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get("workspace_effect_settled"))
-        .and_then(Value::as_bool)
-        == Some(true);
-    if settled {
-        return result;
-    }
-    astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-    astra_tools::workspace_effect_unsettled_tool_result(name, result)
+    // MCP providers need not manufacture Astra workspace receipts. A received
+    // response is their result; dispatch loss is marked unknown at its source.
+    result
 }
 
 fn tool_result_from_provider_outcome(outcome: ProviderCallOutcome) -> astra_tools::ToolResult {
@@ -6057,7 +6068,11 @@ fn mcp_call_error_result(
         ),
         ("retryable".to_string(), Value::Bool(!side_effects_maybe)),
     ]));
-    result
+    if side_effects_maybe {
+        result.with_execution_outcome_unknown()
+    } else {
+        result
+    }
 }
 
 fn durable_result_persistence_failure(
@@ -6999,6 +7014,7 @@ pub(crate) mod tests {
         assert!(attached.metadata.as_ref().is_none_or(|metadata| {
             !metadata.contains_key(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
         }));
+
         let metadata = attached.metadata.as_ref().unwrap();
         assert_eq!(metadata["error_kind"], "durable_result_persistence");
         assert_eq!(metadata["retryable"], false);
@@ -7032,13 +7048,10 @@ pub(crate) mod tests {
             "call-unknown",
         )
         .unwrap();
-        let mut ambiguous = astra_tools::ToolResult::text(
+        let ambiguous = astra_tools::ToolResult::text(
             "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
-        );
-        ambiguous.metadata = Some(Map::from_iter([(
-            "side_effects_maybe".to_string(),
-            Value::Bool(true),
-        )]));
+        )
+        .with_execution_outcome_unknown();
         let governed = govern_runtime_tool_result(ambiguous, false).into_inner();
         let attached = exec
             .attach_governed_result_artifact_if_needed(&identity, governed)
@@ -7052,6 +7065,47 @@ pub(crate) mod tests {
         assert!(attached.metadata.as_ref().is_none_or(|metadata| {
             !metadata.contains_key(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
         }));
+
+        // A known result may have performed a write; that alone must not
+        // discard its acknowledged output as though execution were unknown.
+        let mut known = astra_tools::ToolResult::text(
+            "y".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
+        );
+        known.metadata = Some(Map::from_iter([(
+            "side_effects_maybe".into(),
+            Value::Bool(true),
+        )]));
+        let governed = govern_runtime_tool_result(known, false).into_inner();
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, governed)
+            .await;
+        assert!(!attached.is_error, "{attached:?}");
+        assert!(store.seen.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn control_producer_preserves_rejection_and_retryability_in_the_ledger() {
+        use astra_turn_types::ToolInvocationTerminalOutcome;
+        let (exec, _dir) = test_executor();
+        let busy = exec.runtime_binding_busy_error_result("bash", "provider");
+        assert!(matches!(
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&busy),
+            ToolInvocationTerminalOutcome::Failed {
+                retryable: true,
+                ..
+            }
+        ));
+        let denied = exec.runtime_environment_denial_error_result(
+            "write_file",
+            &RuntimeEnvironmentDenial::RuntimeSurfaceDenied("read-only".into()),
+        );
+        assert!(matches!(
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&denied),
+            ToolInvocationTerminalOutcome::Rejected {
+                retryable: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -8888,12 +8942,6 @@ pub(crate) mod tests {
         let unclassified: Vec<_> = handler_names
             .iter()
             .filter(|n| {
-                // `run_script` is a real handler only on hosts with an
-                // invocation-owned process scope.  The executor keeps the
-                // route registered so an explicit call gets the typed
-                // capability error, but the model-facing schema is
-                // capability-projected away when dispatch cannot be
-                // proven safe.
                 if *n == "run_script"
                     && (cfg!(not(unix)) || !astra_sandbox::process_scope_available())
                 {
@@ -10644,6 +10692,39 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_result_does_not_require_a_private_workspace_receipt() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let authority = acquire_server_workspace_authority(
+            workspace.path(),
+            "mcp__demo__mutate",
+            &json!({}),
+            true,
+            true,
+            false,
+            false,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("MCP mutation authority");
+        let mut result = astra_tools::ToolResult::text("provider completed".into());
+        result.metadata = Some(Map::from_iter([(
+            "mcp_call_dispatched".into(),
+            json!(true),
+        )]));
+        let result = finalize_mcp_workspace_effect(
+            workspace.path(),
+            "mcp__demo__mutate",
+            ResolvedToolEffect::Mutating,
+            true,
+            &authority,
+            result,
+        );
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output, "provider completed");
+    }
+
+    #[tokio::test]
     async fn mcp_mutation_cannot_publish_receipt_after_generation_revocation() {
         let workspace = tempfile::tempdir().expect("workspace");
         let authority = acquire_server_workspace_authority(
@@ -11167,11 +11248,8 @@ pub(crate) mod tests {
                 panic!("first read should dispatch")
             }
         };
-        let mut ambiguous = astra_tools::ToolResult::text("unacknowledged payload".to_string());
-        ambiguous.metadata = Some(Map::from_iter([(
-            "side_effects_maybe".to_string(),
-            Value::Bool(true),
-        )]));
+        let ambiguous = astra_tools::ToolResult::text("unacknowledged payload".to_string())
+            .with_execution_outcome_unknown();
         let outcome =
             crate::server::tool_invocation_runtime::terminal_outcome_from_result(&ambiguous);
         let durable = ledger
@@ -14679,33 +14757,40 @@ pub(crate) mod tests {
         } else {
             assert!(result.is_error, "{result:?}");
             assert_eq!(
-                result.metadata.as_ref().unwrap()["workspace_effect_settled"],
-                false
+                result.metadata.as_ref().unwrap()["execution_fact"],
+                "unknown"
             );
-            assert!(matches!(
-                writer,
-                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
-            ));
+            assert!(
+                writer.is_ok(),
+                "a lost response must not permanently block the workspace"
+            );
         }
         server.abort();
     }
 
     async fn execute_provider_interaction_sequence(
         unique_request_ids: bool,
-        decision: astra_tools::ProviderInteractionDecision,
+        decision: Option<astra_tools::ProviderInteractionDecision>,
         cross_cutoff: Option<bool>,
+        continuation: Option<Value>,
     ) -> (astra_tools::ToolResult, usize, usize) {
         let provider_calls = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new()
             .route(
                 "/mcp",
                 axum::routing::post(
-                    |axum::extract::State((calls, unique_request_ids)): axum::extract::State<(
+                    |axum::extract::State((calls, unique_request_ids, continuation)): axum::extract::State<(
                         Arc<AtomicUsize>,
                         bool,
+                        Option<Value>,
                     )>,
                      axum::Json(body): axum::Json<Value>| async move {
                         let call = calls.fetch_add(1, Ordering::SeqCst);
+                        if call > 0 && let Some(continuation) = continuation {
+                            let mut response = json!({"jsonrpc":"2.0", "id":body["id"]});
+                            response.as_object_mut().unwrap().extend(continuation.as_object().unwrap().clone());
+                            return axum::Json(response);
+                        }
                         let request_id = if unique_request_ids {
                             format!("request-{call}")
                         } else {
@@ -14731,7 +14816,7 @@ pub(crate) mod tests {
                     },
                 ),
             )
-            .with_state((Arc::clone(&provider_calls), unique_request_ids));
+            .with_state((Arc::clone(&provider_calls), unique_request_ids, continuation));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test provider");
@@ -14758,18 +14843,20 @@ pub(crate) mod tests {
                 &["mcp__mail__send"],
                 &endpoint,
             )
-            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::ReadOnly),
+            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::Mutating),
         ));
         let wait = cross_cutoff.map(|_| ProjectionWriteBarrier {
             entered: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
             completed: Arc::new(tokio::sync::Notify::new()),
         });
-        exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
-            calls: Arc::clone(&gate_calls),
-            decision,
-            wait: wait.clone(),
-        }));
+        if let Some(decision) = decision {
+            exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
+                calls: Arc::clone(&gate_calls),
+                decision,
+                wait: wait.clone(),
+            }));
+        }
         let mut request = exec.tool_execution_request("mcp__mail__send", &json!({}));
         request.tool_call_id = "call-provider-interaction".to_string();
         request.policy.admission_deadline =
@@ -14810,9 +14897,10 @@ pub(crate) mod tests {
     async fn provider_interaction_loop_rejects_repeated_resolved_request_id() {
         let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
             false,
-            astra_tools::ProviderInteractionDecision::Submitted(json!({
+            Some(astra_tools::ProviderInteractionDecision::Submitted(json!({
                 "selected": "primary"
-            })),
+            }))),
+            None,
             None,
         )
         .await;
@@ -14820,15 +14908,19 @@ pub(crate) mod tests {
         assert!(result.output.contains("made no progress"), "{result:?}");
         assert_eq!(provider_calls, 2);
         assert_eq!(gate_calls, 1);
+        assert!(astra_tools::execution_outcome::outcome_is_unknown(
+            result.metadata.as_ref()
+        ));
     }
 
     #[tokio::test]
     async fn provider_interaction_loop_bounds_unique_sequential_requests() {
         let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
             true,
-            astra_tools::ProviderInteractionDecision::Submitted(json!({
+            Some(astra_tools::ProviderInteractionDecision::Submitted(json!({
                 "selected": "primary"
-            })),
+            }))),
+            None,
             None,
         )
         .await;
@@ -14841,6 +14933,9 @@ pub(crate) mod tests {
         );
         assert_eq!(provider_calls, 17);
         assert_eq!(gate_calls, 16);
+        assert!(astra_tools::execution_outcome::outcome_is_unknown(
+            result.metadata.as_ref()
+        ));
     }
 
     #[tokio::test]
@@ -15010,11 +15105,11 @@ for line in sys.stdin:
                     .await;
                 if prior_dispatch {
                     assert_eq!(fields["mcp_call_dispatched"], true);
-                    assert_eq!(
-                        fields["error_kind"],
-                        astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
+                    assert_eq!(fields["execution_fact"], "unknown");
+                    assert!(
+                        writer.is_ok(),
+                        "the model can inspect state before a new action"
                     );
-                    assert!(matches!(writer, Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)));
                 } else {
                     assert_eq!(fields["cancelled"], true);
                     assert_ne!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
@@ -15029,7 +15124,127 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn mcp_interaction_resume_cancellation_quarantines_unsettled_mutation() {
+    async fn capability_source_cancellation_before_continuation_retains_prior_dispatch() {
+        use super::super::capability_source::tests::{
+            http_fixture, register_fixture_candidate, request,
+        };
+        for prior_dispatch in [false, true] {
+            let fixture = http_fixture(false).await;
+            fixture.rpc_results.lock().unwrap().insert("astra/capabilities/invoke".into(), json!({
+                "content":[], "_meta":{"astra/providerInteraction":{
+                    "request_id":"source-interaction", "payload":{"type":"choose"}, "timeout_ms":60_000
+                }}
+            }));
+            let (mut exec, _dir) = test_executor();
+            exec.user_id = fixture.scope.user_id.clone();
+            exec.session_id = fixture.scope.session_id.clone();
+            exec.set_agent_binding_mcp(fixture.transport.clone());
+            exec.set_capability_source(Some(fixture.source()));
+            let key =
+                register_fixture_candidate(exec.capability_source.as_ref().unwrap(), &fixture)
+                    .await;
+            let found = exec
+                .execute_source_tool_search(&request(
+                    &fixture.scope,
+                    "tool_search",
+                    json!({"query":format!("select:{key}")}),
+                ))
+                .await
+                .unwrap();
+            assert!(!found.is_error, "{found:?}");
+            exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
+                calls: Arc::new(AtomicUsize::new(0)),
+                decision: astra_tools::ProviderInteractionDecision::Submitted(json!({})),
+                wait: None,
+            }));
+            let token = CancellationToken::new();
+            let rounds = Arc::new(AtomicUsize::new(0));
+            exec.mcp_before_transport = Some(Arc::new({
+                let token = token.clone();
+                move || {
+                    if rounds.fetch_add(1, Ordering::SeqCst) == usize::from(prior_dispatch) {
+                        token.cancel();
+                    }
+                }
+            }));
+            let result = exec
+                .execute_server_local_tool(&request(&fixture.scope, &key, json!({})), Some(&token))
+                .await
+                .result;
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(
+                astra_tools::execution_outcome::outcome_is_unknown(result.metadata.as_ref()),
+                prior_dispatch,
+                "{result:?}"
+            );
+            let fields = result.metadata.unwrap();
+            assert_eq!(
+                fields["execution_fact"],
+                if prior_dispatch {
+                    "unknown"
+                } else {
+                    "not_executed"
+                }
+            );
+            assert_eq!(fields["retryable"], false);
+            assert_eq!(
+                fixture
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| call["method"] == "astra/capabilities/invoke")
+                    .count(),
+                usize::from(prior_dispatch)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_source_registration_failure_preserves_received_outcome_kind() {
+        use super::super::capability_source::tests::{http_fixture, request};
+        for interaction in [false, true] {
+            let fixture = http_fixture(false).await;
+            let mut response =
+                json!({"content":[], "_meta":{"astra.capability_candidates":{"invalid":true}}});
+            if interaction {
+                response["_meta"]["astra/providerInteraction"] = json!({"request_id":"choose", "payload":{"type":"choose"}, "timeout_ms":60_000});
+            }
+            fixture
+                .rpc_results
+                .lock()
+                .unwrap()
+                .insert("tools/call".into(), response);
+            let (mut exec, _dir) = test_executor();
+            exec.user_id = fixture.scope.user_id.clone();
+            exec.session_id = fixture.scope.session_id.clone();
+            exec.set_agent_binding_mcp(fixture.transport.clone());
+            exec.set_capability_source(Some(fixture.source()));
+            let name = fixture.bundle.schemas[0]["function"]["name"]
+                .as_str()
+                .unwrap();
+            let result = exec
+                .execute_mcp_tool(&request(&fixture.scope, name, json!({})), None, None)
+                .await;
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(
+                astra_tools::execution_outcome::outcome_is_unknown(result.metadata.as_ref()),
+                interaction,
+                "{result:?}"
+            );
+            assert_eq!(
+                result.metadata.as_ref().unwrap()["mcp_call_dispatched"],
+                true
+            );
+            assert_eq!(
+                result.metadata.unwrap()["execution_fact"],
+                if interaction { "unknown" } else { "executed" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_interaction_resume_cancellation_reports_unknown_without_blocking() {
         let provider_calls = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new().route(
             "/mcp",
@@ -15113,22 +15328,16 @@ for line in sys.stdin:
         assert!(result.is_error, "{result:?}");
         let fields = result.metadata.as_ref().unwrap();
         assert_eq!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
-        assert_eq!(
-            fields["error_kind"],
-            astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
-        );
-        assert_eq!(fields["workspace_effect_settled"], false);
+        assert_eq!(fields["execution_fact"], "unknown");
         assert!(
-            matches!(
-                astra_tools::workspace_observation::begin_workspace_writer_with_options(
-                    dir.path(),
-                    None,
-                    Duration::from_millis(100),
-                )
-                .await,
-                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
-            ),
-            "an intermediate interaction response must not admit a later workspace writer"
+            astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                dir.path(),
+                None,
+                Duration::from_millis(100),
+            )
+            .await
+            .is_ok(),
+            "an unknown response must not permanently block later inspection"
         );
     }
 
@@ -15140,13 +15349,20 @@ for line in sys.stdin:
             } else {
                 astra_tools::ProviderInteractionDecision::Submitted(json!({"selected": "primary"}))
             };
-            let (result, provider_calls, gate_calls) =
-                execute_provider_interaction_sequence(false, decision, Some(cross_cutoff)).await;
+            let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
+                false,
+                Some(decision),
+                Some(cross_cutoff),
+                None,
+            )
+            .await;
             assert_eq!(gate_calls, 1);
             assert_eq!(provider_calls, if cross_cutoff || cancel { 1 } else { 2 });
             assert!(result.is_error, "{result:?}");
             let fields = result.metadata.as_ref().unwrap();
             assert_eq!(fields["mcp_call_dispatched"], true);
+            assert_eq!(fields["execution_fact"], "unknown");
+            assert_eq!(fields["retryable"], false);
             if cross_cutoff {
                 assert_eq!(fields["execution_started"], true);
                 assert_eq!(fields["side_effects_maybe"], true);
@@ -15172,10 +15388,11 @@ for line in sys.stdin:
     async fn rejected_provider_submission_does_not_continue_the_mcp_call() {
         let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
             true,
-            astra_tools::ProviderInteractionDecision::Error(
+            Some(astra_tools::ProviderInteractionDecision::Error(
                 "provider interaction response was recorded without durable resume authority"
                     .to_string(),
-            ),
+            )),
+            None,
             None,
         )
         .await;
@@ -15187,6 +15404,96 @@ for line in sys.stdin:
         );
         assert_eq!(provider_calls, 1, "no continuation MCP call may be sent");
         assert_eq!(gate_calls, 1);
+        assert!(astra_tools::execution_outcome::outcome_is_unknown(
+            result.metadata.as_ref()
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_interaction_local_timeout_retains_unknown_outcome() {
+        let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
+            false,
+            Some(astra_tools::ProviderInteractionDecision::Timeout),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((provider_calls, gate_calls), (1, 1));
+        assert!(result.output.contains("timed out"), "{result:?}");
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(fields["error_kind"], "tool_timeout");
+    }
+
+    #[tokio::test]
+    async fn mcp_interaction_without_gate_preserves_unknown_dispatched_result() {
+        let (result, provider_calls, gate_calls) =
+            execute_provider_interaction_sequence(false, None, None, None).await;
+        assert_eq!((provider_calls, gate_calls), (1, 0));
+        assert!(
+            result.output.contains("no provider interaction gate"),
+            "{result:?}"
+        );
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn mcp_interaction_continuation_distinguishes_provider_terminal_from_local_failure() {
+        for (response, failed, unknown) in [
+            (
+                json!({"result":{"content":[{"type":"text","text":"done"}]}}),
+                false,
+                false,
+            ),
+            (
+                json!({"result":{"isError":true,"content":[{"type":"text","text":"rejected"}]}}),
+                true,
+                false,
+            ),
+            (
+                json!({"error":{"code":-32000,"message":"rejected"}}),
+                true,
+                false,
+            ),
+            (
+                json!({"error":{"code":-32000,"message":"unconfirmed","data":{"execution_outcome":"unknown"}}}),
+                true,
+                true,
+            ),
+            (
+                json!({"id":"uncorrelated","error":{"code":-32000,"message":"rejected"}}),
+                true,
+                true,
+            ),
+            (
+                json!({"result":{"content":[],"_meta":{"astra/providerInteraction":{"request_id":" ","payload":[]}}}}),
+                true,
+                true,
+            ),
+        ] {
+            let (result, provider_calls, gate_calls) = execute_provider_interaction_sequence(
+                false,
+                Some(astra_tools::ProviderInteractionDecision::Submitted(json!(
+                    {}
+                ))),
+                None,
+                Some(response),
+            )
+            .await;
+            assert_eq!((provider_calls, gate_calls), (2, 1));
+            assert_eq!(result.is_error, failed, "{result:?}");
+            assert_eq!(
+                astra_tools::execution_outcome::outcome_is_unknown(result.metadata.as_ref()),
+                unknown,
+                "{result:?}"
+            );
+            if unknown {
+                assert_eq!(result.metadata.unwrap()["retryable"], false);
+            }
+        }
     }
 
     struct AlwaysTimeoutGate;
@@ -16050,14 +16357,9 @@ for line in sys.stdin:
     #[cfg(unix)]
     #[tokio::test]
     async fn run_script_executes_in_server_workspace() {
-        let scope = astra_sandbox::apply_process_scope();
-        if !scope.ownership_guaranteed() {
-            // This host cannot prove that a Python child (or a daemonized
-            // descendant) is owned by the invocation. The production contract
-            // is an explicit no-dispatch result, not an unobserved fallback.
+        if !astra_sandbox::process_scope_available() {
             return;
         }
-        drop(scope);
         if std::process::Command::new("python3")
             .arg("--version")
             .output()

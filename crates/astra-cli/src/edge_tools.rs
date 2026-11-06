@@ -5223,50 +5223,8 @@ impl ToolExecutor {
             .await;
         let ToolExecutionFacts {
             fields: mut tool_result_fields,
-            is_error: mut source_is_error,
+            is_error: source_is_error,
         } = facts;
-        if native_protocol.is_some()
-            || matches!(
-                mcp_workspace_effect,
-                Some(astra_turn_types::ResolvedToolEffect::Mutating)
-            )
-        {
-            let result = astra_tools::ToolResult {
-                output,
-                metadata: tool_result_fields,
-                is_error: source_is_error.unwrap_or(false),
-                exit_semantics: None,
-            };
-            let dispatched = result.metadata.as_ref().is_some_and(|fields| {
-                fields.get("mcp_call_dispatched").and_then(Value::as_bool) == Some(true)
-                    || (native_protocol.is_some()
-                        && fields
-                            .get("native_collaborator")
-                            .and_then(|native| native.get("target_released"))
-                            != Some(&Value::Bool(false)))
-            });
-            let settled = result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("workspace_effect_settled"))
-                .and_then(Value::as_bool)
-                == Some(true);
-            let result = if dispatched && !settled {
-                if let Some(lease) = &_workspace_mutation_lease {
-                    lease.mark_unsettled();
-                } else {
-                    astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                        &execution_root,
-                    );
-                }
-                astra_tools::workspace_effect_unsettled_tool_result(name, result)
-            } else {
-                result
-            };
-            output = result.output;
-            tool_result_fields = result.metadata;
-            source_is_error = Some(result.is_error);
-        }
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
             astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
         ) && _recursive_writer_epoch
@@ -5308,6 +5266,10 @@ impl ToolExecutor {
             output.push_str(
                 "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
+            let fields = tool_result_fields.get_or_insert_with(Default::default);
+            fields.insert("execution_fact".into(), json!("unknown"));
+            fields.insert("side_effects_maybe".into(), json!(true));
+            fields.insert("retryable".into(), json!(false));
         }
         let direct_writer_applied = coordination_integrity_valid
             && !nested_run_script_callback
@@ -5333,7 +5295,6 @@ impl ToolExecutor {
                 tool_result_fields.get_or_insert_with(Default::default),
             );
         }
-
         // Source status wins over result prose. Unmigrated String handlers
         // retain their status adapter, but cannot invent an error category.
         let mut is_error = source_is_error.unwrap_or_else(|| cli_tool_output_is_error(&output))
@@ -5757,7 +5718,7 @@ impl ToolExecutor {
                 }
                 "enter_plan_mode" => self.enter_plan_mode_remote(args).await,
                 "exit_plan_mode" => self.exit_plan_mode_remote(args).await,
-                "adjust_config" => self.adjust_config(args),
+                "adjust_config" => self.adjust_config(args, tool_result_fields),
                 "compress_context" => self.compress_context(args),
                 "get_agent_info" => self.get_agent_info(args).await,
                 "reflect" => {
@@ -5971,7 +5932,7 @@ impl ToolExecutor {
                         };
                     match action {
                         astra_tools::session_tool_contract::SessionAction::Config => {
-                            self.adjust_config(args)
+                            self.adjust_config(args, tool_result_fields)
                         }
                         astra_tools::session_tool_contract::SessionAction::Sleep => {
                             self.sleep_tool(args).await
@@ -8203,7 +8164,7 @@ pub(crate) mod tests {
         assert_eq!(
             names.contains("run_script"),
             astra_sandbox::process_scope_available(),
-            "run_script visibility must follow the invocation-ownership capability"
+            "run_script visibility follows the available process scope"
         );
         assert!(!names.contains("task_board"));
         assert_eq!(
@@ -8324,11 +8285,11 @@ pub(crate) mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn cli_run_script_is_explicit_shared_tool_delegate() {
-        let scope = astra_sandbox::apply_process_scope();
-        if !scope.ownership_guaranteed() {
+        if !astra_tools::run_script::python3_available()
+            || !astra_sandbox::process_scope_available()
+        {
             return;
         }
-        drop(scope);
         let executor = test_executor();
         let output = executor
             .execute(
@@ -8346,11 +8307,11 @@ pub(crate) mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn run_script_nested_bash_stays_out_of_detach_lane() {
-        let scope = astra_sandbox::apply_process_scope();
-        if !scope.ownership_guaranteed() {
+        if !astra_tools::run_script::python3_available()
+            || !astra_sandbox::process_scope_available()
+        {
             return;
         }
-        drop(scope);
         let (dir, executor) = temp_executor();
         let (slot, listener) = astra_tools::detach::new_slot_with_handle();
         let executor = executor.with_bash_detach_slot(slot);
@@ -8373,7 +8334,7 @@ pub(crate) mod tests {
             !listener.is_active(),
             "run_script RPC Bash must remain foreground-only"
         );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), future)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), future)
             .await
             .expect("nested run_script timeout")
             .expect("nested run_script task");

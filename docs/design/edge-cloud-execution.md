@@ -218,12 +218,15 @@ Reconnect cannot begin while the previous connection's tasks remain active.
 
 `timeout_secs` is the deadline for requesting cancellation, not a deadline for
 abandoning cleanup. Edge uses the canonical executor's cancellation contract:
-generic asynchronous dispatch is cancellation-aware in the executor wrapper;
-Bash and run_script must terminate/reap children and settle workspace observation
-before returning. New executor paths must preserve this contract. A synchronous
+generic asynchronous dispatch is cancellation-aware in the executor wrapper.
+Bash and run_script terminate and reap their direct processes and attempt to
+clean their process group. A process group cannot prove that descendants which
+created another session have stopped. Configured CPU or memory limits still
+require a working resource boundary before starting a script. A synchronous
 non-yielding operation cannot be made preemptible by wrapping it in a Tokio
-timeout. Do not add a cleanup timeout that merely drops the future and allows a
-new connection to overlap an unproven old execution.
+timeout. A Server-local executor that does not finish bounded cleanup reports
+an unknown outcome rather than retaining the waiter and workspace indefinitely;
+its old operation may overlap later work.
 
 After cancellation the connection drops its completion sender and drains the
 remaining senders while tasks finish, then joins their handles. It persists

@@ -3,7 +3,7 @@ import { parseChatSseFrame, isReplayObservationEvent } from "@/lib/api/chat-sse-
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError, streamObservationInterrupted } from "@/lib/api/errors";
 import type { StreamEventState } from "@/lib/api/stream-event-handler";
-import { isExplainAnalyzeEventV1, isArtifactPublicationV1 } from "@astra/sdk";
+import { isExplainAnalyzeEventV1, isArtifactPublicationV1, cancelledContextObservation, contextSaveWarning } from "@astra/sdk";
 import type { ExplainAnalyzeEventV1, ArtifactPublicationV1 } from "@astra/sdk";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
 import {
@@ -220,6 +220,7 @@ export type ChatStreamHandlers = {
     runId?: string;
     status: string;
     error?: string | null;
+    contextNotSaved?: boolean | null;
   }) => void;
   onApprovalRequired?: (approval: PendingRunApproval) => void;
   onInteractionResolved?: () => void;
@@ -741,7 +742,10 @@ function applyStreamEvent(
       runId: typeof event.run_id === "string" ? event.run_id : undefined,
       status,
       error: typeof event.error === "string" ? event.error : null,
+      contextNotSaved: cancelledContextObservation(event),
     });
+    const warning = contextSaveWarning(cancelledContextObservation(event));
+    if (warning && state.runLifecycle !== "finished") handlers.onWarning?.(warning);
     if (status === "cancelled") {
       state.runLifecycle = "finished";
       return;

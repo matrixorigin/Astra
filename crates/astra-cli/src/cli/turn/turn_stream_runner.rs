@@ -475,7 +475,7 @@ where
                     || failure.partial.admission_rejected
             }) =>
             {
-                Ok(())
+                Ok(None)
             }
             None => Err(
                 "Server admission identity was not observed before cancellation completed".into(),
@@ -497,13 +497,37 @@ where
         pair = settle => pair,
     };
     let snapshot = incremental_state.snapshot();
+    // The exact cancellation response observes the terminal even if the
+    // local stream stopped before it arrived.
+    let mut context_not_saved = settled
+        .as_ref()
+        .ok()
+        .copied()
+        .filter(|_| snapshot.run_id.is_some());
+    let result_run_id = match &result {
+        Ok(result) => result.run_id.as_deref(),
+        Err(failure) => failure.partial.run_id.as_deref(),
+    };
+    if result_run_id.is_some()
+        && result_run_id != snapshot.run_id.as_deref()
+        && context_not_saved.is_some()
+    {
+        context_not_saved = Some(None);
+    }
     match settled {
-        Ok(()) => result.map_err(|mut failure| {
-            failure.partial.run_id = failure.partial.run_id.or(snapshot.run_id);
-            failure.partial.remote_cancel_required = false;
-            failure.partial.remote_cancel_run_id = None;
-            failure
-        }),
+        Ok(_) => match result {
+            Ok(mut result) => {
+                result.cancel_context_not_saved = context_not_saved;
+                Ok(result)
+            }
+            Err(mut failure) => {
+                failure.partial.run_id = failure.partial.run_id.or(snapshot.run_id);
+                failure.partial.remote_cancel_required = false;
+                failure.partial.remote_cancel_run_id = None;
+                failure.partial.cancel_context_not_saved = context_not_saved;
+                Err(failure)
+            }
+        },
         Err(error) => {
             let error = astra_logging::redact_known_secret_patterns(&error);
             tracing::warn!(
@@ -876,6 +900,92 @@ mod tests {
             Some("run-owned")
         );
         assert!(!failure.is_clean_local_cancel());
+    }
+
+    #[tokio::test]
+    async fn interactive_cancel_observes_late_context_terminal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for expected in [Some(true), Some(false), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/chat/runs/run-owned"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id":"run-owned", "execution_settled":false
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/chat/runs/run-owned/cancel"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id":"run-owned", "execution_settled":true, "context_not_saved":expected
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let incremental =
+                Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+            incremental.set_run_id("run-owned".into());
+            // The local stream already ended on cancellation; the terminal is
+            // observed only after the exact remote cancellation settles.
+            let mut stream = std::pin::pin!(async {
+                super::super::turn_cancellation::fabricate_user_cancel_failure(
+                    "cancelled",
+                    incremental.clone(),
+                )
+            });
+            let failure = super::settle_interactive_user_cancel(
+                &mut stream,
+                &api,
+                "test-token",
+                None,
+                &incremental,
+                "test",
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+            assert!(!failure.partial.remote_cancel_required);
+            assert_eq!(failure.partial.cancel_context_not_saved, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_cancel_keeps_success_and_context_observation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for observation in [Some(true), Some(false), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/chat/runs/run-owned"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id":"run-owned", "execution_settled":true, "context_not_saved":observation
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let incremental =
+                Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+            incremental.set_run_id("run-owned".into());
+            let mut stream =
+                std::pin::pin!(async { Ok(crate::tests::stub_stream_result("completed")) });
+            let result = super::settle_interactive_user_cancel(
+                &mut stream,
+                &api,
+                "test-token",
+                None,
+                &incremental,
+                "test",
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "completed");
+            assert_eq!(result.cancel_context_not_saved, Some(observation));
+        }
     }
 
     #[tokio::test]

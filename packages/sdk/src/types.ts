@@ -123,9 +123,18 @@ export type RunFinishedEvent = {
   turn_evaluation?: Record<string, unknown> | null;
   status?: string;
   error?: string | null;
+  /** true: Context lost; false: saved/unchanged; absent: unconfirmed. */
+  context_not_saved?: boolean;
   interrupted?: boolean;
   resumable?: boolean;
   waiting_for?: string | null;
+};
+
+export type RunCancellationResult = {
+  runId: string;
+  status: string;
+  executionSettled: boolean;
+  contextNotSaved?: boolean;
 };
 
 export type RunCancelledEvent = {
@@ -1086,6 +1095,8 @@ export type ChatMessage = {
   timestamp: number;
   /** Whether this message is still being streamed. */
   streaming?: boolean;
+  /** null means cancellation ended without confirmed Context-saving evidence. */
+  contextNotSaved?: boolean | null;
 };
 
 export type WorkspaceState = {
@@ -1520,10 +1531,12 @@ export type RuntimeConversationResponse = {
   kind: "conversation";
   session: RuntimeSessionResponse;
   selected_root: { run_id: string; status: string; waiting_for: string | null; created_at: string } | null;
-  items: Array<({ kind: "raw"; failure?: RuntimeConversationFailure } & RuntimeTranscriptItemResponse) | {
+  items: Array<({ kind: "raw"; failure?: RuntimeConversationFailure; context_not_saved?: boolean | null } & RuntimeTranscriptItemResponse) | {
     kind: "opening"; id: string; run_id: string; source_event_id: string; created_at: string; content: string;
   } | {
     kind: "failure"; id: string; run_id: string; created_at: string; failure: RuntimeConversationFailure;
+  } | {
+    kind: "cancellation"; id: string; run_id: string; created_at: string; context_not_saved: boolean | null;
   }>;
   history_loaded: boolean;
   raw_page: { next_before_seq: number | null; has_more: boolean } | null;

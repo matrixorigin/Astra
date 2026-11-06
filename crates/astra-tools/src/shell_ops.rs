@@ -1062,16 +1062,6 @@ pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
     default_bash_timeout_for(command).clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
 }
 
-/// Whether a completed Bash call lacks authoritative process ownership.
-/// Command spelling cannot prove that descendants are unable to mutate later.
-/// Missing ownership after execution is handled by the stronger unsettled
-/// boundary; absence here does not establish that no process ran.
-pub fn bash_scope_requires_attribution_quarantine(
-    ownership: Option<astra_sandbox::ScopeOwnership>,
-) -> bool {
-    ownership.is_some_and(|ownership| !ownership.is_authoritative())
-}
-
 /// Execute a bash command with bounded partial-output capture.
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     execute_bash_with_environment(ctx, args, &[]).await
@@ -1320,52 +1310,21 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
             );
         }
     }
-    finalize_bash_scope_quarantine(
-        &ctx.workspace_root,
-        execution_started,
-        scope_quarantined,
-        scope_ownership,
-        args.get("command")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-    );
-    result
-}
-
-fn finalize_bash_scope_quarantine(
-    workspace_root: &Path,
-    execution_started: bool,
-    scope_quarantined: bool,
-    scope_ownership: Option<astra_sandbox::ScopeOwnership>,
-    command: &str,
-) {
-    if execution_started
-        && scope_ownership.is_none()
-        && !crate::workspace_observation::bash_command_is_detachable_safe(command)
+    if coordination_unsettled
+        || scope_quarantined
+        || (execution_started
+            && scope_ownership.is_none()
+            && !crate::workspace_observation::bash_command_is_detachable_safe(
+                args.get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ))
     {
-        crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-        return;
+        result.is_error = true;
+        result.output.push_str("\n\nThe command's final outcome could not be confirmed; a child process may still be running. Inspect the current state before retrying.");
+        result = result.with_execution_outcome_unknown();
     }
-    if scope_quarantined {
-        if scope_ownership.is_some() {
-            crate::workspace_observation::quarantine_after_weak_receipt(
-                workspace_root,
-                scope_ownership.as_ref().map(|ownership| ownership.as_str()),
-            );
-        } else {
-            crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-        }
-    }
-    // A foreground process group is useful current-call evidence, but it
-    // cannot rule out a descendant that escaped with `setsid` and writes
-    // later. Quarantine future fingerprint attribution even when the
-    // immediate pre/post state is clean.
-    if bash_scope_requires_attribution_quarantine(scope_ownership) {
-        crate::workspace_observation::quarantine_after_weak_receipt(
-            workspace_root,
-            scope_ownership.as_ref().map(|ownership| ownership.as_str()),
-        );
-    }
+    result
 }
 
 async fn execute_bash_inner(
@@ -1702,10 +1661,8 @@ async fn execute_bash_inner(
             result.push('\n');
         }
         result.push_str(
-            "\n⚠ Live descendant processes were terminated when this foreground bash call ended; \
-             they are not running now. This includes programs that daemonize themselves, even \
-             when the command contains no `&`. This executor provides no process-persistence \
-             guarantee.",
+            "\n⚠ Live processes observed in this Bash execution scope were terminated when the call ended. \
+             Processes that escaped the scope may still run. This executor provides no process-persistence guarantee.",
         );
     }
 
@@ -1785,7 +1742,6 @@ fn attach_scope_settled(
     if descendants_terminated {
         let metadata = result.metadata.as_mut().expect("scope metadata inserted");
         metadata.insert("background_children_reaped".to_string(), Value::Bool(true));
-        metadata.insert("descendant_persistence".to_string(), Value::Bool(false));
     }
     if let Some(capture) = capture {
         let fields = result.metadata.as_mut().expect("scope metadata inserted");
@@ -6085,21 +6041,9 @@ printf 'probe.txt:1:needle\n'
         }
     }
 
-    #[test]
-    fn weak_scope_quarantine_uses_process_authority() {
-        assert!(bash_scope_requires_attribution_quarantine(Some(
-            astra_sandbox::ScopeOwnership::ForegroundProcessGroup
-        )));
-        assert!(!bash_scope_requires_attribution_quarantine(Some(
-            astra_sandbox::ScopeOwnership::InvocationCgroup
-        )));
-        // Executed scopes with missing authority are fenced by their producer.
-        assert!(!bash_scope_requires_attribution_quarantine(None));
-    }
-
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn weak_attribution_quarantine_does_not_disable_later_bash_calls() {
+    async fn weak_process_group_does_not_disable_later_bash_calls() {
         let dir = tempdir().expect("workspace");
         let initialized = std::process::Command::new("git")
             .args(["init", dir.path().to_str().expect("workspace path")])
@@ -6121,8 +6065,8 @@ printf 'probe.txt:1:needle\n'
         assert!(!first.is_error, "first command failed: {}", first.output);
         assert_eq!(
             crate::workspace_observation::workspace_observation_is_quarantined(dir.path()),
-            Some(true),
-            "the compound command should exercise weak-ownership quarantine on macOS"
+            Some(false),
+            "ordinary process-group execution must not quarantine later work"
         );
         assert_eq!(
             crate::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
@@ -7510,36 +7454,6 @@ printf 'probe.txt:1:needle\n'
         }));
     }
 
-    #[test]
-    fn started_core_bash_without_settled_ownership_quarantines_before_delayed_daemon_write() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let delayed_root = workspace.path().to_path_buf();
-        let delayed_daemon = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            std::fs::write(delayed_root.join("core-daemon-late.txt"), "late")
-                .expect("delayed daemon write");
-        });
-
-        finalize_bash_scope_quarantine(
-            workspace.path(),
-            true,
-            false,
-            None,
-            "setsid sh -c 'write later'",
-        );
-
-        assert_eq!(
-            crate::workspace_observation::workspace_ownership_is_unsettled(workspace.path()),
-            Some(true),
-            "a trusted started marker with no settled owner must quarantine even without an immediate delta"
-        );
-        delayed_daemon.join().expect("delayed daemon");
-        assert!(
-            crate::workspace_observation::WorkspaceFingerprint::capture(workspace.path()).is_none(),
-            "the daemon's delayed write cannot be attributed to a later core invocation"
-        );
-    }
-
     #[tokio::test]
     async fn bash_timeout_preserves_partial_files_without_attributing_a_snapshot() {
         let dir = tempdir().unwrap();
@@ -8174,13 +8088,15 @@ printf 'probe.txt:1:needle\n'
 
         assert!(!result.is_error, "{}", result.output);
         assert!(
-            result.output.contains("daemonize themselves"),
+            result
+                .output
+                .contains("Live processes observed in this Bash execution scope were terminated"),
             "{}",
             result.output
         );
         let metadata = result.metadata.expect("typed descendant settlement");
         assert_eq!(metadata["background_children_reaped"], true);
-        assert_eq!(metadata["descendant_persistence"], false);
+        assert!(!metadata.contains_key("descendant_persistence"));
     }
 
     #[tokio::test]
