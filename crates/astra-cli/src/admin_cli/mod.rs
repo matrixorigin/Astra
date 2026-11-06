@@ -111,16 +111,19 @@ async fn load_models(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut judgment_available = false;
-    let mut failed_checks = Vec::new();
+    let mut failed_models = Vec::new();
     for (model_name, metadata_only_update, payload, update) in prepared {
-        let needs_check = if metadata_only_update {
-            let body = api
-                .put_bearer_path_json_text(token, &paths::model(model_name), &payload)
+        if judgment_default == Some(model_name) {
+            judgment_available = false;
+        }
+        let result = if metadata_only_update {
+            api.put_bearer_path_json_text(token, &paths::model(model_name), &payload)
                 .await
-                .map_err(map_thin_err)?;
-            stdout_println!("re-synced existing model metadata: {model_name}");
-            print_model_load_server_result(&body, model_name);
-            true
+                .map(|body| {
+                    stdout_println!("re-synced existing model metadata: {model_name}");
+                    print_model_load_server_result(&body, model_name);
+                    true
+                })
         } else {
             match api
                 .post_bearer_path_json_text(token, paths::MODELS, &payload)
@@ -129,34 +132,42 @@ async fn load_models(
                 Ok(body) => {
                     stdout_println!("loaded model: {model_name}");
                     print_model_load_server_result(&body, model_name);
-                    true
+                    Ok(true)
                 }
                 Err(astra_thin_client::ThinClientError::Api { body, .. })
                     if body.contains("already exists") =>
                 {
                     if let Some(update) = update.as_ref() {
-                        let body = api
-                            .put_bearer_path_json_text(token, &paths::model(model_name), update)
+                        api.put_bearer_path_json_text(token, &paths::model(model_name), update)
                             .await
-                            .map_err(map_thin_err)?;
-                        stdout_println!("re-synced existing model: {model_name}");
-                        print_model_load_server_result(&body, model_name);
-                        true
+                            .map(|body| {
+                                stdout_println!("re-synced existing model: {model_name}");
+                                print_model_load_server_result(&body, model_name);
+                                true
+                            })
                     } else {
                         stdout_println!(
                             "skipped (already exists): {model_name} — use `astra admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
                             args.path
                         );
-                        false
+                        Ok(false)
                     }
                 }
-                Err(e) => return Err(map_thin_err(e)),
+                Err(e) => Err(e),
+            }
+        };
+        let needs_check = match result {
+            Ok(needs_check) => needs_check,
+            Err(error) => {
+                eprintln!(
+                    "  could not set up or confirm model {model_name}: {}",
+                    map_thin_err(error)
+                );
+                failed_models.push(model_name.to_string());
+                continue;
             }
         };
         if needs_check || judgment_default == Some(model_name) {
-            if judgment_default == Some(model_name) {
-                judgment_available = false;
-            }
             match api
                 .post_bearer_path_empty_text(token, &paths::model_check(model_name))
                 .await
@@ -166,34 +177,42 @@ async fn load_models(
                         Ok(value) => value,
                         Err(error) => {
                             eprintln!("  model check failed for {model_name}: {error}");
-                            failed_checks.push(model_name.to_string());
+                            failed_models.push(model_name.to_string());
                             continue;
                         }
                     };
                     if judgment_default == Some(model_name) {
                         judgment_available = true;
                     }
-                    match checked
-                        .get("thinking_capability")
+                    if let Some(error) = checked
+                        .pointer("/thinking_probe/error")
                         .and_then(serde_json::Value::as_str)
+                        .filter(|error| !error.trim().is_empty())
                     {
-                        Some("both") => {
-                            stdout_println!("  thinking: both (Normal/Thinking picker) ✓")
+                        eprintln!("  thinking settings could not be verified: {error}");
+                    } else {
+                        match checked
+                            .get("thinking_capability")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            Some("both") => {
+                                stdout_println!("  thinking: both (Normal/Thinking picker) ✓")
+                            }
+                            Some("effort_only") => {
+                                stdout_println!("  thinking: effort_only (Low/High/Max effort) ✓")
+                            }
+                            Some("native_only") => {
+                                stdout_println!("  thinking: native_only (always thinks)")
+                            }
+                            Some("none") => stdout_println!("  thinking: none"),
+                            Some(other) => stdout_println!("  thinking: {other}"),
+                            None => stdout_println!("  thinking: probe returned no capability"),
                         }
-                        Some("effort_only") => {
-                            stdout_println!("  thinking: effort_only (Low/High/Max effort) ✓")
-                        }
-                        Some("native_only") => {
-                            stdout_println!("  thinking: native_only (always thinks)")
-                        }
-                        Some("none") => stdout_println!("  thinking: none"),
-                        Some(other) => stdout_println!("  thinking: {other}"),
-                        None => stdout_println!("  thinking: probe returned no capability"),
                     }
                 }
                 Err(e) => {
                     eprintln!("  model check failed for {model_name}: {e}");
-                    failed_checks.push(model_name.to_string());
+                    failed_models.push(model_name.to_string());
                 }
             }
         }
@@ -207,10 +226,13 @@ async fn load_models(
             );
         }
     }
-    if failed_checks.is_empty() {
+    if failed_models.is_empty() {
         Ok(())
     } else {
-        Err(format!("Model checks failed: {}", failed_checks.join(", ")))
+        Err(format!(
+            "Could not set up or check models: {}. Use `astra admin model show <name>` to check their status before retrying.",
+            failed_models.join(", ")
+        ))
     }
 }
 
@@ -939,22 +961,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_load_continues_after_create_and_update_failures() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (name, status, body) in [
+            ("create-fails", 502, "upstream unavailable"),
+            ("update-fails", 400, "already exists"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/models"))
+                .and(body_partial_json(serde_json::json!({"name": name})))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("PUT"))
+            .and(path("/models/update-fails"))
+            .respond_with(ResponseTemplate::new(504).set_body_string("probe timed out"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/models"))
+            .and(body_partial_json(serde_json::json!({"name": "works"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"is_active":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/models/works/check"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"is_active":true,"thinking_capability":"none"}),
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let doc = yaml(
+            "[{name: create-fails, provider: openai, api_key: placeholder, context_window: 1000}, {name: update-fails, provider: openai, api_key: placeholder, context_window: 1000}, {name: works, provider: openai, api_key: placeholder, context_window: 1000}]",
+        );
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let args = ModelLoadArgs {
+            path: "unused.yaml".into(),
+            update_existing: true,
+        };
+        let error = load_models(&api, "fake-token", doc.as_sequence().unwrap(), &args)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("create-fails") && error.contains("update-fails"),
+            "{error}"
+        );
+        assert!(!error.contains("works"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
     async fn model_load_binds_default_only_after_successful_checks() {
         use wiremock::matchers::{body_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        for (default, check_status, active, binding_status, expected_ok) in [
-            (true, 200, Some(true), 200, true),
-            (false, 200, Some(true), 200, true),
-            (true, 503, Some(true), 200, false),
-            (true, 200, Some(true), 400, false),
-            (true, 200, Some(false), 200, false),
-            (true, 200, None, 200, false),
+        for (default, update_status, check_status, active, binding_status, expected_ok) in [
+            (true, 200, 200, Some(true), 200, true),
+            (false, 200, 200, Some(true), 200, true),
+            (true, 503, 200, Some(true), 200, false),
+            (true, 200, 503, Some(true), 200, false),
+            (true, 200, 200, Some(true), 400, false),
+            (true, 200, 200, Some(false), 200, false),
+            (true, 200, 200, None, 200, false),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("PUT"))
                 .and(path("/models/jev"))
                 .respond_with(
-                    ResponseTemplate::new(200)
+                    ResponseTemplate::new(update_status)
                         .set_body_json(serde_json::json!({"is_active":true,"context_window":1000})),
                 )
                 .expect(1)
@@ -986,7 +1072,7 @@ mod tests {
                     ResponseTemplate::new(check_status)
                         .set_body_json(serde_json::json!({"is_active":active})),
                 )
-                .expect(1)
+                .expect(if update_status == 200 { 1 } else { 0 })
                 .mount(&server)
                 .await;
             Mock::given(method("PUT"))
@@ -996,11 +1082,17 @@ mod tests {
                     ResponseTemplate::new(binding_status)
                         .set_body_json(serde_json::json!({"value":"jev"})),
                 )
-                .expect(if default && check_status == 200 && active == Some(true) {
-                    1
-                } else {
-                    0
-                })
+                .expect(
+                    if default
+                        && update_status == 200
+                        && check_status == 200
+                        && active == Some(true)
+                    {
+                        1
+                    } else {
+                        0
+                    },
+                )
                 .mount(&server)
                 .await;
             // No credentials or profiles: metadata-only load uses the stored server key.
@@ -1015,7 +1107,7 @@ mod tests {
             let result = load_models(&api, "fake-token", doc.as_sequence().unwrap(), &args).await;
             assert_eq!(result.is_ok(), expected_ok, "{result:?}");
             let requests = server.received_requests().await.unwrap();
-            if default && check_status == 200 && active == Some(true) {
+            if default && update_status == 200 && check_status == 200 && active == Some(true) {
                 assert_eq!(
                     requests.last().unwrap().url.path(),
                     "/admin/config/judgment_model"

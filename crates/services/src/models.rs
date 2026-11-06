@@ -6236,7 +6236,6 @@ enum ModelProbeError {
     Network(String),
     Timeout,
     Response(&'static str),
-    Truncated,
     Http(StatusCode),
 }
 
@@ -6286,9 +6285,7 @@ impl ModelProbeError {
             Self::Configuration(_) => (StatusCode::BAD_REQUEST, "model_probe_configuration"),
             Self::Network(_) => (StatusCode::BAD_GATEWAY, "model_probe_network"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout"),
-            Self::Response(_) | Self::Truncated => {
-                (StatusCode::BAD_GATEWAY, "model_probe_response")
-            }
+            Self::Response(_) => (StatusCode::BAD_GATEWAY, "model_probe_response"),
             Self::Http(status) if *status == StatusCode::TOO_MANY_REQUESTS => {
                 (StatusCode::TOO_MANY_REQUESTS, "model_probe_rate_limited")
             }
@@ -6334,7 +6331,6 @@ impl std::fmt::Display for ModelProbeError {
             Self::Configuration(message) | Self::Network(message) => f.write_str(message),
             Self::Timeout => f.write_str("Model check timed out"),
             Self::Response(message) => f.write_str(message),
-            Self::Truncated => f.write_str("Model check did not produce a complete response"),
             Self::Http(status)
                 if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
             {
@@ -6432,9 +6428,22 @@ fn finish_response_probe(
     let output = accumulator.finish().map_err(|_| {
         ModelProbeError::Response("Model check did not produce a complete response")
     })?;
-    if output.text.trim().is_empty()
+    // A typed output-limit terminal with generated tokens proves the model
+    // was reached, even when all output was private reasoning. It does not
+    // establish that a complete answer or thinking capability is available.
+    let generated = !output.text.trim().is_empty()
+        || (output.finish_reason.as_deref() == Some("length")
+            && output
+                .response_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+            && output
+                .usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0));
+    if !generated
         || !output.tool_calls.is_empty()
-        || output.finish_reason.as_deref() == Some("length")
         || output.items.iter().any(|item| {
             item["type"] == "message"
                 && item["content"]
@@ -6503,9 +6512,7 @@ async fn validate_connectivity_for_protocol(
 
     let custom_messages = !matches!(provider, "anthropic" | "bedrock" | "typesafe")
         && probe_endpoint.is_some_and(|path| path.trim_matches('/') == "messages");
-    // Retry only when the provider explicitly says the small response was truncated.
-    let probe = async |output_tokens| {
-        // A retry is a new outbound attempt: re-resolve and pin BYOK each time.
+    let probe = async {
         let client = make_client().await?;
         let result = if provider == "typesafe" {
             if api_key.trim().is_empty() {
@@ -6545,11 +6552,7 @@ async fn validate_connectivity_for_protocol(
                 "model": model_name,
                 "messages": [{"role": "user", "content": "hi"}]
             });
-            astra_core::model_wire::apply_chat_output_token_limit(
-                &mut body,
-                provider,
-                output_tokens,
-            );
+            astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
             req.json(&body).send().await
         } else if provider == "bedrock" {
             let Some(base_url_value) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
@@ -6581,7 +6584,7 @@ async fn validate_connectivity_for_protocol(
                     "content": [{"text": "hi"}]
                 }],
                 "inferenceConfig": {
-                    "maxTokens": output_tokens
+                    "maxTokens": 32
                 }
             }))
             .send()
@@ -6626,7 +6629,7 @@ async fn validate_connectivity_for_protocol(
                 } else {
                     provider
                 },
-                output_tokens,
+                32,
             );
             if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
                 req = req.timeout(Duration::from_secs(360));
@@ -6647,16 +6650,9 @@ async fn validate_connectivity_for_protocol(
     } else {
         Duration::from_secs(15)
     };
-    tokio::time::timeout(timeout, async {
-        let result = probe(32).await;
-        if matches!(result, Err(ModelProbeError::Truncated)) {
-            probe(1024).await
-        } else {
-            result
-        }
-    })
-    .await
-    .map_err(|_| ModelProbeError::Timeout)?
+    tokio::time::timeout(timeout, probe)
+        .await
+        .map_err(|_| ModelProbeError::Timeout)?
 }
 
 async fn validate_probe_response(
@@ -6679,11 +6675,6 @@ async fn validate_probe_response(
         serde_json::from_slice(&bytes)
     }
     .map_err(|_| ModelProbeError::Response("Model check returned an invalid provider response"))?;
-    if probe_response_truncated(provider, &value)
-        || (custom_messages && probe_response_truncated("anthropic", &value))
-    {
-        return Err(ModelProbeError::Truncated);
-    }
     if !valid_probe_response(provider, &value)
         && !(custom_messages && valid_probe_response("anthropic", &value))
     {
@@ -6694,42 +6685,33 @@ async fn validate_probe_response(
     Ok(())
 }
 
-fn probe_response_truncated(provider: &str, value: &Value) -> bool {
-    match provider {
-        "anthropic" => value["stop_reason"] == "max_tokens",
-        "bedrock" => value["stopReason"] == "max_tokens",
-        "typesafe" => false,
-        _ => value["choices"]
-            .as_array()
-            .and_then(|choices| choices.first())
-            .is_some_and(|choice| choice["finish_reason"] == "length"),
-    }
-}
-
 fn valid_probe_response(provider: &str, value: &Value) -> bool {
     if !value.is_object() || value.get("error").is_some_and(|error| !error.is_null()) {
         return false;
     }
     let text = |value: &Value| value.as_str().is_some_and(|text| !text.trim().is_empty());
     match provider {
-        "anthropic" => {
-            value["stop_reason"] != "max_tokens"
-                && value["content"].as_array().is_some_and(|parts| {
-                    parts.iter().all(|part| part["type"] != "tool_use")
-                        && parts
-                            .iter()
-                            .any(|part| part["type"] == "text" && text(&part["text"]))
+        "anthropic" => value["content"].as_array().is_some_and(|parts| {
+            parts
+                .iter()
+                .all(|part| part["type"] != "tool_use" && part["type"] != "refusal")
+                && parts.iter().any(|part| {
+                    (part["type"] == "text" && text(&part["text"]))
+                        || (value["stop_reason"] == "max_tokens"
+                            && part["type"] == "thinking"
+                            && text(&part["thinking"]))
                 })
-        }
-        "bedrock" => {
-            value["stopReason"] != "max_tokens"
-                && value["output"]["message"]["content"]
-                    .as_array()
-                    .is_some_and(|parts| {
-                        parts.iter().all(|part| part.get("toolUse").is_none())
-                            && parts.iter().any(|part| text(&part["text"]))
+        }),
+        "bedrock" => value["output"]["message"]["content"]
+            .as_array()
+            .is_some_and(|parts| {
+                parts.iter().all(|part| part.get("toolUse").is_none())
+                    && parts.iter().any(|part| {
+                        text(&part["text"])
+                            || (value["stopReason"] == "max_tokens"
+                                && text(&part["reasoningContent"]["reasoningText"]["text"]))
                     })
-        }
+            }),
         "typesafe" => value["model"].as_str().is_some_and(|model| {
             let native = serde_json::json!({
                 "schema_version": astra_turn_types::JUDGMENT_SCHEMA_VERSION,
@@ -6749,15 +6731,42 @@ fn valid_probe_response(provider: &str, value: &Value) -> bool {
             .and_then(|choices| choices.first())
             .is_some_and(|choice| {
                 let message = &choice["message"];
-                choice["finish_reason"] != "length"
-                    && choice["finish_reason"] != "tool_calls"
+                let finish = &choice["finish_reason"];
+                (finish.is_null() || matches!(finish.as_str(), Some("stop" | "length")))
                     && message.is_object()
+                    && message
+                        .get("role")
+                        .is_none_or(|role| role.is_null() || role == "assistant")
+                    && message
+                        .get("content")
+                        .is_none_or(|content| content.is_null() || content.is_string())
+                    && message.get("refusal").is_none_or(Value::is_null)
                     && message.get("tool_calls").is_none_or(|calls| {
                         calls.is_null() || calls.as_array().is_some_and(Vec::is_empty)
                     })
-                    && text(&message["content"])
+                    && (text(&message["content"])
+                        || (choice["finish_reason"] == "length"
+                            && (text(&message["reasoning_content"])
+                                || (value["choices"]
+                                    .as_array()
+                                    .is_some_and(|choices| choices.len() == 1)
+                                    && has_reasoning_tokens(value)))))
             }),
     }
+}
+
+fn has_reasoning_tokens(value: &Value) -> bool {
+    [
+        "/usage/completion_tokens_details/reasoning_tokens",
+        "/usage/reasoning_tokens",
+    ]
+    .iter()
+    .any(|path| {
+        value
+            .pointer(path)
+            .and_then(Value::as_u64)
+            .is_some_and(|tokens| tokens > 0)
+    })
 }
 
 fn typesafe_probe_contract() -> astra_turn_types::JudgmentRequest {
@@ -6892,7 +6901,10 @@ async fn probe_thinking_behavior_with_protocol_inner(
         )
         .await
         {
-            Ok(output) if output.items.iter().any(|item| item["type"] == "reasoning") => {
+            Ok(output)
+                if output.finish_reason.as_deref() != Some("length")
+                    && output.items.iter().any(|item| item["type"] == "reasoning") =>
+            {
                 ThinkingProbeResult {
                     capability: ThinkingCapability::EffortOnly,
                     error: None,
@@ -7128,17 +7140,7 @@ async fn send_openai_probe_with_timeout(
         .and_then(serde_json::Value::as_str)
         .is_some_and(|s| !s.is_empty());
 
-    let usage_reasoning = observe_usage_reasoning
-        && [
-            "/usage/completion_tokens_details/reasoning_tokens",
-            "/usage/reasoning_tokens",
-        ]
-        .iter()
-        .any(|path| {
-            json.pointer(path)
-                .and_then(Value::as_u64)
-                .is_some_and(|tokens| tokens > 0)
-        });
+    let usage_reasoning = observe_usage_reasoning && has_reasoning_tokens(&json);
     let observed = has_think_tags || has_reasoning_content || usage_reasoning;
     if !observed
         && json
@@ -8202,7 +8204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_model_check_requires_a_complete_response() {
+    async fn responses_connectivity_and_thinking_use_distinct_evidence() {
         use axum::{
             Json, Router,
             body::{Body, Bytes},
@@ -8211,14 +8213,18 @@ mod tests {
         };
         use futures_util::StreamExt;
         let app = Router::new().route("/responses", post(|headers: HeaderMap, Json(body): Json<Value>| async move {
-            assert_eq!(body["model"], "model");
             assert_eq!(body["stream"], true);
             assert_eq!(body["max_output_tokens"], 1024);
             assert_eq!(body["reasoning"]["effort"], "high");
             assert_eq!(headers["x-probe"], "fixture");
             let item = serde_json::json!({"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"391","annotations":[]}]});
             let reasoning = serde_json::json!({"type":"reasoning","id":"reason-1","summary":[]});
-            let events = format!("data: {}\n\ndata: {}\n\ndata: {}\n\n", serde_json::json!({"type":"response.output_item.done","output_index":0,"item":reasoning}), serde_json::json!({"type":"response.output_item.done","output_index":1,"item":item}), serde_json::json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}));
+            let events = if matches!(body["model"].as_str(), Some("truncated" | "empty")) {
+                let output_tokens = if body["model"] == "truncated" { 32 } else { 0 };
+                format!("data: {}\n\n", serde_json::json!({"type":"response.incomplete","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"output_tokens":output_tokens}}}))
+            } else {
+                format!("data: {}\n\ndata: {}\n\ndata: {}\n\n", serde_json::json!({"type":"response.output_item.done","output_index":0,"item":reasoning}), serde_json::json!({"type":"response.output_item.done","output_index":1,"item":item}), serde_json::json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}))
+            };
             let stream = futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(Bytes::from(events)) }).chain(futures_util::stream::pending());
             Response::new(Body::from_stream(stream))
         })).route("/incomplete", post(|| async { "data: {\"type\":\"response.created\"}\n\n" }))
@@ -8262,6 +8268,41 @@ mod tests {
             .await
             .is_err()
         );
+        let truncated = probe_responses(
+            &client,
+            &format!("{base}/responses"),
+            "truncated",
+            "key",
+            Some(&headers),
+            Some("high"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(truncated.finish_reason.as_deref(), Some("length"));
+        assert!(
+            probe_responses(
+                &client,
+                &format!("{base}/responses"),
+                "empty",
+                "key",
+                Some(&headers),
+                Some("high")
+            )
+            .await
+            .is_err()
+        );
+        let incomplete_observation = probe_thinking_behavior_with_protocol(
+            "openai",
+            "truncated",
+            "key",
+            Some(&base),
+            Some(&headers),
+            Some("high"),
+            Some(ThinkingProtocol::ResponsesReasoning),
+        )
+        .await;
+        assert_eq!(incomplete_observation.capability, ThinkingCapability::None);
+        assert!(incomplete_observation.error.is_some());
         assert!(
             probe_responses(
                 &client,
@@ -8354,11 +8395,27 @@ mod tests {
             {"message":{"content":"partial"},"finish_reason":"length"},
             {"message":{"content":"ok"},"finish_reason":"stop"}
         ]});
-        assert!(probe_response_truncated(
-            "openai",
-            &first_choice_is_truncated
-        ));
-        assert!(!valid_probe_response("openai", &first_choice_is_truncated));
+        assert!(valid_probe_response("openai", &first_choice_is_truncated));
+        for (provider, partial) in [
+            (
+                "openai",
+                serde_json::json!({"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"length"}]}),
+            ),
+            (
+                "openai",
+                serde_json::json!({"choices":[{"message":{"content":null},"finish_reason":"length"}],"usage":{"completion_tokens_details":{"reasoning_tokens":32}}}),
+            ),
+            (
+                "anthropic",
+                serde_json::json!({"content":[{"type":"thinking","thinking":"working"}],"stop_reason":"max_tokens"}),
+            ),
+            (
+                "bedrock",
+                serde_json::json!({"output":{"message":{"content":[{"reasoningContent":{"reasoningText":{"text":"working"}}}]}},"stopReason":"max_tokens"}),
+            ),
+        ] {
+            assert!(valid_probe_response(provider, &partial), "{provider}");
+        }
         for parts in [
             serde_json::json!([{"toolUse":{"toolUseId":"1","name":"bash","input":{}}}]),
             serde_json::json!([{"text":"hello"},{"toolUse":{"toolUseId":"1","name":"bash","input":{}}}]),
@@ -8386,18 +8443,30 @@ mod tests {
             "openai",
             &serde_json::json!({"choices":[{"message":{"content":"  "}}]})
         ));
-        assert!(!valid_probe_response(
+        assert!(valid_probe_response(
             "openai",
             &serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]})
         ));
-        assert!(!valid_probe_response(
+        assert!(valid_probe_response(
             "anthropic",
             &serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"})
         ));
-        assert!(!valid_probe_response(
+        assert!(valid_probe_response(
             "bedrock",
             &serde_json::json!({"output":{"message":{"content":[{"text":"partial"}]}},"stopReason":"max_tokens"})
         ));
+        for invalid in [
+            serde_json::json!({"choices":[{"message":{"content":null,"reasoning_content":""},"finish_reason":"length"}]}),
+            serde_json::json!({"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"stop"}]}),
+            serde_json::json!({"choices":[{"message":{"content":"partial","refusal":"no"},"finish_reason":"length"}]}),
+            serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"content_filter"}]}),
+            serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":42}]}),
+            serde_json::json!({"choices":[{"message":{"role":"user","content":"partial"},"finish_reason":"length"}]}),
+            serde_json::json!({"choices":[{"message":{"content":[],"reasoning_content":"thinking"},"finish_reason":"length"}]}),
+            serde_json::json!({"choices":[{"message":{"content":null},"finish_reason":"length"},{"message":{"content":"other"},"finish_reason":"stop"}],"usage":{"reasoning_tokens":32}}),
+        ] {
+            assert!(!valid_probe_response("openai", &invalid), "{invalid}");
+        }
     }
 
     #[tokio::test]
@@ -11564,14 +11633,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connectivity_probe_retries_only_explicit_truncation() {
-        use axum::{Json, Router, extract::ConnectInfo, routing::post};
+    async fn connectivity_probe_accepts_generated_partial_output_once() {
+        use axum::{Json, Router, routing::post};
         for (provider, path, endpoint, truncated, complete) in [
             (
                 "openai",
                 "/chat/completions",
                 None,
-                serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}),
+                serde_json::json!({"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"length"}]}),
                 serde_json::json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}),
             ),
             (
@@ -11597,20 +11666,19 @@ mod tests {
             ),
         ] {
             for mode in ["complete", "truncated", "invalid", "rate_limit"] {
-                let captured = Arc::new(Mutex::new(Vec::<(Value, std::net::SocketAddr)>::new()));
+                let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
                 let app = Router::new().route(
                     path,
                     post({
                         let (captured, truncated, complete) =
                             (captured.clone(), truncated.clone(), complete.clone());
-                        move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-                              Json(body): Json<Value>| {
+                        move |Json(body): Json<Value>| {
                             let (captured, truncated, complete) =
                                 (captured.clone(), truncated.clone(), complete.clone());
                             async move {
                                 let mut requests =
                                     astra_core::sync_poison::recover_mutex_lock(&captured);
-                                requests.push((body, peer));
+                                requests.push(body);
                                 let response = match mode {
                                     "rate_limit" => (
                                         StatusCode::TOO_MANY_REQUESTS,
@@ -11620,7 +11688,6 @@ mod tests {
                                         (StatusCode::OK, serde_json::json!({"status":"ok"}))
                                     }
                                     "truncated" => (StatusCode::OK, truncated),
-                                    _ if requests.len() == 1 => (StatusCode::OK, truncated),
                                     _ => (StatusCode::OK, complete),
                                 };
                                 (response.0, Json(response.1))
@@ -11630,33 +11697,7 @@ mod tests {
                 );
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let base = format!("http://{}", listener.local_addr().unwrap());
-                let task = tokio::spawn(async move {
-                    axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                    )
-                    .await
-                    .unwrap()
-                });
-                if provider == "openai" && endpoint.is_none() && mode == "complete" {
-                    // Prove the fixture keeps connections alive: a single client
-                    // should reuse the connection that a fresh retry must not.
-                    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-                    for _ in 0..2 {
-                        client
-                            .post(format!("{base}{path}"))
-                            .json(&serde_json::json!({}))
-                            .send()
-                            .await
-                            .unwrap()
-                            .bytes()
-                            .await
-                            .unwrap();
-                    }
-                    let mut requests = astra_core::sync_poison::recover_mutex_lock(&captured);
-                    assert_eq!(requests[0].1, requests[1].1);
-                    requests.clear();
-                }
+                let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
                 let result = validate_connectivity_for_protocol(
                     provider,
                     "model",
@@ -11668,8 +11709,9 @@ mod tests {
                 )
                 .await;
                 match mode {
-                    "complete" => assert!(result.is_ok(), "{provider}/{path}: {result:?}"),
-                    "truncated" => assert!(matches!(result, Err(ModelProbeError::Truncated))),
+                    "complete" | "truncated" => {
+                        assert!(result.is_ok(), "{provider}/{path}: {result:?}")
+                    }
                     "invalid" => assert!(matches!(result, Err(ModelProbeError::Response(_)))),
                     _ => assert!(matches!(
                         result,
@@ -11677,18 +11719,8 @@ mod tests {
                     )),
                 }
                 let requests = astra_core::sync_poison::recover_mutex_lock(&captured);
-                assert_eq!(
-                    requests.len(),
-                    if matches!(mode, "complete" | "truncated") {
-                        2
-                    } else {
-                        1
-                    }
-                );
-                if provider == "openai" && endpoint.is_none() && mode == "complete" {
-                    assert_ne!(requests[0].1, requests[1].1);
-                }
-                for (index, (request, _)) in requests.iter().enumerate() {
+                assert_eq!(requests.len(), 1);
+                for request in requests.iter() {
                     if endpoint.is_some() {
                         assert!(request.get("max_completion_tokens").is_none());
                     }
@@ -11699,7 +11731,7 @@ mod tests {
                     } else {
                         &request["max_tokens"]
                     };
-                    assert_eq!(*tokens, if index == 0 { 32 } else { 1024 });
+                    assert_eq!(*tokens, 32);
                 }
                 task.abort();
             }
