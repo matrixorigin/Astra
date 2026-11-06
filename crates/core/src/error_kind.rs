@@ -673,10 +673,14 @@ pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
 #[must_use]
 pub fn structured_llm_error_code(body: &str) -> Option<(ErrorKind, &'static str)> {
     let error = llm_error_envelope_error(body)?;
+    // `code` wins when it is a usable string; OpenAI-compatible envelopes
+    // commonly carry `"code": null` (or omit it), so null/non-string/empty
+    // values must fall back to `type` instead of failing the parse.
     let code = error
         .get("code")
-        .or_else(|| error.get("type"))
-        .and_then(serde_json::Value::as_str)?;
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| !code.trim().is_empty())
+        .or_else(|| error.get("type").and_then(serde_json::Value::as_str))?;
     llm_error_envelope_code_class(code)
 }
 
@@ -702,24 +706,43 @@ pub fn llm_error_envelope_code_class(code: &str) -> Option<(ErrorKind, &'static 
 /// user-visible errors or structured log fields.
 ///
 /// Provider error envelopes are untrusted: an arbitrary `request_id` could
-/// carry echoed credentials (`"Bearer secret-token"`), control characters,
-/// or unbounded diagnostics. Only bounded machine tokens pass: ASCII
-/// alphanumerics plus `-`/`_`, which covers TaaS's `req_<hyphenated-uuid>`
-/// and plain hex ids while rejecting whitespace, quotes, and control bytes.
+/// carry echoed credentials, control characters, or unbounded diagnostics.
+/// A character whitelist cannot tell an identifier from a credential —
+/// `sk-proj-secretABC123` is alphanumerics and dashes — so only documented
+/// identifier shapes pass:
+///
+/// - `req_<uuid>` — TaaS and current OpenAI request ids.
+/// - `req_<hex>` — legacy OpenAI request ids (8..=96 hex digits).
+/// - `<uuid>` — bare UUID request ids used by some gateways.
+///
+/// Credential shapes (`sk-…`, `Bearer …`, `AKIA…`), free text, and overlong
+/// values are structurally excluded: they match none of these forms.
 #[must_use]
 pub fn validated_llm_provider_request_id(value: &str) -> Option<String> {
     const MAX_REQUEST_ID_LEN: usize = 128;
+    const MAX_REQ_HEX_LEN: usize = 96;
     let value = value.trim();
     if value.is_empty() || value.len() > MAX_REQUEST_ID_LEN {
         return None;
     }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return None;
-    }
-    Some(value.to_string())
+    let is_uuid = |token: &str| {
+        token.len() == 36
+            && token.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+    };
+    let valid = if let Some(token) = value.strip_prefix("req_") {
+        is_uuid(token)
+            || ((8..=MAX_REQ_HEX_LEN).contains(&token.len())
+                && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    } else {
+        is_uuid(value)
+    };
+    valid.then(|| value.to_string())
 }
 
 /// Extract `error.request_id` from a provider error envelope body for log
@@ -1576,15 +1599,15 @@ mod tests {
     fn structured_llm_error_request_id_extraction() {
         assert_eq!(
             structured_llm_error_request_id(
-                r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123"}}"#
+                r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123de"}}"#
             ),
-            Some("req_abc123".to_string())
+            Some("req_abc123de".to_string())
         );
         assert_eq!(
             structured_llm_error_request_id(
-                r#"LLM error 400: {"error":{"message":"bad param","code":"invalid_request","request_id":"req_def456"}}"#
+                r#"LLM error 400: {"error":{"message":"bad param","code":"invalid_request","request_id":"req_def45678"}}"#
             ),
-            Some("req_def456".to_string())
+            Some("req_def45678".to_string())
         );
         assert_eq!(
             structured_llm_error_request_id(
@@ -1597,16 +1620,30 @@ mod tests {
 
     #[test]
     fn structured_llm_error_request_id_rejects_untrusted_values() {
-        // TaaS's `req_<hyphenated-uuid>` and plain hex ids pass.
+        // Documented identifier shapes pass: TaaS's `req_<hyphenated-uuid>`,
+        // legacy `req_<hex>`, and bare UUID gateway ids.
         assert_eq!(
             structured_llm_error_request_id(
                 r#"{"error":{"code":"invalid_request","request_id":"req_3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
             ),
             Some("req_3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
         );
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"error":{"code":"invalid_request","request_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
+            ),
+            Some("3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
+        );
         // Secret-bearing values must never reach user-visible errors or logs.
+        // A character whitelist cannot tell these credential shapes from an
+        // identifier — only the structural forms above are accepted.
         for body in [
             r#"{"error":{"code":"invalid_request","request_id":"Bearer secret-token"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"sk-proj-secretABC123"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"sk-ant-api03-secretABC123"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"AKIAIOSFODNN7EXAMPLE"}}"#,
+            // A `req_` prefix does not rescue a credential-shaped payload.
+            r#"{"error":{"code":"invalid_request","request_id":"req_sk-proj-secretABC123"}}"#,
             // Control characters and quotes break log/message structure.
             r#"{"error":{"code":"invalid_request","request_id":"req_ok\u000aevil"}}"#,
             r#"{"error":{"code":"invalid_request","request_id":"req_\"quoted\""}}"#,
@@ -1651,6 +1688,25 @@ mod tests {
             (
                 r#"{"error":{"type":"request_body_too_large","message":"too large"}}"#,
                 Some("request_body_too_large"),
+            ),
+            // OpenAI-compatible envelopes commonly carry `"code": null`;
+            // unusable code values fall back to `type`.
+            (
+                r#"{"error":{"code":null,"type":"request_body_too_large","message":"too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            (
+                r#"{"error":{"code":"","type":"context_length_exceeded","message":"too long"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            (
+                r#"{"error":{"code":123,"type":"invalid_request","message":"bad param"}}"#,
+                Some("invalid_request"),
+            ),
+            // A usable `code` keeps precedence over `type`.
+            (
+                r#"{"error":{"code":"context_length_exceeded","type":"invalid_request","message":"too long"}}"#,
+                Some("context_length_exceeded"),
             ),
             (
                 r#"{"error":{"code":"internal_error: db conn 10.0.0.1 refused","message":"x"}}"#,
