@@ -32691,18 +32691,20 @@ mod tests {
             &mut state,
             admission.rejected,
         );
-        crate::turn::agentic_loop::tool_phase::settle_non_retryable_tool_rejections(
-            &mut state,
-            &[settle],
-            0,
-            false,
-            false,
-            false,
+        let read = json!({
+            "id":"independent-read", "type":"function",
+            "function":{"name":"read_file", "arguments":"{\"path\":\"notes.txt\"}"}
+        });
+        let alternative = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: ordinary_admitted([read]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
         );
-        assert!(
-            state.hooks.completion_settlement.text_only,
-            "without an outstanding run dependency the ordinary non-retryable boundary remains"
-        );
+        assert_eq!(alternative.admitted.len(), 1);
+        assert!(alternative.rejected.is_empty());
 
         let carrier = json!({
             "id": "settle-carrier-while-child-runs",

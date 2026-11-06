@@ -803,8 +803,24 @@ fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Opt
             .take(256)
             .collect::<String>()
     });
-    let evidence = result
-        .and_then(|value| value.get("recovery_evidence"))
+    // Pre-execution rejections carry their structured result as a JSON string
+    // in the canonical record. Preserve those facts when the body is compacted.
+    let rejection = (disposition == ToolCallDisposition::Rejected)
+        .then(|| {
+            record
+                .runtime_model_result_full
+                .as_deref()
+                .or(record.result_full.as_deref())
+                .filter(|raw| raw.len() <= 8192)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        })
+        .flatten();
+    let field = |key| {
+        result
+            .and_then(|value| value.get(key))
+            .or_else(|| rejection.as_ref().and_then(|value| value.get(key)))
+    };
+    let evidence = field("recovery_evidence")
         .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
         .and_then(|value| {
             serde_json::from_value::<astra_core::ToolFailureEvidence>(value.clone()).ok()
@@ -815,7 +831,7 @@ fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Opt
         "result_delivery": record.execution_ok.map(|_| "incomplete"),
         "error_kind": record.error_kind.map(|kind| kind.as_str()),
         "detail": detail,
-        "retryable": result.and_then(|value| value.get("retryable")).and_then(Value::as_bool),
+        "retryable": field("retryable").and_then(Value::as_bool),
         "recovery_evidence": evidence,
     });
     facts
@@ -1105,6 +1121,14 @@ mod tests {
             ..Default::default()
         };
         assert!(tool_outcome_advisory(&ok, None).is_none());
+
+        let rejected = ToolCallRecord {
+            disposition: Some(Disposition::Rejected),
+            result_full: Some(json!({"retryable": false}).to_string()),
+            ..Default::default()
+        };
+        let fact = tool_outcome_advisory(&rejected, None).unwrap();
+        assert!(fact.contains("\"retryable\":false"));
 
         let fact = tool_outcome_advisory(
             &ToolCallRecord {

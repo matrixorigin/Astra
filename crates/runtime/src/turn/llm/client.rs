@@ -15512,6 +15512,14 @@ mod tests {
             ..Default::default()
         }
         .continuation(&connection, "model");
+        let key = astra_services::FernetTokenEncryptor::new("responses-fixture").unwrap();
+        crate::turn::llm::private_continuation::seal(
+            &mut assistant[CONTINUATION_KEY],
+            &key,
+            "owner",
+            "session",
+        )
+        .unwrap();
         let control = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
             "retry required Work",
             crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
@@ -15529,7 +15537,17 @@ mod tests {
                 history.push(json!({"role":"user", "content":"new question"}));
             }
             let canonical = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(history).unwrap();
-            let replay = request("model", &canonical, None, &connection, false, None).unwrap();
+            let mut opened = canonical.clone();
+            crate::turn::llm::private_continuation::open(
+                &mut opened,
+                &key,
+                "owner",
+                &HashSet::from(["session".to_string()]),
+                &connection,
+                "model",
+            )
+            .unwrap();
+            let replay = request("model", &opened, None, &connection, false, None).unwrap();
             assert!(
                 replay["input"]
                     .as_array()

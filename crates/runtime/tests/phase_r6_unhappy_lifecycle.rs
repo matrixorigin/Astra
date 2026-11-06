@@ -106,8 +106,12 @@ async fn unhappy_tool_call_with_invalid_json_args() {
         serde_json::from_str(records[0]["result_full"].as_str().unwrap()).unwrap();
     assert_eq!(rejection["status"], "rejected");
     assert_eq!(rejection["error_kind"], "tool_call_arguments_invalid");
-    let wire_rejection: Value = serde_json::from_str(paired_failure(&messages)).unwrap();
+    let (body, guidance) = paired_failure(&messages)
+        .split_once("\n\n[Runtime tool guidance]\n")
+        .expect("the model receives both the rejection and its execution facts");
+    let wire_rejection: Value = serde_json::from_str(body).unwrap();
     assert_eq!(wire_rejection["error_kind"], "tool_call_arguments_invalid");
+    assert!(guidance.contains("\"execution\":\"not_executed\""));
 }
 
 #[tokio::test]

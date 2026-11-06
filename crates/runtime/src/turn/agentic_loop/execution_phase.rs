@@ -12338,29 +12338,6 @@ mod tests {
             entry.payload["signal"] == "canonical_validation_failed_repair_once"
                 && entry.payload["origin"] == "rejected_work_settlement"
         }));
-        super::super::tool_phase::settle_non_retryable_tool_rejections(
-            &mut state,
-            &[serde_json::json!({
-                "id": "call-settle",
-                "type": "function",
-                "function": {"name": "settle_work_item", "arguments": "{}"}
-            })],
-            2,
-            false,
-            true,
-            false,
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .map(|window| &window.action),
-            Some(&CompletionAction::CanonicalWorkRepair),
-            "the later terminal-rejection gate must not revoke Work repair authority"
-        );
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
         // The same rejection cannot authorize repair after a local suffix
         // record is lost. Keep the positive control above.
         state.stall.verification_frontier =
@@ -17547,7 +17524,14 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_spill_failure_cancellation_and_small_summary_preserve_history() {
-        for condition in ["failure", "cancel", "late-cancel", "no-benefit", "success"] {
+        for condition in [
+            "failure",
+            "cancel",
+            "late-cancel",
+            "no-benefit",
+            "reasoning",
+            "success",
+        ] {
             let mut host = MockHost::new(Vec::new());
             host.history_artifact_enabled = true;
             host.history_artifact_error = condition == "failure";
@@ -17562,7 +17546,7 @@ mod tests {
             state
                 .messages
                 .push(serde_json::json!({"role":"user","content":"current request"}));
-            if condition == "success" {
+            if condition == "reasoning" {
                 state.messages[1][astra_core::model_wire::responses::CONTINUATION_KEY] = serde_json::json!({
                     "items":[{"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}]
                 });

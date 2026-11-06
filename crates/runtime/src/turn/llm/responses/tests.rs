@@ -368,11 +368,35 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     // A result without a matching call in the same group can be the only
     // surviving evidence of an already executed tool.
     let mut extra_result = messages.clone();
+    let replay_key = FernetTokenEncryptor::new("responses-replay-fixture").unwrap();
+    let seal_history = |history: &mut [Value]| {
+        let saved = history
+            .iter_mut()
+            .find_map(|message| {
+                message.get_mut(astra_core::model_wire::responses::CONTINUATION_KEY)
+            })
+            .unwrap();
+        crate::turn::llm::private_continuation::seal(saved, &replay_key, "owner", "session")
+            .unwrap();
+    };
+    let open_history = |history: &mut [Value]| {
+        crate::turn::llm::private_continuation::open(
+            history,
+            &replay_key,
+            "owner",
+            &HashSet::from(["session".to_string()]),
+            &scope,
+            "model",
+        )
+        .unwrap();
+    };
+    seal_history(&mut extra_result);
     extra_result.push(json!({"role":"tool", "tool_call_id":"call-1", "content":"found"}));
     extra_result
         .push(json!({"role":"tool", "tool_call_id":"missing-call", "content":"effect occurred"}));
     let mut extra_result = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(extra_result).unwrap();
     extra_result = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(extra_result).unwrap();
+    open_history(&mut extra_result);
     for protocol in [
         LlmProviderProtocol::OpenAiResponses,
         LlmProviderProtocol::OpenAiCompatible,
@@ -628,7 +652,9 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         .as_array_mut()
         .unwrap()
         .push(json!({"type":"function_call", "call_id":"call-2", "name":"lookup"}));
+    seal_history(&mut inconsistent);
     let mut inconsistent = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(inconsistent).unwrap();
+    open_history(&mut inconsistent);
     for protocol in [
         LlmProviderProtocol::OpenAiResponses,
         LlmProviderProtocol::OpenAiCompatible,
@@ -648,7 +674,21 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
     ] {
         let mut attempt = call(&inconsistent, &tools, &scope, &base, &thinking);
         attempt.route.inference_protocol = Some(protocol);
-        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto).unwrap();
+        let prepared = prepare_streaming_call(attempt, RuntimeToolChoice::Auto);
+        if protocol == LlmProviderProtocol::OpenAiResponses {
+            let error = match prepared {
+                Err(error) => error,
+                Ok(_) => panic!("Responses silently discarded inconsistent reasoning"),
+            };
+            assert!(
+                error
+                    .details_json
+                    .unwrap()
+                    .contains("responses_continuation_history_incomplete")
+            );
+            continue;
+        }
+        let prepared = prepared.unwrap();
         let body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
         let wire = body.to_string();
         assert!(wire.contains("call-1"));

@@ -6425,6 +6425,7 @@ pub(crate) mod tests {
         turn_results: Vec<HostTurnResult>,
         pub(crate) terminal_provider_error: Option<astra_core::ClassifiedError>,
         admitted_results_by_turn: Vec<Vec<EdgeToolExecResult>>,
+        pre_execution_rejection: Option<String>,
         current_turn: usize,
         pub(crate) provider_call_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
         provider_response_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -6492,6 +6493,7 @@ pub(crate) mod tests {
                 turn_results,
                 terminal_provider_error: None,
                 admitted_results_by_turn,
+                pre_execution_rejection: None,
                 current_turn: 0,
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
@@ -6781,6 +6783,16 @@ pub(crate) mod tests {
             tool_calls: &[Value],
         ) -> AdmittedToolCallOutcome {
             self.admitted_tool_call_batches.push(tool_calls.to_vec());
+            if let Some(result) = self.pre_execution_rejection.take() {
+                assert_eq!(tool_calls.len(), 1);
+                return AdmittedToolCallOutcome {
+                    pre_execution_rejections: vec![RejectedToolCall::ordinary(
+                        tool_calls[0].clone(),
+                        result,
+                    )],
+                    ..Default::default()
+                };
+            }
             let scripted = self
                 .current_turn
                 .checked_sub(1)
@@ -8528,26 +8540,57 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn stop_after_success_template_becomes_rendered_final_text() {
-        let mut host = MockHost::new(vec![edge_tool_result(
-            vec![make_edge_tool(
-                "mcp__moi__read_catalog_file_content",
-                "parsing",
+        let tool = "mcp__moi__read_catalog_file_content";
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let binding = astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+            astra_runtime_env::WorkspaceBinding::none(),
+            astra_runtime_env::ExecutorBinding {
+                kind: astra_runtime_env::ExecutorBindingKind::Mcp,
+                executor_id: "moi".into(),
+                display_name: "MOI".into(),
+                transport: astra_runtime_env::ToolTransportKind::McpHttp,
+                status: astra_runtime_env::ExecutorStatus::Online,
+            },
+            astra_runtime_env::RuntimeBinding::none(),
+            astra_runtime_env::PolicyIntent::cloud_control_plane(),
+            &registry,
+            &[astra_runtime_env::request_scoped_mcp_provider(
+                "moi",
+                [tool.to_string()],
             )],
-            20,
-            10,
-            Some(50),
-        )])
-        .with_stop_after_success_completion(
-            "mcp__moi__read_catalog_file_content",
-            Some("文件正在解析，工作流执行 ID：syswfe-1"),
         );
+        let mut result = make_edge_tool(tool, "parsing");
+        result.tool_result_fields.as_mut().unwrap().insert(
+            "runtime_environment_advertisement".into(),
+            serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+                binding,
+            ))
+            .unwrap(),
+        );
+        let mut host = MockHost::new(vec![edge_tool_result(vec![result], 20, 10, Some(50))])
+            .with_stop_after_success_completion(
+                tool,
+                Some("文件正在解析，工作流执行 ID：syswfe-1"),
+            );
         let mut state = make_state();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "expected Ok but got: {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "expected Ok but got: {outcome:?}; records={:?}; messages={:?}",
+            state.stall.tool_call_records,
+            state.messages,
+        );
         assert_eq!(host.current_turn, 1);
         assert_eq!(state.final_text, "文件正在解析，工作流执行 ID：syswfe-1");
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| { record.name == tool && record.was_executed() && record.ok })
+        );
         assert!(state.final_text_streamed);
         let terminal_messages = state
             .messages
@@ -8562,6 +8605,35 @@ pub(crate) mod tests {
             terminal_messages, 1,
             "provider-declared terminal text must become one canonical assistant message"
         );
+    }
+
+    #[tokio::test]
+    async fn denied_mcp_tool_does_not_trigger_a_success_template() {
+        let tool = "mcp__moi__read_catalog_file_content";
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool(tool, "parsing")], 20, 10, Some(50)),
+            text_result("The tool was unavailable.", 15, 5, Some(30)),
+        ])
+        .with_stop_after_success_completion(tool, Some("premature success"));
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected model recovery: {outcome:?}");
+        assert_eq!(state.final_text, "The tool was unavailable.");
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| { record.name == tool && !record.was_executed() && !record.ok })
+        );
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["tool_call_id"] == format!("req-{tool}")
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("mcp_executor_required"))
+        }));
     }
 
     #[tokio::test]
@@ -8607,6 +8679,62 @@ pub(crate) mod tests {
                     })
         }));
         assert_eq!(state.final_text, "recovered");
+    }
+
+    #[tokio::test]
+    async fn non_retryable_rejection_allows_a_different_permitted_action() {
+        let rejected = json!({
+            "id": "denied-command", "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"denied\"}"}
+        });
+        let mut host = MockHost::new(vec![
+            server_tool_result(vec![rejected], Vec::new(), 20, 10, Some(50)),
+            edge_tool_result(
+                vec![make_edge_tool("read_file", "available")],
+                20,
+                10,
+                Some(30),
+            ),
+            text_result("done", 15, 5, Some(30)),
+        ])
+        .with_valid_tools(&["bash", "read_file"]);
+        host.pre_execution_rejection = Some(
+            json!({"status":"rejected", "error_kind":"policy_denied", "retryable":false,
+                   "error":"This command is not permitted."})
+            .to_string(),
+        );
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected recovery: {outcome:?}");
+        assert!(state.interruption.is_none());
+        assert_eq!(state.final_text, "done");
+        assert_eq!(host.current_turn, 3);
+        assert!(!host.text_only_turns[1]);
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["tool_call_id"] == "denied-command"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("This command is not permitted"))
+                && message["_astra_tool_result_advisories"]
+                    .to_string()
+                    .contains("\\\"retryable\\\":false")
+        }));
+        let denied = state
+            .stall
+            .tool_call_records
+            .iter()
+            .find(|record| record.tool_call_id.as_deref() == Some("denied-command"))
+            .expect("rejection receipt");
+        assert!(!denied.was_executed());
+        assert!(
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| { record.name == "read_file" && record.was_executed() && record.ok })
+        );
     }
 
     fn completed_write_with_lost_result() -> EdgeToolExecResult {

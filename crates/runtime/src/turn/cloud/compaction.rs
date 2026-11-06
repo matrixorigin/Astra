@@ -535,9 +535,8 @@ fn close_retained_dependencies(messages: &[Value], keep: &mut [bool]) {
     }
 }
 
-/// The latest tool batch is the model's next observation for this user turn.
-/// Keep its call/result pairing when removing history; individual result
-/// bodies remain eligible for the normal bounded compaction.
+/// Keep an unobserved tool batch paired until the next model response.
+/// Individual result bodies remain eligible for normal bounded compaction.
 fn retain_latest_tool_batch(messages: &[Value], keep: &mut [bool]) {
     let latest_user = messages
         .iter()
@@ -554,6 +553,9 @@ fn retain_latest_tool_batch(messages: &[Value], keep: &mut [bool]) {
     });
     if let Some(index) = latest_result
         && latest_user.is_none_or(|user| index > user)
+        && !messages[index + 1..].iter().any(|message| {
+            message["role"] == "assistant" && !astra_turn_types::is_runtime_owned_message(message)
+        })
     {
         keep[index] = true;
     }
@@ -2196,6 +2198,8 @@ mod tests {
     fn latest_parallel_tool_batch_survives_pruning_while_large_results_compact() {
         let messages = vec![
             json!({"role":"user", "content":"inspect"}),
+            json!({"role":"assistant", "content":"progress".repeat(100)}),
+            json!({"role":"assistant", "content":"progress".repeat(100)}),
             json!({"role":"assistant", "tool_calls":[
                 {"id":"failed", "type":"function", "function":{"name":"read_file", "arguments":"{}"}},
                 {"id":"large", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}
@@ -2203,8 +2207,11 @@ mod tests {
             json!({"role":"tool", "tool_call_id":"failed", "content":"source unavailable",
                 "_astra_tool_result_advisories":["Tool outcome: {\"execution\":\"failed\"}"]}),
             json!({"role":"tool", "tool_call_id":"large", "content":"x".repeat(20_000)}),
-            json!({"role":"assistant", "content":"progress".repeat(100)}),
-            json!({"role":"assistant", "content":"progress".repeat(100)}),
+            astra_turn_types::runtime_owned_message(
+                "assistant",
+                "runtime frame".repeat(100),
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
         ];
         let compacted =
             compact_tiered_impl(&messages, 1_500, 100, CompactionTier::AggressivePrune, 1);

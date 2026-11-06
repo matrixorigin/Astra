@@ -259,105 +259,6 @@ fn provider_tool_call_facts(tool_calls: &[Value]) -> (u32, Vec<String>) {
     )
 }
 
-/// Only exact, recorded non-execution receipts can close the batch. A
-/// pre-resolved result alone is not proof that a skill or edge callback had no
-/// side effect; the terminal tool ledger owns that distinction.
-fn all_requested_calls_rejected_non_retryable(
-    requested: &[Value],
-    records: &[ToolCallRecord],
-) -> bool {
-    !requested.is_empty()
-        && records.iter().all(|record| !record.was_executed())
-        && requested.iter().all(|call| {
-            let Some(id) = call.get("id").and_then(Value::as_str) else {
-                return false;
-            };
-            let mut matches = records
-                .iter()
-                .filter(|record| record.tool_call_id.as_deref() == Some(id));
-            let Some(record) = matches.next() else {
-                return false;
-            };
-            matches.next().is_none()
-                && !record.ok
-                // Invalid arguments forbid an unchanged retry, not a new
-                // invocation with corrected arguments. Keep the existing
-                // repair path open instead of forcing text-only settlement.
-                && record.error_kind != Some(astra_core::ErrorKind::ToolInvalidArgs)
-                && record.disposition
-                    == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
-                && record
-                    .runtime_model_result_full
-                    .as_deref()
-                    .or(record.result_full.as_deref())
-                    .and_then(|result| serde_json::from_str::<Value>(result).ok())
-                    .and_then(|value| value.get("retryable").and_then(Value::as_bool))
-                    == Some(false)
-        })
-}
-
-fn is_non_retryable_delegation_rejection(record: &ToolCallRecord) -> bool {
-    record.disposition == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
-        && record
-            .runtime_model_result_full
-            .as_deref()
-            .or(record.result_full.as_deref())
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .is_some_and(|result| {
-                result.get("retryable").and_then(Value::as_bool) == Some(false)
-                    && matches!(
-                        result.get("error_kind").and_then(Value::as_str),
-                        Some(
-                            "invalid_delegation_model_scope"
-                                | "delegation_model_scope_unresolved"
-                                | "delegation_model_assessment_unavailable"
-                                | "delegation_model_unavailable"
-                        )
-                    )
-            })
-}
-
-/// Reconcile the terminal tool batch without overriding a typed action that
-/// Work or completion recovery has already authorized from those same facts.
-pub(crate) fn settle_non_retryable_tool_rejections(
-    state: &mut AgenticLoopState,
-    requested: &[Value],
-    round_records_start: usize,
-    edge_results_present: bool,
-    active_work_attempt: bool,
-    pending_run_dependency: bool,
-) {
-    if edge_results_present
-        || super::execution_phase::completion_action_window_requires_followup(state)
-        // A rejected operation cannot terminate the turn while this run still
-        // owns an unfinished child or correlated reply. The request remains
-        // rejected, but existing communication authority must survive.
-        || (pending_run_dependency && !active_work_attempt)
-        // A frozen model-admission failure blocks delegation, not independent
-        // parent work. Rejected calls still enter the existing stall signature
-        // and budget-renewal path below; retryability never grants execution.
-        || (!active_work_attempt
-            && state.stall.tool_call_records[round_records_start..]
-                .iter().all(is_non_retryable_delegation_rejection))
-        || !all_requested_calls_rejected_non_retryable(
-            requested,
-            &state.stall.tool_call_records[round_records_start..],
-        )
-    {
-        return;
-    }
-    engage_non_retryable_admission_boundary(state, active_work_attempt, requested.len());
-}
-
-fn has_pending_run_dependency<H: AgenticLoopHost>(host: &H, state: &AgenticLoopState) -> bool {
-    let Some(run_id) = state.current_run_id.as_deref() else {
-        return false;
-    };
-    host.direct_child_completion_owner(state)
-        .is_some_and(|owner| owner.parent_run_id() == run_id && owner.has_pending_direct_children())
-        || state.messaging.reply_obligations.has_pending(run_id)
-}
-
 /// A failed or deferred call in the same provider batch must be visible before
 /// an optional wait or automatic completion. Reused and suppressed calls can
 /// still represent successful observations; their `ok` status is authoritative.
@@ -369,65 +270,6 @@ fn settled_round_has_failed_call(settled_tool_calls: &[ToolCallRecord]) -> bool 
                 | astra_services::session_journal::ToolCallDisposition::Deferred
         ) || !record.ok
     })
-}
-
-/// Select the terminal repair boundary for a provider batch that could not
-/// execute any requested call.
-///
-/// A normal turn has no execution owner left at this point, so the only safe
-/// continuation is text-only.  An active primary Work attempt is different:
-/// its executor still owns a durable assignment, and the state machine must
-/// retain one typed settlement transition so the model can report blocked or
-/// failed work truthfully.  Collapsing both cases into `text_only` makes the
-/// settlement tool self-reject and strands the owner until the transport
-/// reports an incomplete run.
-fn engage_non_retryable_admission_boundary(
-    state: &mut AgenticLoopState,
-    active_work_attempt: bool,
-    rejected_tool_calls: usize,
-) {
-    if active_work_attempt {
-        state.hooks.completion_settlement.work_settlement_only = true;
-        state.hooks.completion_settlement.text_only = false;
-        // A Work settlement is the next execution boundary, not the
-        // text-only retry used by ordinary turns.  Do not let an earlier
-        // wrap-up marker reject the one allowed typed settlement call.
-        state.budget_wrapup_injected = false;
-    } else {
-        state.hooks.completion_settlement.work_settlement_only = false;
-        state.hooks.completion_settlement.text_only = true;
-    }
-    if state.hooks.completion_settlement.wrapup_origin.is_none() {
-        state.hooks.completion_settlement.wrapup_origin = Some(BudgetWrapupOrigin::RoundSlice);
-    }
-    state.push_volatile_payload(
-        super::host::VolatileKind::BudgetAdvisory,
-        serde_json::json!({
-            "schema": "completion_settlement.v2",
-            "signal": "non_retryable_admission_rejection",
-            "mode": if active_work_attempt { "work_settlement_only" } else { "text_only" },
-            "allowed_action": if active_work_attempt { serde_json::json!("settle_work_item") } else { serde_json::Value::Null },
-            "execution_authority": if active_work_attempt { "one_matching_action" } else { "none" },
-            "attempts_remaining": if active_work_attempt { 1 } else { 0 },
-            "instruction": if active_work_attempt {
-                "The requested tool calls were rejected before execution. Settle the currently owned WorkItem now with its truthful typed outcome (delivered, blocked, or failed). Do not request another tool."
-            } else {
-                "The requested tool calls were rejected before execution and cannot be retried in this turn. Answer from verified evidence or state the execution gap. Do not request another tool."
-            },
-            "authority": "runtime_admission_boundary",
-        }),
-    );
-    tracing::warn!(
-        target: "astra::loop_guard",
-        tier = if active_work_attempt {
-            "non_retryable_admission_work_settlement"
-        } else {
-            "non_retryable_admission_lockout"
-        },
-        round = state.current_round_index,
-        rejected_tool_calls,
-        "all requested tool calls were rejected before execution; bounded repair boundary engaged"
-    );
 }
 
 fn record_provider_round_observation(
@@ -2446,22 +2288,8 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             evo_records_before,
         );
 
-        // Admission and server preflight are one causal boundary. The latter can
-        // reject an admitted call non-retryably; wait until its terminal result,
-        // tool ledger, output batch, and Work reconciliation are settled before
-        // constraining the next provider round.
-        let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
-        crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
-    );
-        let pending_run_dependency = has_pending_run_dependency(host, state);
-        settle_non_retryable_tool_rejections(
-            state,
-            &turn_result.accum.tool_calls,
-            round_records_start,
-            !edge_tool_round.is_empty(),
-            active_work_attempt,
-            pending_run_dependency,
-        );
+        // Rejection is scoped to the requested operation. Its retryability
+        // does not decide whether a different permitted action can run.
 
         let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results);
 
@@ -3421,38 +3249,10 @@ mod tests {
             Some(astra_services::session_journal::ToolCallDisposition::Rejected)
         );
         assert!(!records[0].was_executed());
-        assert!(all_requested_calls_rejected_non_retryable(
-            std::slice::from_ref(&call),
-            records
-        ));
         assert_eq!(
             pre_resolved_server_tool_terminal_records(records, &[], &HashSet::new(), &[]).len(),
             1
         );
-        settle_non_retryable_tool_rejections(
-            &mut state,
-            std::slice::from_ref(&call),
-            0,
-            false,
-            false,
-            false,
-        );
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-        assert!(!state.budget_wrapup_injected);
-        assert!(state.hooks.completion_settlement.wrapup_origin.is_none());
-
-        // A durable Work executor must still settle its owned assignment.
-        settle_non_retryable_tool_rejections(
-            &mut state,
-            std::slice::from_ref(&call),
-            0,
-            false,
-            true,
-            false,
-        );
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-        assert!(!state.hooks.completion_settlement.text_only);
     }
 
     fn publish_test_feedback(
@@ -4345,7 +4145,7 @@ mod tests {
     }
 
     #[test]
-    fn argument_rejection_preserves_kind_and_keeps_correction_open() {
+    fn argument_rejection_preserves_kind_and_non_execution() {
         let mut state = make_state();
         let args = json!({"action":"spawn","description":"Read a value","prompt":"Return the value","requested_model_policy":"{}"});
         let call =
@@ -4365,143 +4165,6 @@ mod tests {
         );
         assert!(!record.was_executed());
         assert_eq!(results[0].content, rejection.rejection_output().to_string());
-        settle_non_retryable_tool_rejections(&mut state, &[call], 0, false, false, false);
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    #[test]
-    fn all_non_retryable_admission_rejections_open_text_only_boundary() {
-        let requested = vec![
-            json!({"id":"call-1","function":{"name":"agent_fanout","arguments":"{}"}}),
-            json!({"id":"call-2","function":{"name":"bash","arguments":"{}"}}),
-        ];
-        let admission = super::super::host::ToolCallAdmission {
-            admitted: Vec::new(),
-            rejected: vec![
-                super::super::host::RejectedToolCall::ordinary(
-                    requested[0].clone(),
-                    json!({
-                        "status":"rejected",
-                        "retryable":false,
-                        "error_kind":"work_lifecycle_topology_conflict"
-                    })
-                    .to_string(),
-                ),
-                super::super::host::RejectedToolCall::ordinary(
-                    requested[1].clone(),
-                    json!({
-                        "status":"rejected",
-                        "retryable":false,
-                        "error_kind":"work_lifecycle_topology_conflict"
-                    })
-                    .to_string(),
-                ),
-            ],
-            completion_action_applied: true,
-        };
-        let mut state = make_state();
-        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
-            &mut state,
-            admission.rejected,
-        );
-        assert!(all_requested_calls_rejected_non_retryable(
-            &requested,
-            &state.stall.tool_call_records
-        ));
-
-        state.stall.tool_call_records[1].result_full = Some(
-            json!({
-                "status":"rejected",
-                "retryable":true,
-                "error_kind":"tool_validation"
-            })
-            .to_string(),
-        );
-        assert!(!all_requested_calls_rejected_non_retryable(
-            &requested,
-            &state.stall.tool_call_records
-        ));
-    }
-
-    #[test]
-    fn pending_run_dependency_preserves_communication_after_non_retryable_rejection() {
-        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
-            "parent-run",
-            "child-agent",
-        );
-        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
-            applied_user_intents: Vec::new(),
-            agent_id: "child-agent".into(),
-            run_id: "child-run".into(),
-            parent_agent_id: "parent-agent".into(),
-            status: crate::orchestration::AgentStatus::Running {
-                activity: "working".into(),
-            },
-        });
-        let mut host = MockHost::new(Vec::new());
-        host.direct_child_owner = Some(Arc::clone(&owner));
-        let mut state = make_state();
-        state.current_run_id = Some("parent-run".into());
-        assert!(has_pending_run_dependency(&host, &state));
-
-        let call =
-            json!({"id":"bad-settle","function":{"name":"settle_work_item","arguments":"{}"}});
-        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
-            &mut state,
-            vec![super::super::host::RejectedToolCall::ordinary(
-                call.clone(),
-                json!({"status":"rejected","retryable":false,"error_kind":"canonical_work_attempt_required"}).to_string(),
-            )],
-        );
-        assert!(all_requested_calls_rejected_non_retryable(
-            std::slice::from_ref(&call),
-            &state.stall.tool_call_records
-        ));
-        let pending_run_dependency = has_pending_run_dependency(&host, &state);
-        settle_non_retryable_tool_rejections(
-            &mut state,
-            std::slice::from_ref(&call),
-            0,
-            false,
-            false,
-            pending_run_dependency,
-        );
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-
-        state.current_run_id = Some("foreign-run".into());
-        assert!(!has_pending_run_dependency(&host, &state));
-        state.current_run_id = Some("parent-run".into());
-        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
-            applied_user_intents: Vec::new(),
-            agent_id: "child-agent".into(),
-            run_id: "child-run".into(),
-            parent_agent_id: "parent-agent".into(),
-            status: crate::orchestration::AgentStatus::Completed {
-                result: "done".into(),
-                finish_reason: None,
-            },
-        });
-        assert!(has_pending_run_dependency(&host, &state));
-        assert_eq!(owner.take_completed_direct_children().len(), 1);
-        assert!(!has_pending_run_dependency(&host, &state));
-
-        state
-            .messaging
-            .reply_obligations
-            .reserve(
-                "parent-run",
-                "question-1",
-                astra_messaging::types::AgentAddress::new("peer-run", "peer-agent"),
-            )
-            .expect("current-run question");
-        assert!(has_pending_run_dependency(&host, &state));
-        state
-            .messaging
-            .reply_obligations
-            .reject("parent-run", "question-1");
-        assert!(!has_pending_run_dependency(&host, &state));
     }
 
     #[test]
@@ -4587,90 +4250,6 @@ mod tests {
             wait.clone()
         ]));
         assert!(settled_round_has_failed_call(&[unrelated_failure, wait]));
-    }
-
-    #[test]
-    fn pending_child_does_not_bypass_active_work_settlement_boundary() {
-        let call = json!({"id":"rejected-call","function":{"name":"read_file","arguments":"{}"}});
-        let mut state = make_state();
-        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
-            &mut state,
-            vec![super::super::host::RejectedToolCall::ordinary(
-                call.clone(),
-                json!({"status":"rejected","retryable":false,"error_kind":"work_policy_denied"})
-                    .to_string(),
-            )],
-        );
-        settle_non_retryable_tool_rejections(&mut state, &[call], 0, false, true, true);
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-        assert!(!state.hooks.completion_settlement.text_only);
-    }
-
-    #[test]
-    fn post_admission_preflight_rejection_is_a_terminal_non_retryable_receipt() {
-        use astra_services::session_journal::ToolCallDisposition;
-
-        let requested = vec![json!({"id":"spawn","function":{"name":"agent","arguments":"{}"}})];
-        let mut records = vec![ToolCallRecord {
-            tool_call_id: Some("spawn".into()),
-            name: "agent".into(),
-            ok: false,
-            disposition: Some(ToolCallDisposition::Rejected),
-            result_full: Some(
-                json!({
-                    "status":"failed",
-                    "error_kind":"delegation_model_scope_unresolved",
-                    "retryable":false,
-                    "advisory":{"executed":false}
-                })
-                .to_string(),
-            ),
-            ..Default::default()
-        }];
-        assert!(all_requested_calls_rejected_non_retryable(
-            &requested, &records
-        ));
-        records[0].disposition = Some(ToolCallDisposition::Executed);
-        assert!(!all_requested_calls_rejected_non_retryable(
-            &requested, &records
-        ));
-        records[0].disposition = Some(ToolCallDisposition::Rejected);
-        records[0].tool_call_id = Some("other".into());
-        assert!(!all_requested_calls_rejected_non_retryable(
-            &requested, &records
-        ));
-    }
-
-    #[test]
-    fn non_retryable_rejection_preserves_work_settlement_authority() {
-        let mut state = make_state();
-
-        engage_non_retryable_admission_boundary(&mut state, true, 2);
-
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert!(!state.budget_wrapup_injected);
-        let advisory = state
-            .volatile_pending
-            .last()
-            .expect("typed Work settlement advisory");
-        assert_eq!(advisory.payload["mode"], "work_settlement_only");
-        assert_eq!(advisory.payload["allowed_action"], "settle_work_item");
-        assert_eq!(advisory.payload["attempts_remaining"], 1);
-    }
-
-    #[test]
-    fn non_retryable_rejection_without_work_uses_text_only_boundary() {
-        let mut state = make_state();
-
-        engage_non_retryable_admission_boundary(&mut state, false, 1);
-
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-        assert!(state.hooks.completion_settlement.text_only);
-        let advisory = state.volatile_pending.last().expect("text-only advisory");
-        assert_eq!(advisory.payload["mode"], "text_only");
-        assert!(advisory.payload["allowed_action"].is_null());
-        assert_eq!(advisory.payload["attempts_remaining"], 0);
     }
 
     #[test]
