@@ -38,6 +38,13 @@ function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
 }
 
 describe("MessageBubble", () => {
+  it.each([true, null, false])("renders Context-saving evidence independently of the answer (%s)", observation => {
+    render(<MessageBubble message={assistantMessage({ content: "partial answer", status: "complete", contextNotSaved: observation })} />);
+    expect(screen.getByText("partial answer")).toBeInTheDocument();
+    if (observation === false) expect(screen.queryByText(/context.*not saved|Context saving could not/)).not.toBeInTheDocument();
+    else expect(screen.getByText(observation ? /context was not saved/ : /Context saving could not be confirmed/)).toBeInTheDocument();
+  });
+
   beforeEach(() => {
     HTMLElement.prototype.scrollTo = vi.fn();
     HTMLElement.prototype.scrollBy = vi.fn();

@@ -209,6 +209,20 @@ impl ToolResult {
         self
     }
 
+    /// The caller lost the result after dispatch; effects may have occurred.
+    #[must_use]
+    pub fn with_execution_outcome_unknown(mut self) -> Self {
+        self.is_error = true;
+        self.exit_semantics = Some(exit_semantics::ExitSemantics::ExecutionError);
+        let fields = self.metadata.get_or_insert_with(Map::new);
+        fields.insert("execution_fact".into(), json!("unknown"));
+        fields.insert("side_effects_maybe".into(), json!(true));
+        fields.insert("retryable".into(), json!(false));
+        fields.insert("exit_semantics".into(), json!("execution_error"));
+        fields.insert("result_class".into(), json!("execution_error"));
+        self
+    }
+
     /// Attach exit-code semantics while preserving the existing output/error shape.
     pub fn with_exit_semantics(mut self, semantics: exit_semantics::ExitSemantics) -> Self {
         self.exit_semantics = Some(semantics);
@@ -354,6 +368,7 @@ pub fn dispatch_deadline_result(
     ]);
     let message = if execution_started {
         fields.insert("executed".into(), Value::Null);
+        fields.insert("execution_fact".into(), json!("unknown"));
         "The run admission deadline expired before a continuation. An earlier call started; its outcome remains unresolved and no further call was dispatched."
     } else {
         fields.insert("executed".into(), json!(false));
@@ -634,6 +649,7 @@ pub fn workspace_effect_unsettled_tool_result(name: &str, mut result: ToolResult
             ),
         ),
         ("execution_started".to_string(), Value::Bool(true)),
+        ("execution_fact".to_string(), json!("unknown")),
         ("side_effects_maybe".to_string(), Value::Bool(true)),
         ("retryable".to_string(), Value::Bool(false)),
         ("workspace_effect_settled".to_string(), Value::Bool(false)),
@@ -663,7 +679,7 @@ pub trait ToolExecutor: Send + Sync {
         };
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                cancelled_tool_result(name, true)
+                cancelled_tool_result(name, true).with_execution_outcome_unknown()
             }
             result = self.execute(name, args) => result,
         }

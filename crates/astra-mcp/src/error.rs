@@ -54,12 +54,28 @@ pub enum McpError {
 }
 
 impl McpError {
+    /// A correlated provider error is a terminal response, unlike a local
+    /// transport/preparation failure while resuming an interaction.
+    pub fn provider_acknowledged(&self) -> bool {
+        matches!(self, Self::Service(ServiceError::McpError(_)))
+    }
+
     /// Whether a tool request may have crossed the MCP transport boundary
     /// without a terminal provider acknowledgement.
     ///
     /// Callers must preserve this as outcome-unknown evidence; retrying such
     /// an invocation can duplicate external side effects.
     pub fn side_effects_maybe(&self) -> bool {
+        if let Self::Service(ServiceError::McpError(error)) = self
+            && error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("execution_outcome"))
+                .and_then(serde_json::Value::as_str)
+                == Some("unknown")
+        {
+            return true;
+        }
         matches!(
             self,
             Self::Service(
@@ -80,6 +96,18 @@ impl McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correlated_provider_error_preserves_explicit_unknown_without_losing_acknowledgement() {
+        for outcome in [None, Some("failed"), Some("unknown")] {
+            let error = serde_json::from_value::<rmcp::model::ErrorData>(serde_json::json!({
+                "code":-32000, "message":"unknown is only prose here", "data":outcome.map(|value| serde_json::json!({"execution_outcome":value}))
+            })).unwrap();
+            let error = McpError::Service(ServiceError::McpError(error));
+            assert!(error.provider_acknowledged());
+            assert_eq!(error.side_effects_maybe(), outcome == Some("unknown"));
+        }
+    }
 
     #[test]
     fn timeout_is_outcome_unknown_but_pre_dispatch_lookup_failure_is_terminal() {

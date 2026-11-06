@@ -2583,6 +2583,7 @@ async fn execute_cli_command_impl(
             let mut user_interrupted = false;
             let mut wall_deadline_root_settled = false;
             let mut wall_deadline_server_terminal_settled = false;
+            let mut cancelled_context_observation = None;
             // First polled after the initial interruption, then retained through
             // every settlement phase. Never poll again after it completes.
             let second_interrupt = tokio::signal::ctrl_c();
@@ -2641,7 +2642,7 @@ async fn execute_cli_command_impl(
                                 let cancel = crate::cli::turn::turn_facade::cancel_exact_run_until_settled_with_deadline(
                                     api, &token, &run_id, chat_ctx.auth_owner.as_ref(), cancel_deadline,
                                 );
-                                if let Err(error) = tokio::select! {
+                                let context_observation = match tokio::select! {
                                     biased;
                                     _ = &mut second_interrupt => {
                                         second_interrupted = true;
@@ -2649,11 +2650,12 @@ async fn execute_cli_command_impl(
                                     }
                                     result = cancel => result,
                                 } {
-                                    return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
-                                        &error,
-                                        wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
-                                    );
-                                }
+                                    Ok(observation) => observation,
+                                    Err(error) => return crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                                        &error, wall_deadline_incremental_state.as_ref().expect("one-shot state").clone(),
+                                    ),
+                                };
+                                cancelled_context_observation = Some(context_observation);
                                 request_session_execution_lease.mark_remote_execution_settled();
                                 wall_deadline_server_terminal_settled = true;
                                 let drain_budget = terminal
@@ -2670,6 +2672,11 @@ async fn execute_cli_command_impl(
                                 match drained {
                                     Some(result) => {
                                         wall_deadline_root_settled = true;
+                                        if let Err(failure) = &result {
+                                            cancelled_context_observation = Some(
+                                                merge_cancelled_context_for_run(context_observation, &run_id, failure),
+                                            );
+                                        }
                                         match result {
                                             Ok(result) => Ok(result),
                                             Err(_) if !user_interrupted => Ok(stream_result_from_incremental_snapshot(
@@ -2823,6 +2830,11 @@ async fn execute_cli_command_impl(
                 );
             }
 
+            if let Some(observation) = cancelled_context_observation
+                && let Err(failure) = &mut turn_result
+            {
+                failure.partial.cancel_context_not_saved = Some(observation);
+            }
             let mut sr = match turn_result {
                 Ok(sr) => sr,
                 Err(e)
@@ -2849,8 +2861,12 @@ async fn execute_cli_command_impl(
                         crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&e)
                     );
                     if args.json {
+                        let mut output = hard_failure_json_output(e);
+                        if let Some(observation) = cancelled_context_observation {
+                            output["context_not_saved"] = serde_json::json!(observation);
+                        }
                         write_headless_stdout_line(
-                            &serde_json::to_string_pretty(&hard_failure_json_output(e))
+                            &serde_json::to_string_pretty(&output)
                                 .map_err(|error| error.to_string())?,
                         )?;
                         return Ok(failure_exit);
@@ -2874,6 +2890,21 @@ async fn execute_cli_command_impl(
                     }));
                     if !had_partial_text {
                         sr.full_text = "Execution interrupted by the user.".to_string();
+                    }
+                }
+                if let Some(observation) = cancelled_context_observation {
+                    if let Some(interruption) = sr
+                        .interruption
+                        .as_mut()
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        interruption
+                            .insert("context_not_saved".into(), serde_json::json!(observation));
+                    }
+                    if let Some(notice) =
+                        crate::cli::turn::turn_cancellation::cancelled_context_notice(observation)
+                    {
+                        eprintln!("{notice}");
                     }
                 }
                 retain_interrupted_partial_canonical_messages(&mut sr, &message);
@@ -3939,6 +3970,11 @@ fn hard_failure_exit_code(failure: &crate::TurnFailure) -> ExitCode {
 /// only from the physical stream's validated root binding.
 fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
     let exit_code = hard_failure_exit_code(&failure);
+    let mut diagnostic = failure.error.clone();
+    crate::cli::turn::turn_failure_reporting::append_cancelled_context_notice(
+        &mut diagnostic,
+        failure.partial.cancel_context_not_saved,
+    );
     let partial = failure.partial;
     let authoritative_failed = partial.failed_run_terminal.is_some()
         && !partial.remote_cancel_required
@@ -3993,10 +4029,37 @@ fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
         output["model_item_id"] = serde_json::json!(model_item_id);
     }
     output["tool_result_class_counts"] = classes;
-    output["error"] = serde_json::json!(failure.error);
+    output["error"] = serde_json::json!(diagnostic);
     output["error_code"] = serde_json::json!(partial.error_code);
     output["error_metadata"] = serde_json::json!(partial.error_metadata);
+    if let Some(observation) = partial.cancel_context_not_saved {
+        output["context_not_saved"] = serde_json::json!(observation);
+    }
     output
+}
+
+fn merge_cancelled_context_observations(first: Option<bool>, second: Option<bool>) -> Option<bool> {
+    match (first, second) {
+        (Some(a), Some(b)) if a != b => None,
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn merge_cancelled_context_for_run(
+    outer: Option<bool>,
+    run_id: &str,
+    failure: &crate::TurnFailure,
+) -> Option<bool> {
+    if failure.partial.run_id.as_deref() != Some(run_id) {
+        return None;
+    }
+    failure
+        .partial
+        .cancel_context_not_saved
+        .map_or(outer, |inner| {
+            merge_cancelled_context_observations(outer, inner)
+        })
 }
 
 fn final_stream_json_result(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Value {
@@ -4030,7 +4093,7 @@ fn final_json_output_with_context(
             .expect("fixed tool result-class aggregate must serialize")
     };
     let disposition = completion_disposition(sr, exit_code);
-    serde_json::json!({
+    let mut output = serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
         "run_id": sr.run_id,
@@ -4075,7 +4138,15 @@ fn final_json_output_with_context(
         "success": exit_code == ExitCode::Success && disposition == "completed",
         "completion_disposition": disposition,
         "error_kind": error_kind_for_exit_code(exit_code),
-    })
+    });
+    if let Some(observation) = sr
+        .interruption
+        .as_ref()
+        .and_then(|value| value.get("context_not_saved"))
+    {
+        output["context_not_saved"] = observation.clone();
+    }
+    output
 }
 
 // All one-shot entrypoints bypass interactive startup but advertise a native
@@ -5910,7 +5981,59 @@ mod exit_code_tests {
 
 #[cfg(test)]
 mod final_json_output_tests {
-    use super::{ExitCode, StreamResult, final_json_output_with_context, final_stream_json_result};
+    use super::{
+        ExitCode, StreamResult, final_json_output_with_context, final_stream_json_result,
+        hard_failure_json_output,
+    };
+
+    #[test]
+    fn interrupted_json_preserves_context_save_observation() {
+        for observed in [Some(true), Some(false), None] {
+            let mut result = StreamResult::default();
+            result.interruption = Some(serde_json::json!({"context_not_saved": observed}));
+            let output = final_json_output_with_context(&result, ExitCode::Partial, None, None);
+            assert_eq!(output["context_not_saved"], serde_json::json!(observed));
+        }
+    }
+
+    #[test]
+    fn failed_json_preserves_context_save_observation() {
+        for observed in [Some(true), Some(false), None] {
+            let output = hard_failure_json_output(crate::TurnFailure {
+                error: "cancelled during cleanup".into(),
+                partial: crate::PartialTurnData {
+                    cancel_context_not_saved: Some(observed),
+                    ..Default::default()
+                },
+            });
+            assert_eq!(output["context_not_saved"], serde_json::json!(observed));
+        }
+    }
+
+    #[test]
+    fn stronger_cancelled_context_observation_wins_but_conflicts_are_unknown() {
+        use super::merge_cancelled_context_observations as merge;
+        assert_eq!(merge(None, Some(true)), Some(true));
+        assert_eq!(merge(Some(false), None), Some(false));
+        assert_eq!(merge(Some(true), Some(false)), None);
+        assert_eq!(merge(None, None), None);
+        let failure = crate::TurnFailure {
+            error: "cancelled".into(),
+            partial: crate::PartialTurnData {
+                run_id: Some("root".into()),
+                cancel_context_not_saved: Some(Some(true)),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            super::merge_cancelled_context_for_run(None, "root", &failure),
+            Some(true)
+        );
+        assert_eq!(
+            super::merge_cancelled_context_for_run(None, "child", &failure),
+            None
+        );
+    }
 
     fn stream_result_for_json() -> StreamResult {
         StreamResult {
@@ -7029,6 +7152,7 @@ mod one_shot_persistence_tests {
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
+            cancel_context_not_saved: None,
             session_persistence_error: None,
             local_continuation_omitted: false,
             full_text: "answer".into(),
@@ -7164,6 +7288,7 @@ mod one_shot_persistence_tests {
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
+            cancel_context_not_saved: None,
             session_persistence_error: None,
             local_continuation_omitted: false,
             full_text: "answer".into(),

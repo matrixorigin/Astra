@@ -24,6 +24,7 @@ async fn cancel_exact_run_until_settled(
         tokio::time::Instant::now() + SESSION_BINDING_CANCEL_DEADLINE,
     )
     .await
+    .map(|_| ())
 }
 
 /// Resolve the cancellation bearer for one captured owner. `rejected` is
@@ -59,7 +60,7 @@ pub(crate) async fn cancel_exact_run_until_settled_with_deadline(
     run_id: &str,
     owner: Option<&crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     deadline: tokio::time::Instant,
-) -> Result<(), String> {
+) -> Result<Option<bool>, String> {
     // The captured owner, when present, supplies every bearer for the exact
     // cancellation request; an inherited transport provider must not replace
     // it with another binding at dispatch. A `None` owner keeps the original
@@ -113,7 +114,11 @@ pub(crate) async fn cancel_exact_run_until_settled_with_deadline(
                     .get("execution_settled")
                     .and_then(serde_json::Value::as_bool)
                 {
-                    Some(true) => return Ok(()),
+                    Some(true) => {
+                        return Ok(response
+                            .get("context_not_saved")
+                            .and_then(serde_json::Value::as_bool));
+                    }
                     Some(false) => cancellation_accepted = true,
                     None => {
                         return Err(
@@ -255,7 +260,7 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
         return result;
     }
     let exact_run_id = exact_run_id_from_turn_result(&result, incremental_state);
-    let cancellation_error = match exact_run_id.as_deref() {
+    let cancellation = match exact_run_id.as_deref() {
         Some(run_id) => {
             let deadline = tokio::time::Instant::now() + cancel_deadline;
             cancel_exact_run_until_settled_with_deadline(
@@ -266,13 +271,27 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
                 deadline,
             )
             .await
-            .err()
         }
-        None => Some(
+        None => Err(
             "remote owner cleanup could not cancel the exact run because no authoritative run id was observed"
                 .to_string(),
         ),
     };
+    let (cancellation_error, context_observation) = match cancellation {
+        Ok(observation) => (None, Some(observation)),
+        Err(error) => (Some(error), None),
+    };
+    let root_run_id = match &result {
+        Ok(result) => result.run_id.as_deref(),
+        Err(failure) => failure.partial.run_id.as_deref(),
+    };
+    let context_observation = context_observation.map(|observation| {
+        if root_run_id.is_some() && root_run_id == exact_run_id.as_deref() {
+            observation
+        } else {
+            None
+        }
+    });
     if let Some(request_lease) = request_lease {
         if cancellation_error.is_some() {
             request_lease.retain_unsettled_owner_until_process_exit();
@@ -310,6 +329,7 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
                 );
             }
             turn_failure.error = error;
+            turn_failure.partial.cancel_context_not_saved = context_observation;
             if cancellation_error.is_none() {
                 turn_failure.partial.remote_cancel_required = false;
                 turn_failure.partial.remote_cancel_run_id = None;
@@ -346,6 +366,7 @@ async fn settle_request_session_binding_failure_with_cancel_deadline(
                 llm_rounds: result.llm_rounds,
                 token_usage_coverage: result.token_usage_coverage,
                 interruption: result.interruption,
+                cancel_context_not_saved: context_observation,
                 remote_cancel_required: cancellation_error.is_some(),
                 remote_cancel_run_id: cancellation_error
                     .is_some()

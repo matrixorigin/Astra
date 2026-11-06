@@ -875,33 +875,60 @@ delayed. The ordinary client currently negotiates MCP 2025-11-25, whose
 [cancellation contract](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)
 does not promise a response after cancellation. Retaining the receiver only
 preserves the chance to observe a racing completion; it does not require a
-cancelled provider to respond. A late response to a workspace-mutating call
-still needs the existing explicit workspace-effect settlement evidence. The
-notification acknowledgement, connection closure and token alone cannot prove
-process termination. Missing execution evidence retains the existing cleanup
-deadline and workspace quarantine. Complete cooperative cleanup convergence
-requires a provider-owned settlement contract beyond the one-way notification.
+cancelled provider to respond. A correlated tool response is reported as the
+provider's result; it does not need an Astra-specific workspace receipt. A
+notification acknowledgement, connection closure or token alone cannot prove
+completion. When a dispatched call loses its result, report the outcome as
+unknown and retain its invocation identity without automatically sending it again.
 
 Agent Binding HTTP admits a result or provider error only from a JSON-RPC 2.0
 response with the exact, typed protocol request ID of that exchange. SSE
 notifications and other request IDs cannot settle it. A missing/mismatched ID,
 malformed envelope or disconnected transport retains unknown-outcome handling;
 even a response carrying `astra.workspace_effect.settled` cannot discharge a
-different invocation. A correlated completion still requires the existing
-workspace-effect marker and valid workspace receipt authority before releasing
-a workspace-mutating call. Correlation does not independently prove provider
+different invocation. Correlation does not independently prove provider
 cleanup or make a cancellation acknowledgement into a completion receipt.
+
+An earlier unresolved tool call does not by itself prevent a new Run after the
+previous Run and its owner are no longer active. The new Run and streaming
+client receive a general advisory from the existing admission result; it does
+not infer which call or effect is involved. Available tool details remain in
+the conversation and execution history. No extra query is needed. A new
+invocation has a new identity and can overlap the earlier operation,
+which may still be running; the model should inspect the current state before
+repeating a potentially effectful action. Binding changes, controller operations
+and deletion retain their own stricter admission rules.
+
+When the active owner settles a cancelled Run, it commits the available
+conversation Context together with the terminal. Recorded tool results remain
+unchanged; a valid call whose result was lost receives a provider-compatible
+message saying its outcome is unknown. If the Context authority changed or its
+size budget prevents storage, cancellation may still settle without that turn's
+Context. The terminal and exact-run cancellation response expose
+`context_not_saved` when known; an absent value means the result is unknown.
+Interactive and one-shot clients warn about a lost or unconfirmed Context. An
+executor crash before settlement, or an owner that has already been fenced,
+cannot promise to save its in-memory history.
+
+Web projects the same Context observation separately from assistant text. It
+retains the exact-run cancellation response even after Stop closes the stream;
+an acknowledgement without execution settlement remains unconfirmed. Once the
+existing Stop reconciliation observes a terminal, the bounded conversation
+read projects its receipt within the original Stop response budget. A slow
+read leaves saving unconfirmed and does not retain a terminal active slot.
+Cold history attaches that observation to the
+recorded terminal assistant, or a display-only cancellation item in the same
+Run when no assistant is visible. Historical cancellations remain attached to
+their own Run after a successor starts. This extends the existing snapshot
+projection, without another ordinary execution query or persistence owner.
 
 The MOI receiving boundary is outside Astra. Matrixflow
 [PR #18920](https://github.com/matrixorigin/matrixflow/pull/18920) adds protocol-ID
 propagation and authenticated, process-local cooperative cancellation; it does
-not establish remote execution settlement. The remaining gateway/provider
-contract must reach the exact invocation owner across replica and
-ownership-generation changes. That owner must cancel and
-settle its execution boundary, expose idempotent owner-scoped readback, and
-verify subprocess termination/reaping and absence of later writes. Astra's
-sender and response validation do not supply those receiving/provider facts;
-unknown outcomes keep the current cleanup deadline and quarantine protection.
+not establish remote execution settlement. Astra's sender and response
+validation cannot prove that the provider has stopped. An unknown outcome
+retains its invocation identity and is not automatically redelivered; a later
+distinct invocation may overlap the earlier operation.
 
 ### Session cancellation convergence
 

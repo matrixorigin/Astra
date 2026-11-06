@@ -344,6 +344,7 @@ function isLocallyStoppedRun(
 }
 
 async function reconcileStoppedRun(
+  ownerUserId: string,
   runId: string,
   ownedChat: () => ChatRecord | undefined,
   admittedClient?: WebRuntimeClient,
@@ -372,6 +373,11 @@ async function reconcileStoppedRun(
   if (isTerminalChatRunStatus(status.status)) {
     forgetLocallyStoppedRun(chat, runId);
     chat.activeRun = undefined;
+    // The existing bounded conversation read carries the terminal's Context
+    // receipt too. A failed read leaves saving unconfirmed, without retaining
+    // a terminal Run as active or delaying the user's next turn.
+    try { await syncBackendTranscript(ownerUserId, chat.id, client); }
+    catch (error) { console.warn("Failed to read stopped conversation:", runtimeErrorDetail(error)); }
   }
   // Nonterminal polling cannot reverse an admitted local cancellation. The
   // existing stopped-run marker and hydration owner retain that intent.
@@ -1239,12 +1245,26 @@ export async function stopActiveRun(
     current.activeRun = previousRun;
   };
   let cancelPending: boolean;
+  const responseDeadline = Date.now() + (options?.cancelTimeoutMs ?? 1_500);
   try {
-    cancelPending = await settleRuntimeCancel(client.sdk.cancelRun(binding.runId), options?.cancelTimeoutMs,
+    const cancellation = client.sdk.cancelRun(binding.runId).then(receipt => {
+      const current = ownedChat();
+      const assistant = current?.messages.find(item => item.id === binding.assistantMessageId && item.role === "assistant");
+      if (assistant) {
+        // The receipt observes this exact command. Missing evidence is not loss,
+        // and a late response cannot modify a successor Run or assistant.
+        if (!receipt || receipt.runId === binding.runId &&
+          (receipt.status === "cancelled" || !receipt.executionSettled)) {
+          assistant.contextNotSaved = receipt?.executionSettled ? receipt.contextNotSaved ?? null : null;
+        }
+      }
+      return receipt;
+    });
+    cancelPending = await settleRuntimeCancel(cancellation, Math.max(1, responseDeadline - Date.now()),
       settled => {
         if (settled.status === "completed") {
           completeMessage();
-          void reconcileStoppedRun(binding.runId, ownedChat);
+          void reconcileStoppedRun(ownerUserId, binding.runId, ownedChat);
         } else restore();
       });
   } catch (error) {
@@ -1254,9 +1274,22 @@ export async function stopActiveRun(
   const current = ownedChat();
   if (cancelPending && current) cancellingRun.waitingFor = "cancel_requested";
   completeMessage();
-  if (!cancelPending) await reconcileStoppedRun(binding.runId, ownedChat, client);
+  if (!cancelPending) {
+    // Receipt observation shares the command's response budget. Its guarded
+    // read may finish later, but cannot keep the Stop response waiting.
+    const reconciliation = reconcileStoppedRun(ownerUserId, binding.runId, ownedChat, client);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([reconciliation, new Promise<void>(resolve => {
+        timeout = setTimeout(resolve, Math.max(0, responseDeadline - Date.now()));
+      })]);
+    } finally { if (timeout !== undefined) clearTimeout(timeout); }
+  }
   const selected = findChat();
-  return selected ? { activeRun: publicActiveRun(selected), cancelPending } : null;
+  const contextNotSaved = selected?.messages.find(item => item.role === "assistant" && item.contextNotSaved !== undefined &&
+    (item.id === binding.assistantMessageId || item.runId === binding.runId))?.contextNotSaved;
+  return selected ? { activeRun: publicActiveRun(selected), cancelPending,
+    ...(contextNotSaved !== undefined ? { contextNotSaved } : {}) } : null;
 }
 
 export async function resumeActiveRun(ownerUserId: string, chatId: string, admittedClient?: WebRuntimeClient) {
@@ -1341,6 +1374,7 @@ export function updateStreamingAssistantMessage(
     reasoning?: string;
     reasoningStatus?: ChatMessage["reasoningStatus"];
     status?: ChatMessage["status"];
+    contextNotSaved?: ChatMessage["contextNotSaved"];
     artifacts?: ChatMessage["artifacts"];
     artifactPublication?: ChatMessage["artifactPublication"];
     explainAnalyzeEvent?: NonNullable<ChatMessage["explainAnalyzeEvents"]>[number];
@@ -1373,6 +1407,7 @@ export function updateStreamingAssistantMessage(
   if (patch.status !== undefined) {
     message.status = patch.status;
   }
+  if ("contextNotSaved" in patch) message.contextNotSaved = patch.contextNotSaved;
   if (patch.artifacts !== undefined) {
     message.artifacts = mergeChatArtifacts(
       message.artifacts ?? [],
@@ -2044,6 +2079,7 @@ function transcriptItemToMessage(
 
   return {
     id: `${chatId}:${item.item_seq}`,
+    runId: item.run_id ?? undefined,
     role: item.role,
     content: item.content,
     reasoning: reasoning || undefined,
@@ -2143,9 +2179,12 @@ async function syncBackendTranscript(ownerUserId: string, chatId: string, admitt
     record.messages = parsed.items.flatMap(item => {
       if (item.kind === "opening") return [{ id: item.id, role: "user" as const,
         content: item.content, createdAt: item.created_at, status: "complete" as const }];
-      if (item.kind === "failure") return [{ id: item.id, role: "assistant" as const,
+      if (item.kind === "failure") return [{ id: item.id, runId: item.run_id, role: "assistant" as const,
         content: item.failure.message, createdAt: item.created_at, status: "failed" as const }];
+      if (item.kind === "cancellation") return [{ id: item.id, runId: item.run_id, role: "assistant" as const,
+        content: "Stopped.", contextNotSaved: item.context_not_saved, createdAt: item.created_at, status: "complete" as const }];
       const message = transcriptItemToMessage(record.id, item);
+      if (message && item.context_not_saved !== undefined) message.contextNotSaved = item.context_not_saved;
       if (message && item.failure) {
         message.status = "failed";
         message.content = appendRunFailure(message.content, item.failure.message);

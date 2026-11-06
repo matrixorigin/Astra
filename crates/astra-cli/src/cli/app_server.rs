@@ -706,7 +706,7 @@ async fn run_turn(
     let mut sr = match result {
         Ok(sr) => sr,
         Err(err) => {
-            let error = err.error;
+            let error = crate::cli::turn::turn_failure_reporting::turn_failure_diagnostic(&err);
             write_notification(&writer, "error", serde_json::json!({"message": error})).await?;
             write_notification(
                 &writer,
@@ -1224,6 +1224,9 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
             "turn/runtimeFeedback",
             serde_json::json!({"runtimeFeedback": frame}),
         )),
+        StreamEvent::SystemWarning(message) => {
+            Some(("warning", serde_json::json!({"message": message})))
+        }
         StreamEvent::ToolStarted {
             name, description, ..
         } => Some((
@@ -1500,6 +1503,16 @@ mod tests {
                 .expect("runtime feedback notification");
         assert_eq!(method, "turn/runtimeFeedback");
         assert_eq!(params["runtimeFeedback"], serde_json::json!(frame));
+    }
+
+    #[test]
+    fn app_server_forwards_system_warnings() {
+        let message = "A previous tool result is unknown; inspect the state before retrying.";
+        let (method, params) =
+            stream_event_notification(&StreamEvent::SystemWarning(message.into()))
+                .expect("warning notification");
+        assert_eq!(method, "warning");
+        assert_eq!(params["message"], message);
     }
 
     #[test]

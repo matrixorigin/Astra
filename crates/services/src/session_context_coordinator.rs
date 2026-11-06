@@ -453,6 +453,7 @@ pub struct ResumedExecutionTurn {
     run: crate::runs::DurableRunRecord,
     checkpoint: crate::runs::DurableRunCheckpointRecord,
     receipt: ResumedExecutionTurnReceipt,
+    prior_unresolved_tool_calls: bool,
 }
 
 impl ResumedExecutionTurn {
@@ -466,6 +467,10 @@ impl ResumedExecutionTurn {
 
     pub fn receipt(&self) -> &ResumedExecutionTurnReceipt {
         &self.receipt
+    }
+
+    pub fn prior_unresolved_tool_calls(&self) -> bool {
+        self.prior_unresolved_tool_calls
     }
 }
 
@@ -1057,9 +1062,7 @@ impl DatabaseSessionContextCoordinator {
             )
             .await?;
         if current.admission_fingerprint() != authority.admission_fingerprint() {
-            return Err(SessionContextCoordinatorError::Invalid(
-                "Context base changed before empty terminal".into(),
-            ));
+            return Err(SessionContextCoordinatorError::Fenced);
         }
         Ok(())
     }
@@ -2323,37 +2326,47 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             {
                 return Err(SessionContextCoordinatorError::Fenced);
             }
-            if run.run_generation == request.expected_owner_generation {
-                // The existing custody operation performs the only ownership
-                // CAS and immutable checkpoint association.
-                crate::runs::activate_execution_resume_tx(
-                    &mut tx,
-                    &mut run,
-                    &checkpoint,
-                    request.owner_pod_id,
-                )
-                .await
-                .map_err(execution_resume_storage_error)?;
-            } else {
-                // lock_execution_resume_tx has proven the exact tail custody
-                // claim. Also require its current live owner;
-                // a metadata-only checkpoint receipt never authorizes replay.
-                let live: i64 = sqlx::query_scalar(
-                    "SELECT CAST(COALESCE(status = 'running' AND owner_pod_id = ?
+            let prior_unresolved_tool_calls =
+                if run.run_generation == request.expected_owner_generation {
+                    // The existing custody operation performs the only ownership
+                    // CAS and immutable checkpoint association.
+                    crate::runs::activate_execution_resume_tx(
+                        &mut tx,
+                        &mut run,
+                        &checkpoint,
+                        request.owner_pod_id,
+                    )
+                    .await
+                    .map_err(execution_resume_storage_error)?
+                } else {
+                    // lock_execution_resume_tx has proven the exact tail custody
+                    // claim. Also require its current live owner;
+                    // a metadata-only checkpoint receipt never authorizes replay.
+                    let live: i64 = sqlx::query_scalar(
+                        "SELECT CAST(COALESCE(status = 'running' AND owner_pod_id = ?
                        AND owner_lease_expires_at >= NOW(6), FALSE) AS SIGNED)
                      FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ?",
-                )
-                .bind(request.owner_pod_id)
-                .bind(request.user_id)
-                .bind(request.session_id)
-                .bind(request.run_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|source| database_error("validate_resumed_run_owner", source))?;
-                if live != 1 {
-                    return Err(SessionContextCoordinatorError::Fenced);
-                }
-            }
+                    )
+                    .bind(request.owner_pod_id)
+                    .bind(request.user_id)
+                    .bind(request.session_id)
+                    .bind(request.run_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|source| database_error("validate_resumed_run_owner", source))?;
+                    if live != 1 {
+                        return Err(SessionContextCoordinatorError::Fenced);
+                    }
+                    crate::storage::session_execution_activity(
+                        &mut tx,
+                        request.user_id,
+                        request.session_id,
+                        Some(request.run_id),
+                    )
+                    .await
+                    .map_err(|source| database_error("read_resume_execution_activity", source))?
+                    .unresolved_invocations
+                };
             let binding = match source.binding {
                 RunContextBinding::Absent => 0,
                 RunContextBinding::Present { generation } => generation,
@@ -2382,6 +2395,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 run,
                 checkpoint,
                 receipt,
+                prior_unresolved_tool_calls,
             })
         }
         .await;

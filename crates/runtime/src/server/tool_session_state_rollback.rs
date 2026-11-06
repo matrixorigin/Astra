@@ -493,6 +493,7 @@ where
             "success": false,
             "error": "rollback_session_state settlement task failed",
             "detail": error.to_string().chars().take(240).collect::<String>(),
+            "executed": null,
             "side_effects_maybe": true,
         })
         .to_string(),

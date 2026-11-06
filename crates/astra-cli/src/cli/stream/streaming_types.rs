@@ -440,6 +440,8 @@ pub(crate) struct PartialTurnData {
     /// admission may carry this without having created a durable Run.
     pub error_code: Option<String>,
     pub error_metadata: Option<serde_json::Value>,
+    /// Outer `None`: no cancellation observation; inner `None`: unknown.
+    pub cancel_context_not_saved: Option<Option<bool>>,
     /// The server rejected the request before durable Run admission. Such a
     /// request is not a failed turn and must not be reconciled or journaled as
     /// one.
@@ -705,6 +707,8 @@ pub(crate) struct StreamResult {
     pub(crate) qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub(crate) session_id: Option<String>,
     pub(crate) run_id: Option<String>,
+    /// Context observation made while settling this exact Run's cancellation.
+    pub(crate) cancel_context_not_saved: Option<Option<bool>>,
     /// Durable local persistence failure recorded after the runtime finished
     /// successfully (for example one-shot journal append failure).
     pub(crate) session_persistence_error: Option<String>,
@@ -1560,6 +1564,7 @@ impl Default for StreamResult {
             turn_evaluation: None,
             session_id: None,
             run_id: None,
+            cancel_context_not_saved: None,
             session_persistence_error: None,
             local_continuation_omitted: false,
             full_text: String::new(),

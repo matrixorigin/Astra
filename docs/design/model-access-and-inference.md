@@ -338,9 +338,10 @@ the same purpose throughout a drain, as well as checking revision and total.
 
 #### Catalog response compatibility
 
-The executable support baseline is published CLI and Edge **0.2.12**. The two
-HTTP catalog endpoints retain that release's complete response field set as
-the frozen format version 2, including `thinking_protocol` and `pricing`. A
+The two HTTP catalog endpoints retain the complete response field set as the
+frozen format version 2, including `thinking_protocol` and `pricing`. This is a
+catalog API contract, not a promise that older CLI or Edge binaries support the
+current interaction protocol. Deploy matching current clients with the Server. A
 missing `x-astra-model-catalog-version` header and explicit `2` select the
 same frozen format; current thin-client and TypeScript SDK requests negotiate
 the current format `3` on every page.
@@ -348,14 +349,9 @@ Unknown, repeated, or malformed versions (including `1`) return
 `400 model_catalog_version_unsupported`. The response identifies its format
 in the same header and is not cached.
 
-Unversioned 0.2.10 and 0.2.12 catalog requests have no trustworthy distinction.
-The Server must not infer a version from identity or strip protocol metadata
-needed by the supported 0.2.12 picker. CLI 0.2.10's strict catalog decoder and
-its embedded schema-v1 executor are outside the support baseline, as is
-standalone Edge 0.2.10. Users of those binaries must upgrade to 0.2.12 or later.
-The installed CLI can still report an unknown-field/invalid-JSON error before
-execution; a new Server error code cannot repair that old diagnostic. This
-policy does not claim to repair the original 0.2.10 conversation failure.
+The Server must not infer a catalog version from identity or strip protocol
+metadata needed by consumers of the frozen catalog contract. This response
+shape alone does not grant older clients an execution or interaction guarantee.
 
 Version validation does not authorize access. The response uses the existing
 service-owned authorized catalog, Offering identity, capabilities, access
@@ -397,10 +393,8 @@ verify that the selected format can represent the required semantics.
 Authentication, execution requests, approvals, and Edge advertisements are not
 made permissive.
 
-Historical fixtures and binary identities do not move with the producer.
-Support changes must be reviewed separately and document affected features
-and migration. See [client compatibility tests](../guides/testing.md#released-cli-and-edge-compatibility)
-for the fixed artifact inventory and required behavior.
+See [current client integration tests](../guides/testing.md#candidate-cli-and-edge-integration)
+for the tested client and Server journeys.
 
 Explicit Offering IDs cannot bypass this policy. Primary chat admission and
 provider-boundary revalidation reject incompatible protocol-purpose pairs before

@@ -53,6 +53,68 @@ function setup() {
   vi.mocked(requireRuntimeClient).mockResolvedValue(runtime as never);
   return runtime;
 }
+
+it.each([true, false, null])('retains cancelled Context evidence across a cold read and successor (%s)', async observation => {
+  const runtime = setup();
+  const cancelled = conversation('run', 'cancelled');
+  cancelled.items.push({ kind: 'raw', session_id: 'session', item_seq: 2, run_id: 'run', role: 'assistant',
+    content: 'partial answer', created_at: '2026-10-25T03:01:00Z', context_not_saved: observation });
+  const successor = conversation('next', 'completed', 'next request');
+  successor.items.unshift(...cancelled.items);
+  successor.items.push({ kind: 'raw', session_id: 'session', item_seq: 3, run_id: 'next', role: 'assistant', content: 'new answer', created_at: '2026-10-25T03:02:00Z' });
+  for (const snapshot of [cancelled, successor]) {
+    globalThis.__astraWebStores = undefined;
+    runtime.sdk.getSessionConversation.mockResolvedValue(snapshot);
+    const detail = await getChatHydrated('owner', 'session');
+    expect(detail?.messages.find(item => item.content === 'partial answer')).toMatchObject({ contextNotSaved: observation, runId: 'run' });
+    expect(detail?.messages.filter(item => item.runId === 'next').every(item => item.contextNotSaved === undefined)).toBe(true);
+  }
+});
+
+it.each([true, false, null])('settles a pending Stop ACK through the final canonical conversation (%s)', async observation => {
+  const runtime = setup();
+  const detail = await getChatHydrated('owner', 'session');
+  const assistantMessageId = detail!.activeRun!.assistantMessageId ?? null;
+  runtime.sdk.cancelRun.mockResolvedValue({ runId: 'run', status: 'cancellation_requested', executionSettled: false } as never);
+  runtime.sdk.getRunStatus.mockResolvedValue({ runId: 'run', sessionId: 'session', status: 'cancelled', eventsCount: 4 });
+  const terminal = conversation('run', 'cancelled');
+  terminal.items.push({ kind: 'cancellation', id: 'cancellation:run', run_id: 'run', created_at: '2026-10-25T03:01:00Z', context_not_saved: observation });
+  runtime.sdk.getSessionConversation.mockResolvedValue(terminal);
+  const stopped = await stopActiveRun('owner', 'session', { sessionId: 'session', runId: 'run', assistantMessageId },
+    { skipSync: true, client: runtime });
+  expect(stopped?.activeRun).toBeUndefined();
+  expect(stopped?.contextNotSaved).toBe(observation);
+  expect(getChat('owner', 'session')?.messages.at(-1)).toMatchObject({ contextNotSaved: observation, content: 'Stopped.' });
+  expect(runtime.sdk.cancelRun).toHaveBeenCalledOnce();
+});
+
+it('bounds Stop receipt observation and rejects its late projection after a successor starts', async () => {
+  const runtime = setup();
+  const detail = await getChatHydrated('owner', 'session');
+  const assistantMessageId = detail!.activeRun!.assistantMessageId ?? null;
+  const reading = deferred<RuntimeConversationResponse>();
+  runtime.sdk.cancelRun.mockResolvedValue({ runId: 'run', status: 'cancellation_requested', executionSettled: false } as never);
+  runtime.sdk.getRunStatus.mockResolvedValue({ runId: 'run', sessionId: 'session', status: 'cancelled', eventsCount: 4 });
+  runtime.sdk.getSessionConversation.mockReturnValue(reading.promise);
+  vi.useFakeTimers();
+  try {
+    const stopping = stopActiveRun('owner', 'session', { sessionId: 'session', runId: 'run', assistantMessageId },
+      { skipSync: true, cancelTimeoutMs: 20, client: runtime });
+    await vi.advanceTimersByTimeAsync(25);
+    const stopped = await stopping;
+    expect(stopped?.activeRun).toBeUndefined();
+    expect(stopped?.contextNotSaved).toBeNull();
+    const chat = getStore('owner').chats[0];
+    chat.activeRun = { runId: 'next', status: 'running', source: 'local_mutation', observedAt: new Date().toISOString() };
+    const terminal = conversation('run', 'cancelled');
+    terminal.items.push({ kind: 'cancellation', id: 'cancelled:run', run_id: 'run', created_at: session.created_at, context_not_saved: true });
+    reading.resolve(terminal);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(chat.activeRun.runId).toBe('next');
+    expect(chat.messages.some(item => item.contextNotSaved === true)).toBe(false);
+    expect(runtime.sdk.cancelRun).toHaveBeenCalledOnce();
+  } finally { vi.useRealTimers(); }
+});
 it.each(["warm", "cold", "successor"])("preserves failed partial answers across %s detail refreshes", async mode => {
   const runtime = setup();
   await getChatHydrated("owner", "session");

@@ -367,6 +367,9 @@ continuation and rejects this policy before admitting a turn.
 
 ## User-facing diagnostics
 
+The stdio app-server forwards system diagnostics as `warning` notifications
+with a `message`, including uncertain tool outcomes and unsaved turn history.
+
 A user should be able to answer:
 
 - Is it running, blocked, waiting, cancelled, or complete?

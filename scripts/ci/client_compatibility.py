@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise reviewed historical binaries against an explicitly disposable server.
+"""Exercise candidate CLI and Edge binaries against a disposable server.
 
-No installer, user credentials, external model service or moving channel is used.
-The same entrypoint runs against the PR router fixture and the candidate image.
+No installer, user credentials or external model service is used.
 Only categorical failures and artifact identities are written to the report.
 """
 
@@ -14,7 +13,6 @@ from pathlib import Path
 import queue
 import re
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -24,8 +22,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-
-from historical_clients import ArtifactError, baseline_document, prepare
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "load"))
 import mock_openai_server as mock  # noqa: E402
@@ -115,7 +111,7 @@ def result_json(result):
     try:
         body = json.loads(result.stdout)
     except (ValueError, UnicodeDecodeError):
-        # Historical clients can fail during command preflight before their
+        # A client can fail during command preflight before its
         # JSON terminal writer is entered. Retain bounded, redacted evidence
         # from this isolated synthetic command instead of losing the cause.
         diagnostics = {"exit_code": result.returncode}
@@ -249,6 +245,20 @@ class Provider:
                     owner.arrived.set()
                     owner.release.wait(30)
                 messages = body.get("messages", [])
+                if case in ("resume-after-first-cancellation", "resume-after-cancellation"):
+                    if not any(message.get("role") == "user" and message.get("content") ==
+                               "Wait until cancelled: " + owner.marker for message in messages):
+                        owner.errors.append("cancelled_history_missing_from_inference")
+                        return mock.write_json(self, mock.HTTPStatus.BAD_REQUEST,
+                                               {"error": {"code": "fixture_cancelled_history_missing"}})
+                    if case == "resume-after-cancellation" and not (
+                            any(message.get("role") == "user" and message.get("content") ==
+                                "Establish committed history: " + owner.marker for message in messages)
+                            and any(message.get("role") == "assistant" and message.get("content") == owner.marker
+                                    for message in messages)):
+                        owner.errors.append("seed_history_missing_from_inference")
+                        return mock.write_json(self, mock.HTTPStatus.BAD_REQUEST,
+                                               {"error": {"code": "fixture_seed_history_missing"}})
                 operation_id = "compat-operation-" + str(case)
                 readback_id = "compat-readback-" + str(case)
                 with owner.lock:
@@ -508,9 +518,8 @@ def cancellation(binary, env, home, origin, token, model, provider, seed_history
         seed_run = None
         seed_cursor = None
         if seed_history:
-            # Cancellation revokes the current turn's Context; it must not
-            # manufacture a head for a never-completed conversation. Establish
-            # real committed history before testing cross-process cold resume.
+            # Establish real committed history before testing cross-process
+            # cancellation and cold resume.
             provider.case = "cancellation-history-seed"
             provider.mode = "text"
             turn = rpc.send("turn/start", {"threadId": thread,
@@ -541,21 +550,24 @@ def cancellation(binary, env, home, origin, token, model, provider, seed_history
         terminal = rpc.wait(lambda event: event.get("method") == "turn/completed"
                             and event.get("params", {}).get("threadId") == thread
                             and event.get("params", {}).get("turn", {}).get("id") == turn)
-        # 0.2.12 reports cancellation as a failed local turn. Durable Server
+        # The CLI reports cancellation as a failed local turn. Durable Server
         # status, rather than that display label, proves cancellation settled.
         require(terminal["params"].get("status") == "failed", "cancel_client_terminal_mismatch")
         settled_session_run(origin, token, thread, model, "cancelled", run_id)
+        restored = request(origin, "/sessions/" + thread + "/resume", token, {})
+        cursor = restored.get("resume_bundle", {}).get("cursor")
+        previous_turn = seed_cursor.get("completed_turn", 0) if seed_cursor else 0
+        require(isinstance(cursor, dict) and cursor.get("completed_turn", 0) > previous_turn,
+                "cancelled_turn_history_not_committed")
+        messages = restored.get("resume_bundle", {}).get("conversation_messages", [])
+        require(any(message.get("role") == "user" and message.get("content") ==
+                    "Wait until cancelled: " + provider.marker for message in messages),
+                "cancelled_turn_user_message_missing")
         if seed_history:
-            restored = request(origin, "/sessions/" + thread + "/resume", token, {})
-            require(restored.get("resume_bundle", {}).get("cursor") == seed_cursor,
-                    "cancelled_turn_changed_committed_history")
-        else:
-            try:
-                request(origin, "/sessions/" + thread + "/resume", token, {})
-            except Failure as error:
-                require(str(error) == "server_http_404", "cancel_without_history_unexpected_restore_error")
-            else:
-                raise Failure("cancel_without_history_invented_resume_state")
+            require(any(message.get("role") == "user" and message.get("content") ==
+                        "Establish committed history: " + provider.marker for message in messages)
+                    and any(message.get("role") == "assistant" and message.get("content") == provider.marker
+                            for message in messages), "seed_history_missing_after_cancellation")
         return thread, run_id
     finally:
         provider.mode = "text"
@@ -572,7 +584,7 @@ def edge_execution(home, origin, token, edge_id, model, provider, report, client
     provider.tool_result_seen = False
     (home / provider.target).write_text(provider.marker)
     try:
-        session = request(origin, "/sessions", token, {"title": "Historical Edge compatibility"})["session_id"]
+        session = request(origin, "/sessions", token, {"title": "Candidate Edge integration"})["session_id"]
         catalog = request(origin, "/models", token)
         rows = catalog if isinstance(catalog, list) else catalog["items"]
         offering = next(row["offering_id"] for row in rows if row["name"] == model)
@@ -583,7 +595,7 @@ def edge_execution(home, origin, token, edge_id, model, provider, report, client
             "workspace_binding": {"kind": "edge_workspace", "display_name": "Compatibility workspace",
                 "root": str(home), "source": {"kind": "edge_path", "path": str(home)}, "authority": "read_write"},
             "executor_binding": {"kind": "edge_agent", "executor_id": edge_id,
-                "display_name": "Historical Edge", "transport": "edge_ws", "status": "online"},
+                "display_name": "Candidate Edge", "transport": "edge_ws", "status": "online"},
         }
         wire = urllib.request.Request(origin + "/chat/stream", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
@@ -622,9 +634,9 @@ def edge_execution(home, origin, token, edge_id, model, provider, report, client
         provider.tool_name = "write_file"
 
 
-def edge_case(binary, env, home, origin, token, version, model, provider, report):
-    begin_case(report, version, "edge_schema1_rejection" if version == "0.2.10" else "edge_handshake")
-    edge_id = "compat-edge-" + version.replace(".", "-")
+def edge_case(binary, env, home, origin, token, model, provider, report):
+    begin_case(report, "candidate", "edge_handshake")
+    edge_id = "candidate-edge-" + uuid.uuid4().hex
     with tempfile.TemporaryFile() as diagnostics:
         process = subprocess.Popen([str(binary), "--server-url", origin, "--workspace-dir", str(home),
                                     "--edge-id", edge_id, "--reconnect", "false"], env=env, cwd=home,
@@ -634,15 +646,16 @@ def edge_case(binary, env, home, origin, token, version, model, provider, report
             while time.monotonic() < deadline:
                 edges = request(origin, "/edges/status", token).get("edges", [])
                 online = any(edge.get("edge_agent_id") == edge_id for edge in edges)
-                if version == "0.2.12" and online:
-                    edge_execution(home, origin, token, edge_id, model, provider, report, version)
+                if online:
+                    edge_execution(home, origin, token, edge_id, model, provider, report, "candidate")
                     return
                 if process.poll() is not None:
                     diagnostics.seek(0)
                     detail = diagnostics.read().decode(errors="replace")
-                    require(version == "0.2.10" and process.returncode != 0 and not online
-                            and "schema v1" in detail and "upgrade" in detail.lower(), "edge_rejection_not_classified")
-                    return
+                    raise Failure("candidate_edge_exited", {
+                        "exit_code": process.returncode,
+                        "stderr_summary": safe_error_summary(detail),
+                    })
                 time.sleep(0.1)
             raise Failure("edge_handshake_timeout")
         finally:
@@ -655,7 +668,7 @@ def edge_case(binary, env, home, origin, token, version, model, provider, report
                     process.wait()
 
 
-def bootstrap(origin, provider, provider_host):
+def bootstrap(origin, provider):
     user = "compatibility_" + uuid.uuid4().hex
     password = uuid.uuid4().hex + "Aa9!"
     registered = request(origin, "/admin/register", payload={"username": user,
@@ -663,81 +676,13 @@ def bootstrap(origin, provider, provider_host):
     token = registered["access_token"]
     model = "compatibility-" + uuid.uuid4().hex
     request(origin, "/models", token, {"name": model, "provider": "openai", "api_key": "synthetic-only",
-        "base_url": "http://" + provider_host + ":" + str(provider.server.server_port) + "/v1",
+        "base_url": "http://127.0.0.1:" + str(provider.server.server_port) + "/v1",
         "context_window": 128000, "max_completion_tokens": 1024, "supported_parameters": ["tools"],
         "pricing": {"currency": "USD", "unit": "per_token", "prompt": 0.000001, "completion": 0.000002},
         "tags": ["chat", "code"], "quirks": {"thinking_protocol": "unknown"}})
     provider.expected_model = model
     return token, model, user, password
 
-
-def rollback(args, artifacts, report):
-    """The archived 0.2.12 CLI embeds that release's real HTTP Server owner."""
-    begin_case(report, "candidate", "released_server_startup")
-    require(bool(args.rollback_database), "rollback_database_required")
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
-    origin = "http://127.0.0.1:" + str(port)
-    keys = ("PATH", "LANG", "LC_ALL", "MATRIXONE_HOST", "MATRIXONE_PORT", "MATRIXONE_USER",
-            "MATRIXONE_PASSWORD", "ASTRA_JWT_SECRET", "ASTRA_TOKEN_ENCRYPTION_KEY",
-            "ASTRA_RUNTIME_ROOT_SECRET", "MEMORIA_BASE_URL", "MEMORIA_MASTER_KEY", "MEMORIA_SELF_HOSTED_MASTER_ACCESS")
-    env = {key: os.environ[key] for key in keys if key in os.environ}
-    env.update({"ASTRA_CONFIG_SOURCE": "explicit-env", "ASTRA_DATABASE": args.rollback_database,
-                "ASTRA_AUTO_CREATE_DATABASE": "1", "ASTRA_API_HOST": "127.0.0.1", "ASTRA_API_PORT": str(port)})
-    provider = Provider()
-    with tempfile.TemporaryDirectory(prefix="astra-rollback-server-") as directory:
-        home = Path(directory)
-        env.update({"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
-                    "XDG_CACHE_HOME": str(home / ".cache"), "XDG_DATA_HOME": str(home / ".local/share")})
-        process = subprocess.Popen([str(artifacts / "0.2.12" / "astra"), "serve", "http",
-                                    "--host", "127.0.0.1", "--port", str(port)],
-                                   env=env, cwd=home, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, start_new_session=True)
-        try:
-            deadline = time.monotonic() + 90
-            ready = False
-            while time.monotonic() < deadline:
-                require(process.poll() is None, "released_server_exited")
-                try:
-                    ready = request(origin, "/ready").get("status") == "ready"
-                except (Failure, urllib.error.URLError):
-                    ready = False
-                if ready:
-                    break
-                time.sleep(0.2)
-            require(ready, "released_server_readiness_timeout")
-            begin_case(report, "candidate", "released_server_source_identity")
-            health = request(origin, "/health")
-            require(health.get("build_git_sha") == "70a5ee3ec25bb3b02d3f591675a13abc33a85159",
-                    "released_server_source_mismatch")
-            begin_case(report, "candidate", "released_server_bootstrap")
-            token, model, username, password = bootstrap(origin, provider, "127.0.0.1")
-            provider.case = "rollback-chat"
-            with tempfile.TemporaryDirectory(prefix="astra-rollback-client-") as client_directory:
-                client_home = Path(client_directory)
-                client_env = child_environment(client_home, origin, token)
-                begin_case(report, "candidate", "login_against_released_server")
-                authenticate_cli(args.current_cli.resolve(), client_env, client_home, origin, username, password)
-                begin_case(report, "candidate", "catalog_against_released_server")
-                listed = command(args.current_cli.resolve(), client_env, client_home,
-                                 [*cli_base(origin, model), "model", "list"])
-                require(listed.returncode == 0 and model in listed.stdout.decode(errors="replace"), "rollback_catalog_unreadable")
-                begin_case(report, "candidate", "ordinary_chat_against_released_server")
-                completed(command(args.current_cli.resolve(), client_env, client_home,
-                    [*one_shot_chat_base(origin, model), "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker]), provider.marker)
-                require(not provider.errors, "rollback_provider_contract_failed")
-            report["cases"].append({"client": "candidate", "case": "catalog_and_chat_against_released_server",
-                "server_source": "70a5ee3ec25bb3b02d3f591675a13abc33a85159", "server_version": "0.2.12", "status": "passed"})
-        finally:
-            provider.close()
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
 
 
 def run(args, report):
@@ -747,117 +692,90 @@ def run(args, report):
     require(parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1")
             and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
             and parsed.path == "", "disposable_loopback_server_required")
-    begin_case(report, "released", "component_download_and_identity")
-    artifacts = prepare(args.artifacts)
+    require(bool(report["server_source"]), "candidate_server_source_required")
+    begin_case(report, "server", "component_identity")
+    health = request(origin, "/health")
+    require(health.get("build_git_sha") == report["server_source"], "candidate_server_source_mismatch")
     provider = Provider()
     try:
         begin_case(report, "server", "bootstrap")
-        token, model, username, password = bootstrap(origin, provider, args.provider_host)
-        for baseline in baseline_document()["baselines"]:
-            version = baseline["version"]
-            with tempfile.TemporaryDirectory(prefix="astra-compatibility-") as directory:
-                home = Path(directory)
-                env = child_environment(home, origin, token)
-                begin_case(report, version, "edge_component_version")
-                edge_identity = command(artifacts / version / "astra-edge", env, home, ["--version"])
-                require(edge_identity.returncode == 0 and version in edge_identity.stdout.decode(), "edge_version_mismatch")
-                binary = artifacts / version / "astra"
-                begin_case(report, version, "cli_component_version")
-                identity = command(binary, env, home, ["--version"])
-                require(identity.returncode == 0 and version in identity.stdout.decode(), "client_version_mismatch")
-                begin_case(report, version, "profile_login")
-                authenticate_cli(binary, env, home, origin, username, password)
-                begin_case(report, version, "unsupported_catalog" if version == "0.2.10" else "model_catalog")
-                listed = command(binary, env, home, [*cli_base(origin, model), "model", "list"])
-                if version == "0.2.10":
-                    # This installed strict decoder cannot negotiate v2. Keep
-                    # the known failure visible; never call it a supported
-                    # catalog or conversation. Its standalone Edge remains a
-                    # separate schema-v1 rejection case below.
-                    detail = (listed.stdout + listed.stderr).decode(errors="replace")
-                    require(listed.returncode != 0 and "unknown field" in detail
-                            and "thinking_protocol" in detail, "unsupported_catalog_boundary_changed")
-                    report["cases"].append({"client": version, "case": "unsupported_catalog",
-                        "status": "passed", "support": "unsupported", "action": "upgrade_to_0.2.12_or_later"})
-                else:
-                    require(listed.returncode == 0 and model in listed.stdout.decode(errors="replace"), "historical_catalog_unreadable")
-                    # Inspect output decoded and reserialized by the actual
-                    # published CLI. A legacy projection silently yields None
-                    # for these fields even though `model list` succeeds.
-                    catalog = result_json(listed)
-                    offerings = [item for item in catalog.get("items", []) if item.get("name") == model]
-                    require(len(offerings) == 1, "historical_catalog_offering_missing")
-                    require(offerings[0].get("thinking_protocol") == "unknown", "historical_protocol_metadata_lost")
-                    pricing = offerings[0].get("pricing")
-                    require(isinstance(pricing, dict) and pricing.get("currency") == "USD"
-                            and pricing.get("unit") == "per_token" and pricing.get("prompt") == 0.000001
-                            and pricing.get("completion") == 0.000002, "historical_pricing_metadata_lost")
-                    report["cases"].append({"client": version, "case": "model_catalog", "status": "passed"})
-                    provider.case = version + "-ordinary-chat"
-                    begin_case(report, version, "ordinary_chat")
-                    chat = command(binary, env, home, [*one_shot_chat_base(origin, model), "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker])
-                    completed(chat, provider.marker)
-                    report["cases"].append({"client": version, "case": "ordinary_chat", "status": "passed"})
-                    approvals(binary, env, home, origin, token, model, provider, report, version)
-                    report["cases"].append({"client": version, "case": "tool_approval_allow_and_deny", "status": "passed"})
-                    begin_case(report, version, "cancel_before_first_commit")
-                    empty_session, _ = cancellation(binary, env, home, origin, token, model, provider)
-                    empty_resume = command(binary, env, home, [*one_shot_chat_base(origin, model),
-                        "--json", "--session-id", empty_session, "-m", "Continue: " + provider.marker])
-                    require(empty_resume.returncode != 0
-                            and b"no restorable canonical state" in empty_resume.stderr,
-                            "cancel_without_history_client_not_explicitly_rejected")
-                    report["cases"].append({"client": version, "case": "cancel_before_first_commit",
-                        "status": "passed", "resume": "no_committed_history"})
-                    begin_case(report, version, "cancel_with_committed_history")
-                    session, cancelled_run = cancellation(binary, env, home, origin, token, model, provider,
-                                                          seed_history=True)
-                    provider.case = "resume-after-cancellation"
-                    begin_case(report, version, "resume_after_cancellation")
-                    resumed = completed(command(binary, env, home, [*one_shot_chat_base(origin, model), "--json", "--session-id", session, "-m", "Continue after cancellation: " + provider.marker]), provider.marker)
-                    require(resumed["session_id"] == session and resumed["run_id"] != cancelled_run,
-                            "resume_run_identity_mismatch")
-                    settled_session_run(origin, token, session, model, "completed", resumed["run_id"])
-                    settled_session_run(origin, token, session, model, "cancelled", cancelled_run)
-                    report["cases"].append({"client": version, "case": "cancel_and_resume", "status": "passed"})
-                edge_case(artifacts / version / "astra-edge", env, home, origin, token, version, model, provider, report)
-                report["cases"].append({"client": version, "case": "edge_handshake_and_tool_execution" if version == "0.2.12" else "edge_schema1_rejection", "status": "passed"})
-        if args.current_cli is not None:
-            with tempfile.TemporaryDirectory(prefix="astra-current-client-") as directory:
-                home = Path(directory)
-                env = child_environment(home, origin, token)
-                begin_case(report, "candidate", "cli_component_identity")
-                identify_current(args.current_cli.resolve(), env, home, report)
-                begin_case(report, "candidate", "profile_login")
-                authenticate_cli(args.current_cli.resolve(), env, home, origin, username, password)
-                provider.case = "candidate-chat"
-                begin_case(report, "candidate", "ordinary_chat")
-                completed(command(args.current_cli.resolve(), env, home,
-                    [*one_shot_chat_base(origin, model), "--json", "--no-resume", "-m", "Reply to the fixture: " + provider.marker]), provider.marker)
-                report["cases"].append({"client": "candidate", "case": "ordinary_chat", "status": "passed"})
+        token, model, username, password = bootstrap(origin, provider)
+        with tempfile.TemporaryDirectory(prefix="astra-candidate-client-") as directory:
+            home = Path(directory)
+            env = child_environment(home, origin, token)
+            cli = args.current_cli.resolve()
+            edge = args.current_edge.resolve()
+            begin_case(report, "candidate", "cli_component_identity")
+            identify_current(cli, env, home, report)
+            begin_case(report, "candidate", "edge_component_identity")
+            version = command(edge, env, home, ["--version"])
+            require(version.returncode == 0, "candidate_edge_version_unavailable")
+            with edge.open("rb") as stream:
+                report["current_edge"] = {"sha256": hashlib.file_digest(stream, "sha256").hexdigest(),
+                                          "version": version.stdout.decode().strip()}
+            begin_case(report, "candidate", "profile_login")
+            authenticate_cli(cli, env, home, origin, username, password)
+            begin_case(report, "candidate", "model_catalog")
+            listed = command(cli, env, home, [*cli_base(origin, model), "model", "list"])
+            require(listed.returncode == 0 and model in listed.stdout.decode(errors="replace"),
+                    "candidate_catalog_unreadable")
+            catalog = result_json(listed)
+            offerings = [item for item in catalog.get("items", []) if item.get("name") == model]
+            require(len(offerings) == 1 and offerings[0].get("thinking_protocol") == "unknown",
+                    "candidate_catalog_metadata_missing")
+            pricing = offerings[0].get("pricing")
+            require(isinstance(pricing, dict) and pricing.get("currency") == "USD"
+                    and pricing.get("unit") == "per_token" and pricing.get("prompt") == 0.000001
+                    and pricing.get("completion") == 0.000002, "candidate_catalog_pricing_missing")
+            report["cases"].append({"client": "candidate", "case": "model_catalog", "status": "passed"})
+            provider.case = "candidate-ordinary-chat"
+            begin_case(report, "candidate", "ordinary_chat")
+            completed(command(cli, env, home, [*one_shot_chat_base(origin, model), "--json", "--no-resume",
+                                              "-m", "Reply to the fixture: " + provider.marker]), provider.marker)
+            report["cases"].append({"client": "candidate", "case": "ordinary_chat", "status": "passed"})
+            approvals(cli, env, home, origin, token, model, provider, report, "candidate")
+            report["cases"].append({"client": "candidate", "case": "tool_approval_allow_and_deny", "status": "passed"})
+            begin_case(report, "candidate", "cancel_before_first_commit")
+            empty_session, cancelled_run = cancellation(cli, env, home, origin, token, model, provider)
+            provider.case = "resume-after-first-cancellation"
+            empty_resume = completed(command(cli, env, home, [*one_shot_chat_base(origin, model),
+                "--json", "--session-id", empty_session, "-m", "Continue: " + provider.marker]), provider.marker)
+            require(empty_resume["session_id"] == empty_session and empty_resume["run_id"] != cancelled_run,
+                    "cancel_without_history_resume_identity_mismatch")
+            settled_session_run(origin, token, empty_session, model, "completed", empty_resume["run_id"])
+            settled_session_run(origin, token, empty_session, model, "cancelled", cancelled_run)
+            report["cases"].append({"client": "candidate", "case": "cancel_before_first_commit", "status": "passed"})
+            begin_case(report, "candidate", "cancel_with_committed_history")
+            session, cancelled_run = cancellation(cli, env, home, origin, token, model, provider, seed_history=True)
+            provider.case = "resume-after-cancellation"
+            begin_case(report, "candidate", "resume_after_cancellation")
+            resumed = completed(command(cli, env, home, [*one_shot_chat_base(origin, model), "--json",
+                "--session-id", session, "-m", "Continue after cancellation: " + provider.marker]), provider.marker)
+            require(resumed["session_id"] == session and resumed["run_id"] != cancelled_run,
+                    "resume_run_identity_mismatch")
+            settled_session_run(origin, token, session, model, "completed", resumed["run_id"])
+            settled_session_run(origin, token, session, model, "cancelled", cancelled_run)
+            report["cases"].append({"client": "candidate", "case": "cancel_and_resume", "status": "passed"})
+            edge_case(edge, env, home, origin, token, model, provider, report)
+            report["cases"].append({"client": "candidate", "case": "edge_tool_execution", "status": "passed"})
         require(not provider.errors, "provider_contract_failed")
     finally:
         with provider.lock:
             report["provider_error_categories"] = list(provider.errors)
             report["provider_phases"] = sorted([list(phase) for phase in provider.claimed])
         provider.close()
-    if args.current_cli is not None:
-        rollback(args, artifacts, report)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", required=True)
-    parser.add_argument("--provider-host", default="127.0.0.1", choices=("127.0.0.1", "host.docker.internal"))
-    parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--current-cli", type=Path)
-    parser.add_argument("--rollback-database")
+    parser.add_argument("--current-cli", type=Path, required=True)
+    parser.add_argument("--current-edge", type=Path, required=True)
     parser.add_argument("--disposable-server", action="store_true", required=True)
     args = parser.parse_args()
-    report = {"schema": 1, "minimum_executable_version": "0.2.12", "platform": "linux-amd64", "baselines": baseline_document()["baselines"],
-              "server_source": os.environ.get("ASTRA_COMPAT_SERVER_SOURCE"),
-              "server_image_digest": os.environ.get("ASTRA_COMPAT_SERVER_IMAGE_DIGEST"), "cases": [], "status": "failed"}
+    report = {"schema": 1, "platform": "linux-amd64",
+              "server_source": os.environ.get("ASTRA_COMPAT_SERVER_SOURCE"), "cases": [], "status": "failed"}
     started = time.monotonic()
     signal.signal(signal.SIGALRM, deadline_exceeded)
     signal.signal(signal.SIGTERM, deadline_exceeded)
@@ -868,7 +786,7 @@ def main():
         report["active_case"] = None
         report["active_client"] = None
     except Exception as error:
-        report["failure_category"] = str(error) if isinstance(error, (Failure, ArtifactError)) else type(error).__name__
+        report["failure_category"] = str(error) if isinstance(error, Failure) else type(error).__name__
         if isinstance(error, Failure) and error.diagnostics is not None:
             report["diagnostics"] = error.diagnostics
     finally:
@@ -880,8 +798,8 @@ def main():
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
             with Path(summary).open("a") as output:
-                output.write("\n### Historical client compatibility\n\n```json\n" + serialized + "```\n")
-    print("Historical client compatibility: " + report["status"])
+                output.write("\n### Candidate client integration\n\n```json\n" + serialized + "```\n")
+    print("Candidate client integration: " + report["status"])
     return 0 if report["status"] == "passed" else 1
 
 
