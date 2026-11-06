@@ -263,7 +263,10 @@ When execution selection rejects a new turn with
 `metadata.attempt_admission_state: rejected`. The CLI preserves that code, restores the
 draft and suggests `/login` or restarting only when no earlier dispatched
 attempt remains ambiguous. The thin transport returns sticky retry provenance
-alongside the final response. Older clients ignore this new attempt-only field
+alongside the final response. Connector failures known to precede HTTP request
+dispatch (including a refused connection) do not create ambiguity; they also
+cannot clear ambiguity from an earlier attempt that may have reached the Server.
+Older clients ignore this new attempt-only field
 instead of interpreting it as the legacy `admission_state: rejected` guarantee. A lost response followed by a rejected retry keeps
 recovery evidence and reports unknown execution state without restoring a draft
 or claiming no model/tool ran. An admitted run or resume failure is never
