@@ -1004,6 +1004,9 @@ pub(crate) struct ModelAddArgs {
     /// HTTPS API base URL, required for openai-compatible
     #[arg(long)]
     pub base_url: Option<String>,
+    /// API format required by the provider (default: chat)
+    #[arg(long = "api-format", value_parser = ["chat", "responses"])]
+    pub api_format: Option<String>,
     /// Read the API key from standard input
     #[arg(long)]
     pub api_key_stdin: bool,

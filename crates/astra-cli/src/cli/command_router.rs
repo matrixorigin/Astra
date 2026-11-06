@@ -3279,6 +3279,12 @@ async fn execute_cli_command_impl(
                 "context_window": context_window,
                 "is_default": is_default,
             });
+            if let Some(format) = args.api_format {
+                payload["inference_protocol"] = serde_json::json!(match format.as_str() {
+                    "responses" => "openai_responses",
+                    _ => "openai_compatible",
+                });
+            }
             if let Some(connection) = connection {
                 payload["connection_id"] = serde_json::json!(connection);
             }

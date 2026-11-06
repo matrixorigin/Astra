@@ -3160,10 +3160,22 @@ pub(crate) fn apply_model_picker_result(
         ));
         return Some(false);
     };
+    let protocol = entry.thinking_protocol.unwrap_or_default();
+    let personal_responses = entry.access_kind
+        == astra_services::models::ModelAccessKind::CloudByok
+        && entry.access_id == "cloud-byok"
+        && protocol == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning;
+    let observed_capability = entry.thinking_capability.map(|value| value.as_str());
+    let picker_capability =
+        if personal_responses && !matches!(observed_capability, Some("both" | "effort_only")) {
+            Some("effort_only")
+        } else {
+            observed_capability
+        };
     let opts: Vec<_> = astra_turn_core::thinking_config::thinking_options(
         (!entry.provider.trim().is_empty()).then_some(entry.provider.trim()),
-        entry.thinking_capability.map(|value| value.as_str()),
-        entry.thinking_protocol.unwrap_or_default(),
+        picker_capability,
+        protocol,
     )
     .into_iter()
     .filter(|option| {
@@ -3184,7 +3196,14 @@ pub(crate) fn apply_model_picker_result(
             .iter()
             .map(|option| SelectionItem {
                 name: option.label.into(),
-                description: None,
+                description: (protocol
+                    == astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning
+                    && entry.supported_reasoning_efforts.is_none()
+                    && !matches!(
+                        option.config,
+                        astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+                    ))
+                .then(|| "Provider support for this setting is not verified".into()),
                 is_current: option.is_default,
             })
             .collect();
@@ -4848,7 +4867,7 @@ mod model_catalog_loading_tests {
     use crate::cli::session::session_runtime::{ModelCatalogError, fetch_owner_model_catalog};
     use crate::test_utils::ProcessEnvGuard;
     use crate::tests::isolate_credentials;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[derive(Debug)]
@@ -4883,6 +4902,69 @@ mod model_catalog_loading_tests {
             },
         );
         save_credentials(&credentials).expect("save isolated credentials");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_sends_selected_api_format() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action, Outcome},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _identity =
+            install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me/model-connections"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"management_available":true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/me/models"))
+            .and(body_partial_json(
+                serde_json::json!({"inference_protocol":"openai_responses"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"model_id":"fixture"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+        let result = model_setup::run(
+            Action::Create(astra_services::UserModelCreateRequestData {
+                connection_id: None,
+                name: "mine".into(),
+                provider: "openai".into(),
+                inference_protocol: Some(
+                    astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                ),
+                model: "fixture".into(),
+                base_url: None,
+                api_key: "synthetic-key".into(),
+                context_window: 128000,
+                is_default: false,
+            }),
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            cli_owner_auth_snapshot(),
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(LoginControl::default()),
+            progress,
+        )
+        .await;
+        assert!(matches!(result, Ok(Outcome::Saved { model_id, .. }) if model_id == "fixture"));
     }
 
     #[serial_test::serial]

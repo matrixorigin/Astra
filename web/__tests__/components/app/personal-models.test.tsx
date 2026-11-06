@@ -21,6 +21,15 @@ function actions() {
 describe('personal source setup', () => {
   beforeEach(() => { vi.clearAllMocks(); request.mockResolvedValue(settings as never); });
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  it('lets an API-key user select Responses for a provider that requires it', async () => {
+    render(<PersonalModels onChanged={vi.fn()} />); await ready();
+    fireEvent.change(screen.getByLabelText('Model name'), { target: { value: 'mine' } });
+    fireEvent.change(screen.getByLabelText('Provider model ID'), { target: { value: 'model' } });
+    fireEvent.change(screen.getByLabelText('API key'), { target: { value: 'synthetic-key' } });
+    fireEvent.change(screen.getByLabelText('API format'), { target: { value: 'openai_responses' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Check and add personal model' }));
+    await waitFor(() => expect(actions()).toContainEqual(expect.objectContaining({ action: 'create', inference_protocol: 'openai_responses' })));
+  });
   it('keeps API keys and cleanup usable when the Server disables ChatGPT', async () => {
     request.mockResolvedValue({ ...settings, chatgpt: { available: false, detail: 'ChatGPT disabled by Server' },
       connections: [{ connection_id: authorization, label: 'personal', status: 'connected' }] } as never);

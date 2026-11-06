@@ -562,6 +562,14 @@ fn authority_retention(
         if additional.as_ref().is_some_and(|mask| mask[index]) {
             plan.protected[index] = true;
         }
+        if human.is_none_or(|anchor| index > anchor)
+            && message["role"] == "assistant"
+            && message
+                .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_some()
+        {
+            plan.protected[index] = true;
+        }
         let delivery = astra_turn_types::runtime_message_delivery(message);
         if astra_turn_types::is_runtime_owned_message(message) && delivery.is_none() {
             return None;
@@ -1649,6 +1657,72 @@ mod tests {
     use serde_json::json;
     use std::collections::HashSet;
 
+    #[test]
+    fn active_incomplete_tool_evidence_survives_aggressive_compaction() {
+        let mut assistant = serde_json::json!({"role":"assistant", "content":"", "tool_calls":[
+            {"id":"c1", "type":"function", "function":{"name":"write_file", "arguments":"{}"}}
+        ]});
+        assistant[astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD] = Value::Bool(true);
+        let mut history = vec![
+            serde_json::json!({"role":"user", "content":"work"}),
+            assistant,
+            serde_json::json!({"role":"tool", "tool_call_id":"c1", "content":"done"}),
+        ];
+        history.extend((0..10).map(|_| {
+            serde_json::json!({
+                "role":"assistant", "content":"progress ".repeat(100)
+            })
+        }));
+        let compacted = compact_tiered_impl(&history, 200, 40, CompactionTier::AggressivePrune, 1);
+        assert!(compacted.messages.iter().any(|message| {
+            message
+                .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_some()
+        }));
+        assert!(
+            compacted
+                .messages
+                .iter()
+                .any(|message| message["tool_call_id"] == "c1")
+        );
+
+        let mut middle = history.clone();
+        assert!(compact_middle_messages(&mut middle, 2, false).estimated_tokens_freed > 0);
+        let boundary = middle
+            .iter()
+            .position(|message| message["_compact_boundary"] == true)
+            .unwrap();
+        let marker = middle
+            .iter()
+            .position(|message| {
+                message
+                    .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                    .is_some()
+            })
+            .unwrap();
+        assert!(
+            marker < boundary,
+            "the boundary must exercise the restore regression"
+        );
+        let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(middle).unwrap();
+        assert!(restored.iter().any(|message| {
+            message
+                .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
+                .is_some()
+        }));
+        assert!(
+            restored
+                .iter()
+                .any(|message| message["tool_call_id"] == "c1")
+        );
+
+        history.push(serde_json::json!({"role":"user", "content":"start a new turn"}));
+        let retention = authority_retention(&history, None, None).unwrap();
+        assert!(
+            !retention.protected[1],
+            "historical incomplete evidence must not be pinned"
+        );
+    }
     #[test]
     fn request_summary_acceptance_rejects_unproven_or_unprofitable_rewrites() {
         let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(

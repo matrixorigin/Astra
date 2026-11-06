@@ -407,6 +407,16 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
 
     for (change, restore, expected) in [
         (
+            "ALTER TABLE user_llm_models DROP COLUMN inference_protocol",
+            "ALTER TABLE user_llm_models ADD inference_protocol VARCHAR(32) NULL",
+            "inference_protocol",
+        ),
+        (
+            "ALTER TABLE user_llm_models MODIFY inference_protocol VARCHAR(16) NULL",
+            "ALTER TABLE user_llm_models MODIFY inference_protocol VARCHAR(32) NULL",
+            "inference_protocol",
+        ),
+        (
             "ALTER TABLE user_llm_models DROP COLUMN api_key_encrypted",
             "ALTER TABLE user_llm_models ADD api_key_encrypted TEXT NULL",
             "api_key_encrypted",

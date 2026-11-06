@@ -83,7 +83,7 @@ upload protocols keep their existing transactions and retention deadlines.
 
 This is a fresh empty database and same-version deployment contract. There is
 no additional marker mechanism, migration, compatibility API or old-data cleanup.
-The combined schema contract version advances to v119 and rejects earlier versions. Strict
+The combined schema contract version advances to v120 and rejects earlier versions. Strict
 request-context JSON decoding is not promised for historical payloads. Existing
 engine snapshots and in-flight old Git operations are not reconciled by the new
 build; stop old workers before handing their workspaces to a new deployment.
@@ -734,9 +734,10 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
-Fresh schema contract `2026-11-02-v119` combines personal model connection and
-authorization storage with v118 invocation archival. It rejects a main-only v118
-database under the existing fresh-database contract; no implicit migration runs.
+Fresh schema contract `2026-11-04-v120` adds personal model protocol selection to
+the existing model row. It rejects earlier databases under the existing
+fresh-database contract; no implicit migration runs. Operators must make an
+explicit data and deployment decision before moving an existing database.
 
 Personal API-key and connection model fields are declared together in the canonical
 `user_llm_models` CREATE. Startup checks their types, nullability and declaration
