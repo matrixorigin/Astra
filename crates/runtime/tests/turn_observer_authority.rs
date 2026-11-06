@@ -364,11 +364,20 @@ async fn observer_connection_error_is_classified_without_url_or_credential() {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let endpoint = format!("http://{}", socket.local_addr().unwrap());
-    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(endpoint))));
-    assert_eq!(
-        worker.run(request("astra-a")).await.unwrap_err(),
-        "memoria observer connection failed"
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(endpoint.clone()))));
+    let error = worker.run(request("astra-a")).await.unwrap_err();
+    // A bound, non-listening socket may reject the connection or time it out,
+    // depending on the host network stack. Both must remain classified and
+    // sanitized; the OS behavior is not an application protocol contract.
+    assert!(
+        matches!(
+            error.as_str(),
+            "memoria observer connection failed" | "memoria observer request timed out"
+        ),
+        "unexpected network failure category: {error}"
     );
+    assert!(!error.contains(&endpoint));
+    assert!(!error.contains("synthetic-scoped-key"));
 }
 
 #[tokio::test(start_paused = true)]

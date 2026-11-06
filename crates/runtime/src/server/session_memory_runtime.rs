@@ -380,7 +380,10 @@ mod observation_tests {
         {
             let seen = worker.calls.lock().unwrap();
             for session in &sessions {
-                assert!(seen.contains(session), "lost committed observation: {session}");
+                assert!(
+                    seen.contains(session),
+                    "lost committed observation: {session}"
+                );
             }
             assert_eq!(seen.len(), sessions.len());
         }
