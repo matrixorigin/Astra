@@ -1418,6 +1418,7 @@ fn build_introspect_snapshot_with_tool_admission(
         current_round,
         tool_errors,
         circuit_breaker,
+        thinking: Some(state.thinking.clone()),
     };
 
     // Enrich live-metric fields from provider data when available.
