@@ -6513,7 +6513,15 @@ async fn call_prepared_llm_with_total_budget(
                         // Structured envelopes (e.g. TaaS) are authoritative:
                         // a 413 gateway byte limit is not context overflow.
                         kind
-                    } else if status == 400 && astra_core::is_llm_context_window_error(&text) {
+                    } else if status == 400
+                        && !astra_core::has_structured_llm_error_facts(&text)
+                        && astra_core::is_llm_context_window_error(&text)
+                    {
+                        // Prose needle matching is only for upstreams without
+                        // machine-readable error facts: a parsed provider
+                        // error with an unrecognized cause is bounded by the
+                        // HTTP status below, never re-read as context overflow
+                        // and funneled into compaction.
                         astra_core::ErrorKind::ContextWindow
                     } else {
                         provider_http_error_kind(status, code.unwrap_or("invalid_request"))
@@ -6670,8 +6678,18 @@ async fn call_prepared_llm_with_total_budget(
             }
         }
 
-        // Context-window errors — classified at source, no string prefix needed.
-        if status == 400 && astra_core::is_llm_context_window_error(&text) {
+        // Context-window errors — classified at source, no string prefix
+        // needed. An explicit context-overflow envelope code stays
+        // authoritative; prose needle matching is only for upstreams without
+        // machine-readable error facts, so a parsed parameter rejection with
+        // an unrecognized cause is bounded by the status ladder below
+        // instead of authorizing compaction via message matching.
+        let context_overflow = matches!(
+            envelope_code,
+            Some((astra_core::ErrorKind::ContextWindow, _))
+        ) || (!astra_core::has_structured_llm_error_facts(&text)
+            && astra_core::is_llm_context_window_error(&text));
+        if status == 400 && context_overflow {
             let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContextWindow,
                 format!("LLM error {status}: {text}"),
@@ -8902,7 +8920,16 @@ fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
         // Structured envelopes (e.g. TaaS) are authoritative: a 413 gateway
         // byte limit is a request-size problem, never context overflow.
         kind
-    } else if status == 400 && astra_core::is_llm_context_window_error(body) {
+    } else if status == 400
+        && !astra_core::has_structured_llm_error_facts(body)
+        && astra_core::is_llm_context_window_error(body)
+    {
+        // Prose needle matching is only for upstreams without
+        // machine-readable error facts: a parsed provider error with an
+        // unrecognized cause is bounded by the status ladder (400 →
+        // InvalidRequest), never re-read as context overflow and funneled
+        // into compaction. Only an explicit context-overflow code (above)
+        // may claim ContextWindow once structured facts are present.
         ErrorKind::ContextWindow
     } else if status == 400 {
         ErrorKind::InvalidRequest
@@ -17278,53 +17305,40 @@ mod tests {
         );
     }
 
-    /// Mock provider: 400 with an unrecognized envelope `code`
-    /// (`unsupported_parameter`) but a recognized `type` (`invalid_request`)
-    /// — a parameter/output-limit rejection whose prose mentions a token
-    /// maximum.
-    async fn mock_400_unsupported_parameter_max_tokens() -> Response {
+    /// Mock provider: 400 with a parsed parameter rejection whose envelope
+    /// tokens are *both* unrecognized (`invalid_value` /
+    /// `invalid_request_error`) — the reviewer's retained probe payload.
+    /// No whitelist entry rescues this; only the presence of machine facts
+    /// keeps the prose out of the classification.
+    async fn mock_400_invalid_value_max_tokens() -> Response {
         Response::builder()
             .status(400)
             .body(Body::from(
-                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"unsupported_parameter"}}"#,
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
             ))
             .unwrap()
     }
 
     #[tokio::test]
-    async fn call_llm_and_collect_unrecognized_code_defers_to_recognized_type() {
+    async fn call_llm_and_collect_structured_facts_preempt_context_prose() {
         reset_rate_limit_cooldown_for_tests();
-        let app = Router::new().route(
-            "/chat/completions",
-            post(mock_400_unsupported_parameter_max_tokens),
-        );
+        let app = Router::new().route("/chat/completions", post(mock_400_invalid_value_max_tokens));
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
             .await
             .expect_err("should fail with invalid request");
-        // A present but unrecognized `code` must not drop the recognized
-        // `type` into the context-window text fallback: this is a
-        // parameter/output-limit rejection, which conversation compaction
-        // cannot correct.
+        // A parsed provider error with unrecognized cause tokens is bounded
+        // by the HTTP status and machine facts (400 + param=max_tokens →
+        // InvalidRequest); the message prose must not re-read this
+        // parameter/output-limit rejection as context overflow — compaction
+        // cannot correct it.
         assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
         assert!(err.message.contains("max_tokens"), "{}", err.message);
     }
 
-    /// Mock provider: 400 with an unrecognized envelope `code`
-    /// (`invalid_value`) but a recognized `type` (`invalid_request`) — the
-    /// non-stream twin of the streaming boundary above.
-    async fn mock_400_invalid_value_max_tokens() -> Response {
-        Response::builder()
-            .status(400)
-            .body(Body::from(
-                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"invalid_value"}}"#,
-            ))
-            .unwrap()
-    }
-
     #[tokio::test]
-    async fn call_llm_nonstream_unrecognized_code_defers_to_recognized_type() {
+    async fn call_llm_nonstream_structured_facts_preempt_context_prose() {
         reset_rate_limit_cooldown_for_tests();
         let app = Router::new().route("/chat/completions", post(mock_400_invalid_value_max_tokens));
         let base = spawn_local_http_server(app).await;
@@ -17336,9 +17350,43 @@ mod tests {
         )
         .await
         .expect_err("parameter rejection must fail the non-stream call");
-        // `invalid_value` is likewise unrecognized, but the recognized
-        // `invalid_request` type keeps the shared classifier authoritative
-        // instead of the prose fallback.
+        // The shared non-stream classifier applies the same boundary:
+        // structured facts present → status-driven kind, never prose.
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    }
+
+    /// Mock provider: 400 whose envelope tokens are unrecognized *and* whose
+    /// message is genuine context-window prose. Presence of machine facts
+    /// must still bound the cause by HTTP status — a provider rewording its
+    /// parameter rejection cannot turn it into conversation compaction.
+    async fn mock_400_unrecognized_facts_context_prose() -> Response {
+        Response::builder()
+            .status(400)
+            .body(Body::from(
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"some_future_type","param":null,"code":"some_future_code"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_nonstream_unrecognized_facts_bound_context_prose() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_400_unrecognized_facts_context_prose),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let error = call_llm_nonstream(
+            global_llm_client(),
+            collect_call(&base, &messages),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("unrecognized structured cause must fail the non-stream call");
+        // Even maximal context-window prose does not authorize compaction
+        // once machine-readable facts are present; only an explicit
+        // context_length_exceeded code may do that.
         assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
     }
 

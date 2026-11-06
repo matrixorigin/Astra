@@ -783,6 +783,31 @@ pub fn structured_llm_error_request_id(body: &str) -> Option<String> {
     validated_llm_provider_request_id(error.get("request_id")?.as_str()?)
 }
 
+/// Whether the body carries a parsed provider error envelope with at least
+/// one machine-readable cause token (`code`, `type`, or `param`).
+///
+/// This is the *presence* responsibility of the envelope boundary, kept
+/// distinct from [`structured_llm_error_code`] (safe diagnostic-token
+/// projection for user-visible messages) and [`structured_llm_error_kind`]
+/// (recovery classification of recognized cause tokens). When machine facts
+/// are present, HTTP status and those facts — never message prose — must
+/// drive the failure kind: an unrecognized structured category is bounded by
+/// the status ladder instead of authorizing context compaction via needle
+/// matching, and only an explicit context-overflow code may claim
+/// [`ErrorKind::ContextWindow`]. A message-only error object is prose in
+/// JSON and does not count.
+#[must_use]
+pub fn has_structured_llm_error_facts(body: &str) -> bool {
+    llm_error_envelope_error(body).is_some_and(|error| {
+        ["code", "type", "param"].iter().any(|key| {
+            error
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|token| !token.trim().is_empty())
+        })
+    })
+}
+
 /// Parse the `error` object of a provider error envelope out of `body`,
 /// accepting either a raw JSON body or a message that embeds the JSON after a
 /// non-JSON prefix (e.g. `"LLM error 413: {...}"`).
@@ -1615,6 +1640,14 @@ mod tests {
                 r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"invalid_value"}}"#,
                 Some(ErrorKind::InvalidRequest),
             ),
+            // Both cause tokens unrecognized → still None: no alias
+            // whitelist extension. Presence of machine facts
+            // ([`has_structured_llm_error_facts`]), not this classifier, is
+            // what keeps the prose fallback from reclaiming the envelope.
+            (
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
+                None,
+            ),
             // No recognized code → caller falls back to needle classification.
             (
                 r#"{"error":{"message":"rate limited","type":"rate_limit","code":"rate_limit_exceeded"}}"#,
@@ -1706,6 +1739,33 @@ mod tests {
     }
 
     #[test]
+    fn has_structured_llm_error_facts_detects_machine_tokens() {
+        // Any machine-readable cause token (code, type, or param) marks a
+        // parsed provider error — even when every token is unrecognized and
+        // the classification whitelist yields None.
+        for body in [
+            r#"{"error":{"code":"invalid_value","type":"invalid_request_error","param":"max_tokens","message":"max_tokens is too large; maximum output is 8192"}}"#,
+            r#"{"error":{"code":"some_future_code","type":"some_future_type","message":"x"}}"#,
+            r#"{"error":{"param":"max_tokens","message":"x"}}"#,
+            r#"LLM error 400: {"error":{"type":"invalid_request_error","message":"x"}}"#,
+        ] {
+            assert!(has_structured_llm_error_facts(body), "{body}");
+        }
+        // A message-only error object is prose in JSON; absent envelopes,
+        // unusable token values, and plain text leave the needle fallback in
+        // charge.
+        for body in [
+            r#"{"error":{"message":"maximum context length exceeded"}}"#,
+            r#"{"error":{"code":null,"type":"","param":null,"message":"x"}}"#,
+            r#"{"usage":{"tokens":1}}"#,
+            "maximum context length exceeded",
+            "",
+        ] {
+            assert!(!has_structured_llm_error_facts(body), "{body}");
+        }
+    }
+
+    #[test]
     fn structured_llm_error_code_is_whitelisted() {
         // Only fixed protocol tokens are surfaced for user-visible messages;
         // unrecognized codes yield None so free-text diagnostics never leak.
@@ -1760,6 +1820,10 @@ mod tests {
             // text fallback.
             (
                 r#"{"error":{"code":"unsupported_parameter","type":"some_new_type","message":"x"}}"#,
+                None,
+            ),
+            (
+                r#"{"error":{"code":"invalid_value","type":"invalid_request_error","message":"max_tokens is too large; maximum output is 8192"}}"#,
                 None,
             ),
             (
