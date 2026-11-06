@@ -1034,6 +1034,9 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         execution_deadline_unix_ms: None,
         execution_timeout_ms: None,
         command_timeout_cap_ms: None,
+
+        traceparent: None,
+        tracestate: None,
     };
     dispatch
         .insert_dispatch(
@@ -1098,6 +1101,9 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         execution_deadline_unix_ms: None,
         execution_timeout_ms: None,
         command_timeout_cap_ms: None,
+
+        traceparent: None,
+        tracestate: None,
     };
     dispatch
         .insert_dispatch(

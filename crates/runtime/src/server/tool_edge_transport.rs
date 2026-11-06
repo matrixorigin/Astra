@@ -467,6 +467,7 @@ async fn try_edge_websocket(
         invocation_user_id = %plan.identity().user_id,
         "edge_dispatch: durable direct delivery admitted; sending tool request over WS"
     );
+    let carrier = astra_logging::trace_context::current();
     let edge_result = pool
         .execute_durably_admitted_invocation_on_connection_with_cancel(
             astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
@@ -483,6 +484,8 @@ async fn try_edge_websocket(
                 execution_timeout_ms: plan.execution_timeout_ms(),
                 command_timeout_cap_ms: plan.command_timeout_cap_ms(),
                 cancel_token,
+                traceparent: carrier.traceparent.as_deref(),
+                tracestate: carrier.tracestate.as_deref(),
             },
         )
         .await;

@@ -414,7 +414,15 @@ mode: Bypass, or Auto with `allow_sensitive_path_writes`, lets the agent edit it
 
 ### Observability
 
-- `ASTRA_LOG_FORMAT`, `ASTRA_SERVICE_NAME`, `ASTRA_OTEL_ENABLED`
+- `ASTRA_LOG_FORMAT`, `ASTRA_SERVICE_NAME`
+
+Trace export stays off unless the binary is built with the `otel` feature
+(`astra-runtime/otel` on the server image) and both `OTEL_TRACES_ENABLED=1`
+and an unpadded `OTEL_EXPORTER_OTLP_ENDPOINT` are set. The endpoint includes
+its scheme, for example `http://127.0.0.1:4317`.
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` alone, or `ASTRA_OTEL_ENABLED`, does not
+enable export. A failure to initialize or flush the exporter does not change
+the HTTP result, command result, or process exit code.
 
 ### CLI overrides (optional)
 
