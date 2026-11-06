@@ -675,7 +675,11 @@ impl HttpExternalProviderClient {
                     "external provider '{}' action '{}' request failed: {error}",
                     provider.id, action
                 ),
-                "external_provider_request_failed",
+                if action == "resolve_memory_identity" && error.is_timeout() {
+                    "external_provider_request_timeout"
+                } else {
+                    "external_provider_request_failed"
+                },
             )
         })?;
         let status = response.status();
@@ -696,19 +700,35 @@ impl HttpExternalProviderClient {
             return Err(invalid_body());
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| invalid_body())? {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            if action == "resolve_memory_identity" && error.is_timeout() {
+                error_response_coded(
+                    StatusCode::BAD_GATEWAY,
+                    "external provider response timed out",
+                    "external_provider_request_timeout",
+                )
+            } else {
+                invalid_body()
+            }
+        })? {
             if chunk.len() > response_limit.saturating_sub(body.len()) {
                 return Err(invalid_body());
             }
             body.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            return Err(map_provider_error_status(
+            let mut error = map_provider_error_status(
                 &provider.id,
                 action,
                 status,
                 &String::from_utf8_lossy(&body),
-            ));
+            );
+            if action == "resolve_memory_identity" {
+                // The memory authority layer classifies safe diagnostics from
+                // the actual upstream status, not the generic gateway mapping.
+                error.0 = status;
+            }
+            return Err(error);
         }
         let envelope =
             serde_json::from_slice::<ProviderSuccessEnvelope>(&body).map_err(|error| {
@@ -1306,7 +1326,7 @@ mod tests {
             assert_eq!(error.0, StatusCode::BAD_GATEWAY);
             assert_eq!(
                 error.1.error_code.as_deref(),
-                Some("external_provider_request_failed")
+                Some("external_provider_request_timeout")
             );
         }
         server.abort();

@@ -11,7 +11,7 @@ mod admission;
 mod cancellation;
 mod execution_resume;
 mod persistence;
-pub(crate) use persistence::server_input_source_event_id;
+pub(crate) use persistence::{run_server_loop_observer_request, server_input_source_event_id};
 mod projection;
 pub(crate) mod run_state;
 

@@ -47,6 +47,18 @@ pub struct SessionMemoryWork {
     pub consolidation_complete: bool,
     pub optional_complete: bool,
     pub last_report: Option<Value>,
+    /// At most one queued snapshot plus one leased snapshot per Session.
+    /// A newer transcript supersedes queued work, never an uncertain attempt.
+    pub pending_observation: Option<SessionObservationWork>,
+    pub active_observation: Option<SessionObservationWork>,
+    pub observed_turn: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionObservationWork {
+    pub event_id: String,
+    pub turn: i64,
+    pub request: Value,
 }
 
 impl SessionMemoryWork {
@@ -56,8 +68,34 @@ impl SessionMemoryWork {
                 && self.latest_fingerprint != self.completed_fingerprint)
     }
     pub fn pending(&self) -> bool {
-        self.extraction_pending() || (self.finalize_requested && !self.optional_complete)
+        self.pending_observation.is_some()
+            || self.active_observation.is_some()
+            || self.extraction_pending()
+            || (self.finalize_requested && !self.optional_complete)
     }
+    pub fn enqueue_observation(&mut self, observation: SessionObservationWork) {
+        if self
+            .observed_turn
+            .is_some_and(|turn| observation.turn <= turn)
+            || self.active_observation.as_ref().is_some_and(|active| {
+                active.event_id == observation.event_id || active.turn >= observation.turn
+            })
+            || self
+                .pending_observation
+                .as_ref()
+                .is_some_and(|pending| pending.turn > observation.turn)
+        {
+            return;
+        }
+        self.pending_observation = Some(observation);
+    }
+
+    fn claim_observation(&mut self) {
+        if self.active_observation.is_none() {
+            self.active_observation = self.pending_observation.take();
+        }
+    }
+
     pub fn reset_plan(&mut self) {
         self.plan = None;
         self.receipts.clear();
@@ -304,6 +342,7 @@ impl SessionMemoryLifecycleStore {
             return Ok(None);
         }
         let mut work = decode_work(&row)?;
+        work.claim_observation();
         if work.extraction_pending() && work.active_request.is_none() {
             work.active_request = work.pending_request.take();
             work.active_fingerprint = work.latest_fingerprint.clone();
@@ -472,6 +511,33 @@ impl SessionMemoryLifecycleStore {
         Ok(result)
     }
 
+    /// Acknowledge only the leased observation. Newer queued evidence remains
+    /// due, as do extraction/finalization stages sharing the existing journal.
+    pub async fn finish_observation(&self, claim: &SessionMemoryWorkClaim) -> Result<(), String> {
+        let event = claim
+            .work
+            .active_observation
+            .as_ref()
+            .ok_or("missing claimed observation")?
+            .event_id
+            .clone();
+        self.finish_claim(claim, false, true, move |work| {
+            Box::pin(async move {
+                let active = work
+                    .active_observation
+                    .take()
+                    .ok_or("missing active observation")?;
+                if active.event_id != event {
+                    return Err("observation was superseded".into());
+                }
+                work.observed_turn =
+                    Some(work.observed_turn.unwrap_or(active.turn).max(active.turn));
+                Ok(())
+            })
+        })
+        .await
+    }
+
     pub async fn finish_extraction(
         &self,
         claim: &SessionMemoryWorkClaim,
@@ -584,6 +650,26 @@ async fn ensure_work_row(
     Ok(())
 }
 
+/// Enqueue under the already-held canonical Session fence, in the same
+/// transaction as terminal transcript settlement. No in-memory admission limit
+/// can discard committed evidence; expired claims recover after process death.
+pub async fn enqueue_observation_tx(
+    tx: &mut Transaction<'_, MySql>,
+    user: &str,
+    session: &str,
+    observation: SessionObservationWork,
+) -> Result<(), String> {
+    ensure_work_row(tx, user, session).await?;
+    let Json(mut work) = sqlx::query_scalar::<_, Json<SessionMemoryWork>>(
+        "SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    ).bind(user).bind(session).fetch_one(&mut **tx).await.map_err(|error| error.to_string())?;
+    work.enqueue_observation(observation);
+    sqlx::query("UPDATE agent_session_memory_work SET state_json = ?, complete = ?, next_attempt_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+        .bind(serde_json::to_string(&work).map_err(|error| error.to_string())?).bind(!work.pending()).bind(user).bind(session)
+        .execute(&mut **tx).await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Called inside the session service's close transaction, after its row lock.
 pub(crate) async fn request_finalization_tx(
     tx: &mut Transaction<'_, MySql>,
@@ -623,4 +709,40 @@ async fn canonical_turn_tx(
     let turn:i64=sqlx::query_scalar("SELECT COALESCE(MAX(completed_turn), 0) FROM session_context_heads WHERE owner_user_id = ? AND session_id = ?")
         .bind(user).bind(session).fetch_one(&mut **tx).await.map_err(|error|error.to_string())?;
     u32::try_from(turn).map_err(|_| "canonical turn exceeds supported memory coordinate".into())
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    fn observation(turn: i64) -> SessionObservationWork {
+        SessionObservationWork {
+            event_id: format!("run-{turn}"),
+            turn,
+            request: serde_json::json!({"turn_count":turn}),
+        }
+    }
+
+    #[test]
+    fn observation_retry_retains_uncertain_payload_and_newer_queued_generation() {
+        let mut work = SessionMemoryWork::default();
+        work.enqueue_observation(observation(1));
+        work.claim_observation();
+        work.enqueue_observation(observation(2));
+        // Process death / authority timeout: JSON is the entire durable state.
+        let mut recovered: SessionMemoryWork =
+            serde_json::from_value(serde_json::to_value(work).unwrap()).unwrap();
+        recovered.claim_observation();
+        assert_eq!(recovered.active_observation.as_ref().unwrap().turn, 1);
+        assert_eq!(recovered.pending_observation.as_ref().unwrap().turn, 2);
+        assert!(recovered.pending());
+        recovered.observed_turn = Some(1);
+        recovered.active_observation = None;
+        recovered.claim_observation();
+        assert_eq!(recovered.active_observation.as_ref().unwrap().turn, 2);
+        recovered.enqueue_observation(observation(1));
+        assert!(
+            recovered.pending_observation.is_none(),
+            "old terminal replay cannot replace a newer attempt"
+        );
+    }
 }

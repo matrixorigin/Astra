@@ -1808,12 +1808,72 @@ pub(crate) async fn delete_session_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Lifecycle requests use the same verified principal and retained provider
+/// scope as conversation admission. An edge token keeps its own namespace;
+/// it cannot close a request-signed Session merely by sharing the IAM subject.
+async fn session_lifecycle_user(
+    state: &AppState,
+    session_id: &str,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    route: &'static str,
+    body: &Bytes,
+) -> Result<astra_services::AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+    let auth = state
+        .auth_service
+        .current_principal_for_request_with_provenance(
+            headers,
+            external_request_descriptor(method, uri, headers, route, body),
+        )
+        .await?;
+    let user = auth.principal.user.clone();
+    // Exact ownership is checked for every mechanism, before provider scope.
+    state
+        .session_service
+        .get_session(session_id.to_owned(), user.user_id.clone())
+        .await?;
+    if let Some(owner) = fork_provider_scope(&auth, true)? {
+        let pool = state.shared_pool.as_ref().ok_or_else(|| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider session authority is unavailable",
+            )
+        })?;
+        astra_services::session_fork_coordinator::authorize_provider_fork_session(
+            pool.get(),
+            &user.user_id,
+            session_id,
+            Some(&owner),
+            Some(&state.fernet_encryptor),
+            // Lifecycle mutation requires retained scope evidence, including
+            // ordinary provider Sessions; never infer an old unbound scope.
+            astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ForkSource,
+        )
+        .await
+        .map_err(session_fork_http_error)?;
+    }
+    Ok(user)
+}
+
 pub(crate) async fn close_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let user = session_lifecycle_user(
+        &state,
+        &session_id,
+        &method,
+        &uri,
+        &headers,
+        "/sessions/{session_id}/close",
+        &body,
+    )
+    .await?;
     let owner_id = user.user_id.clone();
     let session = state
         .session_service
@@ -1837,13 +1897,21 @@ pub(crate) async fn close_session_handler(
 pub(crate) async fn session_memory_status_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    state
-        .session_service
-        .get_session(session_id.clone(), user.user_id.clone())
-        .await?;
+    let user = session_lifecycle_user(
+        &state,
+        &session_id,
+        &method,
+        &uri,
+        &headers,
+        "/sessions/{session_id}/memory/status",
+        &body,
+    )
+    .await?;
     let pool = state.shared_pool.clone().ok_or_else(|| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1861,13 +1929,21 @@ pub(crate) async fn session_memory_status_handler(
 pub(crate) async fn finalize_session_memory_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    state
-        .session_service
-        .get_session(session_id.clone(), user.user_id.clone())
-        .await?;
+    let user = session_lifecycle_user(
+        &state,
+        &session_id,
+        &method,
+        &uri,
+        &headers,
+        "/sessions/{session_id}/memory/finalize",
+        &body,
+    )
+    .await?;
     let resolver = state.auth_service.memoria_credentials().ok_or_else(|| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,

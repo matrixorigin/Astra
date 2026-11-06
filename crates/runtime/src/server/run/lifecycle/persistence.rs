@@ -49,41 +49,8 @@ use super::{
     build_runtime_turn_evaluation_event, flush_turn_observability, persist_turn_evaluation_journal,
 };
 
-const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
 const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
 const METRIC_TURN_OBSERVER_RUNS_TOTAL: &str = "astra_turn_observer_runs_total";
-static TURN_OBSERVER_ASYNC_IN_FLIGHT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-struct TurnObserverAsyncPermit;
-
-impl Drop for TurnObserverAsyncPermit {
-    fn drop(&mut self) {
-        TURN_OBSERVER_ASYNC_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
-fn try_acquire_turn_observer_async_permit(limit: usize) -> Option<TurnObserverAsyncPermit> {
-    if limit == 0 {
-        return None;
-    }
-
-    let mut current = TURN_OBSERVER_ASYNC_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire);
-    loop {
-        if current >= limit {
-            return None;
-        }
-        match TURN_OBSERVER_ASYNC_IN_FLIGHT.compare_exchange_weak(
-            current,
-            current + 1,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(TurnObserverAsyncPermit),
-            Err(observed) => current = observed,
-        }
-    }
-}
 
 fn register_turn_observer_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
     registry.register_counter(
@@ -198,6 +165,14 @@ impl PostLoopPersistContext {
             let Some(worker) = self.observer_worker.clone() else {
                 return Ok(());
             };
+            if self.shared_pool.is_some() {
+                record_turn_observer_dispatch_metrics(
+                    self.metrics_registry.as_ref(),
+                    "durable",
+                    "queued",
+                );
+                return Ok(());
+            }
             fire_server_loop_observer(
                 worker,
                 &self.user_id,
@@ -972,6 +947,22 @@ async fn persist_server_loop_canonical_append_attempt(
     )
     .await
     .map_err(|error| format!("canonical raw append failed: {error}"))?;
+    if append.include_terminal_assistant
+        && let Some(request) =
+            build_server_loop_observer_request(append.user_id, append.session_id, state)
+    {
+        astra_services::session_memory_lifecycle::enqueue_observation_tx(
+            &mut tx,
+            append.user_id,
+            append.session_id,
+            astra_services::session_memory_lifecycle::SessionObservationWork {
+                event_id: append.run_id.to_owned(),
+                turn: request.turn_count,
+                request: serde_json::to_value(request).map_err(|error| error.to_string())?,
+            },
+        )
+        .await?;
+    }
     match tx.commit().await {
         Ok(()) => connection.release(),
         Err(error) => {
@@ -2322,57 +2313,24 @@ async fn fire_server_loop_observer(
     state: &AgenticLoopState,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 ) -> Result<(), String> {
-    fire_server_loop_observer_with_async_limit(
-        observer_worker,
-        user_id,
-        session_id,
-        state,
-        metrics_registry,
-        DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
-    )
-    .await
-}
-
-async fn fire_server_loop_observer_with_async_limit(
-    observer_worker: Arc<dyn TurnObserverWorker>,
-    user_id: &str,
-    session_id: &str,
-    state: &AgenticLoopState,
-    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-    async_concurrency_limit: usize,
-) -> Result<(), String> {
     let Some(request) = build_server_loop_observer_request(user_id, session_id, state) else {
-        record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "none", "skipped_empty");
+        record_turn_observer_dispatch_metrics(
+            metrics_registry.as_ref(),
+            "ephemeral",
+            "skipped_empty",
+        );
         return Ok(());
     };
-
-    let Some(permit) = try_acquire_turn_observer_async_permit(async_concurrency_limit) else {
-        record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "dropped_full");
-        tracing::warn!(
-            session_id = %session_id,
-            concurrency_limit = async_concurrency_limit,
-            "server-loop observer async concurrency full; durable turn was saved but observer evidence was not scheduled"
-        );
-        return Err(format!(
-            "observer capacity exhausted for session {session_id}; evidence requires retry"
-        ));
-    };
-    record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "scheduled");
-    let queue_reservation = reserve_server_observer_request(&request);
-    let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        let _queue_reservation = queue_reservation;
-        let _permit = permit;
-        run_server_loop_observer_request(
-            observer_worker.as_ref(),
-            &session_id,
-            request,
-            "async",
-            metrics_registry.as_ref(),
-        )
-        .await;
-    });
-    Ok(())
+    // Ephemeral deployments explicitly have no crash-recovery capability.
+    // Await bounded work after terminal delivery instead of dropping at capacity.
+    run_server_loop_observer_request(
+        observer_worker.as_ref(),
+        session_id,
+        request,
+        "ephemeral",
+        metrics_registry.as_ref(),
+    )
+    .await
 }
 
 fn build_server_loop_observer_request(
@@ -2404,14 +2362,19 @@ fn build_server_loop_observer_request(
     })
 }
 
-async fn run_server_loop_observer_request(
+pub(crate) async fn run_server_loop_observer_request(
     observer_worker: &dyn TurnObserverWorker,
     session_id: &str,
     request: TurnObserverRequest,
     mode: &'static str,
     metrics_registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
-) {
-    let outcome = match observer_worker.run(request).await {
+) -> Result<(), String> {
+    let _reservation = reserve_server_observer_request(&request);
+    let result = tokio::time::timeout(Duration::from_secs(60), observer_worker.run(request))
+        .await
+        .map_err(|_| "memoria observer attempt timed out".to_string())
+        .and_then(|result| result);
+    let outcome = match &result {
         Ok(TurnObserverOutcome::Observed) => "success",
         Ok(TurnObserverOutcome::NotConfigured) => "not_configured",
         Ok(TurnObserverOutcome::AccessDisabled) => "access_disabled",
@@ -2425,6 +2388,7 @@ async fn run_server_loop_observer_request(
         }
     };
     record_turn_observer_run_metrics(metrics_registry, mode, outcome);
+    result.map(|_| ())
 }
 
 pub(crate) fn build_run_turn_complete_event_with_interruption(
@@ -3079,10 +3043,6 @@ mod tests {
                 block_until_released,
             }
         }
-
-        fn call_count(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
     }
 
     #[async_trait::async_trait]
@@ -3110,288 +3070,6 @@ mod tests {
         state
     }
 
-    async fn wait_for_observer_calls(worker: &CaptureObserverWorker, expected: usize) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-        loop {
-            if worker.call_count() >= expected {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "observer call count did not reach {expected}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn wait_for_observer_in_flight(expected: usize) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-        loop {
-            let current = TURN_OBSERVER_ASYNC_IN_FLIGHT.load(Ordering::SeqCst);
-            if current == expected {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "observer in-flight count stayed at {current}, expected {expected}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(history_work)]
-    async fn server_loop_observer_async_does_not_block_caller() {
-        let observer = Arc::new(CaptureObserverWorker::new(true));
-        let started = observer.started.notified();
-        let state = observer_test_state();
-
-        tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            fire_server_loop_observer_with_async_limit(
-                observer.clone(),
-                "user-1",
-                "session-1",
-                &state,
-                None,
-                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
-            ),
-        )
-        .await
-        .expect("async observer dispatch should return without waiting for worker")
-        .expect("available observer capacity should schedule the worker");
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), started)
-            .await
-            .expect("spawned observer should start");
-        wait_for_observer_calls(observer.as_ref(), 1).await;
-        observer.release.notify_waiters();
-        wait_for_observer_in_flight(0).await;
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(history_work)]
-    async fn server_loop_observer_async_limit_reports_saturation_without_blocking() {
-        let first = Arc::new(CaptureObserverWorker::new(true));
-        let second = Arc::new(CaptureObserverWorker::new(false));
-        let first_started = first.started.notified();
-        let state = observer_test_state();
-
-        fire_server_loop_observer_with_async_limit(
-            first.clone(),
-            "user-1",
-            "session-1",
-            &state,
-            None,
-            1,
-        )
-        .await
-        .expect("first observer should acquire the only permit");
-        tokio::time::timeout(std::time::Duration::from_millis(500), first_started)
-            .await
-            .expect("first observer should start");
-        wait_for_observer_calls(first.as_ref(), 1).await;
-        wait_for_observer_in_flight(1).await;
-
-        let saturated = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            fire_server_loop_observer_with_async_limit(
-                second.clone(),
-                "user-1",
-                "session-2",
-                &state,
-                None,
-                1,
-            ),
-        )
-        .await
-        .expect("full async observer pool should report without blocking");
-        assert!(
-            saturated.is_err(),
-            "saturation must be visible to the persistence caller"
-        );
-
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        assert_eq!(second.call_count(), 0);
-        first.release.notify_waiters();
-        wait_for_observer_in_flight(0).await;
-    }
-
-    #[derive(Clone)]
-    struct SlowCallbackMemoryPort {
-        client: reqwest::Client,
-        callback: String,
-    }
-
-    #[async_trait::async_trait]
-    impl astra_memoria::MemoriaPort for SlowCallbackMemoryPort {
-        fn bind_owner(&self, _: &str) -> Result<Arc<dyn astra_memoria::MemoriaPort>, String> {
-            Ok(Arc::new(self.clone()))
-        }
-
-        async fn resolve_observer_transport(
-            &self,
-        ) -> Result<Option<astra_memoria::MemoriaToolTransport>, String> {
-            self.client
-                .post(&self.callback)
-                .send()
-                .await
-                .map_err(|_| "callback unavailable")?;
-            Err("unexpected callback response".into())
-        }
-
-        async fn retrieve_ext(
-            &self,
-            _: &str,
-            _: Option<&str>,
-            _: usize,
-            _: bool,
-        ) -> Result<Vec<astra_memoria::MemoriaMemory>, astra_memoria::MemoriaOperationError>
-        {
-            panic!("observer authority lookup must not retrieve memory")
-        }
-
-        async fn store(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-        ) -> Result<String, String> {
-            panic!("observer authority timeout must not write memory")
-        }
-
-        async fn purge_working(&self, _: &str) -> Result<u64, String> {
-            panic!("observer authority timeout must not purge memory")
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(history_work)]
-    async fn server_loop_observer_slow_authority_releases_all_slots_for_other_users() {
-        let started = Arc::new(AtomicUsize::new(0));
-        let callbacks = started.clone();
-        let app = axum::Router::new().route(
-            "/identity",
-            axum::routing::post(move || {
-                callbacks.fetch_add(1, Ordering::SeqCst);
-                std::future::pending::<axum::http::StatusCode>()
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let callback = format!("http://{}/identity", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let worker = Arc::new(crate::DatabaseTurnObserverWorker::new(Some(Arc::new(
-            SlowCallbackMemoryPort {
-                client: reqwest::Client::builder()
-                    .no_proxy()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .unwrap(),
-                callback,
-            },
-        ))));
-        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
-        let state = observer_test_state();
-        for i in 0..DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY {
-            fire_server_loop_observer(
-                worker.clone(),
-                &format!("user-{i}"),
-                &format!("session-{i}"),
-                &state,
-                Some(registry.clone()),
-            )
-            .await
-            .unwrap();
-        }
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while started.load(Ordering::SeqCst) != DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("all four callbacks must be in flight together");
-        let healthy = Arc::new(CaptureObserverWorker::new(false));
-        assert!(
-            fire_server_loop_observer(
-                healthy.clone(),
-                "healthy-user",
-                "healthy-session",
-                &state,
-                Some(registry.clone()),
-            )
-            .await
-            .is_err(),
-            "existing saturation policy must remain visible"
-        );
-        tokio::time::timeout(Duration::from_secs(4), async {
-            while TURN_OBSERVER_ASYNC_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("authority deadlines must cancel slow requests and release all permits");
-        assert!(
-            registry
-                .render_prometheus()
-                .contains("astra_turn_observer_runs_total{mode=\"async\",outcome=\"error\"} 4"),
-            "authority timeouts must be errors, not access denials or successes"
-        );
-        fire_server_loop_observer(
-            healthy.clone(),
-            "healthy-user",
-            "healthy-session",
-            &state,
-            Some(registry),
-        )
-        .await
-        .expect("another user must be admitted after the authority deadlines");
-        wait_for_observer_calls(healthy.as_ref(), 1).await;
-        wait_for_observer_in_flight(0).await;
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(history_work)]
-    async fn server_loop_observer_metrics_stay_low_cardinality() {
-        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
-        let observer = Arc::new(CaptureObserverWorker::new(false));
-        let state = observer_test_state();
-
-        fire_server_loop_observer_with_async_limit(
-            observer.clone(),
-            "user-1",
-            "session-1",
-            &state,
-            Some(registry.clone()),
-            DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
-        )
-        .await
-        .expect("available observer capacity should schedule the worker");
-        wait_for_observer_calls(observer.as_ref(), 1).await;
-
-        let rendered = registry.render_prometheus();
-        assert!(
-            rendered.contains(
-                "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"scheduled\"} 1"
-            ),
-            "{rendered}"
-        );
-        assert!(
-            rendered
-                .contains("astra_turn_observer_runs_total{mode=\"async\",outcome=\"success\"} 1"),
-            "{rendered}"
-        );
-        assert!(
-            !rendered.contains("user_id=")
-                && !rendered.contains("session_id=")
-                && !rendered.contains("run_id="),
-            "observer metrics must stay low-cardinality: {rendered}"
-        );
-    }
-
     #[tokio::test]
     async fn server_loop_observer_unconfigured_is_not_reported_as_success_or_denial() {
         let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
@@ -3399,11 +3077,12 @@ mod tests {
         let request =
             build_server_loop_observer_request("user-1", "session-1", &observer_test_state())
                 .unwrap();
-        run_server_loop_observer_request(&worker, "session-1", request, "async", Some(&registry))
-            .await;
+        run_server_loop_observer_request(&worker, "session-1", request, "durable", Some(&registry))
+            .await
+            .unwrap();
         let rendered = registry.render_prometheus();
         assert!(rendered.contains(
-            "astra_turn_observer_runs_total{mode=\"async\",outcome=\"not_configured\"} 1"
+            "astra_turn_observer_runs_total{mode=\"durable\",outcome=\"not_configured\"} 1"
         ));
         assert!(!rendered.contains("outcome=\"success\""));
         assert!(!rendered.contains("outcome=\"access_disabled\""));
