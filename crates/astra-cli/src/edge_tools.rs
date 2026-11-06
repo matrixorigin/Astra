@@ -7367,6 +7367,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn read_file_dispatch_preserves_source_io_failure() {
+        use astra_core::{ErrorKind, ToolFailureCause, ToolFailureEvidence, ToolRecoveryAction};
         use serde_json::Value;
         let (_dir, executor) = temp_executor();
 
@@ -7376,18 +7377,29 @@ pub(crate) mod tests {
 
         assert!(outcome.is_error);
         assert!(outcome.output.starts_with("Error:"));
-        let fields = outcome.tool_result_fields.as_ref();
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("dispatch must retain the source I/O facts");
         assert_ne!(
-            fields
-                .and_then(|fields| fields.get("disposition"))
-                .and_then(Value::as_str),
+            fields.get("disposition").and_then(Value::as_str),
             Some("rejected"),
             "an attempted read's I/O failure is not an admission rejection"
         );
-        assert!(
-            fields.and_then(|fields| fields.get("error_kind")).is_none(),
-            "unknown I/O cause must not be guessed from its message"
+        assert_eq!(
+            fields.get("error_kind").and_then(Value::as_str),
+            Some(ErrorKind::ToolNotFound.as_str()),
+            "dispatch must preserve the OS-derived failure kind"
         );
+        let evidence: ToolFailureEvidence =
+            serde_json::from_value(fields["recovery_evidence"].clone()).unwrap();
+        assert_eq!(evidence.kind, ErrorKind::ToolNotFound);
+        assert_eq!(evidence.cause, ToolFailureCause::ResourceMissing);
+        assert_eq!(
+            evidence.recovery_actions,
+            [ToolRecoveryAction::VerifyResource]
+        );
+        assert!(!evidence.retryable);
     }
 
     fn assert_typed_workspace_mutation_receipt(outcome: &super::ToolExecutionOutcome) {

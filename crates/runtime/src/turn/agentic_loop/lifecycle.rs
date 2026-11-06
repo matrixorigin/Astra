@@ -2947,9 +2947,8 @@ pub(super) fn prepare_iteration_budget(
 /// Unified diagnosis of all stall conditions evaluated at interruption time.
 ///
 /// Computes the signal string, human-readable summary, and restricted tool
-/// list in a single pass to avoid re-evaluating the same three stall
-/// conditions (exploration family streak, redundant reads, single-tool
-/// streak) across three separate functions.
+/// list in a single pass to avoid re-evaluating the same stall
+/// observations across three separate functions.
 struct StallDiagnosis {
     signal: Option<String>,
     summary: Option<String>,
@@ -2962,42 +2961,16 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
         astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
         && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
     {
-        let mut summary_text = match family {
+        let summary_text = match family {
             "read" => format!("{streak} consecutive read-dominant exploratory rounds"),
             "search" => format!("{streak} consecutive search-dominant exploratory rounds"),
             "diff" => format!("{streak} consecutive diff-dominant exploratory rounds"),
             _ => format!("{streak} consecutive {family}-dominant exploratory rounds"),
         };
-        // Enrich with redundant read detail when co-occurring
-        if family == "read" {
-            let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
-                &state.stall.tool_call_records,
-            );
-            if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD
-            {
-                summary_text.push_str(&format!(
-                    "; {redundant_reads} redundant overlapping reads on unchanged files"
-                ));
-            }
-        }
         let summary = Some(summary_text);
         return StallDiagnosis {
             signal: Some(format!("exploration_family={family};streak={streak}")),
             summary,
-            restricted_tools: Vec::new(),
-        };
-    }
-
-    // 2. Redundant overlapping reads
-    let redundant_reads = astra_turn_core::evaluation::count_redundant_overlapping_reads(
-        &state.stall.tool_call_records,
-    );
-    if redundant_reads >= astra_turn_core::evaluation::REDUNDANT_OVERLAPPING_READS_THRESHOLD {
-        return StallDiagnosis {
-            signal: Some(format!("redundant_reads={redundant_reads}")),
-            summary: Some(format!(
-                "{redundant_reads} redundant overlapping reads on unchanged files"
-            )),
             restricted_tools: Vec::new(),
         };
     }
@@ -5472,8 +5445,8 @@ mod tests {
             "expected read-family diagnosis, got {diagnosis}"
         );
         assert!(
-            diagnosis.contains("redundant overlapping reads"),
-            "expected redundant-read detail, got {diagnosis}"
+            !diagnosis.contains("redundant"),
+            "requested ranges are not delivery evidence"
         );
     }
 

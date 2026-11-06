@@ -788,14 +788,17 @@ fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Opt
         } else {
             match execution_fact {
                 Some("executed" | "not_executed") => false,
-                _ => matches!(
-                    record.error_kind,
-                    Some(
-                        astra_core::ErrorKind::Cancelled
-                            | astra_core::ErrorKind::ToolTimeout
-                            | astra_core::ErrorKind::ToolOutcomeUnknown
-                    )
-                ),
+                _ => {
+                    record.outcome_is_unknown()
+                        || matches!(
+                            record.error_kind,
+                            Some(
+                                astra_core::ErrorKind::Cancelled
+                                    | astra_core::ErrorKind::ToolTimeout
+                                    | astra_core::ErrorKind::ToolOutcomeUnknown
+                            )
+                        )
+                }
             }
         };
     if record.ok && disposition != ToolCallDisposition::Deferred && !unknown {
@@ -831,11 +834,13 @@ fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Opt
             .and_then(|value| value.get(key))
             .or_else(|| rejection.as_ref().and_then(|value| value.get(key)))
     };
-    let evidence = field("recovery_evidence")
-        .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
-        .and_then(|value| {
-            serde_json::from_value::<astra_core::ToolFailureEvidence>(value.clone()).ok()
-        });
+    let evidence = record.recovery_evidence.clone().or_else(|| {
+        field("recovery_evidence")
+            .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
+            .and_then(|value| {
+                serde_json::from_value::<astra_core::ToolFailureEvidence>(value.clone()).ok()
+            })
+    });
     let mut facts = serde_json::json!({
         "disposition": disposition,
         "execution": execution,
@@ -1093,6 +1098,44 @@ mod tests {
         }
         assert_eq!(first["content"].as_str().unwrap().len(), 23_000);
         assert_eq!(second["content"], "small");
+    }
+
+    #[test]
+    fn source_recovery_evidence_survives_journal_roundtrip_and_compacted_body() {
+        use astra_core::{ErrorKind, ToolFailureCause, ToolFailureEvidence, ToolRecoveryAction};
+        for (evidence, execution) in [
+            (
+                ToolFailureEvidence::from_error_kind(ErrorKind::ToolNotFound),
+                "failed",
+            ),
+            (
+                ToolFailureEvidence::new(
+                    ErrorKind::Network,
+                    ToolFailureCause::OutcomeUnknown,
+                    false,
+                    vec![ToolRecoveryAction::ReconcileOutcome],
+                ),
+                "unknown",
+            ),
+        ] {
+            let record = ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                error_kind: Some(evidence.kind),
+                recovery_evidence: Some(evidence.clone()),
+                ..Default::default()
+            };
+            let restored: ToolCallRecord =
+                serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+            let advice = tool_outcome_advisory(&restored, None)
+                .expect("compacted failure keeps its source evidence");
+            let facts: Value =
+                serde_json::from_str(advice.strip_prefix("Tool outcome: ").unwrap()).unwrap();
+            assert_eq!(facts["execution"], execution);
+            assert_eq!(facts["error_kind"], evidence.kind.as_str());
+            assert_eq!(facts["recovery_evidence"], json!(evidence));
+        }
     }
 
     #[test]

@@ -678,7 +678,7 @@ mod tests {
                         code = false;
                         false
                     }
-                    Event::Text(value) => code && value.contains(&call),
+                    Event::Text(value) => code && value.contains(call),
                     _ => false,
                 }),
                 "CommonMark must classify the invocation as code: {text:?}"

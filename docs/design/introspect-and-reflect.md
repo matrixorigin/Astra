@@ -39,6 +39,12 @@ Introspect reports system facts. Reflect reasons over those facts.
 
 Introspection must be factual, structured, and bounded. Reflection may synthesize strategy, uncertainty, and next actions, but should not mutate state by itself.
 
+Live introspection exposes the configured runtime `thinking` policy in JSON
+reports and bounded model projections; text summaries use the same snapshot value.
+Model default inherits the admitted model/provider settings, including request
+body overrides. This policy does not establish provider-internal effort or
+provider-side clamping.
+
 The errors facet includes current-run pre-dispatch refusals from the existing
 tool records, explicitly marked `admission_rejected`, separately from execution
 failures. It does not increment executor health or infer a dispatch. Records

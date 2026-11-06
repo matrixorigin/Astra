@@ -1982,7 +1982,7 @@ mod resume_tests {
             Some(&serde_json::json!({
                 "kind": "budget_exhausted",
                 "resumable": true,
-                "stall_signal": "redundant_reads=4",
+                "stall_signal": "exploration_family=read;streak=4",
                 "resume_restricted_tools": ["view", "read_file", "view"]
             })),
             None,

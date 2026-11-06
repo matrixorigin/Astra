@@ -84,6 +84,24 @@ pub(super) enum FsLeafError {
 }
 
 impl FsLeafError {
+    /// Keep the OS failure at its owner; downstream recovery must not infer
+    /// a missing resource or permission failure from the rendered message.
+    fn io(error: &std::io::Error, output: String) -> Self {
+        use astra_core::{ErrorKind, ToolFailureEvidence, ToolRecoveryAction};
+
+        let kind = match error.kind() {
+            std::io::ErrorKind::NotFound => ErrorKind::ToolNotFound,
+            std::io::ErrorKind::PermissionDenied => ErrorKind::PolicyDenied,
+            std::io::ErrorKind::IsADirectory => ErrorKind::ToolInvalidArgs,
+            _ => ErrorKind::Unknown,
+        };
+        let mut evidence = ToolFailureEvidence::from_error_kind(kind);
+        if error.kind() == std::io::ErrorKind::IsADirectory {
+            evidence.recovery_actions = vec![ToolRecoveryAction::SelectAvailableCapability];
+        }
+        Self::Shared(astra_tools::ToolResult::error(output).with_failure_evidence(evidence))
+    }
+
     fn sandbox_denied(message: String) -> Self {
         Self::SandboxDenied(message)
     }
@@ -242,9 +260,10 @@ impl ToolExecutor {
                     .map_err(|error| format!("Error: Cannot bind file target: {error}"))?
             }
             Err(error) => {
-                return Err(
-                    format!("Error: Cannot bind file target {}: {error}", path.display()).into(),
-                );
+                return Err(FsLeafError::io(
+                    &error,
+                    format!("Error: Cannot bind file target {}: {error}", path.display()),
+                ));
             }
         };
         if !self.is_within_sandbox_boundary(&target) {
@@ -396,7 +415,7 @@ impl ToolExecutor {
                         self.record_read(&path, false);
                         return Ok(format!("data:{mime};base64,{b64}"));
                     }
-                    Err(e) => return Err(format!("Error reading image: {e}").into()),
+                    Err(e) => return Err(FsLeafError::io(&e, format!("Error reading image: {e}"))),
                 }
             }
 
@@ -432,7 +451,7 @@ impl ToolExecutor {
                 // evidence of definitions or line counts in the unread suffix.
                 let cap = limit.saturating_mul(2).min(size);
                 let content = read_capped_to_string_lossy(&path, cap)
-                    .map_err(|e| format!("Error reading file: {e}"))?;
+                    .map_err(|e| FsLeafError::io(&e, format!("Error reading file: {e}")))?;
                 let lines_in_cap = content.lines().count();
                 let safe_outline_text =
                     astra_tools::fs_ops::render_outline(&path, &content, lines_in_cap)
@@ -475,20 +494,20 @@ impl ToolExecutor {
                             if let Some(cached) = self.get_cached_content(&path) {
                                 cached
                             } else {
-                                read_to_string_lossy(&path).map_err(|e| format!("Error: {e}"))?
+                                read_to_string_lossy(&path)
+                                    .map_err(|e| FsLeafError::io(&e, format!("Error: {e}")))?
                             };
                         let total_lines = content_for_outline.lines().count();
                         let (safe_content_for_outline, _) =
                             astra_text_utils::credential_redaction::redact_credentials_in_text(
                                 &content_for_outline,
                             );
-                        self.record_read_cached(&path, true, content_for_outline.clone());
-
                         if let Some(outline) = astra_tools::fs_ops::render_outline(
                             &path,
                             &content_for_outline,
                             total_lines,
                         ) {
+                            self.record_read_cached(&path, true, content_for_outline.clone());
                             return Ok(format!(
                                 "[Auto-downgraded to outline — aggregate output budget is high \
                                  ({agg} bytes used). Use start_line/end_line to read specific sections.]\n{outline}"
@@ -505,7 +524,21 @@ impl ToolExecutor {
                             .read_file_body_output_limit()
                             .saturating_sub(marker.chars().count());
                         let lines: Vec<&str> = safe_content_for_outline.split('\n').collect();
-                        let mut delivered = add_line_numbers_budgeted(&lines, 1, budget).output;
+                        let delivery = add_line_numbers_budgeted(&lines, 1, budget);
+                        let end = delivery.complete_lines.min(total_lines);
+                        let delivered_range = (end > 0
+                            && safe_content_for_outline.lines().count() == total_lines)
+                            .then_some(super::file_state::DeliveredLineRange {
+                                start: 1,
+                                end: end as u64,
+                            });
+                        self.record_read_with_delivery_range_cached(
+                            &path,
+                            true,
+                            content_for_outline,
+                            delivered_range,
+                        );
+                        let mut delivered = delivery.output;
                         push_suffix_if_fits(
                             &mut delivered,
                             &marker,
@@ -535,19 +568,28 @@ impl ToolExecutor {
                         };
                         let root = self.effective_project_root();
                         let cwd = root.display();
-                        return Err(format!(
-                            "{msg}. Note: current working directory is {cwd}. Use list_dir or glob to find the correct path first.{hint}"
-                        ).into());
+                        return Err(FsLeafError::io(
+                            &e,
+                            format!(
+                                "{msg}. Note: current working directory is {cwd}. Use list_dir or glob to find the correct path first.{hint}"
+                            ),
+                        ));
                     }
                     if e.kind() == std::io::ErrorKind::IsADirectory {
-                        return Err(format!("{msg}. Use list_dir instead for directories.").into());
+                        return Err(FsLeafError::io(
+                            &e,
+                            format!("{msg}. Use list_dir instead for directories."),
+                        ));
                     }
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        return Err(format!(
-                            "{msg}. Check file permissions or use bash with `sudo cat` if appropriate."
-                        ).into());
+                        return Err(FsLeafError::io(
+                            &e,
+                            format!(
+                                "{msg}. Check access to the requested file or select an authorized resource."
+                            ),
+                        ));
                     }
-                    return Err(msg.into());
+                    return Err(FsLeafError::io(&e, msg));
                 }
             }
         };
@@ -619,7 +661,7 @@ impl ToolExecutor {
                 let expanded = format!(
                     "[Auto-expanded to full file ({total_lines} lines) — \
                      small enough to read entirely. Use this content for all \
-                     references to {path_str}; do not re-read.]\n\
+                     references to {path_str}.]\n\
                      {numbered}"
                 );
                 if expanded.chars().count() <= self.read_file_model_output_limit() {
@@ -783,8 +825,8 @@ impl ToolExecutor {
 
     fn read_warning_for(overlaps_prior_delivery: bool) -> String {
         if overlaps_prior_delivery {
-            "\n\nNote: Some returned content overlaps lines already returned for the same captured file content. \
-             Earlier output may no longer be in context; authorized rereads can still be necessary."
+            "\n\nNote: This executor previously produced overlapping numbered lines for the same captured file content. \
+             Earlier output may have been compacted or not delivered; reread when needed."
                 .to_string()
         } else {
             String::new()
@@ -964,7 +1006,8 @@ impl ToolExecutor {
             .unwrap_or(false);
 
         let target = self.bind_file_mutation_target(&path)?;
-        let original_bytes = fs::read(&target).map_err(|e| format!("Error reading file: {e}"))?;
+        let original_bytes = fs::read(&target)
+            .map_err(|e| FsLeafError::io(&e, format!("Error reading file: {e}")))?;
         let content = std::str::from_utf8(&original_bytes)
             .map_err(|_| {
                 "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
@@ -1672,7 +1715,8 @@ impl ToolExecutor {
             .unwrap_or(false);
 
         let target = self.bind_file_mutation_target(&path)?;
-        let original_bytes = fs::read(&target).map_err(|e| format!("Error reading file: {e}"))?;
+        let original_bytes = fs::read(&target)
+            .map_err(|e| FsLeafError::io(&e, format!("Error reading file: {e}")))?;
         let content = std::str::from_utf8(&original_bytes)
             .map_err(|_| {
                 "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
@@ -2207,7 +2251,9 @@ fn push_suffix_if_fits(output: &mut String, suffix: &str, max_chars: usize) {
 #[cfg(test)]
 mod tests {
     use super::super::ToolExecutor;
-    use super::{add_line_numbers, is_unc_path, similarity_score};
+    use super::{
+        FsLeafError, SANDBOX_DENIED_PREFIX, add_line_numbers, is_unc_path, similarity_score,
+    };
     use astra_text_utils::str_preview::truncate_str;
     use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
     use serde_json::{Value, json};
@@ -3035,7 +3081,7 @@ mod tests {
                 "end_line": start + 5
             }));
             assert!(
-                !out.contains("overlaps lines already returned"),
+                !out.contains("previously produced overlapping numbered lines"),
                 "disjoint pages must not be called redundant"
             );
         }
@@ -3045,7 +3091,7 @@ mod tests {
             "end_line": 45
         }));
         assert!(
-            !third.contains("overlaps lines already returned"),
+            !third.contains("previously produced overlapping numbered lines"),
             "third disjoint page must not warn, got: {}",
             &third[third.len().saturating_sub(200)..]
         );
@@ -3061,13 +3107,13 @@ mod tests {
             let output = executor.read_file(&serde_json::json!({"path": "observations.txt"}));
             assert!(output.contains("first observation"));
             if index > 0 {
-                assert!(output.contains("Earlier output may no longer be in context"));
+                assert!(output.contains("Earlier output may have been compacted or not delivered"));
             }
         }
         std::fs::write(&path, "changed observation\n").unwrap();
         let changed = executor.read_file(&serde_json::json!({"path": "observations.txt"}));
         assert!(changed.contains("changed observation"));
-        assert!(!changed.contains("overlaps lines already returned"));
+        assert!(!changed.contains("previously produced overlapping numbered lines"));
     }
 
     #[test]
@@ -3092,14 +3138,14 @@ mod tests {
                     output.contains("line 99:"),
                     "new range content must remain available"
                 );
-                assert!(output.contains("authorized rereads can still be necessary"));
+                assert!(output.contains("reread when needed"));
                 assert!(
-                    output.contains("overlaps lines already returned"),
+                    output.contains("previously produced overlapping numbered lines"),
                     "an actual overlap should be called out, got: {output}"
                 );
             } else {
                 assert!(
-                    !output.contains("overlaps lines already returned"),
+                    !output.contains("previously produced overlapping numbered lines"),
                     "disjoint pages should not warn, got: {output}"
                 );
             }
@@ -3132,7 +3178,7 @@ mod tests {
             "end_line": 40
         }));
         assert!(
-            repeated_large_range.contains("overlaps lines already returned"),
+            repeated_large_range.contains("previously produced overlapping numbered lines"),
             "a complete-line prefix delivered by a truncated full read counts as covered"
         );
 
@@ -3179,7 +3225,7 @@ mod tests {
             "path": "big.txt", "start_line": 60, "end_line": 65
         }));
         assert!(
-            !fourth_ranged.contains("overlaps lines already returned"),
+            !fourth_ranged.contains("previously produced overlapping numbered lines"),
             "4th disjoint page must not trigger a redundant-read warning"
         );
         assert!(
@@ -3223,7 +3269,7 @@ mod tests {
             "path": "a.txt", "start_line": 40, "end_line": 45
         }));
         assert!(
-            !third_a.contains("overlaps lines already returned"),
+            !third_a.contains("previously produced overlapping numbered lines"),
             "3rd disjoint ranged read of file a should not warn, got: {third_a}"
         );
         // A third disjoint page of file b remains useful pagination too.
@@ -3231,7 +3277,8 @@ mod tests {
             "path": "b.txt", "start_line": 40, "end_line": 45
         }));
         assert!(
-            !third_b.contains("overlaps lines already returned") && !third_b.contains("Use grep"),
+            !third_b.contains("previously produced overlapping numbered lines")
+                && !third_b.contains("Use grep"),
             "3rd disjoint ranged read of file b should not trigger a grep nudge"
         );
     }
@@ -3272,6 +3319,34 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_read_results_keep_errors_local_to_each_call() {
+        let dir = tempfile::tempdir().unwrap();
+        write_large_file(dir.path(), "sample.txt", 1000);
+        let executor = test_executor_in(dir.path());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let executor = &executor;
+                scope.spawn(move || {
+                    for index in 0..16 {
+                        let missing = index % 2 == 0;
+                        let result = executor.read_file_with_metadata(&json!({
+                            "path": if missing { "missing.txt" } else { "sample.txt" },
+                            "start_line":50, "end_line":145,
+                        }));
+                        assert_eq!(result.is_error, missing);
+                        if missing {
+                            assert_eq!(result.metadata.unwrap()["error_kind"], "tool_not_found");
+                        } else {
+                            assert!(result.output.contains("line 50:"));
+                            assert!(result.metadata.is_none());
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn read_file_treats_error_prefixed_file_content_as_success() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3287,15 +3362,116 @@ mod tests {
         assert!(result.output.contains("Error: literal file content"));
     }
 
-    #[test]
-    fn read_file_reports_actual_io_failure_structurally() {
+    #[tokio::test]
+    async fn read_file_reports_actual_io_failure_structurally() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
+        std::fs::create_dir(dir.path().join("directory")).unwrap();
+        for (path, kind, action) in [
+            (
+                "missing.txt",
+                astra_core::ErrorKind::ToolNotFound,
+                astra_core::ToolRecoveryAction::VerifyResource,
+            ),
+            (
+                "missing.png",
+                astra_core::ErrorKind::ToolNotFound,
+                astra_core::ToolRecoveryAction::VerifyResource,
+            ),
+            (
+                "directory",
+                astra_core::ErrorKind::ToolInvalidArgs,
+                astra_core::ToolRecoveryAction::SelectAvailableCapability,
+            ),
+        ] {
+            let result = executor
+                .execute_with_metadata("read_file", &serde_json::json!({"path": path}))
+                .await;
+            assert!(result.is_error, "{path}");
+            let fields = result
+                .tool_result_fields
+                .as_ref()
+                .expect("source error evidence");
+            assert_eq!(fields["error_kind"], kind.as_str());
+            let evidence: astra_core::ToolFailureEvidence =
+                serde_json::from_value(fields["recovery_evidence"].clone()).unwrap();
+            assert_eq!(evidence.kind, kind);
+            assert_eq!(evidence.recovery_actions, vec![action]);
+            assert_ne!(
+                fields.get("execution_started"),
+                Some(&Value::Bool(false)),
+                "I/O was attempted"
+            );
+        }
+        std::fs::write(
+            dir.path().join("missing.txt"),
+            "Error: ordinary file content\n",
+        )
+        .unwrap();
+        let recovered = executor
+            .execute_with_metadata("read_file", &serde_json::json!({"path": "missing.txt"}))
+            .await;
+        assert!(!recovered.is_error);
+        assert!(recovered.output.contains("Error: ordinary file content"));
+        assert!(
+            recovered
+                .tool_result_fields
+                .as_ref()
+                .is_none_or(|fields| !fields.contains_key("error_kind")),
+            "a prior failure is not sticky authority"
+        );
+    }
 
-        let result = executor.read_file_with_metadata(&serde_json::json!({"path": "missing.txt"}));
-
+    #[cfg(unix)]
+    #[test]
+    fn read_file_os_permissions_preserve_failure_without_sandbox_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        std::fs::write(&path, "private\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let os_failure = std::fs::read(&path).err().map(|error| error.kind());
+        let result =
+            test_executor_in(dir.path()).read_file_with_metadata(&json!({"path": "private.txt"}));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if os_failure.is_none() {
+            // Privileged processes may be allowed to read mode-000 files.
+            assert!(!result.is_error, "do not invent a permission denial");
+            return;
+        }
+        assert_eq!(os_failure, Some(std::io::ErrorKind::PermissionDenied));
         assert!(result.is_error);
-        assert!(result.output.starts_with("Error:"));
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["error_kind"], "policy_denied");
+        assert_eq!(fields["recovery_evidence"]["cause"], "permission_boundary");
+        assert!(!result.output.contains("sudo"));
+        assert!(!result.output.contains(SANDBOX_DENIED_PREFIX));
+        assert_ne!(fields.get("disposition"), Some(&json!("rejected")));
+    }
+
+    #[test]
+    fn filesystem_io_kind_survives_independent_of_rendered_error_text() {
+        for (source, expected) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                astra_core::ErrorKind::PolicyDenied,
+            ),
+            (
+                std::io::ErrorKind::NotFound,
+                astra_core::ErrorKind::ToolNotFound,
+            ),
+            (
+                std::io::ErrorKind::IsADirectory,
+                astra_core::ErrorKind::ToolInvalidArgs,
+            ),
+            (std::io::ErrorKind::Other, astra_core::ErrorKind::Unknown),
+        ] {
+            let error = std::io::Error::from(source);
+            let result =
+                FsLeafError::io(&error, "localized source diagnostic".into()).into_tool_result();
+            assert!(result.is_error);
+            assert_eq!(result.metadata.unwrap()["error_kind"], expected.as_str());
+        }
     }
 
     #[test]
