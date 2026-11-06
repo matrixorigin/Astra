@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TurnObserverRequest {
     pub user_id: String,
     pub session_id: String,

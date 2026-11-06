@@ -467,7 +467,27 @@ impl MemoriaCredentialResolver {
             {
                 return Ok(MemoriaCredentialResolution::Denied);
             }
-            Err(_) => return Err("MOI memory identity lookup failed".into()),
+            Err((status, error)) => {
+                // Use only locally allowlisted categories. Provider text, URLs,
+                // subjects and credentials must never reach tool errors or logs.
+                let kind = match (status, error.error_code.as_deref()) {
+                    (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _) => "service_credentials",
+                    (_, Some("external_provider_request_timeout")) => "timeout",
+                    (_, Some("external_provider_response_invalid")) => "invalid_response",
+                    (_, Some("external_provider_request_failed")) => "transport",
+                    (StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT, _) => {
+                        "unavailable"
+                    }
+                    _ => "upstream_rejected",
+                };
+                tracing::warn!(
+                    phase = "moi_memory_identity",
+                    error_kind = kind,
+                    status = status.as_u16(),
+                    "memory authority lookup failed"
+                );
+                return Err(format!("MOI memory identity lookup failed: {kind}"));
+            }
         };
         if identity.external_subject != subject
             || identity.issuer != uc.settings.issuer
@@ -1238,6 +1258,7 @@ mod moi_memory_tests {
                 let mode = callback_mode.load(Ordering::SeqCst);
                 let issuer = callback_issuer.clone();
                 async move {
+                    if mode == 21 { tokio::time::sleep(std::time::Duration::from_secs(3)).await; }
                     assert_eq!(headers["authorization"], "Bearer test-callback-key");
                     assert_eq!(body, serde_json::json!({"action":"resolve_memory_identity", "provider_id":"moi", "external_subject":"iam-1"}));
                     let status = match mode {
@@ -1438,6 +1459,47 @@ mod moi_memory_tests {
                 );
             }
         }
+        for (mode_value, category) in [
+            (8, "service_credentials"),
+            (4, "unavailable"),
+            (9, "invalid_response"),
+            (20, "invalid_response"),
+            (21, "timeout"),
+        ] {
+            mode.store(mode_value, Ordering::SeqCst);
+            let error = MemoriaCredentialResolver::resolve_moi_builtin(
+                &memoria,
+                Some(&uc),
+                &providers,
+                &client,
+                "iam-1",
+            )
+            .await
+            .err()
+            .expect("authority failure");
+            assert_eq!(
+                error,
+                format!("MOI memory identity lookup failed: {category}")
+            );
+            assert!(!error.contains(&origin));
+            assert!(!error.contains("test-callback-key"));
+        }
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_endpoint = format!("http://{}/callback", closed.local_addr().unwrap());
+        drop(closed);
+        let mut unavailable_providers = providers.clone();
+        unavailable_providers[0].external_auth_endpoint = closed_endpoint;
+        let error = MemoriaCredentialResolver::resolve_moi_builtin(
+            &memoria,
+            Some(&uc),
+            &unavailable_providers,
+            &client,
+            "iam-1",
+        )
+        .await
+        .err()
+        .expect("closed endpoint must not grant access");
+        assert_eq!(error, "MOI memory identity lookup failed: transport");
         assert!(
             MemoriaCredentialResolver::resolve_moi_builtin(
                 &memoria,

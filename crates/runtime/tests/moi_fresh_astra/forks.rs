@@ -1631,3 +1631,166 @@ async fn provider_signed_forks_continue_from_exact_history_without_inherited_aut
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real disposable MatrixOne; signed Session memory lifecycle"]
+async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
+    use astra_core::{EdgeTokenAuthConfig, MemoriaSettings, config::UcNativeSettings};
+    use astra_memoria::MemoriaPort;
+    use astra_runtime::turn::cloud::memoria_compact::UserScopedMemoriaPort;
+    use astra_services::{
+        AuthService, DatabaseAuthService, FernetTokenEncryptor, auth::uc::UcNativeProvider,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fixture = ReviewFixture::new().await;
+    let read_only = Arc::new(AtomicBool::new(true));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let callback_issuer = base.clone();
+    let grant = read_only.clone();
+    let bridge = Router::new()
+        .route("/callback", route_post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let issuer = callback_issuer.clone(); let grant = grant.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer lifecycle-callback-key");
+                assert_eq!(body["action"], "resolve_memory_identity");
+                Json(json!({"code":0,"data":{"external_subject":body["external_subject"],
+                    "issuer":issuer,"uc_subject":"lifecycle-uc-owner",
+                    "memory_access":if grant.load(Ordering::SeqCst) {"read_only"} else {"read_write"}}}))
+            }
+        }))
+        .route("/protocol/openid-connect/token", route_post(|| async {
+            Json(json!({"access_token":"lifecycle-service","expires_in":300,"token_type":"Bearer"}))
+        }))
+        .route("/api/v1/uc/internal/users/{subject}/status", axum::routing::get(|| async {
+            Json(json!({"code":"OK","data":{"uc_sub":"lifecycle-uc-owner","status":"active"}}))
+        }))
+        .route("/check", route_post(|| async {Json(json!({"code":0,"data":{"ok":true}}))}));
+    let bridge = tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+    let mut settings = AppSettings::from_explicit_env().unwrap();
+    settings.matrixone.database = fixture.database.clone();
+    let auth = Arc::new(
+        DatabaseAuthService::new(settings.matrixone, settings.jwt)
+            .with_pool(fixture.state.shared_pool.clone().unwrap())
+            .with_encryptor(FernetTokenEncryptor::new("lifecycle-test-encryption").unwrap())
+            .with_provider_request_auth(vec![ProviderRequestAuthConfig {
+                provider: "moi".into(),
+                auth_type: "hmac".into(),
+                key: KEY.into(),
+            }])
+            .with_edge_token_auth(EdgeTokenAuthConfig {
+                key: super::fork_auth_compat::USER_TOKEN_KEY.into(),
+                check_endpoint: format!("{base}/check"),
+            })
+            .with_external_providers(vec![astra_services::ExternalAuthProviderConfig {
+                id: "moi".into(),
+                display_name: "MOI".into(),
+                external_auth_endpoint: format!("{base}/callback"),
+                auth_key: "lifecycle-callback-key".into(),
+            }])
+            .with_uc_native(Some(
+                UcNativeProvider::new(UcNativeSettings {
+                    issuer: base.clone(),
+                    adapter_url: base.clone(),
+                    moi_api_url: base.clone(),
+                    genesis_url: base.clone(),
+                    client_secret: "lifecycle-uc-secret".into(),
+                    builtin_memory: true,
+                })
+                .unwrap(),
+            ))
+            .with_memoria_settings(&MemoriaSettings {
+                base_url: base.clone(),
+                master_key: Some("lifecycle-memory-key".into()),
+                self_hosted_master_access: false,
+                issuer: None,
+                web_url: None,
+            })
+            .unwrap(),
+    );
+    let app = build_app(fixture.state.clone().with_auth_service(auth.clone()));
+    let owner = fixture.parent_cursor["owner_id"].as_str().unwrap();
+    let port = UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), owner.into());
+    // Actual explicit-port failure, before contacting Memoria, not just an enum assertion.
+    let denied = port
+        .store("test memory", "semantic", None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        denied.contains("read-only") && denied.contains("administrator"),
+        "{denied}"
+    );
+    assert!(!denied.contains("Connected apps") && !denied.contains("Memoria Settings"));
+    let gateway = astra_tools::memoria::MemoriaToolGateway::new(None, None)
+        .require_composition_port()
+        .with_memoria_port(Arc::new(port));
+    let tool_error = gateway
+        .call(
+            "remember",
+            &json!({"content":"synthetic release preference","memory_type":"semantic"}),
+        )
+        .await;
+    assert!(
+        tool_error.contains("read-only") && tool_error.contains("administrator"),
+        "{tool_error}"
+    );
+    assert!(!tool_error.contains("Connected apps") && !tool_error.contains("Memoria Settings"));
+    let finalize_path = format!("/sessions/{}/memory/finalize", fixture.parent);
+    let finalize_route = "/sessions/{session_id}/memory/finalize";
+    let (status, _) = control(&app, "POST", &finalize_path, finalize_route, "").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read-only must not authorize maintenance"
+    );
+    read_only.store(false, Ordering::SeqCst);
+    let (status, accepted) = control(&app, "POST", &finalize_path, finalize_route, "").await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(accepted["accepted"], true);
+    let close_path = format!("/sessions/{}/close", fixture.parent);
+    let close_route = "/sessions/{session_id}/close";
+    for (path, route) in [(&finalize_path, finalize_route), (&close_path, close_route)] {
+        let (status, _) = response(
+            &app,
+            signed_in_scope("POST", path, route, "", "other-workspace"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "another workspace cannot finalize or close this Session"
+        );
+        let now = chrono::Utc::now().timestamp();
+        let subject = owner.strip_prefix("provider_authorized:moi:").unwrap();
+        let token = super::fork_auth_compat::token(
+            json!({"sub":subject,"workspace_id":"moi-contract-workspace", "iss":"moi-backend", "iat":now,"exp":now+300,
+            "purpose":"edge_registration","edge_agent_id":"lifecycle-edge","jti":Uuid::new_v4().to_string()}),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = response(&app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "same IAM subject is a different Session owner namespace"
+        );
+    }
+    let mut tampered = signed_http_request("POST", &close_path, close_route, "".into());
+    *tampered.body_mut() = Body::from("{}");
+    let (status, _) = response(&app, tampered).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "lifecycle must verify the signed body digest"
+    );
+    let (status, closed) = control(&app, "POST", &close_path, close_route, "").await;
+    assert_eq!(status, StatusCode::OK, "{closed}");
+    assert_eq!(closed["status"], "closed");
+    bridge.abort();
+    fixture.close().await;
+}

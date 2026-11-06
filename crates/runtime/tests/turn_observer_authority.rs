@@ -13,7 +13,10 @@ use axum::{
     routing::post,
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU8, Ordering},
+};
 
 #[derive(Clone)]
 struct AuthorityPort {
@@ -24,6 +27,7 @@ struct AuthorityPort {
     transport_missing: bool,
     master: bool,
     calls: Arc<Mutex<Vec<String>>>,
+    changing_grant: Option<Arc<AtomicU8>>,
 }
 
 #[async_trait]
@@ -45,6 +49,9 @@ impl MemoriaPort for AuthorityPort {
         assert!(write);
         assert!(self.bound_owner.is_some());
         self.calls.lock().unwrap().push("admit-write".into());
+        if let Some(grant) = &self.changing_grant {
+            return Ok(grant.load(Ordering::SeqCst) != 1);
+        }
         self.allowed.clone()
     }
     async fn resolve_tool_transport(
@@ -53,6 +60,13 @@ impl MemoriaPort for AuthorityPort {
     ) -> Result<Option<MemoriaToolTransport>, String> {
         assert!(write);
         self.calls.lock().unwrap().push("resolve-write".into());
+        if self
+            .changing_grant
+            .as_ref()
+            .is_some_and(|grant| grant.load(Ordering::SeqCst) == 0)
+        {
+            std::future::pending::<()>().await;
+        }
         if let Some(error) = &self.transport_error {
             return Err(error.clone());
         }
@@ -133,6 +147,7 @@ fn port(base_url: String) -> AuthorityPort {
         transport_missing: false,
         master: false,
         calls: Arc::default(),
+        changing_grant: None,
     }
 }
 
@@ -354,4 +369,54 @@ async fn observer_connection_error_is_classified_without_url_or_credential() {
         worker.run(request("astra-a")).await.unwrap_err(),
         "memoria observer connection failed"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn observer_retry_after_authority_timeout_resolves_current_grant() {
+    let (url, requests, server) = backend(StatusCode::NO_CONTENT).await;
+    let mut authority = port(url);
+    let grant = Arc::new(AtomicU8::new(0));
+    authority.changing_grant = Some(grant.clone());
+    let calls = authority.calls.clone();
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(authority)));
+    let started = tokio::time::Instant::now();
+    assert!(
+        worker
+            .run(request("astra-a"))
+            .await
+            .unwrap_err()
+            .contains("authority lookup timed out")
+    );
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+    assert!(requests.lock().unwrap().is_empty());
+    grant.store(1, Ordering::SeqCst);
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap(),
+        TurnObserverOutcome::AccessDisabled
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a revoked retry cannot reuse old authority"
+    );
+    grant.store(2, Ordering::SeqCst);
+    tokio::time::resume();
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap(),
+        TurnObserverOutcome::Observed
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            "bind:astra-a",
+            "admit-write",
+            "resolve-write",
+            "bind:astra-a",
+            "admit-write",
+            "bind:astra-a",
+            "admit-write",
+            "resolve-write"
+        ]
+    );
+    server.abort();
 }

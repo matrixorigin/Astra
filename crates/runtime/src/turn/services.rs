@@ -9,9 +9,10 @@ use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError
 use sqlx::Acquire;
 
 // Includes all fresh authority dependencies (MOI mapping, UC service token and
-// account status). Dropping the timed-out future releases an observer slot;
-// the backend send retains its independent 30-second request timeout.
-const OBSERVER_AUTHORITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+// account status). A timeout releases the bounded worker; durable recovery
+// retains the observation and rechecks current authority on the next attempt.
+// The backend send retains its independent 30-second request timeout.
+const OBSERVER_AUTHORITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub(crate) struct NoopTurnObserverWorker;

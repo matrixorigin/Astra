@@ -288,10 +288,14 @@ not that memory was recalled or injected into a subsequent conversation.
 This change does not wire automatic prompt recall: the retained memory-prefetch
 helpers have no production caller. Verify cross-session recall with an explicit
 memory-tool invocation and verify account isolation separately.
-Resolver integration does not expand HTTP authentication: request-bound HMAC
-authentication is not accepted by the memory proxy or close/finalize routes,
-which use `current_user`; MOI edge-token authentication remains available there.
-The MOI caller must also invoke close/finalize to trigger that maintenance.
+Close, memory-status and finalize accept request-bound HMAC authentication using
+exact method/path/body verification and the retained provider Session scope proof,
+just like conversation admission. The caller must sign a fresh request for each
+lifecycle operation; pre-upgrade HMAC Sessions without retained scope evidence
+are rejected rather than assigned a guessed workspace. Edge tokens retain their
+own owner namespace and cannot control an HMAC-created Session, even with the same IAM subject. The memory proxy
+retains its existing user-token authentication contract. The MOI caller must
+invoke close/finalize to trigger session-end maintenance.
 The MOI callback must be deployed before enabling this path in Astra.
 Compare its effective issuer with Astra's configured issuer byte for byte before
 deployment, including any trailing slash. A normal observer authority resolution
@@ -305,12 +309,25 @@ credentials are attached per request, and identity/access decisions are not
 cached. Other provider actions retain their 30-second deadline with an 8 MiB
 response limit.
 
-The observer has a separate two-second budget for its entire authority lookup,
-including MOI and UC dependencies. Expiry cancels that lookup, records an error,
-and releases the existing async observer permit; it does not become access
-denial. The backend send retains its independent 30-second timeout. The existing
-four-slot scheduler still reports saturation during this bounded interval;
-this change does not introduce an unbounded queue or guarantee lossless delivery.
+The observer has a ten-second budget for the entire fresh authority lookup,
+including MOI and UC dependencies, and a separate 30-second backend deadline.
+Observation work is checkpointed in the existing session-memory journal within
+the canonical terminal transaction. The existing recovery driver scans at most
+16 due Sessions and runs at most two attempts concurrently per process. It uses
+the journal's 90-second fenced leases, a 60-second attempt budget and existing
+exponential backoff (5–960 seconds); expired leases recover process death.
+A timeout or transport failure retains the frozen observation for retry, which
+rechecks current authorization. Revocation skips the write and acknowledges that
+observation; no retry uses a previously resolved credential. At most one active
+and one newer queued transcript are retained per Session. Queued full-context
+snapshots coalesce to the newest turn; an active uncertain attempt is never
+replaced. Delivery is at least once, not exactly once. Session deletion removes
+the journal through the existing lifecycle cleanup. Ephemeral deployments have
+no durable recovery and await bounded observation after terminal delivery.
+MOI built-in read-only grants use product-neutral remediation, while scoped
+Memoria logins retain their Connected apps instructions. Authority failures expose
+only stable allowlisted categories (service credentials, timeout, transport,
+unavailable, invalid response, upstream rejection), never provider body text.
 The callback's explicit identity denial is HTTP 403 with error code
 `moi_memory_identity_denied`; the resolver returns `Denied` for that exact pair.
 Service-authentication failures, unclassified 403 responses, dependency failures
