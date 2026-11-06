@@ -181,29 +181,28 @@ impl TokenManager {
     /// Try `candidate` on the next connection without writing it to the token
     /// file. The credential that is current now becomes the one-shot fallback,
     /// so a candidate that cannot authenticate does not replace a working one.
-    /// Returns false when the candidate cannot be staged; the caller keeps any
-    /// queued copy and retries.
+    /// Returns whether the next connection uses a different credential.
     pub async fn stage_unproven_candidate(&self, candidate: String) -> bool {
         if candidate.is_empty() {
             return false;
         }
         let mut state = self.state.lock().await;
         if state.current == candidate {
-            return true;
+            return false;
         }
         if state.dirty {
-            match write_token_atomic(&self.token_file, &state.current) {
-                Ok(()) => state.dirty = false,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra.edge",
-                        path = %self.token_file.display(),
-                        error = %error,
-                        "kept the working edge token; the refreshed credential was not staged"
-                    );
-                    return false;
-                }
+            // Retrying later would persist the unproven candidate, so the debt
+            // ends here. If this write fails, whichever credential next
+            // authenticates heals the file through `mark_proven`.
+            if let Err(error) = write_token_atomic(&self.token_file, &state.current) {
+                tracing::warn!(
+                    target: "astra.edge",
+                    path = %self.token_file.display(),
+                    error = %error,
+                    "cannot persist the working edge token before staging a handed-off credential"
+                );
             }
+            state.dirty = false;
         }
         let previous = std::mem::replace(&mut state.current, candidate);
         state.fallback = Some(previous);
@@ -570,6 +569,7 @@ mod tests {
         assert!(manager.swap_to_fallback().await);
         assert_eq!(manager.snapshot().await, working);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), working);
+        assert!(!manager.stage_unproven_candidate(working.clone()).await);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
