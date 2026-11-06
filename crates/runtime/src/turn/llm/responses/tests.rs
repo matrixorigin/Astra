@@ -56,6 +56,9 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             if body["input"].to_string().contains("reject this") {
                 return (StatusCode::BAD_REQUEST, Json(json!({"error":{"code":"unsupported_parameter","param":"temperature","message":"secret provider detail"}}))).into_response();
             }
+            if body["input"].to_string().contains("too large failure") {
+                return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error":{"code":"request_body_too_large","type":"request_body_too_large","message":"secret provider detail","request_id":"req_4c5d6e7f-8091-4ab2-9cbd-ef3456789012"}}))).into_response();
+            }
             let continued = body["input"].as_array().unwrap().iter().any(|item| item["type"] == "function_call_output");
             requests.lock().unwrap().push(body);
             let output = if continued {
@@ -372,6 +375,37 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         assert_eq!(error.kind, kind);
         assert!(!format!("{error:?}").contains("secret provider detail"));
     }
+    // A Responses 413 with a structured TaaS envelope is the gateway byte
+    // cap, not model context overflow: the whitelisted code and validated
+    // request id name the cause while the provider message stays hidden
+    // (#19075).
+    let too_large = vec![json!({"role":"user","content":"too large failure"})];
+    let error = call_llm_and_collect_with_stream_callback(
+        call(&too_large, &tools, &scope, &base, &thinking),
+        LlmCancel::None,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    assert!(error.message.contains("request_body_too_large"));
+    assert!(
+        error
+            .message
+            .contains("req_4c5d6e7f-8091-4ab2-9cbd-ef3456789012")
+    );
+    assert!(!format!("{error:?}").contains("secret provider detail"));
+    let details: Value =
+        serde_json::from_str(error.details_json.as_deref().expect("structured details"))
+            .expect("valid details");
+    assert_eq!(details["code"], "request_body_too_large");
+    assert_eq!(
+        details["request_id"],
+        "req_4c5d6e7f-8091-4ab2-9cbd-ef3456789012"
+    );
     let mut chat_call = call(&rejected, &tools, &scope, &base, &thinking);
     chat_call.route.inference_protocol = None;
     let error = call_llm_and_collect_with_stream_callback(

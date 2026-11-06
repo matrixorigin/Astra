@@ -677,6 +677,18 @@ pub fn structured_llm_error_code(body: &str) -> Option<(ErrorKind, &'static str)
         .get("code")
         .or_else(|| error.get("type"))
         .and_then(serde_json::Value::as_str)?;
+    llm_error_envelope_code_class(code)
+}
+
+/// Classify a single provider error-envelope code token.
+///
+/// This is the same whitelist [`structured_llm_error_code`] applies to
+/// envelope bodies, exposed for boundaries that already hold the bare token
+/// (e.g. the negotiated MOI model gateway contract). Returns the classified
+/// kind alongside the canonical static token; unrecognized codes return
+/// `None` so callers keep their existing fallback.
+#[must_use]
+pub fn llm_error_envelope_code_class(code: &str) -> Option<(ErrorKind, &'static str)> {
     match code {
         "context_length_exceeded" => Some((ErrorKind::ContextWindow, "context_length_exceeded")),
         "request_body_too_large" => Some((ErrorKind::InvalidRequest, "request_body_too_large")),
@@ -686,13 +698,37 @@ pub fn structured_llm_error_code(body: &str) -> Option<(ErrorKind, &'static str)
     }
 }
 
+/// Validate a provider-supplied request id before it crosses into
+/// user-visible errors or structured log fields.
+///
+/// Provider error envelopes are untrusted: an arbitrary `request_id` could
+/// carry echoed credentials (`"Bearer secret-token"`), control characters,
+/// or unbounded diagnostics. Only bounded machine tokens pass: ASCII
+/// alphanumerics plus `-`/`_`, which covers TaaS's `req_<hyphenated-uuid>`
+/// and plain hex ids while rejecting whitespace, quotes, and control bytes.
+#[must_use]
+pub fn validated_llm_provider_request_id(value: &str) -> Option<String> {
+    const MAX_REQUEST_ID_LEN: usize = 128;
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_REQUEST_ID_LEN {
+        return None;
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// Extract `error.request_id` from a provider error envelope body for log
-/// correlation. Same parsing rules as [`structured_llm_error_kind`].
+/// correlation. Same parsing rules as [`structured_llm_error_kind`]; the id
+/// is validated by [`validated_llm_provider_request_id`] before use.
 #[must_use]
 pub fn structured_llm_error_request_id(body: &str) -> Option<String> {
     let error = llm_error_envelope_error(body)?;
-    let request_id = error.get("request_id")?.as_str()?.trim();
-    (!request_id.is_empty()).then(|| request_id.to_string())
+    validated_llm_provider_request_id(error.get("request_id")?.as_str()?)
 }
 
 /// Parse the `error` object of a provider error envelope out of `body`,
@@ -1557,6 +1593,37 @@ mod tests {
             None
         );
         assert_eq!(structured_llm_error_request_id("not json"), None);
+    }
+
+    #[test]
+    fn structured_llm_error_request_id_rejects_untrusted_values() {
+        // TaaS's `req_<hyphenated-uuid>` and plain hex ids pass.
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"error":{"code":"invalid_request","request_id":"req_3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
+            ),
+            Some("req_3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
+        );
+        // Secret-bearing values must never reach user-visible errors or logs.
+        for body in [
+            r#"{"error":{"code":"invalid_request","request_id":"Bearer secret-token"}}"#,
+            // Control characters and quotes break log/message structure.
+            r#"{"error":{"code":"invalid_request","request_id":"req_ok\u000aevil"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"req_\"quoted\""}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"req spaced"}}"#,
+        ] {
+            assert_eq!(
+                structured_llm_error_request_id(body),
+                None,
+                "untrusted request_id must be rejected: {body}"
+            );
+        }
+        // Overlong values are unbounded diagnostics, not identifiers.
+        let overlong = format!(
+            r#"{{"error":{{"code":"invalid_request","request_id":"req_{}"}}}}"#,
+            "a".repeat(256)
+        );
+        assert_eq!(structured_llm_error_request_id(&overlong), None);
     }
 
     #[test]
