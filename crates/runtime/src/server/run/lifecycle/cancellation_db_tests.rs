@@ -202,7 +202,7 @@ impl CancellationFixture {
 
 #[tokio::test]
 #[ignore = "requires disposable MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn db_previous_unknown_is_reported_without_blocking_a_new_run() {
+async fn db_previous_unknown_preserves_evidence_without_blocking_a_new_run() {
     let fixture = CancellationFixture::new(false, true).await;
     let identity = fixture.tool(true).await;
     sqlx::query("UPDATE agent_runs SET status = 'cancelled', owner_pod_id = NULL, owner_lease_expires_at = NULL WHERE user_id = ? AND run_id = ?")
@@ -240,10 +240,7 @@ async fn db_previous_unknown_is_reported_without_blocking_a_new_run() {
         )
         .await
         .expect("a prior unknown result must not prevent continuing");
-    assert_eq!(
-        participant.admission.unwrap().previous_tool_advisory,
-        Some(PREVIOUS_TOOL_ADVISORY)
-    );
+    assert!(participant.admission.is_some());
 
     let ledger = astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger::new(
         fixture.pool.clone(),

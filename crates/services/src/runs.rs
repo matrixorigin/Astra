@@ -25341,9 +25341,8 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
 
 fn project_client_warning(event: serde_json::Value) -> serde_json::Value {
     // Do not expose arbitrary internal warnings or adjacent config/provider payloads.
-    // Both accepted messages are authored by typed, redacted producers.
-    let Some(code @ ("hook_configuration" | "previous_tool_outcome_unknown")) =
-        event.get("code").and_then(serde_json::Value::as_str)
+    // Accepted messages are authored by the typed, redacted hook producer.
+    let Some(code @ "hook_configuration") = event.get("code").and_then(serde_json::Value::as_str)
     else {
         return serde_json::Value::Null;
     };
@@ -26922,14 +26921,6 @@ mod tests {
                 .is_null()
             );
         }
-        let previous = serde_json::json!({
-            "type": "warning", "code": "previous_tool_outcome_unknown",
-            "message": "A previous tool may have changed state; inspect it before retrying.",
-            "arguments": "SECRET"
-        });
-        let projected = super::transform_run_event_for_client(previous);
-        assert_eq!(projected["code"], "previous_tool_outcome_unknown");
-        assert!(!projected.to_string().contains("SECRET"));
     }
 
     #[tokio::test(start_paused = true)]

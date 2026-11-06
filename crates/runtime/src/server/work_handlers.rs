@@ -5121,6 +5121,16 @@ fn parse_workspace_attestation(
     }))
 }
 
+fn workspace_attestation_args(start_marker: &str, end_marker: &str) -> serde_json::Value {
+    let command = format!(
+        "printf '%s\\n' '{start_marker}'; pwd; git rev-parse --show-toplevel; git rev-parse HEAD; git rev-parse HEAD^{{tree}}; git rev-parse --show-object-format=storage; (git symbolic-ref --short -q HEAD || printf '%s\\n' '(detached)'); repo_identity=\"$(git config --get remote.origin.url || true)\"; if [ -z \"$repo_identity\" ]; then repo_identity=\"$(pwd -P)/$(git rev-parse --git-common-dir)\"; fi; printf '%s' \"$repo_identity\" | git hash-object --stdin; git status --porcelain=v1 --untracked-files=all; printf '%s\\n' '{end_marker}'"
+    );
+    serde_json::json!({
+        "command": command,
+        "timeout": WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
+    })
+}
+
 async fn attest_edge_workspace(
     state: &AppState,
     record: &astra_services::multi_agent::EdgeAgentRecord,
@@ -5152,14 +5162,7 @@ async fn attest_edge_workspace(
     )
     .map_err(|_| "attestation_identity_invalid")?;
     let (start_marker, end_marker) = attestation_markers(attestation_nonce);
-    let command = format!(
-        "printf '%s\\n' '{start_marker}'; pwd; git rev-parse --show-toplevel; git rev-parse HEAD; git rev-parse HEAD^{{tree}}; git rev-parse --show-object-format=storage; (git symbolic-ref --short -q HEAD || printf '%s\\n' '(detached)'); repo_identity=\"$(git config --get remote.origin.url || true)\"; if [ -z \"$repo_identity\" ]; then repo_identity=\"$(pwd -P)/$(git rev-parse --git-common-dir)\"; fi; printf '%s' \"$repo_identity\" | git hash-object --stdin; git status --porcelain=v1 --untracked-files=all; printf '%s\\n' '{end_marker}'"
-    );
-    let mut args = serde_json::json!({
-        "command": command,
-        "mode": "verify",
-        "timeout": WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
-    });
+    let mut args = workspace_attestation_args(&start_marker, &end_marker);
     let (output, connection_generation) = if let Some(connection) = connection.as_ref() {
         // A same-pod socket is still checked before dispatch. The local pool
         // is authoritative for its live generation and must agree with the
@@ -10137,6 +10140,15 @@ mod tests {
         ] {
             assert!(!valid_committed_work_cursor(&invalid));
         }
+    }
+
+    #[test]
+    fn execution_attestation_uses_supported_bash_arguments() {
+        let (start, end) = attestation_markers("test-nonce");
+        let args = workspace_attestation_args(&start, &end);
+        astra_tools::schemas::validate_tool_arguments("bash", &args)
+            .expect("Work switch attestation must pass the Runner's canonical argument validation");
+        assert_eq!(args["timeout"], WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS);
     }
 
     #[test]

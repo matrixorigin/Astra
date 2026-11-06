@@ -38,6 +38,8 @@ cache: the canonical verification frontier tracks actual invocation evidence
 and invalidates it after recorded workspace mutations. Recovery restores the frozen
 complete declarations and selected phase from Control V4, using the original
 task profile; it does not reread configuration or reset validation evidence.
+Successful checks remain bound to their invocation evidence across checkpoint
+and recovery even when no preceding workspace mutation was observed.
 
 ## Principle
 

@@ -681,12 +681,42 @@ pub(crate) mod tests {
             executed(&mut ledger, "read", "read_file", ""),
             executed(&mut ledger, "verify", "bash", "./a"),
         ];
+        let VerificationHandoff::Bound { snapshot } =
+            frontier.export(None, &hooks, &records, Some("chain"))
+        else {
+            panic!("declared check outcomes must survive without prior changes");
+        };
+        let snapshot = serde_json::from_slice::<astra_turn_types::BoundVerificationFrontier>(
+            &serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        assert!(snapshot.mutation.is_none());
+        let completion = records[1].execution_completion.as_ref().unwrap();
+        assert_eq!(
+            &snapshot.proofs[0].as_ref().unwrap().invocation,
+            completion.as_invocation().unwrap()
+        );
+        let rows = [ledger.get(completion.identity()).unwrap().clone()];
+        let restored = VerificationFrontier::restore(
+            None, &snapshot, "user", "session", "run", "chain", &hooks, &rows,
+        )
+        .unwrap();
+        assert_eq!(restored.missing(), Some(vec![]));
         assert!(
             matches!(
-                frontier.export(None, &hooks, &records, Some("chain")),
-                VerificationHandoff::Bound { .. }
+                VerificationFrontier::restore(
+                    None,
+                    &snapshot,
+                    "user",
+                    "session",
+                    "run",
+                    "chain",
+                    &hooks,
+                    &[]
+                ),
+                Err(VerificationRecoveryError::LedgerMismatch)
             ),
-            "declared check outcomes can be retained without prior changes"
+            "a no-write check still requires its exact execution evidence"
         );
         let mut records = records;
         records.push(record("write_file", true, ""));
@@ -1068,8 +1098,8 @@ impl VerificationFrontier {
                     invocation,
                 })
         };
-        // Without an authoritative obligation or source mutation, old
-        // verifier calls are irrelevant to the current completion predicate.
+        // Only authoritative obligations retain change/check evidence. A check
+        // can satisfy its obligation even when no preceding write was observed.
         let mutation = if view.contract.is_empty() {
             None
         } else if let Some(evidence) = &view.mutation {
@@ -1081,16 +1111,14 @@ impl VerificationFrontier {
             None
         };
         let mut proofs = vec![None; view.contract.len()];
-        if mutation.is_some() {
-            for (index, evidence) in view.proofs.iter().enumerate() {
-                if let Some(evidence) = evidence {
-                    let Some(bound) = bind(evidence) else {
-                        return unavailable(VerificationUnavailable::UnboundProof {
-                            hook_index: index,
-                        });
-                    };
-                    proofs[index] = Some(bound);
-                }
+        for (index, evidence) in view.proofs.iter().enumerate() {
+            if let Some(evidence) = evidence {
+                let Some(bound) = bind(evidence) else {
+                    return unavailable(VerificationUnavailable::UnboundProof {
+                        hook_index: index,
+                    });
+                };
+                proofs[index] = Some(bound);
             }
         }
         // Handoff custody is enforced independently from named verification.

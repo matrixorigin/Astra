@@ -5394,7 +5394,6 @@ struct CanonicalTurnAdmission {
     prior_messages: Vec<Value>,
     authorized_session_ids: Option<HashSet<String>>,
     had_canonical_head: bool,
-    previous_tool_advisory: Option<&'static str>,
     _weighted_permit: astra_services::WeightedAdmissionPermit,
 }
 
@@ -5442,8 +5441,6 @@ struct PreparedRootContextAdmission {
     key: astra_turn_types::SessionKeyV1,
     current_bytes: u64,
 }
-
-const PREVIOUS_TOOL_ADVISORY: &str = "Earlier tool calls have unconfirmed outcomes. A call may still be running or may have changed state. Review the previous tool history and inspect the current state before repeating it.";
 
 /// Prepare under the Run opening fence. The immutable snapshot and this
 /// attempt's local capacity permit commit only with its own Run insertion.
@@ -5914,7 +5911,6 @@ impl AgenticRunLifecycleService {
         Ok(CanonicalTurnAdmission {
             coordinator,
             had_canonical_head: authority.base_head.is_some(),
-            previous_tool_advisory: None,
             authority,
             opening_hash: None,
             prior_messages: Vec::new(),
@@ -15743,15 +15739,6 @@ impl AgenticRunLifecycleService {
                     );
                 }
             }
-            if let Some(advisory) = canonical_turn
-                .as_ref()
-                .and_then(|admission| admission.previous_tool_advisory.as_ref())
-            {
-                state.push_volatile(
-                    crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
-                    (*advisory).to_owned(),
-                );
-            }
             let fresh_session_current_date = state
                 .pipeline_session
                 .as_ref()
@@ -15848,18 +15835,6 @@ impl AgenticRunLifecycleService {
                 );
                 event_rx = Some(receiver);
                 delivery = Some(stream_delivery);
-                if let Some(advisory) = canonical_turn
-                    .as_ref()
-                    .and_then(|admission| admission.previous_tool_advisory.as_ref())
-                {
-                    let _ = event_tx
-                        .as_ref()
-                        .expect("stream sender exists")
-                        .try_send(json!({
-                            "type": "warning", "code": "previous_tool_outcome_unknown",
-                            "message": advisory,
-                        }));
-                }
             }
             host.set_interaction_sink(interaction_sink);
             host.set_client_cancel(llm_cancel_token.clone());
