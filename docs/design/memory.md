@@ -313,15 +313,27 @@ The observer has a ten-second budget for the entire fresh authority lookup,
 including MOI and UC dependencies, and a separate 30-second backend deadline.
 Observation is optional background work and never writes a job, serializes a
 second transcript, or adds a failure dependency to canonical chat settlement.
-When configured, the existing managed recovery owner discovers the latest
-unobserved completed canonical head, reads its immutable nodes in the same
-query, and delegates content/fork validation to the canonical coordinator.
+When configured, the existing managed recovery owner traverses pages of 64
+canonical Session keys. Only those keys enter a separate eligibility query;
+each participating table has direct full-key predicates. Idle pages read no
+transcripts. Eligible Sessions are then rechecked and materialized selectively
+with their latest canonical head in one snapshot; content/fork validation stays
+with the canonical coordinator. Direct storage predicates also protect normal
+restore/resume/history materialization from unrelated manifest scans.
 An existing sweeper lease selects one cross-process observation owner; a local
 keyset cursor advances past deferred Sessions and wraps without replacing durable
-checkpoints. The owner drains
-at most sixteen Sessions per tick with one bounded attempt at a time. The
-ordinary non-fork path adds one discovery/materialization query, fresh authority,
+checkpoints. Each of at most sixteen steps per tick either advances an empty
+eligibility page or attempts one Session, with one observation in flight.
+Candidates are rechecked after paging, so cached keys are not authorization,
+head, or retry-state snapshots. Cancellation or a checkpoint error retains the
+current candidate; restart scans from the beginning. The ordinary non-fork
+attempt adds one selective discovery/materialization query, fresh authority,
 and one atomic progress checkpoint, without per-Session claim transactions.
+Catalog traversal adds two queries per 64-key page, separately from attempts.
+MatrixOne can still scan/sort remaining narrow keys for an ordered page; this
+is not a constant-time catalog scan or a fixed recall-latency guarantee. The
+expensive Session/checkpoint eligibility and payload reads are limited to the
+page/selected Session, including when all retained Sessions are already observed.
 Unconfigured deployments create no observation owner or observation journal.
 
 Only a completed-turn watermark, revision, and independent exponential retry

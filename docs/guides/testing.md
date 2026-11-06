@@ -649,6 +649,20 @@ turn. Errors, dropped work, extra work, missing completions, or skipped outcomes
 cannot satisfy the authorized HTTP-path measurement. Unconfigured deployment
 coverage separately proves that no observer job or background owner is created.
 
+The Session-scoped SQL probe does not measure global catalog traversal. The
+ignored `astra-services` test
+`session_observation::tests::retained_catalog_plans_keep_payload_reads_selective`
+runs in the online services lane and seeds 100,000 synthetic retained Sessions
+using the real schema. Prepared `EXPLAIN ANALYZE` statements exercise the actual
+canonical materializer, 64-key eligibility query, and selected-Session query in
+both fully observed and sparse-work states. It checks storage `inputRows`, not
+just returned rows or SQL count; page eligibility must not read transcripts.
+MatrixOne may read an 8,192-row storage block for a key set. Narrow key sorting
+is still catalog-dependent and is not claimed to scan only 64 physical rows.
+Run it directly with `ASTRA_TEST_DB_IT=1 cargo test -p astra-services --lib
+session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
+-- --exact --ignored --nocapture` against a dedicated local database service.
+
 The readonly-round comparison accounts for exact periodic control reads and
 at most one account/session authentication snapshot when its 30-second cache
 expires. Those statements still count toward the raw 20-statement limit;
