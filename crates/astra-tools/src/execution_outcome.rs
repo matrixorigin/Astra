@@ -140,8 +140,22 @@ pub fn insert_not_executed_fact(metadata: &mut serde_json::Map<String, Value>) {
 /// Record process startup at the executor that owns it. Later validation or
 /// observation failure cannot turn an executed command into a preflight refusal.
 pub fn insert_started_execution_fact(metadata: &mut serde_json::Map<String, Value>) {
+    let unknown = outcome_is_unknown(Some(metadata));
     metadata.insert("execution_started".into(), Value::Bool(true));
     metadata.insert("disposition".into(), Value::String("executed".into()));
-    metadata.insert("execution_fact".into(), Value::String("executed".into()));
+    if !unknown {
+        metadata.insert("execution_fact".into(), Value::String("executed".into()));
+    }
     metadata.insert("side_effects_maybe".into(), Value::Bool(true));
+}
+
+/// A known result may have effects. Only an explicit executor or transport
+/// fact means that its outcome is unknown.
+pub fn outcome_is_unknown(metadata: Option<&serde_json::Map<String, Value>>) -> bool {
+    ["execution_fact", "outcome_certainty"].iter().any(|key| {
+        metadata
+            .and_then(|fields| fields.get(*key))
+            .and_then(Value::as_str)
+            == Some("unknown")
+    })
 }

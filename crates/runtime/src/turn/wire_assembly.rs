@@ -2094,6 +2094,47 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn prior_unknown_tool_fact_survives_required_only_wire_assembly() {
+        use crate::turn::agentic_loop::host::{VolatileInjection, VolatileKind};
+        let injections = vec![
+            VolatileInjection {
+                kind: VolatileKind::BackgroundTaskNotification,
+                payload: json!("Earlier bash outcome is unknown; inspect current state."),
+                round_index: 1,
+                attempt_leased: true,
+            },
+            VolatileInjection {
+                kind: VolatileKind::BehaviorAdvisory,
+                payload: json!("unrelated optional advice"),
+                round_index: 1,
+                attempt_leased: true,
+            },
+        ];
+        for capability in [
+            append_only_required_capability(),
+            required_only_tail_capability(),
+        ] {
+            let wire = assemble_llm_messages_with_cache_capability_output(
+                vec![json!({"role":"system", "content":"rules"})],
+                Vec::new(),
+                injections.clone(),
+                vec![json!({"role":"user", "content":"continue"})],
+                &PostCompactAttachments::default(),
+                "sid",
+                "openai",
+                "model",
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                Some(capability),
+                &cache_cfg(),
+            )
+            .unwrap();
+            let text = serde_json::to_string(&wire.messages).unwrap();
+            assert!(text.contains("Earlier bash outcome is unknown"), "{text}");
+            assert!(!text.contains("unrelated optional advice"), "{text}");
+        }
+    }
+
+    #[test]
     fn semantic_input_survives_delivery_retirement_across_cache_placements() {
         use crate::turn::agentic_loop::host::{
             DIRECT_CHILD_RESULT_SCHEMA, RETAINED_MAILBOX_CONTEXT_SCHEMA, VolatileKind,

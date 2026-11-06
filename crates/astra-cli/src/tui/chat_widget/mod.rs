@@ -9135,6 +9135,8 @@ mod tests {
                 "capacity unavailable",
             );
         assert!(fanout_completion_is_authoritative(None, Some(&rejection)));
+        let unknown = r#"{"status":"unknown","executed":null,"group_id":"review-42","error":"acknowledgement lost"}"#;
+        assert!(fanout_completion_is_authoritative(None, Some(unknown)));
     }
 
     #[test]

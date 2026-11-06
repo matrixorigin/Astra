@@ -38,6 +38,29 @@ without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
+## Provider rejection contract
+
+The shared ordinary-provider HTTP boundary distinguishes authentication (`auth`), an
+explicit provider balance/quota denial (`provider_quota_exhausted`), and a
+provider denial without a proven cause (`provider_forbidden`). HTTP 401 is
+authentication failure. HTTP 403 alone, including `upstream_forbidden`, is not
+evidence of expired credentials or exhausted credit. Only the bounded machine
+codes `invalid_api_key`, `invalid_token`, `authentication_error`,
+`insufficient_quota`, and `insufficient_balance` refine that classification;
+provider message text never does. A quota-coded 429 is terminal, unlike a
+transient rate limit. These access rejections do not trigger automatic retry,
+credential refresh, provider fallback, or a waiting run.
+
+Both streaming and nonstreaming calls preserve these classifications through
+the shared agent loop and failed Run outcome. The negotiated MOI gateway can
+carry the same provider facts using `provider_authentication_failed`,
+`provider_forbidden`, and `provider_quota_exhausted`. Its billing-owner reasons
+(for example `insufficient_credit`) keep their separate versioned contract.
+Provider diagnostics, balances, and echoed credentials never enter public
+error messages. Clients must not infer an end-user billing remedy from a
+provider-account failure. Real input/authorization waits retain their existing
+lifecycle semantics.
+
 ## Implemented ChatGPT subscription connection boundary
 
 The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
@@ -315,9 +338,10 @@ the same purpose throughout a drain, as well as checking revision and total.
 
 #### Catalog response compatibility
 
-The executable support baseline is published CLI and Edge **0.2.12**. The two
-HTTP catalog endpoints retain that release's complete response field set as
-the frozen format version 2, including `thinking_protocol` and `pricing`. A
+The two HTTP catalog endpoints retain the complete response field set as the
+frozen format version 2, including `thinking_protocol` and `pricing`. This is a
+catalog API contract, not a promise that older CLI or Edge binaries support the
+current interaction protocol. Deploy matching current clients with the Server. A
 missing `x-astra-model-catalog-version` header and explicit `2` select the
 same frozen format; current thin-client and TypeScript SDK requests negotiate
 the current format `3` on every page.
@@ -325,14 +349,9 @@ Unknown, repeated, or malformed versions (including `1`) return
 `400 model_catalog_version_unsupported`. The response identifies its format
 in the same header and is not cached.
 
-Unversioned 0.2.10 and 0.2.12 catalog requests have no trustworthy distinction.
-The Server must not infer a version from identity or strip protocol metadata
-needed by the supported 0.2.12 picker. CLI 0.2.10's strict catalog decoder and
-its embedded schema-v1 executor are outside the support baseline, as is
-standalone Edge 0.2.10. Users of those binaries must upgrade to 0.2.12 or later.
-The installed CLI can still report an unknown-field/invalid-JSON error before
-execution; a new Server error code cannot repair that old diagnostic. This
-policy does not claim to repair the original 0.2.10 conversation failure.
+The Server must not infer a catalog version from identity or strip protocol
+metadata needed by consumers of the frozen catalog contract. This response
+shape alone does not grant older clients an execution or interaction guarantee.
 
 Version validation does not authorize access. The response uses the existing
 service-owned authorized catalog, Offering identity, capabilities, access
@@ -374,10 +393,8 @@ verify that the selected format can represent the required semantics.
 Authentication, execution requests, approvals, and Edge advertisements are not
 made permissive.
 
-Historical fixtures and binary identities do not move with the producer.
-Support changes must be reviewed separately and document affected features
-and migration. See [client compatibility tests](../guides/testing.md#released-cli-and-edge-compatibility)
-for the fixed artifact inventory and required behavior.
+See [current client integration tests](../guides/testing.md#candidate-cli-and-edge-integration)
+for the tested client and Server journeys.
 
 Explicit Offering IDs cannot bypass this policy. Primary chat admission and
 provider-boundary revalidation reject incompatible protocol-purpose pairs before

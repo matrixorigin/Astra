@@ -318,8 +318,8 @@ pub const CAPABILITY_CASES: &[CapabilityCase] = &[
         quadrant: CapabilityQuadrant::Recovery,
         topology: Topology::CliServer,
         kind: CaseKind::Happy,
-        boundary: "cancelled run is terminal cancelled, not failed",
-        system_test: "cancelled_run_interrupts_thin_client_tool_result_wait",
+        boundary: "SIGINT settles the exact CLI Run and preserves its Context receipt",
+        system_test: "one_shot_sigint_settles_exact_run_without_wall_deadline",
         model_validation: ModelValidation::DeterministicOnly {
             reason: "cancellation must race an active run from an external controller",
         },

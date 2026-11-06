@@ -2221,12 +2221,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_fetch",
-                "description": "Fetch a URL and return structured JSON with metadata, extracted content (Markdown by default), and navigation links. Handles HTML-to-Markdown conversion, link discovery, and content truncation automatically.",
+                "description": "Fetch a URL and return a JSON result containing metadata, a content string, and navigation links. For HTML, format selects how the content is extracted; JSON response bodies are returned as text in content. Content may be truncated.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {"type": "string", "description": "URL to fetch (http:// or https://)"},
-                        "format": {"type": "string", "enum": ["markdown", "text"], "description": "Output format for extracted content (default: markdown)"},
+                        "format": {"type": "string", "enum": ["markdown", "text"], "description": "HTML content extraction style: markdown (default) or text. This does not select the JSON result format."},
                         "max_content": {"type": "integer", "description": "Max extracted content characters (default 24576; increase when the full page is needed)"},
                         "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)"},
                         "max_links": {"type": "integer", "description": "Max navigation links to extract (default 25)"}

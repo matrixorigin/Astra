@@ -527,39 +527,6 @@ pub fn ledger_entry_is_expected(
         .unwrap_or(false)
 }
 
-/// Convert a live callback custody record into a short-lived cancellation
-/// acknowledgement lease.  The associated entry is discarded because the
-/// runtime has already synthesized its cancellation result; a later exact
-/// `cancelled` callback is acknowledged but cannot re-open delivery.
-pub async fn discard_ledger_entry_for_cancelled_callback_ack(
-    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
-    key: &str,
-) {
-    let weak = Arc::downgrade(ledger);
-    if let Ok(mut expectations) = ledger_expectations().lock() {
-        let now = Instant::now();
-        if let Some(candidates) = expectations.get_mut(key) {
-            candidates.retain(|candidate| {
-                candidate.ledger.upgrade().is_some()
-                    && now.saturating_duration_since(candidate.registered_at)
-                        <= MAX_LEDGER_ENTRY_AGE
-            });
-            for candidate in candidates.iter_mut() {
-                if Weak::ptr_eq(&candidate.ledger, &weak) {
-                    candidate.cancelled_at = Some(now);
-                }
-            }
-        }
-    }
-    ledger.lock().await.remove(key);
-    if let Ok(mut timestamps) = ledger_timestamps().lock() {
-        timestamps.remove(key);
-    }
-    if let Ok(mut meta) = ledger_meta().lock() {
-        meta.remove(key);
-    }
-}
-
 /// Consume the terminal-only cancellation acknowledgement authority for one
 /// exact edge executor.  Callers must additionally require `status=cancelled`
 /// before accepting a callback through this route.

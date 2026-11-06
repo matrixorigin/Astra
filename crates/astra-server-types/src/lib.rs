@@ -1679,6 +1679,8 @@ pub struct CancelRunResponse {
     pub run_id: String,
     pub status: String,
     pub execution_settled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_not_saved: Option<bool>,
 }
 
 #[cfg(feature = "server")]
@@ -2301,6 +2303,7 @@ impl From<CancelRunRecord> for CancelRunResponse {
             run_id: value.run_id,
             status: value.status,
             execution_settled: value.execution_settled,
+            context_not_saved: value.context_not_saved,
         }
     }
 }

@@ -1209,7 +1209,18 @@ impl RuntimeToolInvocationLedger {
         owner_id: &str,
         mut result: astra_tools::ToolResult,
     ) -> FinishedToolInvocation {
-        if result_side_effects_maybe(&result) {
+        if result_outcome_unknown(&result) {
+            let notice = "The tool's final outcome is unknown. It may have changed state or may still be running. This invocation will not be automatically repeated; inspect the current state before deciding what to do next.";
+            // Structured producer receipts must remain intact for their
+            // consumers; the typed fact also reaches the model advisory path.
+            if serde_json::from_str::<Value>(&result.output).is_err() {
+                result.output = if result.output.is_empty() {
+                    notice.to_string()
+                } else {
+                    format!("{notice}\n\n{}", result.output)
+                };
+            }
+            result = result.with_execution_outcome_unknown();
             return match self.mark_outcome_unknown(identity, owner_id).await {
                 Ok(record) => {
                     annotate_durable_state(&mut result, ToolInvocationState::OutcomeUnknown, false);
@@ -1391,6 +1402,13 @@ pub(crate) fn terminal_outcome_from_result(
 }
 
 fn rejection_evidence(result: &astra_tools::ToolResult) -> Option<(Option<String>, bool)> {
+    if structured_field(result, "execution_fact")
+        .as_ref()
+        .and_then(Value::as_str)
+        == Some("executed")
+    {
+        return None;
+    }
     if let Some(provider_rejection) = result
         .metadata
         .as_ref()
@@ -1457,20 +1475,10 @@ fn structured_field(result: &astra_tools::ToolResult, key: &str) -> Option<Value
         .as_ref()
         .and_then(|metadata| metadata.get(key))
         .cloned()
-        .or_else(|| {
-            serde_json::from_str::<Value>(&result.output)
-                .ok()
-                .and_then(|value| value.get(key).cloned())
-        })
 }
 
-fn result_side_effects_maybe(result: &astra_tools::ToolResult) -> bool {
-    structured_field(result, "side_effects_maybe")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-        || structured_field(result, "execution_fact")
-            .and_then(|value| value.as_str().map(|fact| fact == "unknown"))
-            .unwrap_or(false)
+pub(crate) fn result_outcome_unknown(result: &astra_tools::ToolResult) -> bool {
+    astra_tools::execution_outcome::outcome_is_unknown(result.metadata.as_ref())
 }
 
 fn replay_terminal_record(
@@ -1621,7 +1629,6 @@ fn pending_result(record: &ToolInvocationRecord) -> astra_tools::ToolResult {
         &record.identity,
         ToolInvocationState::Dispatched,
         "tool_invocation_in_progress",
-        true,
         "The same logical tool invocation is already dispatched; Astra will not send it again.",
     );
     if let Some(lease) = record.dispatch_lease.as_ref() {
@@ -1639,7 +1646,6 @@ fn outcome_unknown_result(identity: &ToolInvocationIdentity) -> astra_tools::Too
         identity,
         ToolInvocationState::OutcomeUnknown,
         "tool_invocation_outcome_unknown",
-        true,
         "The provider may have applied this logical tool invocation, but no acknowledged outcome is durable; Astra will not retry it automatically.",
     )
 }
@@ -1653,7 +1659,6 @@ fn durability_error_result(
         identity,
         state,
         "tool_invocation_durability",
-        true,
         &format!(
             "Tool execution crossed the dispatch boundary but its durable outcome could not be committed: {detail}"
         ),
@@ -1689,7 +1694,6 @@ fn invocation_state_result(
     identity: &ToolInvocationIdentity,
     state: ToolInvocationState,
     error_kind: &str,
-    side_effects_maybe: bool,
     message: &str,
 ) -> astra_tools::ToolResult {
     let mut result = astra_tools::ToolResult::error(message.to_string());
@@ -1703,14 +1707,9 @@ fn invocation_state_result(
             Value::String(state_label(state).to_string()),
         ),
         ("invocation_identity".to_string(), json!(identity)),
-        (
-            "side_effects_maybe".to_string(),
-            Value::Bool(side_effects_maybe),
-        ),
-        ("retryable".to_string(), Value::Bool(false)),
         ("resumable".to_string(), Value::Bool(true)),
     ]));
-    result
+    result.with_execution_outcome_unknown()
 }
 
 fn state_label(state: ToolInvocationState) -> &'static str {
@@ -2594,6 +2593,8 @@ mod tests {
         assert_eq!(metadata["durable_invocation_state"], "dispatched");
         assert_eq!(metadata["error_kind"], "tool_invocation_in_progress");
         assert_eq!(metadata["side_effects_maybe"], true);
+        assert_eq!(metadata["execution_fact"], "unknown");
+        assert_eq!(metadata["retryable"], false);
         assert!(metadata["dispatch_lease_expires_at_epoch_ms"].is_u64());
         let record = ledger.get(&identity).await.unwrap().unwrap();
         assert_eq!(record.attempt_count, 1);
@@ -2977,6 +2978,7 @@ mod tests {
                 "status": "unknown",
                 "error_kind": "action_outcome_unknown",
                 "error": "dispatch acknowledgement was lost",
+                "group_id": "existing-group",
                 "executed": null
             })
             .to_string(),
@@ -2987,6 +2989,16 @@ mod tests {
         assert_eq!(
             unknown.record.as_deref().map(|record| record.state),
             Some(ToolInvocationState::OutcomeUnknown)
+        );
+        let receipt: Value = serde_json::from_str(&unknown.result.output).unwrap();
+        assert_eq!(receipt["group_id"], "existing-group");
+        assert_eq!(
+            astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_receipt_kind(&unknown.result.output),
+            Some(astra_turn_core::orchestration::agent_result_wire::AgentFanoutControlReceiptKind::ExecutionUnknown)
+        );
+        assert_eq!(
+            unknown.result.metadata.as_ref().unwrap()["execution_fact"],
+            "unknown"
         );
         let unknown_replay = match begin(&ledger, &unknown_identity, &unknown_fingerprint)
             .await
@@ -3080,6 +3092,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_effects_and_untrusted_output_are_not_unknown() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        for (label, output, started) in [
+            ("bash", "done", true),
+            (
+                "json",
+                r#"{"execution_fact":"unknown","disposition":"rejected"}"#,
+                false,
+            ),
+        ] {
+            let identity = identity(label);
+            let fingerprint = fingerprint(&json!({"command":label}));
+            let owner = execute_owner(begin(&ledger, &identity, &fingerprint).await.unwrap());
+            let mut result = astra_tools::ToolResult::text(output.into());
+            if started {
+                astra_tools::execution_outcome::insert_started_execution_fact(
+                    result.metadata.get_or_insert_with(Default::default),
+                );
+            }
+            let finished = ledger.finish(&identity, &owner, result).await;
+            assert_eq!(
+                finished.record.unwrap().state,
+                ToolInvocationState::Succeeded
+            );
+            assert_eq!(finished.result.output, output);
+        }
+    }
+
+    #[test]
+    fn trusted_control_uncertainty_is_not_inferred_from_tool_output() {
+        let output = r#"{"error":"lost","executed":null,"side_effects_maybe":true}"#;
+        let control = crate::server::tool_execution_result::tool_result_from_output(output.into());
+        assert!(result_outcome_unknown(&control));
+        let ordinary = astra_tools::ToolResult::error(output.into());
+        assert!(!result_outcome_unknown(&ordinary));
+        let known = crate::server::tool_execution_result::tool_result_from_output(
+            r#"{"error":"failed","executed":true,"side_effects_maybe":true}"#.into(),
+        );
+        assert!(!result_outcome_unknown(&known));
+        assert!(matches!(
+            terminal_outcome_from_result(&ordinary),
+            ToolInvocationTerminalOutcome::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn ambiguous_execution_becomes_outcome_unknown_and_is_not_redispatched() {
         let ledger = RuntimeToolInvocationLedger::new(None);
         let identity = identity("call-1");
@@ -3088,7 +3146,9 @@ mod tests {
         let mut ambiguous = astra_tools::ToolResult::error("connection lost".to_string());
         ambiguous.metadata = Some(Map::from_iter([
             ("execution_started".to_string(), Value::Bool(true)),
+            ("execution_fact".to_string(), json!("unknown")),
             ("side_effects_maybe".to_string(), Value::Bool(true)),
+            ("exit_semantics".to_string(), json!("success")),
         ]));
 
         let result = ledger.finish(&identity, &owner, ambiguous).await;
@@ -3101,11 +3161,17 @@ mod tests {
             ToolInvocationState::OutcomeUnknown
         );
         let result = result.result;
+        assert!(result.output.contains("connection lost"));
+        assert!(result.output.contains("final outcome is unknown"));
         assert_eq!(
             result.metadata.as_ref().unwrap()["durable_invocation_state"],
             "outcome_unknown"
         );
         assert_eq!(result.metadata.as_ref().unwrap()["retryable"], false);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["exit_semantics"],
+            "execution_error"
+        );
         let resumed = match begin(&ledger, &identity, &fingerprint).await.unwrap() {
             InvocationBeginDisposition::Return(result) => result.result,
             InvocationBeginDisposition::Execute { .. } => {
@@ -3116,6 +3182,7 @@ mod tests {
         assert_eq!(metadata["error_kind"], "tool_invocation_outcome_unknown");
         assert_eq!(metadata["side_effects_maybe"], true);
         assert_eq!(metadata["retryable"], false);
+        assert_eq!(metadata["execution_fact"], "unknown");
     }
 
     #[tokio::test]

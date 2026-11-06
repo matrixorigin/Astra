@@ -2296,7 +2296,15 @@ pub(crate) fn project_completion_action_text_settlement(state: &mut AgenticLoopS
 
 /// Physical execution custody is independent of task-quality or Work claims.
 pub(crate) fn reject_unsettled_execution_completion(state: &mut AgenticLoopState) -> bool {
-    let reason = if workspace_observation_requires_terminal_incomplete(state) {
+    let partial = state.stall.workspace_observation_quarantine.as_ref().is_some_and(|q| {
+        q.reason == astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::PARTIAL_MUTATION_REASON
+    });
+    let reason = if partial {
+        Some((
+            "workspace update was only partially applied",
+            "Some workspace changes were applied before the tool failed. Review the affected files before continuing.",
+        ))
+    } else if workspace_observation_requires_terminal_incomplete(state) {
         Some((
             "workspace execution ownership is unsettled",
             "Workspace execution could not be confirmed stopped. The available result is preserved as unverified.",
@@ -2315,6 +2323,57 @@ pub(crate) fn reject_unsettled_execution_completion(state: &mut AgenticLoopState
     };
     if let Some((detail, fallback)) = reason {
         mark_workspace_completion_incomplete(state, detail, fallback);
+        let source = state
+            .stall
+            .workspace_observation_quarantine
+            .as_ref()
+            .and_then(|quarantine| quarantine.source_tool_call_id.as_deref())
+            .and_then(|id| {
+                state.stall.tool_call_records.iter().rev().find(|record| {
+                    record.tool_call_id.as_deref() == Some(id)
+                        && record.was_executed()
+                        && !record.ok
+                })
+            });
+        let cause = source
+            .map(|record| {
+                let name: String = record
+                    .name
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+                    .take(80)
+                    .collect();
+                let tool = if name.is_empty() {
+                    "A tool".to_string()
+                } else {
+                    format!("The {name} tool")
+                };
+                if partial {
+                    return format!("{tool} reported a partial update. ");
+                }
+                match record.error_kind {
+                    Some(astra_core::ErrorKind::ToolTimeout) => format!("{tool} timed out. "),
+                    Some(astra_core::ErrorKind::Cancelled) => format!("{tool} was cancelled. "),
+                    _ => format!("{tool} did not return a confirmed result. "),
+                }
+            })
+            .unwrap_or_default();
+        if let Some(interruption) = state.interruption.as_mut() {
+            let checkpoint = if interruption.has_checkpoint {
+                "Progress was saved."
+            } else {
+                "No checkpoint was saved."
+            };
+            interruption.user_message = if partial {
+                format!(
+                    "{cause}Some changes were applied before the tool failed. {checkpoint} Review the affected files and available output before continuing."
+                )
+            } else {
+                format!(
+                    "{cause}Execution could not be confirmed stopped and may have changed state. {checkpoint} Review available output and inspect the current state before retrying."
+                )
+            };
+        }
         true
     } else {
         false
@@ -10772,6 +10831,36 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_notice_identifies_only_its_known_tool_cause() {
+        for (source, names_timeout) in [("timed-out", true), ("other", false)] {
+            let temp = tempfile::tempdir().unwrap();
+            assert!(
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    temp.path()
+                )
+            );
+            let mut state = make_state();
+            state.hooks.workspace_root_hint = Some(temp.path().to_string_lossy().into_owned());
+            state.stall.workspace_observation_quarantine = Some(
+                astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::weak_process_ownership(Some(source.into())),
+            );
+            let mut record = executed_record("bash", false, None);
+            record.tool_call_id = Some("timed-out".into());
+            record.error_kind = Some(astra_core::ErrorKind::ToolTimeout);
+            state.stall.tool_call_records.push(record);
+            assert!(reject_unsettled_execution_completion(&mut state));
+            let message = &state.interruption.as_ref().unwrap().user_message;
+            assert_eq!(
+                message.contains("bash tool timed out"),
+                names_timeout,
+                "{message}"
+            );
+            assert!(message.contains("No checkpoint was saved"), "{message}");
+            assert!(message.contains("inspect the current state"), "{message}");
+        }
+    }
+
+    #[test]
     fn live_weak_receipt_can_settle_current_turn_but_not_restored_authority() {
         let mut state = make_state();
         state.task_profile.mutates_workspace = true;
@@ -10976,6 +11065,14 @@ mod tests {
             Some(
                 astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::PARTIAL_MUTATION_REASON
             )
+        );
+        assert!(reject_unsettled_execution_completion(&mut partial));
+        let message = &partial.interruption.as_ref().unwrap().user_message;
+        assert!(message.contains("partial update"), "{message}");
+        assert!(message.contains("Review the affected files"), "{message}");
+        assert!(
+            !message.contains("could not be confirmed stopped"),
+            "{message}"
         );
     }
 

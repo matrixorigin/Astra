@@ -872,7 +872,7 @@ async fn assert_one_shot_sigint(
             async move {
                 assert_eq!(run, "sigint-run", "cancel only the observed exact run");
                 cancels.fetch_add(1, Ordering::SeqCst);
-                axum::Json(serde_json::json!({"run_id": run, "execution_settled": settled}))
+                axum::Json(serde_json::json!({"run_id": run, "execution_settled": settled, "context_not_saved":true}))
             }
         }));
     use futures_util::StreamExt as _;
@@ -1006,6 +1006,8 @@ async fn assert_one_shot_sigint(
         assert_eq!(json["interruption_reason"], "user_interrupted");
         assert_eq!(json["text"], "observed partial");
         assert_eq!(json["server_terminal_unverified"], false);
+        assert_eq!(json["context_not_saved"], true);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("history could not be saved"));
         // Exercise canonical replay of what the real router committed before
         // publishing the interrupted JSON, not just its display envelope.
         let _journal_root = astra_services::session_journal::JournalDirGuard::new(

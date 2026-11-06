@@ -18,6 +18,7 @@ import {
   planStepResultStatus,
   projectRunWaitingState,
   toolTerminalStatus,
+  cancelledContextObservation,
 } from "./lifecycle-utils";
 
 // ─── useAstraChat ──────────────────────────────────────────────────
@@ -381,6 +382,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
   const toolCallMapRef = useRef(new Map<string, ToolCall>());
   const assistantIdRef = useRef(0);
   const streamGenerationRef = useRef(0);
+  const rootRunIdRef = useRef<string | undefined>(undefined);
   const usageRef = useRef<TokenUsage>({ ...emptyUsage });
   const turnUsageBaseRef = useRef<TokenUsage>({ ...emptyUsage });
 
@@ -441,11 +443,14 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
     switch (event.type) {
       case "session_info":
+        rootRunIdRef.current = event.run_id;
         dispatch({ type: "SET_SESSION_ID", sessionId: event.session_id });
         if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
         break;
 
       case "run_started":
+        if (rootRunIdRef.current && event.run_id && event.run_id !== rootRunIdRef.current) break;
+        rootRunIdRef.current ??= event.run_id;
         applyRunExecutionBoundary();
         if (event.run_id) dispatch({ type: "SET_RUN_ID", runId: event.run_id });
         dispatch({
@@ -878,6 +883,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
 
       case "run_finished":
       case "run_cancelled":
+        if (rootRunIdRef.current && event.run_id && event.run_id !== rootRunIdRef.current) break;
         // Run completion never substitutes for a tool's own result. Live-only
         // cards can be absent from cold replay; discard unresolved presentation.
         for (const [callId, tool] of toolCallMapRef.current) {
@@ -903,8 +909,10 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
           type: "SET_MESSAGES",
           messages: (prev) => {
             const last = prev[prev.length - 1];
-            if (last?.role === "assistant" && last.streaming) {
-              return [...prev.slice(0, -1), { ...last, streaming: false }];
+            if (last?.role === "assistant" && (last.streaming || event.type === "run_finished")) {
+              return [...prev.slice(0, -1), { ...last, streaming: false,
+                ...(event.type === "run_finished" ? { contextNotSaved: cancelledContextObservation(event) } : {}),
+              }];
             }
             return prev;
           },
@@ -942,6 +950,7 @@ export function useAstraChat(config: UseAstraChatConfig): UseAstraChatReturn {
       }
       // Bump generation so processEvent from the previous stream is ignored.
       const generation = ++streamGenerationRef.current;
+      rootRunIdRef.current = undefined;
 
       // Add user message
       const userMsg: ChatMessage = {

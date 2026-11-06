@@ -27,6 +27,7 @@ import { ExplainAnalyzePanel } from "@/components/app/explain-analyze-panel";
 import { IconButton } from "@/components/ui/icon-button";
 import { useToast } from "@/components/ui/toast";
 import { splitThinkingTags } from "@/lib/api/chats";
+import { contextSaveWarning } from "@astra/sdk";
 import type { ChatArtifactRef, ChatMessage } from "@/lib/api/types";
 import { safeArtifactDownloadUrl } from "@/lib/api/stream-artifacts";
 import { isChatScrolledToBottom } from "@/lib/chat-scroll-state";
@@ -194,6 +195,7 @@ export const MessageBubble = memo(function MessageBubble({
     !showReasoning;
   const artifacts = message.artifacts ?? [];
   const hasArtifacts = artifacts.length > 0;
+  const contextWarning = contextSaveWarning(message.contextNotSaved);
   const isSettledEmptyAssistant =
     !isUser &&
     message.status !== "streaming" &&
@@ -201,7 +203,7 @@ export const MessageBubble = memo(function MessageBubble({
     !hasReasoning &&
     !hasArtifacts &&
     !message.explainAnalyzeEvents?.length &&
-    !message.explainAnalyzeDegraded;
+    !message.explainAnalyzeDegraded && !contextWarning;
   const { addToast } = useToast();
   const [copied, setCopied] = useState(false);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -281,6 +283,9 @@ export const MessageBubble = memo(function MessageBubble({
       ) : (
         <MarkdownContent content={content} />
       )}
+      {!isUser && contextWarning ? (
+        <p role="status" className="mt-2 text-sm text-amber-600">{contextWarning}</p>
+      ) : null}
       {message.explainAnalyzeEvents?.length || message.explainAnalyzeDegraded ? (
         <ExplainAnalyzePanel
           events={message.explainAnalyzeEvents ?? []}

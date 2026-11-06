@@ -154,6 +154,10 @@ pub(crate) struct RpcResponse {
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_unknown: Option<bool>,
 }
 
 impl RpcResponse {
@@ -161,12 +165,16 @@ impl RpcResponse {
         Self {
             output: Some(output),
             error: None,
+            retryable: None,
+            outcome_unknown: None,
         }
     }
     pub fn error(msg: String) -> Self {
         Self {
             output: None,
             error: Some(msg),
+            retryable: None,
+            outcome_unknown: None,
         }
     }
 }
@@ -304,6 +312,8 @@ pub(crate) enum RpcOutcome {
     /// Request handled successfully (including policy-rejected requests that
     /// produced error responses).
     Ok,
+    /// A dispatched nested call's outcome was not established.
+    OutcomeUnknown,
     /// The script exceeded `max_tool_calls`. Caller should kill the child.
     ExceededCallLimit,
     /// The parent invocation was cancelled while this connection was being
@@ -515,13 +525,39 @@ pub(crate) async fn handle_rpc_connection(
     // result from flooding the sandbox and triggering an OOM inside it.
     let capped = redact_then_truncate_rpc_output(&result.output, policy.max_response_bytes);
 
-    let response = if result.is_error {
-        RpcResponse::error(capped)
+    let unknown = crate::execution_outcome::outcome_is_unknown(result.metadata.as_ref());
+    let response = if result.is_error || unknown {
+        let mut response = RpcResponse::error(capped);
+        response.retryable = result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("retryable"))
+            .and_then(Value::as_bool);
+        if unknown {
+            response.retryable = Some(false);
+            response.outcome_unknown = Some(true);
+        }
+        response
     } else {
         RpcResponse::success(capped)
     };
 
-    reply_with_cancel(&mut writer, response, cancel_token).await
+    if unknown {
+        reply_with_outcome_and_cancel(
+            &mut writer,
+            response,
+            RpcOutcome::OutcomeUnknown,
+            cancel_token,
+        )
+        .await
+    } else {
+        // A lost response after dispatch leaves the script unable to know
+        // whether repeating the call would repeat its effects.
+        match reply_with_cancel(&mut writer, response, cancel_token).await {
+            RpcOutcome::IoError => RpcOutcome::OutcomeUnknown,
+            other => other,
+        }
+    }
 }
 
 /// Strip newlines from a string before embedding in an error message.

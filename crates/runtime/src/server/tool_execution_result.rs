@@ -27,6 +27,23 @@ fn insert_parsed_work_unit_observation(parsed: Option<&Value>, metadata: &mut Ma
     }
 }
 
+fn insert_control_execution_facts(parsed: Option<&Value>, metadata: &mut Map<String, Value>) {
+    astra_tools::execution_outcome::insert_producer_execution_fact(parsed, metadata);
+    if let Some(parsed) = parsed {
+        for key in ["side_effects_maybe", "retryable"] {
+            if let Some(value) = parsed.get(key).and_then(Value::as_bool) {
+                metadata.insert(key.to_string(), Value::Bool(value));
+            }
+        }
+        if let Some(reason) = parsed.get("reason_kind").and_then(Value::as_str) {
+            metadata.insert("reason_kind".to_string(), Value::String(reason.to_string()));
+        }
+    }
+    if astra_tools::execution_outcome::outcome_is_unknown(Some(metadata)) {
+        metadata.insert("retryable".into(), Value::Bool(false));
+    }
+}
+
 /// Adapt an in-process, host-rendered control response. Provider/file output
 /// remains `ToolResult` data; artifact readers wrap it in a tool-result window
 /// before using this adapter. Only these producer responses can supply facts.
@@ -62,7 +79,7 @@ pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult
     }
     if parsed.is_some() {
         let metadata = result.metadata.get_or_insert_with(Map::new);
-        astra_tools::execution_outcome::insert_producer_execution_fact(parsed.as_ref(), metadata);
+        insert_control_execution_facts(parsed.as_ref(), metadata);
     }
     if let Some(observation) = parsed_work_unit_observation(parsed.as_ref()) {
         let metadata = result.metadata.get_or_insert_with(Map::new);
@@ -177,7 +194,7 @@ pub(crate) fn agent_tool_result_from_output(
     // their producer-owned execution fact must still reach the canonical
     // invocation ledger. In particular, `executed=null` remains outcome
     // unknown and `executed=false` remains a pre-dispatch rejection.
-    astra_tools::execution_outcome::insert_producer_execution_fact(parsed.as_ref(), &mut metadata);
+    insert_control_execution_facts(parsed.as_ref(), &mut metadata);
     insert_parsed_work_unit_observation(parsed.as_ref(), &mut metadata);
     if let Some(result_class) = result_class {
         metadata.insert(
@@ -224,22 +241,6 @@ pub(crate) fn tool_timeout_tool_result(message: String) -> astra_tools::ToolResu
         ),
     ]));
     result
-}
-
-pub(crate) fn annotate_default_executor_cancel_if_needed(
-    tool_name: &str,
-    result: &mut astra_tools::ToolResult,
-) {
-    if !result.is_error || result_metadata_str(result, "error_kind").is_some() {
-        return;
-    }
-    let cancelled_before = format!("Tool '{tool_name}' cancelled before completion");
-    let not_executed = format!("Tool '{tool_name}' not executed: run was cancelled");
-    if result.output != cancelled_before && result.output != not_executed {
-        return;
-    }
-    let execution_started = result.output == cancelled_before;
-    *result = astra_tools::cancelled_tool_result(tool_name, execution_started);
 }
 
 pub(crate) fn workspace_path_mismatch_tool_result(message: String) -> astra_tools::ToolResult {

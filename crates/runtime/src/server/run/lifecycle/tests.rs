@@ -14,7 +14,27 @@ mod trace_ingestion_tests;
 
 #[path = "skill_ledger_tests.rs"]
 mod skill_ledger_tests;
+
+#[path = "provider_rejection_tests.rs"]
+mod provider_rejection_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
+
+#[test]
+fn previous_tool_warning_reaches_the_real_sse_consumer() {
+    use astra_turn_core::chat_turn_sse_dispatch::{
+        ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
+    };
+    let wire = json!({"type": "warning", "code": "previous_tool_outcome_unknown", "message": PREVIOUS_TOOL_ADVISORY});
+    let wire = astra_services::runs::transform_run_event_for_client(wire);
+    let effects = dispatch_chat_turn_sse_event_block(
+        &format!("data: {wire}\n\n"),
+        &mut ChatTurnSseAccum::default(),
+        &mut Vec::new(),
+    );
+    assert!(
+        matches!(effects.as_slice(), [SseRenderEffect::SystemWarning(message)] if message.contains("unconfirmed outcomes") && message.contains("previous tool history"))
+    );
+}
 
 #[tokio::test]
 async fn caught_loop_panic_settles_host_usage_before_returning_error() {
@@ -3417,13 +3437,9 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_rederives_tool_
         24_000
     );
     assert_eq!(state.compaction_effectiveness.last_tokens_freed, 1_500);
-    assert_eq!(
-        state
-            .stall
-            .workspace_observation_quarantine
-            .as_ref()
-            .and_then(|quarantine| quarantine.source_tool_call_id.as_deref()),
-        Some("call-edge")
+    assert!(
+        state.stall.workspace_observation_quarantine.is_none(),
+        "a stale checkpoint must not fence a new Run"
     );
     assert!(!state.compaction_effectiveness.last_was_insufficient);
     assert_eq!(
@@ -36054,10 +36070,7 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             }
         );
         let json = serde_json::to_value(items).unwrap();
-        assert_eq!(
-            json.as_array().unwrap().len(),
-            if cancelled { 1 } else { 2 }
-        );
+        assert_eq!(json.as_array().unwrap().len(), 2);
         assert_eq!(json[0]["kind"], "opening");
         assert_eq!(json[0]["run_id"], run);
         assert_eq!(json[0]["content"], request.message);
@@ -36065,7 +36078,13 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             json[0]["source_event_id"],
             persistence::server_input_source_event_id(&session, &run)
         );
-        if !cancelled {
+        if cancelled {
+            assert_eq!(json[1]["kind"], "cancellation");
+            assert_eq!(json[1]["id"], format!("cancellation:{run}"));
+            assert_eq!(json[1]["run_id"], run);
+            assert_eq!(json[1].get("context_not_saved"), Some(&Value::Null));
+            assert!(json[1].get("item_seq").is_none());
+        } else {
             assert_eq!(json[1]["kind"], "failure");
             assert_eq!(json[1]["id"], format!("failure:{run}"));
             assert_eq!(json[1]["run_id"], run);

@@ -1933,6 +1933,20 @@ fn drain_stream_chunks(
     capture.drain_ready(rx);
 }
 
+fn process_exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .or_else(|| status.signal().map(|signal| 128 + signal))
+    }
+    #[cfg(not(unix))]
+    {
+        status.code()
+    }
+}
+
 fn trim_incomplete_trailing_line(output: &mut String) {
     if output.is_empty() || output.ends_with('\n') || output.ends_with('\r') {
         return;
@@ -2826,7 +2840,7 @@ async fn execute_isolated_with_cancel_impl(
                 } else {
                     settle_process_scope_detailed(cg_path.as_deref(), leader_pid)
                 };
-                exit_code = status.code();
+                exit_code = process_exit_code(&status);
                 break;
             }
             Ok(None) => {}
@@ -2929,10 +2943,10 @@ async fn execute_isolated_with_cancel_impl(
     } = capture;
     let mut stdout = String::from_utf8_lossy(&stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
-    if timed_out || stdout_capped {
+    if timed_out || cancelled || stdout_capped {
         trim_incomplete_trailing_line(&mut stdout);
     }
-    if timed_out || stderr_capped {
+    if timed_out || cancelled || stderr_capped {
         trim_incomplete_trailing_line(&mut stderr);
     }
 
@@ -2957,6 +2971,16 @@ async fn execute_isolated_with_cancel_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_process_is_not_a_successful_exit() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -9 $$"])
+            .status()
+            .expect("start shell");
+        assert_eq!(process_exit_code(&status), Some(137));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

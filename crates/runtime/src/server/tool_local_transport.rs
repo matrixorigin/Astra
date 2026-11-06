@@ -91,11 +91,6 @@ where
                 match tokio::time::timeout(LOCAL_OWNER_CLEANUP_TIMEOUT, execution.as_mut()).await {
                     Ok(settled) => settled,
                     Err(_) => {
-                        if let Some(root) = result_workspace.cwd.as_deref() {
-                            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                                std::path::Path::new(root),
-                            );
-                        }
                         let mut result = cancelled_runtime_tool_result_for_binding(
                             result_workspace,
                             result_executor,
@@ -108,23 +103,8 @@ where
                             result.output.push_str("\n\n");
                         }
                         result.output.push_str(
-                            "Error: cancelled server-local execution did not settle its ownership boundary before the cleanup deadline; the workspace is quarantined and no later writer may be admitted.",
+                            "The executor did not confirm termination before the cleanup deadline. The operation or its child processes may still be running; inspect the workspace before retrying.",
                         );
-                        result
-                            .metadata
-                            .get_or_insert_with(Default::default)
-                            .insert(
-                                "workspace_observation_quarantined".to_string(),
-                                serde_json::Value::Bool(true),
-                            );
-                        // The cancellation contract was violated: dropping
-                        // this future would release the live writer guard
-                        // while descendants may still exist. Retain the
-                        // ownership future as a terminal process-lifetime
-                        // barrier. The sticky unsettled state above ensures
-                        // at most one such terminal owner per workspace and
-                        // prevents every later writer from entering.
-                        std::mem::forget(execution);
                         result.into()
                     }
                 }
@@ -323,7 +303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_deadline_retains_terminal_owner_and_rejects_second_writer() {
+    async fn cleanup_deadline_reports_unknown_and_releases_the_waiter() {
         let workspace = tempfile::tempdir().expect("workspace");
         let started = Arc::new(Notify::new());
         let future_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -360,20 +340,13 @@ mod tests {
             .expect("transport task");
         assert!(result.is_error);
         assert_eq!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("workspace_observation_quarantined"))
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
+            result.metadata.as_ref().unwrap()["execution_fact"],
+            "unknown"
         );
+        assert!(result.output.contains("may still be running"));
         assert!(
-            !future_dropped.load(std::sync::atomic::Ordering::Acquire),
-            "a terminal cleanup deadline must retain, not drop, the live ownership future"
-        );
-        assert_eq!(
-            astra_tools::workspace_observation::workspace_ownership_is_unsettled(workspace.path()),
-            Some(true)
+            future_dropped.load(std::sync::atomic::Ordering::Acquire),
+            "a timed-out waiter must not retain the execution forever"
         );
         assert!(
             astra_tools::workspace_observation::begin_workspace_writer_with_options(
@@ -382,8 +355,8 @@ mod tests {
                 Duration::from_millis(50),
             )
             .await
-            .is_err(),
-            "no second writer may enter after a terminal ownership timeout"
+            .is_ok(),
+            "the user may continue after receiving an honest uncertainty report"
         );
     }
 }

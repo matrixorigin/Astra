@@ -62,8 +62,8 @@ pub enum CanonicalTerminalContext {
     /// Legitimately empty outcome: validate the admitted base without
     /// fabricating an empty conversation turn.
     Unchanged,
-    /// A real control revocation forbids a Context write, even when the Run's
-    /// cancellation and original raw history can still be committed.
+    /// This Run's Context was not saved, while its raw history and terminal
+    /// may still be committed (for example after revocation or a size limit).
     Revoked,
     Unowned,
 }
@@ -199,6 +199,13 @@ impl CanonicalRunTerminalReceipt {
             if let CanonicalTerminalOutcome::Cancelled { origin } = self.outcome {
                 data["cancelled"] = true.into();
                 data["cancellation_origin"] = origin.as_str().into();
+            }
+            match &self.context {
+                CanonicalTerminalContext::Revoked => data["context_not_saved"] = true.into(),
+                CanonicalTerminalContext::Advanced { .. } | CanonicalTerminalContext::Unchanged => {
+                    data["context_not_saved"] = false.into();
+                }
+                CanonicalTerminalContext::Unowned => {}
             }
             if let Some(interruption) = &self.interruption {
                 data["interruption"] = interruption.to_json();
@@ -712,6 +719,7 @@ impl DatabaseRunStateStore {
             context_admission_hash: receipt.context_admission_hash.clone(),
             operation: RunMutationOperation::Terminal,
             session_capture_override: None,
+            prior_unresolved_tool_calls: false,
         }))
     }
 

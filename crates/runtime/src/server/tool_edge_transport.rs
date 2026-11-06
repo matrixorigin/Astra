@@ -543,14 +543,8 @@ async fn try_edge_websocket(
             return EdgeTransportAttempt::TransportDisconnected;
         }
     };
-    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
-        return EdgeTransportAttempt::Delivered(cancelled_runtime_tool_result(
-            request,
-            binding,
-            ToolTransportKind::EdgeWs,
-            true,
-        ));
-    }
+    // A concurrently cancelled caller must not discard an already received
+    // result: the executor's actual response is more informative.
     EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         edge_result.output,
         edge_result.is_error,
@@ -832,25 +826,20 @@ fn delivered_dispatch_result(
     result_json: &str,
     transport: ToolTransportKind,
 ) -> EdgeTransportAttempt {
-    let (output, is_error, tool_result_fields) =
-        match serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json) {
-            Ok(request) => {
-                let is_error =
-                    astra_thin_client::tool_result_status_is_error(&request.status).unwrap_or(true);
-                (request.output, is_error, request.tool_result_fields)
-            }
-            Err(error) => (
-                format!("Error: invalid durable Edge tool result protocol: {error}"),
-                true,
-                None,
-            ),
-        };
-    EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
-        output,
-        is_error,
-        transport,
-        tool_result_fields,
-    ))
+    match serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json) {
+        Ok(request) => {
+            let is_error = astra_thin_client::tool_result_status_is_error(&request.status).unwrap_or(true);
+            EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
+                request.output, is_error, transport, request.tool_result_fields,
+            ))
+        }
+        Err(error) => EdgeTransportAttempt::Delivered(
+            plan.delivered_result_with_fields(
+                format!("Error: the executor returned an invalid result: {error}. The operation may have completed; inspect its effects before retrying."),
+                true, transport, None,
+            ).with_execution_outcome_unknown(),
+        ),
+    }
 }
 
 fn edge_unavailable_result(
