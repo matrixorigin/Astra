@@ -42,6 +42,9 @@ may be compacted while active controls and their immediate dependencies remain
 intact. Provider user-role tool-result envelopes do not start a new human turn
 or expire authority; an expired control must not become active after its expiry
 witness is removed. Invalid or unanchored authority is retained conservatively.
+An incomplete tool group retains minimal evidence of the unknown result across
+canonical projection and compaction. It blocks another model request until a
+new human turn; unmatched calls and internal evidence are never sent upstream.
 If required context alone exceeds the window, the result remains truthfully
 over budget; compaction cannot delete controls to manufacture progress. Tool-call identities,
 opaque extension fields, ordered non-text blocks and artifact recovery handles

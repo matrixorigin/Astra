@@ -79,6 +79,17 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 ## Personal subscription connections
 
+`POST /me/models` also accepts an optional `inference_protocol` for API-key
+models. Set it to `openai_responses` when the provider requires Responses, or
+`openai_compatible` for Chat Completions. Omission uses the provider's default.
+`PUT /me/models/{id}` can change the selection; a successful change checks the
+selected endpoint and invalidates the old thinking observation. Key rotation and
+model checks continue using the configured protocol. The selected value is
+returned in the personal model record; it is independent of provider credentials.
+An omitted `supported_reasoning_efforts` inventory means the provider's complete
+list is unknown. Personal Responses requests may try an Astra-supported effort;
+provider rejection does not cause Astra to change it or retry with another.
+
 The connection-list response includes `management_available`, the authenticated
 principal's personal-management capability. It is independent of whether any
 model already exists and is false for the managed UC model path. The same

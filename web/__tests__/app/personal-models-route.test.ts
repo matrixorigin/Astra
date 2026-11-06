@@ -70,6 +70,12 @@ describe('personal model public routes', () => {
     expect(runtime.post).toHaveBeenCalledWith('/me/models', expect.objectContaining({ api_key: 'synthetic-key', is_default: false }));
     expect(JSON.stringify(await result.json())).not.toContain('synthetic-key');
   });
+  it('passes the selected API format to the model service', async () => {
+    const runtime = client(); auth.mockResolvedValue({ user: { user_id: 'user' }, client: runtime, response: null } as never);
+    const result = await POST(request({ owner_id: 'user', action: 'create', name: 'mine', provider: 'openai', model: 'fixture', api_key: 'synthetic-key', inference_protocol: 'openai_responses', context_window: 128000 }));
+    expect(result.status).toBe(200);
+    expect(runtime.post).toHaveBeenCalledWith('/me/models', expect.objectContaining({ inference_protocol: 'openai_responses' }));
+  });
   it('binds local OAuth to the browser loopback listener', async () => {
     const runtime = client(); auth.mockResolvedValue({ user: { user_id: 'user' }, client: runtime, response: null } as never);
     expect((await POST(request({ owner_id: 'user', action: 'start' }))).status).toBe(200);
