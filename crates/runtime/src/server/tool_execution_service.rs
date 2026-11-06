@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde_json::Map;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use super::tool_admission::{
     ToolAdmissionContext, ToolHiddenReason, resolve_tool_admission_for_binding_with_context,
@@ -684,8 +685,16 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let route = self.routing_decision(&request);
-        self.execute_with_route_and_cancel(request, route, local_transport, cancel_token)
-            .await
+        let span = tracing::info_span!(target: "astra.tool", "tool.exec");
+        crate::server::run_trace::parent_to_active_run(&span);
+        let result = self
+            .execute_with_route_and_cancel(request, route, local_transport, cancel_token)
+            .instrument(span.clone())
+            .await;
+        if result.is_error {
+            astra_logging::trace_context::mark_error(&span);
+        }
+        result
     }
 
     pub(crate) async fn execute_boundary_with_cancel<L, R>(
@@ -698,13 +707,21 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport<R> + ?Sized,
         R: ToolTransportResult,
     {
-        self.execute_with_route_and_cancel(
-            boundary.request().clone(),
-            boundary.route_kind(),
-            local_transport,
-            cancel_token,
-        )
-        .await
+        let span = tracing::info_span!(target: "astra.tool", "tool.exec");
+        crate::server::run_trace::parent_to_active_run(&span);
+        let mut result = self
+            .execute_with_route_and_cancel(
+                boundary.request().clone(),
+                boundary.route_kind(),
+                local_transport,
+                cancel_token,
+            )
+            .instrument(span.clone())
+            .await;
+        if result.result_mut().is_error {
+            astra_logging::trace_context::mark_error(&span);
+        }
+        result
     }
 
     async fn execute_with_route_and_cancel<L, R>(

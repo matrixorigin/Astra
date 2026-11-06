@@ -35118,6 +35118,9 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                         execution_timeout_ms: None,
                         command_timeout_cap_ms: Some(8_000),
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await

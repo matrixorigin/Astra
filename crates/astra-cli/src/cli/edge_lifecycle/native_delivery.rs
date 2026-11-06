@@ -2492,6 +2492,8 @@ for line in sys.stdin:
                     network_allowed: false,
                 },
             )),
+            traceparent: None,
+            tracestate: None,
         }
     }
 
@@ -3121,6 +3123,9 @@ for line in sys.stdin:
                 execution_deadline_unix_ms: Some(unix + 5000),
                 execution_timeout_ms: Some(5000),
                 command_timeout_cap_ms: Some(120_000),
+
+                traceparent: None,
+                tracestate: None,
             };
             ws.send(Message::Text(
                 serde_json::to_string(&request).unwrap().into(),
@@ -3449,6 +3454,9 @@ for line in sys.stdin:
                 ),
                 execution_timeout_ms: Some(15_000),
                 command_timeout_cap_ms: Some(120_000),
+
+                traceparent: None,
+                tracestate: None,
             };
             if scenario == "released" {
                 let mut refused = request.clone();

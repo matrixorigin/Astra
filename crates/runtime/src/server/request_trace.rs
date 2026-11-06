@@ -161,7 +161,15 @@ pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response 
     );
 
     let start = Instant::now();
-    let mut res = next.run(req).instrument(span).await;
+    let carrier = astra_logging::trace_context::Carrier::from_header_values(
+        req.headers()
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok()),
+        req.headers()
+            .get("tracestate")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let mut res = super::run_trace::scope_inbound(carrier, next.run(req).instrument(span)).await;
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     if should_emit_http_access_line(path.as_str()) {

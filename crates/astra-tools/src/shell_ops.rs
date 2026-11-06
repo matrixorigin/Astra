@@ -1478,6 +1478,10 @@ async fn execute_bash_inner(
         return ToolResult::error(error);
     }
     cmd.kill_on_drop(true);
+    // A sandbox process may inherit a stale carrier. This call supplies the
+    // only TRACEPARENT the command is allowed to see.
+    cmd.env_remove("TRACEPARENT");
+    cmd.env_remove("TRACESTATE");
     cmd.envs(environment.iter().map(|(key, value)| (key, value)));
     // Never let a caller-controlled shell startup hook execute in the tool
     // process.

@@ -1,4 +1,4 @@
-//! OTLP trace export (feature `otel`). Enabled when `ASTRA_OTEL_ENABLED=1` or OTLP endpoint env is set.
+//! OTLP trace export (feature `otel`). Enabled only when `OTEL_TRACES_ENABLED=1` and an OTLP endpoint is set.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -22,18 +22,22 @@ fn tracer_provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
     TRACER_PROVIDER.get_or_init(|| Mutex::new(None))
 }
 
-/// Whether OTLP export should be activated (OTel feature compiled in).
+/// Export only when the shared switch and an unpadded `OTEL_EXPORTER_OTLP_ENDPOINT` are both set.
+/// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` alone, a padded endpoint, or `ASTRA_OTEL_ENABLED=1` alone does not enable export.
 pub(crate) fn wants_otel_export() -> bool {
-    if std::env::var("ASTRA_OTEL_ENABLED").ok().as_deref() == Some("1") {
-        return true;
+    if std::env::var("OTEL_TRACES_ENABLED").ok().as_deref() != Some("1") {
+        return false;
     }
-    fn nonempty(name: &str) -> bool {
+    fn accepted(name: &str) -> bool {
         std::env::var(name)
             .ok()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
+            .is_some_and(|value| endpoint_accepted(&value))
     }
-    nonempty("OTEL_EXPORTER_OTLP_ENDPOINT") || nonempty("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+    accepted("OTEL_EXPORTER_OTLP_ENDPOINT")
+}
+
+fn endpoint_accepted(value: &str) -> bool {
+    !value.is_empty() && value == value.trim()
 }
 
 fn build_resource(config: &LogInitConfig<'_>) -> Resource {
@@ -58,6 +62,9 @@ fn install_otlp_tracer(config: &LogInitConfig<'_>) -> Result<SdkTracer, InitErro
         .build()
         .map_err(|e| -> InitError { Box::new(e) })?;
 
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
     let provider = SdkTracerProvider::builder()
         .with_resource(resource)
         .with_batch_exporter(exporter)
@@ -84,11 +91,14 @@ where
     L: Layer<Registry> + Send + Sync + 'static,
 {
     let filter = make_filter(config);
+    // stderr keeps RUST_LOG. Export accepts only the spans this feature creates.
+    // Existing llm_client logs include url and error and must not become OTel events.
+    let otel_filter = EnvFilter::new("astra.run=info,astra.llm=info,astra.tool=info");
     let timer = UtcTime::rfc_3339();
 
     match format {
         LogFormat::Json => Registry::default()
-            .with(otel_layer.with_filter(filter.clone()))
+            .with(otel_layer.with_filter(otel_filter.clone()))
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_timer(timer)
@@ -103,7 +113,7 @@ where
             .try_init()
             .map_err(|e| -> InitError { Box::new(e) }),
         LogFormat::Pretty => Registry::default()
-            .with(otel_layer.with_filter(filter.clone()))
+            .with(otel_layer.with_filter(otel_filter.clone()))
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_timer(timer)
@@ -118,7 +128,7 @@ where
             .try_init()
             .map_err(|e| -> InitError { Box::new(e) }),
         LogFormat::Compact => Registry::default()
-            .with(otel_layer.with_filter(filter.clone()))
+            .with(otel_layer.with_filter(otel_filter))
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_timer(timer)
@@ -144,6 +154,7 @@ pub(crate) fn init_with_otel(config: &LogInitConfig<'_>) -> Result<(), InitError
     let res = registry_with_fmt(config, format, otel_layer);
 
     if res.is_ok() {
+        crate::trace_context::mark_export_ready();
         let name = std::env::var("ASTRA_SERVICE_NAME")
             .ok()
             .filter(|s| !s.is_empty())
@@ -157,9 +168,61 @@ pub(crate) fn init_with_otel(config: &LogInitConfig<'_>) -> Result<(), InitError
         } else {
             tracing::info!(target: "astra.logging", "logging initialized (OTLP + stderr)");
         }
+    } else {
+        shutdown_tracer_provider();
     }
 
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_accepted;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvReset;
+
+    impl Drop for EnvReset {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("OTEL_TRACES_ENABLED");
+                std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+                std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+            }
+        }
+    }
+
+    #[test]
+    fn padded_or_empty_endpoint_is_rejected() {
+        assert!(!endpoint_accepted(""));
+        assert!(!endpoint_accepted(" http://127.0.0.1:4317"));
+        assert!(!endpoint_accepted("http://127.0.0.1:4317 "));
+        assert!(endpoint_accepted("http://127.0.0.1:4317"));
+    }
+
+    #[test]
+    fn only_the_generic_endpoint_enables_export() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _reset = EnvReset;
+        unsafe {
+            std::env::set_var("OTEL_TRACES_ENABLED", "1");
+            std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://127.0.0.1:4317",
+            );
+        }
+        assert!(!super::wants_otel_export());
+        unsafe {
+            std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", " http://127.0.0.1:4317");
+        }
+        assert!(!super::wants_otel_export());
+        unsafe {
+            std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317");
+        }
+        assert!(super::wants_otel_export());
+    }
 }
 
 /// Flush and shutdown the global OpenTelemetry tracer provider.

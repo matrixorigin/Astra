@@ -12,13 +12,16 @@
 //! # OpenTelemetry (cargo feature `otel`)
 //!
 //! Build with `--features otel` on `astra-logging` (or enable the `otel` feature on `astra-runtime` /
-//! `astra-edge`). Export activates when **`ASTRA_OTEL_ENABLED=1`** or when
-//! **`OTEL_EXPORTER_OTLP_ENDPOINT`** / **`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`** is non-empty.
+//! `astra-edge`). Export activates only when **`OTEL_TRACES_ENABLED=1`** and
+//! **`OTEL_EXPORTER_OTLP_ENDPOINT`** is non-empty without surrounding whitespace.
+//! `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `ASTRA_OTEL_ENABLED=1` alone does not enable export.
 //! Standard **`OTEL_*`** resource attributes apply. Call [`shutdown_otel`] on graceful shutdown so
 //! spans flush (`kill -9` may drop tail batches).
 
 #[cfg(feature = "otel")]
 mod otel;
+
+pub mod trace_context;
 
 use std::io::{self, IsTerminal};
 
