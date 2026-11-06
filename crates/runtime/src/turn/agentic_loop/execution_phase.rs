@@ -1522,7 +1522,20 @@ pub(crate) enum CompletionActionBoundary {
 
 pub(crate) fn tool_terminal_requires_followup(state: &AgenticLoopState) -> bool {
     workspace_observation_requires_terminal_incomplete(state)
-        || has_unsettled_side_effecting_outcome(state)
+        // A later tool's success template cannot replace the model's chance to
+        // interpret that result after an earlier invocation went unconfirmed.
+        || state.stall.tool_call_records.iter().any(|record| {
+            record.was_executed()
+                && !record.ok
+                && matches!(
+                    record.error_kind,
+                    Some(
+                        astra_core::ErrorKind::Cancelled
+                            | astra_core::ErrorKind::ToolTimeout
+                            | astra_core::ErrorKind::ToolOutcomeUnknown
+                    )
+                )
+        })
         || missing_explicit_verification_hooks(state)
             .map(|missing| missing.is_some_and(|labels| !labels.is_empty()))
             .unwrap_or(true)
@@ -2297,11 +2310,6 @@ pub(crate) fn reject_unsettled_execution_completion(state: &mut AgenticLoopState
             "execution quarantine prevents the required verification",
             "The available result is preserved, but required verification cannot safely run until execution ownership is reconciled.",
         ))
-    } else if has_unsettled_side_effecting_outcome(state) {
-        Some((
-            "a side-effect-capable invocation has an interrupted or unknown outcome",
-            "An operation was interrupted or its outcome could not be confirmed. The available result is preserved; reconcile its effects before retrying.",
-        ))
     } else {
         None
     };
@@ -2311,28 +2319,6 @@ pub(crate) fn reject_unsettled_execution_completion(state: &mut AgenticLoopState
     } else {
         false
     }
-}
-
-/// A started cancellation or timeout may have left partial effects. Execution
-/// ownership and the owning lifecycle must reconcile it; unrelated successful tools or
-/// generic state observations cannot establish that the operation succeeded.
-fn has_unsettled_side_effecting_outcome(state: &AgenticLoopState) -> bool {
-    state.stall.tool_call_records.iter().any(|record| {
-        record.was_executed()
-            && !record.ok
-            && matches!(
-                record.error_kind,
-                Some(
-                    astra_core::ErrorKind::Cancelled
-                        | astra_core::ErrorKind::ToolTimeout
-                        | astra_core::ErrorKind::ToolOutcomeUnknown
-                )
-            )
-            && crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
-                &record.name,
-                super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
-            )
-    })
 }
 
 /// Convert an exhausted workspace-delivery recovery window into a typed
@@ -9503,36 +9489,6 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn restored_unknown_side_effect_stops_before_another_provider_or_tool() {
-        let mut state = make_state();
-        state.hooks.completion_settlement.latest_provider_text =
-            Some("retained partial evidence".into());
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            runtime_args_full: Some(
-                serde_json::json!({"command":"perform-external-operation"}).to_string(),
-            ),
-            disposition: Some(ToolCallDisposition::Executed),
-            error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
-            ..Default::default()
-        });
-        let allowance = state.max_turns;
-        let mut host = MockHost::new(vec![text_result("must not be called", 1, 1, None)]);
-        let _ = run_agentic_loop_with_host(&mut host, &mut state)
-            .await
-            .unwrap();
-        assert_eq!(host.turn_count(), 0);
-        assert_eq!(state.stall.tool_call_records.len(), 1);
-        assert_eq!(state.max_turns, allowance);
-        assert_eq!(state.final_text, "retained partial evidence");
-        assert_eq!(
-            state.interruption.as_ref().unwrap().kind,
-            InterruptionKind::ExecutionIncomplete
-        );
-    }
-
     fn explicit_verification_action(state: &mut AgenticLoopState) -> CompletionAction {
         if state.stall.tool_call_records.is_empty() {
             state
@@ -9566,47 +9522,6 @@ mod tests {
             .hooks
             .completion_settlement
             .preserve_final_synthesis_wire_surface = true;
-    }
-
-    #[test]
-    fn started_side_effecting_cancellation_cannot_be_rendered_completed() {
-        let mut state = make_state();
-        state.final_text = "installed successfully".to_string();
-        let args = serde_json::json!({
-            "command": "apt-get install -y package",
-            "timeout": 90.0,
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            ms: 90_000,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..ToolCallRecord::default()
-        });
-
-        assert!(reject_unsettled_execution_completion(&mut state));
-        assert!(matches!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(InterruptionKind::ExecutionIncomplete)
-        ));
-        assert_eq!(
-            state.final_text, "installed successfully",
-            "provider text remains partial evidence"
-        );
-        assert!(
-            state
-                .interruption
-                .as_ref()
-                .unwrap()
-                .error_detail
-                .as_deref()
-                .unwrap()
-                .contains("unknown outcome")
-        );
     }
 
     fn attach_llm_progress_receiver(

@@ -490,6 +490,12 @@ observation. The model reports the work and its verification limits. Explicit
 caller-declared verification hooks and canonical Work validation keep their
 own contracts. No prose, generic successful tool or inferred task profile can
 settle an unknown external effect, pending child or newer Work owner.
+When workspace custody permits continuation, an unknown tool result is delivered
+to the model with its execution facts so it can inspect the outcome using
+permitted tools. The invocation ledger does not
+automatically redispatch it, and a later observation does not rewrite that
+invocation as successful. Completing an agent turn is not confirmation that
+the uncertain operation succeeded; workspace ownership remains a separate gate.
 
 The runtime reserves reporting/settlement space inside an explicit allowance.
 When it cannot fit, it preserves partial text and tool facts and closes with a

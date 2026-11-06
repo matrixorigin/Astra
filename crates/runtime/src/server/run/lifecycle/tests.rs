@@ -21283,7 +21283,7 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
 fn incomplete_run_projection_preserves_partial_without_exposing_internal_diagnostics() {
     for detail in [
         "typed completion action was not satisfied",
-        "a side-effect-capable invocation has an interrupted or unknown outcome",
+        "workspace execution ownership is unsettled",
     ] {
         let svc = test_service();
         let request = test_request("partial");

@@ -834,6 +834,13 @@ fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Opt
         "retryable": field("retryable").and_then(Value::as_bool),
         "recovery_evidence": evidence,
     });
+    if execution == "unknown" {
+        // The invocation ledger prevents automatic redelivery, but only the
+        // model can use operation-specific evidence to decide what happened.
+        facts["guidance"] = serde_json::json!(
+            "If this action could change state, its effects may have occurred. Inspect the outcome before repeating it."
+        );
+    }
     facts
         .as_object_mut()
         .unwrap()

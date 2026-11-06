@@ -2405,6 +2405,11 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         // settled the typed obligation; the following host round may legitimately
         // return no descriptor at all.
         if !settled_round_has_failure
+            && state
+                .hooks
+                .completion_settlement
+                .deferred_success_completion
+                .is_some()
             && !super::execution_phase::tool_terminal_requires_followup(state)
             && let Some(completion) = state
                 .hooks

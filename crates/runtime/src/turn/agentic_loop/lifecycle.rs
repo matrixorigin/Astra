@@ -3468,8 +3468,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         }
     }
 
-    // Recovery must not replay an invocation whose physical effects remain
-    // unknown merely because no new tool record has arrived in this process.
+    // Workspace ownership is separate from an invocation's outcome. An
+    // unknown outcome can reach the model when custody permits; unsettled
+    // ownership still prevents access to a workspace that may be in use.
     if super::execution_phase::reject_unsettled_execution_completion(state) {
         try_write_heavy_checkpoint(state);
         return Ok(PreparedTurnIteration::Finished(

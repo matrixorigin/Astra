@@ -1003,47 +1003,8 @@ fn mixed_request_retains_only_its_workspace_completion_owner() {
         .mutation_completion_scope = MutationCompletionScope::Mixed;
 }
 
-#[test]
-fn unrelated_success_cannot_clear_started_cancellation() {
-    for disposition in [ToolCallDisposition::Rejected, ToolCallDisposition::Executed] {
-        let mut state = external_request();
-        state.final_text = "Operation result remains uncertain.".into();
-        let args = json!({"command": "perform-external-operation"}).to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            runtime_args_full: Some(args),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(disposition),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            runtime_args_full: Some(json!({"command": "test -e /tmp/other"}).to_string()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        assert_eq!(
-            reject_unsettled_execution_completion(&mut state),
-            disposition == ToolCallDisposition::Executed
-        );
-        assert_eq!(
-            state.interruption.is_some(),
-            disposition == ToolCallDisposition::Executed
-        );
-        if disposition == ToolCallDisposition::Executed {
-            assert_eq!(
-                state.interruption.as_ref().unwrap().kind,
-                InterruptionKind::ExecutionIncomplete
-            );
-            assert!(!state.final_text.is_empty());
-        }
-    }
-}
-
 #[tokio::test]
-async fn callback_outcome_facts_survive_journaling_and_control_completion() {
+async fn callback_outcome_facts_reach_the_model_before_recovery() {
     // Use the shared producer, not hand-written rejection metadata. This is
     // the same callback body/metadata the CLI sends after cancellation.
     for (started, unknown) in [(false, false), (true, false), (false, true)] {
@@ -1075,11 +1036,20 @@ async fn callback_outcome_facts_survive_journaling_and_control_completion() {
             result.output = "Error: shell acknowledgement lost; reconcile outcome".into();
         }
         result.status = "failed".into();
+        let mut observed =
+            make_edge_tool_with_args("bash", json!({"command": "pwd"}), "/workspace");
+        observed.request_id = "req-bash-observation".into();
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![result], 10, 2, None),
-            text_result("The operation succeeded.", 10, 2, None),
+            edge_tool_result(vec![observed], 10, 2, None),
+            text_result("The operation's outcome is unknown.", 10, 2, None),
         ])
         .with_valid_tools(&["bash"]);
+        if started || unknown {
+            // A successful-tool terminal cannot skip the model's
+            // interpretation of this later observation.
+            host = host.with_stop_after_success_completion("bash", Some("premature success"));
+        }
         let mut state = external_request();
         let _ = run_agentic_loop_with_host(&mut host, &mut state)
             .await
@@ -1094,40 +1064,74 @@ async fn callback_outcome_facts_survive_journaling_and_control_completion() {
             })
         );
         assert_eq!(record.was_executed(), started || unknown);
-        assert_eq!(
-            state.interruption.is_some(),
-            started || unknown,
-            "{record:?}"
+        assert!(
+            !record.ok,
+            "the unrelated observation must not settle the original call"
         );
-        assert_eq!(state.stall.tool_call_records.len(), 1, "no recovery write");
+        assert!(state.stall.tool_call_records[1].ok);
+        assert_eq!(
+            state.stall.tool_call_records.len(),
+            2,
+            "no automatic recovery write"
+        );
+        assert_eq!(host.turn_count(), 3);
+        assert!(state.interruption.is_none(), "{:?}", state.interruption);
+        let model_context = serde_json::to_string(&host.executed_messages[1]).unwrap();
+        assert!(
+            model_context.contains(if started || unknown {
+                "Inspect the outcome before repeating it"
+            } else {
+                "not_executed"
+            }),
+            "{model_context}"
+        );
+        assert_eq!(state.final_text, "The operation's outcome is unknown.");
+        assert_eq!(host.final_output_ready, vec![state.final_text.clone()]);
+
         if started || unknown {
-            let interruption = state.interruption.as_ref().unwrap();
-            assert_eq!(interruption.kind, InterruptionKind::ExecutionIncomplete);
+            // Resume the canonical messages and journal facts produced by the
+            // real first round; a checkpoint must not authorize a replay or
+            // lose the evidence needed by the next provider request.
+            let record = record.clone();
+            state.messages = host.executed_messages[1].clone();
+            let checkpoint = super::super::finalization::build_current_heavy_checkpoint(&mut state)
+                .expect("the active turn can be checkpointed");
+            let checkpoint: astra_pipeline::step_protocol::HeavyCheckpoint =
+                serde_json::from_str(&serde_json::to_string(&checkpoint).unwrap()).unwrap();
+            let mut restored = external_request();
+            restored.messages = checkpoint.messages;
+            restored.stall.tool_call_records =
+                serde_json::from_str(&serde_json::to_string(&[record]).unwrap()).unwrap();
+            let mut resumed = MockHost::new(vec![text_result(
+                "The operation's outcome is unknown.",
+                10,
+                2,
+                None,
+            )])
+            .with_valid_tools(&["bash"]);
+            run_agentic_loop_with_host(&mut resumed, &mut restored)
+                .await
+                .unwrap();
+            assert_eq!(resumed.turn_count(), 1);
+            assert!(resumed.admitted_tool_call_batches.is_empty());
+            assert!(!restored.stall.tool_call_records[0].ok);
             assert!(
-                interruption
-                    .error_detail
-                    .as_deref()
+                serde_json::to_string(&resumed.executed_messages[0])
                     .unwrap()
-                    .contains("interrupted or unknown outcome")
+                    .contains("Inspect the outcome before repeating it")
             );
-            assert!(!record.ok);
-            // Unknown effects close before requesting another provider answer.
-            assert_eq!(host.turn_count(), 1);
-            assert!(!state.final_text.is_empty());
-            assert_ne!(state.final_text, "The operation succeeded.");
-            assert_eq!(host.final_output_ready, vec![state.final_text.clone()]);
         }
     }
 }
 
 #[tokio::test]
-async fn timeout_callback_requires_reconciliation_only_for_started_side_effects() {
+async fn timeout_callback_remains_unconfirmed_after_an_unrelated_observation() {
     // The callback and journal must preserve the executor's timeout and startup
     // facts. A later successful observation cannot settle the earlier operation.
-    for (command, started, incomplete) in [
-        ("perform-external-operation", true, true),
-        ("perform-external-operation", false, false),
-        ("pwd", true, false),
+    for (command, started) in [
+        ("perform-external-operation", true),
+        ("perform-external-operation", false),
+        ("pwd", true),
     ] {
         let mut result = make_edge_tool_with_args("bash", json!({"command": command}), "");
         let fields = result.tool_result_fields.as_mut().unwrap();
@@ -1157,32 +1161,15 @@ async fn timeout_callback_requires_reconciliation_only_for_started_side_effects(
         assert_eq!(record.error_kind, Some(astra_core::ErrorKind::ToolTimeout));
         assert_eq!(record.was_executed(), started);
         assert!(!record.ok);
-        if !incomplete {
-            assert!(
-                state.stall.tool_call_records[1].ok,
-                "the unrelated probe succeeded"
-            );
-        }
-        assert_eq!(state.interruption.is_some(), incomplete, "{record:?}");
-        if incomplete {
-            assert_eq!(
-                state.interruption.as_ref().unwrap().kind,
-                InterruptionKind::ExecutionIncomplete
-            );
-        }
-        assert_eq!(
-            host.turn_count(),
-            if incomplete { 1 } else { 3 },
-            "unknown side effects stop before another tool or provider call"
+        assert!(
+            state.stall.tool_call_records[1].ok,
+            "the unrelated probe succeeded"
         );
+        assert!(state.interruption.is_none(), "{record:?}");
+        assert_eq!(host.turn_count(), 3, "the model can observe and respond");
         assert_eq!(state.max_turns, budget);
-        assert_eq!(
-            state.stall.tool_call_records.len(),
-            if incomplete { 1 } else { 2 }
-        );
-        if !incomplete {
-            assert_eq!(state.final_text, "Preserved partial report.");
-        }
+        assert_eq!(state.stall.tool_call_records.len(), 2);
+        assert_eq!(state.final_text, "Preserved partial report.");
         assert_eq!(host.final_output_ready, vec![state.final_text.clone()]);
     }
 }
