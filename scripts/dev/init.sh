@@ -6,6 +6,8 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/.env"
 . "$PROJECT_ROOT/scripts/lib/env_file.sh"
+. "$PROJECT_ROOT/scripts/lib/container_runtime.sh"
+container_select "$ENV_FILE"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo "❌ .env file not found. Create one first."
@@ -43,6 +45,8 @@ generate_secret() {
     fi
     openssl rand "$@"
 }
+
+update_or_add ASTRA_CONTAINER_ENGINE "$container_engine"
 
 if needs_generated_secret "ASTRA_TOKEN_ENCRYPTION_KEY"; then
     KEY="$(generate_secret -base64 32)"

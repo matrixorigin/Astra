@@ -1,5 +1,9 @@
 # Monitoring Stack
 
+Docker is the default. Native Podman is also supported; see the
+[container runtime guide](../../docs/guides/container-runtimes.md#monitoring-and-direct-compose-commands)
+for the shared entrypoint and engine selection.
+
 Prometheus + Grafana monitoring for Astra.
 
 ## Quick Start

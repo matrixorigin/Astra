@@ -8,22 +8,7 @@ BACKUP_DIR="${BACKUP_DIR:-./backups}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="${BACKUP_DIR}/astra_backup_${TIMESTAMP}.sql"
 
-# Load .env if present so local dev scripts pick up the same explicit secrets.
-if [ -f .env ]; then
-    set -a; source .env; set +a
-fi
-
-if [ -z "${MATRIXONE_PASSWORD:-}" ]; then
-    echo "❌ Error: MATRIXONE_PASSWORD is required (set it explicitly or source .env)"
-    exit 1
-fi
-
-# Database connection
-DB_HOST="${MATRIXONE_HOST:-localhost}"
-DB_PORT="${MATRIXONE_PORT:-6001}"
-DB_USER="${MATRIXONE_USER:-root}"
-DB_PASSWORD="${MATRIXONE_PASSWORD}"
-DB_NAME="${ASTRA_DATABASE:-astra_runtime}"
+. "$(dirname "${BASH_SOURCE[0]}")/database_runtime.sh"
 
 echo "🔄 Starting database backup..."
 echo "   Database: ${DB_NAME}"
@@ -35,33 +20,10 @@ mkdir -p "${BACKUP_DIR}"
 TEMP_BACKUP="${BACKUP_FILE}.tmp"
 trap 'rm -f "${TEMP_BACKUP}"' EXIT
 
-matrixone_container_ids=""
-if command -v docker >/dev/null 2>&1 && \
-   { [ "${DB_HOST}" = "localhost" ] || [ "${DB_HOST}" = "127.0.0.1" ]; }; then
-    matrixone_container_ids="$(docker ps \
-        --filter label=com.docker.compose.service=matrixone \
-        --format '{{.ID}}' 2>/dev/null || true)"
-fi
-matrixone_container_count="$(printf '%s\n' "${matrixone_container_ids}" | sed '/^$/d' | wc -l | tr -d ' ')"
+ops_find_matrixone
 
-# Perform backup
-if [ "${matrixone_container_count}" -eq 1 ]; then
-    echo "   Using local Compose MatrixOne service..."
-    MYSQL_PWD="${DB_PASSWORD}" docker exec -e MYSQL_PWD "${matrixone_container_ids}" \
-        mysqldump -h127.0.0.1 -P6001 -u"${DB_USER}" "${DB_NAME}" > "${TEMP_BACKUP}"
-elif [ "${matrixone_container_count}" -gt 1 ]; then
-    echo "Error: multiple local MatrixOne Compose containers found; stop unused stacks." >&2
-    exit 1
-else
-    if ! command -v mysqldump >/dev/null 2>&1; then
-        echo "Error: mysqldump is required when no local Compose MatrixOne service is available." >&2
-        exit 1
-    fi
-    echo "   Using local mysqldump..."
-    MYSQL_PWD="${DB_PASSWORD}" mysqldump \
-        -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" \
-        "${DB_NAME}" > "${TEMP_BACKUP}"
-fi
+# Write atomically; preserve native client failures without publishing a partial dump.
+ops_database_command mysqldump "$DB_NAME" > "$TEMP_BACKUP"
 
 mv "${TEMP_BACKUP}" "${BACKUP_FILE}"
 
@@ -93,4 +55,5 @@ fi
 
 echo ""
 echo "📋 To restore this backup, run:"
-echo "   ./scripts/ops/restore.sh ${BACKUP_FILE}"
+printf '   ASTRA_CONTAINER_ENGINE=%q ASTRA_OPS_ENV_FILE=%q ./scripts/ops/restore.sh %q\n' \
+    "$container_engine" "$ops_env_file" "$BACKUP_FILE"
