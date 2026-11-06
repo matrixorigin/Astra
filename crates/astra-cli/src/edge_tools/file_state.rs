@@ -243,7 +243,6 @@ impl ToolExecutor {
             .as_ref()
             .map(|content| content_sha256(content.as_bytes()))
             .or_else(|| file_content_sha256(path).ok());
-        let content_line_count = content.as_deref().map(|value| value.lines().count() as u64);
         let cached_content = content.filter(|c| c.len() <= MAX_CACHED_FILE_BYTES);
         let key = self.file_state_key(path);
         let mut overlapped = false;
@@ -257,16 +256,9 @@ impl ToolExecutor {
             } else {
                 Vec::new()
             };
-            let delivered_range = delivered_range.or_else(|| {
-                if is_partial {
-                    return None;
-                }
-                let line_count = content_line_count?;
-                (line_count > 0).then_some(DeliveredLineRange {
-                    start: 1,
-                    end: line_count,
-                })
-            });
+            // Capturing the full preimage establishes edit freshness, not
+            // numbered-line delivery. Only the renderer knows which complete
+            // source lines survived its outline, redaction and output budget.
             if let Some(delivered_range) =
                 delivered_range.filter(|range| range.start > 0 && range.end >= range.start)
             {
@@ -655,6 +647,37 @@ mod tests {
             exe.get_cached_content(&file).as_deref(),
             Some("fn cached() {}\n")
         );
+    }
+
+    #[test]
+    fn captured_preimage_does_not_imply_numbered_line_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        let content = "first\nsecond\n";
+        std::fs::write(&path, content).unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(dir.path());
+        executor.record_read_cached(&path, false, content.into());
+        let key = executor.file_state_key(&path);
+        {
+            let state = executor.file_state.lock().unwrap();
+            assert!(
+                state[&key].full_content_known,
+                "freshness authority is preserved"
+            );
+            assert!(state[&key].delivered_line_ranges.is_empty());
+        }
+        assert!(!executor.record_read_with_delivery_range_cached(
+            &path,
+            true,
+            content.into(),
+            Some(DeliveredLineRange { start: 1, end: 1 })
+        ));
+        assert!(executor.record_read_with_delivery_range_cached(
+            &path,
+            true,
+            content.into(),
+            Some(DeliveredLineRange { start: 1, end: 1 })
+        ));
     }
 
     #[test]

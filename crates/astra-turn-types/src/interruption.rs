@@ -576,17 +576,6 @@ fn summarize_stall_signal_for_user(signal: &str) -> Option<StallSummary> {
             return Some(StallSummary { cause, correction });
         }
     }
-    if signal.starts_with("redundant_reads=") {
-        let count = signal.trim_start_matches("redundant_reads=");
-        return Some(StallSummary {
-            cause: format!(
-                "the run re-read overlapping file ranges {count} time(s) without any intervening edit"
-            ),
-            correction:
-                "reuse the file content already in context instead of reopening overlapping ranges"
-                    .to_string(),
-        });
-    }
     if signal.starts_with("single_tool_streak=") {
         let streak = signal.trim_start_matches("single_tool_streak=");
         return Some(StallSummary {
@@ -1066,7 +1055,7 @@ mod tests {
     fn stall_resume_restricted_tools_are_ignored_on_restore() {
         let json = serde_json::json!({
             "kind": "empty_completion",
-            "stall_signal": "redundant_reads=22",
+            "stall_signal": "exploration_family=read;streak=22",
             "resume_restricted_tools": ["read_file", "grep", "bash"]
         });
 
@@ -1166,7 +1155,7 @@ mod tests {
                 turns_completed: 14,
                 remaining_turns: 0,
                 error_detail: None,
-                stall_signal: Some("redundant_reads=5".to_string()),
+                stall_signal: Some("exploration_family=read;streak=5".to_string()),
                 resume_restricted_tools: Vec::new(),
             },
         );
@@ -1174,7 +1163,7 @@ mod tests {
         assert!(
             record
                 .user_message
-                .contains("re-read overlapping file ranges 5 time(s)")
+                .contains("read exploration family for 5 consecutive rounds")
         );
         assert!(record.user_message.contains("Continue this session"));
 
@@ -1188,7 +1177,7 @@ mod tests {
                 turns_completed: 16,
                 remaining_turns: 134,
                 error_detail: None,
-                stall_signal: Some("redundant_reads=6".to_string()),
+                stall_signal: Some("exploration_family=read;streak=6".to_string()),
                 resume_restricted_tools: Vec::new(),
             },
         );
@@ -1197,7 +1186,7 @@ mod tests {
         assert!(
             record
                 .user_message
-                .contains("re-read overlapping file ranges 6 time(s)")
+                .contains("read exploration family for 6 consecutive rounds")
         );
         assert!(record.user_message.contains("Continue this session"));
     }
@@ -1324,20 +1313,6 @@ mod tests {
         assert!(guidance.contains("5 consecutive rounds"));
         assert!(guidance.contains("reuse the evidence already gathered"));
 
-        // with redundant_reads stall_signal
-        let irj = serde_json::json!({
-            "kind": "budget_exhausted", "resumable": true, "has_checkpoint": true,
-            "tool_calls_completed": 20, "turns_completed": 14, "remaining_turns": 135,
-            "user_message": "[budget_exhausted] 20 tool call(s) completed.",
-            "stall_signal": "redundant_reads=5"
-        });
-        let guidance = build_resume_guidance(&irj).unwrap();
-        assert!(guidance.contains("re-read overlapping file ranges 5 time"));
-        assert!(guidance.contains("already in context"));
-    }
-
-    #[test]
-    fn resume_guidance_various_kinds() {
         // rate_limited
         let irj = serde_json::json!({
             "kind": "rate_limited", "resumable": true, "has_checkpoint": true,

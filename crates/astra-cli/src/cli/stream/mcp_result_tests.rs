@@ -317,15 +317,18 @@ async fn mcp_lost_ack_reconnect_outcomes_preserve_uncertainty_through_callback_a
             record
                 .runtime_advisories
                 .join("\n")
-                .contains("First reconcile the provider's state")
+                .contains("reconcile the provider state or invocation receipt")
         );
         let content = message["content"].as_str().unwrap();
         assert!(content.contains("unknown outcome"), "{content}");
         assert!(
-            content.contains("First reconcile the provider's state"),
+            content.contains("reconcile the provider state or invocation receipt"),
             "{content}"
         );
-        assert!(content.contains("Do NOT retry this operation"), "{content}");
+        assert!(
+            content.contains("Before repeating any state-changing effect"),
+            "{content}"
+        );
         assert!(!content.contains("capability denied"), "{content}");
         assert!(
             !content.contains("retry only with corrected arguments"),
@@ -358,9 +361,12 @@ async fn mcp_acknowledged_rpc_error_preserves_correction_through_callback_and_pi
     let content = message["content"].as_str().unwrap();
     assert!(content.contains("fixture parameter rejection"), "{content}");
     assert!(!content.contains("unknown outcome"), "{content}");
-    assert!(!content.contains("First reconcile"), "{content}");
     assert!(
-        content.contains("Correct the named fields and make one new call"),
+        !content.contains("Before repeating any state-changing effect"),
+        "{content}"
+    );
+    assert!(
+        content.contains("correct the target or named fields, and make one new call"),
         "{content}"
     );
 }

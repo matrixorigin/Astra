@@ -2445,11 +2445,11 @@ mod tests {
                     "expected_result": "One verified result"
                 },
                 "entries": [{
-                    "signal": "read_coverage_overlap",
+                    "signal": "search_fanout",
                     "stage": "observe",
                     "observed_at_round": 2,
                     "evidence_count": 3,
-                    "recommendation": "review_read_coverage"
+                    "recommendation": "narrow_evidence_search"
                 }]
             }
         }))

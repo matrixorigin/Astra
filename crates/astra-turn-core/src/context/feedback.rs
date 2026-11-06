@@ -79,8 +79,6 @@ pub struct RuntimeContextFeedback {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePolicySignal {
     ExplorationFamilyChurn,
-    /// Historical range overlap, not proof that content is unchanged or retained.
-    ReadCoverageOverlap,
     UnresolvedToolOutcomes,
     RejectedToolRequests,
     SearchFanout,
@@ -106,7 +104,6 @@ pub enum RuntimePolicyStage {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePolicyRecommendation {
     TestExactHypothesis,
-    ReviewReadCoverage,
     DiagnoseToolOutcomes,
     RepairToolRequest,
     NarrowEvidenceSearch,
@@ -583,11 +580,11 @@ mod tests {
             expected_result: "The typed frame is projected unchanged".into(),
         };
         let entry = RuntimePolicyFeedbackEntry {
-            signal: RuntimePolicySignal::ReadCoverageOverlap,
+            signal: RuntimePolicySignal::SearchFanout,
             stage: RuntimePolicyStage::Observe,
             observed_at_round: 3,
             evidence_count: 8,
-            recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
+            recommendation: RuntimePolicyRecommendation::NarrowEvidenceSearch,
         };
         let evaluated = |subject, entries| RuntimePolicyFeedbackSet::Evaluated {
             schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,

@@ -1098,6 +1098,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             rec.tool_call_id = Some(execution.id.clone());
             rec.result_artifact = journal_result.artifact.clone();
             rec.error_kind = error_kind;
+            rec.recovery_evidence =
+                super::execute::execution_recovery_evidence(execution.tool_result_fields.as_ref());
             rec.runtime_advisory_artifact = guidance_artifact;
             rec.runtime_advisories = astra_turn_core::tool::result::advisory::advisories(
                 execution.tool_result_fields.as_ref(),

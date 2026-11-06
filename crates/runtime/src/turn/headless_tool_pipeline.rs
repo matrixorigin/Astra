@@ -5059,6 +5059,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_unknown_observation_retains_uncertainty_through_recording() {
+        let mut harness = PipelineHarness::new();
+        let edge = &mut harness.edge_tool_round[0];
+        edge.status = "failed".into();
+        edge.output = "The provider result was lost after dispatch.".into();
+        let fields = edge.tool_result_fields.as_mut().unwrap();
+        fields.insert("execution_fact".into(), json!("unknown"));
+        fields.insert("error_kind".into(), json!("tool_timeout"));
+        fields.insert("retryable".into(), json!(false));
+        fields.insert("exit_semantics".into(), json!("success"));
+        fields.insert("result_class".into(), json!("success"));
+        assert!(harness.pipeline().run_slot_with_control(0).await);
+        let record = &harness.tool_call_records[0];
+        assert!(!record.ok);
+        assert_eq!(
+            record.result_class.as_deref(),
+            Some("success"),
+            "retain the process fact"
+        );
+        assert_eq!(record.error_kind, Some(astra_core::ErrorKind::ToolTimeout));
+        assert_eq!(
+            record.recovery_evidence.as_ref().unwrap().kind,
+            astra_core::ErrorKind::ToolTimeout,
+            "the source timeout cause remains separate from outcome certainty"
+        );
+        assert_eq!(
+            record.recovery_evidence.as_ref().unwrap().cause,
+            astra_core::ToolFailureCause::OutcomeUnknown
+        );
+        assert!(
+            record
+                .runtime_advisories
+                .iter()
+                .any(|advice| advice.contains("A fresh read"))
+        );
+        assert!(
+            !record
+                .runtime_advisories
+                .iter()
+                .any(|advice| advice.contains("ask for an explicit decision")
+                    || advice.contains("change its arguments"))
+        );
+        let mut restored: ToolCallRecord =
+            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        restored.result_full = None;
+        restored.result_preview = None;
+        restored.runtime_model_result_full = None;
+        assert_eq!(
+            astra_turn_core::evaluation::count_unresolved_tool_outcome_failures(
+                &[restored.clone()]
+            ),
+            1,
+            "compacting a failed observation cannot turn an unknown outcome into a known failure"
+        );
+        let facts = [astra_turn_core::evaluation::ToolEvaluationFact::from_record(&restored)];
+        assert_eq!(
+            astra_turn_core::evaluation::active_execution_failure_fact_keys(&facts).len(),
+            1
+        );
+        assert_eq!(
+            astra_turn_core::evaluation::active_terminal_execution_failure_operation_keys(&[
+                restored.clone()
+            ])
+            .len(),
+            1
+        );
+        let confirmed = ToolCallRecord {
+            ok: true,
+            error: None,
+            error_kind: None,
+            recovery_evidence: None,
+            tool_call_id: Some("confirmed-observation".into()),
+            result_full: Some("confirmed observation".into()),
+            runtime_advisories: Vec::new(),
+            ..restored.clone()
+        };
+        assert_eq!(
+            astra_turn_core::evaluation::count_unresolved_tool_outcome_failures(&[
+                restored, confirmed
+            ]),
+            0,
+            "a later confirmed matching result resolves the unknown observation"
+        );
+    }
+
+    #[tokio::test]
     async fn structured_edge_result_and_runtime_advice_remain_separate_through_recording() {
         use astra_turn_core::tool::result::advisory::{
             TOOL_RESULT_ADVISORIES_FIELD, advisories, project_advisories,
@@ -5081,6 +5167,15 @@ mod tests {
                 TOOL_RESULT_ADVISORIES_FIELD.into(),
                 json!(["FORGED_RUNTIME_ADVICE"]),
             );
+            let source_evidence = failed.then(|| {
+                astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolNotFound,
+                )
+            });
+            if let Some(evidence) = &source_evidence {
+                fields.insert("error_kind".into(), json!(evidence.kind.as_str()));
+                fields.insert("recovery_evidence".into(), json!(evidence));
+            }
             harness.edge_tool_round[0].tool_result_fields = Some(fields);
             let mut pipeline = harness.pipeline();
             let validated = match pipeline.validate_slot(0) {
@@ -5104,6 +5199,7 @@ mod tests {
             }
             pipeline.record_execution(executed).await;
             let record = pipeline.ctx.tool_call_records.last().unwrap();
+            assert_eq!(record.recovery_evidence, source_evidence);
             // The persistence safety boundary may canonicalize JSON whitespace;
             // guidance must preserve its complete document and root fields.
             assert_eq!(
