@@ -36021,10 +36021,7 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             }
         );
         let json = serde_json::to_value(items).unwrap();
-        assert_eq!(
-            json.as_array().unwrap().len(),
-            if cancelled { 1 } else { 2 }
-        );
+        assert_eq!(json.as_array().unwrap().len(), 2);
         assert_eq!(json[0]["kind"], "opening");
         assert_eq!(json[0]["run_id"], run);
         assert_eq!(json[0]["content"], request.message);
@@ -36032,7 +36029,13 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
             json[0]["source_event_id"],
             persistence::server_input_source_event_id(&session, &run)
         );
-        if !cancelled {
+        if cancelled {
+            assert_eq!(json[1]["kind"], "cancellation");
+            assert_eq!(json[1]["id"], format!("cancellation:{run}"));
+            assert_eq!(json[1]["run_id"], run);
+            assert_eq!(json[1].get("context_not_saved"), Some(&Value::Null));
+            assert!(json[1].get("item_seq").is_none());
+        } else {
             assert_eq!(json[1]["kind"], "failure");
             assert_eq!(json[1]["id"], format!("failure:{run}"));
             assert_eq!(json[1]["run_id"], run);
