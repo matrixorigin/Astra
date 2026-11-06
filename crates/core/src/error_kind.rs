@@ -662,6 +662,166 @@ impl From<String> for ClassifiedError {
     }
 }
 
+// ── Structured LLM provider error envelope ───────────────────────────────────
+
+/// Structured classification for provider error envelope bodies.
+///
+/// Gateways such as TaaS return
+/// `{"error":{"message","type","param","code","request_id"}}` where
+/// `error.code` (falling back to `error.type`) authoritatively distinguishes
+/// failures that text needles cannot: an HTTP 413 gateway byte limit
+/// (`request_body_too_large`) is a request-size problem, not model context
+/// overflow, and `invalid_request` / `provider_schema_error` are parameter or
+/// schema rejections, not server faults. `context_length_exceeded` is the only
+/// envelope code that means the model's context window was exceeded.
+///
+/// `body` may be the raw JSON body or a message that embeds it after a prefix
+/// (e.g. `"LLM error 413: {json}"`): the whole string is parsed first, then
+/// the suffix starting at the first `{`.
+///
+/// Returns `None` when the body carries no recognized code or type, so
+/// callers fall back to their existing text-needle classification for
+/// upstreams that do not emit structured envelopes.
+#[must_use]
+pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
+    structured_llm_error_code(body).map(|(kind, _)| kind)
+}
+
+/// The whitelisted `error.code` of a provider error envelope, for surfacing
+/// in user-visible failure messages. Only codes that
+/// [`structured_llm_error_kind`] classifies are returned — they are fixed
+/// protocol tokens, never free-text provider diagnostics, so they are safe to
+/// show to users. Returns the classified kind alongside the code.
+#[must_use]
+pub fn structured_llm_error_code(body: &str) -> Option<(ErrorKind, &'static str)> {
+    let error = llm_error_envelope_error(body)?;
+    let token = |key: &str| {
+        error
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+    };
+    // `code` wins when it classifies; OpenAI-compatible envelopes commonly
+    // carry `"code": null` (or omit it), so null/non-string/empty values fall
+    // back to `type`. A present but unrecognized `code` must not block a
+    // recognized `type` either: the envelope is still structured, so the
+    // recognized category (e.g. `invalid_request` on a parameter rejection)
+    // stays authoritative instead of dropping to text-needle guessing. Only
+    // when neither token classifies do callers fall back.
+    token("code")
+        .and_then(llm_error_envelope_code_class)
+        .or_else(|| token("type").and_then(llm_error_envelope_code_class))
+}
+
+/// Classify a single provider error-envelope code token.
+///
+/// This is the same whitelist [`structured_llm_error_code`] applies to
+/// envelope bodies, exposed for boundaries that already hold the bare token
+/// (e.g. the negotiated MOI model gateway contract). Returns the classified
+/// kind alongside the canonical static token; unrecognized codes return
+/// `None` so callers keep their existing fallback.
+#[must_use]
+pub fn llm_error_envelope_code_class(code: &str) -> Option<(ErrorKind, &'static str)> {
+    match code {
+        "context_length_exceeded" => Some((ErrorKind::ContextWindow, "context_length_exceeded")),
+        "request_body_too_large" => Some((ErrorKind::InvalidRequest, "request_body_too_large")),
+        "invalid_request" => Some((ErrorKind::InvalidRequest, "invalid_request")),
+        "provider_schema_error" => Some((ErrorKind::InvalidRequest, "provider_schema_error")),
+        _ => None,
+    }
+}
+
+/// Validate a provider-supplied request id before it crosses into
+/// user-visible errors or structured log fields.
+///
+/// Provider error envelopes are untrusted: an arbitrary `request_id` could
+/// carry echoed credentials, control characters, or unbounded diagnostics.
+/// A character whitelist cannot tell an identifier from a credential —
+/// `sk-proj-secretABC123` is alphanumerics and dashes — so only documented
+/// identifier shapes pass:
+///
+/// - `req_<uuid>` — TaaS and current OpenAI request ids.
+/// - `req_<hex>` — legacy OpenAI request ids (8..=96 hex digits).
+/// - `<uuid>` — bare UUID request ids used by some gateways.
+///
+/// Credential shapes (`sk-…`, `Bearer …`, `AKIA…`), free text, and overlong
+/// values are structurally excluded: they match none of these forms.
+#[must_use]
+pub fn validated_llm_provider_request_id(value: &str) -> Option<String> {
+    const MAX_REQUEST_ID_LEN: usize = 128;
+    const MAX_REQ_HEX_LEN: usize = 96;
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_REQUEST_ID_LEN {
+        return None;
+    }
+    let is_uuid = |token: &str| {
+        token.len() == 36
+            && token.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+    };
+    let valid = if let Some(token) = value.strip_prefix("req_") {
+        is_uuid(token)
+            || ((8..=MAX_REQ_HEX_LEN).contains(&token.len())
+                && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    } else {
+        is_uuid(value)
+    };
+    valid.then(|| value.to_string())
+}
+
+/// Extract `error.request_id` from a provider error envelope body for log
+/// correlation. Same parsing rules as [`structured_llm_error_kind`]; the id
+/// is validated by [`validated_llm_provider_request_id`] before use.
+#[must_use]
+pub fn structured_llm_error_request_id(body: &str) -> Option<String> {
+    let error = llm_error_envelope_error(body)?;
+    validated_llm_provider_request_id(error.get("request_id")?.as_str()?)
+}
+
+/// Whether the body carries a parsed provider error envelope with at least
+/// one machine-readable cause token (`code`, `type`, or `param`).
+///
+/// This is the *presence* responsibility of the envelope boundary, kept
+/// distinct from [`structured_llm_error_code`] (safe diagnostic-token
+/// projection for user-visible messages) and [`structured_llm_error_kind`]
+/// (recovery classification of recognized cause tokens). When machine facts
+/// are present, HTTP status and those facts — never message prose — must
+/// drive the failure kind: an unrecognized structured category is bounded by
+/// the status ladder instead of authorizing context compaction via needle
+/// matching, and only an explicit context-overflow code may claim
+/// [`ErrorKind::ContextWindow`]. A message-only error object is prose in
+/// JSON and does not count.
+#[must_use]
+pub fn has_structured_llm_error_facts(body: &str) -> bool {
+    llm_error_envelope_error(body).is_some_and(|error| {
+        ["code", "type", "param"].iter().any(|key| {
+            error
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|token| !token.trim().is_empty())
+        })
+    })
+}
+
+/// Parse the `error` object of a provider error envelope out of `body`,
+/// accepting either a raw JSON body or a message that embeds the JSON after a
+/// non-JSON prefix (e.g. `"LLM error 413: {...}"`).
+fn llm_error_envelope_error(body: &str) -> Option<serde_json::Value> {
+    let trimmed = body.trim();
+    let value = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .or_else(|| {
+            let start = trimmed.find('{')?;
+            serde_json::from_str::<serde_json::Value>(trimmed.get(start..)?).ok()
+        })?;
+    value.get("error").cloned()
+}
+
 // ── LLM error-message fallback classifier ────────────────────────────────────
 
 /// Boundary fallback for context-window / prompt-too-long provider text.
@@ -1430,6 +1590,254 @@ mod tests {
         assert!(!is_llm_context_window_error("rate limit exceeded"));
         assert!(!is_llm_context_window_error("internal server error"));
         assert!(!is_llm_context_window_error(""));
+    }
+
+    // ── structured_llm_error_kind ──
+
+    #[test]
+    fn structured_llm_error_kind_cases() {
+        let cases: &[(&str, Option<ErrorKind>)] = &[
+            // A 413 gateway byte limit is never model context overflow.
+            (
+                r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            // Only the envelope code may claim context-window overflow.
+            (
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"context_length_exceeded","param":null,"code":"context_length_exceeded","request_id":"req_def456"}}"#,
+                Some(ErrorKind::ContextWindow),
+            ),
+            (
+                r#"{"error":{"message":"unknown parameter 'temperature'","type":"invalid_request","param":"temperature","code":"invalid_request","request_id":"req_ghi789"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            (
+                r#"{"error":{"message":"schema rejected by provider","type":"provider_schema_error","param":"tools","code":"provider_schema_error","request_id":"req_jkl012"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            // error.type is accepted when error.code is absent.
+            (
+                r#"{"error":{"message":"context exceeded","type":"context_length_exceeded"}}"#,
+                Some(ErrorKind::ContextWindow),
+            ),
+            // Embedded in an "LLM error {status}: {json}" string.
+            (
+                r#"LLM error 413: {"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_mno345"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            (
+                r#"LLM error 400: {"error":{"message":"maximum context length exceeded","type":"context_length_exceeded","code":"context_length_exceeded","request_id":"req_pqr678"}}"#,
+                Some(ErrorKind::ContextWindow),
+            ),
+            // A present but unrecognized `code` must not block the recognized
+            // `type`: parameter/output-limit rejections stay InvalidRequest
+            // instead of dropping to context-window text needles.
+            (
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"unsupported_parameter"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            (
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"invalid_value"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            // Both cause tokens unrecognized → still None: no alias
+            // whitelist extension. Presence of machine facts
+            // ([`has_structured_llm_error_facts`]), not this classifier, is
+            // what keeps the prose fallback from reclaiming the envelope.
+            (
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
+                None,
+            ),
+            // No recognized code → caller falls back to needle classification.
+            (
+                r#"{"error":{"message":"rate limited","type":"rate_limit","code":"rate_limit_exceeded"}}"#,
+                None,
+            ),
+            (r#"{"error":{"message":"no code here"}}"#, None),
+            (r#"{"usage":{"tokens":1}}"#, None),
+            // Unstructured text and invalid JSON → fallback.
+            ("maximum context length exceeded", None),
+            ("LLM error 413: not json at all", None),
+            ("", None),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                structured_llm_error_kind(input),
+                *expected,
+                "structured_llm_error_kind({input:?}) should be {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_llm_error_request_id_extraction() {
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_abc123de"}}"#
+            ),
+            Some("req_abc123de".to_string())
+        );
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"LLM error 400: {"error":{"message":"bad param","code":"invalid_request","request_id":"req_def45678"}}"#
+            ),
+            Some("req_def45678".to_string())
+        );
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"error":{"message":"bad param","code":"invalid_request"}}"#
+            ),
+            None
+        );
+        assert_eq!(structured_llm_error_request_id("not json"), None);
+    }
+
+    #[test]
+    fn structured_llm_error_request_id_rejects_untrusted_values() {
+        // Documented identifier shapes pass: TaaS's `req_<hyphenated-uuid>`,
+        // legacy `req_<hex>`, and bare UUID gateway ids.
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"error":{"code":"invalid_request","request_id":"req_3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
+            ),
+            Some("req_3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
+        );
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"error":{"code":"invalid_request","request_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#
+            ),
+            Some("3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string())
+        );
+        // Secret-bearing values must never reach user-visible errors or logs.
+        // A character whitelist cannot tell these credential shapes from an
+        // identifier — only the structural forms above are accepted.
+        for body in [
+            r#"{"error":{"code":"invalid_request","request_id":"Bearer secret-token"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"sk-proj-secretABC123"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"sk-ant-api03-secretABC123"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"AKIAIOSFODNN7EXAMPLE"}}"#,
+            // A `req_` prefix does not rescue a credential-shaped payload.
+            r#"{"error":{"code":"invalid_request","request_id":"req_sk-proj-secretABC123"}}"#,
+            // Control characters and quotes break log/message structure.
+            r#"{"error":{"code":"invalid_request","request_id":"req_ok\u000aevil"}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"req_\"quoted\""}}"#,
+            r#"{"error":{"code":"invalid_request","request_id":"req spaced"}}"#,
+        ] {
+            assert_eq!(
+                structured_llm_error_request_id(body),
+                None,
+                "untrusted request_id must be rejected: {body}"
+            );
+        }
+        // Overlong values are unbounded diagnostics, not identifiers.
+        let overlong = format!(
+            r#"{{"error":{{"code":"invalid_request","request_id":"req_{}"}}}}"#,
+            "a".repeat(256)
+        );
+        assert_eq!(structured_llm_error_request_id(&overlong), None);
+    }
+
+    #[test]
+    fn has_structured_llm_error_facts_detects_machine_tokens() {
+        // Any machine-readable cause token (code, type, or param) marks a
+        // parsed provider error — even when every token is unrecognized and
+        // the classification whitelist yields None.
+        for body in [
+            r#"{"error":{"code":"invalid_value","type":"invalid_request_error","param":"max_tokens","message":"max_tokens is too large; maximum output is 8192"}}"#,
+            r#"{"error":{"code":"some_future_code","type":"some_future_type","message":"x"}}"#,
+            r#"{"error":{"param":"max_tokens","message":"x"}}"#,
+            r#"LLM error 400: {"error":{"type":"invalid_request_error","message":"x"}}"#,
+        ] {
+            assert!(has_structured_llm_error_facts(body), "{body}");
+        }
+        // A message-only error object is prose in JSON; absent envelopes,
+        // unusable token values, and plain text leave the needle fallback in
+        // charge.
+        for body in [
+            r#"{"error":{"message":"maximum context length exceeded"}}"#,
+            r#"{"error":{"code":null,"type":"","param":null,"message":"x"}}"#,
+            r#"{"usage":{"tokens":1}}"#,
+            "maximum context length exceeded",
+            "",
+        ] {
+            assert!(!has_structured_llm_error_facts(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn structured_llm_error_code_is_whitelisted() {
+        // Only fixed protocol tokens are surfaced for user-visible messages;
+        // unrecognized codes yield None so free-text diagnostics never leak.
+        let cases: &[(&str, Option<&str>)] = &[
+            (
+                r#"{"error":{"code":"request_body_too_large","message":"request body too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            (
+                r#"{"error":{"code":"invalid_request","message":"bad param"}}"#,
+                Some("invalid_request"),
+            ),
+            (
+                r#"{"error":{"code":"provider_schema_error","message":"bad shape"}}"#,
+                Some("provider_schema_error"),
+            ),
+            (
+                r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            // type fallback carries the same whitelist.
+            (
+                r#"{"error":{"type":"request_body_too_large","message":"too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            // OpenAI-compatible envelopes commonly carry `"code": null`;
+            // unusable code values fall back to `type`.
+            (
+                r#"{"error":{"code":null,"type":"request_body_too_large","message":"too large"}}"#,
+                Some("request_body_too_large"),
+            ),
+            (
+                r#"{"error":{"code":"","type":"context_length_exceeded","message":"too long"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            (
+                r#"{"error":{"code":123,"type":"invalid_request","message":"bad param"}}"#,
+                Some("invalid_request"),
+            ),
+            // A usable `code` keeps precedence over `type`.
+            (
+                r#"{"error":{"code":"context_length_exceeded","type":"invalid_request","message":"too long"}}"#,
+                Some("context_length_exceeded"),
+            ),
+            // An unrecognized `code` defers to a recognized `type`; the
+            // surfaced token is the one that classified.
+            (
+                r#"{"error":{"code":"unsupported_parameter","type":"invalid_request","message":"max_tokens is too large; maximum output is 8192"}}"#,
+                Some("invalid_request"),
+            ),
+            // Both tokens unrecognized → None, preserving the caller
+            // text fallback.
+            (
+                r#"{"error":{"code":"unsupported_parameter","type":"some_new_type","message":"x"}}"#,
+                None,
+            ),
+            (
+                r#"{"error":{"code":"invalid_value","type":"invalid_request_error","message":"max_tokens is too large; maximum output is 8192"}}"#,
+                None,
+            ),
+            (
+                r#"{"error":{"code":"internal_error: db conn 10.0.0.1 refused","message":"x"}}"#,
+                None,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                structured_llm_error_code(input).map(|(_, code)| code),
+                *expected,
+                "structured_llm_error_code({input:?}) should be {expected:?}"
+            );
+        }
     }
 
     #[test]

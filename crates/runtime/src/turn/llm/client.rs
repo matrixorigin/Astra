@@ -79,6 +79,25 @@ struct ProviderHttpRejection {
     retryable: bool,
 }
 
+/// Append the validated provider-envelope cause (whitelisted code and/or
+/// request id) to a bounded base message. Free-text provider diagnostics
+/// never cross this boundary: only fixed protocol tokens and validated
+/// request ids are surfaced (#19075).
+fn append_envelope_cause(
+    base: String,
+    envelope: Option<(astra_core::ErrorKind, &'static str)>,
+    request_id: Option<&str>,
+) -> String {
+    match (envelope, request_id) {
+        (Some((_, code)), Some(request_id)) => {
+            format!("{base} ({code}, request_id={request_id})")
+        }
+        (Some((_, code)), None) => format!("{base} ({code})"),
+        (None, Some(request_id)) => format!("{base} (request_id={request_id})"),
+        (None, None) => base,
+    }
+}
+
 /// Parse only the versioned envelope emitted by the trusted MOI model gateway.
 /// The provider message is deliberately ignored: only bounded machine fields
 /// cross the provider boundary, so echoed prompts, credentials, and arbitrary
@@ -109,6 +128,24 @@ fn moi_model_gateway_error(
         .get("action")
         .and_then(Value::as_str)
         .filter(|action| astra_services::models::is_safe_moi_model_gateway_error_code(action));
+    // The negotiated envelope may carry the upstream (TaaS) request id for
+    // provider-caused rejections. It is provider-supplied, so it only crosses
+    // after the same bounded validation as direct-provider envelope ids.
+    let request_id = error
+        .get("request_id")
+        .and_then(Value::as_str)
+        .and_then(astra_core::validated_llm_provider_request_id);
+    // Envelope protocol tokens (context_length_exceeded,
+    // request_body_too_large, …) classify authoritatively; gateway-owned
+    // codes map to their dedicated kinds; anything else stays unknown.
+    let kind = astra_core::llm_error_envelope_code_class(code)
+        .map(|(kind, _)| kind)
+        .unwrap_or_else(|| match code {
+            "provider_quota_exhausted" => astra_core::ErrorKind::ProviderQuotaExhausted,
+            "provider_forbidden" => astra_core::ErrorKind::ProviderForbidden,
+            "provider_authentication_failed" => astra_core::ErrorKind::Auth,
+            _ => astra_core::ErrorKind::Unknown,
+        });
     let mut details = json!({
         "source": astra_services::models::MOI_MODEL_GATEWAY_ERROR_SOURCE,
         "http_status": status,
@@ -118,17 +155,17 @@ fn moi_model_gateway_error(
     if let Some(action) = action {
         details["action"] = Value::String(action.to_string());
     }
+    if let Some(request_id) = &request_id {
+        details["request_id"] = Value::String(request_id.clone());
+    }
+    let message = append_envelope_cause(
+        format!("MOI model gateway rejected inference: {code}"),
+        None,
+        request_id.as_deref(),
+    );
     Some(ProviderHttpRejection {
-        classified: astra_core::ClassifiedError::new(
-            match code {
-                "provider_quota_exhausted" => astra_core::ErrorKind::ProviderQuotaExhausted,
-                "provider_forbidden" => astra_core::ErrorKind::ProviderForbidden,
-                "provider_authentication_failed" => astra_core::ErrorKind::Auth,
-                _ => astra_core::ErrorKind::Unknown,
-            },
-            format!("MOI model gateway rejected inference: {code}"),
-        )
-        .with_details_json(details.to_string()),
+        classified: astra_core::ClassifiedError::new(kind, message)
+            .with_details_json(details.to_string()),
         retryable,
     })
 }
@@ -6310,13 +6347,7 @@ async fn call_prepared_llm_with_total_budget(
         let request_id = headers
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())
-            .filter(|value| {
-                value.strip_prefix("req_").is_some_and(|suffix| {
-                    (8..=96).contains(&suffix.len())
-                        && suffix.bytes().all(|b| b.is_ascii_hexdigit())
-                })
-            })
-            .map(str::to_owned);
+            .and_then(astra_core::validated_llm_provider_request_id);
 
         let remaining = total_budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -6401,6 +6432,15 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
+        // TaaS-style error envelopes carry a per-request id; surface it as a
+        // structured field on provider HTTP error logs for cross-system
+        // correlation. Empty when the body has no structured envelope.
+        let body_request_id = astra_core::structured_llm_error_request_id(&text);
+        // The whitelisted envelope code (a fixed protocol token) classifies
+        // the failure authoritatively and is the only provider-supplied cause
+        // allowed into user-visible messages besides the validated request id.
+        let envelope_code = astra_core::structured_llm_error_code(&text);
+
         let direct_access_error = (subscription.is_none()
             && !uses_moi_model_gateway_error_contract(header_overrides)
             && model_gateway_error_contract.is_none())
@@ -6440,12 +6480,16 @@ async fn call_prepared_llm_with_total_budget(
             || compatible_bad_request
         {
             let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            let code = body
-                .pointer("/error/code")
-                .and_then(Value::as_str)
-                .and_then(astra_core::model_wire::responses::provider_error)
-                .map(|(code, _)| code)
-                .unwrap_or("invalid_request");
+            // The structured envelope code is authoritative when present; the
+            // Responses allowlist below only maps a few protocol codes and
+            // would otherwise replace real causes (e.g. provider_schema_error)
+            // with a generic invalid_request.
+            let code = envelope_code.map(|(_, code)| code).or_else(|| {
+                body.pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .and_then(astra_core::model_wire::responses::provider_error)
+                    .map(|(code, _)| code)
+            });
             let parameter = body
                 .pointer("/error/param")
                 .and_then(Value::as_str)
@@ -6466,6 +6510,10 @@ async fn call_prepared_llm_with_total_budget(
                             | "max_output_tokens"
                     )
                 });
+            // Prefer the envelope's request id (TaaS issues req_<uuid> ids the
+            // header filter cannot see); the validated header id is the
+            // fallback for upstreams that only set x-request-id.
+            let correlation_id = body_request_id.as_deref().or(request_id.as_deref());
             let rejected_effort = (is_responses
                 && matches!(status, 400 | 422)
                 && matches!(
@@ -6484,29 +6532,45 @@ async fn call_prepared_llm_with_total_budget(
                     effort,
                 )
             });
-            let message = if let Some(effort) = rejected_effort {
-                format!(
-                    "The model provider rejected the {effort} reasoning setting. Choose another setting or Model default."
-                )
-            } else {
-                parameter.map_or_else(
-                    || format!("Model provider rejected the request (HTTP {status})"),
-                    |parameter| {
-                        format!("Model provider rejected parameter {parameter} (HTTP {status})")
-                    },
-                )
-            };
+            let message = append_envelope_cause(
+                if let Some(effort) = rejected_effort {
+                    format!(
+                        "The model provider rejected the {effort} reasoning setting. Choose another setting or Model default."
+                    )
+                } else {
+                    parameter.map_or_else(
+                        || format!("Model provider rejected the request (HTTP {status})"),
+                        |parameter| {
+                            format!("Model provider rejected parameter {parameter} (HTTP {status})")
+                        },
+                    )
+                },
+                envelope_code,
+                correlation_id,
+            );
             Some(ProviderHttpRejection {
                 classified: astra_core::ClassifiedError::new(
-                    if status == 400 && astra_core::is_llm_context_window_error(&text) {
+                    if let Some((kind, _)) = envelope_code {
+                        // Structured envelopes (e.g. TaaS) are authoritative:
+                        // a 413 gateway byte limit is not context overflow.
+                        kind
+                    } else if status == 400
+                        && !astra_core::has_structured_llm_error_facts(&text)
+                        && astra_core::is_llm_context_window_error(&text)
+                    {
+                        // Prose needle matching is only for upstreams without
+                        // machine-readable error facts: a parsed provider
+                        // error with an unrecognized cause is bounded by the
+                        // HTTP status below, never re-read as context overflow
+                        // and funneled into compaction.
                         astra_core::ErrorKind::ContextWindow
                     } else {
-                        provider_http_error_kind(status, code)
+                        provider_http_error_kind(status, code.unwrap_or("invalid_request"))
                     },
                     message,
                 )
                 .with_details_json(
-                    json!({"source": if is_responses {"responses"} else {"openai_compatible"},"http_status":status,"code":code,"parameter":parameter,"request_id":request_id})
+                    json!({"source": if is_responses {"responses"} else {"openai_compatible"},"http_status":status,"code":code.unwrap_or("invalid_request"),"parameter":parameter,"request_id":correlation_id})
                         .to_string(),
                 ),
                 retryable: status >= 500,
@@ -6545,11 +6609,18 @@ async fn call_prepared_llm_with_total_budget(
         // leaking secrets that providers may echo back. Retain body for 5xx
         // (helpful for diagnosing transient backend failures) and the 400
         // context-window check below (which still needs to inspect text).
-        last_err = if is_responses || (400..500).contains(&status) {
+        let base_err = if is_responses || (400..500).contains(&status) {
             format!("LLM request rejected: {status}")
         } else {
             format!("LLM error {status}: {text}")
         };
+        // Terminal paths (429/529 exhaustion, generic 4xx) still name the
+        // validated envelope cause so the returned failure correlates with
+        // provider-side logs instead of a bare status (#19075). The body id
+        // wins; the validated header id is the fallback so header-only
+        // providers still correlate after retries are exhausted.
+        let terminal_request_id = body_request_id.as_deref().or(request_id.as_deref());
+        last_err = append_envelope_cause(base_err.clone(), envelope_code, terminal_request_id);
 
         // Record rate-limit errors to cooldown tracker
         if is_rate_limit_status(status) {
@@ -6560,8 +6631,10 @@ async fn call_prepared_llm_with_total_budget(
 
             let tpm_exhaustion = is_tpm_exhaustion(&text);
             if tpm_exhaustion {
-                astra_core::agent_warn!(
-                    "llm",
+                tracing::warn!(
+                    target: "astra.agent",
+                    component = "llm",
+                    request_id = terminal_request_id.unwrap_or(""),
                     "TPM exhaustion detected on {} — applying {}s retry delay",
                     model_key,
                     TPM_EXHAUST_DELAY_MS / 1000
@@ -6569,8 +6642,10 @@ async fn call_prepared_llm_with_total_budget(
             }
 
             let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms));
-            astra_core::agent_warn!(
-                "llm",
+            tracing::warn!(
+                target: "astra.agent",
+                component = "llm",
+                request_id = terminal_request_id.unwrap_or(""),
                 "rate limit (429) on {}: action={:?}",
                 model_key,
                 action,
@@ -6596,8 +6671,10 @@ async fn call_prepared_llm_with_total_budget(
             finish_observed_provider_error(attempt_observer, observed_attempt, &observed_error)
                 .await?;
             let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms));
-            astra_core::agent_warn!(
-                "llm",
+            tracing::warn!(
+                target: "astra.agent",
+                component = "llm",
+                request_id = terminal_request_id.unwrap_or(""),
                 "server overload ({status}) on {}: action={:?}",
                 model_key,
                 action,
@@ -6622,8 +6699,38 @@ async fn call_prepared_llm_with_total_budget(
             continue;
         }
 
-        // Context-window errors — classified at source, no string prefix needed.
-        if status == 400 && astra_core::is_llm_context_window_error(&text) {
+        // Structured provider error envelopes (e.g. TaaS) carry an
+        // authoritative code: a 413 gateway byte limit is a request-size
+        // problem, never model context overflow. Keep the raw body out of
+        // these messages, matching the 4xx suppression above — but surface
+        // the whitelisted envelope code (a fixed protocol token) and the
+        // request id so the user-visible failure names the real cause and
+        // stays correlatable with provider-side logs (#19075). The 400
+        // context-window branch below keeps its pre-existing raw-body
+        // diagnostics; recognizing context_length_exceeded at any other
+        // status must not smuggle the provider body (and any echoed
+        // credentials) past that boundary.
+        if let Some((kind, _)) = envelope_code {
+            if !(kind == astra_core::ErrorKind::ContextWindow && status == 400) {
+                let message = append_envelope_cause(base_err, envelope_code, terminal_request_id);
+                let error = astra_core::ClassifiedError::new(kind, message);
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
+        }
+
+        // Context-window errors — classified at source, no string prefix
+        // needed. An explicit context-overflow envelope code stays
+        // authoritative; prose needle matching is only for upstreams without
+        // machine-readable error facts, so a parsed parameter rejection with
+        // an unrecognized cause is bounded by the status ladder below
+        // instead of authorizing compaction via message matching.
+        let context_overflow = matches!(
+            envelope_code,
+            Some((astra_core::ErrorKind::ContextWindow, _))
+        ) || (!astra_core::has_structured_llm_error_facts(&text)
+            && astra_core::is_llm_context_window_error(&text));
+        if status == 400 && context_overflow {
             let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContextWindow,
                 format!("LLM error {status}: {text}"),
@@ -8408,6 +8515,9 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 return Err(error);
             }
         };
+        // Negotiated MOI model-gateway boundary, same owner as the streaming
+        // path: only the bounded envelope (whitelisted code, validated
+        // request id) crosses — provider text and credentials never do.
         if let Some(rejection) = moi_model_gateway_error(
             status,
             &text,
@@ -8852,7 +8962,20 @@ fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
         ErrorKind::RateLimit
     } else if status >= 500 {
         ErrorKind::ServerError
-    } else if status == 400 && astra_core::is_llm_context_window_error(body) {
+    } else if let Some(kind) = astra_core::structured_llm_error_kind(body) {
+        // Structured envelopes (e.g. TaaS) are authoritative: a 413 gateway
+        // byte limit is a request-size problem, never context overflow.
+        kind
+    } else if status == 400
+        && !astra_core::has_structured_llm_error_facts(body)
+        && astra_core::is_llm_context_window_error(body)
+    {
+        // Prose needle matching is only for upstreams without
+        // machine-readable error facts: a parsed provider error with an
+        // unrecognized cause is bounded by the status ladder (400 →
+        // InvalidRequest), never re-read as context overflow and funneled
+        // into compaction. Only an explicit context-overflow code (above)
+        // may claim ContextWindow once structured facts are present.
         ErrorKind::ContextWindow
     } else if status == 400 {
         ErrorKind::InvalidRequest
@@ -17088,12 +17211,678 @@ mod tests {
         .await
         .expect_err("should fail with context window");
         assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
-        assert_eq!(
-            err.message,
-            "Model provider rejected the request (HTTP 400)"
+        // The whitelisted envelope code names the cause; the free-text
+        // provider message stays out of the user-visible error.
+        assert!(
+            err.message.contains("context_length_exceeded"),
+            "unexpected message: {}",
+            err.message
         );
+        assert!(!err.message.contains("maximum context length is 128000"));
         let details: Value = serde_json::from_str(err.details_json.as_deref().unwrap()).unwrap();
         assert_eq!(details["code"], "context_length_exceeded");
+    }
+
+    /// Mock server that returns 413 with a TaaS-style request_body_too_large
+    /// envelope: the gateway byte limit, not model context overflow.
+    async fn mock_413_request_body_too_large() -> Response {
+        let body = r#"{"error":{"message":"request body too large","type":"request_body_too_large","param":null,"code":"request_body_too_large","request_id":"req_0123456789abcdef"}}"#;
+        Response::builder()
+            .status(413)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_classifies_gateway_body_limit_as_invalid_request() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route("/chat/completions", post(mock_413_request_body_too_large));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    inference_protocol: None,
+                    response_scope: None,
+                    subscription: None,
+                    fixed_temperature: None,
+                    supported_reasoning_efforts: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("should fail with invalid request");
+        // The gateway byte limit must never be attributed to the model
+        // context window (which would trigger the compaction funnel).
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
+        // The raw 4xx body stays suppressed; the whitelisted envelope code
+        // and request id still name the real cause and correlate the failure
+        // with provider-side logs (#19075).
+        assert_eq!(
+            err.message,
+            "LLM request rejected: 413 (request_body_too_large, request_id=req_0123456789abcdef)"
+        );
+    }
+
+    /// Minimal primary-agent chat-completions call against a mock `base`.
+    fn collect_call<'a>(base: &'a str, messages: &'a [Value]) -> LlmCall<'a> {
+        LlmCall {
+            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            messages,
+            tools: &[],
+            cache_capability: None,
+            route: LlmExecutionRoute {
+                inference_protocol: None,
+                response_scope: None,
+                subscription: None,
+                fixed_temperature: None,
+                supported_reasoning_efforts: None,
+                thinking_protocol: None,
+                model_name: "m",
+                wire_model_name: None,
+                api_key: "k",
+                base_url: base,
+                provider: "openai",
+                header_overrides: None,
+                request_body_overrides: None,
+                completions_url_override: None,
+                request_timeout: None,
+            },
+            max_output_tokens: None,
+            temperature: None,
+            thinking: &ThinkingConfig::Off,
+        }
+    }
+
+    /// Mock server that returns 400 with a TaaS-style invalid_request
+    /// envelope carrying a hyphenated-uuid request id.
+    async fn mock_400_invalid_request_envelope() -> Response {
+        let body = r#"{"error":{"message":"unknown parameter: secret-provider-detail","type":"invalid_request","param":"temperature","code":"invalid_request","request_id":"req_3fa85f64-5717-4562-b3fc-2c963f66afa6"}}"#;
+        Response::builder()
+            .status(400)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_names_validated_cause_on_direct_400() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route("/chat/completions", post(mock_400_invalid_request_envelope));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("should fail with invalid request");
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
+        // The early-return branch names the whitelisted envelope code and the
+        // validated req_<uuid> id; the free-text provider message stays hidden.
+        assert!(err.message.contains("invalid_request"), "{}", err.message);
+        assert!(
+            err.message
+                .contains("req_3fa85f64-5717-4562-b3fc-2c963f66afa6"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("temperature"), "{}", err.message);
+        assert!(!err.message.contains("secret-provider-detail"));
+        let details: Value = serde_json::from_str(err.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["code"], "invalid_request");
+        assert_eq!(
+            details["request_id"],
+            "req_3fa85f64-5717-4562-b3fc-2c963f66afa6"
+        );
+    }
+
+    /// Mock provider: 400 with a parsed parameter rejection whose envelope
+    /// tokens are *both* unrecognized (`invalid_value` /
+    /// `invalid_request_error`) — the reviewer's retained probe payload.
+    /// No whitelist entry rescues this; only the presence of machine facts
+    /// keeps the prose out of the classification.
+    async fn mock_400_invalid_value_max_tokens() -> Response {
+        Response::builder()
+            .status(400)
+            .body(Body::from(
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_structured_facts_preempt_context_prose() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route("/chat/completions", post(mock_400_invalid_value_max_tokens));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("should fail with invalid request");
+        // A parsed provider error with unrecognized cause tokens is bounded
+        // by the HTTP status and machine facts (400 + param=max_tokens →
+        // InvalidRequest); the message prose must not re-read this
+        // parameter/output-limit rejection as context overflow — compaction
+        // cannot correct it.
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(err.message.contains("max_tokens"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn call_llm_nonstream_structured_facts_preempt_context_prose() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route("/chat/completions", post(mock_400_invalid_value_max_tokens));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let error = call_llm_nonstream(
+            global_llm_client(),
+            collect_call(&base, &messages),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("parameter rejection must fail the non-stream call");
+        // The shared non-stream classifier applies the same boundary:
+        // structured facts present → status-driven kind, never prose.
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    }
+
+    /// Mock provider: 400 whose envelope tokens are unrecognized *and* whose
+    /// message is genuine context-window prose. Presence of machine facts
+    /// must still bound the cause by HTTP status — a provider rewording its
+    /// parameter rejection cannot turn it into conversation compaction.
+    async fn mock_400_unrecognized_facts_context_prose() -> Response {
+        Response::builder()
+            .status(400)
+            .body(Body::from(
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"some_future_type","param":null,"code":"some_future_code"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_nonstream_unrecognized_facts_bound_context_prose() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_400_unrecognized_facts_context_prose),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let error = call_llm_nonstream(
+            global_llm_client(),
+            collect_call(&base, &messages),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("unrecognized structured cause must fail the non-stream call");
+        // Even maximal context-window prose does not authorize compaction
+        // once machine-readable facts are present; only an explicit
+        // context_length_exceeded code may do that.
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    }
+
+    /// Mock server that returns 413 with a context_length_exceeded envelope
+    /// whose free-text message carries an echoed credential.
+    async fn mock_413_context_window_with_secret() -> Response {
+        let body = r#"{"error":{"message":"Bearer secret-token","type":"context_length_exceeded","code":"context_length_exceeded","request_id":"req_0f9e8d7c-6b5a-4938-a7b6-c5d4e3f2a1b0"}}"#;
+        Response::builder()
+            .status(413)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_context_envelope_at_non_400_suppresses_body() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_413_context_window_with_secret),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("should fail with context window");
+        // The kind still feeds the compaction funnel, but the provider body —
+        // including echoed credentials — must not cross at a non-400 status.
+        assert_eq!(err.kind, astra_core::ErrorKind::ContextWindow);
+        assert!(
+            err.message.contains("context_length_exceeded"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains("req_0f9e8d7c-6b5a-4938-a7b6-c5d4e3f2a1b0"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("Bearer secret-token"));
+    }
+
+    /// Mock server that always returns 429 with a structured envelope: the
+    /// code is not a whitelisted protocol token, but the request id must
+    /// still correlate the terminal rate-limit failure.
+    async fn mock_429_envelope_always(State(Hit(c)): State<Hit>) -> Response {
+        c.fetch_add(1, Ordering::SeqCst);
+        let body = r#"{"error":{"message":"slow down: secret-provider-detail","code":"rate_limit_exceeded","request_id":"req_1a2b3c4d-5e6f-7890-abcd-ef1234567890"}}"#;
+        Response::builder()
+            .status(429)
+            .header("retry-after", "0")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_exhausted_429_names_request_id() {
+        reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_429_envelope_always))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("persistent 429 must exhaust the model call");
+        assert_eq!(err.kind, astra_core::ErrorKind::RateLimit);
+        // The terminal failure keeps the validated request id even though the
+        // envelope code is not whitelisted; the provider text stays hidden.
+        assert!(
+            err.message
+                .contains("req_1a2b3c4d-5e6f-7890-abcd-ef1234567890"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("secret-provider-detail"));
+    }
+
+    fn moi_gateway_headers() -> HashMap<String, String> {
+        HashMap::from([(
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.to_string(),
+        )])
+    }
+
+    async fn call_moi_model_gateway(base: &str) -> astra_core::ClassifiedError {
+        reset_rate_limit_cooldown_for_tests();
+        let headers = moi_gateway_headers();
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let mut call = collect_call(base, &messages);
+        call.route.header_overrides = Some(&headers);
+        call_llm_and_collect(call, LlmCancel::None)
+            .await
+            .expect_err("gateway rejection must fail the model call")
+    }
+
+    /// Mock MOI model gateway: negotiated 413 carrying the bounded upstream
+    /// (TaaS) provider cause and request id.
+    async fn mock_413_moi_model_gateway_body_too_large() -> Response {
+        Response::builder()
+            .status(413)
+            .header(
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1,
+            )
+            .body(Body::from(
+                r#"{"error":{"type":"provider_error","code":"request_body_too_large","retryable":false,"request_id":"req_2b3c4d5e-6f7a-4890-bbcd-ef2345678901","message":"provider secret stays hidden"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_negotiates_provider_body_too_large() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_413_moi_model_gateway_body_too_large),
+        );
+        let base = spawn_local_http_server(app).await;
+        let error = call_moi_model_gateway(&base).await;
+
+        // The gateway byte cap is a request-size problem, never context
+        // overflow, and stays correlatable via the upstream request id.
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(
+            error.message.contains("request_body_too_large"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("req_2b3c4d5e-6f7a-4890-bbcd-ef2345678901"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("provider secret"));
+        let details: Value =
+            serde_json::from_str(error.details_json.as_deref().expect("structured details"))
+                .expect("valid details");
+        assert_eq!(details["source"], "moi_model_gateway");
+        assert_eq!(details["http_status"], 413);
+        assert_eq!(details["error_code"], "request_body_too_large");
+        assert_eq!(
+            details["request_id"],
+            "req_2b3c4d5e-6f7a-4890-bbcd-ef2345678901"
+        );
+    }
+
+    /// Mock MOI model gateway: negotiated 400 for a real model context
+    /// overflow upstream.
+    async fn mock_400_moi_model_gateway_context_window() -> Response {
+        Response::builder()
+            .status(400)
+            .header(
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1,
+            )
+            .body(Body::from(
+                r#"{"error":{"type":"provider_error","code":"context_length_exceeded","retryable":false,"request_id":"req_5e6f7a8b-9c0d-4ef1-a234-567890abcdef","message":"provider secret stays hidden"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_negotiates_context_window_overflow() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_400_moi_model_gateway_context_window),
+        );
+        let base = spawn_local_http_server(app).await;
+        let error = call_moi_model_gateway(&base).await;
+
+        // A genuine context overflow through the gateway keeps the
+        // context-window kind so the compaction funnel still engages.
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert!(
+            error.message.contains("context_length_exceeded"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("req_5e6f7a8b-9c0d-4ef1-a234-567890abcdef"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("provider secret"));
+    }
+
+    /// Mock MOI model gateway: negotiated 413 whose request id fails
+    /// validation (provider echoing a credential-shaped value).
+    async fn mock_413_moi_model_gateway_secret_request_id() -> Response {
+        Response::builder()
+            .status(413)
+            .header(
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1,
+            )
+            .body(Body::from(
+                r#"{"error":{"type":"provider_error","code":"request_body_too_large","retryable":false,"request_id":"Bearer secret-token"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_drops_invalid_provider_request_id() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_413_moi_model_gateway_secret_request_id),
+        );
+        let base = spawn_local_http_server(app).await;
+        let error = call_moi_model_gateway(&base).await;
+
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(
+            error.message.contains("request_body_too_large"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("Bearer secret-token"));
+        let details: Value =
+            serde_json::from_str(error.details_json.as_deref().expect("structured details"))
+                .expect("valid details");
+        assert!(details.get("request_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn call_llm_nonstream_moi_model_gateway_negotiates_provider_cause() {
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_413_moi_model_gateway_body_too_large),
+        );
+        let base = spawn_local_http_server(app).await;
+        reset_rate_limit_cooldown_for_tests();
+        let headers = moi_gateway_headers();
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let mut call = collect_call(&base, &messages);
+        call.route.header_overrides = Some(&headers);
+        let error =
+            call_llm_nonstream(global_llm_client(), call, std::time::Duration::from_secs(5))
+                .await
+                .expect_err("gateway rejection must fail the non-stream call");
+
+        // The negotiated boundary is the same owner as the streaming path:
+        // bounded envelope code and validated request id cross, the upstream
+        // diagnostic text and details_json omission do not.
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(
+            error.message.contains("request_body_too_large"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains("req_2b3c4d5e-6f7a-4890-bbcd-ef2345678901"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("provider secret"));
+        let details: Value =
+            serde_json::from_str(error.details_json.as_deref().expect("structured details"))
+                .expect("valid details");
+        assert_eq!(details["source"], "moi_model_gateway");
+        assert_eq!(details["http_status"], 413);
+        assert_eq!(
+            details["request_id"],
+            "req_2b3c4d5e-6f7a-4890-bbcd-ef2345678901"
+        );
+    }
+
+    /// Mock provider: 429 whose only request id is the validated
+    /// `x-request-id` header — the body carries none.
+    async fn mock_429_header_request_id_only(State(Hit(c)): State<Hit>) -> Response {
+        c.fetch_add(1, Ordering::SeqCst);
+        Response::builder()
+            .status(429)
+            .header("retry-after", "0")
+            .header(
+                "x-request-id",
+                "req_3c4d5e6f-7a8b-49c0-9cde-f34567890123",
+            )
+            .body(Body::from(
+                r#"{"error":{"message":"slow down: secret-provider-detail","code":"rate_limit_exceeded"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_exhausted_429_keeps_header_request_id() {
+        reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_429_header_request_id_only))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("persistent 429 must exhaust the model call");
+        assert_eq!(err.kind, astra_core::ErrorKind::RateLimit);
+        // The body carries no request id; the validated header id still
+        // correlates the terminal rate-limit failure.
+        assert!(
+            err.message
+                .contains("req_3c4d5e6f-7a8b-49c0-9cde-f34567890123"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("secret-provider-detail"));
+    }
+
+    /// Mock provider: persistent 529 overload whose only request id is the
+    /// validated `x-request-id` header.
+    async fn mock_529_header_request_id_only(State(Hit(c)): State<Hit>) -> Response {
+        c.fetch_add(1, Ordering::SeqCst);
+        Response::builder()
+            .status(529)
+            .header("retry-after", "0")
+            .header("x-request-id", "req_4d5e6f7a-8b9c-4ad0-bdef-456789012345")
+            .body(Body::from(r#"{"error":{"code":"overloaded"}}"#))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_exhausted_529_keeps_header_request_id() {
+        reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_529_header_request_id_only))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("persistent 529 must exhaust the model call");
+        assert_eq!(err.kind, astra_core::ErrorKind::ServerError);
+        // The validated header id survives overload retry exhaustion.
+        assert!(
+            err.message
+                .contains("req_4d5e6f7a-8b9c-4ad0-bdef-456789012345"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// Mock provider: 400 envelope whose request id is credential-shaped —
+    /// it must never reach the caller.
+    async fn mock_400_credential_shaped_request_id() -> Response {
+        Response::builder()
+            .status(400)
+            .body(Body::from(
+                r#"{"error":{"message":"unknown parameter: secret-provider-detail","type":"invalid_request","code":"invalid_request","request_id":"sk-proj-secretABC123"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_drops_credential_shaped_request_id() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_400_credential_shaped_request_id),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("400 envelope must fail the model call");
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
+        // The whitelisted code still names the cause; the credential-shaped
+        // id is structurally rejected, not just charset-filtered.
+        assert!(err.message.contains("invalid_request"), "{}", err.message);
+        assert!(
+            !format!("{err:?}").contains("sk-proj-secretABC123"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("secret-provider-detail"));
+    }
+
+    /// Mock provider: 400 with `"code": null` — OpenAI-compatible envelopes
+    /// commonly null the code; `type` must classify instead of the free-text
+    /// message needle.
+    async fn mock_400_null_code_request_body_too_large() -> Response {
+        Response::builder()
+            .status(400)
+            .body(Body::from(
+                r#"{"error":{"code":null,"type":"request_body_too_large","message":"context window is too large"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_null_code_400_is_request_size_not_context_window() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_400_null_code_request_body_too_large),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("400 envelope must fail the model call");
+        // The envelope `type` classifies authoritatively: a byte-cap
+        // rejection is a request-size problem even when its message says
+        // "context window" — classifying as ContextWindow would trigger
+        // compaction that cannot fix it.
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(
+            err.message.contains("request_body_too_large"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// Mock provider: 413 with `"code": null`; `type` still classifies.
+    async fn mock_413_null_code_request_body_too_large() -> Response {
+        Response::builder()
+            .status(413)
+            .body(Body::from(
+                r#"{"error":{"code":null,"type":"request_body_too_large","message":"request body too large"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_null_code_413_falls_back_to_type() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_413_null_code_request_body_too_large),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("413 envelope must fail the model call");
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(
+            err.message.contains("request_body_too_large"),
+            "{}",
+            err.message
+        );
     }
 
     #[tokio::test]
