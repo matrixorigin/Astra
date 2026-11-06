@@ -327,6 +327,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         qualified_usage,
         session_id,
         run_id,
+        cancel_context_not_saved: None,
         session_persistence_error: None,
         local_continuation_omitted: false,
         full_text,

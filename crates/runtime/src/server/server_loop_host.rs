@@ -16773,20 +16773,31 @@ impl ServerAgenticLoopHost {
             self.client_cancel_token.as_deref(),
         )
         .await;
-        if !edge_tool_delivery_timed_out(&delivery) {
+        let cancelled_unknown = delivery.tool_results.iter().any(|result| {
+            result.status == "cancelled"
+                && result
+                    .tool_result_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("execution_fact"))
+                    .and_then(Value::as_str)
+                    == Some("unknown")
+        });
+        if !edge_tool_delivery_timed_out(&delivery) && !cancelled_unknown {
             return delivery;
         }
 
         let Some(dispatch_service) = &self.edge_dispatch_service else {
             return delivery;
         };
-        let result_json = match dispatch_service
-            .wait_result(identity, Some(Duration::from_millis(0)))
-            .await
+        let result_json = match tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatch_service.wait_result(identity, Some(Duration::ZERO)),
+        )
+        .await
         {
-            Ok(Some(result_json)) => result_json,
-            Ok(None) => return delivery,
-            Err(error) => {
+            Ok(Ok(Some(result_json))) => result_json,
+            Ok(Ok(None)) | Err(_) => return delivery,
+            Ok(Err(error)) => {
                 tracing::warn!(
                     target: "astra_runtime::server_loop_host",
                     user_id = %self.user_id,
@@ -16795,7 +16806,7 @@ impl ServerAgenticLoopHost {
                     turn_chain_id = %identity.turn_chain_id,
                     request_id = %identity.request_id,
                     error = %error,
-                    "edge tool ledger timed out and dispatch fallback failed"
+                    "edge tool result was unconfirmed and dispatch fallback failed"
                 );
                 return delivery;
             }
@@ -16840,7 +16851,9 @@ impl ServerAgenticLoopHost {
             identity,
             tc,
             Duration::from_millis(0),
-            self.client_cancel_token.as_deref(),
+            // The authenticated durable result is already available; do not
+            // replace it with a synthetic cancellation in this second read.
+            None,
         )
         .await
     }
@@ -41821,7 +41834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_tool_result_dispatch_fallback_uses_db_result_after_ledger_timeout() {
+    async fn wait_tool_result_dispatch_fallback_preserves_durable_result_after_timeout_or_cancel() {
         let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
             "u-dispatch",
             "s-dispatch",
@@ -41843,52 +41856,59 @@ mod tests {
             },
         );
         let result_json = serde_json::to_string(&body).expect("serialize tool result");
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u-dispatch".to_string(),
-            "s-dispatch".to_string(),
-        )
-        .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
-            result_json: Some(result_json),
-        }))
-        .build();
         let tool_call = json!({
             "id": "r1",
             "type": "function",
             "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
         });
 
-        let delivery = host
-            .wait_tool_result_with_dispatch_fallback(
-                &tool_call,
-                &identity,
-                "edge-1",
-                Duration::from_millis(1),
+        for cancelled in [false, true] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-dispatch".to_string(),
+                "s-dispatch".to_string(),
             )
-            .await;
+            .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
+                result_json: Some(result_json.clone()),
+            }))
+            .build();
+            if cancelled {
+                let cancel = Arc::new(CancellationToken::new());
+                cancel.cancel();
+                host.set_client_cancel(cancel);
+            }
+            let delivery = host
+                .wait_tool_result_with_dispatch_fallback(
+                    &tool_call,
+                    &identity,
+                    "edge-1",
+                    Duration::from_millis(1),
+                )
+                .await;
 
-        let tool_message = delivery
-            .tool_messages
-            .first()
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .expect("tool message content");
-        assert_eq!(tool_message, "from dispatch");
-        let tool_result = delivery.tool_results.first().expect("structured result");
-        assert_eq!(tool_result.status, "completed");
-        assert_eq!(
-            delivery
-                .sse_maps
+            let tool_message = delivery
+                .tool_messages
                 .first()
-                .and_then(|event| event.get("result"))
-                .and_then(Value::as_str),
-            Some("from dispatch")
-        );
-        assert!(
-            host.edge_callback_ledger.lock().await.is_empty(),
-            "dispatch fallback should consume the synthesized ledger entry"
-        );
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str)
+                .expect("tool message content");
+            assert_eq!(tool_message, "from dispatch");
+            let tool_result = delivery.tool_results.first().expect("structured result");
+            assert_eq!(tool_result.status, "completed");
+            assert_eq!(
+                delivery
+                    .sse_maps
+                    .first()
+                    .and_then(|event| event.get("result"))
+                    .and_then(Value::as_str),
+                Some("from dispatch")
+            );
+            assert!(
+                host.edge_callback_ledger.lock().await.is_empty(),
+                "dispatch fallback should consume the synthesized ledger entry"
+            );
+        }
     }
 
     #[tokio::test]
@@ -41926,34 +41946,49 @@ mod tests {
             "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
         });
         for result_json in invalid_results {
-            let host = ServerAgenticLoopHostBuilder::new(
-                mock_matrixone(),
-                mock_encryptor(),
-                identity.user_id.clone(),
-                identity.session_id.clone(),
-            )
-            .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
-                result_json: Some(result_json),
-            }))
-            .build();
-
-            assert!(
-                !host.edge_request_has_custody_or_result(&identity).await,
-                "invalid durable result must not prove callback custody"
-            );
-            let delivery = host
-                .wait_tool_result_with_dispatch_fallback(
-                    &tool_call,
-                    &identity,
-                    "edge-1",
-                    Duration::from_millis(1),
+            for cancelled in [false, true] {
+                let mut host = ServerAgenticLoopHostBuilder::new(
+                    mock_matrixone(),
+                    mock_encryptor(),
+                    identity.user_id.clone(),
+                    identity.session_id.clone(),
                 )
-                .await;
-            assert!(
-                edge_tool_delivery_timed_out(&delivery),
-                "invalid durable result must not be delivered to the model"
-            );
-            assert!(host.edge_callback_ledger.lock().await.is_empty());
+                .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
+                    result_json: Some(result_json.clone()),
+                }))
+                .build();
+                if cancelled {
+                    let cancel = Arc::new(CancellationToken::new());
+                    cancel.cancel();
+                    host.set_client_cancel(cancel);
+                }
+
+                assert!(
+                    !host.edge_request_has_custody_or_result(&identity).await,
+                    "invalid durable result must not prove callback custody"
+                );
+                let delivery = host
+                    .wait_tool_result_with_dispatch_fallback(
+                        &tool_call,
+                        &identity,
+                        "edge-1",
+                        Duration::from_millis(1),
+                    )
+                    .await;
+                assert_eq!(
+                    delivery.tool_results[0].status,
+                    if cancelled { "cancelled" } else { "timed_out" },
+                    "invalid durable result must not be delivered to the model"
+                );
+                assert_eq!(
+                    delivery.tool_results[0]
+                        .tool_result_fields
+                        .as_ref()
+                        .unwrap()["execution_fact"],
+                    "unknown"
+                );
+                assert!(host.edge_callback_ledger.lock().await.is_empty());
+            }
         }
     }
 

@@ -48,7 +48,13 @@ pub(crate) fn cancelled_runtime_tool_result_for_binding(
     let mut metadata = delivered_binding_event_fields(workspace, executor, transport);
     attach_runtime_policy_metadata(&mut metadata, binding);
     metadata.insert("cancelled".to_string(), Value::Bool(true));
-    let message = format!("Tool '{tool_name}' cancelled before completion");
+    let message = if execution_started {
+        format!(
+            "Tool '{tool_name}' was cancelled after dispatch. Its result is unknown; it may still be running or have changed state. Inspect the current state before retrying."
+        )
+    } else {
+        format!("Tool '{tool_name}' was not executed because the run was cancelled")
+    };
     let error = if execution_started {
         astra_runtime_env::RuntimeError::after_start(
             astra_runtime_env::RuntimeErrorKind::Cancelled,
@@ -75,11 +81,16 @@ pub(crate) fn cancelled_runtime_tool_result_for_binding(
         "next_action": "stop_or_resume_parent_turn",
     })
     .to_string();
-    astra_tools::ToolResult {
+    let result = astra_tools::ToolResult {
         output,
         metadata: Some(metadata),
         is_error: true,
         exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+    };
+    if execution_started {
+        result.with_execution_outcome_unknown()
+    } else {
+        result
     }
 }
 

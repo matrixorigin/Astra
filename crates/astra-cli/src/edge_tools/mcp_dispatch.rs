@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(metadata["dispatch_certainty"], "unknown");
         assert_eq!(metadata["error_kind"], "tool_outcome_unknown");
         assert_eq!(metadata["mcp_call_dispatched"], true);
-        assert_eq!(metadata["workspace_effect_settled"], false);
+        assert_eq!(metadata["execution_fact"], "unknown");
         assert_eq!(
             std::fs::read_to_string(&counter).expect("durable fixture mutation"),
             "applied\n",

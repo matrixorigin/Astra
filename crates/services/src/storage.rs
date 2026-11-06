@@ -1277,7 +1277,7 @@ pub(crate) async fn admit_independent_run_creation<T>(
     session_id: &str,
     user_id: &str,
     run_id: &str,
-) -> Result<Option<Option<bool>>, sqlx::Error>
+) -> Result<Option<(Option<bool>, bool)>, sqlx::Error>
 where
     T: TransactionConnection,
 {
@@ -1313,7 +1313,8 @@ where
     if status != "active" {
         return Err(sqlx::Error::RowNotFound);
     }
-    if !SessionExecutionActivity::from_row(&row)?.is_idle() {
+    let activity = SessionExecutionActivity::from_row(&row)?;
+    if activity.active_run {
         return Ok(None);
     }
     let capture = match row.try_get::<Option<i64>, _>("full_llm_capture_override")? {
@@ -1326,7 +1327,7 @@ where
             ));
         }
     };
-    Ok(Some(capture))
+    Ok(Some((capture, activity.unresolved_invocations)))
 }
 
 /// Read actual Run/lease/effect custody under an already held Session fence.

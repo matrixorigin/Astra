@@ -532,6 +532,7 @@ fn append_complete_tool_group(
     let mut matched_results = Vec::new();
     let mut call_counts = std::collections::HashMap::<&str, usize>::new();
     let mut provider_counts = std::collections::HashMap::<&str, usize>::new();
+    let mut missing_result = false;
     for call in calls {
         if let Some(id) = call.get("id").and_then(Value::as_str)
             && !id.is_empty()
@@ -549,15 +550,32 @@ fn append_complete_tool_group(
         if call_counts.get(id) != Some(&1) || provider_counts.get(provider_id) != Some(&1) {
             continue;
         }
-        let Some(Some(result)) = results_by_id.get(id) else {
-            continue;
-        };
-        matched_calls.push(call.clone());
-        matched_results.push(project_tool_result(result, id));
+        match results_by_id.get(id) {
+            Some(Some(result)) => {
+                matched_calls.push(call.clone());
+                matched_results.push(project_tool_result(result, id));
+            }
+            None => {
+                // Keep the provider conversation valid without inventing an
+                // execution fact when cancellation or disconnection lost the result.
+                if let Ok(call) =
+                    crate::tool::args::shape::canonicalize_tool_call_for_execution(call)
+                {
+                    matched_calls.push(call);
+                    matched_results.push(json!({
+                        "role": "tool", "tool_call_id": id,
+                        "content": "The tool result was not recorded. The call may not have started, may have changed state, or may still be running. Inspect the current state before retrying."
+                    }));
+                    missing_result = true;
+                }
+            }
+            Some(None) => {} // Duplicate results are ambiguous, not evidence.
+        }
     }
 
     let saved = canonical_provider_continuation(assistant);
-    let incomplete = assistant.get(INCOMPLETE_TOOL_GROUP_FIELD).is_some()
+    let incomplete = missing_result
+        || assistant.get(INCOMPLETE_TOOL_GROUP_FIELD).is_some()
         || calls.is_empty()
         || matched_calls.len() != calls.len()
         || matched_results.len() != tools.len()
@@ -1199,11 +1217,11 @@ mod tests {
             {"id":"c2", "function":{"name":"read_file", "arguments":"{}"}}
         ]);
         for (tool_calls, results, expected_pairs) in [
-            (calls.clone(), vec![], 0),
+            (calls.clone(), vec![], 2),
             (
                 calls.clone(),
                 vec![json!({"role":"tool", "tool_call_id":"c1", "content":"done"})],
-                1,
+                2,
             ),
             (
                 json!([
@@ -1240,6 +1258,12 @@ mod tests {
                     json!({"role":"tool", "tool_call_id":"c1", "content":"first"}),
                     json!({"role":"tool", "tool_call_id":"c1", "content":"conflicting"}),
                 ],
+                0,
+            ),
+            (json!([{"id":"broken"}]), vec![], 0),
+            (
+                json!([{"id":"broken", "function":{"name":"bash", "arguments":"{"}}]),
+                vec![],
                 0,
             ),
             (json!([{"function":{"name":"write_file"}}]), vec![], 0),
@@ -1283,6 +1307,34 @@ mod tests {
             complete[1]
                 .get(super::INCOMPLETE_TOOL_GROUP_FIELD)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn incomplete_tool_group_preserves_recorded_results_and_reports_missing_outcomes() {
+        let input = vec![
+            json!({"role":"user", "content":"work"}),
+            json!({"role":"assistant", "tool_calls":[
+                {"id":"first", "function":{"name":"write_file", "arguments":"{}"}},
+                {"id":"second", "function":{"name":"bash", "arguments":"{}"}}
+            ]}),
+            json!({"role":"tool", "tool_call_id":"first", "content":"written"}),
+        ];
+        let history =
+            super::sanitize_canonical_continuation_messages_with_turn_semantics(input).unwrap();
+        assert_eq!(history[2]["content"], "written");
+        assert_eq!(history[3]["tool_call_id"], "second");
+        assert!(
+            history[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("may not have started")
+        );
+        assert!(
+            history[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("before retrying")
         );
     }
 
@@ -1759,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_continuation_drops_orphaned_tool_frames_without_splitting_valid_pairs() {
+    fn canonical_continuation_drops_orphans_and_closes_missing_tool_results() {
         let messages = vec![
             json!({"role": "tool", "tool_call_id": "orphan-result", "content": "ignore me"}),
             json!({"role": "user", "content": "inspect"}),
@@ -1780,19 +1832,17 @@ mod tests {
         )
         .expect("valid canonical history");
 
-        assert_eq!(got.len(), 4);
-        assert_eq!(got[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[1]["tool_calls"].as_array().unwrap().len(), 2);
         assert_eq!(got[1]["tool_calls"][0]["id"], "paired");
         assert_eq!(got[2]["tool_call_id"], "paired");
+        assert_eq!(got[2]["content"], "durable evidence");
+        assert_eq!(got[3]["tool_call_id"], "missing");
+        assert!(got[3]["content"].as_str().unwrap().contains("not recorded"));
         assert!(
-            got.iter().all(|message| {
-                message["tool_call_id"] != "orphan-result"
-                    && message
-                        .get("tool_calls")
-                        .and_then(Value::as_array)
-                        .is_none_or(|calls| calls.iter().all(|call| call["id"] != "missing"))
-            }),
-            "projection must retain only provider-valid complete tool groups"
+            got.iter()
+                .all(|message| message["tool_call_id"] != "orphan-result"),
+            "an orphan result must not be attached to a different call"
         );
     }
 

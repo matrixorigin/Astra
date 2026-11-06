@@ -5392,6 +5392,7 @@ struct CanonicalTurnAdmission {
     prior_messages: Vec<Value>,
     authorized_session_ids: Option<HashSet<String>>,
     had_canonical_head: bool,
+    previous_tool_advisory: Option<&'static str>,
     _weighted_permit: astra_services::WeightedAdmissionPermit,
 }
 
@@ -5439,6 +5440,8 @@ struct PreparedRootContextAdmission {
     key: astra_turn_types::SessionKeyV1,
     current_bytes: u64,
 }
+
+const PREVIOUS_TOOL_ADVISORY: &str = "Earlier tool calls have unconfirmed outcomes. A call may still be running or may have changed state. Review the previous tool history and inspect the current state before repeating it.";
 
 /// Prepare under the Run opening fence. The immutable snapshot and this
 /// attempt's local capacity permit commit only with its own Run insertion.
@@ -5492,7 +5495,7 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
             .prepared
             .take()
             .ok_or("root Context preparation is missing")?;
-        let admission = match self
+        let mut admission = match self
             .service
             .stage_canonical_turn(
                 self.user_id,
@@ -5511,6 +5514,9 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
                 return Err("canonical turn admission rejected this run".into());
             }
         };
+        admission.previous_tool_advisory = run_admission
+            .prior_unresolved_tool_calls()
+            .then_some(PREVIOUS_TOOL_ADVISORY);
         opening
             .ok_or("root Run is missing its immutable opening")?
             .bind_context_authority(admission.authority.clone(), &self.request.message)?;
@@ -5708,6 +5714,38 @@ impl AgenticRunLifecycleService {
                 .is_some_and(|run| run.user_id == user_id && run.execution_live)
     }
 
+    /// A cancellation result is a cold path. Read only the exact Run's
+    /// terminal receipt; never hydrate its event history to report Context.
+    async fn cancelled_context_not_saved(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        settled: bool,
+    ) -> Option<bool> {
+        if !settled {
+            return None;
+        }
+        let pool = self.shared_pool.as_ref()?;
+        let (encoded, last_index): (Option<String>, i64) = sqlx::query_as(
+            "SELECT terminal_receipt_json, last_event_idx FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ).bind(user_id).bind(run_id).fetch_optional(pool.get()).await.ok()??;
+        let receipt = astra_services::runs::CommittedRunTerminalReceipt::decode(
+            encoded.as_deref()?,
+            last_index,
+        )
+        .ok()?
+        .receipt;
+        if receipt.user_id != user_id || receipt.run_id != run_id {
+            return None;
+        }
+        match receipt.context {
+            astra_services::runs::CanonicalTerminalContext::Revoked => Some(true),
+            astra_services::runs::CanonicalTerminalContext::Advanced { .. }
+            | astra_services::runs::CanonicalTerminalContext::Unchanged => Some(false),
+            astra_services::runs::CanonicalTerminalContext::Unowned => None,
+        }
+    }
+
     pub fn new(
         matrixone: MatrixOneSettings,
         encryptor: Arc<FernetTokenEncryptor>,
@@ -5877,6 +5915,7 @@ impl AgenticRunLifecycleService {
         Ok(CanonicalTurnAdmission {
             coordinator,
             had_canonical_head: authority.base_head.is_some(),
+            previous_tool_advisory: None,
             authority,
             opening_hash: None,
             prior_messages: Vec::new(),
@@ -14146,8 +14185,10 @@ impl AgenticRunLifecycleService {
                     &bg_run_id,
                 );
 
+                let mut context_not_saved = false;
                 let context_commit = match context_commit {
                     Err(astra_services::SessionContextCoordinatorError::ResourceLimit(detail)) => {
+                        context_not_saved = true;
                         if matches!(&loop_result, Ok(AgenticLoopOutcome::Completed))
                             && state.interruption.is_none()
                         {
@@ -14518,6 +14559,7 @@ impl AgenticRunLifecycleService {
                                             .filter(|_| persisted_status == RunStatus::Failed),
                                         terminal_cancellation_origin,
                                         context_commit.as_ref(),
+                                        context_not_saved,
                                     )
                                     .await
                             }
@@ -15681,6 +15723,15 @@ impl AgenticRunLifecycleService {
                     );
                 }
             }
+            if let Some(advisory) = canonical_turn
+                .as_ref()
+                .and_then(|admission| admission.previous_tool_advisory.as_ref())
+            {
+                state.push_volatile(
+                    crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+                    (*advisory).to_owned(),
+                );
+            }
             let fresh_session_current_date = state
                 .pipeline_session
                 .as_ref()
@@ -15777,6 +15828,18 @@ impl AgenticRunLifecycleService {
                 );
                 event_rx = Some(receiver);
                 delivery = Some(stream_delivery);
+                if let Some(advisory) = canonical_turn
+                    .as_ref()
+                    .and_then(|admission| admission.previous_tool_advisory.as_ref())
+                {
+                    let _ = event_tx
+                        .as_ref()
+                        .expect("stream sender exists")
+                        .try_send(json!({
+                            "type": "warning", "code": "previous_tool_outcome_unknown",
+                            "message": advisory,
+                        }));
+                }
             }
             host.set_interaction_sink(interaction_sink);
             host.set_client_cancel(llm_cancel_token.clone());
@@ -16390,6 +16453,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     run_id,
                     status: "cancellation_requested".into(),
                     execution_settled: false,
+                    context_not_saved: None,
                 })
             } else {
                 Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
@@ -16409,10 +16473,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ));
         }
         let execution_settled = status.is_terminal() && execution_stopped;
+        let context_not_saved = self
+            .cancelled_context_not_saved(&user_id, &run_id, execution_settled)
+            .await;
         Ok(CancelRunRecord {
             run_id,
             status: control.status,
             execution_settled,
+            context_not_saved,
         })
     }
 
@@ -17295,10 +17363,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let execution_settled = self
                 .cancellation_execution_is_settled(&user_id, &run_id, control.owner_lease_live)
                 .await;
+            let context_not_saved = self
+                .cancelled_context_not_saved(&user_id, &run_id, execution_settled)
+                .await;
             return Ok(CancelRunRecord {
                 run_id,
                 status: control.status,
                 execution_settled,
+                context_not_saved,
             });
         }
         if !self
@@ -17326,10 +17398,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let execution_settled = self
                     .cancellation_execution_is_settled(&user_id, &run_id, current.owner_lease_live)
                     .await;
+                let context_not_saved = self
+                    .cancelled_context_not_saved(&user_id, &run_id, execution_settled)
+                    .await;
                 return Ok(CancelRunRecord {
                     run_id,
                     status: current.status,
                     execution_settled,
+                    context_not_saved,
                 });
             }
             return Err(Self::durable_persist_error(
@@ -17359,6 +17435,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 execution_settled: false,
                 run_id,
                 status: "cancellation_requested".to_string(),
+                context_not_saved: None,
             });
         }
 
@@ -17402,6 +17479,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 execution_settled: true,
                 run_id,
                 status: STATUS_CANCELLED.to_string(),
+                context_not_saved: None,
             });
         }
 
@@ -17421,10 +17499,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let execution_settled = self
                 .cancellation_execution_is_settled(&user_id, &run_id, current.owner_lease_live)
                 .await;
+            let context_not_saved = self
+                .cancelled_context_not_saved(&user_id, &run_id, execution_settled)
+                .await;
             return Ok(CancelRunRecord {
                 run_id,
                 status: current.status,
                 execution_settled,
+                context_not_saved,
             });
         }
         if !current.cancellation_requested {
@@ -17437,6 +17519,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             execution_settled: false,
             run_id,
             status: "cancellation_requested".to_string(),
+            context_not_saved: None,
         })
     }
 
@@ -24815,6 +24898,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 completion_tokens: loop_state.total_completion,
                 tool_calls: loop_state.total_tool_calls,
                 context_commit: None,
+                context_not_saved: false,
             })
         } else {
             None

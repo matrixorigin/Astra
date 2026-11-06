@@ -181,6 +181,70 @@ async fn edge_dispatch_full_lifecycle() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_large_result_survives_cross_instance_recovery() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let producer = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let reader = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user = format!("ed-large-{}", unique_suffix());
+    let agent = format!("ed-agent-{}", unique_suffix());
+    let identity = dispatch_identity(&user, &Uuid::new_v4().to_string());
+    let payload = r#"{"tool":"bash","args":{"command":"cat log"}}"#;
+    let result =
+        serde_json::json!({"status":"completed", "output":"日志\\n".repeat(20_000)}).to_string();
+    assert!(result.len() > 100_000);
+    producer
+        .insert_dispatch(&identity, &agent, payload)
+        .await
+        .unwrap();
+    assert!(
+        producer
+            .deliver_result(&identity, &agent, &result)
+            .await
+            .unwrap()
+    );
+
+    let exact = reader
+        .wait_result(&identity, Some(std::time::Duration::ZERO))
+        .await
+        .unwrap();
+    assert_eq!(exact.as_deref(), Some(result.as_str()));
+    let batched = reader
+        .wait_result(&identity, Some(std::time::Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert_eq!(batched.as_deref(), Some(result.as_str()));
+    assert_eq!(
+        reader
+            .admit_dispatch(&identity, &agent, payload)
+            .await
+            .unwrap(),
+        EdgeDispatchAdmission::Terminal(result.clone()),
+    );
+    assert!(
+        reader
+            .deliver_result(&identity, &agent, &result)
+            .await
+            .unwrap()
+    );
+    let other = dispatch_identity(&format!("other-{user}"), &identity.request_id);
+    assert!(
+        reader
+            .wait_result(&other, Some(std::time::Duration::ZERO))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts() {
     require_env();
     let pool = common::setup_pool().await;

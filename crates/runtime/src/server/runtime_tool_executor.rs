@@ -4735,13 +4735,7 @@ impl RuntimeToolExecutor {
         identity: &astra_turn_types::ToolInvocationIdentity,
         mut result: astra_tools::ToolResult,
     ) -> astra_tools::ToolResult {
-        if result
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("side_effects_maybe"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
+        if crate::server::tool_invocation_runtime::result_outcome_unknown(&result) {
             return result;
         }
         let exit_semantics = result.exit_semantics.and_then(|semantics| {
@@ -5296,6 +5290,7 @@ impl RuntimeToolExecutor {
             result.output.push_str(
                 "Error: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
             );
+            result = result.with_execution_outcome_unknown();
         }
         let desired_state = match astra_tools::workspace_observation::consume_workspace_desired_state_convergence_marker(
             &mut result.metadata,
@@ -5958,7 +5953,7 @@ fn mark_mcp_call_dispatched(mut result: astra_tools::ToolResult) -> astra_tools:
 fn mcp_cancelled_tool_result(name: &str, prior_dispatch: bool) -> astra_tools::ToolResult {
     let result = astra_tools::cancelled_tool_result(name, prior_dispatch);
     if prior_dispatch {
-        mark_mcp_call_dispatched(result)
+        mark_mcp_call_dispatched(result.with_execution_outcome_unknown())
     } else {
         result
     }
@@ -5988,23 +5983,13 @@ fn finalize_mcp_workspace_effect(
     if !dispatched {
         return result;
     }
-    if !workspace_authority.coordination_integrity_valid()
-        || !workspace_authority.receipt_authority_valid()
-    {
+    if !workspace_authority.coordination_integrity_valid() {
         astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
         return astra_tools::workspace_effect_unsettled_tool_result(name, result);
     }
-    let settled = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get("workspace_effect_settled"))
-        .and_then(Value::as_bool)
-        == Some(true);
-    if settled {
-        return result;
-    }
-    astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-    astra_tools::workspace_effect_unsettled_tool_result(name, result)
+    // MCP providers need not manufacture Astra workspace receipts. A received
+    // response is their result; dispatch loss is marked unknown at its source.
+    result
 }
 
 fn tool_result_from_provider_outcome(outcome: ProviderCallOutcome) -> astra_tools::ToolResult {
@@ -6057,7 +6042,11 @@ fn mcp_call_error_result(
         ),
         ("retryable".to_string(), Value::Bool(!side_effects_maybe)),
     ]));
-    result
+    if side_effects_maybe {
+        result.with_execution_outcome_unknown()
+    } else {
+        result
+    }
 }
 
 fn durable_result_persistence_failure(
@@ -6999,6 +6988,7 @@ pub(crate) mod tests {
         assert!(attached.metadata.as_ref().is_none_or(|metadata| {
             !metadata.contains_key(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
         }));
+
         let metadata = attached.metadata.as_ref().unwrap();
         assert_eq!(metadata["error_kind"], "durable_result_persistence");
         assert_eq!(metadata["retryable"], false);
@@ -7032,13 +7022,10 @@ pub(crate) mod tests {
             "call-unknown",
         )
         .unwrap();
-        let mut ambiguous = astra_tools::ToolResult::text(
+        let ambiguous = astra_tools::ToolResult::text(
             "x".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
-        );
-        ambiguous.metadata = Some(Map::from_iter([(
-            "side_effects_maybe".to_string(),
-            Value::Bool(true),
-        )]));
+        )
+        .with_execution_outcome_unknown();
         let governed = govern_runtime_tool_result(ambiguous, false).into_inner();
         let attached = exec
             .attach_governed_result_artifact_if_needed(&identity, governed)
@@ -7052,6 +7039,47 @@ pub(crate) mod tests {
         assert!(attached.metadata.as_ref().is_none_or(|metadata| {
             !metadata.contains_key(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
         }));
+
+        // A known result may have performed a write; that alone must not
+        // discard its acknowledged output as though execution were unknown.
+        let mut known = astra_tools::ToolResult::text(
+            "y".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES + 1),
+        );
+        known.metadata = Some(Map::from_iter([(
+            "side_effects_maybe".into(),
+            Value::Bool(true),
+        )]));
+        let governed = govern_runtime_tool_result(known, false).into_inner();
+        let attached = exec
+            .attach_governed_result_artifact_if_needed(&identity, governed)
+            .await;
+        assert!(!attached.is_error, "{attached:?}");
+        assert!(store.seen.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn control_producer_preserves_rejection_and_retryability_in_the_ledger() {
+        use astra_turn_types::ToolInvocationTerminalOutcome;
+        let (exec, _dir) = test_executor();
+        let busy = exec.runtime_binding_busy_error_result("bash", "provider");
+        assert!(matches!(
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&busy),
+            ToolInvocationTerminalOutcome::Failed {
+                retryable: true,
+                ..
+            }
+        ));
+        let denied = exec.runtime_environment_denial_error_result(
+            "write_file",
+            &RuntimeEnvironmentDenial::RuntimeSurfaceDenied("read-only".into()),
+        );
+        assert!(matches!(
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&denied),
+            ToolInvocationTerminalOutcome::Rejected {
+                retryable: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -8888,12 +8916,6 @@ pub(crate) mod tests {
         let unclassified: Vec<_> = handler_names
             .iter()
             .filter(|n| {
-                // `run_script` is a real handler only on hosts with an
-                // invocation-owned process scope.  The executor keeps the
-                // route registered so an explicit call gets the typed
-                // capability error, but the model-facing schema is
-                // capability-projected away when dispatch cannot be
-                // proven safe.
                 if *n == "run_script"
                     && (cfg!(not(unix)) || !astra_sandbox::process_scope_available())
                 {
@@ -10644,6 +10666,39 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_result_does_not_require_a_private_workspace_receipt() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let authority = acquire_server_workspace_authority(
+            workspace.path(),
+            "mcp__demo__mutate",
+            &json!({}),
+            true,
+            true,
+            false,
+            false,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("MCP mutation authority");
+        let mut result = astra_tools::ToolResult::text("provider completed".into());
+        result.metadata = Some(Map::from_iter([(
+            "mcp_call_dispatched".into(),
+            json!(true),
+        )]));
+        let result = finalize_mcp_workspace_effect(
+            workspace.path(),
+            "mcp__demo__mutate",
+            ResolvedToolEffect::Mutating,
+            true,
+            &authority,
+            result,
+        );
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output, "provider completed");
+    }
+
+    #[tokio::test]
     async fn mcp_mutation_cannot_publish_receipt_after_generation_revocation() {
         let workspace = tempfile::tempdir().expect("workspace");
         let authority = acquire_server_workspace_authority(
@@ -11167,11 +11222,8 @@ pub(crate) mod tests {
                 panic!("first read should dispatch")
             }
         };
-        let mut ambiguous = astra_tools::ToolResult::text("unacknowledged payload".to_string());
-        ambiguous.metadata = Some(Map::from_iter([(
-            "side_effects_maybe".to_string(),
-            Value::Bool(true),
-        )]));
+        let ambiguous = astra_tools::ToolResult::text("unacknowledged payload".to_string())
+            .with_execution_outcome_unknown();
         let outcome =
             crate::server::tool_invocation_runtime::terminal_outcome_from_result(&ambiguous);
         let durable = ledger
@@ -14679,13 +14731,13 @@ pub(crate) mod tests {
         } else {
             assert!(result.is_error, "{result:?}");
             assert_eq!(
-                result.metadata.as_ref().unwrap()["workspace_effect_settled"],
-                false
+                result.metadata.as_ref().unwrap()["execution_fact"],
+                "unknown"
             );
-            assert!(matches!(
-                writer,
-                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
-            ));
+            assert!(
+                writer.is_ok(),
+                "a lost response must not permanently block the workspace"
+            );
         }
         server.abort();
     }
@@ -15010,11 +15062,11 @@ for line in sys.stdin:
                     .await;
                 if prior_dispatch {
                     assert_eq!(fields["mcp_call_dispatched"], true);
-                    assert_eq!(
-                        fields["error_kind"],
-                        astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
+                    assert_eq!(fields["execution_fact"], "unknown");
+                    assert!(
+                        writer.is_ok(),
+                        "the model can inspect state before a new action"
                     );
-                    assert!(matches!(writer, Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)));
                 } else {
                     assert_eq!(fields["cancelled"], true);
                     assert_ne!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
@@ -15029,7 +15081,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn mcp_interaction_resume_cancellation_quarantines_unsettled_mutation() {
+    async fn mcp_interaction_resume_cancellation_reports_unknown_without_blocking() {
         let provider_calls = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new().route(
             "/mcp",
@@ -15113,22 +15165,16 @@ for line in sys.stdin:
         assert!(result.is_error, "{result:?}");
         let fields = result.metadata.as_ref().unwrap();
         assert_eq!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
-        assert_eq!(
-            fields["error_kind"],
-            astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
-        );
-        assert_eq!(fields["workspace_effect_settled"], false);
+        assert_eq!(fields["execution_fact"], "unknown");
         assert!(
-            matches!(
-                astra_tools::workspace_observation::begin_workspace_writer_with_options(
-                    dir.path(),
-                    None,
-                    Duration::from_millis(100),
-                )
-                .await,
-                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
-            ),
-            "an intermediate interaction response must not admit a later workspace writer"
+            astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                dir.path(),
+                None,
+                Duration::from_millis(100),
+            )
+            .await
+            .is_ok(),
+            "an unknown response must not permanently block later inspection"
         );
     }
 
@@ -16050,14 +16096,9 @@ for line in sys.stdin:
     #[cfg(unix)]
     #[tokio::test]
     async fn run_script_executes_in_server_workspace() {
-        let scope = astra_sandbox::apply_process_scope();
-        if !scope.ownership_guaranteed() {
-            // This host cannot prove that a Python child (or a daemonized
-            // descendant) is owned by the invocation. The production contract
-            // is an explicit no-dispatch result, not an unobserved fallback.
+        if !astra_sandbox::process_scope_available() {
             return;
         }
-        drop(scope);
         if std::process::Command::new("python3")
             .arg("--version")
             .output()

@@ -916,6 +916,7 @@ async fn stream_chat_sse_inner(
                 failure_kind,
                 error_code: host.last_error_code.clone(),
                 error_metadata: host.last_error_metadata.clone(),
+                cancel_context_not_saved: None,
                 admission_rejected: is_pre_admission_rejection(
                     host.last_error_code.as_deref(),
                     host.last_error_metadata.as_ref(),

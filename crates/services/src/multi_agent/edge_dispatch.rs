@@ -599,7 +599,7 @@ impl EdgeDispatchWaitCoordinator {
     ) -> Result<HashMap<EdgeDispatchIdentity, PolledDispatchState>, String> {
         let mut query = sqlx::QueryBuilder::<MySql>::new(
             "SELECT user_id, session_id, run_id, turn_chain_id, request_id, \
-                    status, CAST(result_json AS CHAR) AS result_json \
+                    status, result_json \
              FROM edge_pending_dispatch WHERE ",
         );
         for (index, identity) in identities.iter().enumerate() {
@@ -903,7 +903,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?;
         let row = sqlx::query(
             "SELECT edge_agent_id, CAST(payload_json AS CHAR) AS payload_json, \
-                    status, CAST(result_json AS CHAR) AS result_json \
+                    status, result_json \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND session_id = ? AND run_id = ? \
                AND turn_chain_id = ? AND request_id = ?",
@@ -1025,7 +1025,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         };
         let row = match sqlx::query(
             "SELECT edge_agent_id, CAST(payload_json AS CHAR) AS payload_json, \
-                    status, CAST(result_json AS CHAR) AS result_json \
+                    status, result_json \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND session_id = ? AND run_id = ? \
                AND turn_chain_id = ? AND request_id = ? FOR UPDATE",
@@ -1234,7 +1234,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let rows = match sqlx::query(
             "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
              CAST(payload_json AS CHAR) AS payload_json, \
-             CAST(result_json AS CHAR) AS result_json, \
+             result_json, \
              status, \
              COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
              FROM edge_pending_dispatch \
@@ -1365,7 +1365,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             true
         } else {
             let row = sqlx::query(
-                "SELECT status, CAST(result_json AS CHAR) AS result_json \
+                "SELECT status, result_json \
                  FROM edge_pending_dispatch \
                  WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                    AND request_id = ? AND edge_agent_id = ?",
@@ -1425,7 +1425,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         edge_agent_id: &str,
     ) -> Result<bool, String> {
         let row = sqlx::query(
-            "SELECT status, CAST(result_json AS CHAR) AS result_json \
+            "SELECT status, result_json \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                AND request_id = ? AND edge_agent_id = ?",
@@ -1513,7 +1513,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 return Err("edge result read requires complete owner identity".into());
             }
             let row = sqlx::query(
-                "SELECT CAST(result_json AS CHAR) AS result_json FROM edge_pending_dispatch \
+                "SELECT result_json FROM edge_pending_dispatch \
                  WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                    AND request_id = ? AND status IN ('completed', 'failed')",
             )
@@ -2262,7 +2262,7 @@ mod tests {
         );
 
         let row = sqlx::query(
-            "SELECT status, CAST(result_json AS CHAR) AS result_json
+            "SELECT status, result_json
              FROM edge_pending_dispatch
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?",
         )

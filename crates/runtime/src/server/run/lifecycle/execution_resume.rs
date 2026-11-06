@@ -272,6 +272,9 @@ impl AgenticRunLifecycleService {
         // preflight checkpoint is no longer used after committed custody.
         drop(parked);
         let generation = proof.run().run_generation;
+        let previous_tool_advisory = proof
+            .prior_unresolved_tool_calls()
+            .then_some(PREVIOUS_TOOL_ADVISORY);
         let mut canonical = CanonicalTurnAdmission {
             coordinator,
             authority: proof.receipt().authority.clone(),
@@ -279,6 +282,7 @@ impl AgenticRunLifecycleService {
             prior_messages: Vec::new(),
             authorized_session_ids: None,
             had_canonical_head: proof.receipt().authority.base_head.is_some(),
+            previous_tool_advisory,
             _weighted_permit: weighted,
         };
         let mut heartbeat = None;
@@ -602,6 +606,12 @@ impl AgenticRunLifecycleService {
         host.restore_handoff_continuation(&mut state, &handoff, &canonical.prior_messages)
             .await
             .map_err(|error| invalid_resume(error.message))?;
+        if let Some(advisory) = &canonical.previous_tool_advisory {
+            state.push_volatile(
+                crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+                (*advisory).to_owned(),
+            );
+        }
         host.bind_execution_handoff(
             self.execution_handoff_requested.clone(),
             self.run_engine.clone(),
