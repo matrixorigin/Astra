@@ -17326,10 +17326,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_nonstream_unrecognized_code_defers_to_recognized_type() {
         reset_rate_limit_cooldown_for_tests();
-        let app = Router::new().route(
-            "/chat/completions",
-            post(mock_400_invalid_value_max_tokens),
-        );
+        let app = Router::new().route("/chat/completions", post(mock_400_invalid_value_max_tokens));
         let base = spawn_local_http_server(app).await;
         let messages = vec![json!({"role":"user","content":"x"})];
         let error = call_llm_nonstream(
