@@ -5173,6 +5173,7 @@ async fn attest_edge_workspace(
         if connection.materialization_id.as_deref() != record.materialization_id.as_deref() {
             return Err("edge_materialization_identity_mismatch");
         }
+        let carrier = astra_logging::trace_context::current();
         let result = state
             .edge_connection_pool
             .execute_durably_admitted_invocation_on_connection_with_cancel(
@@ -5190,6 +5191,8 @@ async fn attest_edge_workspace(
                     execution_timeout_ms: None,
                     command_timeout_cap_ms: None,
                     cancel_token: None,
+                    traceparent: carrier.traceparent.as_deref(),
+                    tracestate: carrier.tracestate.as_deref(),
                 },
             )
             .await
@@ -5238,6 +5241,9 @@ async fn attest_edge_workspace(
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         let payload_json =
             serde_json::to_string(&payload).map_err(|_| "attestation_payload_invalid")?;

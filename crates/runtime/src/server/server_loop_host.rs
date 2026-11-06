@@ -9306,7 +9306,7 @@ impl ServerAgenticLoopHost {
             0,
             started_at,
         );
-        let handle = tokio::spawn(async move {
+        let handle = crate::server::run_trace::spawn_in_active_run(async move {
             let result = match tokio::time::timeout(
                 TURN_INTENT_JUDGE_DEADLINE,
                 judge.classify_and_plan(&planner, &context),
@@ -9407,7 +9407,7 @@ impl ServerAgenticLoopHost {
             SemanticJudgmentPurpose::UserObservation.phase_attempt_index(),
             started_at,
         );
-        let handle = tokio::spawn(async move {
+        let handle = crate::server::run_trace::spawn_in_active_run(async move {
             let result = tokio::time::timeout(TURN_INTENT_JUDGE_DEADLINE, async {
                 let response = judge
                     .summarize(

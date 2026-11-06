@@ -1832,6 +1832,8 @@ async fn wait_for_shared_run_interaction(
     waiting_for: &str,
     timeout: Duration,
 ) -> Option<Value> {
+    let _user_input =
+        (waiting_for == "user_input").then(crate::server::run_trace::suspend_for_user_input);
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(Some(event)) = run_engine
@@ -7799,6 +7801,9 @@ impl AgenticRunLifecycleService {
                 false
             }
         };
+        if committed {
+            crate::server::run_trace::fail_active_run(failure_code.as_str());
+        }
         runs.write().await.remove(run_id);
         committed
     }
@@ -7868,6 +7873,9 @@ impl AgenticRunLifecycleService {
                 false
             }
         };
+        if committed {
+            crate::server::run_trace::fail_active_run("cancelled");
+        }
         runs.write().await.remove(run_id);
         committed.then_some(terminal_events)
     }
@@ -8198,6 +8206,20 @@ impl AgenticRunLifecycleService {
                 }
             }
         };
+
+        match final_status {
+            RunStatus::Failed => crate::server::run_trace::fail_active_run(
+                error_kind
+                    .map(astra_core::ErrorKind::as_str)
+                    .unwrap_or("failed"),
+            ),
+            RunStatus::Cancelled => crate::server::run_trace::fail_active_run("cancelled"),
+            RunStatus::Running
+            | RunStatus::Paused
+            | RunStatus::Waiting
+            | RunStatus::Completed
+            | RunStatus::Delegated => {}
+        }
 
         (events, final_status, error_msg)
     }
@@ -13817,8 +13839,9 @@ impl AgenticRunLifecycleService {
         // through event_tx incrementally; the HTTP handler streams them.
         let bg_task_count_2 = Arc::clone(&self.background_task_count);
         let task_guard = TaskCountGuard::new(Arc::clone(&bg_task_count_2));
+        let inbound = crate::server::run_trace::inbound_carrier();
         let run_abort_handle = spawn_observed(
-            async move {
+            crate::server::run_trace::bind(inbound, async move {
                 // The task is in flight from spawn, including while it waits
                 // for capacity.  Construct this guard before admission so a
                 // cancellation in that wait cannot leak shutdown accounting.
@@ -15153,7 +15176,7 @@ impl AgenticRunLifecycleService {
                 // Release resident capacity after dropping the resident
                 // context and its interaction sender clones. This run task
                 // retains cleanup custody without keeping the stream open.
-            },
+            }),
             "agentic_loop_owned_execution",
         );
         self.track_background_run_abort_handle(run_abort_handle);

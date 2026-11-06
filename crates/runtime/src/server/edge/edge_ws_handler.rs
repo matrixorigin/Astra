@@ -1708,6 +1708,8 @@ fn validate_edge_capabilities(
         astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(Some(
             &capabilities,
         ));
+    let w3c_trace_context_v1 =
+        astra_server_types::edge_ws_protocol::supports_w3c_trace_context(Some(&capabilities));
     let capacity_providers = capabilities
         .get("capacity_rpc_v1")
         .map(|value| {
@@ -1786,13 +1788,21 @@ fn validate_edge_capabilities(
         sanitized["capacity_rpc_v1"] = serde_json::to_value(providers)
             .map_err(|_| "capacity providers could not be serialized".to_string())?;
     }
+    let mut accepted = serde_json::Map::new();
     if runtime_process_authorization_v1 {
-        let mut accepted = serde_json::Map::new();
         accepted.insert(
             astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY
                 .to_string(),
             serde_json::Value::Bool(true),
         );
+    }
+    if w3c_trace_context_v1 {
+        accepted.insert(
+            astra_server_types::edge_ws_protocol::W3C_TRACE_CONTEXT_V1_CAPABILITY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if !accepted.is_empty() {
         sanitized["protocol_capabilities"] = serde_json::Value::Object(accepted);
     }
     Ok(sanitized)
@@ -2056,6 +2066,9 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         }
     }
 
@@ -2199,6 +2212,7 @@ mod tests {
         let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
         capabilities["protocol_capabilities"] = serde_json::json!({
             "runtime_process_authorization_v1": true,
+            "w3c_trace_context_v1": true,
             "unrecognized_future_protocol": true,
         });
 
@@ -2208,6 +2222,11 @@ mod tests {
         assert_eq!(
             sanitized["protocol_capabilities"]
                 [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY],
+            true
+        );
+        assert_eq!(
+            sanitized["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::W3C_TRACE_CONTEXT_V1_CAPABILITY],
             true
         );
         assert!(

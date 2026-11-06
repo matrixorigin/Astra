@@ -240,6 +240,9 @@ pub struct EdgeInvocation {
     pub execution_ceiling: Option<Box<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>>,
     pub runtime_process_authorization:
         Option<Box<astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext>>,
+    /// W3C carrier for this invocation's task. Empty when the server sent none.
+    pub traceparent: Option<String>,
+    pub tracestate: Option<String>,
     /// Bounded semantic inputs addressed to this invocation. Ordinary tool
     /// executors may ignore the receiver; provider-stage adapters consume it.
     pub input_rx: mpsc::Receiver<EdgeInvocationInput>,
@@ -818,6 +821,8 @@ async fn serve_connection_on_owner(
                                 execution_timeout_ms,
                                 command_timeout_cap_ms,
                                 execution_ceiling,
+                                traceparent,
+                                tracestate,
                             }) => {
                                 let execution_deadline = if timeout_secs.is_none() && execution_ceiling.is_none() {
                                     Err("An unbudgeted task requires an admitted execution grant")
@@ -961,6 +966,8 @@ async fn serve_connection_on_owner(
                                             execution_ceiling,
                                             runtime_process_authorization,
                                             input_rx,
+                                            traceparent,
+                                            tracestate,
                                         }, cancel.clone()).await
                                     };
                                     // The executor owns asynchronous subprocess cleanup.
@@ -1553,6 +1560,9 @@ mod tests {
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
             execution_ceiling: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         first_socket
             .send(Message::Text(
@@ -1682,6 +1692,9 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         client
             .send(Message::Text(
@@ -1709,6 +1722,9 @@ mod tests {
             execution_deadline_unix_ms: None,
             execution_timeout_ms: None,
             command_timeout_cap_ms: None,
+
+            traceparent: None,
+            tracestate: None,
         };
         client
             .send(Message::Text(

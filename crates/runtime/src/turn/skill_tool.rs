@@ -1652,8 +1652,12 @@ async fn execute_remote_skill(
     for (name, value) in forwarded_headers {
         request = request.header(name, value);
     }
-    let response = request
-        .send()
+    let mut request = request
+        .build()
+        .map_err(|err| format!("request failed: {err}"))?;
+    crate::server::outbound_trace::rewrite(&mut request);
+    let response = remote_skill_http_client()
+        .execute(request)
         .await
         .map_err(|err| format!("request failed: {err}"))?;
     let status = response.status();

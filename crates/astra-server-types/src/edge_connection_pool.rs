@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::edge_ws_protocol::{
     EDGE_TOOL_RESULT_GRACE_SECS, EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage,
     MAX_EDGE_TOOL_TIMEOUT_SECS, RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
+    supports_w3c_trace_context,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -106,6 +107,9 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub execution_timeout_ms: Option<u64>,
     pub command_timeout_cap_ms: Option<u64>,
     pub cancel_token: Option<&'a CancellationToken>,
+    /// This call's W3C carrier. The pool copies it onto the tool request.
+    pub traceparent: Option<&'a str>,
+    pub tracestate: Option<&'a str>,
 }
 
 /// Information about a tool request dispatched to an edge, stored for
@@ -1081,6 +1085,9 @@ impl EdgeConnectionPool {
                 execution_timeout_ms: None,
                 command_timeout_cap_ms: None,
                 cancel_token,
+
+                traceparent: None,
+                tracestate: None,
             },
         )
         .await
@@ -1111,6 +1118,8 @@ impl EdgeConnectionPool {
             execution_timeout_ms,
             command_timeout_cap_ms,
             cancel_token,
+            traceparent,
+            tracestate,
         } = invocation;
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return Err(EdgeInvocationDeliveryError::NotSent(
@@ -1141,7 +1150,8 @@ impl EdgeConnectionPool {
         let result_deadline = execution_deadline
             .map(|deadline| deadline + Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS));
         let key = pool_key(connection_user_id, edge_agent_id);
-        let (pending_results, sender, connection_generation, materialization_id) = {
+        let has_trace_carrier = traceparent.is_some() || tracestate.is_some();
+        let (pending_results, sender, connection_generation, materialization_id, trace_supported) = {
             let Some(entry) = self.connections.get(&key) else {
                 tracing::warn!(
                     target: "astra_runtime::edge_dispatch_diag",
@@ -1170,7 +1180,13 @@ impl EdgeConnectionPool {
                 conn.sender.clone(),
                 conn.generation,
                 conn.materialization_id.clone(),
+                has_trace_carrier && supports_w3c_trace_context(conn.capabilities.as_ref()),
             )
+        };
+        let (traceparent, tracestate) = if trace_supported {
+            (traceparent, tracestate)
+        } else {
+            (None, None)
         };
 
         let request_id = identity.storage_key();
@@ -1228,6 +1244,8 @@ impl EdgeConnectionPool {
             execution_deadline_unix_ms,
             execution_timeout_ms,
             command_timeout_cap_ms,
+            traceparent: traceparent.map(str::to_owned),
+            tracestate: tracestate.map(str::to_owned),
         };
 
         let send_deadline = (now + PROVIDER_STAGE_INPUT_ACK_TIMEOUT)
@@ -1926,6 +1944,9 @@ mod tests {
                             execution_timeout_ms: None,
                             command_timeout_cap_ms: Some(8_000),
                             cancel_token: None,
+
+                            traceparent: None,
+                            tracestate: None,
                         },
                     )
                     .await
@@ -2020,6 +2041,9 @@ mod tests {
                         execution_timeout_ms: Some(86_400_000),
                         command_timeout_cap_ms: Some(8_000),
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await
@@ -2091,6 +2115,9 @@ mod tests {
                         execution_timeout_ms: remaining,
                         command_timeout_cap_ms: None,
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await;
@@ -2118,6 +2145,9 @@ mod tests {
                         execution_timeout_ms: None,
                         command_timeout_cap_ms: None,
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await
@@ -2180,6 +2210,9 @@ mod tests {
                             execution_timeout_ms: Some(1_000),
                             command_timeout_cap_ms: None,
                             cancel_token: Some(&caller_cancel),
+
+                            traceparent: None,
+                            tracestate: None,
                         },
                     )
                     .await
@@ -2351,6 +2384,73 @@ mod tests {
 
     fn admitted_identity(call_id: &str) -> ToolInvocationIdentity {
         ToolInvocationIdentity::new("user-1", "session", "run", "turn", call_id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn tool_request_omits_trace_carrier_until_edge_advertises_it() {
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "old-edge",
+            None,
+            None,
+            Some(json!({"protocol_capabilities": {"runtime_process_authorization_v1": true}})),
+            None,
+            old_tx,
+        );
+        pool.register_with_capabilities(
+            "user-1",
+            "new-edge",
+            None,
+            None,
+            Some(json!({"protocol_capabilities": {"w3c_trace_context_v1": true}})),
+            None,
+            new_tx,
+        );
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        let ceiling = task_ceiling();
+        for (edge_agent_id, receiver) in [("old-edge", &mut old_rx), ("new-edge", &mut new_rx)] {
+            let identity = admitted_identity(edge_agent_id);
+            let caller = tokio::spawn({
+                let pool = pool.clone();
+                let identity = identity.clone();
+                let ceiling = ceiling.clone();
+                async move {
+                    pool.execute_durably_admitted_invocation_on_connection_with_cancel(
+                        DurablyAdmittedEdgeInvocation {
+                            provider_stage_dispatch: None,
+                            execution_ceiling: Some(&ceiling),
+                            connection_user_id: "user-1",
+                            identity: &identity,
+                            edge_agent_id,
+                            tool: "bash",
+                            args: &json!({"command": "true"}),
+                            runtime_process_authorization: None,
+                            timeout_secs: Some(30),
+                            execution_deadline_unix_ms: None,
+                            execution_timeout_ms: None,
+                            command_timeout_cap_ms: None,
+                            cancel_token: None,
+                            traceparent: Some(parent),
+                            tracestate: Some("vendor=value"),
+                        },
+                    )
+                    .await
+                }
+            });
+            let message = receiver.recv().await.expect("tool request");
+            caller.abort();
+            let encoded = serde_json::to_value(&message).expect("tool request encodes");
+            if edge_agent_id == "old-edge" {
+                assert!(encoded.get("traceparent").is_none());
+                assert!(encoded.get("tracestate").is_none());
+            } else {
+                assert_eq!(encoded["traceparent"], parent);
+                assert_eq!(encoded["tracestate"], "vendor=value");
+            }
+        }
     }
 
     #[test]
@@ -2793,6 +2893,9 @@ mod tests {
                         execution_timeout_ms: None,
                         command_timeout_cap_ms: None,
                         cancel_token: None,
+
+                        traceparent: None,
+                        tracestate: None,
                     },
                 )
                 .await

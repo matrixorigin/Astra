@@ -1053,6 +1053,8 @@ blank lines may omit list indentation without ending that fence.
 CommonMark also validates its opening line and info string. A provisional
 backtick fence that becomes a closed inline span cannot retain later calls.
 Opening-line text still streams while this distinction is unresolved.
+Only backtick openings retain provisional info-string work. Tilde fences are
+already settled, so backticks in their info string do not reparse a growing line.
 Tabs retain
 physical columns and virtual padding; active inline spans ignore block indentation.
 Indented paragraph continuations retain their inline delimiter state; actual
@@ -1079,7 +1081,9 @@ executable invocations. An unmatched escaped opener cannot absorb a real call in
 a later block. Per-kind scope
 indexes make unmatched closers constant-time and matching pops amortized linear.
 Physical line-prefix state follows every byte consumed, including newlines inside
-tags. List context survives continuation lines; unmatched inline delimiters end at
+tags. LF and CRLF use the same line and blank facts; a CRLF pair split across
+deltas keeps its container context while awaiting the LF. Raw text and parameter bytes
+remain unchanged. List context survives continuation lines; unmatched inline delimiters end at
 their CommonMark block boundary. The existing CommonMark parser determines
 paragraph continuation, heading boundaries and new container facts rather than a
 second set of block rules. Structural prefixes are classified through their

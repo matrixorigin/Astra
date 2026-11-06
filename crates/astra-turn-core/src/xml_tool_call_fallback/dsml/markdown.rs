@@ -205,10 +205,7 @@ impl Cursor {
                 Container::List(width) => {
                     let padding = at.indent(bytes, *width);
                     if padding < *width {
-                        if at.byte == bytes.len() && !finish {
-                            return None;
-                        }
-                        if at.byte == bytes.len() || bytes.get(at.byte) == Some(&b'\n') {
+                        if blank_line_start(&bytes[at.byte..], finish)? {
                             return Some(Context::Blank(self.prefix(at, false, containers)));
                         }
                         return Some(Context::Left);
@@ -249,6 +246,17 @@ enum Context {
     Matched,
     Left,
     Blank(Prefix),
+}
+
+/// Match the existing parser's LF/CRLF physical-line grammar without rewriting
+/// source bytes. A trailing CR needs one byte of lookahead across deltas.
+fn blank_line_start(bytes: &[u8], finish: bool) -> Option<bool> {
+    match bytes {
+        [] => finish.then_some(true),
+        [b'\r'] if !finish => None,
+        [b'\n', ..] | [b'\r', b'\n', ..] => Some(true),
+        _ => Some(false),
+    }
 }
 
 /// Facts from the canonical CommonMark parser for a complete physical line.

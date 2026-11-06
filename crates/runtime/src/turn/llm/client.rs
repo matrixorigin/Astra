@@ -30,6 +30,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 #[path = "responses.rs"]
 mod responses;
 
@@ -1666,6 +1667,7 @@ pub(crate) async fn finish_observed_provider_error(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1680,6 +1682,7 @@ pub(crate) async fn finish_observed_provider_error_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -1695,6 +1698,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1709,6 +1713,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -5442,6 +5447,36 @@ async fn read_provider_error_body(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+struct LlmAttemptSpan {
+    span: tracing::Span,
+    failed: bool,
+}
+
+impl LlmAttemptSpan {
+    fn start() -> Self {
+        crate::server::run_trace::clear_attempt_code();
+        let span = tracing::info_span!(target: "astra.llm", "llm.call");
+        crate::server::run_trace::parent_to_active_run(&span);
+        let entered = span.clone();
+        let _entered = entered.enter();
+        Self { span, failed: true }
+    }
+
+    fn succeed(&mut self) {
+        self.failed = false;
+        crate::server::run_trace::clear_attempt_code();
+    }
+}
+
+impl Drop for LlmAttemptSpan {
+    fn drop(&mut self) {
+        if self.failed {
+            let code = crate::server::run_trace::attempt_code().unwrap_or("unknown");
+            astra_logging::trace_context::mark_error(&self.span, code);
+        }
+    }
+}
+
 async fn call_prepared_llm_with_total_budget(
     prepared: PreparedStreamingCall<'_>,
     cancel: LlmCancel<'_>,
@@ -5686,8 +5721,12 @@ async fn call_prepared_llm_with_total_budget(
                     .expect("observed attempt requires observer")
                     .note_dispatch_started(attempt_index);
             }
-            req.body(prepared_request.body()).send().await
+            let mut request = req.body(prepared_request.body()).build()?;
+            crate::server::outbound_trace::rewrite(&mut request);
+            client.execute(request).await
         };
+        let mut llm_attempt = LlmAttemptSpan::start();
+        let send_request = send_request.instrument(llm_attempt.span.clone());
         let send_result = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -5833,6 +5872,7 @@ async fn call_prepared_llm_with_total_budget(
                         {
                             return Err(attach_llm_result_details(error, &result));
                         }
+                        llm_attempt.succeed();
                         return Ok(result);
                     }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Cancelled {
@@ -6125,6 +6165,7 @@ async fn call_prepared_llm_with_total_budget(
                     {
                         return Err(attach_llm_result_details(error, &result));
                     }
+                    llm_attempt.succeed();
                     return Ok(result);
                 }
                 Err(StreamCollectError::Cancelled { partial }) => {
@@ -8274,11 +8315,15 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
                 .expect("observed attempt requires observer")
                 .note_dispatch_started(attempt_index);
         }
-        req.timeout(effective_timeout)
+        let mut request = req
+            .timeout(effective_timeout)
             .body(prepared_request.body())
-            .send()
-            .await
+            .build()?;
+        crate::server::outbound_trace::rewrite(&mut request);
+        client.execute(request).await
     };
+    let mut llm_attempt = LlmAttemptSpan::start();
+    let send_request = send_request.instrument(llm_attempt.span.clone());
     let resp = match send_request.await {
         Ok(response) => response,
         Err(e) => {
@@ -8522,6 +8567,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     {
         return Err(attach_llm_result_details(error, &result));
     }
+    llm_attempt.succeed();
     Ok(result)
 }
 
@@ -13143,6 +13189,8 @@ mod tests {
     async fn collect_llm_stream_dsml_markdown_examples_remain_data() {
         let call = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
         for content in [
+            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
+            format!("1. ~~~xml\n\n   {call}\n   ~~~\n"),
             format!("> ~~~text\n> {call}\n> ~~~"),
             format!("    {call}\n"),
             format!("- ~~~text\n  {call}\n  ~~~"),
@@ -13150,11 +13198,14 @@ mod tests {
             format!("> - ~~~text\n>   {call}\n>   ~~~"),
             format!("100. ~~~text\n     {call}\n     ~~~"),
             format!("```text\n> ```\n{call}\n```"),
-            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
             format!("> - ~~~xml\n>\n>   {call}\n>   ~~~\n"),
             format!(">\t~~~xml\n> {call}\n> ~~~\n"),
             format!("\t{call}\n"),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|text| [text.clone(), text.replace("~~~", "```")])
+        .flat_map(|text| ["\n", "\r\n"].map(|ending| text.replace('\n', ending)))
+        {
             for character_chunks in [false, true] {
                 let chunks = if character_chunks {
                     content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
@@ -13320,7 +13371,12 @@ mod tests {
 
     #[tokio::test]
     async fn collect_llm_stream_dsml_fragmented_long_prefixes_are_preserved_or_hidden() {
+        let fence_info = format!(
+            "~~~{}\n<|DSML|invoke name=\"bash\">{{\"command\":\"pwd\"}}</|DSML|invoke>\n~~~\n",
+            "x`".repeat(32_000)
+        );
         for (content, expected) in [
+            (fence_info.clone(), fence_info),
             (" ".repeat(512 * 1024), " ".repeat(512 * 1024)),
             (
                 format!("<|DSML|invoke name=\"{}", "a".repeat(512 * 1024)),
@@ -13371,6 +13427,11 @@ mod tests {
  tool_calls>"#;
         let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
         for (content, expected, paths) in [
+            (
+                "<|DSML|invoke name=\"read_file\"><|DSML|parameter name=\"path\" string=\"true\">line1\rline2\nline3</|DSML|parameter></|DSML|invoke>".to_owned(),
+                String::new(),
+                vec!["line1\rline2\nline3"],
+            ),
             (
                 format!("```example```\n{call}"),
                 "```example```\n".to_owned(),
@@ -13503,7 +13564,10 @@ mod tests {
                 "    ".to_owned(),
                 vec!["a.txt", "b.txt"],
             ),
-        ] {
+        ].into_iter().flat_map(|(content, expected, paths)| ["\n", "\r\n"].map(|ending| (
+            content.replace('\n', ending), expected.replace('\n', ending),
+            paths.iter().map(|path| path.replace('\n', ending)).collect::<Vec<_>>()
+        ))) {
             for character_chunks in [false, true] {
                 let chunks = if character_chunks {
                     content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()

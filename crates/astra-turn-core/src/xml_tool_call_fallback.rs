@@ -647,8 +647,11 @@ mod tests {
 
     #[test]
     fn dsml_container_and_indented_code_are_literal() {
+        use pulldown_cmark::{Event, Parser, Tag, TagEnd};
         let call = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
         for text in [
+            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
+            format!("1. ~~~xml\n\n   {call}\n   ~~~\n"),
             format!("> ~~~text\n> {call}\n> ~~~"),
             format!("    {call}\n"),
             format!("- ~~~text\n  {call}\n  ~~~"),
@@ -656,11 +659,30 @@ mod tests {
             format!("> - ~~~text\n>   {call}\n>   ~~~"),
             format!("100. ~~~text\n     {call}\n     ~~~"),
             format!("```text\n> ```\n{call}\n```"),
-            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
             format!("> - ~~~xml\n>\n>   {call}\n>   ~~~\n"),
             format!(">\t~~~xml\n> {call}\n> ~~~\n"),
             format!("\t{call}\n"),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|text| [text.clone(), text.replace("~~~", "```")])
+        .flat_map(|text| ["\n", "\r\n"].map(|ending| text.replace('\n', ending)))
+        {
+            let mut code = false;
+            assert!(
+                Parser::new(&text).any(|event| match event {
+                    Event::Start(Tag::CodeBlock(_)) => {
+                        code = true;
+                        false
+                    }
+                    Event::End(TagEnd::CodeBlock) => {
+                        code = false;
+                        false
+                    }
+                    Event::Text(value) => code && value.contains(&call),
+                    _ => false,
+                }),
+                "CommonMark must classify the invocation as code: {text:?}"
+            );
             assert!(
                 parse_degraded_tool_calls(&text).is_none(),
                 "code example: {text:?}"
@@ -684,7 +706,10 @@ mod tests {
             format!("100. ~~~text\n     {example}\n     ~~~\n{real}"),
             format!("> ~~~text\n> {example}\n{real}"),
             format!("- ~~~text\n  {example}\n{real}"),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|text| ["\n", "\r\n"].map(|ending| text.replace('\n', ending)))
+        {
             let calls = parse_degraded_tool_calls(&text).unwrap();
             assert_eq!(
                 calls
@@ -1089,6 +1114,37 @@ mod tests {
                 assert!(parse_degraded_tool_calls(&text).is_none());
                 eprintln!(
                     "mixed malformed {inner} scopes {pairs}: {:?}",
+                    started.elapsed()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dsml_long_fence_info_preserves_literal_output_across_chunking() {
+        use pulldown_cmark::{Event, Parser, Tag};
+        for info in ["x`", "xy"] {
+            for repeats in [8_000, 16_000, 32_000] {
+                let text = format!("~~~{}\nbody\n~~~\n", info.repeat(repeats));
+                assert!(matches!(
+                    Parser::new(&text).next(),
+                    Some(Event::Start(Tag::CodeBlock(_)))
+                ));
+                let started = std::time::Instant::now();
+                assert!(parse_degraded_tool_calls(&text).is_none());
+                let decoded = started.elapsed();
+                assert_eq!(filter_dsml_tool_call_markup_for_display(&text), text);
+                for width in [1, 16] {
+                    let mut filter = DsmlToolCallStreamFilter::default();
+                    let mut visible = String::new();
+                    for chunk in text.as_bytes().chunks(width) {
+                        visible.push_str(&filter.push(std::str::from_utf8(chunk).unwrap()));
+                    }
+                    visible.push_str(&filter.finish());
+                    assert_eq!(visible, text);
+                }
+                eprintln!(
+                    "fence info {info:?} {repeats}: decode {decoded:?}, all projections {:?}",
                     started.elapsed()
                 );
             }

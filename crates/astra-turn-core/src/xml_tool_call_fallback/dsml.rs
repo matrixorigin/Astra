@@ -522,7 +522,9 @@ impl Lexer {
                             self.literal = Some((first, count, fence));
                             if fence {
                                 self.fence_containers = self.line_containers.clone();
-                                self.fence_opening = Some(String::new());
+                                // Tilde fences are already settled: backticks
+                                // cannot invalidate their info string.
+                                self.fence_opening = (first == '`').then(String::new);
                                 self.paragraph_open = false;
                             }
                         }
