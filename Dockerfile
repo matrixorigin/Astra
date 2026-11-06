@@ -49,7 +49,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY vendor ./vendor
-RUN cargo chef prepare --recipe-path recipe.json --features astra-runtime/otel
+RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS dependency-inputs
 
