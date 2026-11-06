@@ -679,9 +679,9 @@ impl From<String> for ClassifiedError {
 /// (e.g. `"LLM error 413: {json}"`): the whole string is parsed first, then
 /// the suffix starting at the first `{`.
 ///
-/// Returns `None` when the body carries no recognized code, so callers fall
-/// back to their existing text-needle classification for upstreams that do
-/// not emit structured envelopes.
+/// Returns `None` when the body carries no recognized code or type, so
+/// callers fall back to their existing text-needle classification for
+/// upstreams that do not emit structured envelopes.
 #[must_use]
 pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
     structured_llm_error_code(body).map(|(kind, _)| kind)
@@ -695,15 +695,22 @@ pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
 #[must_use]
 pub fn structured_llm_error_code(body: &str) -> Option<(ErrorKind, &'static str)> {
     let error = llm_error_envelope_error(body)?;
-    // `code` wins when it is a usable string; OpenAI-compatible envelopes
-    // commonly carry `"code": null` (or omit it), so null/non-string/empty
-    // values must fall back to `type` instead of failing the parse.
-    let code = error
-        .get("code")
-        .and_then(serde_json::Value::as_str)
-        .filter(|code| !code.trim().is_empty())
-        .or_else(|| error.get("type").and_then(serde_json::Value::as_str))?;
-    llm_error_envelope_code_class(code)
+    let token = |key: &str| {
+        error
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+    };
+    // `code` wins when it classifies; OpenAI-compatible envelopes commonly
+    // carry `"code": null` (or omit it), so null/non-string/empty values fall
+    // back to `type`. A present but unrecognized `code` must not block a
+    // recognized `type` either: the envelope is still structured, so the
+    // recognized category (e.g. `invalid_request` on a parameter rejection)
+    // stays authoritative instead of dropping to text-needle guessing. Only
+    // when neither token classifies do callers fall back.
+    token("code")
+        .and_then(llm_error_envelope_code_class)
+        .or_else(|| token("type").and_then(llm_error_envelope_code_class))
 }
 
 /// Classify a single provider error-envelope code token.
@@ -1597,6 +1604,17 @@ mod tests {
                 r#"LLM error 400: {"error":{"message":"maximum context length exceeded","type":"context_length_exceeded","code":"context_length_exceeded","request_id":"req_pqr678"}}"#,
                 Some(ErrorKind::ContextWindow),
             ),
+            // A present but unrecognized `code` must not block the recognized
+            // `type`: parameter/output-limit rejections stay InvalidRequest
+            // instead of dropping to context-window text needles.
+            (
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"unsupported_parameter"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
+            (
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"invalid_value"}}"#,
+                Some(ErrorKind::InvalidRequest),
+            ),
             // No recognized code → caller falls back to needle classification.
             (
                 r#"{"error":{"message":"rate limited","type":"rate_limit","code":"rate_limit_exceeded"}}"#,
@@ -1731,6 +1749,18 @@ mod tests {
             (
                 r#"{"error":{"code":"context_length_exceeded","type":"invalid_request","message":"too long"}}"#,
                 Some("context_length_exceeded"),
+            ),
+            // An unrecognized `code` defers to a recognized `type`; the
+            // surfaced token is the one that classified.
+            (
+                r#"{"error":{"code":"unsupported_parameter","type":"invalid_request","message":"max_tokens is too large; maximum output is 8192"}}"#,
+                Some("invalid_request"),
+            ),
+            // Both tokens unrecognized → None, preserving the caller
+            // text fallback.
+            (
+                r#"{"error":{"code":"unsupported_parameter","type":"some_new_type","message":"x"}}"#,
+                None,
             ),
             (
                 r#"{"error":{"code":"internal_error: db conn 10.0.0.1 refused","message":"x"}}"#,

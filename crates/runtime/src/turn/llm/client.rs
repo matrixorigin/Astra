@@ -17278,6 +17278,73 @@ mod tests {
         );
     }
 
+    /// Mock provider: 400 with an unrecognized envelope `code`
+    /// (`unsupported_parameter`) but a recognized `type` (`invalid_request`)
+    /// — a parameter/output-limit rejection whose prose mentions a token
+    /// maximum.
+    async fn mock_400_unsupported_parameter_max_tokens() -> Response {
+        Response::builder()
+            .status(400)
+            .body(Body::from(
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"unsupported_parameter"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_unrecognized_code_defers_to_recognized_type() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_400_unsupported_parameter_max_tokens),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let err = call_llm_and_collect(collect_call(&base, &messages), LlmCancel::None)
+            .await
+            .expect_err("should fail with invalid request");
+        // A present but unrecognized `code` must not drop the recognized
+        // `type` into the context-window text fallback: this is a
+        // parameter/output-limit rejection, which conversation compaction
+        // cannot correct.
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(err.message.contains("max_tokens"), "{}", err.message);
+    }
+
+    /// Mock provider: 400 with an unrecognized envelope `code`
+    /// (`invalid_value`) but a recognized `type` (`invalid_request`) — the
+    /// non-stream twin of the streaming boundary above.
+    async fn mock_400_invalid_value_max_tokens() -> Response {
+        Response::builder()
+            .status(400)
+            .body(Body::from(
+                r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request","param":"max_tokens","code":"invalid_value"}}"#,
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn call_llm_nonstream_unrecognized_code_defers_to_recognized_type() {
+        reset_rate_limit_cooldown_for_tests();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(mock_400_invalid_value_max_tokens),
+        );
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let error = call_llm_nonstream(
+            global_llm_client(),
+            collect_call(&base, &messages),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("parameter rejection must fail the non-stream call");
+        // `invalid_value` is likewise unrecognized, but the recognized
+        // `invalid_request` type keeps the shared classifier authoritative
+        // instead of the prose fallback.
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    }
+
     /// Mock server that returns 413 with a context_length_exceeded envelope
     /// whose free-text message carries an echoed credential.
     async fn mock_413_context_window_with_secret() -> Response {
