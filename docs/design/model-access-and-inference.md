@@ -38,6 +38,29 @@ without exposing upstream response bodies or credentials.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
+## Provider rejection contract
+
+The shared ordinary-provider HTTP boundary distinguishes authentication (`auth`), an
+explicit provider balance/quota denial (`provider_quota_exhausted`), and a
+provider denial without a proven cause (`provider_forbidden`). HTTP 401 is
+authentication failure. HTTP 403 alone, including `upstream_forbidden`, is not
+evidence of expired credentials or exhausted credit. Only the bounded machine
+codes `invalid_api_key`, `invalid_token`, `authentication_error`,
+`insufficient_quota`, and `insufficient_balance` refine that classification;
+provider message text never does. A quota-coded 429 is terminal, unlike a
+transient rate limit. These access rejections do not trigger automatic retry,
+credential refresh, provider fallback, or a waiting run.
+
+Both streaming and nonstreaming calls preserve these classifications through
+the shared agent loop and failed Run outcome. The negotiated MOI gateway can
+carry the same provider facts using `provider_authentication_failed`,
+`provider_forbidden`, and `provider_quota_exhausted`. Its billing-owner reasons
+(for example `insufficient_credit`) keep their separate versioned contract.
+Provider diagnostics, balances, and echoed credentials never enter public
+error messages. Clients must not infer an end-user billing remedy from a
+provider-account failure. Real input/authorization waits retain their existing
+lifecycle semantics.
+
 ## Implemented ChatGPT subscription connection boundary
 
 The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
