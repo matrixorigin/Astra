@@ -61,6 +61,17 @@ pub async fn ephemeral_provider_chat_stream(
     }
 }
 
+/// Drive one owned Session through the production journal claim/worker/ack
+/// path. In-process Router fixtures do not start the server's managed timers.
+/// Awaiting this boundary includes acknowledgement SQL after worker metrics.
+pub async fn drive_session_memory_recovery_for_test(
+    state: &super::AppState,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    super::session_memory_runtime::drive_session_memory_work(state, user_id, session_id).await
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
     pub method: Method,
