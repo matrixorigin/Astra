@@ -37,10 +37,11 @@ needed.
    Only one entry may declare this default. Missing or false declarations
    leave the existing binding unchanged. All model entries load before the
    optional default is bound. Failed or unconfirmed health checks leave the
-   binding unchanged and report a warning without blocking the remaining models
-   or `make dev-seed`; they never claim that judgment was enabled. Registry
-   errors and rejected binding writes still return an error. After restoring
-   upstream availability, rerun model load rather than the destructive seed.
+   binding unchanged and report a warning without blocking the remaining models;
+   they never claim that judgment was enabled. A failed model or rejected binding
+   makes the load command exit nonzero, including when invoked by `make dev-seed`.
+   After restoring upstream availability, rerun model load rather than the
+   destructive seed.
 3. To switch an already active model manually, run
    `astra admin config set judgment_model jev-1.13.0`.
    Inspect it with `astra admin config get judgment_model`. Exact names are

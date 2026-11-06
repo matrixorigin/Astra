@@ -153,11 +153,13 @@ fn classify_error_kind_outcome(
         ErrorKind::ToolTimeout | ErrorKind::ProviderDeadline => {
             (ExecutionOutcome::Timeout, Some(FailureCategory::Timeout))
         }
-        ErrorKind::ResourceLimit | ErrorKind::PaymentRequired => (
+        ErrorKind::ResourceLimit
+        | ErrorKind::PaymentRequired
+        | ErrorKind::ProviderQuotaExhausted => (
             ExecutionOutcome::ResourceLimit,
             Some(FailureCategory::ResourceExhaustion),
         ),
-        ErrorKind::Auth => (
+        ErrorKind::Auth | ErrorKind::ProviderForbidden => (
             ExecutionOutcome::Failure,
             Some(FailureCategory::PermissionDenied),
         ),

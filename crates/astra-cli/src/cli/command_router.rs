@@ -5,6 +5,7 @@ use crate::cli::arg_render::{
 use crate::cli::auth_flow::{clear_profile_auth, do_login, do_memoria_login_with_key, do_register};
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
+    WorkspaceCmd,
 };
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
@@ -953,7 +954,23 @@ fn one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode) -> Option
         Some(format!("Session persistence degraded: {error}"))
     } else if sr.local_continuation_omitted {
         Some("Local conversation content omitted by privacy policy; this turn cannot be recovered or automatically resumed locally.".into())
+    } else if !sr.server_terminal_authoritative
+        && exit_code != ExitCode::Success
+        && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
+            &sr.tool_call_records,
+        )
+    {
+        Some("A tool result could not be saved or delivered. Check what completed before continuing; do not repeat an action just to recover its output.".into())
     } else if exit_code == ExitCode::Partial {
+        if let Some(message) = sr
+            .interruption
+            .as_ref()
+            .and_then(|interruption| interruption.get("user_message"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+        {
+            return Some(message.to_string());
+        }
         Some(match sr.interruption_kind.as_deref() {
             Some(kind) => format!(
                 "Turn finished partially ({kind}). Inspect partial output before continuing."
@@ -2894,6 +2911,35 @@ async fn execute_cli_command_impl(
             Ok(exit_code)
         }
 
+        Some(Command::Workspace(WorkspaceCmd::ConfirmStopped)) => {
+            if !std::io::stdin().is_terminal() {
+                return Err("Confirm workspace recovery from an interactive terminal.".into());
+            }
+            let root = std::env::current_dir().map_err(|error| error.to_string())?;
+            let recovery = astra_tools::workspace_observation::begin_workspace_recovery(&root)
+                .await
+                .map_err(|error| format!("Workspace recovery failed: {error}"))?;
+            eprintln!("Workspace: {}", root.display());
+            let confirmed = inquire::Confirm::new(
+                "Have all local and connected commands that may still use this workspace stopped?",
+            )
+            .with_default(false)
+            .prompt()
+            .map_err(|error| format!("Could not confirm workspace recovery: {error}"))?;
+            if !confirmed {
+                eprintln!("Workspace recovery cancelled.");
+                return Ok(ExitCode::Success);
+            }
+            recovery
+                .confirm()
+                .await
+                .map_err(|error| format!("Workspace recovery failed: {error}"))?;
+            eprintln!(
+                "Workspace confirmed. Restart any running Astra sessions from this workspace before retrying the rollback."
+            );
+            Ok(ExitCode::Success)
+        }
+
         Some(Command::Session(SessionCmd::Judge(args))) => {
             let message =
                 crate::cli::session_judge::read_message(args.message, std::io::stdin().lock())?;
@@ -3291,8 +3337,15 @@ async fn execute_cli_command_impl(
             let body = api
                 .post_bearer_path_json_text(&token, paths::ME_MODELS, &payload)
                 .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
+                .map_err(crate::cli::cli_config::cli_utils::model_creation_error)?;
+            if interactive {
+                stdout_println!(
+                    "{} Personal model '{name}' added; provider check passed.",
+                    theme::icon_ok()
+                );
+            } else {
+                print_json_or_raw(&body);
+            }
             Ok(ExitCode::Success)
         }
 
@@ -3746,6 +3799,9 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
         {
             return false;
         }
+        if record.execution_ok.is_some() && !record.ok {
+            return true;
+        }
         match record.exit_semantics.as_deref().and_then(|tag| {
             serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
                 serde_json::Value::String(tag.to_string()),
@@ -3780,6 +3836,18 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     // harder error and is intentionally checked first.
     if sr.final_state == "interrupted" {
         return ExitCode::Partial;
+    }
+    // The shared loop's completed response follows its tool-result feedback.
+    // An earlier failed call remains audit evidence, not an exit-code veto.
+    if sr.final_state == "completed" && !sr.full_text.trim().is_empty() {
+        return ExitCode::Success;
+    }
+    if !sr.server_terminal_authoritative
+        && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
+            &sr.tool_call_records,
+        )
+    {
+        return ExitCode::ToolFailure;
     }
     if !sr.server_terminal_authoritative
         && sr.tool_call_records.iter().any(&is_error)
@@ -4002,6 +4070,7 @@ fn final_json_output_with_context(
         "tools_used": sr.tools_used,
         "local_continuation": if sr.local_continuation_omitted { Some("omitted_by_policy") } else { None },
         "persistence_error": sr.session_persistence_error,
+        "warning": one_shot_completion_warning(sr, exit_code),
         "exit_code": i32::from(exit_code),
         "success": exit_code == ExitCode::Success && disposition == "completed",
         "completion_disposition": disposition,
@@ -5491,6 +5560,83 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn exit_code_reports_delivery_failure_after_successful_command() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: false,
+                execution_ok: Some(true),
+                exit_semantics: Some("success".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn completed_model_response_is_not_overridden_by_an_earlier_delivery_failure() {
+        let mut sr = empty_stream_result();
+        sr.full_text = "I verified the output.".into();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "write_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+
+        sr.final_state = "interrupted".into();
+        assert_eq!(compute_exit_code(&sr), ExitCode::Partial);
+    }
+
+    #[test]
+    fn read_delivery_failure_does_not_block_an_alternative_observation() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                args_full: Some(r#"{"path":"one.txt"}"#.into()),
+                ..Default::default()
+            });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".into(),
+                ok: true,
+                args_full: Some(r#"{"path":"two.txt"}"#.into()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+
+        // A lost mutation outcome cannot be recovered by an unrelated read.
+        sr.tool_call_records[0].name = "write_file".into();
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+        assert!(
+            super::one_shot_completion_warning(&sr, ExitCode::ToolFailure)
+                .unwrap()
+                .contains("result could not be saved or delivered")
+        );
+
+        // The server's terminal state supersedes stale local tool records.
+        sr.server_terminal_authoritative = true;
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
     }
 
     fn tool_call_record(

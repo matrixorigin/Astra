@@ -611,6 +611,7 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,
@@ -1630,6 +1631,7 @@ mod tests {
                 owner.clone(),
                 UserModelCreateRequestData {
                     inference_protocol: None,
+                    responses_reasoning_history: None,
                     connection_id: Some(connection),
                     name: "summary".into(),
                     provider: "chatgpt".into(),

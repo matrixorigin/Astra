@@ -791,6 +791,11 @@ impl SessionState {
         // boundary without requiring unbounded shutdown waits.
         self.active_work_registry =
             std::sync::Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
+        // A selected checkout belongs to this session. Rotate the shared
+        // owner so a retiring turn cannot redirect a different session.
+        self.git_worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::edge_tools::worktree::GitWorktreeRollbackJournal::default(),
+        ));
         self.pending_recovery = None;
         self.run_id = None;
         *astra_core::sync_poison::recover_mutex_lock(&self.active_turn_local_run_control) = None;
@@ -1085,6 +1090,14 @@ mod default_tests {
         assert!(state.session_persistence_error.is_none());
         assert!(state.perm_manager.export_session_overrides().is_none());
         assert!(state.pending_bg_notifications.is_empty());
+    }
+
+    #[test]
+    fn resetting_session_replaces_the_worktree_owner() {
+        let mut state = SessionState::default();
+        let prior = state.git_worktree_journal.clone();
+        state.reset_for_new_session();
+        assert!(!std::sync::Arc::ptr_eq(&prior, &state.git_worktree_journal));
     }
 
     #[test]

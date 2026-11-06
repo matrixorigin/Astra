@@ -1945,6 +1945,12 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
         K::PaymentRequired => format!(
             "Model billing restriction ({tool}): check credit and billing limits — {count} occurrences"
         ),
+        K::ProviderQuotaExhausted => format!(
+            "Model provider account quota exhausted ({tool}): ask the account owner to check balance and quota — {count} occurrences"
+        ),
+        K::ProviderForbidden => format!(
+            "Model provider rejected inference ({tool}): inspect the provider rejection — {count} occurrences"
+        ),
         K::ResourceLimit => format!(
             "System resource exhaustion ({tool}): OS cannot fork/allocate — {count} occurrences"
         ),

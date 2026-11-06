@@ -75,6 +75,94 @@ async fn chain_stops_on_error() {
 }
 
 #[tokio::test]
+async fn cancelling_agent_chain_stops_active_and_later_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let executor = std::sync::Arc::new(
+        ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner())),
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let worker =
+        tokio::spawn(async move {
+            executor.execute_with_metadata_cancelable("agent", &json!({
+            "action":"run_chain", "name":"cancel", "description":"cancel active work",
+            "steps":[
+                {"tool":"bash", "args":{"command":"printf ready > started; sleep 20"}},
+                {"tool":"write_file", "args":{"path":"must-not-exist", "content":"late"}}
+            ]
+        }), Some(&worker_cancel)).await
+        });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !dir.path().join("started").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("first step did not start");
+    cancel.cancel();
+    let result = worker.await.unwrap();
+    assert!(result.is_error, "{result:?}");
+    assert!(!dir.path().join("must-not-exist").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_between_chain_steps_preserves_completed_work() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = super::worktree_tests::init_temp_git_repo();
+    let control = tempfile::tempdir().unwrap();
+    let hook = dir.path().join(".git/hooks/post-checkout");
+    let started = control.path().join("started");
+    let release = control.path().join("release");
+    std::fs::write(&hook, format!(
+        "#!/bin/sh\nprintf ready > {}\ni=0\nwhile [ ! -e {} ] && [ \"$i\" -lt 100 ]; do sleep .05; i=$((i+1)); done\n",
+        crate::edge_tools::shell::shell_escape(&started.to_string_lossy()),
+        crate::edge_tools::shell::shell_escape(&release.to_string_lossy()),
+    )).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let executor = std::sync::Arc::new(
+        ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner())),
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker_executor = executor.clone();
+    let worker_cancel = cancel.clone();
+    let worker = tokio::spawn(async move {
+        worker_executor.execute_with_metadata_cancelable("agent", &json!({
+            "action":"run_chain", "name":"cancel-between", "description":"Stop between steps",
+            "steps":[
+                {"tool":"write_file", "args":{"path":"keep.txt", "content":"keep"}},
+                {"tool":"worktree", "args":{"action":"enter", "branch":"cancel-between"}},
+                {"tool":"write_file", "args":{"path":"must-not-run", "content":"late"}}
+            ]
+        }), Some(&worker_cancel)).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("checkout hook did not start");
+    cancel.cancel();
+    std::fs::write(release, "continue").unwrap();
+    let result = worker.await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    assert!(result.is_error, "{body}");
+    assert_eq!(body["steps_executed"], 2, "{body}");
+    assert!(body.get("rollback").is_none(), "{body}");
+    assert!(dir.path().join("keep.txt").exists());
+    let checkout = executor.get_worktree_session().unwrap().worktree_path;
+    assert!(!checkout.join("must-not-run").exists());
+    let kept = executor
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
+    super::worktree_tests::remove_preserved_test_worktree(dir.path(), &checkout);
+}
+
+#[tokio::test]
 async fn chain_preserves_shell_outcome_independently_of_display_text() {
     use astra_turn_core::tool_registry_chain::ToolChain;
 
@@ -119,35 +207,99 @@ async fn chain_failure_remains_failed_at_agent_dispatch() {
 }
 
 #[tokio::test]
-async fn chain_rollback_on_failure_reverts_bounded_file_edits() {
-    use astra_turn_core::tool_registry_chain::ToolChain;
-
+async fn agent_chain_rejects_automatic_rollback_before_execution() {
     let dir = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(dir.path());
-
-    let chain = ToolChain::new("rollback_chain", "Write then fail")
-        .with_rollback_on_failure(true)
-        .step(
-            "write_file",
-            json!({"path": "rolled_back.txt", "content": "temporary"}),
+    let executor =
+        ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner()));
+    let result = executor
+        .execute_with_metadata(
+            "agent",
+            &json!({
+                "action": "run_chain", "name": "rollback_chain", "description": "Write then fail",
+                "rollback_on_failure": true,
+                "steps": [
+                    {"tool":"write_file", "args":{"path":"temporary.txt", "content":"data"}},
+                    {"tool":"read_file", "args":{"path":"missing.txt"}}
+                ]
+            }),
         )
-        .step("read_file", json!({"path": "missing.txt"}));
-
-    let result = executor.execute_chain(&chain, json!({})).await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["steps_executed"], 2);
-    let steps = parsed["steps"].as_array().unwrap();
-    assert!(steps[0]["success"].as_bool().unwrap());
-    assert!(!steps[1]["success"].as_bool().unwrap());
-    assert_eq!(parsed["rollback"]["success"].as_bool(), Some(true));
-    assert_eq!(
-        parsed["rollback"]["reverted_files"]
-            .as_array()
-            .map(Vec::len),
-        Some(1)
+        .await;
+    assert!(result.is_error, "{}", result.output);
+    assert!(
+        result.output.contains("rollback_on_failure"),
+        "{}",
+        result.output
     );
-    assert!(!dir.path().join("rolled_back.txt").exists());
+    assert!(!dir.path().join("temporary.txt").exists());
+}
+
+#[tokio::test]
+async fn agent_chain_can_enter_use_and_leave_worktree() {
+    let dir = super::worktree_tests::init_temp_git_repo();
+    let executor =
+        ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner()));
+    let exit_action =
+        if cfg!(target_os = "macos") || super::worktree_tests::has_authoritative_worktree_owner() {
+            "remove"
+        } else {
+            "keep"
+        };
+    let result = executor
+        .execute_with_metadata(
+            "agent",
+            &json!({
+                "action":"run_chain", "name":"worktree_chain", "description":"Use a worktree",
+                "steps":[
+                    {"tool":"worktree", "args":{"action":"enter", "branch":"chain-branch"}},
+                    {"tool":"write_file", "args":{"path":"created.txt", "content":"worktree"}},
+                    {"tool":"read_file", "args":{"path":"created.txt"}},
+                    {"tool":"worktree", "args":{"action":"exit", "exit_action":exit_action, "discard_changes":true}}
+                ]
+            }),
+        )
+        .await;
+    let body: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    assert!(!result.is_error, "{body}");
+    assert_eq!(body["steps_executed"], 4);
+    assert!(
+        body["steps"][2]["output"]
+            .as_str()
+            .unwrap()
+            .contains("worktree")
+    );
+    assert!(!dir.path().join("created.txt").exists());
+    assert!(!executor.in_worktree_session());
+    if !super::worktree_tests::has_authoritative_worktree_owner() {
+        let list: serde_json::Value =
+            serde_json::from_str(&executor.rollback_git_worktrees(&json!({"scope":"list"})))
+                .unwrap();
+        let checkout = std::path::Path::new(list["entries"][0]["worktree_path"].as_str().unwrap());
+        assert!(checkout.join("created.txt").exists());
+        super::worktree_tests::remove_preserved_test_worktree(dir.path(), checkout);
+    }
+}
+
+#[tokio::test]
+async fn agent_chain_preserves_new_worktree_after_failure() {
+    let dir = super::worktree_tests::init_temp_git_repo();
+    let executor =
+        ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner()));
+    let result = executor.execute_with_metadata("agent", &json!({
+        "action":"run_chain", "name":"worktree_failure", "description":"Keep a worktree after failure",
+        "steps":[
+            {"tool":"worktree", "args":{"action":"enter", "branch":"chain-rollback"}},
+            {"tool":"read_file", "args":{"path":"missing.txt"}}
+        ]
+    })).await;
+    let body: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    assert!(result.is_error, "{body}");
+    assert!(body.get("rollback").is_none(), "{body}");
+    let checkout = executor.get_worktree_session().unwrap().worktree_path;
+    let kept = executor
+        .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+        .await;
+    assert!(!kept.is_error, "{kept:?}");
+    super::worktree_tests::remove_preserved_test_worktree(dir.path(), &checkout);
 }
 
 #[tokio::test]
@@ -173,63 +325,6 @@ async fn chain_without_rollback_on_failure_keeps_prior_edits() {
         "unexpected result: {result}"
     );
     assert!(dir.path().join("kept.txt").exists());
-}
-
-#[tokio::test]
-async fn chain_rollback_on_failure_blocks_mutating_bash_before_execution() {
-    use astra_turn_core::tool_registry_chain::ToolChain;
-
-    let dir = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(dir.path());
-
-    let chain = ToolChain::new("rollback_bash_block", "Write then mutating bash")
-        .with_rollback_on_failure(true)
-        .step(
-            "write_file",
-            json!({"path": "should_not_exist.txt", "content": "temporary"}),
-        )
-        .step("bash", json!({"command": "mkdir unsafe-dir"}));
-
-    let result = executor.execute_chain(&chain, json!({})).await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(
-        parsed["steps_executed"], 0,
-        "chain should be rejected at preflight"
-    );
-    assert!(
-        parsed["final_output"]
-            .as_str()
-            .unwrap()
-            .contains("rollback_on_failure only supports read-only bash steps"),
-        "unexpected result: {result}"
-    );
-    assert!(!dir.path().join("should_not_exist.txt").exists());
-    assert!(!dir.path().join("unsafe-dir").exists());
-}
-
-#[tokio::test]
-async fn chain_rollback_on_failure_allows_read_only_bash_step() {
-    use astra_turn_core::tool_registry_chain::ToolChain;
-
-    let dir = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(dir.path());
-
-    let chain = ToolChain::new("rollback_bash_read_only", "Read-only bash")
-        .with_rollback_on_failure(true)
-        .step("bash", json!({"command": "pwd"}));
-
-    let result = executor.execute_chain(&chain, json!({})).await;
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-
-    assert_eq!(parsed["steps_executed"], 1);
-    assert!(
-        parsed["final_output"]
-            .as_str()
-            .unwrap()
-            .contains(dir.path().to_string_lossy().as_ref()),
-        "read-only bash should still execute: {result}"
-    );
 }
 
 #[tokio::test]

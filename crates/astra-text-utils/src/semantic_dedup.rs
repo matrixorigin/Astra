@@ -176,7 +176,7 @@ fn read_file_semantic_key(args: &Value) -> Option<String> {
 }
 
 fn read_file_effective_line_bounds(args: &Value) -> (Option<u64>, Option<u64>) {
-    (arg_u64(args, "start_line"), arg_u64(args, "end_line"))
+    crate::line_range::ordered_bounds(arg_u64(args, "start_line"), arg_u64(args, "end_line"))
 }
 
 fn semantic_bash_git_key(args: &Value) -> Option<String> {
@@ -454,6 +454,20 @@ mod tests {
         let k1 = semantic_call_key("read_file", &json!({"path": "src/main.rs"}));
         let k2 = semantic_call_key("read_file", &json!({"path": "src/main.rs/"}));
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn reversed_read_file_ranges_share_semantic_identity() {
+        let key = |start, end| {
+            semantic_call_key(
+                "read_file",
+                &json!({
+                    "path":"foo.rs", "start_line":start, "end_line":end
+                }),
+            )
+        };
+        assert_eq!(key(459, 330), key(330, 459));
+        assert_ne!(key(0, 3), key(3, 0));
     }
 
     #[test]

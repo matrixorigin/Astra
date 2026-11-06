@@ -99,8 +99,7 @@ fn projected_writer_applied_bound(
     record: &ToolCallRecord,
     owner: TerminalProjectionOwner,
 ) -> Option<bool> {
-    (record.was_executed()
-        && record.ok
+    (record.execution_succeeded()
         && matches!(
             owner,
             TerminalProjectionOwner::RuntimeRoute | TerminalProjectionOwner::EdgeCallback
@@ -207,6 +206,32 @@ fn persist_tool_result_for_record_with_authority(
     )
 }
 
+/// Retain a pre-resolved result only when its final canonical budget requires it.
+pub(crate) fn retain_canonical_tool_result(
+    user_id: Option<&str>,
+    session_id: Option<&String>,
+    run_id: Option<&str>,
+    call_id: &str,
+    name: &str,
+    content: &str,
+) -> Option<astra_services::session_journal::ToolResultArtifactDescriptor> {
+    match persist_tool_result_for_record_with_authority(
+        user_id,
+        session_id,
+        run_id,
+        call_id,
+        name,
+        content,
+        String::new(),
+    ) {
+        Ok(result) => result.artifact,
+        Err(error) => {
+            tracing::warn!(%error, "could not retain oversized tool result");
+            None
+        }
+    }
+}
+
 struct ToolDocumentPresentation<'a> {
     name: &'a str,
     full: &'a str,
@@ -311,7 +336,7 @@ fn artifact_persistence_failure(
     let failure_kind = "identity_conflict";
     let content = serde_json::json!({
         "status": "failed",
-        "error": "tool execution completed but its durable result evidence could not be persisted",
+        "error": "the tool result was received but its durable evidence could not be persisted",
         "reason": failure_kind,
         "error_kind": "durable_result_persistence",
         "retryable": false,
@@ -365,7 +390,7 @@ fn model_tool_result_for_followup(
         return serde_json::json!({
             "result_delivery_complete": false,
             "error": {"code": "result_delivery_unavailable",
-                "message": "The complete result could not be delivered. This does not change the execution outcome. Do not repeat an executed action merely to recover its output; report the delivery gap or retrieve the retained result."},
+                "message": "The complete result could not be delivered. This does not change the execution outcome. Do not repeat an executed action merely to recover its output; report the delivery gap."},
         }).to_string();
     }
     if presentation == astra_tools::ModelResultPresentation::Generic
@@ -424,15 +449,6 @@ fn tool_result_fields_for_model_roundtrip(
         fields.insert(CANONICAL_WORK_TASK_BOARD_UPDATE_FIELD.to_string(), update);
     }
     (!fields.is_empty()).then_some(fields)
-}
-
-fn source_preimage_recovery_for_record(
-    tool_name: &str,
-    fields: &serde_json::Map<String, Value>,
-) -> Option<Value> {
-    (tool_name == "bash")
-        .then(|| astra_tools::source_preimage::inferred_recovery_fact(fields))
-        .flatten()
 }
 
 /// Build the durable argument projection without retaining credential-shaped
@@ -911,6 +927,29 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         );
         let full_guidance = runtime_advisories.join("\n");
         let inline_guidance = truncate_tool_result_for_model(&execution.name, &full_guidance);
+        let mut execution_ok_on_delivery_error = matches!(
+            terminal_owner,
+            TerminalProjectionOwner::RuntimeRoute | TerminalProjectionOwner::EdgeCallback
+        )
+        .then_some(execution.tool_result_fields.as_ref())
+        .flatten()
+        .and_then(|fields| {
+            (fields
+                .get("provider_outcome_acknowledged")
+                .and_then(Value::as_bool)
+                == Some(true)
+                && fields
+                    .get("durable_result_complete")
+                    .and_then(Value::as_bool)
+                    == Some(false))
+            .then(|| {
+                fields
+                    .get("provider_result_was_error")
+                    .and_then(Value::as_bool)
+                    .map(|error| !error)
+            })
+            .flatten()
+        });
         let (journal_result, guidance_artifact) =
             match persist_tool_result_for_record_with_authority(
                 self.ctx.current_user_id,
@@ -949,13 +988,25 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         error = %error,
                         "durable tool-result artifact persistence failed closed"
                     );
-                    let provider_result_was_error = is_err;
+                    let provider_result_was_error = execution_ok_on_delivery_error
+                        .map(|ok| !ok)
+                        .unwrap_or(is_err);
+                    execution_ok_on_delivery_error = Some(!provider_result_was_error);
                     let (failure, failure_metadata) =
                         artifact_persistence_failure(&error, provider_result_was_error);
                     execution.result_str = failure.clone();
-                    execution.tool_result_fields = Some(failure_metadata);
+                    let fields = execution
+                        .tool_result_fields
+                        .get_or_insert_with(Default::default);
+                    for (key, value) in failure_metadata {
+                        if key != "execution_started" || !fields.contains_key(&key) {
+                            fields.insert(key, value);
+                        }
+                    }
                     is_err = true;
-                    error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                    // Delivery failure does not erase the producer's execution
+                    // outcome, especially an uncertain timeout or cancellation.
+                    error_kind = error_kind.or(Some(astra_core::ErrorKind::ContractViolation));
                     (
                         PersistedRecordResult {
                             delivery_unavailable: false,
@@ -966,6 +1017,19 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     )
                 }
             };
+
+        // The producer may have succeeded even when its complete result
+        // cannot be delivered. Keep those two facts separate so callers do
+        // not repeat a successful mutation or report the delivery as success.
+        let result_delivery_failed = journal_result.delivery_unavailable
+            && astra_tools::model_result_presentation(execution.tool_result_fields.as_ref())
+                == astra_tools::ModelResultPresentation::Generic
+            && work_receipt_for_model(&execution.name, &journal_result_source).is_none();
+        if result_delivery_failed {
+            execution_ok_on_delivery_error.get_or_insert(!is_err);
+            is_err = true;
+            error_kind = error_kind.or(Some(astra_core::ErrorKind::ContractViolation));
+        }
 
         // The final governed source is still complete here, even if persistence
         // replaced its presentation with an artifact or bounded inline result.
@@ -1023,6 +1087,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             ));
         // Fill observability fields on the just-pushed record.
         if let Some(rec) = self.ctx.tool_call_records.last_mut() {
+            rec.execution_ok = execution_ok_on_delivery_error;
+            if result_delivery_failed {
+                rec.error = Some("The tool result could not be delivered completely.".into());
+            }
             rec.invocation_identity = invocation_identity;
             rec.execution_completion = execution_completion;
             rec.work_attribution = Some(work_attribution);
@@ -1095,8 +1163,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             .map(ToString::to_string)
                             .collect()
                     });
-                rec.source_preimage_recovery =
-                    source_preimage_recovery_for_record(&execution.name, fields);
             }
             if let Some(start) = self.ctx.turn_start {
                 rec.start_offset_ms =
@@ -1111,11 +1177,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         if is_err {
             if let Some(sid) = self.ctx.current_session_id {
                 if let Some(rec) = self.ctx.tool_call_records.last() {
-                    let error_msg = format!(
-                        "tool '{}' failed: {}",
-                        execution.name,
-                        truncate_tool_error(&execution.result_str)
-                    );
+                    let error_msg = if result_delivery_failed {
+                        format!(
+                            "tool '{}' result could not be delivered completely",
+                            execution.name
+                        )
+                    } else {
+                        format!(
+                            "tool '{}' failed: {}",
+                            execution.name,
+                            truncate_tool_error(&execution.result_str)
+                        )
+                    };
                     let event = astra_services::session_journal::JournalEvent::tool_call_error(
                         Some(sid),
                         self.ctx.session_turn,
@@ -1189,8 +1262,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     .as_ref()
                     .is_some_and(astra_tools::workspace_observation::is_changed_receipt)
         });
+        // A failed or timed-out writer may already have changed what earlier
+        // reads observed. Invalidation is conservative; it does not claim the
+        // operation succeeded or attribute a particular change to it.
         if observed_workspace_mutation
-            || (!is_err
+            || (disposition == Some(ToolCallDisposition::Executed)
                 && crate::turn::tool_side_effects::tool_call_invalidates_read_cache(
                     &execution.name,
                     Some(&execution.args),
@@ -1489,6 +1565,19 @@ mod tests {
             );
         }
         record.disposition = Some(ToolCallDisposition::Executed);
+        record.ok = false;
+        record.execution_ok = Some(true);
+        assert_eq!(
+            projected_writer_applied_bound(
+                &execution,
+                &record,
+                execution.terminal_projection_owner()
+            ),
+            Some(true),
+            "a delivery error must not erase a confirmed writer"
+        );
+        record.execution_ok = None;
+        record.disposition = Some(ToolCallDisposition::Executed);
         record.ok = true;
         execution.name = "bash".into();
         assert_eq!(
@@ -1704,6 +1793,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oversized_pre_resolved_result_uses_existing_artifact_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session = format!("pre-resolved-{}", uuid::Uuid::new_v4());
+        let content = "result ".repeat(3_000);
+        let descriptor = retain_canonical_tool_result(
+            Some("reviewer-a"),
+            Some(&session),
+            Some("run"),
+            "call",
+            "read_file",
+            &content,
+        )
+        .unwrap();
+        let dir = model_tool_result_session_dir(Some("reviewer-a"), &session).unwrap();
+        assert_eq!(
+            astra_turn_core::tool_result_storage::read_verified_persisted_result(
+                &dir,
+                &descriptor,
+                100_000,
+            )
+            .unwrap(),
+            content
+        );
+    }
+
     #[tokio::test]
     async fn durable_record_io_failure_retains_result_but_reports_incomplete_model_delivery() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1788,31 +1904,6 @@ mod tests {
         assert!(full.contains("[REDACTED:AWS_SECRET_KEY]"));
         assert!(full.contains("[REDACTED:TOKEN_ARGUMENT]"));
         assert!(full.contains("[REDACTED:SECRET_FIELD]"));
-    }
-
-    #[test]
-    fn source_recovery_projection_requires_a_validated_bash_executor_fact() {
-        let fields = serde_json::Map::from_iter([(
-            "source_preimage".into(),
-            json!({
-                "schema_version": 1,
-                "source": "astra_source_preimage_store",
-                "receipt_id": "00000000-0000-4000-8000-000000000001",
-                "mode": "inferred_advisory",
-                "guarantee": false,
-                "status": "changed",
-                "entries": [{"path": "evidence.bin", "status": "deleted"}],
-                "restore_available": true,
-            }),
-        )]);
-        let fact = source_preimage_recovery_for_record("bash", &fields)
-            .expect("trusted Bash metadata should project");
-        assert_eq!(fact["changed_paths"][0], "evidence.bin");
-        assert!(source_preimage_recovery_for_record("external_tool", &fields).is_none());
-
-        let mut forged = fields;
-        forged["source_preimage"]["source"] = json!("external_tool");
-        assert!(source_preimage_recovery_for_record("bash", &forged).is_none());
     }
 
     #[test]

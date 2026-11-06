@@ -1433,26 +1433,11 @@ pub(crate) fn tool_record_is_workspace_mutation(
     if record_has_typed_workspace_tool_receipt(record) {
         return true;
     }
-    // Prefer an executor-owned post-execution fact over a lexical guess.  The
-    // receipt is accepted only from the builtin bash route and only when it
-    // is bound to this workspace; arbitrary tool metadata must not satisfy a
-    // workspace completion contract.
-    if record.name == "bash"
-        && record.workspace_mutation_observed == Some(true)
-        && record.workspace_mutation_scope.as_deref()
-            == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE)
-        && record
-            .workspace_mutation_receipt
-            .as_ref()
-            .is_some_and(astra_tools::workspace_observation::is_changed_receipt)
-    {
-        return true;
-    }
     // `args_preview` is display-only and may be truncated or stale.  It must
     // never become historical proof that an argument-dependent tool mutated
     // the workspace; direct typed writers are handled by their tool identity
     // below, while Bash/Git require the lossless args_full contract (or the
-    // executor-owned receipt above).
+    // typed writer evidence above).
     let args = extract_tool_args(record.authoritative_args_full());
     // Live admission treats missing arguments conservatively because safety
     // must fail closed. Historical completion evidence has the opposite
@@ -3483,8 +3468,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         }
     }
 
-    // Recovery must not replay an invocation whose physical effects remain
-    // unknown merely because no new tool record has arrived in this process.
+    // Workspace ownership is separate from an invocation's outcome. An
+    // unknown outcome can reach the model when custody permits; unsettled
+    // ownership still prevents access to a workspace that may be in use.
     if super::execution_phase::reject_unsettled_execution_completion(state) {
         try_write_heavy_checkpoint(state);
         return Ok(PreparedTurnIteration::Finished(

@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+pub const MAX_RUN_CHAIN_STEPS: usize = 16;
+
 // ─── Chain Step ─────────────────────────────────────────────────────────────
 
 /// A single step in a tool chain.
@@ -41,8 +43,6 @@ pub struct ChainStep {
 pub struct ToolChain {
     pub name: String,
     pub description: String,
-    #[serde(default)]
-    pub rollback_on_failure: bool,
     pub steps: Vec<ChainStep>,
 }
 
@@ -51,15 +51,8 @@ impl ToolChain {
         Self {
             name: name.into(),
             description: description.into(),
-            rollback_on_failure: false,
             steps: Vec::new(),
         }
-    }
-
-    /// Enable or disable automatic bounded rollback when the chain fails.
-    pub fn with_rollback_on_failure(mut self, rollback_on_failure: bool) -> Self {
-        self.rollback_on_failure = rollback_on_failure;
-        self
     }
 
     /// Add a step to the chain (builder pattern).

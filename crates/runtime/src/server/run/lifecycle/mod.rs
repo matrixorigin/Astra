@@ -5390,6 +5390,7 @@ struct CanonicalTurnAdmission {
     authority: astra_services::session_context_coordinator::RunContextAuthority,
     opening_hash: Option<String>,
     prior_messages: Vec<Value>,
+    authorized_session_ids: Option<HashSet<String>>,
     had_canonical_head: bool,
     _weighted_permit: astra_services::WeightedAdmissionPermit,
 }
@@ -5879,6 +5880,7 @@ impl AgenticRunLifecycleService {
             authority,
             opening_hash: None,
             prior_messages: Vec::new(),
+            authorized_session_ids: None,
             _weighted_permit: weighted_permit,
         })
     }
@@ -5888,6 +5890,7 @@ impl AgenticRunLifecycleService {
         messages: &[Value],
         rewrite_proof: Option<&CanonicalRewriteProof>,
         allow_empty_delta: bool,
+        completed_reasoning_scope: Option<(&str, &str)>,
         run_id: &str,
     ) -> Result<
         Option<astra_services::session_context_coordinator::PreparedSessionContextCommit>,
@@ -5900,7 +5903,7 @@ impl AgenticRunLifecycleService {
             if admission.authority.run_id != run_id {
                 return Err("canonical Context belongs to another Run".into());
             }
-            let Some((mode, logical_segments)) = canonical_commit_delta(
+            let Some((mode, mut logical_segments)) = canonical_commit_delta(
                 &admission.prior_messages,
                 admission.had_canonical_head,
                 messages,
@@ -5910,6 +5913,14 @@ impl AgenticRunLifecycleService {
             else {
                 return Ok(None);
             };
+            // A completed CurrentTurn route no longer needs its reasoning in
+            // either an appended suffix or an authorized replacement. Other
+            // routes' continuation state stays untouched.
+            if let Some(route) = completed_reasoning_scope {
+                for message in logical_segments.iter_mut().flatten() {
+                    crate::turn::llm::private_continuation::discard_reasoning(message, Some(route));
+                }
+            }
             let base = admission
                 .authority
                 .base_head
@@ -14126,6 +14137,12 @@ impl AgenticRunLifecycleService {
                     allow_empty_delta
                         || bg_cancel_flag.load(Ordering::Acquire)
                         || bg_llm_cancel_token.is_cancelled(),
+                    (matches!(&loop_result, Ok(AgenticLoopOutcome::Completed))
+                        && state.interruption.is_none()
+                        && !bg_cancel_flag.load(Ordering::Acquire)
+                        && !bg_llm_cancel_token.is_cancelled())
+                    .then(|| host.completed_responses_reasoning_scope())
+                    .flatten(),
                     &bg_run_id,
                 );
 
@@ -15438,18 +15455,20 @@ impl AgenticRunLifecycleService {
             if let Some(admission) = canonical_turn.as_mut()
                 && let Some(head) = admission.authority.base_head.as_ref()
             {
-                admission.prior_messages = admission
-                    .coordinator
-                    .materialize(head)
-                    .await
-                    .map_err(|error| {
-                        error_response_coded(
-                            StatusCode::CONFLICT,
-                            format!("canonical Context requires repair: {error}"),
-                            "session_context_needs_repair",
-                        )
-                    })?
-                    .messages;
+                let materialized =
+                    admission
+                        .coordinator
+                        .materialize(head)
+                        .await
+                        .map_err(|error| {
+                            error_response_coded(
+                                StatusCode::CONFLICT,
+                                format!("canonical Context requires repair: {error}"),
+                                "session_context_needs_repair",
+                            )
+                        })?;
+                admission.prior_messages = materialized.messages;
+                admission.authorized_session_ids = Some(materialized.authorized_session_ids);
             }
 
             // Provision explicit workspace bindings early so build_initial_state
@@ -15728,6 +15747,9 @@ impl AgenticRunLifecycleService {
                 runtime_capabilities.authenticated_edge_discovery.clone(),
             );
             if let Some(admission) = canonical_turn.as_ref() {
+                if let Some(origins) = admission.authorized_session_ids.as_ref() {
+                    host.set_private_reasoning_origins(origins.clone());
+                }
                 host.bind_execution_handoff(
                     self.execution_handoff_requested.clone(),
                     self.run_engine.clone(),

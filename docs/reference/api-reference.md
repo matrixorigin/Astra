@@ -90,6 +90,15 @@ An omitted `supported_reasoning_efforts` inventory means the provider's complete
 list is unknown. Personal Responses requests may try an Astra-supported effort;
 provider rejection does not cause Astra to change it or retry with another.
 
+Model creation and credential changes fail without committing when the provider
+probe fails. A failed connectivity check leaves the existing model unchanged.
+Failures report `model_probe_network`, `model_probe_timeout`,
+`model_probe_credentials_or_access`, `model_probe_request_rejected`,
+`model_probe_configuration`, `model_probe_rate_limited`, `model_probe_upstream`
+or `model_probe_response`; the status distinguishes client configuration,
+rate limiting and provider/network errors. A lost response or an unrelated
+server error can leave the outcome unknown: check the model list before retrying.
+
 The connection-list response includes `management_available`, the authenticated
 principal's personal-management capability. It is independent of whether any
 model already exists and is false for the managed UC model path. The same

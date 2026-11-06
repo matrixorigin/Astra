@@ -4,7 +4,6 @@ pub(crate) mod guards;
 pub mod host;
 pub(crate) mod lifecycle;
 pub(crate) mod permission_boundary;
-pub(crate) mod source_recovery;
 pub(crate) mod tool_phase;
 pub(crate) mod tool_support;
 pub(crate) mod verification_frontier;

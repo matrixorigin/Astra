@@ -14,6 +14,9 @@ mod trace_ingestion_tests;
 
 #[path = "skill_ledger_tests.rs"]
 mod skill_ledger_tests;
+
+#[path = "provider_rejection_tests.rs"]
+mod provider_rejection_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[tokio::test]
@@ -2969,6 +2972,7 @@ fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedMo
     astra_services::ResolvedModelOffering {
         offering_id: "model-test-model".to_string(),
         model: astra_services::ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,
@@ -21282,7 +21286,7 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
 fn incomplete_run_projection_preserves_partial_without_exposing_internal_diagnostics() {
     for detail in [
         "typed completion action was not satisfied",
-        "a side-effect-capable invocation has an interrupted or unknown outcome",
+        "workspace execution ownership is unsettled",
     ] {
         let svc = test_service();
         let request = test_request("partial");

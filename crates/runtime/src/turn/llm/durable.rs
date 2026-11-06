@@ -4750,6 +4750,7 @@ mod tests {
         persistence: Arc<dyn InferenceLedgerPersistence>,
     ) -> DurableInferenceLedger {
         let execution = astra_services::AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,
