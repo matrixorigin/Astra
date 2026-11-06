@@ -82,7 +82,9 @@ The command prints `status`, `logs`, and `stop` with the installed executable
 path and shell quoting. Run those printed commands; a later shell does not need
 `astra-edge` on `PATH`. Running the connect command again with the same
 credential leaves the background runner in place. A refreshed credential is
-handed to that running runner for its next connection; work already admitted
-keeps running. If the new credential cannot authenticate, the runner continues
-with the credential that was already working. The token is not written to the
-runner metadata.
+handed to that running runner and used from its next connection attempt,
+including an attempt whose old credential was just rejected; work already
+admitted keeps running. If the new credential cannot authenticate, the runner
+continues with the credential that was already working. A runner that is
+stopping does not accept a new credential; run the command again after it
+stops. The token is not written to the runner metadata.

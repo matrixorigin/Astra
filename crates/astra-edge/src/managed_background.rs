@@ -32,6 +32,7 @@ const LOG_TAIL_BYTES: u64 = 256 * 1024;
 static INSTANCE_LOCK: Mutex<Option<File>> = Mutex::new(None);
 static SHUTDOWN: OnceLock<CancellationToken> = OnceLock::new();
 static STARTUP_CANCELLED: AtomicBool = AtomicBool::new(false);
+static PARENT_RELEASED: AtomicBool = AtomicBool::new(false);
 static PHASE_STATE: Mutex<PhaseState> = Mutex::new(PhaseState { epoch: 0 });
 
 struct PhaseState {
@@ -189,6 +190,7 @@ fn signal_ready_in(dir: Option<&Path>, ready_fd: Option<i32>) {
     NOTIFIED.call_once(|| {
         if let Some(fd) = ready_fd {
             notify_parent_ready_fd(fd);
+            PARENT_RELEASED.store(true, Ordering::SeqCst);
         }
     });
 }
@@ -244,24 +246,13 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
         eprintln!("Error: cannot create runner state: {error}");
         return 1;
     }
-    let start = match OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join("start.lock"))
-    {
+    let start = match lock_start(&dir) {
         Ok(file) => file,
         Err(error) => {
             eprintln!("Error: cannot lock runner startup: {error}");
             return 1;
         }
     };
-    set_mode(&dir.join("start.lock"), 0o600);
-    if let Err(error) = start.lock_exclusive() {
-        eprintln!("Error: cannot lock runner startup: {error}");
-        return 1;
-    }
     let _start_guard = Unlock(&start);
     let token = option_value(args, "--token").unwrap_or("");
     let fingerprint = credential_fingerprint(token);
@@ -272,19 +263,7 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
                 return existing_instance(&dir, &identity, executable);
             }
             Running::Replace => {
-                eprintln!(
-                    "Handing the new credential to the running runner. Current work is left running."
-                );
-                if let Err(error) = queue_pending_credential(&dir, token) {
-                    eprintln!("Error: cannot hand the credential to the running runner: {error}");
-                    return 1;
-                }
-                if let Err(error) = write_private(&fingerprint_path(&dir), fingerprint.as_bytes()) {
-                    eprintln!("Error: cannot record the runner credential generation: {error}");
-                    return 1;
-                }
-                print_actions(executable, &identity.edge_id, &identity.server_url);
-                return 0;
+                return hand_off_credential(&dir, &identity, token, &fingerprint, executable);
             }
         },
         Ok(false) => {}
@@ -341,6 +320,8 @@ fn credential_fingerprint(token: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Fingerprint of the last credential a connect command gave this runner,
+/// either at startup or through a handoff.
 fn fingerprint_path(dir: &Path) -> PathBuf {
     dir.join("credential.fingerprint")
 }
@@ -349,30 +330,132 @@ fn pending_credential_path(dir: &Path) -> PathBuf {
     dir.join("credential.next")
 }
 
-pub struct PendingCredential {
-    pub path: PathBuf,
-    pub token: String,
+fn claimed_credential_path(dir: &Path) -> PathBuf {
+    dir.join("credential.claimed")
 }
 
-pub fn read_pending_credential() -> Option<PendingCredential> {
-    let dir = std::env::var(STATE_DIR_ENV).ok()?;
-    if dir.is_empty() {
+/// Called with `start.lock` held, so it is ordered against the runner's
+/// final authentication decision (`lock_credential_handoff`).
+fn hand_off_credential(
+    dir: &Path,
+    identity: &Identity,
+    token: &str,
+    fingerprint: &str,
+    executable: &Path,
+) -> i32 {
+    match phase_label(dir) {
+        Ok(phase) if phase == "stopping" => {
+            eprintln!("Error: the runner is stopping. Run the command again after it stops.");
+            return 1;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("Error: cannot inspect the runner lock: {error}");
+            return 1;
+        }
+    }
+    if let Err(error) = queue_pending_credential(dir, token) {
+        eprintln!("Error: cannot hand the credential to the running runner: {error}");
+        return 1;
+    }
+    if let Err(error) = write_private(&fingerprint_path(dir), fingerprint.as_bytes()) {
+        eprintln!("Error: cannot record the runner credential generation: {error}");
+        return 1;
+    }
+    eprintln!(
+        "The running runner uses the new credential from its next connection attempt. Running work is not interrupted."
+    );
+    print_actions(executable, &identity.edge_id, &identity.server_url);
+    0
+}
+
+pub fn queue_pending_credential(dir: &Path, token: &str) -> io::Result<()> {
+    write_private(&pending_credential_path(dir), token.as_bytes())
+}
+
+/// State directory through which connect commands hand credentials to this
+/// managed runner.
+pub fn credential_handoff_dir() -> Option<PathBuf> {
+    if !is_managed_child() {
         return None;
     }
-    let path = pending_credential_path(Path::new(&dir));
-    let token = std::fs::read_to_string(&path)
+    std::env::var(STATE_DIR_ENV)
         .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())?;
-    Some(PendingCredential { path, token })
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
 }
 
-pub fn remove_pending_credential(path: &Path) {
-    let _ = std::fs::remove_file(path);
+/// Take the queued credential, if any. The rename claims exactly the value
+/// that is queued now; a newer handoff published afterwards stays queued.
+pub fn claim_pending_credential(dir: &Path) -> io::Result<Option<String>> {
+    if !move_pending_to_claimed(dir)? {
+        return Ok(None);
+    }
+    take_claimed_credential(dir)
 }
 
-fn queue_pending_credential(dir: &Path, token: &str) -> io::Result<()> {
-    write_private(&pending_credential_path(dir), token.as_bytes())
+fn move_pending_to_claimed(dir: &Path) -> io::Result<bool> {
+    match std::fs::rename(pending_credential_path(dir), claimed_credential_path(dir)) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn take_claimed_credential(dir: &Path) -> io::Result<Option<String>> {
+    let path = claimed_credential_path(dir);
+    let token = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    Ok(Some(token?.trim().to_string()).filter(|token| !token.is_empty()))
+}
+
+pub struct HandoffLock {
+    _lock: File,
+}
+
+impl HandoffLock {
+    /// Hold the lock until the process exits, so a connect command waiting on
+    /// it finds this runner gone and starts a new one.
+    pub fn keep_until_exit(self) {
+        std::mem::forget(self);
+    }
+}
+
+/// Serialize this runner's final authentication decision with connect
+/// commands handing it a credential. Before readiness the starting command
+/// itself holds the lock and no handoff can be in progress.
+pub fn lock_credential_handoff(dir: Option<&Path>) -> Option<HandoffLock> {
+    lock_credential_handoff_with(dir, PARENT_RELEASED.load(Ordering::SeqCst))
+}
+
+fn lock_credential_handoff_with(dir: Option<&Path>, parent_released: bool) -> Option<HandoffLock> {
+    if !parent_released {
+        return None;
+    }
+    match lock_start(dir?) {
+        Ok(file) => Some(HandoffLock { _lock: file }),
+        Err(error) => {
+            tracing::warn!(
+                target: "astra.edge",
+                error = %error,
+                "cannot order the final authentication decision with a credential handoff"
+            );
+            None
+        }
+    }
+}
+
+fn lock_start(dir: &Path) -> io::Result<File> {
+    let path = dir.join("start.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    set_mode(&path, 0o600);
+    file.lock_exclusive()?;
+    Ok(file)
 }
 
 fn read_fingerprint(dir: &Path) -> Option<String> {
@@ -1120,7 +1203,9 @@ fn write_metadata(dir: &Path, identity: &Identity) -> io::Result<()> {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     {
         let mut file = OpenOptions::new()
             .create(true)
@@ -1646,18 +1731,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn readiness_byte_unblocks_the_parent_and_failure_reaps_the_child() {
+        // POSIX sh only redirects single-digit descriptors, so the pipe is
+        // mapped to stdout rather than passed by its allocated number.
         let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
-        let raw = as_fd_raw(&write_fd);
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("printf 1 >&\"$ASTRA_EDGE_READY_FD\"")
-            .env(READY_FD_ENV, raw.to_string());
-        unsafe {
-            command.pre_exec(move || clear_cloexec(raw));
-        }
+            .arg("printf 1")
+            .env(READY_FD_ENV, "1")
+            .stdout(Stdio::from(write_fd));
         let mut child = command.spawn().unwrap();
-        drop(write_fd);
+        drop(command);
         let cancelled = AtomicBool::new(false);
         wait_for_ready(
             &mut child,
@@ -1834,6 +1918,52 @@ time.sleep(30)
         let fingerprint = std::fs::read_to_string(dir.join("credential.fingerprint")).unwrap();
         assert!(!fingerprint.contains("fresh-token"));
         assert_eq!(fingerprint.trim(), credential_fingerprint("fresh-token"));
+
+        std::fs::write(dir.join("phase"), "stopping").unwrap();
+        let late = connect_args("https://example.test", "late-token", &workspace);
+        assert_eq!(supervise(&holder, &late, root.path()), 1);
+        assert_eq!(
+            claim_pending_credential(&dir).unwrap().as_deref(),
+            Some("fresh-token")
+        );
+    }
+
+    #[test]
+    fn claiming_a_credential_never_removes_a_newer_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        queue_pending_credential(dir.path(), "generation-one").unwrap();
+        assert!(move_pending_to_claimed(dir.path()).unwrap());
+        queue_pending_credential(dir.path(), "generation-two").unwrap();
+        assert_eq!(
+            take_claimed_credential(dir.path()).unwrap().as_deref(),
+            Some("generation-one")
+        );
+        assert_eq!(
+            claim_pending_credential(dir.path()).unwrap().as_deref(),
+            Some("generation-two")
+        );
+        assert_eq!(claim_pending_credential(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn final_authentication_decision_excludes_a_concurrent_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(lock_credential_handoff_with(Some(dir.path()), false).is_none());
+        let held = lock_credential_handoff_with(Some(dir.path()), true).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path = dir.path().to_owned();
+        let command = std::thread::spawn(move || {
+            let start = lock_start(&path).unwrap();
+            sender.send(()).unwrap();
+            drop(start);
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a connect command entered while the runner was deciding"
+        );
+        drop(held);
+        receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        command.join().unwrap();
     }
 
     #[test]
