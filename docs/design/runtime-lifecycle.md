@@ -113,57 +113,33 @@ from those provider requests; callbacks do not create additional tool slots or
 replacement identities. A callback without a request ID cannot establish
 execution custody or recovery evidence.
 
-A successful executor-owned verify-mode v2 receipt proves that the bound
-workspace did not change. Parallel verification calls carrying that receipt do
-not invalidate each other's evidence. Opaque commands, failed or malformed
-receipts, and a concurrent writer retain the freshness barrier.
+A successful declared check records the executed command and its successful
+exit. It does not prove that the workspace stayed unchanged or that a different
+executor could not write concurrently. Known concurrent mutations retain the
+freshness barrier.
 
-Canonical Go observations include `go test`, `go build`, and `go vet`, with
-literal scope-preserving environment assignments such as `GOWORK=off`. They
-require a positively successful executed result within the bound workspace;
-dry-run, redirected-scope and opaque wrapper forms are not positive proof.
-Environment configuration and ordered validation stages remain part of operation
-identity: a successful vet does not clear a failed test or a failed build/vet
-chain. A literal external scratch setup followed by `&&` may precede a Go check,
-using the existing scratch-scope contract and a concrete bound root. Its entire
-command remains the operation identity, so a bare check cannot clear a failure
-that may have occurred during setup. Shell configuration changes, opaque
-preparation and concurrent setup do not grant this proof. Scratch paths must not
-overlap the workspace in either direction; ancestor setup is rejected even for a
-benign mkdir. Shell configuration writes invalidate later validation proof with
-or without scratch preparation. Plain output and static printf formats using
-literal text, `%s` and `%%` remain neutral; variable-writing or dynamic formats
-do not. Go checks use the complete invocation as identity, including any
-fallible prefix reader or output stage. A recognizable unsafe check retains only
-attempt identity. Recognized validators with sensitive arguments reuse the existing opaque
-exact-argument identity, so failures remain debts without copying credentials
-into recovery state. An ordinary unscannable command is unknown activity: it
-neither creates nor discharges a validation obligation. Explicit verify-mode
-requests retain their exact receipt contract regardless of shell syntax.
-Mutation freshness and executor custody remain independent of classification.
-Executor-reported bound changes and partial writes override lexical scratch paths. Only an exact retry can resolve a named validation debt;
-an unproven success still needs a separate eligible validation. An explicit
-verify receipt proves workspace freshness under the executor-owned lease,
-successful exit and unchanged fingerprint contract. This declared custom verifier path is
-independent of shell syntax and language. An unsuccessful or unverified custom
-invocation retains exact-argument failure debt until the same invocation produces
-a valid full-scope verify receipt; a changed command or a raw unchanged
-fingerprint cannot clear it. That receipt does not certify which tests ran or
-clear named Work validation debts. A failed custom invocation without an
-authoritative unchanged fingerprint also makes earlier named proof stale. Go
-semantic inference owns inferred observations and named Work validation
-independently; a freshness receipt never overrides an existing named debt. These are invocation receipts under the
-existing trusted executor environment, not a guarantee about inherited tool
-configuration or test counts. Executors enable pipefail for pipelines; commands
-that may disable that setting cannot use the final pipeline stage's success as
-validation evidence. An unchanged Bash fingerprint prevents a false mutation
-barrier but is not, by itself, evidence that any workspace observation or
-requested validation occurred.
+Tool outcomes record what the executor observed: whether execution started,
+output, exit status, and any reported uncertainty or partial effects. Neither a
+zero exit status nor a command's language or framework proves task correctness.
+Ordinary shell calls do not create project-validation debt, a repair budget, or
+a second Work settlement gate. Canonical Work retains assignment and settlement
+ownership; a task that can be answered from its context needs no unrelated tool
+call to acquire delivery authority.
+
+Only explicitly declared authoritative checks create runtime check obligations.
+The normal Bash tool executes the exact declared command with its declared
+`workdir`; no separate verification mode or whole-workspace scan is needed.
+Executed, positively classified results satisfy those checks. Executor-reported
+workspace changes invalidate earlier check ordering; opaque shell commands do
+not manufacture change facts. This records observed invocations and known
+changes, not global workspace immutability or guarantees about other processes.
+The model uses the tool results and user acceptance criteria to choose further
+inspection, correction, or a truthful final answer.
 
 A pre-dispatch capability rejection remains a rejection with no execution or
 verification success. It does not create a separate observation/retry state.
-Explicit verification and Work recovery use their existing contracts within
-the admitted round allowance.
+Explicit checks and canonical Work settlement use their existing admitted
+round allowance.
 
 An incomplete execution remains a terminal failed Run with preserved partial
 output. Its owner-stamped terminal carries the existing sanitized interruption

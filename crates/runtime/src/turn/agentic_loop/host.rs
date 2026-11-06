@@ -8801,22 +8801,17 @@ pub(crate) mod tests {
     async fn edge_completion_window_accepts_independent_verifier_batch() {
         let write =
             make_edge_tool_with_args("write_file", json!({"path": "src/output.txt"}), "written");
-        let mut quality = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "./quality-gate", "mode": "verify"}),
-            "quality ok",
-        );
+        let mut quality =
+            make_edge_tool_with_args("bash", json!({"command": "./quality-gate"}), "quality ok");
         quality.request_id = "req-quality".into();
-        let mut unit = make_edge_tool_with_args(
-            "bash",
-            json!({"command": "./unit-gate", "mode": "verify"}),
-            "unit ok",
-        );
+        let mut unit =
+            make_edge_tool_with_args("bash", json!({"command": "./unit-gate"}), "unit ok");
         unit.request_id = "req-unit".into();
         for receipt in [&mut quality, &mut unit] {
-            receipt.tool_result_fields.as_mut().unwrap().extend(
-                astra_tools::workspace_observation::explicit_workspace_verification_receipt(),
-            );
+            receipt.tool_result_fields.as_mut().unwrap().extend([
+                ("result_class".into(), json!("success")),
+                ("exit_semantics".into(), json!("success")),
+            ]);
         }
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![write], 0, 0, Some(50)),

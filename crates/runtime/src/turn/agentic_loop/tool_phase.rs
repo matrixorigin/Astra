@@ -2271,22 +2271,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         );
         }
 
-        // A required mutation is admitted before execution, but its dependent
-        // observation can only be projected after the journal contains the actual
-        // tool outcome. Keep this bounded chain on the same shared runtime path for
-        // server, edge, and local tool rounds.
-        // Admission rejection can precede the later budget-settlement boundary
-        // that grants repair authority. The recovery transition is Work-attempt
-        // scoped; ordinary completion-window reconciliation below intentionally
-        // continues to consume only executor-produced outcomes.
-        super::execution_phase::advance_rejected_work_settlement_recovery(
-            state,
-            round_records_start,
-        );
-        super::execution_phase::advance_completion_action_window_after_tool_round_from_record_index(
-            state,
-            evo_records_before,
-        );
+        super::execution_phase::advance_completion_action_window_after_tool_round(state);
 
         // Rejection is scoped to the requested operation. Its retryability
         // does not decide whether a different permitted action can run.

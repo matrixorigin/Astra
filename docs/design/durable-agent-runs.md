@@ -485,16 +485,14 @@ and canonical pause reconciliation. These paths preserve the immutable producer
 checkpoint without installing new turn execution authority or reconstructing the
 original executor.
 
-Completion evidence is summarized by one incremental frontier. Explicit
-verification retains the latest source mutation and at most one subsequent
-successful proof per authoritative hook. General workspace observation retains
-its latest mutation barrier, observation proof and latest positive writer; a
-literal-artifact observation also retains the preceding typed delivery it used.
-These predicates are distinct: a successful verifier need not add an observation
-barrier, but can still invalidate an older artifact delivery. Failed or unknown
-writers never supply successful completion proof. Hook or workspace-root changes
-rebuild from complete local history; with a recovered prefix they fail explicitly
-instead of reinterpreting an empty local suffix.
+Caller-declared checks use one incremental frontier. It retains the declared
+contract, the latest executor-reported workspace change and at most one observed
+successful invocation per authoritative check. Known changes invalidate earlier
+outcomes; failed or unknown invocations cannot provide a successful check result.
+There is no inferred project-validation debt, workspace-observation debt, or
+repair/revalidation state machine. Canonical Work owns its own settlement.
+Hook or workspace-root changes rebuild from complete local history; with a
+recovered prefix they fail explicitly instead of reinterpreting an empty suffix.
 
 The runtime handoff requires an explicit verification-evidence disposition.
 `Bound` carries the original canonical turn-chain identity, exact authoritative
@@ -505,16 +503,21 @@ and WAL continuation; unavailable evidence never becomes an empty proof set.
 Display output and persisted journal projections cannot establish these bindings.
 Decoding checks scope, contract, order and completion shape. Restoration additionally
 checks every distinct retained reference against the exact invocation ledger row;
-neither decoding nor restoring these facts grants execution ownership. General
-observation uses constant-size evidence, not a serialized tool-history scan.
-Weak mutation receipts may preserve negative invalidation, never artifact delivery
-or positive mutation-completion authority. An independent subsequent observation
-can discharge observation debt without upgrading the writer's authority.
-Explicit Bash `mode=verify` is admitted only after its prepared invocation owner
-can provide authoritative descendant settlement. A weak process-group fallback
-rejects it before starting the command; an ordinary Bash test may still run,
-but its output alone is not an explicit unchanged-workspace receipt. Typed file
-observation does not replace a required script or test result.
+neither decoding nor restoring these facts grants execution ownership.
+Execution ownership and partial-effect uncertainty retain their existing typed
+boundaries; command outcomes never establish that an unowned process stopped.
+Declared checks use the ordinary authorized command execution path. A
+successful check records its observed invocation and exit, not an unchanged or
+exclusive workspace. Typed file observation remains distinct from a required
+script or test result. No special Bash mode or fingerprint receipt is required.
+
+A prior invocation with an unknown outcome remains in its existing ledger and
+must not be automatically replayed under the same identity. Once its Run and
+owner lease are no longer active, a new conversation turn may proceed. The
+stable model instruction explains that interrupted operations may be absent
+from history and may have partially executed or still be running. This is
+advisory; it does not identify the operation or prove that an executor stopped.
+No ledger lookup is needed for ordinary new-turn admission.
 
 The handoff also records exact primary Work custody using the existing Work
 binding and item-attempt identifiers. Its explicit variants distinguish no

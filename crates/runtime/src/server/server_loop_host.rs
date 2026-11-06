@@ -52,9 +52,6 @@ use crate::server::tool_transport::{
     projected_tool_start_event_fields,
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
-use crate::turn::agentic_loop::execution_phase::{
-    WorkValidationState, current_work_validation_state,
-};
 use crate::turn::agentic_loop::host::{
     AdmittedToolCallControl, AdmittedToolCallOutcome, AgenticLoopHost, AgenticLoopOutcome,
     AgenticLoopState, HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
@@ -6925,57 +6922,6 @@ fn executor_binding_summary(executor: &ExecutorBinding) -> String {
     parts.join(" · ")
 }
 
-fn call_requests_delivered_work_settlement(call: &Value) -> bool {
-    astra_turn_core::tool::args::shape::tool_call_name(call) == Some("settle_work_item")
-        && astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
-            .ok()
-            .and_then(|arguments| {
-                arguments
-                    .get("outcome")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .as_deref()
-            == Some("delivered")
-}
-
-/// Return whether the active Work attempt has a successful executable result
-/// since its latest lifecycle boundary.
-///
-/// Settlement is an event in the Work state machine, not a claim about what a
-/// model wrote in `summary`.  A successful non-control tool result is the
-/// smallest runtime-owned fact that proves the attempt actually did work.
-/// The scan is bounded by the latest typed lifecycle carrier, so a result from
-/// a prior assignment cannot authorize the current one.  Discovery is not
-/// evidence: selecting a schema with `tool_search` does not execute the
-/// assigned task. Planning/control tools are likewise skipped while looking
-/// back to the current assignment boundary. No result text, arguments, task
-/// name, or prompt wording is inspected here.
-fn work_attempt_has_successful_evidence(state: &AgenticLoopState) -> bool {
-    for record in state.stall.tool_call_records.iter().rev() {
-        if matches!(
-            record.name.as_str(),
-            "start_work" | "run_next_work_item" | "settle_work_item"
-        ) {
-            return false;
-        }
-        if matches!(
-            record.name.as_str(),
-            "tool_search"
-                | "inspect_work_plan"
-                | "propose_work_plan"
-                | "inspect_work_criteria"
-                | "propose_work_criteria"
-        ) {
-            continue;
-        }
-        if record.was_executed() && record.ok {
-            return true;
-        }
-    }
-    false
-}
-
 /// A root run remains one provider/cache scope while it moves between
 /// coordinator and foreground-primary-attempt states. Runtime admission still
 /// applies `PrimaryAttempt` authority to calls, but the wire projection must
@@ -6986,23 +6932,6 @@ fn provider_work_execution_context(
     _primary_attempt_active: bool,
 ) -> Option<astra_runtime_env::WorkExecutionContext> {
     delegated_attempt.then_some(astra_runtime_env::WorkExecutionContext::DelegatedAttempt)
-}
-
-fn call_is_pending_canonical_validation(call: &Value) -> bool {
-    let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(call) else {
-        return false;
-    };
-    let raw_args = call
-        .get("function")
-        .and_then(|function| function.get("arguments"))
-        .map(|arguments| match arguments {
-            Value::String(arguments) => arguments.clone(),
-            other => other.to_string(),
-        });
-    raw_args.is_some_and(|args| {
-        crate::turn::agentic_loop::execution_phase::classify_work_validation_attempt(name, &args)
-            .is_some()
-    })
 }
 
 fn append_tool_calls_unique_by_id(target: &mut Vec<Value>, candidates: Vec<Value>) {
@@ -8457,62 +8386,6 @@ impl ServerAgenticLoopHost {
             );
             return Vec::new();
         };
-        let mut admission = admission;
-        let validation_state = current_work_validation_state(state);
-        let validation_pending_in_batch = admission
-            .admitted
-            .iter()
-            .any(|call| call_is_pending_canonical_validation(call.logical_target_call()));
-        let validation_blocks_delivery = matches!(
-            validation_state,
-            WorkValidationState::Failed | WorkValidationState::Stale
-        );
-        if validation_blocks_delivery || validation_pending_in_batch {
-            let mut retained = Vec::with_capacity(admission.admitted.len());
-            for call in admission.admitted.drain(..) {
-                if !call_requests_delivered_work_settlement(&call) {
-                    retained.push(call);
-                    continue;
-                }
-                let retryable = !state.hooks.completion_settlement.work_settlement_only;
-                let error_kind = if validation_pending_in_batch {
-                    "work_validation_pending"
-                } else {
-                    "unresolved_work_validation"
-                };
-                admission.rejected.push(
-                    crate::turn::agentic_loop::host::RejectedToolCall {
-                        invocation: call,
-                        result: json!({
-                            "status": "rejected",
-                            "error_kind": error_kind,
-                            "retryable": retryable,
-                            "unresolved_validation_operations": usize::from(validation_blocks_delivery),
-                            "validation_state": match validation_state {
-                                WorkValidationState::None => "none",
-                                WorkValidationState::Failed => "failed",
-                                WorkValidationState::Stale => "stale",
-                                WorkValidationState::Passed => "passed",
-                            },
-                            "error": if retryable {
-                                if validation_pending_in_batch {
-                                    "A canonical validation in this tool batch has not produced an outcome yet. The WorkItem cannot be recorded as delivered in the same batch; observe the validation result on the next boundary, then settle truthfully."
-                                } else if validation_state == WorkValidationState::Stale {
-                                    "The current WorkItem has no current, verified project-validation result. Run a direct standard build/test check and observe its result before recording delivery, or settle truthfully."
-                                } else {
-                                    "The current WorkItem's latest canonical validation failed. It cannot be recorded as delivered. Repair and rerun proportionate validation, or settle with the truthful failed/blocked outcome."
-                                }
-                            } else {
-                                "The current WorkItem has no successful current validation receipt and the bounded execution slice is closed. It cannot be recorded as delivered; settle with the truthful failed or blocked outcome."
-                            }
-                        })
-                        .to_string(),
-                    },
-                );
-            }
-            admission.admitted = retained;
-        }
-
         let admission =
             crate::turn::agentic_loop::execution_phase::apply_completion_action_admission(
                 state, admission, tool_calls,
@@ -11347,87 +11220,29 @@ impl ServerAgenticLoopHost {
             // In particular, two different settlement payloads cannot be
             // allowed to observe A then B merely because the first call
             // installed B before the second handler started.
-            let validation_pending_in_batch = admission
-                .admitted
-                .iter()
-                .any(|call| call_is_pending_canonical_validation(call.logical_target_call()));
             let settlement_in_batch = admission.admitted.iter().any(|call| {
                 astra_turn_core::tool::args::shape::tool_call_name(call) == Some("settle_work_item")
-                    && (!validation_pending_in_batch
-                        || !call_requests_delivered_work_settlement(call))
             });
-            let delivery_waits_for_validation = !settlement_in_batch
-                && validation_pending_in_batch
-                && admission
-                    .admitted
-                    .iter()
-                    .any(|call| call_requests_delivered_work_settlement(call));
-            let mut settlement_admitted = false;
+            if settlement_in_batch && admission.admitted.len() != 1 {
+                for call in admission.admitted.drain(..) {
+                    admission.rejected.push(crate::turn::agentic_loop::host::RejectedToolCall {
+                        invocation: call,
+                        result: json!({
+                            "status": "rejected",
+                            "error_kind": "canonical_work_settlement_parallel_execution_not_allowed",
+                            "retryable": true,
+                            "error": "A Work assignment transition must be requested on its own. No call in this mixed batch ran; observe other tool results before settling the assignment.",
+                        }).to_string(),
+                    });
+                }
+                return admission;
+            }
             let mut retained = Vec::with_capacity(admission.admitted.len());
             for call in admission.admitted.drain(..) {
                 let name = astra_turn_core::tool::args::shape::tool_call_name(&call);
                 let arguments =
                     astra_turn_core::tool::args::shape::parse_tool_call_arguments(&call)
                         .unwrap_or(Value::Null);
-                if settlement_in_batch || delivery_waits_for_validation {
-                    let rejection = if delivery_waits_for_validation
-                        && call_is_pending_canonical_validation(call.logical_target_call())
-                    {
-                        None
-                    } else if name == Some("settle_work_item") {
-                        if settlement_admitted {
-                            Some(
-                                "Only one settle_work_item transition may be admitted in a provider batch. Wait for its typed receipt before settling the next assignment.",
-                            )
-                        } else {
-                            None
-                        }
-                    } else {
-                        Some(
-                            "settle_work_item is an exclusive Work assignment transition. Wait for its typed receipt before executing another capability.",
-                        )
-                    };
-                    if let Some(error) = rejection {
-                        admission.rejected.push(
-                            crate::turn::agentic_loop::host::RejectedToolCall {
-                                invocation: call,
-                                result: json!({
-                                    "status": "rejected",
-                                    "error_kind": "canonical_work_settlement_parallel_execution_not_allowed",
-                                    "retryable": false,
-                                    "error": error,
-                                })
-                                .to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                }
-                // A delivered outcome is a state transition, not a prose
-                // assertion.  Require one successful non-lifecycle result
-                // from the current attempt before admitting it.  The live
-                // executor check keeps schema-only policy fixtures and
-                // recovery projections observational; production attempts
-                // always have the executor that owns their evidence ledger.
-                if name == Some("settle_work_item")
-                    && call_requests_delivered_work_settlement(&call)
-                    && state.runtime_tool_executor.is_some()
-                    && !work_attempt_has_successful_evidence(state)
-                {
-                    admission.rejected.push(
-                        crate::turn::agentic_loop::host::RejectedToolCall {
-                            invocation: call,
-                            result: json!({
-                                "status": "rejected",
-                                "error_kind": "work_settlement_evidence_required",
-                                "retryable": true,
-                                "error": "A delivered Work settlement needs one successful non-lifecycle tool result for this assigned attempt. Continue the focused evidence path, or settle blocked/failed when execution cannot obtain the result."
-                            })
-                            .to_string(),
-                        },
-                    );
-                    continue;
-                }
                 if name == Some("agent")
                     && arguments.get("action").and_then(Value::as_str) == Some("spawn")
                     && direct_agent_batch_count > 1
@@ -11472,9 +11287,6 @@ impl ServerAgenticLoopHost {
                 if name
                     .is_none_or(|name| tool_contracts.permits_work_execution_context(name, context))
                 {
-                    if name == Some("settle_work_item") {
-                        settlement_admitted = true;
-                    }
                     retained.push(call);
                     continue;
                 }
@@ -23810,6 +23622,57 @@ mod tests {
     use crate::server::provider_test_support::{ProviderGateway, ProviderResponse, ProviderScript};
 
     #[test]
+    fn work_assignment_transition_rejects_every_mixed_batch_before_execution() {
+        let mut host = test_host_builder("u-transition", "s-transition")
+            .with_edge_tools(sample_edge_tools())
+            .with_execution_binding_snapshot(edge_runtime_snapshot())
+            .with_work_item_attempt_bound(true)
+            .build();
+        let mut state = create_test_state();
+        let settlement = json!({"id":"settle","type":"function","function":{
+            "name":"settle_work_item","arguments":r#"{"outcome":"delivered","summary":"observed result"}"#
+        }});
+        for sibling in [
+            json!({"id":"command","type":"function","function":{
+                "name":"bash","arguments":r#"{"command":"./custom-command"}"#
+            }}),
+            json!({"id":"reader","type":"function","function":{
+                "name":"read_file","arguments":r#"{"path":"README.md"}"#
+            }}),
+        ] {
+            for calls in [
+                vec![settlement.clone(), sibling.clone()],
+                vec![sibling, settlement.clone()],
+            ] {
+                let admitted = host.admit_terminal_tool_calls_with_completion(
+                    &mut state,
+                    &calls,
+                    Some("tool_calls"),
+                );
+                assert!(admitted.is_empty());
+                let admission = host.pending_tool_call_admission.take().unwrap();
+                assert_eq!(admission.rejected.len(), calls.len());
+                for rejected in admission.rejected {
+                    let result: Value = serde_json::from_str(&rejected.result).unwrap();
+                    assert_eq!(
+                        result["error_kind"],
+                        "canonical_work_settlement_parallel_execution_not_allowed"
+                    );
+                    assert_eq!(result["retryable"], true);
+                }
+            }
+        }
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                std::slice::from_ref(&settlement),
+                Some("tool_calls"),
+            ),
+            vec![settlement]
+        );
+    }
+
+    #[test]
     fn provider_execution_directory_uses_typed_task_support_and_exact_tools() {
         let required = astra_turn_types::ProviderToolDeclaration {
             native_tool_id: astra_turn_types::NativeToolId::new("native_codex").unwrap(),
@@ -24285,48 +24148,7 @@ mod tests {
     }
 
     #[test]
-    fn work_attempt_evidence_is_bounded_to_the_latest_typed_assignment() {
-        let executed = |name: &str| ToolCallRecord {
-            name: name.to_string(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        };
-        let mut state = create_test_state();
-        state
-            .stall
-            .tool_call_records
-            .extend([executed("start_work"), executed("read_file")]);
-        assert!(work_attempt_has_successful_evidence(&state));
-
-        state
-            .stall
-            .tool_call_records
-            .push(executed("settle_work_item"));
-        assert!(
-            !work_attempt_has_successful_evidence(&state),
-            "evidence from the previous assignment cannot authorize a new settlement"
-        );
-
-        state.stall.tool_call_records.push(executed("tool_search"));
-        assert!(
-            !work_attempt_has_successful_evidence(&state),
-            "schema discovery is not execution evidence"
-        );
-        state
-            .stall
-            .tool_call_records
-            .extend([executed("inspect_work_plan"), executed("propose_work_plan")]);
-        assert!(
-            !work_attempt_has_successful_evidence(&state),
-            "graph inspection and mutation are control events, not task evidence"
-        );
-        state.stall.tool_call_records.push(executed("read_file"));
-        assert!(work_attempt_has_successful_evidence(&state));
-    }
-
-    #[test]
-    fn live_work_attempt_rejects_delivery_without_execution_evidence() {
+    fn model_only_work_attempt_can_reach_its_canonical_settlement_owner() {
         let host = test_host_builder("u-work-evidence", "s-work-evidence")
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                 true, false,
@@ -24341,8 +24163,8 @@ mod tests {
                     executor_run_id: "run-evidence".to_string(),
                     item_id: "task-evidence".to_string(),
                     item_revision: 1,
-                    objective: "Read one file".to_string(),
-                    expected_result: "The file contents".to_string(),
+                    objective: "Answer the arithmetic question from the conversation".to_string(),
+                    expected_result: "Explain why 2 + 2 = 4".to_string(),
                 },
             )
             .expect("install active attempt");
@@ -24364,11 +24186,11 @@ mod tests {
                 completion_action_applied: false,
             },
         );
-        assert!(admission.admitted.is_empty());
-        let rejection = admission.rejected.first().expect("typed rejection");
-        let result: Value = serde_json::from_str(&rejection.result).expect("rejection JSON");
-        assert_eq!(result["error_kind"], "work_settlement_evidence_required");
-        assert_eq!(result["retryable"], true);
+        assert_eq!(admission.admitted.len(), 1);
+        assert!(
+            admission.rejected.is_empty(),
+            "the host must not require unrelated tool I/O"
+        );
 
         let blocked = json!({
             "id": "settle-blocked-without-evidence",
@@ -25261,7 +25083,8 @@ mod tests {
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role":"system", "content":"stable"})],
                 vec![
-                    runtime_system_context_message(&format!("new {}", "y".repeat(7_000)), false)
+                    // Leave room for the stable runtime contract after evicting old history.
+                    runtime_system_context_message(&format!("new {}", "y".repeat(4_000)), false)
                         .unwrap(),
                 ],
                 state.messages.clone(),
@@ -33329,17 +33152,13 @@ mod tests {
         ];
         let admitted =
             primary.admit_terminal_tool_calls(&primary_state, &attempt_calls, Some("tool_calls"));
-        assert_eq!(
-            admitted
-                .iter()
-                .filter_map(astra_turn_core::tool::args::shape::tool_call_name)
-                .collect::<Vec<_>>(),
-            vec!["settle_work_item"],
-            "settlement is an exclusive primary WorkItem transition; sibling capabilities wait for its typed receipt"
+        assert!(
+            admitted.is_empty(),
+            "a mixed Work assignment transition must not execute any sibling"
         );
         let admission =
             AgenticLoopHost::admit_tool_calls(&mut primary, &attempt_calls, Some("tool_calls"));
-        assert_eq!(admission.rejected.len(), 5);
+        assert_eq!(admission.rejected.len(), attempt_calls.len());
         let rejection_kinds = admission
             .rejected
             .iter()
@@ -33356,6 +33175,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
         for call_id in [
             "task-network",
+            "task-settle",
             "task-recursive-dispatch",
             "task-recursive-agent",
             "task-recursive-fanout",
@@ -33367,6 +33187,18 @@ mod tests {
                 "{call_id} must wait for the settlement transition"
             );
         }
+        let settlement = attempt_calls
+            .iter()
+            .find(|call| call["id"] == "task-settle")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            primary
+                .admit_terminal_tool_calls(&primary_state, &[settlement], Some("tool_calls"))
+                .len(),
+            1,
+            "retrying the assignment transition on its own preserves canonical Work admission"
+        );
     }
 
     #[test]
@@ -48595,821 +48427,6 @@ mod tests {
         }));
     }
 
-    fn validation_record(command: &str, ok: bool) -> ToolCallRecord {
-        ToolCallRecord {
-            name: "bash".to_string(),
-            ok,
-            args_full: Some(json!({"command": command}).to_string()),
-            result_class: Some(if ok { "success" } else { "test_failure" }.to_string()),
-            exit_semantics: Some(if ok { "success" } else { "domain_negative" }.to_string()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        }
-    }
-
-    fn write_record(path: &str) -> ToolCallRecord {
-        ToolCallRecord {
-            name: "write_file".to_string(),
-            ok: true,
-            args_full: Some(json!({"path": path, "content": "fixed"}).to_string()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn delivered_work_cannot_override_an_unresolved_exact_validation_failure() {
-        let mut host = test_host_builder("u-work-validation", "s-work-validation")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_work_item_attempt_bound(true)
-            .build();
-        let mut state = create_test_state();
-        state.hooks.completion_settlement.work_settlement_only = true;
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("tsc --noemit false", false));
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Failed
-        );
-        let delivered = json!({
-            "id": "call-delivered",
-            "type": "function",
-            "function": {
-                "name": "settle_work_item",
-                "arguments": r#"{"outcome":"delivered","summary":"done"}"#
-            }
-        });
-
-        assert!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut state,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            )
-            .is_empty()
-        );
-        let admission = AgenticLoopHost::admit_tool_calls(
-            &mut host,
-            std::slice::from_ref(&delivered),
-            Some("tool_calls"),
-        );
-        let rejected = admission.rejected.first().expect("delivered is rejected");
-        let result: Value = serde_json::from_str(&rejected.result).expect("typed rejection");
-        assert_eq!(result["error_kind"], "unresolved_work_validation");
-        assert_eq!(result["retryable"], false);
-        assert_eq!(result["unresolved_validation_operations"], 1);
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-
-        let failed = json!({
-            "id": "call-failed",
-            "type": "function",
-            "function": {
-                "name": "settle_work_item",
-                "arguments": r#"{"outcome":"failed","summary":"validation failed"}"#
-            }
-        });
-        assert_eq!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut state,
-                std::slice::from_ref(&failed),
-                Some("tool_calls"),
-            ),
-            vec![failed]
-        );
-    }
-
-    #[test]
-    fn delivered_work_requires_positive_validation_not_a_completed_empty_result() {
-        let mut host = test_host_builder(
-            "u-work-validation-domain-result",
-            "s-work-validation-domain-result",
-        )
-        .with_edge_tools(sample_edge_tools())
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
-        .with_work_item_attempt_bound(true)
-        .build();
-        let mut state = create_test_state();
-        let mut validation = validation_record("python -m pytest tests", true);
-        validation.result_class = Some("empty_result".to_string());
-        validation.exit_semantics = Some("empty_result".to_string());
-        state.stall.tool_call_records.push(validation);
-        let delivered = json!({
-            "id": "call-delivered-domain-result",
-            "type": "function",
-            "function": {
-                "name": "settle_work_item",
-                "arguments": r#"{"outcome":"delivered","summary":"done"}"#
-            }
-        });
-
-        assert!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut state,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            )
-            .is_empty(),
-            "a completed shell invocation is not positive proof that its validator passed"
-        );
-        let admission = host
-            .pending_tool_call_admission
-            .as_ref()
-            .expect("rejected delivery admission");
-        assert_eq!(admission.rejected.len(), 1);
-        assert!(
-            admission.rejected[0]
-                .result
-                .contains("unresolved_work_validation")
-        );
-    }
-
-    #[test]
-    fn declared_verifier_recovery_gates_work_delivery_at_the_server_boundary() {
-        let mut host = test_host_builder("u-declared-check", "s-declared-check")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_work_item_attempt_bound(true)
-            .build();
-        let delivered = json!({"id":"settle", "type":"function", "function":{
-            "name":"settle_work_item", "arguments":r#"{"outcome":"delivered","summary":"checked"}"#
-        }});
-        for command in [
-            "python3 -c 'assert 1 == 1'",
-            "python3 - <<'PY'\nassert 1 == 1\nPY",
-        ] {
-            let args = json!({"command":command, "mode":"verify"});
-            let record = |ok| {
-                let mut record = validation_record(command, ok);
-                record.args_full = Some(args.to_string());
-                record.runtime_args_full = record.args_full.clone();
-                record.workspace_mutation_scope =
-                    Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-                if ok {
-                    record.workspace_mutation_receipt = astra_tools::workspace_observation::explicit_workspace_verification_receipt()
-                        .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
-                }
-                record
-            };
-            let mut state = create_test_state();
-            state.stall.tool_call_records.push(record(false));
-            assert!(
-                host.admit_terminal_tool_calls_with_completion(
-                    &mut state,
-                    std::slice::from_ref(&delivered),
-                    Some("tool_calls")
-                )
-                .is_empty(),
-                "{command}: failed check must block delivery"
-            );
-            assert!(
-                host.pending_tool_call_admission
-                    .take()
-                    .unwrap()
-                    .rejected
-                    .iter()
-                    .any(|call| call.result.contains("unresolved_work_validation"))
-            );
-            state.stall.tool_call_records.push(record(true));
-            assert_eq!(
-                host.admit_terminal_tool_calls_with_completion(
-                    &mut state,
-                    std::slice::from_ref(&delivered),
-                    Some("tool_calls")
-                ),
-                vec![delivered.clone()],
-                "{command}: exact successful retry must allow delivery"
-            );
-            host.pending_tool_call_admission.take();
-
-            let mut state = create_test_state();
-            let pending = json!({"id":"check", "type":"function", "function":{
-                "name":"bash", "arguments":args.to_string()
-            }});
-            let admitted = host.admit_terminal_tool_calls_with_completion(
-                &mut state,
-                &[pending, delivered.clone()],
-                Some("tool_calls"),
-            );
-            assert!(
-                !admitted
-                    .iter()
-                    .any(|call| call["function"]["name"] == "settle_work_item"),
-                "{command}: same-batch check has no outcome yet"
-            );
-            assert!(
-                host.pending_tool_call_admission
-                    .take()
-                    .unwrap()
-                    .rejected
-                    .iter()
-                    .any(|call| call.result.contains("work_validation_pending"))
-            );
-        }
-    }
-
-    #[test]
-    fn exact_validation_recovery_or_a_new_work_attempt_allows_delivery() {
-        let mut host =
-            test_host_builder("u-work-validation-recovery", "s-work-validation-recovery")
-                .with_edge_tools(sample_edge_tools())
-                .with_execution_binding_snapshot(edge_runtime_snapshot())
-                .with_work_item_attempt_bound(true)
-                .build();
-        let delivered = json!({
-            "id": "call-delivered",
-            "type": "function",
-            "function": {
-                "name": "settle_work_item",
-                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
-            }
-        });
-
-        let mut ordinary_failure = create_test_state();
-        ordinary_failure
-            .stall
-            .tool_call_records
-            .push(ToolCallRecord {
-                name: "read_file".to_string(),
-                ok: false,
-                args_full: Some(json!({"path": "missing.txt"}).to_string()),
-                result_class: Some("execution_error".to_string()),
-                disposition: Some(ToolCallDisposition::Executed),
-                ..Default::default()
-            });
-        assert_eq!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut ordinary_failure,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            ),
-            vec![delivered.clone()],
-            "ordinary tool failures are not validation authority"
-        );
-        host.pending_tool_call_admission.take();
-
-        let mut repaired_with_broader_validation = create_test_state();
-        repaired_with_broader_validation
-            .stall
-            .tool_call_records
-            .push(validation_record("npx tsc --NOEMIT --HELP null", false));
-        repaired_with_broader_validation
-            .stall
-            .tool_call_records
-            .push(write_record("src/lib.rs"));
-        repaired_with_broader_validation
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", true));
-        assert!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut repaired_with_broader_validation,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            )
-            .is_empty(),
-            "a different validation may add evidence after a repair, but cannot waive the failed operation"
-        );
-        host.pending_tool_call_admission.take();
-
-        let mut recovered = create_test_state();
-        recovered
-            .stall
-            .tool_call_records
-            .push(validation_record("tsc --noemit", false));
-        recovered
-            .stall
-            .tool_call_records
-            .push(validation_record("tsc --NOEMIT", true));
-        assert_eq!(
-            current_work_validation_state(&recovered),
-            WorkValidationState::Passed
-        );
-        assert_eq!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut recovered,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            ),
-            vec![delivered.clone()]
-        );
-        host.pending_tool_call_admission.take();
-
-        let mut scoped_types = create_test_state();
-        scoped_types.stall.tool_call_records.push(validation_record(
-            "tsc --noEmit --types @scope/custom index.ts",
-            true,
-        ));
-        assert_eq!(
-            current_work_validation_state(&scoped_types),
-            WorkValidationState::Passed
-        );
-        assert_eq!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut scoped_types,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            ),
-            vec![delivered.clone()],
-            "a consumed scoped types value must not be treated as a response file"
-        );
-        host.pending_tool_call_admission.take();
-
-        for unverified_command in [
-            "tsc --noEmit @args.rsp",
-            "tsc --noEmit --types --help",
-            "tsc --noEmit --types --strict @args.rsp",
-            "tsc --noEmit --types --outDir --types @args.rsp",
-        ] {
-            let mut unverified = create_test_state();
-            unverified
-                .stall
-                .tool_call_records
-                .push(validation_record(unverified_command, true));
-            assert_eq!(
-                current_work_validation_state(&unverified),
-                WorkValidationState::Stale,
-                "{unverified_command}"
-            );
-            assert!(
-                host.admit_terminal_tool_calls_with_completion(
-                    &mut unverified,
-                    std::slice::from_ref(&delivered),
-                    Some("tool_calls"),
-                )
-                .is_empty(),
-                "{unverified_command} cannot prove type-checking"
-            );
-            host.pending_tool_call_admission.take();
-        }
-
-        let ambiguous = "tsc --noEmit --help --outDir --help false";
-        let mut unverified = create_test_state();
-        unverified
-            .stall
-            .tool_call_records
-            .push(validation_record(ambiguous, false));
-        assert_eq!(
-            current_work_validation_state(&unverified),
-            WorkValidationState::Failed
-        );
-        unverified
-            .stall
-            .tool_call_records
-            .push(validation_record(ambiguous, true));
-        assert_eq!(
-            current_work_validation_state(&unverified),
-            WorkValidationState::Stale
-        );
-        assert!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut unverified,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            )
-            .is_empty()
-        );
-        let admission = AgenticLoopHost::admit_tool_calls(
-            &mut host,
-            std::slice::from_ref(&delivered),
-            Some("tool_calls"),
-        );
-        let rejection: Value = serde_json::from_str(
-            &admission
-                .rejected
-                .first()
-                .expect("rejected delivery")
-                .result,
-        )
-        .expect("typed rejection");
-        assert!(
-            rejection["error"]
-                .as_str()
-                .unwrap()
-                .contains("verified project-validation")
-        );
-        host.pending_tool_call_admission.take();
-        unverified
-            .stall
-            .tool_call_records
-            .push(validation_record("tsc --noEmit", true));
-        assert_eq!(
-            current_work_validation_state(&unverified),
-            WorkValidationState::Passed
-        );
-        assert_eq!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut unverified,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            ),
-            vec![delivered.clone()]
-        );
-        host.pending_tool_call_admission.take();
-
-        let mut next_attempt = create_test_state();
-        next_attempt
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", false));
-        next_attempt.stall.tool_call_records.push(ToolCallRecord {
-            name: "settle_work_item".to_string(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        assert_eq!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut next_attempt,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            ),
-            vec![delivered]
-        );
-        host.pending_tool_call_admission.take();
-
-        let delivered = json!({
-            "id": "call-delivered-after-start",
-            "type": "function",
-            "function": {
-                "name": "settle_work_item",
-                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
-            }
-        });
-        let mut pre_start_failure = create_test_state();
-        pre_start_failure
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", false));
-        pre_start_failure
-            .stall
-            .tool_call_records
-            .push(ToolCallRecord {
-                name: "start_work".to_string(),
-                ok: true,
-                result_full: Some(
-                    json!({
-                        "status": "started",
-                        "initial_task": {
-                            "status": "assigned",
-                            "attempt_id": "fresh-initial-attempt",
-                            "execution": "primary_session"
-                        }
-                    })
-                    .to_string(),
-                ),
-                disposition: Some(ToolCallDisposition::Executed),
-                ..Default::default()
-            });
-        assert_eq!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut pre_start_failure,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            ),
-            vec![delivered],
-            "validation before Work acquisition is outside the attempt"
-        );
-        host.pending_tool_call_admission.take();
-    }
-
-    #[test]
-    fn delivered_work_waits_for_a_same_batch_validation_outcome() {
-        let mut host = test_host_builder("u-work-validation-batch", "s-work-validation-batch")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_work_item_attempt_bound(true)
-            .build();
-        let mut state = create_test_state();
-        let validation = json!({
-            "id": "call-validation",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"npx tsc --NOEMIT --HELP null"}"#
-            }
-        });
-        let delivered = json!({
-            "id": "call-delivered",
-            "type": "function",
-            "function": {
-                "name": "settle_work_item",
-                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
-            }
-        });
-
-        let unrelated = json!({"id":"call-unrelated","type":"function","function":{
-            "name":"read_file","arguments":r#"{"path":"README.md"}"#
-        }});
-        let mut duplicate = delivered.clone();
-        duplicate["id"] = json!("call-duplicate-settlement");
-        for calls in [
-            vec![validation.clone(), delivered.clone()],
-            vec![delivered.clone(), validation.clone()],
-            vec![validation.clone(), unrelated, delivered.clone(), duplicate],
-        ] {
-            assert_eq!(
-                host.admit_terminal_tool_calls_with_completion(
-                    &mut state,
-                    &calls,
-                    Some("tool_calls")
-                ),
-                vec![validation.clone()]
-            );
-        }
-        let admission = AgenticLoopHost::admit_tool_calls(
-            &mut host,
-            std::slice::from_ref(&delivered),
-            Some("tool_calls"),
-        );
-        let rejected = admission.rejected.first().expect("settlement is deferred");
-        let result: Value = serde_json::from_str(&rejected.result).expect("typed rejection");
-        assert_eq!(result["error_kind"], "work_validation_pending");
-        assert_eq!(result["retryable"], true);
-        for outcome in ["failed", "blocked"] {
-            let mut settlement = delivered.clone();
-            settlement["function"]["arguments"] =
-                json!(json!({"outcome":outcome,"summary":"cannot finish"}).to_string());
-            assert_eq!(
-                host.admit_terminal_tool_calls_with_completion(
-                    &mut state,
-                    &[validation.clone(), settlement.clone()],
-                    Some("tool_calls")
-                ),
-                vec![settlement]
-            );
-        }
-    }
-
-    #[test]
-    fn latest_failed_validation_blocks_even_after_an_earlier_success() {
-        let mut host = test_host_builder("u-work-validation-latest", "s-work-validation-latest")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .build();
-        let mut state = create_test_state();
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", true));
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("tsc --noemit --help '-?' false", false));
-        let delivered = json!({
-            "id": "call-delivered",
-            "type": "function",
-            "function": {
-                "name": "settle_work_item",
-                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
-            }
-        });
-
-        assert!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut state,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn scheduler_resume_does_not_clear_the_same_attempt_validation_failure() {
-        let mut host = test_host_builder("u-work-validation-resume", "s-work-validation-resume")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .with_work_item_attempt_bound(true)
-            .build();
-        let mut state = create_test_state();
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", false));
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "run_next_work_item".to_string(),
-            ok: true,
-            result_full: Some(
-                json!({
-                    "status": "assigned",
-                    "attempt_id": "same-attempt",
-                    "execution": "primary_session_resumed"
-                })
-                .to_string(),
-            ),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        let delivered = json!({
-            "id": "call-delivered",
-            "type": "function",
-            "function": {
-                "name": "settle_work_item",
-                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
-            }
-        });
-
-        assert!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut state,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            )
-            .is_empty()
-        );
-        // The first assertion consumed the result logically, but the
-        // observational admission wrapper leaves its typed partition for the
-        // host trait consumer. The fresh assignment below is a new provider
-        // boundary and must not reuse that old partition.
-        host.pending_tool_call_admission.take();
-
-        let mut fresh_assignment = create_test_state();
-        fresh_assignment
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", false));
-        fresh_assignment
-            .stall
-            .tool_call_records
-            .push(ToolCallRecord {
-                name: "run_next_work_item".to_string(),
-                ok: true,
-                result_full: Some(
-                    json!({
-                        "status": "assigned",
-                        "attempt_id": "fresh-attempt",
-                        "execution": "primary_session"
-                    })
-                    .to_string(),
-                ),
-                disposition: Some(ToolCallDisposition::Executed),
-                ..Default::default()
-            });
-        assert_eq!(
-            host.admit_terminal_tool_calls_with_completion(
-                &mut fresh_assignment,
-                std::slice::from_ref(&delivered),
-                Some("tool_calls"),
-            ),
-            vec![delivered],
-            "a server-owned fresh assignment starts a new validation epoch"
-        );
-    }
-
-    #[test]
-    fn pending_work_validation_requires_a_recognized_or_declared_check() {
-        for (command, mode, expected) in [
-            ("python3 - <<'PY'\nprint('result')\nPY", None, false),
-            (
-                "python3 - <<'PY'\nprint('result')\nPY",
-                Some("verify"),
-                true,
-            ),
-            ("cargo check", None, true),
-        ] {
-            let mut args = json!({"command": command});
-            if let Some(mode) = mode {
-                args["mode"] = json!(mode);
-            }
-            let call = json!({"function": {"name": "bash", "arguments": args.to_string()}});
-            assert_eq!(call_is_pending_canonical_validation(&call), expected);
-        }
-    }
-
-    #[test]
-    fn work_validation_receipt_overrides_scratch_command_shape() {
-        let command = "printf snapshot > /tmp/work-validation-observation.txt";
-        assert!(
-            crate::turn::agentic_loop::lifecycle::bash_mutation_is_proven_external_scratch(
-                command,
-                Some("/workspace"),
-            )
-        );
-        for (changed, partial) in [(true, false), (true, true), (false, false)] {
-            let mut activity = validation_record(command, true);
-            activity.runtime_args_full = activity.args_full.clone();
-            activity.workspace_mutation_observed = Some(changed);
-            activity.workspace_mutation_partial = Some(partial);
-            activity.workspace_mutation_scope =
-                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-            let mut fields = if changed {
-                astra_tools::workspace_observation::changed_receipt_with_ownership(
-                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-                )
-            } else {
-                astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
-                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-                )
-            };
-            activity.workspace_mutation_receipt = fields.remove(if changed {
-                astra_tools::workspace_observation::RECEIPT_FIELD
-            } else {
-                astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD
-            });
-            let mut state = create_test_state();
-            state.hooks.workspace_root_hint = Some("/workspace".into());
-            state.stall.tool_call_records =
-                vec![validation_record("cargo check", true), activity.clone()];
-            assert_eq!(
-                current_work_validation_state(&state),
-                if changed || partial {
-                    WorkValidationState::Stale
-                } else {
-                    WorkValidationState::Passed
-                }
-            );
-            if changed || partial {
-                let mut host = test_host_builder("receipt-user", "receipt-session")
-                    .with_edge_tools(sample_edge_tools())
-                    .with_execution_binding_snapshot(edge_runtime_snapshot())
-                    .with_work_item_attempt_bound(true)
-                    .build();
-                let delivered = json!({"id":"settle-receipt", "type":"function", "function": {
-                    "name":"settle_work_item", "arguments": r#"{"outcome":"delivered","summary":"done"}"#
-                }});
-                assert!(
-                    host.admit_terminal_tool_calls_with_completion(
-                        &mut state,
-                        std::slice::from_ref(&delivered),
-                        Some("tool_calls"),
-                    )
-                    .is_empty()
-                );
-                let admission =
-                    AgenticLoopHost::admit_tool_calls(&mut host, &[delivered], Some("tool_calls"));
-                let rejection: Value = serde_json::from_str(&admission.rejected[0].result).unwrap();
-                assert_eq!(rejection["error_kind"], "unresolved_work_validation");
-                assert_eq!(rejection["validation_state"], "stale");
-            }
-            state.stall.tool_call_records = vec![activity];
-            assert_eq!(
-                current_work_validation_state(&state),
-                WorkValidationState::None
-            );
-        }
-        let mut scratch_only = create_test_state();
-        scratch_only.hooks.workspace_root_hint = Some("/workspace".into());
-        scratch_only.stall.tool_call_records = vec![
-            validation_record("cargo check", true),
-            validation_record(command, true),
-        ];
-        assert_eq!(
-            current_work_validation_state(&scratch_only),
-            WorkValidationState::Passed
-        );
-    }
-
-    #[test]
-    fn mutation_after_validation_requires_a_new_validation_receipt() {
-        let mut state = create_test_state();
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", false));
-        state
-            .stall
-            .tool_call_records
-            .push(write_record("src/lib.rs"));
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Stale
-        );
-
-        let mut failed_writer = create_test_state();
-        failed_writer
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", false));
-        let mut partial = write_record("src/lib.rs");
-        partial.ok = false;
-        partial.result_class = Some("execution_error".to_string());
-        failed_writer.stall.tool_call_records.push(partial);
-        assert_eq!(
-            current_work_validation_state(&failed_writer),
-            WorkValidationState::Stale,
-            "a partial bound writer cannot turn failed validation into no obligation"
-        );
-
-        let mut scratch = create_test_state();
-        scratch.hooks.workspace_root_hint = Some("/workspace".to_string());
-        scratch
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test --workspace", false));
-        scratch
-            .stall
-            .tool_call_records
-            .push(write_record("/tmp/diagnostic.txt"));
-        assert_eq!(
-            current_work_validation_state(&scratch),
-            WorkValidationState::Failed,
-            "external scratch is not a bound-workspace validation epoch"
-        );
-    }
-
     #[test]
     fn rejected_same_batch_validation_does_not_block_existing_work_settlement() {
         let mut host = test_host_builder(
@@ -49479,7 +48496,7 @@ mod tests {
             "type": "function",
             "function": {
                 "name": "bash",
-                "arguments": r#"{"command":"git diff --stat","mode":"verify"}"#
+                "arguments": r#"{"command":"git diff --stat"}"#
             }
         });
 
@@ -49574,7 +48591,7 @@ mod tests {
             "type": "function",
             "function": {
                 "name": "bash",
-                "arguments": r#"{"command":"git diff --stat","mode":"verify"}"#
+                "arguments": r#"{"command":"git diff --stat"}"#
             }
         });
         assert_eq!(

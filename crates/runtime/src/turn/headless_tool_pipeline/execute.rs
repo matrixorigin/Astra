@@ -488,9 +488,13 @@ mod tests {
             ("result_class".into(), serde_json::json!("success")),
             ("exit_code".into(), serde_json::json!(0)),
             ("error_kind".into(), serde_json::json!("tool_unavailable")),
-            ("recovery_evidence".into(), serde_json::to_value(
-                astra_tools::workspace_observation::explicit_workspace_verification_unavailable_evidence(),
-            ).unwrap()),
+            (
+                "recovery_evidence".into(),
+                serde_json::to_value(astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolUnavailable,
+                ))
+                .unwrap(),
+            ),
         ]);
         assert!(execution_result_is_error(Some(&fields), Some(true)));
     }
