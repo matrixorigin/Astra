@@ -165,11 +165,16 @@ impl PostLoopPersistContext {
             let Some(worker) = self.observer_worker.clone() else {
                 return Ok(());
             };
+            // The managed recovery owner discovers committed canonical heads.
+            // Optional observation cannot add writes to, or fail, chat settlement.
+            if !worker.is_configured() {
+                return Ok(());
+            }
             if self.shared_pool.is_some() {
                 record_turn_observer_dispatch_metrics(
                     self.metrics_registry.as_ref(),
-                    "durable",
-                    "queued",
+                    "canonical",
+                    "eligible",
                 );
                 return Ok(());
             }
@@ -961,22 +966,6 @@ async fn persist_server_loop_canonical_append_attempt(
     )
     .await
     .map_err(|error| format!("canonical raw append failed: {error}"))?;
-    if append.include_terminal_assistant
-        && let Some(request) =
-            build_server_loop_observer_request(append.user_id, append.session_id, state)
-    {
-        astra_services::session_memory_lifecycle::enqueue_observation_tx(
-            &mut tx,
-            append.user_id,
-            append.session_id,
-            astra_services::session_memory_lifecycle::SessionObservationWork {
-                event_id: append.run_id.to_owned(),
-                turn: request.turn_count,
-                request: serde_json::to_value(request).map_err(|error| error.to_string())?,
-            },
-        )
-        .await?;
-    }
     match tx.commit().await {
         Ok(()) => connection.release(),
         Err(error) => {

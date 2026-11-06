@@ -311,19 +311,28 @@ response limit.
 
 The observer has a ten-second budget for the entire fresh authority lookup,
 including MOI and UC dependencies, and a separate 30-second backend deadline.
-Observation work is checkpointed in the existing session-memory journal within
-the canonical terminal transaction. The existing recovery driver scans at most
-16 due Sessions and runs at most two attempts concurrently per process. It uses
-the journal's 90-second fenced leases, a 60-second attempt budget and existing
-exponential backoff (5–960 seconds); expired leases recover process death.
-A timeout or transport failure retains the frozen observation for retry, which
-rechecks current authorization. Revocation skips the write and acknowledges that
-observation; no retry uses a previously resolved credential. At most one active
-and one newer queued transcript are retained per Session. Queued full-context
-snapshots coalesce to the newest turn; an active uncertain attempt is never
-replaced. Delivery is at least once, not exactly once. Session deletion removes
-the journal through the existing lifecycle cleanup. Ephemeral deployments have
-no durable recovery and await bounded observation after terminal delivery.
+Observation is optional background work and never writes a job, serializes a
+second transcript, or adds a failure dependency to canonical chat settlement.
+When configured, the existing managed recovery owner discovers the latest
+unobserved completed canonical head, reads its immutable nodes in the same
+query, and delegates content/fork validation to the canonical coordinator.
+An existing sweeper lease selects one cross-process observation owner; it drains
+at most sixteen Sessions per tick with one bounded attempt at a time. The
+ordinary non-fork path adds one discovery/materialization query, fresh authority,
+and one atomic progress checkpoint, without per-Session claim transactions.
+Unconfigured deployments create no observation owner or observation journal.
+
+Only a completed-turn watermark, revision, and independent exponential retry
+clock (5–960 seconds) are stored in the existing session-memory journal.
+Checkpoint writes preserve extraction/governance fields and reject stale lease
+owners or revisions. A new terminal turn cannot reset the retry clock. After a
+failure or restart, retry coalesces to the newest canonical context and resolves
+current authority again. Revocation skips the write and advances the watermark;
+no retry reuses credentials. Delivery is at least once, not exactly once: a
+crash after backend success and before checkpoint may repeat observation.
+Session deletion removes the journal through existing lifecycle cleanup and
+excludes the Session from discovery. Ephemeral deployments have no durable
+recovery and await bounded observation after terminal delivery.
 MOI built-in read-only grants use product-neutral remediation, while scoped
 Memoria logins retain their Connected apps instructions. Authority failures expose
 only stable allowlisted categories (service credentials, timeout, transport,

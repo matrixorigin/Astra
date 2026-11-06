@@ -274,6 +274,10 @@ impl DatabaseTraceEventWriter {
 
 #[async_trait]
 impl TurnObserverWorker for NoopTurnObserverWorker {
+    fn is_configured(&self) -> bool {
+        false
+    }
+
     async fn run(&self, _request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         Ok(TurnObserverOutcome::NotConfigured)
     }
@@ -281,6 +285,10 @@ impl TurnObserverWorker for NoopTurnObserverWorker {
 
 #[async_trait]
 impl TurnObserverWorker for DatabaseTurnObserverWorker {
+    fn is_configured(&self) -> bool {
+        self.memoria_port.is_some()
+    }
+
     async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         if request.messages.is_empty() {
             return Ok(TurnObserverOutcome::Empty);

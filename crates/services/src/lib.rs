@@ -51,6 +51,7 @@ pub mod session_journal;
 pub(crate) mod session_lifecycle;
 pub mod session_memory_inventory;
 pub mod session_memory_lifecycle;
+pub mod session_observation;
 pub mod session_restore;
 pub mod session_workspace;
 pub mod skill_auto_route_judge;

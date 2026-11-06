@@ -20,6 +20,11 @@ pub enum TurnObserverOutcome {
 
 #[async_trait]
 pub trait TurnObserverWorker: Send + Sync {
+    /// Deployment configuration only; user authority is resolved afresh by run.
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String>;
 }
 

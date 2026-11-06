@@ -627,36 +627,31 @@ cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
   ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
 ```
 
-The raw limit is 35 statements: the existing 20-statement chat allocation plus
-15 for observation durability (3 enqueue statements, 6 fenced-claim statements
-and 6 fenced-acknowledgement statements, including transactions). Auto keeps its
-existing 29 nonperiodic / 31 raw allocation plus the same 15 checkpoint statements.
-The pre-existing observer authority query remains in the original allocation.
+The raw limit remains 20 statements. Auto retains its existing 29 nonperiodic /
+31 raw allocation. Observation never inserts or locks a memory-job row during
+chat settlement. The managed background owner discovers committed canonical
+heads and coalesces each Session to its latest completed turn. It persists only
+a small checkpoint with an independent retry clock, not another transcript.
+The canonical coordinator validates materialized content and fork lineage.
+
 The probe measures each request on an initialized server pool, including all
-transactions, periodic control reads and the real observer's SQL.
-Pool initialization happens before capture; no statements are filtered out
-inside the measured interval. Warm-context setup consumes its complete SSE
-response and waits for observer completion before the next request starts;
-it must not use shutdown drain, which closes admission for that next request.
-Capture ends only after both the measured run and its durable observer finish.
-The in-process Router fixture does not start Server-managed recovery timers, so
-it drives the production Session-memory recovery operation for its exact owner
-and Session. It awaits the journal acknowledgement as well as the HTTP worker;
-the worker's success metric alone is emitted before acknowledgement SQL finishes.
-The authorized probe requires the exact expected number of both `queued`
-dispatches and `success` outcomes with `mode="durable"`. An extra queued observer
-fails even if it is still pending when the expected successes finish. Queued
-work without completion also fails; admission alone cannot end SQL capture.
-After capture, the probe separately verifies the persisted observed-turn receipt
-and absence of active/queued observation work. This assertion query is fixture
-verification, like the existing transcript verification, not production SQL.
-Errors, dropped work, missing completions, and skipped
-outcomes (`not_configured`, `access_disabled`, `empty`) fail the probe even when
-successful observations are also present. Disabled access is covered separately;
-it cannot satisfy this HTTP-path SQL measurement.
+transactions, periodic control reads and the real observer's SQL. Pool and
+background leader initialization happen before capture, as in server startup;
+no statements are filtered out inside the measured interval. Warm-context setup
+consumes its complete SSE response and waits for observer completion before the
+next request. Capture ends only after observation discovery, fresh authority,
+HTTP dispatch, and the checkpoint write finish. The Router fixture has no
+managed timers, so it drives that same production owner for its exact Session.
+It requires the expected `eligible` and `success` metrics with `mode="canonical"`;
+only eligibility is signalled by chat. Eligibility alone cannot end capture.
+After capture, a fixture assertion separately verifies the persisted observed
+turn. Errors, dropped work, extra work, missing completions, or skipped outcomes
+cannot satisfy the authorized HTTP-path measurement. Unconfigured deployment
+coverage separately proves that no observer job or background owner is created.
+
 The readonly-round comparison accounts for exact periodic control reads and
 at most one account/session authentication snapshot when its 30-second cache
-expires. Those statements still count toward the raw 35-statement limit;
+expires. Those statements still count toward the raw 20-statement limit;
 repeated authentication snapshots or any other extra readonly-round SQL fail.
 The HTTP fixture binds both the Memoria URL and its master credential to the
 strict local mock. Enabling self-hosted access exercises the authenticated
