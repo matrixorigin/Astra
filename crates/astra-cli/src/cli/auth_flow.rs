@@ -831,6 +831,8 @@ pub(crate) async fn do_register(
     Ok(tokens.access_token)
 }
 
+const REGISTRATION_OUTCOME_UNKNOWN: &str = "Registration outcome is unknown: the account may have been created. Try /login with the chosen credentials before registering again.";
+
 async fn request_register_tokens(
     api: &astra_thin_client::ThinClient,
     username: &str,
@@ -844,8 +846,22 @@ async fn request_register_tokens(
             "password": password,
         }))
         .await
-        .map_err(map_thin_err)?;
-    parse_auth_tokens(&body)
+        .map_err(|error| {
+            use astra_thin_client::ThinClientError;
+            match &error {
+                ThinClientError::Http(cause) if !cause.is_connect() && !cause.is_builder() => {
+                    REGISTRATION_OUTCOME_UNKNOWN.to_string()
+                }
+                ThinClientError::Api { status, .. }
+                    if !status.is_client_error()
+                        || *status == reqwest::StatusCode::REQUEST_TIMEOUT =>
+                {
+                    REGISTRATION_OUTCOME_UNKNOWN.to_string()
+                }
+                _ => format!("Register failed: {}", map_thin_err(error)),
+            }
+        })?;
+    parse_auth_tokens(&body).map_err(|_| REGISTRATION_OUTCOME_UNKNOWN.to_string())
 }
 
 const AUTH_RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
@@ -1023,7 +1039,6 @@ pub(crate) async fn request_password_authentication(
     password: &str,
     email: Option<&str>,
 ) -> Result<PasswordAuthentication, String> {
-    let operation = if email.is_some() { "Register" } else { "Login" };
     tokio::time::timeout(Duration::from_secs(15), async {
         if crate::cli::native_auth::active().is_some() {
             return Err("Use browser sign-in for the current authenticated connection.".to_string());
@@ -1034,7 +1049,7 @@ pub(crate) async fn request_password_authentication(
         let tokens = if let Some(email) = email {
             request_register_tokens(api, username, email, password).await?
         } else {
-            request_login_tokens(api, username, password).await?
+            request_login_tokens(api, username, password).await.map_err(|error| format!("Login failed: {error}"))?
         };
         let execution_token = match crate::cli::session::session_runtime::active_env_access_token(chrono::Utc::now().timestamp()) {
             None => tokens.access_token.clone(),
@@ -1052,9 +1067,8 @@ pub(crate) async fn request_password_authentication(
         };
         Ok(PasswordAuthentication { tokens, execution_token })
     }).await.map_err(|_| if email.is_some() {
-        "Registration outcome is unknown: the account may have been created. Try /login with the chosen credentials before registering again.".to_string()
-    } else { format!("{operation} failed: authentication timed out; retry sign-in.") })?
-        .map_err(|error| format!("{operation} failed: {error}"))
+        REGISTRATION_OUTCOME_UNKNOWN.to_string()
+    } else { "Login failed: authentication timed out; retry sign-in.".to_string() })?
 }
 
 pub(crate) async fn prepare_password_session_login(
@@ -2104,6 +2118,112 @@ mod tests {
                 .any(|request| request.url.path() == "/agents/edge")
         );
         server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn registration_lost_or_invalid_response_reports_unknown_outcome() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        for reply in [
+            "",
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                let end = loop {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..end]);
+                assert!(headers.starts_with("POST /auth/register"));
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while request.len() < end + length {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                // The complete creation request reached the peer. Its outcome
+                // cannot be inferred from the response being absent or invalid.
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let api =
+                astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap();
+            let error = super::request_password_authentication(
+                &api,
+                "new-user",
+                "synthetic-password",
+                Some("user@example.test"),
+            )
+            .await
+            .err()
+            .expect("missing/invalid credentials cannot complete login");
+            peer.await.unwrap();
+            assert_eq!(error, super::REGISTRATION_OUTCOME_UNKNOWN);
+            assert!(!error.contains("Register failed") && !error.contains("synthetic-password"));
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn registration_authoritative_rejection_or_refused_connection_is_not_unknown() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/register"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": "account already exists"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = super::request_password_authentication(
+            &api,
+            "existing-user",
+            "synthetic-password",
+            Some("user@example.test"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("Register failed"));
+        assert!(!error.contains("outcome is unknown"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let error = super::request_password_authentication(
+            &api,
+            "new-user",
+            "synthetic-password",
+            Some("user@example.test"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("Register failed"));
+        assert!(!error.contains("outcome is unknown"));
     }
 
     #[serial_test::serial]
