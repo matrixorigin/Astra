@@ -307,17 +307,17 @@ tokio::task_local! {
 }
 
 /// Bind `astra.run` and a fresh attempt-code slot for this task.
-pub async fn bind_run<F>(carrier: &Carrier, future: F) -> F::Output
+///
+/// The run future is large; keep the scopes directly around it. An async
+/// wrapper here adds a copy of that future to every poll's stack frame.
+pub fn bind_run<F>(carrier: &Carrier, future: F) -> impl Future<Output = F::Output> + use<F>
 where
     F: Future,
 {
-    ATTEMPT_CODE
-        .scope(RefCell::new(None), async move {
-            ACTIVE_RUN
-                .scope(RefCell::new(RunSpan::start(carrier)), future)
-                .await
-        })
-        .await
+    ATTEMPT_CODE.scope(
+        RefCell::new(None),
+        ACTIVE_RUN.scope(RefCell::new(RunSpan::start(carrier)), future),
+    )
 }
 
 /// Run `future` on a new task that can see the current run without owning it.

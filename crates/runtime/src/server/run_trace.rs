@@ -25,11 +25,11 @@ pub(crate) fn inbound_carrier() -> Carrier {
     INBOUND.try_with(Clone::clone).unwrap_or_default()
 }
 
-pub(crate) async fn bind<F>(carrier: Carrier, future: F) -> F::Output
+pub(crate) fn bind<F>(carrier: Carrier, future: F) -> impl Future<Output = F::Output>
 where
     F: Future,
 {
-    astra_logging::trace_context::bind_run(&carrier, future).await
+    astra_logging::trace_context::bind_run(&carrier, future)
 }
 
 /// Close `astra.run` before the task parks on user input.
