@@ -4,6 +4,7 @@
 //! infrastructure dependencies.
 
 pub mod credential_redaction;
+pub mod line_range;
 pub mod semantic_dedup;
 pub mod str_preview;
 pub mod text_tokenize;

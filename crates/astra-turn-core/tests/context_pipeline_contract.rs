@@ -125,6 +125,7 @@ fn context_pipeline_serializes_provider_request_and_metrics() {
     });
     let run = pipeline
         .run(PipelineRunInput {
+            planning_messages: None,
             sources: &sources,
             tokens: &turn.tokens,
             model_limit: session.model_limit,
@@ -165,6 +166,7 @@ fn context_pipeline_rejects_zero_model_limit_before_compaction() {
 
     let err = pipeline
         .run(PipelineRunInput {
+            planning_messages: None,
             sources: &sources,
             tokens: &turn.tokens,
             model_limit: session.model_limit,
@@ -199,6 +201,7 @@ fn context_pipeline_uses_session_provider_policy_not_default_config() {
 
     let run = pipeline
         .run(PipelineRunInput {
+            planning_messages: None,
             sources: &sources,
             tokens: &turn.tokens,
             model_limit: session.model_limit,
@@ -357,6 +360,7 @@ fn pipeline_aborts_on_consecutive_ptl_errors() {
         provider_policy: session.provider_policy.clone(),
     });
     let result = pipeline.run(PipelineRunInput {
+        planning_messages: None,
         sources: &sources,
         tokens: &turn.tokens,
         model_limit: session.model_limit,
@@ -394,6 +398,7 @@ fn serialized_output_format_system_blocks_are_well_structured() {
     });
     let run = pipeline
         .run(PipelineRunInput {
+            planning_messages: None,
             sources: &sources,
             tokens: &turn.tokens,
             model_limit: session.model_limit,

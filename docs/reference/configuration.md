@@ -136,13 +136,20 @@ public roots remain available. Configure them only in the selected CLI, User
 Runner, or Server process environment. They do not transfer a user machine’s
 trust store to the Server. Restart the process after changing its trust settings.
 
+Model probes and inference use the Server's system DNS and its `HTTPS_PROXY`,
+`ALL_PROXY` and `NO_PROXY` settings. User-configured `openai-compatible`
+endpoints require public DNS answers, which are pinned even through a proxy.
+If DNS returns Fake-IP or private addresses, configure the Server's DNS or
+proxy exclusions to return public addresses. Configure the Server process,
+not the CLI, and do not include proxy credentials in diagnostic reports.
+
 ### Auth secrets (REQUIRED in production)
 
 - `ASTRA_JWT_SECRET`
 - `ASTRA_JWT_ALGORITHM` (default `HS256`)
 - `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `10080` in code; production should override)
 - `ASTRA_JWT_REFRESH_TTL_DAYS` (code default `30`; `.env.example` selects `7`)
-- `ASTRA_TOKEN_ENCRYPTION_KEY` (shared high-entropy secret for stored provider and browser session credentials and request-signed Session scope bindings; changing it makes provider credentials undecryptable, requires browser sign-in again, and invalidates existing Session scope bindings)
+- `ASTRA_TOKEN_ENCRYPTION_KEY` (shared high-entropy secret for stored provider and browser session credentials, private Responses continuation state, and request-signed Session scope bindings; changing it makes existing encrypted credentials and continuations unreadable, requires browser sign-in again, and invalidates existing Session scope bindings)
 - `ASTRA_RUNTIME_ROOT_SECRET`
 
 ### Provider Request Auth

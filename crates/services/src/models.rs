@@ -252,6 +252,9 @@ pub struct QuirksData {
     /// Explicit transport for this offering; credentials remain independent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    /// Declared Responses reasoning history requirement; absent is conservative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     /// Administrator-declared reasoning controls for this deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_reasoning_efforts: Option<Vec<String>>,
@@ -362,6 +365,17 @@ fn user_model_inference_protocol(
         .transpose()
 }
 
+fn user_model_reasoning_history(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<Option<astra_core::model_wire::responses::ReasoningHistory>, String> {
+    row.try_get::<Option<String>, _>("responses_reasoning_history")
+        .map_err(|error| error.to_string())?
+        .map(|value| {
+            serde_json::from_value(Value::String(value)).map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
 fn declared_reasoning_capability(quirks: &QuirksData) -> Option<ThinkingCapability> {
     quirks.supported_reasoning_efforts.as_ref().map(|efforts| {
         if efforts.iter().any(|effort| effort == "none") {
@@ -382,6 +396,11 @@ fn unchanged_probe_endpoint(provider: &str, stored: Option<&str>, supplied: &str
 fn validate_inference_config(provider: &str, quirks: &QuirksData) -> Result<(), String> {
     use astra_core::model_wire::{LlmProviderProtocol, llm_provider_protocol};
     let default = llm_provider_protocol(provider);
+    if quirks.responses_reasoning_history.is_some()
+        && quirks.inference_protocol != Some(LlmProviderProtocol::OpenAiResponses)
+    {
+        return Err("Responses reasoning history requires the Responses protocol".into());
+    }
     if quirks.supported_reasoning_efforts.is_some()
         && quirks.inference_protocol != Some(LlmProviderProtocol::OpenAiResponses)
     {
@@ -894,6 +913,7 @@ impl std::fmt::Debug for ResponseScopeKey {
 #[derive(Clone, PartialEq)]
 pub struct ResolvedActiveLlmModel {
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     /// Secret, domain-separated key used to bind Responses continuations.
     /// Like `api_key`, this is execution material and must not be logged or serialized.
     pub response_scope_key: Option<ResponseScopeKey>,
@@ -1204,6 +1224,7 @@ impl RuntimeModelReasoningControl {
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub response_scope: Option<String>,
     pub subscription: Option<crate::chatgpt::ExecutionCredential>,
     /// Completion time of the trusted admission that produced this material.
@@ -1340,6 +1361,7 @@ impl AdmittedModelExecution {
         let scope_key = offering.model.response_scope_key.clone();
         let mut execution = Self {
             inference_protocol: offering.model.inference_protocol,
+            responses_reasoning_history: offering.model.responses_reasoning_history,
             response_scope: None,
             subscription: None,
             admitted_at: Instant::now(),
@@ -1386,6 +1408,7 @@ impl AdmittedModelExecution {
     ) -> Self {
         Self {
             inference_protocol: None,
+            responses_reasoning_history: None,
             response_scope: None,
             subscription: None,
             admitted_at: Instant::now(),
@@ -2035,6 +2058,7 @@ fn build_resolved_active_llm_from_row(
 
     Ok(ResolvedActiveLlmModel {
         inference_protocol: quirks.inference_protocol,
+        responses_reasoning_history: quirks.responses_reasoning_history,
         response_scope_key,
         supported_reasoning_efforts,
         price_snapshot: row
@@ -2497,7 +2521,7 @@ async fn revalidate_admitted_model_executions_with_access(
         .map_err(ModelOfferingResolutionError::Backend)?,
     };
     let mut query = QueryBuilder::<sqlx::MySql>::new(
-        "SELECT model_id, model_alias, model_name, provider, inference_protocol, api_key_encrypted, base_url, connection_id,
+        "SELECT model_id, model_alias, model_name, provider, inference_protocol, responses_reasoning_history, api_key_encrypted, base_url, connection_id,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 NULL AS configuration_updated_at, NULL AS quirks_json, NULL AS pricing_json,
                 NULL AS tags_json, CAST(NULL AS INT) AS max_completion_tokens, 1 AS personal
@@ -2511,7 +2535,7 @@ async fn revalidate_admitted_model_executions_with_access(
         }
     }
     query.push(") UNION ALL
-         SELECT model_id, model_name AS model_alias, model_name, provider, CAST(NULL AS CHAR(32)) AS inference_protocol, api_key_encrypted, base_url, CAST(NULL AS CHAR(64)) AS connection_id,
+         SELECT model_id, model_name AS model_alias, model_name, provider, CAST(NULL AS CHAR(32)) AS inference_protocol, CAST(NULL AS CHAR(16)) AS responses_reasoning_history, api_key_encrypted, base_url, CAST(NULL AS CHAR(64)) AS connection_id,
                 context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json,
                 CAST(updated_at AS CHAR) AS configuration_updated_at,
                 CAST(quirks AS CHAR) AS quirks_json, CAST(pricing AS CHAR) AS pricing_json,
@@ -2736,10 +2760,13 @@ fn admitted_user_model_from_row(
         .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
     let inference_protocol =
         user_model_inference_protocol(row).map_err(ModelOfferingResolutionError::Backend)?;
+    let responses_reasoning_history =
+        user_model_reasoning_history(row).map_err(ModelOfferingResolutionError::Backend)?;
     validate_inference_config(
         &provider,
         &QuirksData {
             inference_protocol,
+            responses_reasoning_history,
             ..Default::default()
         },
     )
@@ -2763,6 +2790,7 @@ fn admitted_user_model_from_row(
     let cache_capability =
         personal_model_cache_capability(&provider, &base_url, inference_protocol);
     let mut execution = AdmittedModelExecution {
+        responses_reasoning_history,
         inference_protocol,
         response_scope: None,
         subscription: None,
@@ -3332,6 +3360,7 @@ pub struct UserModelRecord {
     pub name: String,
     pub provider: String,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub model: String,
     pub base_url: String,
     pub context_window: i32,
@@ -3348,6 +3377,7 @@ pub struct UserModelCreateRequestData {
     pub name: String,
     pub provider: String,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub model: String,
     pub base_url: Option<String>,
     pub api_key: String,
@@ -3372,6 +3402,7 @@ impl std::fmt::Debug for UserModelCreateRequestData {
 pub struct UserModelUpdateRequestData {
     pub api_key: Option<String>,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub context_window: Option<i32>,
     pub is_default: Option<bool>,
     pub is_active: Option<bool>,
@@ -3840,9 +3871,11 @@ impl DatabaseModelService {
         user_id: String,
         request: UserModelCreateRequestData,
     ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        let (connection_id, name, model, binding, thinking_snapshot, pool) = async {
         if request.provider != crate::chatgpt::PROVIDER
             || !request.api_key.is_empty()
             || request.base_url.is_some()
+            || request.responses_reasoning_history.is_some()
             || request.inference_protocol.is_some_and(|protocol| {
                 protocol != astra_core::model_wire::LlmProviderProtocol::OpenAiResponses
             })
@@ -3883,6 +3916,8 @@ impl DatabaseModelService {
                 "Model alias already exists",
             ));
         }
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>((connection_id, name, model, binding, thinking_snapshot, pool))
+        }.await.map_err(model_not_saved)?;
         let model_id = Uuid::new_v4().to_string();
         let mut tx = pool.begin().await.map_err(internal_error)?;
         binding.lock_current(&mut tx).await?;
@@ -4102,6 +4137,8 @@ impl DatabaseModelService {
         let raw: Option<String> = row.try_get("thinking_probe_json").map_err(internal_error)?;
         let connection: Option<String> = row.try_get("connection_id").map_err(internal_error)?;
         let inference_protocol = user_model_inference_protocol(row).map_err(internal_error)?;
+        let responses_reasoning_history =
+            user_model_reasoning_history(row).map_err(internal_error)?;
         let thinking_probe = raw
             .as_deref()
             .and_then(|value| serde_json::from_str::<ThinkingProbeSnapshot>(value).ok())
@@ -4123,6 +4160,7 @@ impl DatabaseModelService {
             name: row.try_get("model_alias").map_err(internal_error)?,
             provider,
             inference_protocol,
+            responses_reasoning_history,
             model,
             base_url: base,
             context_window,
@@ -4349,10 +4387,81 @@ const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name > ?) \
      OR (provider = ? AND model_name = ? AND model_id > ?))";
 const MODEL_LIST_ORDER_SQL: &str = " ORDER BY provider ASC, model_name ASC, model_id ASC LIMIT ?";
-const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, inference_protocol, base_url, \
+const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, inference_protocol, responses_reasoning_history, base_url, \
     api_key_encrypted, connection_id, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, \
     context_window, is_default, is_active, \
     CAST(created_at AS CHAR) AS created_at_text, CAST(updated_at AS CHAR) AS updated_at_text";
+
+async fn ensure_probed_admin_model_is_current(
+    pool: &sqlx::MySqlPool,
+    row: &sqlx::mysql::MySqlRow,
+    model_name: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let model_id: String = row.try_get("model_id").map_err(internal_error)?;
+    let provider: String = row.try_get("provider").map_err(internal_error)?;
+    let base_url: Option<String> = row.try_get("base_url").map_err(internal_error)?;
+    let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
+    let quirks: String = row.try_get("quirks_json").map_err(internal_error)?;
+    let updated_at: String = row
+        .try_get("configuration_updated_at")
+        .map_err(internal_error)?;
+    let current = query(astra_core::matrixone_statement_with_null_shape(
+        "SELECT 1 FROM infra_llm_models WHERE model_id = ? AND model_name = ? \
+         AND provider = ? AND base_url <=> ? AND api_key_encrypted <=> ? \
+         AND CAST(quirks AS CHAR) = ? AND CAST(updated_at AS CHAR) = ?",
+        [base_url.is_some(), encrypted.is_some()],
+    ))
+    .bind(model_id)
+    .bind(model_name)
+    .bind(provider)
+    .bind(base_url)
+    .bind(encrypted)
+    .bind(quirks)
+    .bind(updated_at)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?;
+    if current.is_none() {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Model changed during connectivity check; check again",
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_probed_user_model_is_current(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let model_id: String = row.try_get("model_id").map_err(internal_error)?;
+    let model: String = row.try_get("model_name").map_err(internal_error)?;
+    let provider: String = row.try_get("provider").map_err(internal_error)?;
+    let base_url: String = row.try_get("base_url").map_err(internal_error)?;
+    let key: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
+    let protocol: Option<String> = row.try_get("inference_protocol").map_err(internal_error)?;
+    let history: Option<String> = row
+        .try_get("responses_reasoning_history")
+        .map_err(internal_error)?;
+    let connection: Option<String> = row.try_get("connection_id").map_err(internal_error)?;
+    let current = query(astra_core::matrixone_statement_with_null_shape(
+        "SELECT 1 FROM user_llm_models WHERE user_id = ? AND model_id = ? \
+         AND model_name = ? AND provider = ? AND base_url = ? AND api_key_encrypted <=> ? \
+         AND inference_protocol <=> ? AND responses_reasoning_history <=> ? AND connection_id <=> ?",
+        [key.is_some(), protocol.is_some(), history.is_some(), connection.is_some()],
+    ))
+    .bind(user_id).bind(model_id).bind(model).bind(provider).bind(base_url)
+    .bind(key).bind(protocol).bind(history).bind(connection)
+    .fetch_optional(pool).await.map_err(internal_error)?;
+    if current.is_none() {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Model changed during connectivity check; check again",
+        ));
+    }
+    Ok(())
+}
 
 #[async_trait]
 impl ModelService for DatabaseModelService {
@@ -4603,11 +4712,12 @@ impl ModelService for DatabaseModelService {
         crate::byok_endpoint::endpoint_client(&base_url)
             .await
             .map_err(|error| {
-                astra_core::error_response_coded(
-                    StatusCode::BAD_GATEWAY,
-                    error,
-                    "model_endpoint_network",
-                )
+                let (status, code) = if error.kind == astra_core::ErrorKind::InvalidRequest {
+                    (StatusCode::BAD_REQUEST, "model_endpoint_invalid")
+                } else {
+                    (StatusCode::BAD_GATEWAY, "model_endpoint_network")
+                };
+                astra_core::error_response_coded(status, error.message, code)
             })?;
         Ok(())
     }
@@ -4621,68 +4731,80 @@ impl ModelService for DatabaseModelService {
         if request.connection_id.is_some() || request.provider == crate::chatgpt::PROVIDER {
             return self.create_subscription_model(user_id, request).await;
         }
-        let name = validate_user_model_identifier("name", &request.name)?;
-        let model = validate_user_model_identifier("model", &request.model)?;
-        let provider = request.provider.trim().to_ascii_lowercase();
-        validate_inference_config(
-            &provider,
-            &QuirksData {
-                inference_protocol: request.inference_protocol,
-                ..Default::default()
-            },
-        )
-        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-        let base_url = user_byok_base_url(&provider, request.base_url.as_deref())?;
-        #[cfg(any(test, feature = "e2e-hooks", feature = "external-contract-tests"))]
-        let base_url = match (provider.as_str(), self.deepseek_test_endpoint) {
-            ("deepseek", Some(endpoint)) => format!("http://{endpoint}"),
-            _ => base_url,
-        };
-        validate_context_window_value(request.context_window, "context_window")
+        // Only failures before the creation transaction can be retried
+        // without an ambiguous commit outcome.
+        let (name, model, provider, base_url, encrypted_key, pool) = async {
+            let name = validate_user_model_identifier("name", &request.name)?;
+            let model = validate_user_model_identifier("model", &request.model)?;
+            let provider = request.provider.trim().to_ascii_lowercase();
+            validate_inference_config(
+                &provider,
+                &QuirksData {
+                    inference_protocol: request.inference_protocol,
+                    responses_reasoning_history: request.responses_reasoning_history,
+                    ..Default::default()
+                },
+            )
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-        validate_user_model_api_key(&request.api_key)?;
-
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let duplicate =
-            query("SELECT 1 FROM user_llm_models WHERE user_id = ? AND model_alias = ? LIMIT 1")
-                .bind(&user_id)
-                .bind(&name)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?;
-        if duplicate.is_some() {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                format!("User model '{name}' already exists"),
-            ));
-        }
-
-        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-            crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
-                .await
+            let base_url = user_byok_base_url(&provider, request.base_url.as_deref())?;
+            #[cfg(any(test, feature = "e2e-hooks", feature = "external-contract-tests"))]
+            let base_url = match (provider.as_str(), self.deepseek_test_endpoint) {
+                ("deepseek", Some(endpoint)) => format!("http://{endpoint}"),
+                _ => base_url,
+            };
+            validate_context_window_value(request.context_window, "context_window")
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-        }
+            validate_user_model_api_key(&request.api_key)?;
 
-        let encrypted_key = self
-            .encryptor
-            .encrypt(&request.api_key)
+            let pool = self.get_pool().await.map_err(internal_error)?;
+            let duplicate = query(
+                "SELECT 1 FROM user_llm_models WHERE user_id = ? AND model_alias = ? LIMIT 1",
+            )
+            .bind(&user_id)
+            .bind(&name)
+            .fetch_optional(&pool)
+            .await
             .map_err(internal_error)?;
-        let connectivity = validate_connectivity_for_protocol(
-            &provider,
-            &model,
-            &request.api_key,
-            Some(&base_url),
-            None,
-            None,
-            request.inference_protocol,
-        )
-        .await;
-        if let Some(reason) = connectivity {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                format!("Model credential or endpoint check failed: {reason}"),
-            ));
+            if duplicate.is_some() {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!("User model '{name}' already exists"),
+                ));
+            }
+
+            if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+                crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
+                    .await
+                    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+            }
+
+            let encrypted_key = self
+                .encryptor
+                .encrypt(&request.api_key)
+                .map_err(internal_error)?;
+            validate_connectivity_for_protocol(
+                &provider,
+                &model,
+                &request.api_key,
+                Some(&base_url),
+                None,
+                None,
+                request.inference_protocol,
+            )
+            .await
+            .map_err(|error| error.response(&provider, Some(&base_url)))?;
+
+            Ok::<_, (StatusCode, Json<ErrorResponse>)>((
+                name,
+                model,
+                provider,
+                base_url,
+                encrypted_key,
+                pool,
+            ))
         }
+        .await
+        .map_err(model_not_saved)?;
 
         let model_id = Uuid::new_v4().to_string();
         let mut tx = pool.begin().await.map_err(internal_error)?;
@@ -4697,10 +4819,10 @@ impl ModelService for DatabaseModelService {
         }
         query(astra_core::matrixone_statement_with_null_shape(
             "INSERT INTO user_llm_models \
-             (model_id, user_id, model_alias, model_name, provider, inference_protocol, api_key_encrypted, base_url, \
+             (model_id, user_id, model_alias, model_name, provider, inference_protocol, responses_reasoning_history, api_key_encrypted, base_url, \
               context_window, is_default, is_active, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
-             [request.inference_protocol.is_some()],
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
+             [request.inference_protocol.is_some(), request.responses_reasoning_history.is_some()],
         ))
         .bind(&model_id)
         .bind(&user_id)
@@ -4708,6 +4830,7 @@ impl ModelService for DatabaseModelService {
         .bind(&model)
         .bind(&provider)
         .bind(request.inference_protocol.map(|protocol| protocol.as_str()))
+        .bind(request.responses_reasoning_history.map(|history| history.as_str()))
         .bind(&encrypted_key)
         .bind(&base_url)
         .bind(request.context_window)
@@ -4756,6 +4879,7 @@ impl ModelService for DatabaseModelService {
     ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
         if request.api_key.is_none()
             && request.inference_protocol.is_none()
+            && request.responses_reasoning_history.is_none()
             && request.context_window.is_none()
             && request.is_default.is_none()
             && request.is_active.is_none()
@@ -4784,11 +4908,20 @@ impl ModelService for DatabaseModelService {
         let model: String = existing.try_get("model_name").map_err(internal_error)?;
         let base_url: String = existing.try_get("base_url").map_err(internal_error)?;
         let previous_protocol = user_model_inference_protocol(&existing).map_err(internal_error)?;
+        let previous_history = user_model_reasoning_history(&existing).map_err(internal_error)?;
         let inference_protocol = request.inference_protocol.or(previous_protocol);
+        let responses_reasoning_history = if inference_protocol
+            == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+        {
+            request.responses_reasoning_history.or(previous_history)
+        } else {
+            request.responses_reasoning_history
+        };
         validate_inference_config(
             &provider,
             &QuirksData {
                 inference_protocol,
+                responses_reasoning_history,
                 ..Default::default()
             },
         )
@@ -4811,6 +4944,12 @@ impl ModelService for DatabaseModelService {
         }
         let mut subscription_binding = None;
         if provider == crate::chatgpt::PROVIDER {
+            if request.responses_reasoning_history.is_some() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Subscription model reasoning history is provider-managed",
+                ));
+            }
             if request.api_key.is_some() {
                 return Err(error_response_coded(
                     StatusCode::BAD_REQUEST,
@@ -4845,7 +4984,7 @@ impl ModelService for DatabaseModelService {
                     )
                     .map_err(internal_error)?,
             };
-            if let Some(reason) = validate_connectivity_for_protocol(
+            if let Err(error) = validate_connectivity_for_protocol(
                 &provider,
                 &model,
                 &api_key,
@@ -4856,10 +4995,8 @@ impl ModelService for DatabaseModelService {
             )
             .await
             {
-                return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Model credential or endpoint check failed: {reason}"),
-                ));
+                ensure_probed_user_model_is_current(&pool, &user_id, &existing).await?;
+                return Err(error.response(&provider, Some(&base_url)));
             }
             Some(if request.api_key.is_some() {
                 self.encryptor.encrypt(&api_key).map_err(internal_error)?
@@ -4888,17 +5025,39 @@ impl ModelService for DatabaseModelService {
             .await
             .map_err(internal_error)?;
         }
-        if let Some(encrypted_key) = encrypted_key {
-            let updated = query(astra_core::matrixone_statement_with_null_shape("UPDATE user_llm_models SET api_key_encrypted = ?, inference_protocol = ?, thinking_probe_json = NULL, updated_at = NOW(6) WHERE user_id = ? AND model_id = ? AND api_key_encrypted <=> ? AND inference_protocol <=> ?", [inference_protocol.is_some(), previous_key.is_some(), previous_protocol.is_some()]))
-                .bind(encrypted_key)
-                .bind(inference_protocol.map(|protocol| protocol.as_str()))
-                .bind(&user_id)
-                .bind(&model_id)
-                .bind(&previous_key)
-                .bind(previous_protocol.map(|protocol| protocol.as_str()))
-                .execute(&mut *tx)
-                .await
-                .map_err(internal_error)?;
+        if encrypted_key.is_some() || responses_reasoning_history != previous_history {
+            // MatrixOne cannot type a CASE expression combining NULL and a
+            // JSON column. Only touch the probe when the route changes.
+            let probe_update = if encrypted_key.is_some() {
+                "thinking_probe_json = NULL, "
+            } else {
+                ""
+            };
+            let statement = format!(
+                "UPDATE user_llm_models SET api_key_encrypted = ?, inference_protocol = ?, responses_reasoning_history = ?, {probe_update}updated_at = NOW(6) WHERE user_id = ? AND model_id = ? AND api_key_encrypted <=> ? AND inference_protocol <=> ? AND responses_reasoning_history <=> ?"
+            );
+            let updated = query(astra_core::matrixone_statement_with_null_shape(
+                sqlx::AssertSqlSafe(statement),
+                [
+                    encrypted_key.as_ref().or(previous_key.as_ref()).is_some(),
+                    inference_protocol.is_some(),
+                    responses_reasoning_history.is_some(),
+                    previous_key.is_some(),
+                    previous_protocol.is_some(),
+                    previous_history.is_some(),
+                ],
+            ))
+            .bind(encrypted_key.as_ref().or(previous_key.as_ref()))
+            .bind(inference_protocol.map(|protocol| protocol.as_str()))
+            .bind(responses_reasoning_history.map(|history| history.as_str()))
+            .bind(&user_id)
+            .bind(&model_id)
+            .bind(&previous_key)
+            .bind(previous_protocol.map(|protocol| protocol.as_str()))
+            .bind(previous_history.map(|history| history.as_str()))
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
             if updated.rows_affected() == 0 {
                 return Err(error_response(
                     StatusCode::CONFLICT,
@@ -5006,7 +5165,7 @@ impl ModelService for DatabaseModelService {
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
-        if let Some(reason) = validate_connectivity_for_protocol(
+        if let Err(error) = validate_connectivity_for_protocol(
             &provider,
             &model,
             &api_key,
@@ -5017,10 +5176,8 @@ impl ModelService for DatabaseModelService {
         )
         .await
         {
-            return Err(error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("Model credential or endpoint check failed: {reason}"),
-            ));
+            ensure_probed_user_model_is_current(&pool, &user_id, &row).await?;
+            return Err(error.response(&provider, Some(&base_url)));
         }
         let protocol = model_thinking_protocol(inference_protocol, &provider, &base_url, &model);
         let result = probe_thinking_behavior_with_protocol(
@@ -5241,7 +5398,7 @@ impl ModelService for DatabaseModelService {
             .as_ref()
             .and_then(|q| q.wire_model_name.as_deref())
             .unwrap_or(&request.name);
-        let conn_result = validate_connectivity_for_protocol(
+        validate_connectivity_for_protocol(
             &request.provider,
             probe_name,
             &request.api_key,
@@ -5256,8 +5413,8 @@ impl ModelService for DatabaseModelService {
                 .and_then(|q| q.probe_endpoint.as_deref()),
             request.quirks.as_ref().and_then(|q| q.inference_protocol),
         )
-        .await;
-        let is_active: i16 = if conn_result.is_none() { 1 } else { 0 };
+        .await
+        .map_err(|error| error.response(&request.provider, base_url.as_deref()))?;
 
         let input_mod = serde_json::to_string(&request.input_modalities)
             .unwrap_or_else(|_| r#"["text"]"#.to_string());
@@ -5293,7 +5450,7 @@ impl ModelService for DatabaseModelService {
         .bind(&encrypted_key)
         .bind(&base_url)
         .bind(&request.description)
-        .bind(is_active)
+        .bind(1_i16)
         .bind(context_window)
         .bind(request.max_completion_tokens)
         .bind(&input_mod)
@@ -5325,7 +5482,7 @@ impl ModelService for DatabaseModelService {
             .map_err(internal_error)?;
 
         let mut record = Self::model_record_from_row(row)?;
-        record.connectivity = Some(conn_result.unwrap_or_else(|| "ok".to_string()));
+        record.connectivity = Some("ok".to_string());
         Ok(record)
     }
 
@@ -5581,8 +5738,6 @@ impl ModelService for DatabaseModelService {
         }
         let base_url = request.base_url.as_deref().or(stored_base_url.as_deref());
         let probe_name = quirks.wire_model_name.as_deref().unwrap_or(&model_name);
-        let mut connectivity = None;
-        let mut active = request.is_active.map(i16::from);
         let encrypted = if let Some(api_key) = request.api_key.as_deref() {
             let encrypted = match stored_encrypted.as_deref() {
                 Some(ciphertext)
@@ -5592,20 +5747,6 @@ impl ModelService for DatabaseModelService {
                 }
                 _ => self.encryptor.encrypt(api_key).map_err(internal_error)?,
             };
-            let check = validate_connectivity_for_protocol(
-                provider,
-                probe_name,
-                api_key,
-                base_url,
-                quirks.probe_headers.as_ref(),
-                quirks.probe_endpoint.as_deref(),
-                quirks.inference_protocol,
-            )
-            .await;
-            if active.is_none() {
-                active = Some(i16::from(check.is_none()));
-            }
-            connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
             Some(encrypted)
         } else {
             None
@@ -5630,6 +5771,28 @@ impl ModelService for DatabaseModelService {
                 !unchanged_probe_endpoint(&stored_provider, stored_base_url.as_deref(), value)
             })
             || replacement_quirks.is_some();
+        let connectivity = if let Some(api_key) = request.api_key.as_deref() {
+            if let Err(error) = validate_connectivity_for_protocol(
+                provider,
+                probe_name,
+                api_key,
+                base_url,
+                quirks.probe_headers.as_ref(),
+                quirks.probe_endpoint.as_deref(),
+                quirks.inference_protocol,
+            )
+            .await
+            {
+                ensure_probed_admin_model_is_current(&pool, &existing, &model_name).await?;
+                return Err(error.response(provider, base_url));
+            }
+            Some("ok".to_string())
+        } else {
+            None
+        };
+        // Activation is an explicit configuration decision. A probe is an
+        // observation and must not disable (or reactivate) an existing model.
+        let active = request.is_active.map(i16::from);
         let mut update = QueryBuilder::<sqlx::MySql>::new("UPDATE infra_llm_models SET ");
         let mut changed = false;
         {
@@ -5808,7 +5971,7 @@ impl ModelService for DatabaseModelService {
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
 
         // Phase 1: connectivity probe
-        let check = validate_connectivity_for_protocol(
+        if let Err(error) = validate_connectivity_for_protocol(
             &provider,
             &probe_name,
             &api_key,
@@ -5817,9 +5980,14 @@ impl ModelService for DatabaseModelService {
             quirks.probe_endpoint.as_deref(),
             quirks.inference_protocol,
         )
-        .await;
+        .await
+        {
+            // A failure belongs to the checked configuration and must not
+            // change activation or blame a newer route.
+            ensure_probed_admin_model_is_current(&pool, &row, &model_name).await?;
+            return Err(error.response(&provider, base_url.as_deref()));
+        }
 
-        let is_active: i16 = if check.is_none() { 1 } else { 0 };
         // A network result belongs to the row and configuration checked, not
         // whatever configuration is installed when the request completes.
         let updated = query(
@@ -5827,7 +5995,7 @@ impl ModelService for DatabaseModelService {
              AND model_name = ? AND provider = ? AND base_url <=> ? \
              AND api_key_encrypted = ? AND CAST(quirks AS CHAR) = ? AND CAST(updated_at AS CHAR) = ?",
         )
-        .bind(is_active)
+        .bind(1_i16)
         .bind(&model_id)
         .bind(&model_name)
         .bind(&provider)
@@ -5849,7 +6017,7 @@ impl ModelService for DatabaseModelService {
         self.invalidate_catalog_revision_cache();
 
         // Phase 2: two-phase thinking behavior probe (only when connected)
-        if check.is_none() {
+        {
             let protocol = offering_thinking_protocol(
                 &quirks,
                 &provider,
@@ -5938,7 +6106,7 @@ impl ModelService for DatabaseModelService {
             })?;
 
         let mut record = Self::model_record_from_row(result_row)?;
-        record.connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
+        record.connectivity = Some("ok".to_string());
         invalidate_active_llm_model_resolution_cache();
         self.invalidate_catalog_revision_cache();
         Ok(record)
@@ -6016,6 +6184,16 @@ fn validate_user_model_api_key(api_key: &str) -> Result<(), (StatusCode, Json<Er
     Ok(())
 }
 
+fn model_not_saved(
+    (status, Json(mut error)): (StatusCode, Json<ErrorResponse>),
+) -> (StatusCode, Json<ErrorResponse>) {
+    let metadata = error.metadata.get_or_insert_with(|| serde_json::json!({}));
+    if let Some(metadata) = metadata.as_object_mut() {
+        metadata.insert("model_saved".into(), serde_json::json!(false));
+    }
+    (status, Json(error))
+}
+
 fn user_model_not_found() -> (StatusCode, Json<ErrorResponse>) {
     error_response(StatusCode::NOT_FOUND, "User model not found")
 }
@@ -6052,6 +6230,133 @@ fn bedrock_converse_probe_url(base_url: &str, model_name: &str) -> Result<String
     Ok(url.to_string())
 }
 
+#[derive(Debug)]
+enum ModelProbeError {
+    Configuration(String),
+    Network(String),
+    Timeout,
+    Response(&'static str),
+    Truncated,
+    Http(StatusCode),
+}
+
+impl ModelProbeError {
+    fn transport(error: reqwest::Error) -> Self {
+        // URLs, proxy credentials and provider errors must not escape through
+        // reqwest's Display or its source chain.
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut io_kind = None;
+        let mut tls = false;
+        for _ in 0..16 {
+            let Some(cause) = source else { break };
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                io_kind = Some(io.kind());
+                if let Some(inner) = io.get_ref() {
+                    source = Some(inner);
+                    continue;
+                }
+            }
+            tls |= cause.downcast_ref::<rustls::Error>().is_some();
+            source = cause.source();
+        }
+        tracing::warn!(
+            timeout = error.is_timeout(),
+            connect = error.is_connect(),
+            tls_detected = tls,
+            ?io_kind,
+            "model probe transport failed"
+        );
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_builder() {
+            Self::Configuration("Invalid model endpoint or request configuration".into())
+        } else if tls {
+            Self::Network("TLS connection failed; check the Server's certificates and proxy".into())
+        } else if io_kind == Some(std::io::ErrorKind::ConnectionRefused) {
+            Self::Network("Connection refused; check the Server's network and proxy".into())
+        } else if error.is_connect() {
+            Self::Network("Could not connect (check DNS, proxy, network and TLS)".into())
+        } else {
+            Self::Network("Connection or response stream was interrupted".into())
+        }
+    }
+
+    fn response(self, provider: &str, base_url: Option<&str>) -> (StatusCode, Json<ErrorResponse>) {
+        let (status, code) = match &self {
+            Self::Configuration(_) => (StatusCode::BAD_REQUEST, "model_probe_configuration"),
+            Self::Network(_) => (StatusCode::BAD_GATEWAY, "model_probe_network"),
+            Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout"),
+            Self::Response(_) | Self::Truncated => {
+                (StatusCode::BAD_GATEWAY, "model_probe_response")
+            }
+            Self::Http(status) if *status == StatusCode::TOO_MANY_REQUESTS => {
+                (StatusCode::TOO_MANY_REQUESTS, "model_probe_rate_limited")
+            }
+            Self::Http(status) if *status == StatusCode::REQUEST_TIMEOUT => {
+                (StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout")
+            }
+            Self::Http(status)
+                if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
+            {
+                (StatusCode::BAD_REQUEST, "model_probe_credentials_or_access")
+            }
+            Self::Http(status) if status.is_client_error() => {
+                (StatusCode::BAD_REQUEST, "model_probe_request_rejected")
+            }
+            Self::Http(_) => (StatusCode::BAD_GATEWAY, "model_probe_upstream"),
+        };
+        let mut detail = self.to_string();
+        if matches!(self, Self::Network(_) | Self::Timeout) {
+            if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+                let route = base_url
+                    .and_then(|url| reqwest::Url::parse(url).ok())
+                    .and_then(|url| astra_core::net::configured_https_proxy_url_for(&url).ok());
+                if let Some(proxy) = route {
+                    detail.push_str(if proxy.is_some() {
+                        ". Server route: configured HTTPS proxy"
+                    } else {
+                        ". Server route: direct connection"
+                    });
+                }
+            } else {
+                detail.push_str(
+                    ". Server route follows its HTTPS_PROXY/ALL_PROXY and NO_PROXY settings",
+                );
+            }
+        }
+        error_response_coded(status, detail, code)
+    }
+}
+
+impl std::fmt::Display for ModelProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(message) | Self::Network(message) => f.write_str(message),
+            Self::Timeout => f.write_str("Model check timed out"),
+            Self::Response(message) => f.write_str(message),
+            Self::Truncated => f.write_str("Model check did not produce a complete response"),
+            Self::Http(status)
+                if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
+            {
+                write!(
+                    f,
+                    "HTTP {status}: provider rejected credentials or model access"
+                )
+            }
+            Self::Http(status) if *status == StatusCode::NOT_FOUND => {
+                write!(
+                    f,
+                    "HTTP {status}: provider could not find the model or endpoint"
+                )
+            }
+            Self::Http(status) if *status == StatusCode::TOO_MANY_REQUESTS => {
+                write!(f, "HTTP {status}: provider rate limit; try again later")
+            }
+            Self::Http(status) => write!(f, "HTTP {status}: provider rejected the model check"),
+        }
+    }
+}
+
 async fn probe_responses(
     client: &reqwest::Client,
     url: &str,
@@ -6059,7 +6364,7 @@ async fn probe_responses(
     api_key: &str,
     headers: Option<&Map<String, Value>>,
     effort: Option<&str>,
-) -> Result<astra_core::model_wire::responses::ResponseOutput, String> {
+) -> Result<astra_core::model_wire::responses::ResponseOutput, ModelProbeError> {
     use futures_util::StreamExt;
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut body = astra_core::model_wire::responses::request(
@@ -6070,7 +6375,7 @@ async fn probe_responses(
             true,
             Some(1024),
         )
-        .map_err(|_| "Could not prepare model check".to_string())?;
+        .map_err(|_| ModelProbeError::Configuration("Could not prepare model check".into()))?;
         ThinkingProtocol::ResponsesReasoning.apply(&mut body, true, effort);
         let mut request = client.post(url).bearer_auth(api_key).json(&body);
         if let Some(headers) = headers {
@@ -6080,32 +6385,30 @@ async fn probe_responses(
                 }
             }
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| "Model check could not reach the provider".to_string())?;
+        let response = request.send().await.map_err(ModelProbeError::transport)?;
         if !response.status().is_success() {
-            return Err(format!(
-                "HTTP {}: check the model and endpoint configuration",
-                response.status().as_u16()
-            ));
+            return Err(ModelProbeError::Http(response.status()));
         }
         let mut stream = response.bytes_stream();
         let mut frames = astra_core::sse_blocks::SseBlankLineUtf8Buf::new();
         let mut accumulator = astra_core::model_wire::responses::ResponseAccumulator::default();
         let mut size = 0usize;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| "Model check response interrupted".to_string())?;
+            let chunk = chunk.map_err(ModelProbeError::transport)?;
             size = size.saturating_add(chunk.len());
             if size > 1024 * 1024 {
-                return Err("Model check response exceeded its size limit".into());
+                return Err(ModelProbeError::Response(
+                    "Model check response exceeded its size limit",
+                ));
             }
-            let blocks = frames
-                .push_bytes(&chunk)
-                .map_err(|_| "Model check response has invalid encoding".to_string())?;
+            let blocks = frames.push_bytes(&chunk).map_err(|_| {
+                ModelProbeError::Response("Model check response has invalid encoding")
+            })?;
             for block in blocks {
                 astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &block)
-                    .map_err(|_| "Model check did not produce a complete response".to_string())?;
+                    .map_err(|_| {
+                        ModelProbeError::Response("Model check did not produce a complete response")
+                    })?;
                 if accumulator.completed() {
                     return finish_response_probe(accumulator);
                 }
@@ -6113,22 +6416,24 @@ async fn probe_responses(
         }
         let tail = frames
             .take_buf()
-            .map_err(|_| "Model check response has invalid encoding".to_string())?;
-        astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail)
-            .map_err(|_| "Model check did not produce a complete response".to_string())?;
+            .map_err(|_| ModelProbeError::Response("Model check response has invalid encoding"))?;
+        astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail).map_err(
+            |_| ModelProbeError::Response("Model check did not produce a complete response"),
+        )?;
         finish_response_probe(accumulator)
     })
     .await
-    .map_err(|_| "Model check timed out".to_string())?
+    .map_err(|_| ModelProbeError::Timeout)?
 }
 
 fn finish_response_probe(
     accumulator: astra_core::model_wire::responses::ResponseAccumulator,
-) -> Result<astra_core::model_wire::responses::ResponseOutput, String> {
-    let output = accumulator
-        .finish()
-        .map_err(|_| "Model check did not produce a complete response".to_string())?;
+) -> Result<astra_core::model_wire::responses::ResponseOutput, ModelProbeError> {
+    let output = accumulator.finish().map_err(|_| {
+        ModelProbeError::Response("Model check did not produce a complete response")
+    })?;
     if output.text.trim().is_empty()
+        || !output.tool_calls.is_empty()
         || output.finish_reason.as_deref() == Some("length")
         || output.items.iter().any(|item| {
             item["type"] == "message"
@@ -6137,29 +6442,11 @@ fn finish_response_probe(
                     .is_some_and(|parts| parts.iter().any(|part| part["type"] == "refusal"))
         })
     {
-        return Err("Model check did not produce a complete response".into());
+        return Err(ModelProbeError::Response(
+            "Model check did not produce a complete response",
+        ));
     }
     Ok(output)
-}
-
-pub async fn validate_connectivity(
-    provider: &str,
-    model_name: &str,
-    api_key: &str,
-    base_url: Option<&str>,
-    probe_headers: Option<&Map<String, Value>>,
-    probe_endpoint: Option<&str>,
-) -> Option<String> {
-    validate_connectivity_for_protocol(
-        provider,
-        model_name,
-        api_key,
-        base_url,
-        probe_headers,
-        probe_endpoint,
-        None,
-    )
-    .await
 }
 
 async fn validate_connectivity_for_protocol(
@@ -6170,9 +6457,9 @@ async fn validate_connectivity_for_protocol(
     probe_headers: Option<&Map<String, Value>>,
     probe_endpoint: Option<&str>,
     inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
-) -> Option<String> {
+) -> Result<(), ModelProbeError> {
     if provider == "mock" {
-        return None;
+        return Ok(());
     }
 
     // Connectivity probes reach external provider endpoints (Anthropic, Bedrock,
@@ -6180,23 +6467,24 @@ async fn validate_connectivity_for_protocol(
     // Native providers share the LLM client's ambient proxy policy. User-owned
     // OpenAI-compatible endpoints instead use the pinned BYOK egress transport
     // below, matching their runtime path without delegating destination DNS.
-    let probe_builder = astra_core::net::apply_env_proxy(
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
-    );
-    let client_result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-        crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
-    } else {
-        probe_builder
+    let make_client = async || {
+        let result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+            crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default())
+                .await
+                .map_err(|error| error.message)
+        } else {
+            astra_core::net::apply_env_proxy(
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+            )
             .build()
             .map(crate::byok_endpoint::EndpointClient::from)
-            .map_err(|e| e.to_string())
-    };
-    let client = match client_result {
-        Ok(c) => c,
-        Err(e) => return Some(format!("Client error: {}", e)),
+            .map_err(|_| "Unable to create model HTTP client".to_string())
+        };
+        result.map_err(ModelProbeError::Network)
     };
 
     if inference_protocol == Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses) {
+        let client = make_client().await?;
         let base = base_url
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("https://api.openai.com/v1");
@@ -6210,155 +6498,281 @@ async fn validate_connectivity_for_protocol(
             None,
         )
         .await
-        .err();
+        .map(|_| ());
     }
 
-    let result = if provider == "typesafe" {
-        if api_key.trim().is_empty() {
-            return Some("TypeSafe API key is not configured".into());
-        }
-        let base = base_url
-            .unwrap_or("https://api.typesafe.ai")
-            .trim_end_matches('/')
-            .trim_end_matches("/v1");
-        let probe = format!("{base}/v1/systemone");
-        let send_result = client.post(&probe).bearer_auth(api_key).json(&serde_json::json!({
-            "model": model_name, "state": "Astra connectivity probe",
-            "questions": {"connected": {"type": "noul", "instructions": "Does the state mention Astra?"}}
-        })).send().await;
-        (send_result, probe)
-    } else if provider == "anthropic" {
-        let probe = anthropic_messages_probe_url(base_url);
-        let mut req = client
-            .post(&probe)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json");
-        if let Some(headers) = probe_headers {
-            for (k, v) in headers {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+    let custom_messages = !matches!(provider, "anthropic" | "bedrock" | "typesafe")
+        && probe_endpoint.is_some_and(|path| path.trim_matches('/') == "messages");
+    // Retry only when the provider explicitly says the small response was truncated.
+    let probe = async |output_tokens| {
+        // A retry is a new outbound attempt: re-resolve and pin BYOK each time.
+        let client = make_client().await?;
+        let result = if provider == "typesafe" {
+            if api_key.trim().is_empty() {
+                return Err(ModelProbeError::Configuration(
+                    "TypeSafe API key is not configured".into(),
+                ));
+            }
+            let base = base_url
+                .unwrap_or("https://api.typesafe.ai")
+                .trim_end_matches('/')
+                .trim_end_matches("/v1");
+            let probe = format!("{base}/v1/systemone");
+            let contract = typesafe_probe_contract();
+            client
+                .post(&probe)
+                .bearer_auth(api_key)
+                .json(&serde_json::json!({
+                    "model": model_name, "state": contract.state, "questions": contract.questions
+                }))
+                .send()
+                .await
+        } else if provider == "anthropic" {
+            let probe = anthropic_messages_probe_url(base_url);
+            let mut req = client
+                .post(&probe)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json");
+            if let Some(headers) = probe_headers {
+                for (k, v) in headers {
+                    if let Some(s) = v.as_str() {
+                        req = req.header(k, s);
+                    }
                 }
             }
-        }
-        let mut body = serde_json::json!({
-            "model": model_name,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
-        let send_result = req.json(&body).send().await;
-        (send_result, probe)
-    } else if provider == "bedrock" {
-        let Some(base_url_value) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
-            return Some(
-                "No base_url for provider 'bedrock'. Set base_url to your Bedrock runtime root, e.g. https://bedrock-runtime.us-east-1.amazonaws.com."
-                    .to_string(),
+            let mut body = serde_json::json!({
+                "model": model_name,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            astra_core::model_wire::apply_chat_output_token_limit(
+                &mut body,
+                provider,
+                output_tokens,
             );
-        };
-        let Ok(probe) = bedrock_converse_probe_url(base_url_value, model_name) else {
-            return Some(format!(
-                "Invalid base_url for provider 'bedrock': '{}'. Set base_url to your Bedrock runtime root, e.g. https://bedrock-runtime.us-east-1.amazonaws.com.",
-                base_url_value
-            ));
-        };
-        let mut req = client
-            .post(&probe)
-            .header("authorization", format!("Bearer {}", api_key))
-            .header("content-type", "application/json");
-        if let Some(headers) = probe_headers {
-            for (k, v) in headers {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+            req.json(&body).send().await
+        } else if provider == "bedrock" {
+            let Some(base_url_value) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
+                return Err(ModelProbeError::Configuration(
+                    "No base_url for provider 'bedrock'. Set base_url to your Bedrock runtime root, e.g. https://bedrock-runtime.us-east-1.amazonaws.com."
+                        .to_string(),
+                ));
+            };
+            let Ok(probe) = bedrock_converse_probe_url(base_url_value, model_name) else {
+                return Err(ModelProbeError::Configuration(
+                    "Invalid base_url for provider 'bedrock'. Set it to your Bedrock runtime root."
+                        .into(),
+                ));
+            };
+            let mut req = client
+                .post(&probe)
+                .header("authorization", format!("Bearer {}", api_key))
+                .header("content-type", "application/json");
+            if let Some(headers) = probe_headers {
+                for (k, v) in headers {
+                    if let Some(s) = v.as_str() {
+                        req = req.header(k, s);
+                    }
                 }
             }
-        }
-        let send_result = req
-            .json(&serde_json::json!({
+            req.json(&serde_json::json!({
                 "messages": [{
                     "role": "user",
                     "content": [{"text": "hi"}]
                 }],
                 "inferenceConfig": {
-                    "maxTokens": 1
+                    "maxTokens": output_tokens
                 }
             }))
             .send()
-            .await;
-        (send_result, probe)
-    } else {
-        let base_trim = base_url.map(str::trim).filter(|s| !s.is_empty());
-        let url = match base_trim {
-            Some(b) => b.trim_end_matches('/').to_string(),
-            None if provider == "openai" => "https://api.openai.com/v1".to_string(),
-            // Deliberately refuse to guess for unknown providers with no base_url —
-            // the admin must specify base_url for any non-OpenAI provider.
-            // This aligns with the runtime's guarantee that base_url is always set
-            // from the DB row before calling llm_completions_url_for_provider.
-            None => {
-                return Some(format!(
-                    "No base_url for provider '{provider}'. \
-                         Set base_url (e.g. DashScope/Moonshot compatible-mode /v1 root).",
-                ));
-            }
-        };
-        let endpoint = probe_endpoint.unwrap_or("/chat/completions");
-        let probe = astra_core::model_wire::endpoint_url(&url, endpoint);
-        let mut req = client
-            .post(&probe)
-            .header("authorization", format!("Bearer {}", api_key))
-            .header("content-type", "application/json");
-        if let Some(headers) = probe_headers {
-            for (k, v) in headers {
-                if let Some(s) = v.as_str() {
-                    req = req.header(k, s);
+            .await
+        } else {
+            let base_trim = base_url.map(str::trim).filter(|s| !s.is_empty());
+            let url = match base_trim {
+                Some(b) => b.trim_end_matches('/').to_string(),
+                None if provider == "openai" => "https://api.openai.com/v1".to_string(),
+                // Deliberately refuse to guess for unknown providers with no base_url —
+                // the admin must specify base_url for any non-OpenAI provider.
+                // This aligns with the runtime's guarantee that base_url is always set
+                // from the DB row before calling llm_completions_url_for_provider.
+                None => {
+                    return Err(ModelProbeError::Configuration(format!(
+                        "No base_url for provider '{provider}'. \
+                             Set base_url (e.g. DashScope/Moonshot compatible-mode /v1 root).",
+                    )));
+                }
+            };
+            let endpoint = probe_endpoint.unwrap_or("/chat/completions");
+            let probe = astra_core::model_wire::endpoint_url(&url, endpoint);
+            let mut req = client
+                .post(&probe)
+                .header("authorization", format!("Bearer {}", api_key))
+                .header("content-type", "application/json");
+            if let Some(headers) = probe_headers {
+                for (k, v) in headers {
+                    if let Some(s) = v.as_str() {
+                        req = req.header(k, s);
+                    }
                 }
             }
-        }
-        let mut body = serde_json::json!({
-            "model": model_name,
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
-        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-            req = req.timeout(Duration::from_secs(360));
-        }
-        let send_result = req.json(&body).send().await;
-        (send_result, probe)
-    };
-
-    match result {
-        (Ok(resp), _) if resp.status().is_success() => None,
-        (Ok(resp), _) => {
-            let status = resp.status().as_u16();
+            let mut body = serde_json::json!({
+                "model": model_name,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            astra_core::model_wire::apply_chat_output_token_limit(
+                &mut body,
+                if custom_messages {
+                    "anthropic"
+                } else {
+                    provider
+                },
+                output_tokens,
+            );
             if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-                // Arbitrary compatible endpoints may reflect credentials in
-                // their error body. Return status without forwarding that body.
-                return Some(format!(
-                    "HTTP {status}: check the model ID, API key and endpoint"
-                ));
+                req = req.timeout(Duration::from_secs(360));
             }
-            let text = resp.text().await.unwrap_or_default();
-            let detail = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")?
-                        .get("message")?
-                        .as_str()
-                        .map(|s| s.to_string())
+            req.json(&body).send().await
+        };
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                validate_probe_response(resp, provider, custom_messages).await
+            }
+            Ok(resp) => Err(ModelProbeError::Http(resp.status())),
+            Err(error) => Err(ModelProbeError::transport(error)),
+        }
+    };
+    let timeout = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+        Duration::from_secs(360)
+    } else {
+        Duration::from_secs(15)
+    };
+    tokio::time::timeout(timeout, async {
+        let result = probe(32).await;
+        if matches!(result, Err(ModelProbeError::Truncated)) {
+            probe(1024).await
+        } else {
+            result
+        }
+    })
+    .await
+    .map_err(|_| ModelProbeError::Timeout)?
+}
+
+async fn validate_probe_response(
+    mut response: reqwest::Response,
+    provider: &str,
+    custom_messages: bool,
+) -> Result<(), ModelProbeError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(ModelProbeError::transport)? {
+        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err(ModelProbeError::Response(
+                "Model check response exceeded its size limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Value = if provider == "typesafe" {
+        astra_turn_types::parse_unique_json(&bytes)
+    } else {
+        serde_json::from_slice(&bytes)
+    }
+    .map_err(|_| ModelProbeError::Response("Model check returned an invalid provider response"))?;
+    if probe_response_truncated(provider, &value)
+        || (custom_messages && probe_response_truncated("anthropic", &value))
+    {
+        return Err(ModelProbeError::Truncated);
+    }
+    if !valid_probe_response(provider, &value)
+        && !(custom_messages && valid_probe_response("anthropic", &value))
+    {
+        return Err(ModelProbeError::Response(
+            "Model check returned an invalid provider response",
+        ));
+    }
+    Ok(())
+}
+
+fn probe_response_truncated(provider: &str, value: &Value) -> bool {
+    match provider {
+        "anthropic" => value["stop_reason"] == "max_tokens",
+        "bedrock" => value["stopReason"] == "max_tokens",
+        "typesafe" => false,
+        _ => value["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .is_some_and(|choice| choice["finish_reason"] == "length"),
+    }
+}
+
+fn valid_probe_response(provider: &str, value: &Value) -> bool {
+    if !value.is_object() || value.get("error").is_some_and(|error| !error.is_null()) {
+        return false;
+    }
+    let text = |value: &Value| value.as_str().is_some_and(|text| !text.trim().is_empty());
+    match provider {
+        "anthropic" => {
+            value["stop_reason"] != "max_tokens"
+                && value["content"].as_array().is_some_and(|parts| {
+                    parts.iter().all(|part| part["type"] != "tool_use")
+                        && parts
+                            .iter()
+                            .any(|part| part["type"] == "text" && text(&part["text"]))
                 })
-                .unwrap_or_else(|| text.chars().take(200).collect());
-            Some(format!("HTTP {}: {}", status, detail))
         }
-        (Err(e), probe) => {
-            let mut msg = format!("Connection failed for {probe}: {e}");
-            if provider != "anthropic" {
-                msg.push_str(
-                    " — host unreachable (firewall/DNS/TLS) or region blocks; \
-                     point base_url at an API gateway you can reach, or fix outbound HTTPS/proxy.",
-                );
-            }
-            Some(msg)
+        "bedrock" => {
+            value["stopReason"] != "max_tokens"
+                && value["output"]["message"]["content"]
+                    .as_array()
+                    .is_some_and(|parts| {
+                        parts.iter().all(|part| part.get("toolUse").is_none())
+                            && parts.iter().any(|part| text(&part["text"]))
+                    })
         }
+        "typesafe" => value["model"].as_str().is_some_and(|model| {
+            let native = serde_json::json!({
+                "schema_version": astra_turn_types::JUDGMENT_SCHEMA_VERSION,
+                "model": model,
+                "answers": value["answers"],
+            });
+            astra_turn_types::normalize_judgment_response(
+                &typesafe_probe_contract(),
+                &native.to_string(),
+                model,
+                Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability),
+            )
+            .is_ok()
+        }),
+        _ => value["choices"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .is_some_and(|choice| {
+                let message = &choice["message"];
+                choice["finish_reason"] != "length"
+                    && choice["finish_reason"] != "tool_calls"
+                    && message.is_object()
+                    && message.get("tool_calls").is_none_or(|calls| {
+                        calls.is_null() || calls.as_array().is_some_and(Vec::is_empty)
+                    })
+                    && text(&message["content"])
+            }),
+    }
+}
+
+fn typesafe_probe_contract() -> astra_turn_types::JudgmentRequest {
+    use astra_turn_types::{JUDGMENT_SCHEMA_VERSION, JudgmentQuestion, JudgmentRequest};
+    JudgmentRequest {
+        schema_version: JUDGMENT_SCHEMA_VERSION,
+        state: serde_json::json!("Astra connectivity probe"),
+        questions: [(
+            "connected".into(),
+            JudgmentQuestion::Noul {
+                instructions: "Does the state mention Astra?".into(),
+                criteria: None,
+            },
+        )]
+        .into(),
     }
 }
 
@@ -6423,16 +6837,17 @@ async fn probe_thinking_behavior_with_protocol_inner(
         };
     }
 
-    let probe_builder = astra_core::net::apply_env_proxy(
-        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
-    );
     let client_result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-        crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
+        crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default())
+            .await
+            .map_err(|error| error.message)
     } else {
-        probe_builder
-            .build()
-            .map(crate::byok_endpoint::EndpointClient::from)
-            .map_err(|e| e.to_string())
+        astra_core::net::apply_env_proxy(
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+        )
+        .build()
+        .map(crate::byok_endpoint::EndpointClient::from)
+        .map_err(|e| e.to_string())
     };
     let client = match client_result {
         Ok(c) => c,
@@ -6491,7 +6906,7 @@ async fn probe_thinking_behavior_with_protocol_inner(
             },
             Err(error) => ThinkingProbeResult {
                 capability: ThinkingCapability::None,
-                error: Some(error),
+                error: Some(error.to_string()),
             },
         };
     }
@@ -6796,6 +7211,7 @@ pub struct UserModelCreateRequest {
     pub name: String,
     pub provider: String,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub model: String,
     pub base_url: Option<String>,
     #[serde(default)]
@@ -6822,6 +7238,7 @@ impl std::fmt::Debug for UserModelCreateRequest {
 pub struct UserModelUpdateRequest {
     pub api_key: Option<String>,
     pub inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     pub context_window: Option<i32>,
     pub is_default: Option<bool>,
     pub is_active: Option<bool>,
@@ -7873,6 +8290,267 @@ mod tests {
     }
 
     #[test]
+    fn successful_model_probe_requires_the_selected_protocol_shape() {
+        for (provider, valid) in [
+            (
+                "openai",
+                serde_json::json!({"choices":[{"message":{"content":"ok"}}]}),
+            ),
+            (
+                "anthropic",
+                serde_json::json!({"content":[{"type":"text","text":"ok"}]}),
+            ),
+            (
+                "bedrock",
+                serde_json::json!({"output":{"message":{"content":[{"text":"ok"}]}}}),
+            ),
+            (
+                "typesafe",
+                serde_json::json!({"model":"model","answers":{"connected":{"type":"noul","noul":0.9}}}),
+            ),
+        ] {
+            assert!(valid_probe_response(provider, &valid), "{provider}");
+            for invalid in [
+                serde_json::json!({}),
+                serde_json::json!({"status":"ok"}),
+                serde_json::json!({"error":{"message":"no"}}),
+            ] {
+                assert!(
+                    !valid_probe_response(provider, &invalid),
+                    "{provider}: {invalid}"
+                );
+            }
+        }
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"content":[]}}]})
+        ));
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"content":[{"type":"text","text":"ok"}]}}]})
+        ));
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"tool_calls":[{}]}}]})
+        ));
+        assert!(!valid_probe_response(
+            "bedrock",
+            &serde_json::json!({"output":{"message":{"content":[{"reasoningContent":{}}]}}})
+        ));
+        for content in [Value::Null, serde_json::json!("hello")] {
+            assert!(!valid_probe_response(
+                "openai",
+                &serde_json::json!({
+                    "choices":[{"message":{"content":content,"tool_calls":[{"id":"1","function":{"name":"bash","arguments":"{}"}}]}}]
+                })
+            ));
+        }
+        let later_choice_is_valid = serde_json::json!({"choices":[
+            {"message":{"tool_calls":[{"id":"1","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"},
+            {"message":{"content":"ok"},"finish_reason":"stop"}
+        ]});
+        assert!(!valid_probe_response("openai", &later_choice_is_valid));
+        let first_choice_is_truncated = serde_json::json!({"choices":[
+            {"message":{"content":"partial"},"finish_reason":"length"},
+            {"message":{"content":"ok"},"finish_reason":"stop"}
+        ]});
+        assert!(probe_response_truncated(
+            "openai",
+            &first_choice_is_truncated
+        ));
+        assert!(!valid_probe_response("openai", &first_choice_is_truncated));
+        for parts in [
+            serde_json::json!([{"toolUse":{"toolUseId":"1","name":"bash","input":{}}}]),
+            serde_json::json!([{"text":"hello"},{"toolUse":{"toolUseId":"1","name":"bash","input":{}}}]),
+        ] {
+            assert!(!valid_probe_response(
+                "bedrock",
+                &serde_json::json!({"output":{"message":{"content":parts}}})
+            ));
+        }
+        assert!(!valid_probe_response(
+            "anthropic",
+            &serde_json::json!({
+                "content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"1","name":"bash","input":{}}]
+            })
+        ));
+        for invalid in [
+            serde_json::json!({"model":" ","answers":{"connected":{"type":"noul","noul":0.9}}}),
+            serde_json::json!({"model":"m","answers":{"connected":{"type":"noul","noul":0.9},"extra":{"type":"noul","noul":0.9}}}),
+            serde_json::json!({"model":"m","answers":{"connected":{"type":"noul","noul":0.9,"extra":true}}}),
+            serde_json::json!({"model":"m","answers":{"connected":{"type":"noul","noul":1.1}}}),
+        ] {
+            assert!(!valid_probe_response("typesafe", &invalid), "{invalid}");
+        }
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"content":"  "}}]})
+        ));
+        assert!(!valid_probe_response(
+            "openai",
+            &serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]})
+        ));
+        assert!(!valid_probe_response(
+            "anthropic",
+            &serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"})
+        ));
+        assert!(!valid_probe_response(
+            "bedrock",
+            &serde_json::json!({"output":{"message":{"content":[{"text":"partial"}]}},"stopReason":"max_tokens"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_probe_reports_safe_actionable_errors_for_both_wire_protocols() {
+        use astra_core::model_wire::LlmProviderProtocol;
+        use axum::{Router, extract::Path, routing::post};
+
+        async fn reject(Path(status): Path<u16>) -> (StatusCode, &'static str) {
+            (StatusCode::from_u16(status).unwrap(), "provider-secret")
+        }
+        let app = Router::new()
+            .route("/{status}/responses", post(reject))
+            .route("/{status}/chat/completions", post(reject))
+            .route(
+                "/embedded/chat/completions",
+                post(|| async { Json(serde_json::json!({"error":{"message":"provider-secret"}})) }),
+            )
+            .route(
+                "/oversize/chat/completions",
+                post(|| async { "x".repeat(1024 * 1024 + 1) }),
+            )
+            .route(
+                "/empty/chat/completions",
+                post(|| async { Json(serde_json::json!({})) }),
+            )
+            .route(
+                "/unrelated/chat/completions",
+                post(|| async { Json(serde_json::json!({"status":"ok"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for protocol in [None, Some(LlmProviderProtocol::OpenAiResponses)] {
+            for (upstream, expected_status, expected_code) in [
+                (
+                    401,
+                    StatusCode::BAD_REQUEST,
+                    "model_probe_credentials_or_access",
+                ),
+                (
+                    403,
+                    StatusCode::BAD_REQUEST,
+                    "model_probe_credentials_or_access",
+                ),
+                (404, StatusCode::BAD_REQUEST, "model_probe_request_rejected"),
+                (408, StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout"),
+                (
+                    429,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "model_probe_rate_limited",
+                ),
+                (503, StatusCode::BAD_GATEWAY, "model_probe_upstream"),
+            ] {
+                let base = format!("http://{address}/{upstream}?token=url-secret");
+                let failure = validate_connectivity_for_protocol(
+                    "openai",
+                    "model",
+                    "credential-secret",
+                    Some(&base),
+                    None,
+                    None,
+                    protocol,
+                )
+                .await
+                .expect_err("provider must reject probe");
+                let (status, Json(error)) = failure.response("openai", None);
+                assert_eq!(status, expected_status, "{protocol:?} {upstream}");
+                assert_eq!(error.error_code.as_deref(), Some(expected_code));
+                assert!(error.detail.contains(&format!("HTTP {upstream}")));
+                for secret in ["provider-secret", "credential-secret", "url-secret"] {
+                    assert!(!error.detail.contains(secret), "{}", error.detail);
+                }
+            }
+        }
+        for path in ["200", "embedded", "oversize", "empty", "unrelated"] {
+            let failure = validate_connectivity_for_protocol(
+                "openai",
+                "model",
+                "credential-secret",
+                Some(&format!("http://{address}/{path}")),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("an invalid 2xx response must not count as a successful probe");
+            let (status, Json(error)) = failure.response("openai", None);
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(error.error_code.as_deref(), Some("model_probe_response"));
+            assert!(!error.detail.contains("provider-secret"));
+        }
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = probe_responses(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &format!("http://{address}/responses?token=url-secret"),
+            "model",
+            "credential-secret",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let (status, Json(error)) = error.response("openai", None);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.error_code.as_deref(), Some("model_probe_network"));
+        assert!(!error.detail.contains("url-secret"));
+        assert!(!error.detail.contains("credential-secret"));
+
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into();
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key)
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = tokio_rustls::TlsAcceptor::from(Arc::new(tls))
+                .accept(tcp)
+                .await;
+        });
+        let error = probe_responses(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &format!("https://{address}/responses"),
+            "model",
+            "credential-secret",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let (status, Json(error)) = error.response("openai", None);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            error.detail.contains("TLS connection failed"),
+            "{}",
+            error.detail
+        );
+        assert!(!error.detail.contains("credential-secret"));
+        server.await.unwrap();
+    }
+
+    #[test]
     fn probe_endpoint_equivalence_respects_provider_defaults() {
         assert!(unchanged_probe_endpoint(
             "openai",
@@ -8099,6 +8777,7 @@ mod tests {
         .expect("unchanged catalog identity is admitted");
 
         let changed_name = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             model_name: "different-model".to_string(),
@@ -8114,6 +8793,7 @@ mod tests {
         assert_eq!(error.0, StatusCode::CONFLICT);
 
         let changed_source = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             source_identity: Some(ResolvedModelSourceIdentity {
@@ -8450,6 +9130,7 @@ mod tests {
 
     fn sample_resolved_active_model(name: &str) -> ResolvedActiveLlmModel {
         ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,
@@ -8552,6 +9233,7 @@ mod tests {
         .expect("admitted execution");
 
         let refreshed_material = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             api_key: "rotated-secret".to_string(),
@@ -8562,6 +9244,7 @@ mod tests {
         assert!(selected.has_same_execution_identity(&refreshed_material));
 
         let changed_upstream = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             wire_model_name: Some("upstream-model-b".to_string()),
@@ -8570,6 +9253,7 @@ mod tests {
         assert!(!selected.has_same_execution_identity(&changed_upstream));
 
         let changed_provider = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             provider: "anthropic".to_string(),
@@ -8578,6 +9262,7 @@ mod tests {
         assert!(!selected.has_same_execution_identity(&changed_provider));
 
         let changed_source = AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             source_identity: Some(ResolvedModelSourceIdentity {
@@ -9295,6 +9980,7 @@ mod tests {
     #[test]
     fn resolved_upstream_name_prefers_wire_model_name_when_set() {
         let r = ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,
@@ -9322,6 +10008,7 @@ mod tests {
     #[test]
     fn resolved_upstream_name_falls_back_to_local_name_when_unset() {
         let r = ResolvedActiveLlmModel {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope_key: None,
             supported_reasoning_efforts: None,
@@ -9486,6 +10173,7 @@ mod tests {
     fn quirks_data_serialization_roundtrip() {
         let q = QuirksData {
             inference_protocol: None,
+            responses_reasoning_history: None,
             supported_reasoning_efforts: None,
             fixed_temperature: Some(0.7),
             thinking_protocol: None,
@@ -10574,49 +11262,67 @@ mod tests {
 
     #[tokio::test]
     async fn validate_connectivity_mock_provider_skips_network() {
-        let result =
-            super::validate_connectivity("mock", "any-model", "key", None, None, None).await;
+        let result = super::validate_connectivity_for_protocol(
+            "mock",
+            "any-model",
+            "key",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(
-            result.is_none(),
+            result.is_ok(),
             "mock provider should short-circuit to success"
         );
     }
 
     #[tokio::test]
     async fn validate_connectivity_unknown_provider_no_base_url_errors() {
-        let result =
-            super::validate_connectivity("dashscope", "qwen-plus", "key", None, None, None).await;
-        let msg = result.expect("should return an error");
+        let result = super::validate_connectivity_for_protocol(
+            "dashscope",
+            "qwen-plus",
+            "key",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let msg = result.expect_err("should return an error").to_string();
         assert!(msg.contains("No base_url"), "got: {msg}");
     }
 
     #[tokio::test]
     async fn validate_connectivity_bedrock_no_base_url_errors() {
-        let result = super::validate_connectivity(
+        let result = super::validate_connectivity_for_protocol(
             "bedrock",
             "anthropic.claude-3-5-sonnet-v1:0",
             "key",
             None,
             None,
             None,
+            None,
         )
         .await;
-        let msg = result.expect("should return an error");
+        let msg = result.expect_err("should return an error").to_string();
         assert!(msg.contains("No base_url"), "got: {msg}");
     }
 
     #[tokio::test]
     async fn validate_connectivity_bedrock_invalid_base_url_errors() {
-        let result = super::validate_connectivity(
+        let result = super::validate_connectivity_for_protocol(
             "bedrock",
             "anthropic.claude-3-5-sonnet-v1:0",
             "key",
             Some("not a url"),
             None,
             None,
+            None,
         )
         .await;
-        let msg = result.expect("should return an error");
+        let msg = result.expect_err("should return an error").to_string();
         assert!(msg.contains("Invalid base_url"), "got: {msg}");
     }
 
@@ -10746,7 +11452,7 @@ mod tests {
     // ── Provider-aware probe regression tests ─────────────────────────
 
     #[tokio::test]
-    async fn connectivity_probe_uses_native_token_budget_and_preserves_provider_errors() {
+    async fn connectivity_probe_uses_native_token_budget_and_classifies_provider_failures() {
         use axum::{Json, Router, http::HeaderMap, routing::post};
         for (provider, model, path, token_field, wrong_field) in [
             (
@@ -10809,32 +11515,221 @@ mod tests {
                         } else {
                             StatusCode::OK
                         };
-                        (
-                            status,
-                            Json(serde_json::json!({"error":{"message":"fixture rejection"}})),
-                        )
+                        let response = if status == StatusCode::OK && provider == "anthropic" {
+                            serde_json::json!({"content":[{"type":"text","text":"ok"}]})
+                        } else if status == StatusCode::OK {
+                            serde_json::json!({"choices":[{"message":{"content":"ok"}}]})
+                        } else {
+                            serde_json::json!({"error":{"message":"fixture rejection"}})
+                        };
+                        (status, Json(response))
                     }
                 }),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let result =
-                validate_connectivity(provider, model, "valid-key", Some(&base), None, None).await;
-            assert!(result.is_none(), "{provider}/{model}: {result:?}");
+            let result = validate_connectivity_for_protocol(
+                provider,
+                model,
+                "valid-key",
+                Some(&base),
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(result.is_ok(), "{provider}/{model}: {result:?}");
             for (key, model_id, expected) in [
                 ("invalid-key", model, "HTTP 401"),
                 ("valid-key", "missing-model", "HTTP 404"),
             ] {
-                let result =
-                    validate_connectivity(provider, model_id, key, Some(&base), None, None)
-                        .await
-                        .unwrap();
+                let result = validate_connectivity_for_protocol(
+                    provider,
+                    model_id,
+                    key,
+                    Some(&base),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
                 assert!(result.contains(expected), "{provider}: {result}");
             }
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn connectivity_probe_retries_only_explicit_truncation() {
+        use axum::{Json, Router, extract::ConnectInfo, routing::post};
+        for (provider, path, endpoint, truncated, complete) in [
+            (
+                "openai",
+                "/chat/completions",
+                None,
+                serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}),
+                serde_json::json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}),
+            ),
+            (
+                "anthropic",
+                "/v1/messages",
+                None,
+                serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}),
+                serde_json::json!({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}),
+            ),
+            (
+                "bedrock",
+                "/model/model/converse",
+                None,
+                serde_json::json!({"output":{"message":{"content":[{"text":"partial"}]}},"stopReason":"max_tokens"}),
+                serde_json::json!({"output":{"message":{"content":[{"text":"ok"}]}},"stopReason":"end_turn"}),
+            ),
+            (
+                "openai",
+                "/messages",
+                Some("/messages"),
+                serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}),
+                serde_json::json!({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}),
+            ),
+        ] {
+            for mode in ["complete", "truncated", "invalid", "rate_limit"] {
+                let captured = Arc::new(Mutex::new(Vec::<(Value, std::net::SocketAddr)>::new()));
+                let app = Router::new().route(
+                    path,
+                    post({
+                        let (captured, truncated, complete) =
+                            (captured.clone(), truncated.clone(), complete.clone());
+                        move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+                              Json(body): Json<Value>| {
+                            let (captured, truncated, complete) =
+                                (captured.clone(), truncated.clone(), complete.clone());
+                            async move {
+                                let mut requests =
+                                    astra_core::sync_poison::recover_mutex_lock(&captured);
+                                requests.push((body, peer));
+                                let response = match mode {
+                                    "rate_limit" => (
+                                        StatusCode::TOO_MANY_REQUESTS,
+                                        serde_json::json!({"error":"rate limit"}),
+                                    ),
+                                    "invalid" => {
+                                        (StatusCode::OK, serde_json::json!({"status":"ok"}))
+                                    }
+                                    "truncated" => (StatusCode::OK, truncated),
+                                    _ if requests.len() == 1 => (StatusCode::OK, truncated),
+                                    _ => (StatusCode::OK, complete),
+                                };
+                                (response.0, Json(response.1))
+                            }
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let task = tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .await
+                    .unwrap()
+                });
+                if provider == "openai" && endpoint.is_none() && mode == "complete" {
+                    // Prove the fixture keeps connections alive: a single client
+                    // should reuse the connection that a fresh retry must not.
+                    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                    for _ in 0..2 {
+                        client
+                            .post(format!("{base}{path}"))
+                            .json(&serde_json::json!({}))
+                            .send()
+                            .await
+                            .unwrap()
+                            .bytes()
+                            .await
+                            .unwrap();
+                    }
+                    let mut requests = astra_core::sync_poison::recover_mutex_lock(&captured);
+                    assert_eq!(requests[0].1, requests[1].1);
+                    requests.clear();
+                }
+                let result = validate_connectivity_for_protocol(
+                    provider,
+                    "model",
+                    "key",
+                    Some(&base),
+                    None,
+                    endpoint,
+                    None,
+                )
+                .await;
+                match mode {
+                    "complete" => assert!(result.is_ok(), "{provider}/{path}: {result:?}"),
+                    "truncated" => assert!(matches!(result, Err(ModelProbeError::Truncated))),
+                    "invalid" => assert!(matches!(result, Err(ModelProbeError::Response(_)))),
+                    _ => assert!(matches!(
+                        result,
+                        Err(ModelProbeError::Http(StatusCode::TOO_MANY_REQUESTS))
+                    )),
+                }
+                let requests = astra_core::sync_poison::recover_mutex_lock(&captured);
+                assert_eq!(
+                    requests.len(),
+                    if matches!(mode, "complete" | "truncated") {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                if provider == "openai" && endpoint.is_none() && mode == "complete" {
+                    assert_ne!(requests[0].1, requests[1].1);
+                }
+                for (index, (request, _)) in requests.iter().enumerate() {
+                    if endpoint.is_some() {
+                        assert!(request.get("max_completion_tokens").is_none());
+                    }
+                    let tokens = if provider == "bedrock" {
+                        &request["inferenceConfig"]["maxTokens"]
+                    } else if provider == "openai" && endpoint.is_none() {
+                        &request["max_completion_tokens"]
+                    } else {
+                        &request["max_tokens"]
+                    };
+                    assert_eq!(*tokens, if index == 0 { 32 } else { 1024 });
+                }
+                task.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typesafe_probe_rejects_duplicate_json_keys() {
+        use axum::{Router, routing::post};
+        let app = Router::new().route(
+            "/v1/systemone",
+            post(|| async {
+                r#"{"model":"m","answers":{"connected":{"type":"noul","noul":0.1,"noul":0.9}}}"#
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = validate_connectivity_for_protocol(
+            "typesafe",
+            "m",
+            "key",
+            Some(&base),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(ModelProbeError::Response(_))));
+        task.abort();
     }
     //
     // Based on real API recordings from 2026-05-04.
@@ -11063,6 +11958,7 @@ mod tests {
         let create = UserModelCreateRequestData {
             connection_id: None,
             inference_protocol: None,
+            responses_reasoning_history: None,
             name: "deepseek".into(),
             provider: "deepseek".into(),
             model: "deepseek-chat".into(),

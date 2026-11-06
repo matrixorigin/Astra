@@ -232,13 +232,6 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn database_snapshot_journal_checkpoint(&self) -> u64 {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.checkpoint(),
-            Err(poisoned) => poisoned.into_inner().checkpoint(),
-        }
-    }
-
     fn execute_snapshot_rollback(
         &self,
         entry: &DatabaseSnapshotRollbackEntry,

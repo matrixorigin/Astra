@@ -1246,6 +1246,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1299,6 +1300,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1339,6 +1341,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1387,6 +1390,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1429,6 +1433,7 @@ mod tests {
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1521,6 +1526,7 @@ mod tests {
             });
             session
                 .run_turn_adaptive(AdaptiveTurnInput {
+                    planning_messages: None,
                     statics: &input.statics,
                     agent: &input.agent,
                     session: &input.session,
@@ -1595,6 +1601,7 @@ mod tests {
         });
         let out_with = sess
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci.statics,
                 agent: &ci.agent,
                 session: &ci.session,
@@ -1621,6 +1628,7 @@ mod tests {
         });
         let out_without = sess2
             .run_turn_adaptive(AdaptiveTurnInput {
+                planning_messages: None,
                 statics: &ci2.statics,
                 agent: &ci2.agent,
                 session: &ci2.session,

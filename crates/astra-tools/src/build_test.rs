@@ -340,6 +340,13 @@ impl BuildTestResult {
             ));
         }
 
+        if self.framework == "go"
+            && (self.tests_passed > 0 || self.tests_failed > 0)
+            && self.summary.starts_with("at least one package reported")
+        {
+            parts.push(format!("⚠ {}", self.summary));
+        }
+
         // Truncation warning
         if self.truncated {
             parts.push("⚠ Output was truncated".to_string());
@@ -1021,7 +1028,11 @@ fn detect_framework(output: &str) -> String {
         return "vitest".to_string();
     }
 
-    if lower.contains("--- pass:") || lower.contains("--- fail:") || lower.contains("ok  \t") {
+    if lower.contains("--- pass:")
+        || lower.contains("--- fail:")
+        || lower.contains("ok  \t")
+        || go_test_no_match(output)
+    {
         return "go".to_string();
     }
 
@@ -1030,6 +1041,15 @@ fn detect_framework(output: &str) -> String {
     }
 
     "unknown".to_string()
+}
+
+/// Go reports an empty selection differently in verbose and quiet output.
+pub fn go_test_no_match(output: &str) -> bool {
+    output.lines().any(|line| {
+        let line = line.trim();
+        line == "testing: warning: no tests to run"
+            || (line.starts_with("ok ") && line.ends_with("[no tests to run]"))
+    })
 }
 
 // ─── Cargo Parser ────────────────────────────────────────────────────────────
@@ -1448,10 +1468,16 @@ fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> Bui
 
     result.passed = result.tests_failed == 0 && exit_code.map(|c| c == 0).unwrap_or(true);
     result.error_count = result.tests_failed;
-    result.summary = format!(
-        "{} passed, {} failed",
-        result.tests_passed, result.tests_failed
-    );
+    result.summary = if go_test_no_match(output) {
+        "at least one package reported no matching tests; verify the intended test ran".into()
+    } else if result.tests_passed == 0 && result.tests_failed == 0 && result.tests_skipped == 0 {
+        "test count unavailable from output".into()
+    } else {
+        format!(
+            "{} passed, {} failed",
+            result.tests_passed, result.tests_failed
+        )
+    };
 
     result
 }
@@ -1784,6 +1810,38 @@ exit status 1
         assert_eq!(result.framework, "go");
         assert_eq!(result.tests_passed, 2);
         assert_eq!(result.tests_failed, 1);
+    }
+
+    #[test]
+    fn go_success_distinguishes_no_matching_tests_from_unknown_count() {
+        let empty = "testing: warning: no tests to run\nPASS\nok  \texample/pkg\t0.01s\n";
+        let result = parse_build_test_output(empty, Some(0));
+        assert!(result.passed);
+        assert_eq!(result.framework, "go");
+        assert!(
+            result
+                .to_enhanced_output(empty)
+                .contains("no matching tests")
+        );
+
+        let quiet = "ok  \texample/pkg\t0.01s\n";
+        let result = parse_build_test_output(quiet, Some(0));
+        assert!(result.passed);
+        assert!(result.summary.contains("unavailable"));
+
+        let quiet_empty = "ok  \texample/pkg\t0.01s [no tests to run]\n";
+        let result = parse_build_test_output(quiet_empty, Some(0));
+        assert!(result.passed);
+        assert!(result.summary.contains("no matching tests"));
+
+        let mixed = "--- PASS: TestOne (0.00s)\ntesting: warning: no tests to run\nPASS\n";
+        let result = parse_build_test_output(mixed, Some(0));
+        assert!(result.passed);
+        assert!(
+            result
+                .to_enhanced_output(mixed)
+                .contains("at least one package")
+        );
     }
 
     #[test]

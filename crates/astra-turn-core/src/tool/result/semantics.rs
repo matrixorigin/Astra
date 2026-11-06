@@ -409,8 +409,23 @@ pub fn scoped_tool_health_identity(
 }
 
 pub(crate) fn canonical_tool_identity_parts(name: &str, args: &Value) -> (String, Value) {
-    canonical_read_only_tool_signature(name, args)
-        .unwrap_or_else(|| (name.to_string(), normalize_tool_arguments(args)))
+    canonical_read_only_tool_signature(name, args).unwrap_or_else(|| {
+        let mut normalized = normalize_tool_arguments(args);
+        if name == "read_file"
+            && let (Some(start), Some(end)) = (
+                normalized.get("start_line").and_then(Value::as_u64),
+                normalized.get("end_line").and_then(Value::as_u64),
+            )
+        {
+            if let (Some(start), Some(end)) =
+                astra_text_utils::line_range::ordered_bounds(Some(start), Some(end))
+            {
+                normalized["start_line"] = Value::from(start);
+                normalized["end_line"] = Value::from(end);
+            }
+        }
+        (name.to_string(), normalized)
+    })
 }
 
 fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(String, Value)> {
@@ -697,6 +712,20 @@ mod tests {
             tool_dedup_signature("test", &args1),
             tool_dedup_signature("test", &args2)
         );
+    }
+
+    #[test]
+    fn reversed_read_file_ranges_share_tool_identity() {
+        let key = |start, end| {
+            tool_dedup_signature(
+                "read_file",
+                &json!({
+                    "path":"foo.rs", "start_line":start, "end_line":end
+                }),
+            )
+        };
+        assert_eq!(key(459, 330), key(330, 459));
+        assert_ne!(key(0, 3), key(3, 0));
     }
 
     #[test]

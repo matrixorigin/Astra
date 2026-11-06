@@ -393,8 +393,19 @@ pub(crate) fn resolve_publish_artifact_path(
 pub(crate) fn undo_file_with_candidates(
     journal: &FileEditJournal,
     candidates: &[PathBuf],
+    workspace_root: &Path,
 ) -> std::io::Result<Option<(PathBuf, EditType)>> {
     for candidate in candidates {
+        if journal
+            .entries()
+            .filter(|entry| entry.path == *candidate)
+            .last()
+            .is_some_and(|entry| !entry.belongs_to_workspace(workspace_root))
+        {
+            return Err(std::io::Error::other(
+                "This edit belongs to another workspace; no file was rolled back",
+            ));
+        }
         match journal.undo_file(candidate)? {
             Some(edit_type) => return Ok(Some((candidate.clone(), edit_type))),
             None => continue,
@@ -634,6 +645,7 @@ fn with_file_journal<T>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn file_journal_checkpoint(file_journal: &Mutex<FileEditJournal>) -> u64 {
     with_file_journal(file_journal, "file_journal_checkpoint", |journal| {
         journal.checkpoint()
@@ -662,12 +674,21 @@ pub(crate) fn execute_server_write_file(
             file_journal,
             "server_write_file:record_committed",
             |journal| {
-                journal.record_committed(
+                #[cfg(unix)]
+                journal.record_published_write(
+                    &prepared,
+                    "server-write",
+                    turn_index,
+                    edit_type,
+                    workspace_root,
+                );
+                #[cfg(not(unix))]
+                journal.record_committed_in_workspace(
+                    workspace_root,
                     prepared.path(),
                     "server-write",
                     turn_index,
-                    prepared.original_content_bytes(),
-                    prepared.content_bytes(),
+                    (prepared.original_content_bytes(), prepared.content_bytes()),
                     edit_type,
                 );
             },
@@ -697,12 +718,24 @@ pub(crate) fn execute_server_str_replace(
             file_journal,
             "server_str_replace:record_committed",
             |journal| {
-                journal.record_committed(
+                #[cfg(unix)]
+                journal.record_published_write(
+                    prepared.publication(),
+                    "server-str-replace",
+                    turn_index,
+                    EditType::Patch,
+                    workspace_root,
+                );
+                #[cfg(not(unix))]
+                journal.record_committed_in_workspace(
+                    workspace_root,
                     prepared.path(),
                     "server-str-replace",
                     turn_index,
-                    Some(prepared.original_content_bytes()),
-                    prepared.new_content_bytes(),
+                    (
+                        Some(prepared.original_content_bytes()),
+                        prepared.new_content_bytes(),
+                    ),
                     EditType::Patch,
                 );
             },
@@ -737,12 +770,24 @@ pub(crate) fn execute_server_multi_edit(
                 file_journal,
                 "server_multi_path:record_committed",
                 |journal| {
-                    journal.record_committed(
+                    #[cfg(unix)]
+                    journal.record_published_write(
+                        edit.publication(),
+                        "server-multi-path",
+                        turn_index,
+                        EditType::Patch,
+                        workspace_root,
+                    );
+                    #[cfg(not(unix))]
+                    journal.record_committed_in_workspace(
+                        workspace_root,
                         edit.path(),
                         "server-multi-path",
                         turn_index,
-                        Some(edit.original_content_bytes()),
-                        edit.new_content_bytes(),
+                        (
+                            Some(edit.original_content_bytes()),
+                            edit.new_content_bytes(),
+                        ),
                         EditType::Patch,
                     );
                 },
@@ -764,12 +809,24 @@ pub(crate) fn execute_server_multi_edit(
             file_journal,
             "server_multi_edit:record_committed",
             |journal| {
-                journal.record_committed(
+                #[cfg(unix)]
+                journal.record_published_write(
+                    prepared.publication(),
+                    "server-multi-edit",
+                    turn_index,
+                    EditType::Patch,
+                    workspace_root,
+                );
+                #[cfg(not(unix))]
+                journal.record_committed_in_workspace(
+                    workspace_root,
                     prepared.path(),
                     "server-multi-edit",
                     turn_index,
-                    Some(prepared.original_content_bytes()),
-                    prepared.new_content_bytes(),
+                    (
+                        Some(prepared.original_content_bytes()),
+                        prepared.new_content_bytes(),
+                    ),
                     EditType::Patch,
                 );
             },
@@ -796,11 +853,23 @@ pub(crate) fn execute_server_delete_file(
             file_journal,
             "server_delete_file:record_delete",
             |journal| {
-                journal.record_delete(
+                #[cfg(unix)]
+                journal.record_delete_in_parent(
                     &path,
                     "server-delete",
                     turn_index,
-                    prepared.into_before_content(),
+                    prepared.before_content(),
+                    prepared.parent_binding().cloned(),
+                    workspace_root,
+                );
+                #[cfg(not(unix))]
+                journal.record_committed_in_workspace(
+                    workspace_root,
+                    &path,
+                    "server-delete",
+                    turn_index,
+                    (Some(prepared.before_content()), &[]),
+                    EditType::Delete,
                 );
             },
         );
@@ -852,7 +921,7 @@ pub(crate) fn execute_rollback_file_edits(
             let rollback_candidates = rollback_path_candidates(raw_path, &path, workspace_root);
             let undo_result =
                 with_file_journal(file_journal, "rollback_file_edits:file", |journal| {
-                    undo_file_with_candidates(journal, &rollback_candidates)
+                    undo_file_with_candidates(journal, &rollback_candidates, workspace_root)
                 });
             rollback_file_edits_file_result(&path, undo_result, workspace_root)
         }
@@ -870,9 +939,27 @@ pub(crate) fn execute_rollback_file_edits(
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             let result = with_file_journal(file_journal, "rollback_file_edits:turn", |journal| {
-                journal.undo_turn_since(selected_turn_index, checkpoint)
+                if journal.entries().any(|entry| {
+                    entry.turn_index == selected_turn_index
+                        && entry.sequence >= checkpoint
+                        && !entry.belongs_to_workspace(workspace_root)
+                }) {
+                    None
+                } else {
+                    Some(journal.undo_turn_since(selected_turn_index, checkpoint))
+                }
             });
-            rollback_file_edits_turn_result(scope, selected_turn_index, result, workspace_root)
+            match result {
+                Some(result) => rollback_file_edits_turn_result(
+                    scope,
+                    selected_turn_index,
+                    result,
+                    workspace_root,
+                ),
+                None => serde_json::json!({"success":false, "scope":scope,
+                    "error":"Some edits belong to another workspace; no files were rolled back."})
+                .to_string(),
+            }
         }
         other => rollback_file_edits_invalid_scope_result(other),
     }
@@ -905,11 +992,19 @@ mod tests {
         let missing_alias = dir.path().join("missing.txt");
         let mut journal = FileEditJournal::new(10);
         std::fs::write(&path, "created").expect("write created file");
-        journal.record_committed(&path, "test", 1, None, b"created", EditType::Create);
+        journal.record_committed_in_workspace(
+            dir.path(),
+            &path,
+            "test",
+            1,
+            (None, b"created"),
+            EditType::Create,
+        );
 
-        let result = undo_file_with_candidates(&journal, &[missing_alias, path.clone()])
-            .expect("undo should not fail")
-            .expect("second candidate should match");
+        let result =
+            undo_file_with_candidates(&journal, &[missing_alias, path.clone()], dir.path())
+                .expect("undo should not fail")
+                .expect("second candidate should match");
 
         assert_eq!(result, (path.clone(), EditType::Create));
         assert!(!path.exists(), "created file should be deleted");

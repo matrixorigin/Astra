@@ -114,8 +114,9 @@ impl ToolExecutor {
     // ─── File state helpers ──────────────────────────────────────────────────
 
     fn project_root_aliases(&self) -> Vec<PathBuf> {
-        let mut aliases = vec![self.project_root.clone()];
-        if let Ok(canonical) = self.project_root.canonicalize()
+        let root = self.effective_project_root();
+        let mut aliases = vec![root.clone()];
+        if let Ok(canonical) = root.canonicalize()
             && !aliases.iter().any(|existing| existing == &canonical)
         {
             aliases.push(canonical);
@@ -127,8 +128,9 @@ impl ToolExecutor {
         if let Ok(canonical) = path.canonicalize() {
             return canonical;
         }
-        if let Ok(canonical_root) = self.project_root.canonicalize() {
-            if let Ok(rel) = path.strip_prefix(&self.project_root) {
+        let root = self.effective_project_root();
+        if let Ok(canonical_root) = root.canonicalize() {
+            if let Ok(rel) = path.strip_prefix(&root) {
                 return canonical_root.join(rel);
             }
             if let Ok(rel) = path.strip_prefix(&canonical_root) {
@@ -139,20 +141,21 @@ impl ToolExecutor {
     }
 
     pub(super) fn prefer_project_root_alias(&self, path: &Path) -> PathBuf {
-        if let Ok(rel) = path.strip_prefix(&self.project_root) {
+        let root = self.effective_project_root();
+        if let Ok(rel) = path.strip_prefix(&root) {
             return if rel.as_os_str().is_empty() {
-                self.project_root.clone()
+                root.clone()
             } else {
-                self.project_root.join(rel)
+                root.join(rel)
             };
         }
-        if let Ok(canonical_root) = self.project_root.canonicalize()
+        if let Ok(canonical_root) = root.canonicalize()
             && let Ok(rel) = path.strip_prefix(&canonical_root)
         {
             return if rel.as_os_str().is_empty() {
-                self.project_root.clone()
+                root.clone()
             } else {
-                self.project_root.join(rel)
+                root.join(rel)
             };
         }
         path.to_path_buf()
@@ -160,7 +163,7 @@ impl ToolExecutor {
 
     pub(super) fn project_relative_display(&self, path: &Path) -> String {
         self.prefer_project_root_alias(path)
-            .strip_prefix(&self.project_root)
+            .strip_prefix(self.effective_project_root())
             .unwrap_or(path)
             .display()
             .to_string()
@@ -178,7 +181,11 @@ impl ToolExecutor {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_ref() {
-            Some(policy) => policy.is_path_allowed(path),
+            Some(policy) => {
+                let mut policy = policy.clone();
+                policy.project_root = self.effective_project_root();
+                policy.is_path_allowed(path)
+            }
             None => true,
         }
     }
@@ -295,12 +302,13 @@ impl ToolExecutor {
     }
 
     fn record_write_impl(&self, path: &Path, content: Option<&str>) {
+        let workspace_root = self.effective_project_root();
         match content {
             Some(text) => {
                 self.passive_lsp
-                    .sync_after_write_with_content(&self.project_root, path, text)
+                    .sync_after_write_with_content(&workspace_root, path, text)
             }
-            None => self.passive_lsp.sync_after_write(&self.project_root, path),
+            None => self.passive_lsp.sync_after_write(&workspace_root, path),
         }
         let ts = Self::file_mtime_ms(path);
         let content_sha256 = content
@@ -386,7 +394,7 @@ impl ToolExecutor {
         let abs = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.project_root.join(path)
+            self.effective_project_root().join(path)
         };
         self.record_read(&abs, false);
     }

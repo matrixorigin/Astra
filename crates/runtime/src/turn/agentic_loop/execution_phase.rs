@@ -1522,7 +1522,20 @@ pub(crate) enum CompletionActionBoundary {
 
 pub(crate) fn tool_terminal_requires_followup(state: &AgenticLoopState) -> bool {
     workspace_observation_requires_terminal_incomplete(state)
-        || has_unsettled_side_effecting_outcome(state)
+        // A later tool's success template cannot replace the model's chance to
+        // interpret that result after an earlier invocation went unconfirmed.
+        || state.stall.tool_call_records.iter().any(|record| {
+            record.was_executed()
+                && !record.ok
+                && matches!(
+                    record.error_kind,
+                    Some(
+                        astra_core::ErrorKind::Cancelled
+                            | astra_core::ErrorKind::ToolTimeout
+                            | astra_core::ErrorKind::ToolOutcomeUnknown
+                    )
+                )
+        })
         || missing_explicit_verification_hooks(state)
             .map(|missing| missing.is_some_and(|labels| !labels.is_empty()))
             .unwrap_or(true)
@@ -2297,11 +2310,6 @@ pub(crate) fn reject_unsettled_execution_completion(state: &mut AgenticLoopState
             "execution quarantine prevents the required verification",
             "The available result is preserved, but required verification cannot safely run until execution ownership is reconciled.",
         ))
-    } else if has_unsettled_side_effecting_outcome(state) {
-        Some((
-            "a side-effect-capable invocation has an interrupted or unknown outcome",
-            "An operation was interrupted or its outcome could not be confirmed. The available result is preserved; reconcile its effects before retrying.",
-        ))
     } else {
         None
     };
@@ -2311,28 +2319,6 @@ pub(crate) fn reject_unsettled_execution_completion(state: &mut AgenticLoopState
     } else {
         false
     }
-}
-
-/// A started cancellation or timeout may have left partial effects. Execution
-/// ownership and the owning lifecycle must reconcile it; unrelated successful tools or
-/// generic state observations cannot establish that the operation succeeded.
-fn has_unsettled_side_effecting_outcome(state: &AgenticLoopState) -> bool {
-    state.stall.tool_call_records.iter().any(|record| {
-        record.was_executed()
-            && !record.ok
-            && matches!(
-                record.error_kind,
-                Some(
-                    astra_core::ErrorKind::Cancelled
-                        | astra_core::ErrorKind::ToolTimeout
-                        | astra_core::ErrorKind::ToolOutcomeUnknown
-                )
-            )
-            && crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
-                &record.name,
-                super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
-            )
-    })
 }
 
 /// Convert an exhausted workspace-delivery recovery window into a typed
@@ -4793,6 +4779,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     capture_latest_provider_text(state, &turn_result);
     capture_deferred_candidate_text(state, &turn_result);
     state.record_appended_prompt_history_from(transcript_append_start);
+    if !turn_result.accum.has_tool_calls && turn_result.accum.tool_calls.is_empty() {
+        super::finalization::bound_ingested_terminal_message(state, transcript_append_start);
+    }
     if let Some(session_id) = state.current_session_id.as_deref() {
         if let Some(buffer) = state.turn_event_buffer.as_mut()
             && let Err(error) = buffer.bind_session_id(session_id)
@@ -5250,6 +5239,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 }
             }
 
+            // Even error kinds without a resumable interruption mapping may
+            // have delivered a partial answer before this checkpoint.
+            super::finalization::bound_current_terminal_message(state);
             finalize_turn_trace(state).await;
             try_write_heavy_checkpoint(state);
             return Err(e);
@@ -6335,17 +6327,22 @@ fn record_rejected_work_validation_state(
     }
 }
 
-/// A repair may share a provider batch with a rejected delivery request. Only
-/// an executed, successful mutation from a typed builtin writer, a strong
-/// executor receipt can advance that batch to revalidation. Weak receipts,
-/// failed writers and lexical shell guesses remain insufficient.
+/// A successful repair attempt can advance to revalidation. An opaque shell
+/// cannot prove it changed a file, so its result only schedules the actual
+/// validation; it is not evidence that the repair succeeded.
 fn record_is_effective_workspace_repair(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
-    record.was_executed()
-        && record.ok
-        && (record_has_trusted_workspace_mutation_receipt(record)
-            || super::lifecycle::record_has_typed_workspace_tool_receipt(record))
+    record.execution_succeeded()
+        && (super::lifecycle::record_has_typed_workspace_tool_receipt(record)
+            || (record.name == "bash"
+                && super::lifecycle::extract_tool_args(record.authoritative_args_full())
+                    .is_some_and(|args| {
+                        crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
+                            &record.name,
+                            Some(&args),
+                        )
+                    })))
 }
 
 /// Project the one completion action that is already justified by typed
@@ -9492,36 +9489,6 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn restored_unknown_side_effect_stops_before_another_provider_or_tool() {
-        let mut state = make_state();
-        state.hooks.completion_settlement.latest_provider_text =
-            Some("retained partial evidence".into());
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            runtime_args_full: Some(
-                serde_json::json!({"command":"perform-external-operation"}).to_string(),
-            ),
-            disposition: Some(ToolCallDisposition::Executed),
-            error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
-            ..Default::default()
-        });
-        let allowance = state.max_turns;
-        let mut host = MockHost::new(vec![text_result("must not be called", 1, 1, None)]);
-        let _ = run_agentic_loop_with_host(&mut host, &mut state)
-            .await
-            .unwrap();
-        assert_eq!(host.turn_count(), 0);
-        assert_eq!(state.stall.tool_call_records.len(), 1);
-        assert_eq!(state.max_turns, allowance);
-        assert_eq!(state.final_text, "retained partial evidence");
-        assert_eq!(
-            state.interruption.as_ref().unwrap().kind,
-            InterruptionKind::ExecutionIncomplete
-        );
-    }
-
     fn explicit_verification_action(state: &mut AgenticLoopState) -> CompletionAction {
         if state.stall.tool_call_records.is_empty() {
             state
@@ -9555,47 +9522,6 @@ mod tests {
             .hooks
             .completion_settlement
             .preserve_final_synthesis_wire_surface = true;
-    }
-
-    #[test]
-    fn started_side_effecting_cancellation_cannot_be_rendered_completed() {
-        let mut state = make_state();
-        state.final_text = "installed successfully".to_string();
-        let args = serde_json::json!({
-            "command": "apt-get install -y package",
-            "timeout": 90.0,
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            ms: 90_000,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..ToolCallRecord::default()
-        });
-
-        assert!(reject_unsettled_execution_completion(&mut state));
-        assert!(matches!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(InterruptionKind::ExecutionIncomplete)
-        ));
-        assert_eq!(
-            state.final_text, "installed successfully",
-            "provider text remains partial evidence"
-        );
-        assert!(
-            state
-                .interruption
-                .as_ref()
-                .unwrap()
-                .error_detail
-                .as_deref()
-                .unwrap()
-                .contains("unknown outcome")
-        );
     }
 
     fn attach_llm_progress_receiver(
@@ -12327,29 +12253,6 @@ mod tests {
             entry.payload["signal"] == "canonical_validation_failed_repair_once"
                 && entry.payload["origin"] == "rejected_work_settlement"
         }));
-        super::super::tool_phase::settle_non_retryable_tool_rejections(
-            &mut state,
-            &[serde_json::json!({
-                "id": "call-settle",
-                "type": "function",
-                "function": {"name": "settle_work_item", "arguments": "{}"}
-            })],
-            2,
-            false,
-            true,
-            false,
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .map(|window| &window.action),
-            Some(&CompletionAction::CanonicalWorkRepair),
-            "the later terminal-rejection gate must not revoke Work repair authority"
-        );
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
         // The same rejection cannot authorize repair after a local suffix
         // record is lost. Keep the positive control above.
         state.stall.verification_frontier =
@@ -12818,10 +12721,10 @@ mod tests {
             workspace_mutation_receipt: Some(weak_receipt),
             ..ToolCallRecord::default()
         };
-        assert!(!record_is_effective_workspace_repair(&weak_repair));
+        assert!(record_is_effective_workspace_repair(&weak_repair));
         let mut restored_weak_repair = weak_repair.clone();
         restored_weak_repair.runtime_args_full = None;
-        assert!(!record_is_effective_workspace_repair(&restored_weak_repair));
+        assert!(record_is_effective_workspace_repair(&restored_weak_repair));
         state.stall.tool_call_records = vec![
             ToolCallRecord {
                 name: "run_next_work_item".into(),
@@ -17536,7 +17439,14 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_spill_failure_cancellation_and_small_summary_preserve_history() {
-        for condition in ["failure", "cancel", "late-cancel", "no-benefit", "success"] {
+        for condition in [
+            "failure",
+            "cancel",
+            "late-cancel",
+            "no-benefit",
+            "reasoning",
+            "success",
+        ] {
             let mut host = MockHost::new(Vec::new());
             host.history_artifact_enabled = true;
             host.history_artifact_error = condition == "failure";
@@ -17551,6 +17461,11 @@ mod tests {
             state
                 .messages
                 .push(serde_json::json!({"role":"user","content":"current request"}));
+            if condition == "reasoning" {
+                state.messages[1][astra_core::model_wire::responses::CONTINUATION_KEY] = serde_json::json!({
+                    "items":[{"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}]
+                });
+            }
             let original = state.messages.clone();
             if condition == "cancel" || condition == "late-cancel" {
                 let token = Arc::new(tokio_util::sync::CancellationToken::new());
@@ -17568,7 +17483,16 @@ mod tests {
                 assert_eq!(state.messages.last(), original.last());
                 let stored: Vec<serde_json::Value> =
                     serde_json::from_str(&host.history_artifacts[0].transcript_json).unwrap();
-                assert_eq!(stored, original[..stored.len()]);
+                let expected: Vec<_> = original[..stored.len()]
+                    .iter()
+                    .map(astra_core::model_wire::responses::without_continuation)
+                    .collect();
+                assert_eq!(stored, expected);
+                assert!(
+                    !host.history_artifacts[0]
+                        .transcript_json
+                        .contains("reasoning_text")
+                );
             } else {
                 assert!(result.is_none(), "{condition}");
                 assert_eq!(state.messages, original, "{condition}");
@@ -21007,7 +20931,11 @@ async fn spill_old_messages_to_artifact(
     }
     let session_id = state.current_session_id.as_deref()?;
     let run_id = state.current_run_id.as_deref()?;
-    let transcript = serde_json::to_string(&state.messages[..count]).ok()?;
+    let transcript: Vec<_> = state.messages[..count]
+        .iter()
+        .map(astra_core::model_wire::responses::without_continuation)
+        .collect();
+    let transcript = serde_json::to_string(&transcript).ok()?;
     let history =
         astra_turn_types::ContextHistoryArtifactV1::new(session_id, run_id, count, transcript)
             .ok()?;

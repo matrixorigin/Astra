@@ -94,6 +94,11 @@
 #   inference_protocol: openai_responses
 #   thinking_protocol: responses_reasoning # or omit it to use the Responses default
 #   supported_reasoning_efforts: [high, max] # only values verified for this model
+# If the deployment has been verified to require reasoning only within the
+# current human turn, it may also declare:
+#   responses_reasoning_history: current_turn
+# Omit this field for an unknown endpoint; Astra conservatively retains and
+# replays its available history. `all_turns` explicitly selects that behavior.
 # Replace any existing thinking_protocol: reasoning_effort; it applies to Chat
 # Completions and conflicts with Responses. Without an effort declaration, only
 # a successfully probed level is selectable.

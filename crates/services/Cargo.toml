@@ -58,7 +58,6 @@ hmac.workspace = true
 jsonwebtoken.workspace = true
 regex.workspace = true
 reqwest.workspace = true
-hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"] }
 rustls.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 

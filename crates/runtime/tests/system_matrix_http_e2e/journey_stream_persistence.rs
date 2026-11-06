@@ -1361,17 +1361,21 @@ pub async fn run_stream_corrects_invalid_model_policy_before_child_execution(exp
             })
         })
         .expect("rejection must reach the next actual provider request");
-    let receipt: Value = repair_request.body["messages"]
+    let content = repair_request.body["messages"]
         .as_array()
         .unwrap()
         .iter()
         .find(|m| m["tool_call_id"] == "invalid-policy")
         .and_then(|m| m["content"].as_str())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .expect("typed model-facing rejection");
+        .expect("model-facing rejection");
+    let (body, guidance) = content
+        .split_once("\n\n[Runtime tool guidance]\n")
+        .expect("the model receives execution facts alongside the rejection");
+    let receipt: Value = serde_json::from_str(body).expect("typed model-facing rejection");
     assert_eq!(receipt["executed"], false);
     assert_eq!(receipt["retryable"], false);
     assert_eq!(receipt["error_kind"], "tool_invalid_args");
+    assert!(guidance.contains("\"execution\":\"not_executed\""));
     assert_eq!(
         receipt["recovery_evidence"]["recovery_actions"],
         json!(["correct_arguments"])
