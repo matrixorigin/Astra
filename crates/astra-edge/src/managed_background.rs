@@ -32,6 +32,11 @@ const LOG_TAIL_BYTES: u64 = 256 * 1024;
 static INSTANCE_LOCK: Mutex<Option<File>> = Mutex::new(None);
 static SHUTDOWN: OnceLock<CancellationToken> = OnceLock::new();
 static STARTUP_CANCELLED: AtomicBool = AtomicBool::new(false);
+static PHASE_STATE: Mutex<PhaseState> = Mutex::new(PhaseState { epoch: 0 });
+
+struct PhaseState {
+    epoch: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Identity {
@@ -123,10 +128,17 @@ pub fn note_phase(phase: &str) {
     if dir.is_empty() {
         return;
     }
-    let _ = write_private(&PathBuf::from(dir).join("phase"), phase.as_bytes());
+    note_phase_with(&PHASE_STATE, Path::new(&dir), phase);
 }
 
-pub fn signal_ready() {
+pub fn current_phase_epoch() -> u64 {
+    phase_epoch(&PHASE_STATE)
+}
+
+/// Publish readiness only when no newer phase was recorded after `epoch`.
+/// A connection that has already moved to reconnecting or stopping keeps
+/// that later phase, and the parent is not told that this attempt is ready.
+pub fn signal_ready_for_epoch(epoch: u64) {
     let dir = std::env::var(STATE_DIR_ENV)
         .ok()
         .filter(|dir| !dir.is_empty())
@@ -135,7 +147,38 @@ pub fn signal_ready() {
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
         .filter(|fd| *fd >= 0);
-    signal_ready_in(dir.as_deref(), ready_fd);
+    signal_ready_for_epoch_with(&PHASE_STATE, epoch, dir.as_deref(), ready_fd);
+}
+
+fn phase_epoch(state: &Mutex<PhaseState>) -> u64 {
+    lock_phase(state).epoch
+}
+
+fn note_phase_with(state: &Mutex<PhaseState>, dir: &Path, phase: &str) {
+    let mut gate = lock_phase(state);
+    if phase != "connected" {
+        gate.epoch = gate.epoch.wrapping_add(1);
+    }
+    let _ = write_private(&dir.join("phase"), phase.as_bytes());
+}
+
+fn signal_ready_for_epoch_with(
+    state: &Mutex<PhaseState>,
+    epoch: u64,
+    dir: Option<&Path>,
+    ready_fd: Option<i32>,
+) {
+    let _gate = lock_phase(state);
+    if _gate.epoch != epoch {
+        return;
+    }
+    signal_ready_in(dir, ready_fd);
+}
+
+fn lock_phase(state: &Mutex<PhaseState>) -> std::sync::MutexGuard<'_, PhaseState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn signal_ready_in(dir: Option<&Path>, ready_fd: Option<i32>) {
@@ -220,8 +263,32 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
         return 1;
     }
     let _start_guard = Unlock(&start);
+    let token = option_value(args, "--token").unwrap_or("");
+    let fingerprint = credential_fingerprint(token);
     match instance_is_locked(&dir) {
-        Ok(true) => return existing_instance(&dir, &identity),
+        Ok(true) => match reconcile_running(&dir, &identity, &fingerprint) {
+            Running::Same => return existing_instance(&dir, &identity, executable),
+            Running::Conflict | Running::Unreadable => {
+                return existing_instance(&dir, &identity, executable);
+            }
+            Running::Replace => {
+                let record = match read_metadata(&dir) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        eprintln!("Error: cannot read runner state: {error}");
+                        return 1;
+                    }
+                };
+                eprintln!("Refreshing the background runner credential.");
+                if stop_instance_with(&record, false) != 0 {
+                    return 1;
+                }
+                if instance_is_locked(&dir).unwrap_or(true) {
+                    eprintln!("Error: runner is still stopping");
+                    return 1;
+                }
+            }
+        },
         Ok(false) => {}
         Err(error) => {
             eprintln!("Error: cannot inspect the existing runner: {error}");
@@ -234,7 +301,11 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
     }
     match spawn_and_wait(executable, args, &dir, &identity.workspace) {
         Ok(()) => {
-            print_connected(&identity.edge_id, &identity.server_url);
+            if let Err(error) = write_private(&fingerprint_path(&dir), fingerprint.as_bytes()) {
+                eprintln!("Error: cannot record the runner credential generation: {error}");
+                return 1;
+            }
+            print_connected(executable, &identity.edge_id, &identity.server_url);
             0
         }
         Err(error) => {
@@ -245,7 +316,45 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
     }
 }
 
-fn existing_instance(dir: &Path, identity: &Identity) -> i32 {
+enum Running {
+    Same,
+    Replace,
+    Conflict,
+    Unreadable,
+}
+
+fn reconcile_running(dir: &Path, identity: &Identity, fingerprint: &str) -> Running {
+    let record = match read_metadata(dir) {
+        Ok(record) => record,
+        Err(_) => return Running::Unreadable,
+    };
+    if record.workspace != identity.workspace.display().to_string() {
+        return Running::Conflict;
+    }
+    match read_fingerprint(dir) {
+        Some(stored) if stored == fingerprint => Running::Same,
+        _ => Running::Replace,
+    }
+}
+
+fn credential_fingerprint(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn fingerprint_path(dir: &Path) -> PathBuf {
+    dir.join("credential.fingerprint")
+}
+
+fn read_fingerprint(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(fingerprint_path(dir))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn existing_instance(dir: &Path, identity: &Identity, executable: &Path) -> i32 {
     let record = match read_metadata(dir) {
         Ok(record) => record,
         Err(error) => {
@@ -259,19 +368,21 @@ fn existing_instance(dir: &Path, identity: &Identity) -> i32 {
             record.edge_id, record.workspace
         );
         eprintln!(
-            "Stop it with: astra-edge stop --edge-id {} --server-url {}",
-            record.edge_id, record.server_url
+            "Stop it with: {} stop --edge-id {} --server-url {}",
+            shell_quote(&executable.display().to_string()),
+            shell_quote(&record.edge_id),
+            shell_quote(&record.server_url)
         );
         return 1;
     }
     let phase = phase_label(dir);
     if phase == "connected" {
         eprintln!("Runner is already connected in the background.");
-        print_actions(&record.edge_id, &record.server_url);
+        print_actions(executable, &record.edge_id, &record.server_url);
         return 0;
     }
     eprintln!("Runner is already running in phase {phase}.");
-    print_actions(&record.edge_id, &record.server_url);
+    print_actions(executable, &record.edge_id, &record.server_url);
     1
 }
 
@@ -533,7 +644,7 @@ fn select_instances<'a>(
     let matched: Vec<&Record> = records
         .iter()
         .filter(|record| edge_id.is_none_or(|id| record.edge_id == id))
-        .filter(|record| server_url.is_none_or(|url| record.server_url == url))
+        .filter(|record| server_url.is_none_or(|url| same_destination(&record.server_url, url)))
         .collect();
     if matched.is_empty() {
         match action {
@@ -587,15 +698,21 @@ fn print_status(record: &Record) {
 }
 
 fn stop_instance(record: &Record) -> i32 {
+    stop_instance_with(record, true)
+}
+
+fn stop_instance_with(record: &Record, announce: bool) -> i32 {
     if !instance_is_locked(&record.dir).unwrap_or(false) {
-        eprintln!("Runner is already stopped.");
+        if announce {
+            eprintln!("Runner is already stopped.");
+        }
         return 0;
     }
     let Some(pid) = read_pid(&record.dir) else {
         eprintln!("Error: runner state has no process id");
         return 1;
     };
-    if !is_astra_edge_pid(pid) {
+    if !is_stoppable_pid(record, pid) {
         eprintln!("Error: refusing to signal process {pid}; it is not astra-edge");
         return 1;
     }
@@ -609,7 +726,9 @@ fn stop_instance(record: &Record) -> i32 {
     let started = Instant::now();
     while started.elapsed() < STOP_TIMEOUT {
         if !instance_is_locked(&record.dir).unwrap_or(true) {
-            eprintln!("Runner stopped.");
+            if announce {
+                eprintln!("Runner stopped.");
+            }
             return 0;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -750,6 +869,10 @@ fn user_runner_identity_with(
     {
         return Ok(None);
     }
+    let server_url = match astra_edge::edge_ws_url(server_url) {
+        Ok(server_url) => server_url,
+        Err(_) => return Ok(None),
+    };
     let workspace = workspace_from_args(args, workspace_env)?;
     Ok(Some(Identity {
         edge_id: edge_id.to_string(),
@@ -836,17 +959,58 @@ fn identity_key(identity: &Identity) -> String {
         .collect()
 }
 
-fn print_connected(edge_id: &str, server_url: &str) {
+fn print_connected(executable: &Path, edge_id: &str, server_url: &str) {
     eprintln!("Runner connected in the background.");
-    print_actions(edge_id, server_url);
+    print_actions(executable, edge_id, server_url);
 }
 
-fn print_actions(edge_id: &str, server_url: &str) {
+fn print_actions(executable: &Path, edge_id: &str, server_url: &str) {
     eprintln!("  edge-id: {edge_id}");
     eprintln!("  server: {server_url}");
-    eprintln!("  status: astra-edge status --edge-id {edge_id} --server-url {server_url}");
-    eprintln!("  logs: astra-edge logs --edge-id {edge_id} --server-url {server_url}");
-    eprintln!("  stop: astra-edge stop --edge-id {edge_id} --server-url {server_url}");
+    eprintln!(
+        "  status: {}",
+        management_command(executable, "status", edge_id, server_url)
+    );
+    eprintln!(
+        "  logs: {}",
+        management_command(executable, "logs", edge_id, server_url)
+    );
+    eprintln!(
+        "  stop: {}",
+        management_command(executable, "stop", edge_id, server_url)
+    );
+}
+
+fn management_command(executable: &Path, action: &str, edge_id: &str, server_url: &str) -> String {
+    format!(
+        "{} {action} --edge-id {} --server-url {}",
+        shell_quote(&executable.display().to_string()),
+        shell_quote(edge_id),
+        shell_quote(server_url)
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn same_destination(left: &str, right: &str) -> bool {
+    match (
+        astra_edge::edge_ws_url(left),
+        astra_edge::edge_ws_url(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn acquire_instance_lock(dir: &Path) -> io::Result<File> {
@@ -1000,6 +1164,23 @@ fn io_error(error: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
 }
 
+fn is_stoppable_pid(record: &Record, pid: u32) -> bool {
+    if is_astra_edge_pid(pid) {
+        return true;
+    }
+    // Unit tests hold the instance lock with a short-lived helper process.
+    // Release builds do not contain this branch.
+    #[cfg(test)]
+    {
+        record.dir.join("test-allow-stop").is_file()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = record;
+        false
+    }
+}
+
 fn is_astra_edge_pid(pid: u32) -> bool {
     process_exe(pid)
         .and_then(|path| path.file_name().map(|name| name == "astra-edge"))
@@ -1055,6 +1236,7 @@ impl Drop for Unlock<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -1102,6 +1284,20 @@ mod tests {
             &moi_args(),
             true,
             Some("1"),
+            false,
+            None
+        ));
+        assert!(!should_detach_with(
+            &moi_args(),
+            true,
+            Some("true"),
+            false,
+            None
+        ));
+        assert!(!should_detach_with(
+            &moi_args(),
+            true,
+            Some("yes"),
             false,
             None
         ));
@@ -1239,13 +1435,22 @@ mod tests {
             server_url: "wss://astra.example".to_string(),
             workspace: std::fs::canonicalize(".").unwrap(),
         };
-        assert_eq!(existing_instance(root.path(), &identity), 1);
+        assert_eq!(
+            existing_instance(root.path(), &identity, Path::new("astra-edge")),
+            1
+        );
         write_metadata(root.path(), &identity).unwrap();
         write_private(&root.path().join("phase"), b"reconnecting").unwrap();
         let _lock = acquire_instance_lock(root.path()).unwrap();
-        assert_eq!(existing_instance(root.path(), &identity), 1);
+        assert_eq!(
+            existing_instance(root.path(), &identity, Path::new("astra-edge")),
+            1
+        );
         write_private(&root.path().join("phase"), b"connected").unwrap();
-        assert_eq!(existing_instance(root.path(), &identity), 0);
+        assert_eq!(
+            existing_instance(root.path(), &identity, Path::new("astra-edge")),
+            0
+        );
     }
 
     #[test]
@@ -1272,7 +1477,7 @@ mod tests {
         let selected = select_instances(
             &records,
             Some("runner-abc"),
-            Some("wss://b.example"),
+            Some("https://b.example/"),
             Action::Logs,
         )
         .unwrap();
@@ -1319,20 +1524,55 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_ready_updates_phase_without_notifying_the_parent_again() {
+    fn current_readiness_updates_phase_and_stale_readiness_does_not() {
+        let state = Mutex::new(PhaseState { epoch: 0 });
         let root = tempfile::tempdir().unwrap();
         let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
         let raw = as_fd_raw(&write_fd);
         std::mem::forget(write_fd);
-        signal_ready_in(Some(root.path()), Some(raw));
-        write_private(&root.path().join("phase"), b"reconnecting").unwrap();
-        signal_ready_in(Some(root.path()), None);
-        let phase = std::fs::read_to_string(root.path().join("phase")).unwrap();
-        assert_eq!(phase, "connected");
+        let epoch = phase_epoch(&state);
+        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), Some(raw));
+        note_phase_with(&state, root.path(), "reconnecting");
+        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), None);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("phase")).unwrap(),
+            "reconnecting"
+        );
+        let epoch = phase_epoch(&state);
+        signal_ready_for_epoch_with(&state, epoch, Some(root.path()), None);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("phase")).unwrap(),
+            "connected"
+        );
         let mut read = File::from(read_fd);
         let mut buf = [0u8; 8];
         let count = read.read(&mut buf).unwrap();
         assert_eq!(&buf[..count], b"1");
+    }
+
+    #[tokio::test]
+    async fn delayed_readiness_cannot_overwrite_a_newer_phase() {
+        let state = std::sync::Arc::new(Mutex::new(PhaseState { epoch: 0 }));
+        let root = tempfile::tempdir().unwrap();
+        note_phase_with(&state, root.path(), "starting");
+        let epoch = phase_epoch(&state);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (done_sender, done_receiver) = tokio::sync::oneshot::channel();
+        let task_state = std::sync::Arc::clone(&state);
+        let dir = root.path().to_path_buf();
+        tokio::spawn(async move {
+            if receiver.await.is_ok() {
+                signal_ready_for_epoch_with(&task_state, epoch, Some(&dir), None);
+            }
+            let _ = done_sender.send(());
+        });
+        note_phase_with(&state, root.path(), "reconnecting");
+        sender.send(()).unwrap();
+        done_receiver.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("phase")).unwrap(),
+            "reconnecting"
+        );
     }
 
     #[cfg(unix)]
@@ -1419,5 +1659,130 @@ mod tests {
         assert!(startup.flag().load(Ordering::Relaxed));
         drop(startup);
         assert!(!STARTUP_CANCELLED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn equivalent_server_urls_share_one_runner_and_commands_use_the_installed_path() {
+        let workspace = std::fs::canonicalize(".").unwrap();
+        let with_slash = connect_args("https://example.test/", "secret-token", &workspace);
+        let without_slash = connect_args("https://example.test", "secret-token", &workspace);
+        let left = user_runner_identity_with(&with_slash, None)
+            .unwrap()
+            .unwrap();
+        let right = user_runner_identity_with(&without_slash, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(left.server_url, right.server_url);
+        assert_eq!(identity_key(&left), identity_key(&right));
+        assert!(same_destination(
+            "https://example.test",
+            "https://example.test/"
+        ));
+        assert!(!same_destination("https://a.example", "https://b.example"));
+        let command = management_command(
+            Path::new("/opt/My Tools/astra-edge"),
+            "stop",
+            "runner-abc",
+            &left.server_url,
+        );
+        assert_eq!(
+            command,
+            format!(
+                "'/opt/My Tools/astra-edge' stop --edge-id 'runner-abc' --server-url {}",
+                shell_quote(&left.server_url)
+            )
+        );
+        assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
+    }
+
+    #[test]
+    fn replacement_token_restarts_the_connected_runner_without_storing_it() {
+        let python = Command::new("python3")
+            .arg("--version")
+            .output()
+            .expect("python3 is required to hold the test runner lock");
+        assert!(python.status.success(), "python3 --version failed");
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let argv_log = root.path().join("argv.txt");
+        let holder_py = root.path().join("holder.py");
+        let holder = root.path().join("holder.sh");
+        std::fs::write(
+            &holder_py,
+            r#"import fcntl, os, time
+state = os.environ["ASTRA_EDGE_STATE_DIR"]
+lock = open(os.path.join(state, "instance.lock"), "a")
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+with open(os.path.join(state, "pid"), "w") as pid:
+    pid.write(str(os.getpid()))
+os.write(int(os.environ["ASTRA_EDGE_READY_FD"]), b"1")
+time.sleep(30)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &holder,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexec python3 '{}'\n",
+                argv_log.display(),
+                holder_py.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = connect_args("https://example.test", "old-token", &workspace);
+        let identity = user_runner_identity_with(&old, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test-allow-stop"), b"1").unwrap();
+        let _stop = StopHolder(dir.clone());
+        assert_eq!(supervise(&holder, &old, root.path()), 0);
+        let fresh = connect_args("https://example.test/", "fresh-token", &workspace);
+        assert_eq!(supervise(&holder, &fresh, root.path()), 0);
+        let argv = std::fs::read_to_string(&argv_log).unwrap();
+        assert!(argv.contains("old-token"), "first runner did not start");
+        assert!(
+            argv.contains("fresh-token"),
+            "replacement token was not given to the new runner"
+        );
+        let metadata = std::fs::read_to_string(dir.join("metadata.json")).unwrap();
+        assert!(!metadata.contains("old-token"));
+        assert!(!metadata.contains("fresh-token"));
+        let fingerprint = std::fs::read_to_string(dir.join("credential.fingerprint")).unwrap();
+        assert!(!fingerprint.contains("fresh-token"));
+        assert_eq!(fingerprint.trim(), credential_fingerprint("fresh-token"));
+    }
+
+    fn connect_args(server_url: &str, token: &str, workspace: &Path) -> Vec<String> {
+        args(&[
+            "--edge-id",
+            "runner-abc",
+            "--server-url",
+            server_url,
+            "--token",
+            token,
+            "--reconnect",
+            "true",
+            "--workspace-dir",
+            workspace.to_str().unwrap(),
+        ])
+    }
+
+    struct StopHolder(PathBuf);
+
+    impl Drop for StopHolder {
+        fn drop(&mut self) {
+            let Ok(pid) = std::fs::read_to_string(self.0.join("pid")) else {
+                return;
+            };
+            let Ok(pid) = pid.trim().parse::<i32>() else {
+                return;
+            };
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
     }
 }

@@ -71,3 +71,16 @@ Keep workspace and private-network execution outside the Server deployment.
 Connect `astra-edge` as a separate User Runner only for the workspaces or
 networks that should be exposed, using a dedicated identity and token for each
 Runner boundary.
+
+The MOI connect command (`astra-edge --edge-id runner-… --server-url … --token … --reconnect true`)
+detaches when it is started from a terminal. After it returns, the terminal can
+be closed. `ASTRA_EDGE_FOREGROUND=1` (also `true` or `yes`) keeps that same
+command in the foreground. Containers, sandbox processes, and non-interactive
+starts stay in the foreground.
+
+The command prints `status`, `logs`, and `stop` with the installed executable
+path and shell quoting. Run those printed commands; a later shell does not need
+`astra-edge` on `PATH`. Running the connect command again with the same
+credential leaves the background runner in place. A refreshed credential
+restarts that runner, and the next connection and reconnect use the new token.
+The token is not written to the runner metadata.

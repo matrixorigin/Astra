@@ -704,10 +704,13 @@ fn managed_ready_sender() -> Option<tokio::sync::oneshot::Sender<()>> {
     if !managed_background::is_managed_child() {
         return None;
     }
+    // Capture the phase generation before this connection can disconnect.
+    // The callback may run after the loop has already recorded reconnecting.
+    let epoch = managed_background::current_phase_epoch();
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if receiver.await.is_ok() {
-            managed_background::signal_ready();
+            managed_background::signal_ready_for_epoch(epoch);
         }
     });
     Some(sender)
