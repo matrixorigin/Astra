@@ -719,7 +719,6 @@ impl DatabaseRunStateStore {
             context_admission_hash: receipt.context_admission_hash.clone(),
             operation: RunMutationOperation::Terminal,
             session_capture_override: None,
-            prior_unresolved_tool_calls: false,
         }))
     }
 

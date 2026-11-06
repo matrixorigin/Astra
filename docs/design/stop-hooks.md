@@ -11,6 +11,11 @@ or `.astra/stop-hooks.yml`. Its `when` field accepts `stop` (the default) or
 preparation with the file path and validation reason; it does not become an
 empty verification contract. Declared checks execute through ordinary tool
 admission and the selected provider, and require successful execution evidence.
+Selected authoritative declarations are explicit caller requirements; they do not
+come from shell-language guesses. Calls match the declared command exactly and
+pass its declared directory through Bash `workdir`. A later failed invocation
+replaces that check's earlier success. Checks report command outcomes, not global
+workspace immutability, and use no special Bash verification mode.
 
 For remote workspaces, CLI collects declarations at the user-local boundary and
 passes `completion_checks` through HTTP or WebSocket admission. Both `stop` and

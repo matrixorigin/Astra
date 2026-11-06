@@ -2010,14 +2010,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-            "description": "Omit mode for inspection; verify adds a post-edit workspace proof. workdir is call-local. source_artifacts preserves inputs before spawn; no process-persistence guarantee.",
+            "description": "Execute a command and report its output and exit status. workdir is call-local. source_artifacts preserves inputs before spawn; no process-persistence guarantee.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "command": {"type": "string", "description": BASH_COMMAND_GUIDANCE},
                         "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
-                        "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Omit this field for calculations, read-only probes, diagnostics, tests, and commands whose stdout is the evidence. Use it only for a foreground command that verifies a bound workspace stayed unchanged after edits; it succeeds only when the command exits zero and the executor proves that fact, and it must not be used for commands that write files.", "x-astra-discovery-summary": "Omit inspection; verify unchanged workspace after edits."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
                         "source_artifacts": {
@@ -2998,6 +2997,32 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn bash_checks_use_the_ordinary_command_contract() {
+        assert!(
+            validate_tool_arguments(
+                "bash",
+                &json!({
+                    "command": "./check", "workdir": "src", "timeout": 60,
+                })
+            )
+            .is_ok()
+        );
+        let error = validate_tool_arguments(
+            "bash",
+            &json!({
+                "command": "./check", "mode": "verify",
+            }),
+        )
+        .expect_err("the retired workspace-proof mode is not a current argument");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.code == ValidationCode::AdditionalProperties)
+        );
+    }
 
     #[test]
     fn rejected_execution_controls_explain_legal_shapes_without_execution() {
@@ -5368,12 +5393,8 @@ mod tests {
             Some("string")
         );
         assert!(
-            bash.pointer("/function/parameters/properties/mode/description")
-                .and_then(Value::as_str)
-                .is_some_and(|description| {
-                    description.contains("Omit this field for calculations")
-                        && description.contains("after edits")
-                })
+            bash.pointer("/function/parameters/properties/mode")
+                .is_none()
         );
         validate_tool_arguments(
             "bash",

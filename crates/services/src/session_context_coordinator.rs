@@ -1703,7 +1703,7 @@ impl DatabaseSessionContextCoordinator {
             return Ok(binding);
         }
 
-        admit_controller_context_write(&mut tx, key).await?;
+        admit_strict_controller_context_write(&mut tx, key).await?;
         ensure_database_state_admitted(&mut tx, key, AuthorityEpochsV1::default()).await?;
         let (state, now) = lock_database_state_at_now(&mut tx, key).await?;
         if state
@@ -3443,7 +3443,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 source => database_error("admit_forced_writer_fence", source),
             })?;
         } else {
-            admit_controller_context_write(&mut tx, &request.key).await?;
+            admit_strict_controller_context_write(&mut tx, &request.key).await?;
         }
         let now = database_now_ms(&mut tx).await?;
         let expires_at = checked_expiry(now, ttl)?;
@@ -4920,6 +4920,21 @@ async fn admit_controller_context_write(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
 ) -> Result<(), SessionContextCoordinatorError> {
+    admit_controller_context_write_with_effects(tx, key, false).await
+}
+
+async fn admit_strict_controller_context_write(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<(), SessionContextCoordinatorError> {
+    admit_controller_context_write_with_effects(tx, key, true).await
+}
+
+async fn admit_controller_context_write_with_effects(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+    require_settled_effects: bool,
+) -> Result<(), SessionContextCoordinatorError> {
     let facts = crate::storage::admit_context_execution_write_with_facts(
         tx,
         &key.session_id,
@@ -4930,7 +4945,17 @@ async fn admit_controller_context_write(
         sqlx::Error::RowNotFound => SessionContextCoordinatorError::SessionLifecycleFenced,
         source => database_error("admit_controller_context_write", source),
     })?;
-    if let Some(blocker) = lock_session_run_execution_blocker(tx, key, &facts).await? {
+    let blocker = if require_settled_effects {
+        lock_session_run_execution_blocker(tx, key, &facts).await?
+    } else if crate::storage::session_has_active_run(tx, &key.owner_user_id, &key.session_id, None)
+        .await
+        .map_err(|source| database_error("read_session_execution_activity", source))?
+    {
+        Some(SessionExecutionBlocker::ActiveRun)
+    } else {
+        None
+    };
+    if let Some(blocker) = blocker {
         return Err(SessionContextCoordinatorError::ExecutionOccupied(blocker));
     }
     Ok(())
@@ -4956,7 +4981,7 @@ pub(crate) async fn admit_session_lifecycle_writes(
             ))
     });
     for key in keys {
-        admit_controller_context_write(tx, key).await?;
+        admit_strict_controller_context_write(tx, key).await?;
     }
     Ok(())
 }

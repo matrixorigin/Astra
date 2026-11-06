@@ -5547,7 +5547,6 @@ pub struct RunMutationAdmission {
     context_admission_hash: Option<String>,
     operation: RunMutationOperation,
     session_capture_override: Option<Option<bool>>,
-    prior_unresolved_tool_calls: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5568,7 +5567,6 @@ impl RunMutationAdmission {
             context_admission_hash: run.context_admission_hash.clone(),
             operation,
             session_capture_override: None,
-            prior_unresolved_tool_calls: false,
         }
     }
 
@@ -5580,11 +5578,6 @@ impl RunMutationAdmission {
     /// the inner option is its explicit capture override, if any.
     pub fn session_capture_override(&self) -> Option<Option<bool>> {
         self.session_capture_override
-    }
-
-    /// Prior calls may need the model's attention; this is not a dispatch grant.
-    pub fn prior_unresolved_tool_calls(&self) -> bool {
-        self.prior_unresolved_tool_calls
     }
 
     /// Only a freshly claimed terminal can skip raw-history membership reads.
@@ -14759,7 +14752,7 @@ impl DatabaseRunStateStore {
                 &record.user_id,
             )
             .await
-            .map(|()| Some((None, false)))
+            .map(|()| Some(None))
         }
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
@@ -14768,8 +14761,7 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
-        let (session_capture_override, prior_unresolved_tool_calls) =
-            session_admission.ok_or(RunAdmissionError::SessionBusy)?;
+        let session_capture_override = session_admission.ok_or(RunAdmissionError::SessionBusy)?;
         let provider_owner = record
             .opening
             .loaded()?
@@ -14841,7 +14833,6 @@ impl DatabaseRunStateStore {
                 RunMutationAdmission::from_record(&record, RunMutationOperation::Opening);
             if independent {
                 admission.session_capture_override = Some(session_capture_override);
-                admission.prior_unresolved_tool_calls = prior_unresolved_tool_calls;
             }
             participant
                 .stage(&mut tx, &admission, record.opening.loaded_mut()?)
@@ -31225,6 +31216,28 @@ mod tests {
             &session,
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
+        // Ordinary controller work may proceed after the Run owner exits,
+        // while destructive workspace reuse still requires settled effects.
+        use crate::session_context_coordinator::{
+            AcquireWriterOutcome, DatabaseSessionContextCoordinator, SessionContextCoordinator,
+        };
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let actor = astra_turn_types::ActorContextV1::owner_user(
+            &user,
+            "controller",
+            astra_turn_types::ActorKindV1::Cli,
+            astra_turn_types::SessionSurfaceV1::Cli,
+            None,
+            Default::default(),
+        );
+        let AcquireWriterOutcome::Acquired(lease) = coordinator
+            .acquire_writer(&key, None, &actor, Duration::from_secs(60), "after-unknown")
+            .await
+            .expect("a prior unknown result is not a live controller owner")
+        else {
+            panic!("no controller owns this Session")
+        };
+        coordinator.release_writer(&lease).await.unwrap();
         let mut tx = pool.get().begin().await.unwrap();
         let facts =
             crate::storage::admit_context_execution_write_with_facts(&mut tx, &session, &user)
@@ -31265,7 +31278,7 @@ mod tests {
             "the original invocation must not be redelivered"
         );
         // Only a confirmed result settles the original invocation, independently
-        // of admitting a new Run. Controller changes retain their stricter gate.
+        // of admitting a new Run. Destructive changes retain their stricter gate.
         ledger
             .compare_and_complete(
                 &identity,
@@ -31295,9 +31308,10 @@ mod tests {
             .execute(pool.get())
             .await
             .unwrap();
-        for run in [&winner, &next, &final_run] {
+        for run in [&winner, &next] {
             cleanup_database_run_fixture(&pool, &user, &run.run_id).await;
         }
+        cleanup_execution_resume_fixture(&pool, &user, &final_run.run_id).await;
         sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
             .bind(&user)
             .bind(&session)

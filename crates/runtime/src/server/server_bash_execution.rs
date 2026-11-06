@@ -149,26 +149,6 @@ pub(crate) async fn execute_server_bash(
             }
         }
     }
-    let explicit_verification =
-        astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-            "bash", args,
-        );
-    // Normal commands report their own result; only an explicit verification
-    // needs a workspace-wide comparison.
-    let workspace_before = if explicit_verification && observation_lease.is_some() {
-        let root = workspace_root.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
-    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        return astra_tools::cancelled_tool_result("bash", false);
-    }
     let wrapped_command = wrap_command_with_limits(sandbox_policy, command);
 
     let mode = server_bash_execution_mode(sandbox_policy);
@@ -201,76 +181,33 @@ pub(crate) async fn execute_server_bash(
             result.output.push_str("\n\nThe command was interrupted; earlier effects may remain. Inspect the current state before retrying.");
         }
         if !partial.is_empty() {
-            let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(&partial).0;
-            result.output.push_str(&format!("\n\nOutput before interruption:\n{safe}"));
+            let safe =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(&partial).0;
+            result
+                .output
+                .push_str(&format!("\n\nOutput before interruption:\n{safe}"));
         }
         result
     } else {
         tool_result_from_server_bash_output(command, output, timeout_secs)
-    }.with_metadata_scope_settled(scope_ownership, execution_started);
-    let workspace_after = if workspace_before.is_some() {
-        let root = workspace_root.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
     };
-    let scope_settled = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get("_astra_scope_settled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let scope_ownership = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get("_astra_scope_ownership"))
-        .and_then(Value::as_str)
-        .and_then(|value| match value {
-            astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP => {
-                Some(astra_sandbox::ScopeOwnership::InvocationCgroup)
-            }
-            astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP => {
-                Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup)
-            }
-            astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP => {
-                Some(astra_sandbox::ScopeOwnership::InvocationSupervisor)
-            }
-            _ => None,
-        });
-    let execution_started = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get("_astra_execution_started"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let mut result = result;
-    if let Some(fields) = result.metadata.as_mut() {
-        fields.remove("_astra_scope_settled");
-        fields.remove("_astra_scope_ownership");
-        fields.remove("_astra_execution_started");
+    let fields = result.metadata.get_or_insert_with(Default::default);
+    if execution_started {
+        astra_tools::execution_outcome::insert_started_execution_fact(fields);
+    } else {
+        astra_tools::execution_outcome::insert_not_executed_fact(fields);
+        fields.insert("side_effects_maybe".into(), Value::Bool(false));
     }
     let coordination_integrity_valid = observation_lease.as_ref().is_none_or(
         astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
     );
-    let receipt_authority_valid = observation_lease.as_ref().is_none_or(
-        astra_tools::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
-    );
-    let mut result = attach_workspace_observation(
+    let mut result = finish_bash_ownership(
         result,
         workspace_root,
-        workspace_before,
-        workspace_after,
         execution_started,
-        scope_settled,
         scope_ownership,
         coordination_integrity_valid,
-        receipt_authority_valid,
-        explicit_verification,
     );
     astra_tools::shell_ops::attach_bash_workdir_evidence(
         &mut result,
@@ -281,141 +218,23 @@ pub(crate) async fn execute_server_bash(
     attach_source_preimage(result, source_preimages)
 }
 
-trait ScopeSettledResult {
-    fn with_metadata_scope_settled(
-        self,
-        ownership: Option<astra_sandbox::ScopeOwnership>,
-        execution_started: bool,
-    ) -> Self;
-}
-
-impl ScopeSettledResult for astra_tools::ToolResult {
-    fn with_metadata_scope_settled(
-        mut self,
-        ownership: Option<astra_sandbox::ScopeOwnership>,
-        execution_started: bool,
-    ) -> Self {
-        let fields = self.metadata.get_or_insert_with(Default::default);
-        if execution_started {
-            astra_tools::execution_outcome::insert_started_execution_fact(fields);
-        } else {
-            astra_tools::execution_outcome::insert_not_executed_fact(fields);
-            fields.insert("side_effects_maybe".into(), Value::Bool(false));
-        }
-        fields.insert(
-            "_astra_execution_started".to_string(),
-            Value::Bool(execution_started),
-        );
-        fields.insert(
-            "_astra_scope_settled".to_string(),
-            Value::Bool(ownership.is_some()),
-        );
-        if let Some(ownership) = ownership {
-            fields.insert(
-                "_astra_scope_ownership".to_string(),
-                Value::String(ownership.as_str().to_string()),
-            );
-        }
-        self
-    }
-}
-
-fn attach_workspace_observation(
+fn finish_bash_ownership(
     mut result: astra_tools::ToolResult,
-    workspace_root: &std::path::Path,
-    before: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
-    after: Option<astra_tools::workspace_observation::WorkspaceFingerprint>,
+    workspace_root: &Path,
     execution_started: bool,
-    scope_settled: bool,
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
     coordination_integrity_valid: bool,
-    receipt_authority_valid: bool,
-    explicit_verification: bool,
 ) -> astra_tools::ToolResult {
     if !coordination_integrity_valid {
         astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-        if let Some(fields) = result.metadata.as_mut() {
-            fields.remove(astra_tools::workspace_observation::OBSERVED_FIELD);
-            fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
-            fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
-        }
         result.is_error = true;
-        if !result.output.is_empty() {
-            result.output.push_str("\n\n");
-        }
-        result.output.push_str(
-            "Error: workspace binding or coordination generation changed during Bash execution; the command may have changed files, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
-        );
+        result.output.push_str("\n\nWorkspace binding changed during Bash execution; inspect its effects before retrying.");
         return result.with_execution_outcome_unknown();
     }
     if execution_started && scope_ownership.is_none() {
-        if let Some(fields) = result.metadata.as_mut() {
-            fields.remove(astra_tools::workspace_observation::OBSERVED_FIELD);
-            fields.remove(astra_tools::workspace_observation::SCOPE_FIELD);
-            fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
-        }
         result.is_error = true;
-        if !result.output.is_empty() {
-            result.output.push_str("\n\n");
-        }
-        result.output.push_str(
-            "Error: Bash execution started but its final outcome could not be confirmed. Child processes may still be running; inspect the current state before retrying.",
-        );
+        result.output.push_str("\n\nBash execution started but its final outcome could not be confirmed. Child processes may still be running; inspect the current state before retrying.");
         return result.with_execution_outcome_unknown();
-    }
-    let before_available = before.is_some();
-    let after_available = after.is_some();
-    let comparison = before
-        .as_ref()
-        .map(|before| before.compare_with(after.as_ref()))
-        .unwrap_or(astra_tools::workspace_observation::WorkspaceFingerprintComparison::Unknown);
-    // A changed snapshot cannot identify its writer. A foreground process
-    // group also cannot rule
-    // out a setsid/double-fork descendant that writes after this function
-    // returns, even when the immediate fingerprint delta is empty.
-    let verify_receipt_valid = explicit_verification
-        && !result.is_error
-        && result
-            .metadata
-            .as_ref()
-            .and_then(|fields| fields.get("exit_code"))
-            .and_then(Value::as_i64)
-            == Some(0)
-        && before_available
-        && after_available
-        && receipt_authority_valid
-        && comparison
-            == astra_tools::workspace_observation::WorkspaceFingerprintComparison::Unchanged
-        && scope_settled
-        && scope_ownership.is_some_and(astra_sandbox::ScopeOwnership::is_authoritative);
-    if verify_receipt_valid {
-        result
-            .metadata
-            .get_or_insert_with(Default::default)
-            .extend(astra_tools::workspace_observation::explicit_workspace_verification_receipt());
-    } else if explicit_verification && !result.is_error {
-        if !before_available || !after_available {
-            result = result.with_failure_evidence(
-                astra_tools::workspace_observation::explicit_workspace_verification_unavailable_evidence(),
-            );
-            result
-                .metadata
-                .get_or_insert_with(Default::default)
-                .insert("retryable".to_string(), Value::Bool(false));
-            result.metadata.get_or_insert_with(Default::default).insert(
-                "workspace_observation_retry_scope".to_string(),
-                Value::String("workspace_generation".to_string()),
-            );
-            if !result.output.is_empty() {
-                result.output.push_str("\n\n");
-            }
-            result.output.push_str(
-                astra_tools::workspace_observation::EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE,
-            );
-        } else {
-            result.is_error = true;
-            result.output.push_str("\n\nError: verify-mode command did not produce an authoritative unchanged-workspace observation receipt.");
-        }
     }
     result
 }
@@ -931,102 +750,9 @@ mod tests {
         assert!(environment["GIT_SSH_COMMAND"].contains("IdentityAgent=none"));
     }
 
-    fn successful_bash_result() -> astra_tools::ToolResult {
-        let mut result = astra_tools::ToolResult::text("ok".into());
-        result.metadata = Some(serde_json::Map::from_iter([(
-            "exit_code".to_string(),
-            Value::from(0),
-        )]));
-        result
-    }
-
-    #[test]
-    fn unavailable_server_verify_is_typed_and_never_mints_receipt() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let result = attach_workspace_observation(
-            successful_bash_result(),
-            workspace.path(),
-            None,
-            None,
-            false,
-            true,
-            Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
-            true,
-            true,
-            true,
-        );
-        assert!(result.is_error);
-        let fields = result.metadata.expect("typed failure");
-        assert_eq!(fields["error_kind"], "tool_unavailable");
-        assert_eq!(fields["retryable"], false);
-        assert!(
-            fields
-                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn server_verify_requires_stable_authoritative_observation() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let git_init = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(workspace.path())
-            .status()
-            .expect("git installed");
-        assert!(git_init.success(), "initialize workspace repository");
-        for writer_intervened in [false, true] {
-            let before =
-                astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                    .expect("before");
-            if writer_intervened {
-                let writer =
-                    astra_tools::workspace_observation::begin_workspace_writer_with_options(
-                        workspace.path(),
-                        None,
-                        Duration::from_secs(120),
-                    )
-                    .await
-                    .expect("writer generation");
-                drop(writer);
-            }
-            let after =
-                astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                    .expect("after");
-            let result = attach_workspace_observation(
-                successful_bash_result(),
-                workspace.path(),
-                Some(before),
-                Some(after),
-                true,
-                true,
-                Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
-                true,
-                true,
-                true,
-            );
-            assert_eq!(result.is_error, writer_intervened);
-            let fields = result.metadata.expect("execution evidence");
-            let receipt = fields.get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
-            assert_eq!(
-                receipt.is_some_and(
-                    astra_tools::workspace_observation::is_explicit_workspace_verification_receipt
-                ),
-                !writer_intervened,
-                "an intervening writer is unknown, not verified unchanged: {fields:?}"
-            );
-        }
-    }
-
     #[test]
     fn weak_process_group_does_not_claim_a_workspace_receipt() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let before =
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                .expect("before fingerprint");
-        let after =
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                .expect("after fingerprint");
         let delayed_root = workspace.path().to_path_buf();
         let delayed_writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
@@ -1034,19 +760,14 @@ mod tests {
                 .expect("delayed escaped writer");
         });
 
-        let result = attach_workspace_observation(
+        let result = finish_bash_ownership(
             astra_tools::ToolResult::text(
                 "foreground command returned before escaped writer".into(),
             ),
             workspace.path(),
-            Some(before),
-            Some(after),
-            true,
             true,
             Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
             true,
-            true,
-            false,
         );
 
         assert!(
@@ -1076,12 +797,6 @@ mod tests {
     #[test]
     fn started_server_bash_without_settled_ownership_reports_unknown() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let before =
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                .expect("before fingerprint");
-        let after =
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                .expect("unchanged immediate fingerprint");
         let delayed_root = workspace.path().to_path_buf();
         let delayed_daemon = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
@@ -1089,17 +804,12 @@ mod tests {
                 .expect("delayed daemon write");
         });
 
-        let result = attach_workspace_observation(
+        let result = finish_bash_ownership(
             astra_tools::ToolResult::text("supervisor disappeared after spawn".into()),
             workspace.path(),
-            Some(before),
-            Some(after),
             true,
-            false,
             None,
             true,
-            true,
-            false,
         );
 
         assert!(
@@ -1130,17 +840,12 @@ mod tests {
     #[test]
     fn pre_spawn_server_bash_refusal_does_not_quarantine_workspace() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let result = attach_workspace_observation(
+        let result = finish_bash_ownership(
             astra_tools::ToolResult::error("sandbox preflight refused execution".into()),
             workspace.path(),
-            None,
-            None,
-            false,
             false,
             None,
             true,
-            true,
-            false,
         );
 
         assert!(result.is_error);
@@ -1309,25 +1014,14 @@ mod tests {
     #[test]
     fn workspace_observation_does_not_attribute_a_partial_failure() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let before =
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                .expect("workspace fingerprint");
         std::fs::write(workspace.path().join("generated.txt"), "partial").unwrap();
-        let after =
-            astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
-                .expect("workspace fingerprint");
 
-        let result = attach_workspace_observation(
+        let result = finish_bash_ownership(
             astra_tools::ToolResult::error("writer failed after partial output".into()),
             workspace.path(),
-            Some(before),
-            Some(after),
-            true,
             true,
             Some(astra_sandbox::ScopeOwnership::InvocationCgroup),
             true,
-            true,
-            false,
         );
         assert!(result.is_error);
         assert!(result.metadata.as_ref().is_none_or(|fields| {

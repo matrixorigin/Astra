@@ -5497,7 +5497,7 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
             .prepared
             .take()
             .ok_or("root Context preparation is missing")?;
-        let mut admission = match self
+        let admission = match self
             .service
             .stage_canonical_turn(
                 self.user_id,
@@ -5516,9 +5516,6 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
                 return Err("canonical turn admission rejected this run".into());
             }
         };
-        admission.previous_tool_advisory = run_admission
-            .prior_unresolved_tool_calls()
-            .then_some(PREVIOUS_TOOL_ADVISORY);
         opening
             .ok_or("root Run is missing its immutable opening")?
             .bind_context_authority(admission.authority.clone(), &self.request.message)?;

@@ -1221,7 +1221,7 @@ where
 /// query must bind its own scope: MatrixOne may otherwise apply LIMIT before
 /// decorrelating an EXISTS, letting another Session hide this one's owner.
 /// Callers retain the lifecycle/Session fence and current-read locks.
-fn push_session_execution_activity(
+fn push_session_active_runs(
     query: &mut sqlx::QueryBuilder<MySql>,
     user_id: &str,
     session_id: &str,
@@ -1239,8 +1239,23 @@ fn push_session_execution_activity(
     if let Some(run_id) = except_run_id {
         query.push(" AND executor.run_id <> ").push_bind(run_id);
     }
-    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active, CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ")
-        .push_bind(user_id).push(" AND custody.session_id = ").push_bind(session_id)
+    query.push(" LIMIT 1 FOR UPDATE)) AS SIGNED) AS execution_active");
+}
+
+fn push_session_execution_activity(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) {
+    push_session_active_runs(query, user_id, session_id, except_run_id);
+    query
+        .push(
+            ", CAST(EXISTS (SELECT 1 FROM tool_invocation_ledger custody WHERE custody.user_id = ",
+        )
+        .push_bind(user_id)
+        .push(" AND custody.session_id = ")
+        .push_bind(session_id)
         .push(" AND custody.state IN ('prepared', 'dispatched', 'outcome_unknown')");
     if let Some(run_id) = except_run_id {
         query.push(" AND custody.run_id <> ").push_bind(run_id);
@@ -1277,7 +1292,7 @@ pub(crate) async fn admit_independent_run_creation<T>(
     session_id: &str,
     user_id: &str,
     run_id: &str,
-) -> Result<Option<(Option<bool>, bool)>, sqlx::Error>
+) -> Result<Option<Option<bool>>, sqlx::Error>
 where
     T: TransactionConnection,
 {
@@ -1297,7 +1312,7 @@ where
           WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE -1 END \
          ELSE NULL END AS SIGNED) AS full_llm_capture_override, ",
     );
-    push_session_execution_activity(&mut query, user_id, session_id, Some(run_id));
+    push_session_active_runs(&mut query, user_id, session_id, Some(run_id));
     query
         .push(" FROM agent_sessions session WHERE session.user_id = ")
         .push_bind(user_id)
@@ -1313,8 +1328,7 @@ where
     if status != "active" {
         return Err(sqlx::Error::RowNotFound);
     }
-    let activity = SessionExecutionActivity::from_row(&row)?;
-    if activity.active_run {
+    if row.try_get::<i64, _>("execution_active")? != 0 {
         return Ok(None);
     }
     let capture = match row.try_get::<Option<i64>, _>("full_llm_capture_override")? {
@@ -1327,7 +1341,24 @@ where
             ));
         }
     };
-    Ok(Some((capture, activity.unresolved_invocations)))
+    Ok(Some(capture))
+}
+
+/// Read live Run owners under an existing Session fence. Old unknown tool
+/// outcomes remain in their invocation ledger, but are not live Run owners.
+pub(crate) async fn session_has_active_run<T>(
+    tx: &mut T,
+    user_id: &str,
+    session_id: &str,
+    except_run_id: Option<&str>,
+) -> Result<bool, sqlx::Error>
+where
+    T: TransactionConnection,
+{
+    let mut query = sqlx::QueryBuilder::<MySql>::new("SELECT ");
+    push_session_active_runs(&mut query, user_id, session_id, except_run_id);
+    let row = query.build().fetch_one(&mut **tx).await?;
+    Ok(row.try_get::<i64, _>("execution_active")? != 0)
 }
 
 /// Read actual Run/lease/effect custody under an already held Session fence.

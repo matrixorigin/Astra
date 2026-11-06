@@ -179,10 +179,11 @@ Command output can establish a current state, including an already-satisfied
 request or an absent directory, without claiming this invocation changed it.
 Neither a zero exit status nor a generic filesystem delta proves arbitrary task
 correctness. Domain tools and canonical Work retain their own result contracts.
-Inspection and diagnostics omit `mode`. Explicit `mode=verify` adds an unchanged-workspace proof obligation
-after edits. If bounded observation is unavailable, command output is retained
-but the requested verification fails closed; it must not mint a completion or
-no-change receipt. Command text does not select or weaken this contract.
+Inspection, diagnostics and checks use the same command tool. The executor
+reports the actual output and exit status without a whole-workspace fingerprint
+or a separate verification mode. Declared checks are explicit runtime contracts;
+a successful invocation does not prove workspace exclusivity or that no other
+process will write later.
 
 ### Rename authority
 
@@ -394,8 +395,9 @@ check receipt authority independently of the coordination check used to launch.
 Receipt-attribution quarantine is retained per workspace observation root for
 the executor process lifetime, not per conversation. It prevents new attribution
 receipts, while healthy execution coordination remains independent. Explicit
-verification still fails when the required proof is unavailable. Quarantine
-diagnostics log a root digest, not local paths or shell input. A new conversation does not clear quarantine; before restarting
+verification records the observed command result and does not require a
+fingerprint. Quarantine diagnostics log a root digest, not local paths or shell
+input. A new conversation does not clear quarantine; before restarting
 the affected Astra or astra-edge process, verify that earlier background work
 has stopped. Restart alone does not stop escaped descendants or prove safety.
 

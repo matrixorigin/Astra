@@ -1039,10 +1039,7 @@ fn terminal_completion_disposition(
             .foreground_fanout_pagination
             .is_none()
         && super::lifecycle::unfinished_parallel_agent_ids(state).is_empty()
-        && matches!(
-            pending_terminal_completion_action_for_work_state(state, false),
-            Ok(None)
-        );
+        && matches!(pending_completion_action(state), Ok(None));
     if bounded_synthesis_authorized {
         return TerminalCompletionDisposition::RoundSliceTextDelivery;
     }
@@ -1266,141 +1263,47 @@ pub(crate) fn workspace_observation_requires_terminal_incomplete(state: &Agentic
         .unwrap_or(false)
 }
 
-/// A volatile scratch mutation may be ignored by the workspace observation
-/// watermark only when its target is authoritative and every target is
-/// proven external. Unknown shell bodies and missing paths remain barriers;
-/// they may have changed the bound workspace despite an apparently unrelated
-/// command name or exit status.
-pub(super) fn record_is_proven_external_scratch_mutation(
-    workspace_root: Option<&str>,
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    // Executor facts outrank a lexical scratch target (for example, a target
-    // may resolve into the workspace). A shape cannot erase an observed change.
-    if record_has_live_workspace_mutation_receipt(record)
-        || record_has_trusted_workspace_mutation_receipt(record)
-        || record.workspace_mutation_partial == Some(true)
-        || record
-            .workspace_mutation_partial_paths
-            .as_ref()
-            .is_some_and(|paths| !paths.is_empty())
-    {
-        return false;
-    }
-    let args = super::lifecycle::extract_tool_args(record.authoritative_args_full());
-    if !crate::turn::tool_side_effects::tool_call_may_mutate_workspace(&record.name, args.as_ref())
-    {
-        return false;
-    }
-    if record.name == "bash" {
-        let Some(command) = args.and_then(|args| {
-            astra_turn_core::tool_argument_hints::command_hint_from_args(&args).map(str::to_string)
-        }) else {
-            return false;
-        };
-        return super::lifecycle::bash_mutation_is_proven_external_scratch(
-            &command,
-            workspace_root,
-        );
-    }
-    let Some(path) = super::lifecycle::record_explicit_path(record) else {
-        return false;
-    };
-    super::lifecycle::path_is_external_volatile_scratch(&path, workspace_root)
-}
-
-/// Normalize the small command surface used by explicit stop-hook contracts.
-/// This intentionally does not try to understand a shell grammar: the hook
-/// is a concrete command supplied by the caller, and only simple sequencing
-/// plus whitespace/benign redirect differences are safe to correlate.
-fn canonical_verification_command(command: &str) -> String {
-    // A declared verification command is an operation identity, not a shell
-    // program fragment. Compound commands and extra arguments cannot be
-    // correlated safely without a shell parser and an explicit cwd contract,
-    // so fail closed rather than treating a prefix as a receipt.
-    if command.contains(';') || command.contains("&&") || command.contains("||") {
-        return String::new();
-    }
-    let command = command.trim();
-    if command.is_empty() || command.starts_with("cd ") {
-        return String::new();
-    }
-    let command = astra_turn_core::cloud_approval_policy::strip_benign_fd_redirects(command);
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn canonical_verification_invocation(
-    command: &str,
-    hook: &astra_turn_core::stop_hooks::StopHook,
-) -> String {
-    let expected = canonical_verification_command(&hook.command);
-    if expected.is_empty() {
-        return String::new();
-    }
-    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    if let Some(working_dir) = hook.working_dir.as_deref().filter(|dir| !dir.is_empty()) {
-        let Some((prefix, body)) = normalized.split_once("&&") else {
-            return String::new();
-        };
-        let prefix = prefix.split_whitespace().collect::<Vec<_>>().join(" ");
-        let body = canonical_verification_command(body);
-        let expected_prefix = format!("cd {}", working_dir.trim());
-        if prefix != expected_prefix || body != expected {
-            return String::new();
-        }
-        return format!("{prefix} && {body}");
-    }
-    canonical_verification_command(&normalized)
-}
-
-fn tool_call_verifies_explicit_hook(
+pub(super) fn tool_call_verifies_explicit_hook(
     name: &str,
     args: Option<&serde_json::Value>,
     hook: &astra_turn_core::stop_hooks::StopHook,
+    workspace_root: Option<&str>,
 ) -> bool {
-    // A typed verification tool can be represented without forcing every
-    // caller through bash. The identity is still the explicit hook
-    // command/label, never a guessed framework or filename.
-    if name != "bash" {
+    if name != "bash" || hook.command.trim().is_empty() {
         return false;
     }
     let Some(args) = args else {
         return false;
     };
-    let Some(command) = args.get("command").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    let actual = canonical_verification_invocation(command, hook);
-    if actual.is_empty() {
-        return false;
-    }
-    let expected = canonical_verification_command(&hook.command);
-    if expected.is_empty() {
-        return false;
-    }
-    let expected = hook
+    let command = args.get("command").and_then(serde_json::Value::as_str);
+    let workdir = args.get("workdir").and_then(serde_json::Value::as_str);
+    let actual_dir = workdir.filter(|dir| *dir != ".").or(workspace_root);
+    let expected_dir = hook
         .working_dir
         .as_deref()
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| format!("cd {} && {expected}", dir.trim()))
-        .unwrap_or(expected);
-    actual == expected
+        .filter(|dir| !dir.is_empty() && *dir != ".")
+        .or(workspace_root);
+    command == Some(hook.command.as_str()) && actual_dir == expected_dir
 }
 
 pub(crate) fn record_verifies_explicit_hook(
     record: &astra_services::session_journal::ToolCallRecord,
     hook: &astra_turn_core::stop_hooks::StopHook,
+    workspace_root: Option<&str>,
 ) -> bool {
-    if !record.was_executed() || !record.ok {
+    if record.workspace_mutation_partial == Some(true)
+        || record.result_class.as_deref() != Some("success")
+        || !astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
+    {
         return false;
     }
 
     let args = super::lifecycle::extract_tool_args(record.authoritative_args_full());
-    tool_call_verifies_explicit_hook(&record.name, args.as_ref(), hook)
+    tool_call_verifies_explicit_hook(&record.name, args.as_ref(), hook, workspace_root)
 }
 
-/// Return the explicit verification obligations that have no successful
-/// receipt after the latest source mutation. Auto-detected hooks are advisory
+/// Return the declared checks without a successful outcome after the latest
+/// executor-reported workspace change. Auto-detected hooks are advisory
 /// and deliberately excluded: without an explicit contract Astra cannot know
 /// the hidden verifier's scope.
 pub(crate) fn missing_explicit_verification_hooks(
@@ -1413,10 +1316,8 @@ pub(crate) fn missing_explicit_verification_hooks(
     )
 }
 
-/// Enforce only caller-declared verification contracts at terminal settlement.
-/// The ordinary post-mutation observation guard remains intentionally softer:
-/// an unconstrained task can finish with an honest best-effort result, while a
-/// declared contract cannot be silently replaced by a read/diff operation.
+/// Enforce only caller-declared checks at terminal settlement. Ordinary tool
+/// outcomes do not create a project-validation or workspace-proof contract.
 fn enforce_explicit_verification_before_text_completion(state: &mut AgenticLoopState) -> bool {
     let missing = match missing_explicit_verification_hooks(state) {
         Ok(Some(missing)) => missing,
@@ -1446,7 +1347,12 @@ fn enforce_explicit_verification_before_text_completion(state: &mut AgenticLoopS
                 "schema": "explicit_verification_required.v1",
                 "signal": "verification_contract_unmet",
                 "missing_obligations": missing,
-                "instruction": "The explicit verification contract is not satisfied after the latest workspace change. Run every missing declared check through the normal tool path, fix failures, and only then give the final answer. A read or diff is observation, not a passing verification receipt.",
+                "checks": state.hooks.stop_hooks.iter().filter(|hook| hook.authoritative && missing.contains(&hook.label)).map(|hook| serde_json::json!({
+                    "label": hook.label,
+                    "command": hook.command,
+                    "workdir": hook.working_dir,
+                })).collect::<Vec<_>>(),
+                "instruction": "Run the missing declared commands with their declared workdir through the normal tool path. Report their actual results. A successful exit is evidence of that invocation, not a guarantee of global workspace freshness.",
                 "authority": "caller_declared_verification_contract",
             }),
         );
@@ -1455,7 +1361,7 @@ fn enforce_explicit_verification_before_text_completion(state: &mut AgenticLoopS
 
     state.final_text_model_item_id = None;
     state.final_text = format!(
-        "The workspace change was not verified: required checks still missing ({}) after the bounded verification recovery.",
+        "Required checks did not complete successfully: checks still missing ({}) after the bounded verification recovery.",
         missing.join(", ")
     );
     state.final_text_streamed = false;
@@ -1505,9 +1411,8 @@ pub(crate) fn finish_unavailable_policy(
 
 /// Close a typed completion-action window after its one attempt.  A matching
 /// call is not enough by itself: the post-action ledger must show that the
-/// original obligation disappeared.  This prevents a mutation that failed,
-/// or a mutation still lacking verification, from reopening ordinary
-/// exploration after the hard slice boundary.
+/// original obligation disappeared. A failed declared check cannot reopen
+/// ordinary exploration after the hard slice boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompletionActionBoundary {
     NoWindow,
@@ -1601,7 +1506,7 @@ pub(crate) fn enforce_completion_action_window_before_text_completion(
                     "allowed_action": action.clone(),
                     "attempts_remaining": 1,
                     "mismatch_corrections_remaining": 0,
-                    "action_hint": completion_action_hint_for_state(state, &action),
+                    "action_hint": completion_action_hint(&action),
                     "execution_authority": "one_matching_action",
                     "instruction": if active_work_attempt {
                         "The previous response did not execute the required typed completion action. Perform exactly one matching action now, then settle the currently owned WorkItem truthfully with settle_work_item. Do not return prose or request an unrelated tool."
@@ -1634,8 +1539,6 @@ pub(crate) fn enforce_completion_action_window_before_text_completion(
             CompletionAction::ExplicitVerification { missing_labels } => {
                 format!("explicit verification ({})", missing_labels.join(", "))
             }
-            CompletionAction::CanonicalWorkValidation => "canonical Work validation".to_string(),
-            CompletionAction::CanonicalWorkRepair => "canonical Work repair".to_string(),
         };
         state.final_text_model_item_id = None;
         state.final_text = format!(
@@ -1681,567 +1584,43 @@ pub(crate) fn completion_action_window_requires_followup(state: &AgenticLoopStat
         .is_some_and(|window| !window.consumed || !window.matched)
 }
 
-/// Reconcile the completion window against the exact tool-record range added
-/// by one authoritative tool boundary. Production callers must pass the
-/// pre-execution record count so a successful lifecycle record cannot be
-/// hidden behind a later failed sibling in the same provider batch.
-pub(crate) fn advance_completion_action_window_after_tool_round_from_record_index(
-    state: &mut AgenticLoopState,
-    new_records_start: usize,
-) {
+/// An explicit check keeps its existing bounded terminal attempt. Canonical
+/// Work owns its own settlement; command-shape guesses never open a repair or
+/// revalidation state machine.
+pub(crate) fn advance_completion_action_window_after_tool_round(state: &mut AgenticLoopState) {
     let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
         crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
     );
-    advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-        state,
-        active_work_attempt,
-        new_records_start,
-    );
+    advance_completion_action_window_after_tool_round_for_work_state(state, active_work_attempt);
 }
 
-/// Reopen one bounded repair boundary when the current Work attempt has both
-/// a fresh failed canonical validator and a server-owned rejected delivery.
-/// The rejection can precede the later budget-settlement boundary that makes
-/// repair authority available, but only a rejection from the current causal
-/// provider round may open that authority.
-pub(crate) fn advance_rejected_work_settlement_recovery(
-    state: &mut AgenticLoopState,
-    round_records_start: usize,
-) {
-    let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
-        crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
-    );
-    advance_rejected_work_settlement_recovery_for_work_state(
-        state,
-        active_work_attempt,
-        round_records_start,
-    );
-}
-
-#[cfg(test)]
-fn advance_rejected_work_settlement_recovery_for_test(
-    state: &mut AgenticLoopState,
-    round_records_start: usize,
-) {
-    advance_rejected_work_settlement_recovery_for_work_state(state, true, round_records_start);
-}
-
-pub(crate) fn advance_rejected_work_settlement_recovery_for_work_state(
-    state: &mut AgenticLoopState,
-    active_work_attempt: bool,
-    round_records_start: usize,
-) {
-    if let Err(error) = missing_explicit_verification_hooks(state) {
-        finish_unavailable_verification(state, error);
-        return;
-    }
-    let validation = WorkValidationEvidence::collect(state, active_work_attempt);
-    let current_round_records = state
-        .stall
-        .tool_call_records
-        .get(round_records_start..)
-        .unwrap_or_default();
-    let rejected_validation_state = current_round_records
-        .iter()
-        .find_map(record_rejected_work_validation_state);
-    let validation_state = validation.state;
-    let failed_validation_requiring_revalidation = (validation_state
-        == WorkValidationState::Failed)
-        .then(|| {
-            validation
-                .failed_operation_requiring_revalidation()
-                .map(str::to_owned)
-        })
-        .flatten();
-    let failed_declared_opaque_record = validation
-        .unresolved_operations
-        .last()
-        .and_then(|(_, index)| state.stall.tool_call_records.get(*index))
-        .filter(|record| {
-            classify_record_validation_attempt(record)
-                .is_some_and(|(_, opaque_declared)| opaque_declared)
-        });
-    let failed_declared_opaque_verification = failed_declared_opaque_record.is_some();
-    // An indeterminate or changed invocation is still an outstanding debt,
-    // but it cannot authorize either an automatic replay or a repair.
-    if failed_declared_opaque_record
-        .is_some_and(|record| !record_can_retry_declared_verification(record))
-    {
-        return;
-    }
-    let concurrent_mutation_risk = current_round_records.iter().any(|record| {
-        tool_record_may_have_mutated_bound_workspace(
-            state.hooks.workspace_root_hint.as_deref(),
-            record,
-        )
-    });
-    let recovery_action = match (rejected_validation_state, validation_state) {
-        // A failed operation followed by a workspace change is stale evidence,
-        // even when a different validator later passes. Re-run that exact
-        // operation before asking for another code change.
-        (_, WorkValidationState::Failed) if failed_validation_requiring_revalidation.is_some() => {
-            Some(CompletionAction::CanonicalWorkValidation)
-        }
-        // A declared opaque verification can fail without establishing that
-        // the workspace needs a repair. Retry that same operation once.
-        (_, WorkValidationState::Failed) if failed_declared_opaque_verification => {
-            Some(CompletionAction::CanonicalWorkValidation)
-        }
-        // A later canonical failure in the same batch is decisive evidence,
-        // even if the admission-time rejection was caused by stale evidence.
-        (_, WorkValidationState::Failed) => Some(CompletionAction::CanonicalWorkRepair),
-        // A stale rejection means the Work needs its prior canonical
-        // validation again; no workspace repair has been established.
-        (Some(RejectedWorkValidationState::Stale), WorkValidationState::Stale) => {
-            Some(CompletionAction::CanonicalWorkValidation)
-        }
-        // The rejected delivery saw a failure, but a sibling writer may have
-        // changed the workspace before this boundary settled. A strong receipt
-        // is required for mutation completion, not for invalidation: revalidate
-        // the resulting state rather than trusting the old failure or granting
-        // another blind repair.
-        (Some(RejectedWorkValidationState::Failed), WorkValidationState::Stale)
-            if concurrent_mutation_risk =>
-        {
-            Some(CompletionAction::CanonicalWorkValidation)
-        }
-        _ => None,
-    };
-    if !active_work_attempt
-        || state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .is_some()
-        || state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries
-            != 0
-        || workspace_observation_is_quarantined(state)
-        || rejected_validation_state.is_none()
-        || recovery_action.is_none()
-    {
-        return;
-    }
-
-    let next_action = recovery_action.expect("checked above");
-    let validation_operation = match (
-        &next_action,
-        failed_validation_requiring_revalidation.clone(),
-    ) {
-        (CompletionAction::CanonicalWorkValidation, Some(operation)) => Some(operation),
-        _ => None,
-    }
-    .or_else(|| validation.recovery_operation().map(str::to_owned));
-    // An attempt-only success has no proof-eligible exact operation to reuse.
-    // Its server-owned stale rejection still authorizes one bounded direct
-    // validator; the action matcher below requires positive-proof eligibility.
-    if validation_operation.is_none() && validation_state != WorkValidationState::Stale {
-        return;
-    }
-    let needs_proven_validation = validation_operation.is_none();
-
-    // Reserve the selected recovery action and truthful settlement. A matched
-    // repair/revalidation transition reserves its dependent action only when
-    // the executor records the outcome; preserve any already-authorized
-    // ordinary headroom.
-    if state.remaining_turns < 2 {
-        mark_work_settlement_incomplete(state);
-        return;
-    }
-    let consumes_repair_opportunity = failed_validation_requiring_revalidation.is_none()
-        || matches!(next_action, CompletionAction::CanonicalWorkRepair);
-    state
-        .hooks
-        .completion_settlement
-        .canonical_validation_recovery_retries = if consumes_repair_opportunity { 1 } else { 0 };
-    state
-        .hooks
-        .completion_settlement
-        .canonical_validation_recovery_failed_action_retries = 0;
-    state
-        .hooks
-        .completion_settlement
-        .canonical_validation_recovery_operation = validation_operation;
-
-    state.hooks.completion_settlement.work_settlement_only = false;
-    state.hooks.completion_settlement.text_only = false;
-    state.hooks.completion_settlement.wrapup_origin = None;
-    state.budget_wrapup_injected = false;
-    state.hooks.completion_settlement.completion_action_window =
-        Some(super::host::CompletionActionWindow {
-            action: next_action.clone(),
-            attempts_remaining: 1,
-            mismatch_corrections_remaining: 1,
-            consumed: false,
-            matched: false,
-        });
-    state.push_volatile_payload(
-        super::host::VolatileKind::FinalAnswerSettlement,
-        serde_json::json!({
-            "schema": "canonical_validation_recovery.v1",
-            "signal": if matches!(next_action, CompletionAction::CanonicalWorkRepair) {
-                "canonical_validation_failed_repair_once"
-            } else if failed_declared_opaque_verification {
-                "declared_verification_failed_revalidate_exact_operation"
-            } else if failed_validation_requiring_revalidation.is_some() {
-                "canonical_validation_failed_before_workspace_change_revalidate_exact_operation"
-            } else if needs_proven_validation {
-                "canonical_validation_success_unverified_revalidate_once"
-            } else {
-                "canonical_validation_repair_already_executed_revalidate_once"
-            },
-            "origin": "rejected_work_settlement",
-            "allowed_action": next_action,
-            "attempts_remaining": 1,
-            "next_required_action": if matches!(next_action, CompletionAction::CanonicalWorkRepair) {
-                serde_json::json!(CompletionAction::CanonicalWorkValidation)
-            } else {
-                serde_json::json!("settle_work_item")
-            },
-            "instruction": if matches!(next_action, CompletionAction::CanonicalWorkRepair) {
-                "The owned WorkItem could not be delivered because the runtime-recognized project validation failed. Make one smallest workspace change that addresses it; the next boundary requires the same class of direct standard project build/test validation. Then settle the currently owned WorkItem truthfully. Do not resume broad exploration."
-            } else if failed_declared_opaque_verification {
-                "The declared verification did not complete successfully. Retry that exact verification with the same arguments, then settle the owned WorkItem truthfully. Do not resume broad exploration."
-            } else if needs_proven_validation {
-                "The last validation attempt completed, but its command arguments cannot prove that project validation ran. Run one direct standard project build/test validator with unambiguous arguments, then settle the owned WorkItem truthfully."
-            } else if matches!(rejected_validation_state, Some(RejectedWorkValidationState::Stale)) {
-                "The owned WorkItem could not be delivered because the last canonical project validation is stale after later workspace changes. Rerun the same class of direct standard project build/test validation, then settle the currently owned WorkItem truthfully. Do not resume broad exploration."
-            } else if failed_validation_requiring_revalidation.is_some() {
-                "The unresolved canonical validation failed before a later workspace change. Rerun that exact validation operation before making another workspace change. If the fresh result still fails, the runtime will open only the bounded repair required by that result. Then settle the currently owned WorkItem truthfully. Do not resume broad exploration."
-            } else {
-                "The owned WorkItem could not be delivered because the runtime-recognized project validation failed. A bounded workspace repair already executed in this same boundary, so rerun the same class of direct standard project build/test validation next. Then settle the currently owned WorkItem truthfully. Do not resume broad exploration."
-            },
-            "authority": "canonical_work_validation_outcome",
-        }),
-    );
-}
-
-#[cfg(test)]
 fn advance_completion_action_window_after_tool_round_for_work_state(
     state: &mut AgenticLoopState,
     active_work_attempt: bool,
 ) {
-    let new_records_start = state.stall.tool_call_records.len().saturating_sub(1);
-    advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-        state,
-        active_work_attempt,
-        new_records_start,
-    );
-}
-
-/// Reopen the selected typed action without replenishing its mismatch or
-/// recovery budget. The caller explicitly owns any one-shot budget change.
-fn restart_completion_action_window(state: &mut AgenticLoopState, action: &CompletionAction) {
-    if let Some(window) = state
-        .hooks
-        .completion_settlement
-        .completion_action_window
-        .as_mut()
-    {
-        window.action = action.clone();
-        window.attempts_remaining = 1;
-        window.consumed = false;
-        window.matched = false;
-    }
-}
-
-fn advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-    state: &mut AgenticLoopState,
-    active_work_attempt: bool,
-    new_records_start: usize,
-) {
-    let validation = WorkValidationEvidence::collect(state, active_work_attempt);
-    let pending_action =
-        match pending_completion_action_with_validation(state, active_work_attempt, || {
-            validation.state
-        }) {
-            Ok(action) => action,
-            Err(error) => {
-                finish_unavailable_verification(state, error);
-                return;
-            }
-        };
-    // Repair authority is per canonical Work attempt. A new structured
-    // assignment, or a successful typed settlement that closes the prior
-    // attempt, must not inherit either the one-shot budget or its validation
-    // operation identity. Rejected/deferred lifecycle records do not satisfy
-    // this predicate and therefore cannot reset the bound.
-    if state
-        .stall
-        .tool_call_records
-        .get(new_records_start..)
-        .is_some_and(|records| records.iter().any(record_starts_fresh_work_attempt))
-    {
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries = 0;
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_failed_action_retries = 0;
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = None;
-    }
-
+    let pending_action = match pending_completion_action(state) {
+        Ok(action) => action,
+        Err(error) => {
+            finish_unavailable_verification(state, error);
+            return;
+        }
+    };
     let Some(window) = state
         .hooks
         .completion_settlement
         .completion_action_window
-        .clone()
+        .as_ref()
     else {
         return;
     };
-
     if !window.consumed {
         return;
     }
-
-    let round_records = state.stall.tool_call_records.get(new_records_start..);
-    // A repair boundary is a commitment to make one *effective* correction,
-    // not a commitment to accept the first failed write request as progress.
-    // Tool admission happens before execution, so a syntactically matching
-    // repair can still fail on an atomic precondition (a stale or ambiguous
-    // edit anchor is the common example).  Treating that outcome as having
-    // spent the repair authority creates a catch-22: the model has received a
-    // deterministic correction from the tool but cannot apply it.  We permit
-    // one bounded retry of the same repair obligation.  This does not reopen
-    // general exploration, does not make the failed result evidence of
-    // progress, and still requires the original canonical validation before
-    // a WorkItem can be settled.
-    //
-    // The extra correction budget is intentionally scoped to the repair
-    // window.  Other completion actions retain their single-attempt contract;
-    // a second failed repair remains terminal and must be reported
-    // truthfully.  Failed processes may have left partial state, so the
-    // retry instruction explicitly requires a corrective mutation rather
-    // than assuming the workspace is unchanged.
-    let repair_execution_failed = matches!(window.action, CompletionAction::CanonicalWorkRepair)
-        && window.matched
-        && state
-            .stall
-            .tool_call_records
-            .get(new_records_start..)
-            .is_some_and(|records| {
-                records
-                    .iter()
-                    .any(|record| record.was_executed() && !record.ok)
-            });
-    if active_work_attempt
-        && repair_execution_failed
-        && state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_failed_action_retries
-            == 0
-    {
-        restart_completion_action_window(state, &window.action);
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_failed_action_retries = 1;
-        state.hooks.completion_settlement.text_only = false;
-        state.hooks.completion_settlement.work_settlement_only = false;
-        state.budget_wrapup_injected = false;
-        state.push_volatile_payload(
-            super::host::VolatileKind::FinalAnswerSettlement,
-            serde_json::json!({
-                "schema": "canonical_validation_recovery.v1",
-                "signal": "canonical_work_repair_failed_retry_once",
-                "allowed_action": CompletionAction::CanonicalWorkRepair,
-                "attempts_remaining": 1,
-                "next_required_action": CompletionAction::CanonicalWorkValidation,
-                "instruction": "The bounded repair did not complete successfully, so it did not advance validation. Make one corrected workspace mutation now; it may need to account for partial state from the failed attempt. The next boundary requires the same class of direct standard project build/test validation. Do not resume broad exploration.",
-                "authority": "executed_tool_outcome",
-            }),
-        );
-        return;
-    }
     if active_work_attempt
         && window.matched
-        && matches!(window.action, CompletionAction::CanonicalWorkRepair)
-        && round_records
-            .is_some_and(|records| records.iter().any(record_is_effective_workspace_repair))
-        && matches!(
-            validation.state,
-            WorkValidationState::Stale | WorkValidationState::Failed
-        )
-        && matches!(
-            pending_action,
-            Some(CompletionAction::CanonicalWorkValidation)
-        )
-    {
-        let next_action = CompletionAction::CanonicalWorkValidation;
-        restart_completion_action_window(state, &next_action);
-        state.hooks.completion_settlement.text_only = false;
-        state.budget_wrapup_injected = false;
-        state.push_volatile_payload(
-            super::host::VolatileKind::FinalAnswerSettlement,
-            serde_json::json!({
-                "schema": "completion_settlement.v2",
-                "signal": "typed_completion_action_available",
-                "mode": if active_work_attempt { "bounded_completion_then_work_settlement" } else { "bounded_completion_chain" },
-                "allowed_action": next_action,
-                "attempts_remaining": 1,
-                "action_hint": completion_action_hint_for_state(state, &next_action),
-                "declarations_may_remain_visible_for_cache": true,
-                "execution_authority": "one_matching_action",
-                "instruction": if active_work_attempt {
-                    "The bounded workspace action completed. Perform exactly one action matching the next typed completion obligation, then settle the currently owned WorkItem truthfully with settle_work_item. Do not resume ordinary exploration or request an unrelated tool."
-                } else {
-                    "The bounded workspace action completed. Perform exactly one action matching the next typed completion obligation, then produce the final answer. Do not resume ordinary exploration or request an unrelated tool."
-                },
-                "authority": "typed_turn_intent_and_executed_tool_ledger",
-            }),
-        );
-        return;
-    }
-
-    if active_work_attempt
-        && window.matched
-        && matches!(window.action, CompletionAction::CanonicalWorkValidation)
+        && pending_action.is_none()
         && !workspace_observation_is_quarantined(state)
-        && validation.state == WorkValidationState::Stale
-        && validation.failed_operation().is_none()
-        && round_records.is_some_and(|records| {
-            records.iter().any(|record| {
-                record.was_executed()
-                    && (astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
-                        || super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record))
-                    && record.authoritative_args_full().is_some_and(|args| {
-                        astra_turn_core::evaluation::normalize_validation_attempt_prefix(
-                            &record.name,
-                            args,
-                        )
-                        .is_some()
-                            && astra_turn_core::evaluation::normalize_validation_prefix(
-                                &record.name,
-                                args,
-                            )
-                            .is_none()
-                    })
-            })
-        })
     {
-        // The exact retry discharged its failure, but cannot certify that a
-        // project check ran. Reserve one dependent proof step before handing
-        // the WorkItem back to settlement-only authority.
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = None;
-        restart_completion_action_window(state, &window.action);
-        state.hooks.completion_settlement.text_only = false;
-        state.budget_wrapup_injected = false;
-        state.push_volatile_payload(
-            super::host::VolatileKind::FinalAnswerSettlement,
-            serde_json::json!({
-                "schema": "canonical_validation_recovery.v1",
-                "signal": "canonical_validation_exact_retry_unverified_revalidate_once",
-                "allowed_action": CompletionAction::CanonicalWorkValidation,
-                "attempts_remaining": 1,
-                "next_required_action": "settle_work_item",
-                "instruction": "The failed validation attempt has been retried successfully, but its arguments still cannot prove that project validation ran. Run one direct standard project build/test validator with unambiguous arguments, then settle the owned WorkItem truthfully.",
-                "authority": "canonical_work_validation_outcome",
-            }),
-        );
-        return;
-    }
-
-    if active_work_attempt
-        && window.matched
-        && matches!(window.action, CompletionAction::CanonicalWorkValidation)
-        && !workspace_observation_is_quarantined(state)
-        && matches!(validation.state, WorkValidationState::Failed)
-        && state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries
-            == 0
-        && let Some(failed_operation) = validation
-            .failed_operation_since(
-                new_records_start,
-                state
-                    .hooks
-                    .completion_settlement
-                    .canonical_validation_recovery_operation
-                    .as_deref(),
-            )
-            .map(str::to_owned)
-    {
-        // A failed final validation is decisive new evidence, not proof that
-        // the task cannot be repaired. Reuse the reserved settlement boundary
-        // for one focused repair and add only the following revalidation
-        // boundary. A second validation failure must settle truthfully.
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries = 1;
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_failed_action_retries = 0;
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = Some(failed_operation.clone());
-        if let Some(window) = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-        {
-            window.mismatch_corrections_remaining = 1;
-        }
-        restart_completion_action_window(state, &CompletionAction::CanonicalWorkRepair);
-        state.hooks.completion_settlement.text_only = false;
-        state.hooks.completion_settlement.work_settlement_only = false;
-        state.budget_wrapup_injected = false;
-        state.push_volatile_payload(
-            super::host::VolatileKind::FinalAnswerSettlement,
-            serde_json::json!({
-                "schema": "canonical_validation_recovery.v1",
-                "signal": "canonical_validation_failed_repair_once",
-                "allowed_action": CompletionAction::CanonicalWorkRepair,
-                "attempts_remaining": 1,
-                "next_required_action": CompletionAction::CanonicalWorkValidation,
-                "instruction": "The runtime-recognized project validation failed. Make one smallest workspace change that addresses it; the next boundary requires the same class of direct standard project build/test validation. Then settle the currently owned WorkItem truthfully. Do not resume broad exploration.",
-                "authority": "canonical_work_validation_outcome",
-            }),
-        );
-        return;
-    }
-
-    if active_work_attempt
-        && window.matched
-        && !workspace_observation_is_quarantined(state)
-        && (pending_action.is_none()
-            || (matches!(window.action, CompletionAction::CanonicalWorkRepair)
-                && repair_execution_failed
-                && state
-                    .hooks
-                    .completion_settlement
-                    .canonical_validation_recovery_failed_action_retries
-                    > 0)
-            || (matches!(window.action, CompletionAction::CanonicalWorkValidation)
-                && matches!(
-                    validation.state,
-                    WorkValidationState::Failed | WorkValidationState::Stale
-                )))
-    {
-        // An active canonical Work attempt owns the terminal claim. Once the
-        // one bounded completion action has run, hand authority back to its
-        // truthful settlement operation instead of forcing final prose. The
-        // handoff is valid after the ledger proves that ordinary completion
-        // obligations are gone. Canonical Work validation is the one
-        // exception: after its single attempt, the Work lifecycle must still
-        // be allowed to record a truthful failed/blocked outcome. Delivery
-        // remains protected by the server's validation-state gate. A
-        // rejected or unmatched action never acquires settlement authority.
         state.hooks.completion_settlement.completion_action_window = None;
         state.hooks.completion_settlement.work_settlement_only = true;
         state.hooks.completion_settlement.text_only = false;
@@ -2251,16 +1630,12 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
             serde_json::json!({
                 "schema": "work_settlement_required.v1",
                 "signal": "completion_action_attempted_settle_work",
-                "instruction": "The bounded completion action has finished. Settle the currently owned WorkItem now with its truthful outcome using settle_work_item. Do not request any other tool or return prose.",
+                "instruction": "The declared checks finished. Settle the currently owned WorkItem with its observed outcome using settle_work_item.",
                 "authority": "canonical_work_lifecycle",
             }),
         );
         return;
     }
-
-    // Outside canonical Work, or when its bounded action did not settle the
-    // typed obligation, keep the current window auditable until the final-text
-    // boundary renders a truthful incomplete result.
     state.hooks.completion_settlement.text_only = true;
     project_completion_action_text_settlement(state);
 }
@@ -5835,87 +5210,11 @@ fn prompt_cache_eligible_tokens_from_manifest(manifest: Option<&serde_json::Valu
         .and_then(serde_json::Value::as_u64)
 }
 
-/// Positive mutation shape is retained even when the command failed: the
-/// executor may have written a partial result before returning an error.
-#[cfg(test)]
-fn has_executed_positive_workspace_mutation(state: &AgenticLoopState) -> bool {
-    state.stall.tool_call_records.iter().any(|record| {
-        tool_record_may_have_mutated_bound_workspace(
-            state.hooks.workspace_root_hint.as_deref(),
-            record,
-        )
-    })
-}
-
-/// Conservative invalidation fact: an executed writer may have changed the
-/// bound workspace even when it failed or lacks a positive completion receipt.
-/// This is deliberately weaker than completion authority. It may invalidate an
-/// older validation receipt, but it can never satisfy a mutation requirement.
-pub(super) fn tool_record_may_have_mutated_bound_workspace(
-    workspace_root: Option<&str>,
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if !record.was_executed() || !tool_record_has_positive_mutation_shape(record) {
-        return false;
-    }
-    // Compound read/inspect commands often materialize a snapshot under
-    // /tmp before reading it. The executor already proved that every writer
-    // target is external scratch; do not turn that typed proof into a global
-    // post-mutation observation obligation merely because the command also
-    // mentions the bound repository in its read-only producer.
-    if record_is_proven_external_scratch_mutation(workspace_root, record) {
-        return false;
-    }
-    !super::lifecycle::record_explicit_path(record).is_some_and(|path| {
-        super::lifecycle::path_is_external_volatile_scratch(&path, workspace_root)
-    })
-}
-
-/// A successful mutation receipt is stronger than an admission-time risk
-/// classification. `args_preview` is display data, never an execution
-/// contract, while known direct writers remain positive even when an old
-/// journal entry has no structured argument payload.
-pub(crate) fn tool_record_has_positive_mutation_shape(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    // The shell executor can observe mutations that are invisible to any
-    // command-shape classifier (inline interpreters, generated helpers, and
-    // project-specific writers). A foreground-process-group receipt is valid
-    // current-turn evidence that bytes changed, but is deliberately not
-    // durable authority: `runtime_args_full` is skipped by serde, so the same
-    // weak receipt cannot satisfy completion after checkpoint restore.
-    if record_has_live_workspace_mutation_receipt(record) {
-        return true;
-    }
-    if crate::turn::tool_side_effects::tool_classified_from_arguments(&record.name) {
-        let args = super::lifecycle::extract_tool_args(record.authoritative_args_full());
-        return args.as_ref().is_some_and(|args| {
-            crate::turn::tool_side_effects::tool_call_records_workspace_mutation(
-                &record.name,
-                Some(args),
-            )
-        });
-    }
-
-    // Direct workspace writers are typed by tool name. Their preview/full
-    // payload is useful for scoping a target, but it is not needed to know
-    // that the executor ran a writer. Never let a lossy preview or malformed
-    // payload erase that typed execution fact.
-    crate::turn::tool_side_effects::tool_call_records_workspace_mutation(&record.name, None)
-}
-
-pub(crate) fn record_has_trusted_workspace_mutation_receipt(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    record_has_bound_workspace_receipt(record)
-        .is_some_and(astra_tools::workspace_observation::is_authoritative_changed_receipt)
-}
-
 /// A bound executor receipt that is still attached to the live invocation.
 /// This admits weaker foreground-process-group provenance for the current
 /// completion chain without promoting it to durable cache, renewal, or resume
 /// authority. Restored records have no `runtime_args_full` by contract.
-fn record_has_live_workspace_mutation_receipt(
+pub(super) fn record_has_live_workspace_mutation_receipt(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
     record.runtime_args_full.is_some()
@@ -5943,7 +5242,7 @@ pub(crate) fn record_has_weak_workspace_mutation_receipt(
         .is_some_and(astra_tools::workspace_observation::is_weak_changed_receipt)
 }
 
-fn record_has_trusted_partial_workspace_mutation_receipt(
+pub(super) fn record_has_trusted_partial_workspace_mutation_receipt(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
     matches!(record.name.as_str(), "str_replace" | "lsp")
@@ -6000,656 +5299,65 @@ pub fn workspace_observation_quarantine_from_records(
     Some(quarantine)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkValidationState {
-    None,
-    Failed,
-    Stale,
-    Passed,
-}
-
-fn record_starts_fresh_work_attempt(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if !record.ok
-        || record.effective_disposition()
-            != astra_services::session_journal::ToolCallDisposition::Executed
-    {
-        return false;
-    }
-    if record.name == "settle_work_item" {
-        return true;
-    }
-    let Some(result) = record
-        .result_full
-        .as_deref()
-        .and_then(|result| serde_json::from_str::<serde_json::Value>(result).ok())
-    else {
-        return false;
-    };
-    let assignment = match record.name.as_str() {
-        "run_next_work_item" => &result,
-        "start_work" => match result.get("initial_task") {
-            Some(initial_task) => initial_task,
-            None => return false,
-        },
-        _ => return false,
-    };
-    assignment.get("status").and_then(serde_json::Value::as_str) == Some("assigned")
-        && assignment
-            .get("execution")
-            .and_then(serde_json::Value::as_str)
-            == Some("primary_session")
-        && assignment
-            .get("attempt_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|attempt_id| !attempt_id.trim().is_empty())
-}
-
-/// A Work obligation comes from a recognized validator or an explicit verify
-/// request. An unscannable ordinary command supplies neither validation debt
-/// nor validation proof; its effects and custody are checked independently.
-pub(crate) fn classify_work_validation_attempt(
-    name: &str,
-    args: &str,
-) -> Option<(astra_turn_core::evaluation::ValidationAttempt, bool)> {
-    let attempt = astra_turn_core::evaluation::classify_validation_attempt(name, args)?;
-    let opaque = matches!(
-        attempt,
-        astra_turn_core::evaluation::ValidationAttempt::Opaque(_)
-    );
-    let declared = opaque
-        && super::lifecycle::extract_tool_args(Some(args)).is_some_and(|args| {
-            astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-                name, &args,
-            )
-        });
-    (!opaque || declared).then_some((attempt, declared))
-}
-
-fn classify_record_validation_attempt(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> Option<(astra_turn_core::evaluation::ValidationAttempt, bool)> {
-    classify_work_validation_attempt(&record.name, record.authoritative_args_full()?)
-}
-
-/// Only a completed, known-negative custom verification may reserve a retry.
-/// Its transport `ok` flag may describe successful delivery of a negative
-/// command result, so use the existing source-authored outcome taxonomies.
-fn record_can_retry_declared_verification(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    use astra_tools::exit_semantics::{CommandResultClass, ExitSemantics};
-
-    let semantics = record.exit_semantics.as_ref().and_then(|semantics| {
-        serde_json::from_value::<ExitSemantics>(serde_json::Value::String(semantics.clone())).ok()
-    });
-    let result_class = record
-        .result_class
-        .as_ref()
-        .map(|class| {
-            serde_json::from_value::<CommandResultClass>(serde_json::Value::String(class.clone()))
-        })
-        .transpose();
-    let Ok(result_class) = result_class else {
-        return false;
-    };
-    record.was_executed()
-        && matches!(
-            (semantics, result_class),
-            (
-                Some(ExitSemantics::EmptyResult),
-                None | Some(CommandResultClass::EmptyResult)
-            ) | (
-                Some(ExitSemantics::DomainNegative),
-                None | Some(
-                    CommandResultClass::DomainNegative
-                        | CommandResultClass::TestFailure
-                        | CommandResultClass::EnvFailure
-                        | CommandResultClass::Inconclusive
-                )
-            ) | (
-                Some(ExitSemantics::ExecutionError),
-                None | Some(
-                    CommandResultClass::ExecutionError
-                        | CommandResultClass::TestFailure
-                        | CommandResultClass::EnvFailure
-                )
-            )
-        )
-        && record
-            .error_kind
-            .is_none_or(|kind| kind == astra_core::ErrorKind::Unknown)
-        && record.workspace_mutation_observed != Some(true)
-        && record.workspace_mutation_partial != Some(true)
-        && record
-            .workspace_mutation_partial_paths
-            .as_ref()
-            .is_none_or(Vec::is_empty)
-}
-
-/// Ephemeral evidence for one completion/admission boundary. Operation debts
-/// retain their last failure index; no new persisted validation state is needed.
-struct WorkValidationEvidence {
-    state: WorkValidationState,
-    unresolved_operations: Vec<(String, usize)>,
-    latest_validation_operation: Option<String>,
-    last_workspace_mutation_index: Option<usize>,
-}
-
-impl WorkValidationEvidence {
-    fn collect(state: &AgenticLoopState, active_work_attempt: bool) -> Self {
-        let mut evidence = Self {
-            state: WorkValidationState::None,
-            unresolved_operations: Vec::new(),
-            latest_validation_operation: None,
-            last_workspace_mutation_index: None,
-        };
-        if !active_work_attempt {
-            return evidence;
-        }
-        let mut saw_validation = false;
-        let mut saw_current_positive_validation = false;
-        let mut saw_unverified_validation_success = false;
-        let mut validation_is_stale = false;
-        let records = &state.stall.tool_call_records;
-        let attempt_start = records
-            .iter()
-            .rposition(record_starts_fresh_work_attempt)
-            .map_or(0, |index| index.saturating_add(1));
-        for (index, record) in records.iter().enumerate().skip(attempt_start) {
-            if !record.was_executed() {
-                continue;
-            }
-            let args = record.authoritative_args_full();
-            let attempt = classify_record_validation_attempt(record);
-            let opaque_declared = attempt.as_ref().is_some_and(|(_, declared)| *declared);
-            // Unknown shell effects can stale existing proof without inventing
-            // a validator obligation for an ordinary read/fetch task.
-            let unknown_effect_risk = saw_validation
-                && attempt.is_none()
-                && record.name == "bash"
-                && !record_is_proven_external_scratch_mutation(
-                    state.hooks.workspace_root_hint.as_deref(),
-                    record,
-                )
-                && super::lifecycle::extract_tool_args(args).is_none_or(|args| {
-                    crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
-                        &record.name,
-                        Some(&args),
-                    )
-                });
-            if (tool_record_may_have_mutated_bound_workspace(
-                state.hooks.workspace_root_hint.as_deref(),
-                record,
-            ) || unknown_effect_risk) && !(record.workspace_mutation_partial != Some(true)
-                && (super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
-                    || (opaque_declared
-                        && super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record))))
-            {
-                evidence.last_workspace_mutation_index = Some(index);
-                if saw_validation {
-                    validation_is_stale = true;
-                    saw_current_positive_validation = false;
-                    saw_unverified_validation_success = false;
-                }
-            }
-            let Some(args) = args else {
-                continue;
-            };
-            let Some((attempt, _)) = attempt else {
-                continue;
-            };
-            let operation = attempt.into_identity();
-            if opaque_declared {
-                // A declared custom verifier can clear only its own failure;
-                // it is not named project validation. An unsuccessful or
-                // unverified invocation may have changed prior validated
-                // state, unless the executor separately proved no change.
-                if super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
-                    record,
-                ) {
-                    evidence
-                        .unresolved_operations
-                        .retain(|(candidate, _)| candidate != &operation);
-                } else {
-                    if saw_validation
-                        && (record.workspace_mutation_partial == Some(true)
-                            || !super::lifecycle::is_authoritative_unchanged_bash_observation_record(
-                                record,
-                            ))
-                    {
-                        validation_is_stale = true;
-                        saw_current_positive_validation = false;
-                        saw_unverified_validation_success = false;
-                    }
-                    evidence
-                        .unresolved_operations
-                        .retain(|(candidate, _)| candidate != &operation);
-                    evidence.unresolved_operations.push((operation, index));
-                }
-                continue;
-            }
-            saw_validation = true;
-            let positive = astra_turn_core::evaluation::tool_outcome_is_positive_success(record)
-                || (record.ok
-                    && super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
-                        record,
-                    ));
-            let proof_operation =
-                astra_turn_core::evaluation::normalize_validation_prefix(&record.name, args);
-            let arguments_prove_validation = proof_operation.is_some();
-            let proof_operation = proof_operation.filter(|_| {
-                record.workspace_mutation_observed != Some(true)
-                    && record.workspace_mutation_partial != Some(true)
-                    && super::lifecycle::extract_tool_args(Some(args)).is_some_and(|args| {
-                        super::lifecycle::bash_invocation_has_scoped_workspace_observation(
-                            state.hooks.workspace_root_hint.as_deref(),
-                            &args,
-                        )
-                    })
-            });
-            if let Some(proof_operation) = proof_operation.as_ref() {
-                evidence.latest_validation_operation = Some(proof_operation.clone());
-            }
-            // Only the same canonical operation discharges a failure. A
-            // narrowed or differently flagged command supplies independent evidence.
-            if !positive {
-                evidence
-                    .unresolved_operations
-                    .retain(|(candidate, _)| candidate != &operation);
-                evidence.unresolved_operations.push((operation, index));
-                // A fresh failed validator exposes debt even after a mutation.
-                validation_is_stale = false;
-            } else if proof_operation.is_some() {
-                evidence
-                    .unresolved_operations
-                    .retain(|(candidate, _)| candidate != &operation);
-                validation_is_stale = false;
-                saw_current_positive_validation = true;
-            } else {
-                if !arguments_prove_validation {
-                    // An attempt-only invocation can resolve its own execution
-                    // failure, but it cannot preserve earlier validation proof.
-                    evidence
-                        .unresolved_operations
-                        .retain(|(candidate, _)| candidate != &operation);
-                }
-                saw_current_positive_validation = false;
-                // Invocation success without proof-eligible arguments cannot
-                // authorize delivery, even when its exact failure is cleared.
-                saw_unverified_validation_success = true;
-            }
-        }
-        evidence.state = if validation_is_stale {
-            WorkValidationState::Stale
-        } else if !evidence.unresolved_operations.is_empty() {
-            WorkValidationState::Failed
-        } else if saw_current_positive_validation {
-            WorkValidationState::Passed
-        } else if saw_unverified_validation_success {
-            WorkValidationState::Stale
-        } else {
-            WorkValidationState::None
-        };
-        evidence
-    }
-
-    fn failed_operation(&self) -> Option<&str> {
-        self.unresolved_operations
-            .last()
-            .map(|(operation, _)| operation.as_str())
-    }
-
-    fn failed_operation_requiring_revalidation(&self) -> Option<&str> {
-        let (operation, failure_index) = self.unresolved_operations.last()?;
-        self.last_workspace_mutation_index
-            .is_some_and(|mutation_index| mutation_index > *failure_index)
-            .then_some(operation.as_str())
-    }
-
-    fn recovery_operation(&self) -> Option<&str> {
-        self.failed_operation()
-            .or(self.latest_validation_operation.as_deref())
-    }
-
-    fn failed_operation_since(&self, start: usize, expected: Option<&str>) -> Option<&str> {
-        self.unresolved_operations
-            .iter()
-            .rev()
-            .find_map(|(operation, index)| {
-                (*index >= start && expected.is_none_or(|expected| expected == operation))
-                    .then_some(operation.as_str())
-            })
-    }
-}
-
-/// Current Work validation derived at the caller's boundary, without a cache
-/// whose lifetime could outlive permissions, execution or a new Work attempt.
-pub(crate) fn current_work_validation_state(state: &AgenticLoopState) -> WorkValidationState {
-    WorkValidationEvidence::collect(state, true).state
-}
-
-fn failed_work_validation_operation(state: &AgenticLoopState) -> Option<String> {
-    WorkValidationEvidence::collect(state, true)
-        .failed_operation()
-        .map(str::to_owned)
-}
-
-#[cfg(test)]
-fn failed_work_validation_operation_requiring_revalidation(
-    state: &AgenticLoopState,
-) -> Option<String> {
-    WorkValidationEvidence::collect(state, true)
-        .failed_operation_requiring_revalidation()
-        .map(str::to_owned)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RejectedWorkValidationState {
-    Failed,
-    Stale,
-}
-
-/// Only a server-owned unresolved-validation rejection reopens one bounded
-/// Work recovery edge. A user/tool schema rejection, a failed executor
-/// settlement, or another lifecycle error must stay at truthful settlement.
-fn record_rejected_work_validation_state(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> Option<RejectedWorkValidationState> {
-    if record.name != "settle_work_item"
-        || !matches!(
-            record.effective_disposition(),
-            astra_services::session_journal::ToolCallDisposition::Rejected
-        )
-    {
-        return None;
-    }
-
-    let payload = serde_json::from_str::<serde_json::Value>(record.result_full.as_deref()?).ok()?;
-    if payload.get("status").and_then(serde_json::Value::as_str) != Some("rejected")
-        || payload
-            .get("error_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("unresolved_work_validation")
-    {
-        return None;
-    }
-
-    match payload
-        .get("validation_state")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("failed") => Some(RejectedWorkValidationState::Failed),
-        Some("stale") => Some(RejectedWorkValidationState::Stale),
-        _ => None,
-    }
-}
-
-/// A successful repair attempt can advance to revalidation. An opaque shell
-/// cannot prove it changed a file, so its result only schedules the actual
-/// validation; it is not evidence that the repair succeeded.
-fn record_is_effective_workspace_repair(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    record.execution_succeeded()
-        && (super::lifecycle::record_has_typed_workspace_tool_receipt(record)
-            || (record.name == "bash"
-                && super::lifecycle::extract_tool_args(record.authoritative_args_full())
-                    .is_some_and(|args| {
-                        crate::turn::tool_side_effects::tool_call_may_mutate_workspace(
-                            &record.name,
-                            Some(&args),
-                        )
-                    })))
-}
-
-/// Project the one completion action that is already justified by typed
-/// intent and the executed-tool ledger.  This deliberately does not inspect
-/// user prose, tool names beyond their side-effect classification, or policy
-/// advisory signals.
+/// Only explicitly declared checks create a runtime completion obligation.
+/// Tool results remain evidence for the model and canonical Work owner; the
+/// runtime does not infer a project-validation contract from shell syntax.
 pub(crate) fn pending_completion_action(
     state: &AgenticLoopState,
-) -> Result<Option<CompletionAction>, VerificationRecoveryError> {
-    let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
-        crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
-    );
-    pending_completion_action_for_work_state(state, active_work_attempt)
-}
-
-pub(crate) fn pending_completion_action_for_work_state(
-    state: &AgenticLoopState,
-    active_work_attempt: bool,
-) -> Result<Option<CompletionAction>, VerificationRecoveryError> {
-    pending_completion_action_with_validation(state, active_work_attempt, || {
-        current_work_validation_state(state)
-    })
-}
-
-fn pending_completion_action_with_validation(
-    state: &AgenticLoopState,
-    active_work_attempt: bool,
-    validation_state: impl FnOnce() -> WorkValidationState,
 ) -> Result<Option<CompletionAction>, VerificationRecoveryError> {
     let missing = missing_explicit_verification_hooks(state)?;
     if workspace_observation_is_quarantined(state) {
         return Ok(None);
     }
-    if active_work_attempt
-        && matches!(
-            validation_state(),
-            WorkValidationState::Failed | WorkValidationState::Stale
-        )
-    {
-        return Ok(Some(CompletionAction::CanonicalWorkValidation));
-    }
-    if let Some(missing_labels) = missing.filter(|missing| !missing.is_empty()) {
-        return Ok(Some(CompletionAction::ExplicitVerification {
-            missing_labels,
-        }));
-    }
-    Ok(None)
+    Ok(missing
+        .filter(|labels| !labels.is_empty())
+        .map(|missing_labels| CompletionAction::ExplicitVerification { missing_labels }))
 }
 
-/// Select the single task-facing action available only at a hard terminal
-/// slice. Unknown/MayMutate intent cannot justify forcing a write, while a
-/// missing concrete mutation cannot justify narrowing the boundary to an
-/// observation. One ordinarily admitted external action is the bounded,
-/// provider-neutral fallback. Explicit ReadOnly and active Work lifecycle
-/// paths retain their existing text/settlement boundaries.
-pub(crate) fn pending_terminal_completion_action_for_work_state(
-    state: &AgenticLoopState,
-    active_work_attempt: bool,
-) -> Result<Option<CompletionAction>, VerificationRecoveryError> {
-    pending_completion_action_for_work_state(state, active_work_attempt)
-}
-
-/// Project a bounded, provider-neutral explanation of the active completion
-/// obligation.  The payload is advisory presentation only; the exact matcher
-/// below remains the sole execution authority.  In particular, do not infer a
-/// path from prose, a truncated args preview, or a task name.
 pub(crate) fn completion_action_hint(action: &CompletionAction) -> serde_json::Value {
-    let mut accepted_action_shapes = Vec::new();
-    let (reason_code, latest_target, missing_labels): (&str, Option<String>, serde_json::Value) =
-        match action {
-            CompletionAction::ExplicitVerification { missing_labels } => (
-                "explicit_verification_missing",
-                None,
-                serde_json::json!(missing_labels),
-            ),
-            CompletionAction::CanonicalWorkValidation => {
-                accepted_action_shapes.push(serde_json::json!({
-                    "tool": "bash",
-                    "evidence_source": "prior_runtime_recognized_project_validation",
-                    "constraint": "run one direct standard project build/test validator; repeat an exact operation when bound, otherwise use unambiguous arguments; do not substitute a custom inline program, reader/probe, workspace mutation, or settlement call; arguments are re-checked by the runtime",
-                    "raw_arguments_projected": false,
-                }));
-                (
-                    "work_validation_stale_or_failed",
-                    None,
-                    serde_json::Value::Null,
-                )
-            }
-            CompletionAction::CanonicalWorkRepair => {
-                accepted_action_shapes.push(serde_json::json!({
-                    "constraint": "one workspace mutation addressing the latest canonical validation failure; the runtime requires canonical revalidation next",
-                }));
-                (
-                    "canonical_work_validation_failed",
-                    None,
-                    serde_json::Value::Null,
-                )
-            }
-        };
-    let accepted_action_family = serde_json::json!(match action {
-        CompletionAction::ExplicitVerification { .. } => "declared_verification",
-        CompletionAction::CanonicalWorkValidation => "canonical_work_validation",
-        CompletionAction::CanonicalWorkRepair => "canonical_work_repair",
-    });
-
+    let CompletionAction::ExplicitVerification { missing_labels } = action;
     serde_json::json!({
         "hint_version": "completion_action_hint.v1",
-        "reason_code": reason_code,
-        "latest_known_stable_target": latest_target,
-        "accepted_action_family": accepted_action_family,
-        "accepted_action_shapes": accepted_action_shapes,
+        "reason_code": "explicit_verification_missing",
+        "latest_known_stable_target": null,
+        "accepted_action_family": "declared_verification",
+        "accepted_action_shapes": [],
         "missing_labels": missing_labels,
         "authority": "typed_completion_action_window",
     })
 }
 
-fn expected_completion_validation_operation(state: &AgenticLoopState) -> Option<String> {
-    state
-        .hooks
-        .completion_settlement
-        .canonical_validation_recovery_operation
-        .clone()
-        .or_else(|| {
-            state
-                .runtime_tool_executor
-                .as_deref()
-                .is_some_and(crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt)
-                .then(|| failed_work_validation_operation(state))
-                .flatten()
-        })
-}
-
-pub(crate) fn completion_action_hint_for_state(
-    state: &AgenticLoopState,
-    action: &CompletionAction,
-) -> serde_json::Value {
-    let mut hint = completion_action_hint(action);
-    if matches!(action, CompletionAction::CanonicalWorkValidation)
-        && expected_completion_validation_operation(state).is_some()
-    {
-        hint["accepted_action_shapes"] = serde_json::json!([{
-            "tool": "bash",
-            "evidence_source": "prior_runtime_recognized_validation_or_declared_verification",
-            "constraint": "repeat the exact previously selected validation or declared verification with the same arguments; the runtime checks the operation identity and outcome",
-            "raw_arguments_projected": false,
-        }]);
-    }
-
-    hint
-}
-
-fn completion_action_mismatch_instruction(
-    state: &AgenticLoopState,
-    action: &CompletionAction,
-    correction_available: bool,
-) -> &'static str {
-    if matches!(action, CompletionAction::CanonicalWorkValidation)
-        && expected_completion_validation_operation(state).is_some()
-    {
-        return if correction_available {
-            "This request did not match the selected validation or declared verification and was not executed. Retry that exact operation with the same arguments. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
-        } else {
-            "Only the exact previously selected validation or declared verification with the same arguments may execute at this boundary."
-        };
-    }
-
-    match (action, correction_available) {
-        (CompletionAction::CanonicalWorkValidation, true) => {
-            "This request did not match the typed completion obligation and was not executed. Rerun one direct standard project build/test validation previously recognized in this Work attempt; do not wrap it in a custom inline program. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
-        }
-        (CompletionAction::CanonicalWorkValidation, false) => {
-            "Only one direct standard project build/test validation matching the typed completion obligation may execute at this boundary; a custom inline program, reader/probe, mutation, or settlement call does not match."
-        }
-        (CompletionAction::CanonicalWorkRepair, true) => {
-            "This request did not match the bounded canonical-validation repair obligation and was not executed. Make exactly one workspace change; the runtime will require canonical revalidation next."
-        }
-        (CompletionAction::CanonicalWorkRepair, false) => {
-            "Only one workspace repair may execute after the failed canonical validation; the next boundary requires canonical revalidation."
-        }
-
-        (_, true) => {
-            "This request did not match the typed completion obligation and was not executed. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
-        }
-        (_, false) => {
-            "Only tool calls matching the typed completion obligation may execute at this boundary; each declared verification may be attempted at most once."
-        }
+fn completion_action_mismatch_instruction(correction_available: bool) -> &'static str {
+    if correction_available {
+        "This request did not match a declared check and was not executed. Correct it with one matching command."
+    } else {
+        "Only commands matching the remaining declared checks may execute at this boundary."
     }
 }
 
-/// Return the explicit hook identity matched by a call.  The label is used as
-/// the de-duplication key when several independent verification hooks are
-/// declared for one settlement boundary.
 pub(crate) fn completion_action_match_label(
     state: &AgenticLoopState,
     action: &CompletionAction,
     call: &serde_json::Value,
 ) -> Option<String> {
     let name = astra_turn_core::tool::args::shape::tool_call_name(call)?;
-    if name.trim().is_empty() {
-        return None;
-    }
     let args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call).ok();
-    match action {
-        CompletionAction::ExplicitVerification { missing_labels } => state
-            .hooks
-            .stop_hooks
-            .iter()
-            .find(|hook| {
-                hook.authoritative
-                    && missing_labels.iter().any(|label| label == &hook.label)
-                    && tool_call_verifies_explicit_hook(name, args.as_ref(), hook)
-            })
-            .map(|hook| hook.label.clone()),
-        CompletionAction::CanonicalWorkValidation => {
-            // Canonical Work validation is an obligation only while its
-            // primary Work attempt is active. A successful typed settlement
-            // closes that attempt, so a duplicate sibling result cannot
-            // resurrect its validation debt after the reset boundary.
-            let expected_operation = expected_completion_validation_operation(state);
-            let raw_args = call
-                .get("function")
-                .and_then(|function| function.get("arguments"))
-                .map(|arguments| match arguments {
-                    serde_json::Value::String(arguments) => arguments.clone(),
-                    other => other.to_string(),
-                });
-            raw_args
-                .and_then(|args| {
-                    if expected_operation.is_some() {
-                        astra_turn_core::evaluation::normalize_validation_attempt_prefix(
-                            name, &args,
-                        )
-                    } else {
-                        astra_turn_core::evaluation::normalize_validation_prefix(name, &args)
-                    }
-                })
-                .filter(|operation| {
-                    expected_operation
-                        .as_ref()
-                        .is_none_or(|expected| expected == operation)
-                })
-                .map(|_| "canonical_work_validation".to_string())
-        }
-        CompletionAction::CanonicalWorkRepair => {
-            crate::turn::tool_side_effects::tool_call_may_mutate_workspace(name, args.as_ref())
-                .then(|| "canonical_work_repair".to_string())
-        }
-    }
+    let CompletionAction::ExplicitVerification { missing_labels } = action;
+    state
+        .hooks
+        .stop_hooks
+        .iter()
+        .find(|hook| {
+            hook.authoritative
+                && missing_labels.iter().any(|label| label == &hook.label)
+                && tool_call_verifies_explicit_hook(
+                    name,
+                    args.as_ref(),
+                    hook,
+                    state.hooks.workspace_root_hint.as_deref(),
+                )
+        })
+        .map(|hook| hook.label.clone())
 }
 
 /// A single provider boundary may carry all missing independent verifiers,
@@ -6660,9 +5368,7 @@ pub(crate) fn completion_action_window_is_batchable(
     state: &AgenticLoopState,
     action: &CompletionAction,
 ) -> bool {
-    let CompletionAction::ExplicitVerification { missing_labels } = action else {
-        return true;
-    };
+    let CompletionAction::ExplicitVerification { missing_labels } = action;
     state.hooks.stop_hooks.iter().all(|hook| {
         !hook.authoritative
             || !missing_labels.iter().any(|label| label == &hook.label)
@@ -6703,7 +5409,6 @@ pub(crate) fn apply_completion_action_admission(
         return admission;
     }
 
-    let is_explicit_verification = matches!(&action, CompletionAction::ExplicitVerification { .. });
     // Completion obligations apply to logical operations, not their transport
     // carrier. Include rejected requests so a denied matching action consumes
     // its boundary without acquiring execution authority or a mismatch retry.
@@ -6725,15 +5430,11 @@ pub(crate) fn apply_completion_action_admission(
         .completion_action_window
         .as_ref()
         .is_some_and(|window| window.mismatch_corrections_remaining > 0);
-    let mut retained = Vec::with_capacity(if is_explicit_verification {
-        admission.admitted.len()
-    } else {
-        1
-    });
+    let mut retained = Vec::with_capacity(admission.admitted.len());
     let mut matched_labels = Vec::new();
     for call in admission.admitted.drain(..) {
         let match_label = completion_action_match_label(state, &action, call.logical_target_call());
-        let matches = if is_explicit_verification {
+        let matches = {
             match_label.as_ref().is_some_and(|label| {
                 if matched_labels.iter().any(|seen| seen == label) {
                     false
@@ -6742,8 +5443,6 @@ pub(crate) fn apply_completion_action_admission(
                     true
                 }
             })
-        } else {
-            retained.is_empty() && match_label.is_some()
         };
         if matches {
             retained.push(call);
@@ -6756,12 +5455,8 @@ pub(crate) fn apply_completion_action_admission(
                 "error_kind": "completion_action_mismatch",
                 "retryable": !requested_matching_action && correction_available,
                 "allowed_action": action.clone(),
-                "action_hint": completion_action_hint_for_state(state, &action),
-                "error": completion_action_mismatch_instruction(
-                    state,
-                    &action,
-                    !requested_matching_action && correction_available,
-                ),
+                "action_hint": completion_action_hint(&action),
+                "error": completion_action_mismatch_instruction(!requested_matching_action && correction_available),
             })
             .to_string(),
         });
@@ -6769,8 +5464,8 @@ pub(crate) fn apply_completion_action_admission(
     let matched = !retained.is_empty();
     admission.admitted = retained;
     if !requested_matching_action && correction_available {
-        let action_hint = completion_action_hint_for_state(state, &action);
-        let mismatch_instruction = completion_action_mismatch_instruction(state, &action, true);
+        let action_hint = completion_action_hint(&action);
+        let mismatch_instruction = completion_action_mismatch_instruction(true);
         if let Some(window) = state
             .hooks
             .completion_settlement
@@ -9258,120 +7953,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workspace_observation_explicit_writer_invalidates_previous_delivery_source() {
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/app".into());
-        let hook = explicit_verification_hook("writer verifier", "touch /app/marker");
-        let writer_verifier =
-            executed_record("bash", true, Some(r#"{"command":"touch /app/marker"}"#));
-        assert!(record_verifies_explicit_hook(&writer_verifier, &hook));
-        assert!(tool_record_may_have_mutated_bound_workspace(
-            Some("/app"),
-            &writer_verifier
-        ));
-        state.hooks.stop_hooks.push(hook);
-        state.stall.tool_call_records = vec![
-            executed_record("write_file", true, Some(r#"{"path":"/app/solution.py"}"#)),
-            writer_verifier,
-        ];
-        state
-            .stall
-            .verification_frontier
-            .advance(
-                Some("/app"),
-                &state.hooks.stop_hooks,
-                &state.stall.tool_call_records,
-            )
-            .unwrap();
-
-        state.stall.tool_call_records.push(executed_record(
-            "bash",
-            true,
-            Some(r#"{"command":"cd /app && python3 solution.py"}"#),
-        ));
-        state
-            .stall
-            .verification_frontier
-            .advance(
-                Some("/app"),
-                &state.hooks.stop_hooks,
-                &state.stall.tool_call_records,
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn restored_verification_error_cannot_settle_or_reopen_a_completion_window() {
-        for active_work in [false, true] {
-            let mut state = make_state();
-            state.stall.verification_frontier =
-                super::super::verification_frontier::tests::restored_read_only_prefix();
-            state
-                .hooks
-                .stop_hooks
-                .push(explicit_verification_hook("new contract", "./new-check"));
-            state.max_turns = 50;
-            state.remaining_turns = 0;
-            state.charged_iterations = 50;
-            state.budget_wrapup_injected = true;
-            state.hooks.completion_settlement.wrapup_origin =
-                Some(super::super::host::BudgetWrapupOrigin::RoundSlice);
-            state.hooks.completion_settlement.completion_action_window =
-                Some(super::super::host::CompletionActionWindow {
-                    action: CompletionAction::ExplicitVerification {
-                        missing_labels: vec!["verify".into()],
-                    },
-                    attempts_remaining: 0,
-                    mismatch_corrections_remaining: 0,
-                    consumed: true,
-                    matched: true,
-                });
-            let window =
-                serde_json::to_value(&state.hooks.completion_settlement.completion_action_window)
-                    .unwrap();
-            assert_eq!(
-                pending_completion_action_for_work_state(&state, active_work),
-                Err(VerificationRecoveryError::ContractChanged)
-            );
-            assert_eq!(
-                terminal_completion_disposition(&state, false),
-                TerminalCompletionDisposition::RoundSliceIncomplete
-            );
-            assert_eq!(
-                terminal_completion_disposition(&state, true),
-                TerminalCompletionDisposition::RoundSliceIncomplete
-            );
-            advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-                &mut state,
-                active_work,
-                0,
-            );
-            assert_eq!(
-                enforce_completion_action_window_before_text_completion(&mut state),
-                CompletionActionBoundary::TerminalIncomplete
-            );
-            assert_eq!(
-                (
-                    state.max_turns,
-                    state.remaining_turns,
-                    state.charged_iterations
-                ),
-                (50, 0, 50)
-            );
-            assert_eq!(
-                serde_json::to_value(&state.hooks.completion_settlement.completion_action_window)
-                    .unwrap(),
-                window
-            );
-            assert_eq!(
-                state.interruption.as_ref().map(|record| record.kind),
-                Some(InterruptionKind::ExecutionIncomplete)
-            );
-            assert!(state.volatile_pending.is_empty());
-        }
-    }
-
     #[tokio::test]
     async fn missing_policy_history_preserves_tool_terminal_and_ends_incomplete() {
         let mut state = make_state();
@@ -9896,22 +8477,16 @@ mod tests {
     fn full_scope_verify_record() -> ToolCallRecord {
         let args = serde_json::json!({
             "command": "ls -la /app/program.py /app/requirements.txt && python3 /app/program.py",
-            "mode": "verify",
         })
         .to_string();
-        let fields = astra_tools::workspace_observation::explicit_workspace_verification_receipt();
         ToolCallRecord {
             name: "bash".into(),
             ok: true,
             disposition: Some(ToolCallDisposition::Executed),
             args_full: Some(args.clone()),
             runtime_args_full: Some(args),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: fields
-                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .cloned(),
+            result_class: Some("success".into()),
+            exit_semantics: Some("success".into()),
             ..ToolCallRecord::default()
         }
     }
@@ -9948,67 +8523,6 @@ mod tests {
             );
             assert!(state.interruption.is_none());
         }
-    }
-
-    #[tokio::test]
-    async fn edge_callback_v2_metadata_survives_record_ingestion_and_settles_completion() {
-        let mut program_write = make_edge_tool("write_file", "program written");
-        program_write.request_id = "edge-write-program".into();
-        program_write.args = serde_json::json!({
-            "path": "/app/program.py",
-            "content": "print('ok')",
-        });
-        let mut requirements_write = make_edge_tool("write_file", "requirements written");
-        requirements_write.request_id = "edge-write-requirements".into();
-        requirements_write.args = serde_json::json!({
-            "path": "/app/requirements.txt",
-            "content": "dependency>=1",
-        });
-
-        let mut verify = make_edge_tool("bash", "program and requirements verified");
-        verify.request_id = "edge-verify-workspace".into();
-        verify.args = serde_json::json!({
-            "command": "ls -la /app/program.py /app/requirements.txt && python3 /app/program.py",
-            "mode": "verify",
-        });
-        verify
-            .tool_result_fields
-            .as_mut()
-            .expect("edge callback fixture carries owner metadata")
-            .extend(astra_tools::workspace_observation::explicit_workspace_verification_receipt());
-
-        let mut host = MockHost::new(vec![
-            edge_tool_result(vec![program_write, requirements_write], 20, 10, Some(30)),
-            edge_tool_result(vec![verify], 20, 10, Some(30)),
-            text_result("The files are ready and verified.", 20, 10, Some(30)),
-        ])
-        .with_valid_tools(&["write_file", "bash"]);
-        let mut state = make_state();
-        mark_must_mutate(&mut state);
-        state.hooks.workspace_root_hint = Some("/app".into());
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
-            .await
-            .expect("typed edge receipt should settle the run");
-
-        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
-        assert_eq!(host.turn_count(), 3);
-        let verify_record = state
-            .stall
-            .tool_call_records
-            .iter()
-            .find(|record| record.tool_call_id.as_deref() == Some("edge-verify-workspace"))
-            .expect("edge callback must become a tool record");
-        assert!(verify_record.runtime_args_full.is_some());
-        assert!(
-            super::super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
-                verify_record
-            )
-        );
-
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-        assert!(state.interruption.is_none());
-        assert_eq!(state.final_text, "The files are ready and verified.");
     }
 
     #[tokio::test]
@@ -10180,8 +8694,8 @@ mod tests {
             ..Default::default()
         };
         // Provider-neutral fixtures model the same owner fact production
-        // direct writers now emit: a successful call has an applied receipt;
-        // a failed call remains mutation risk but cannot be positive proof.
+        // direct writers now emit: a successful applied write has a receipt.
+        // A failed call alone does not report a workspace change.
         if ok
             && matches!(
                 name,
@@ -10228,318 +8742,31 @@ mod tests {
     }
 
     #[test]
-    fn opaque_activity_does_not_invent_or_discharge_work_validation() {
-        for command in [
-            "python3 - <<'PY'\nprint('reader result')\nPY",
-            "for url in https://example.org; do curl -sS \"$url\"; done",
+    fn explicit_hook_requires_a_successful_command_result() {
+        let hook = explicit_verification_hook("check", "grep pattern input.txt");
+        let mut record = validation_record("grep pattern input.txt", "success");
+        assert!(record_verifies_explicit_hook(&record, &hook, None));
+        for class in [
+            "empty_result",
+            "domain_negative",
+            "test_failure",
+            "inconclusive",
         ] {
-            let mut state = make_state();
-            state.hooks.workspace_root_hint = Some("/workspace".into());
-            let activity = validation_record(command, "success");
-            state.stall.tool_call_records = vec![activity.clone()];
-            assert_eq!(
-                current_work_validation_state(&state),
-                WorkValidationState::None
-            );
-            assert!(failed_work_validation_operation(&state).is_none());
-
-            state.stall.tool_call_records = vec![
-                validation_record("cargo check", "test_failure"),
-                activity.clone(),
-            ];
-            assert_ne!(
-                current_work_validation_state(&state),
-                WorkValidationState::Passed
-            );
-            assert_eq!(
-                failed_work_validation_operation(&state).as_deref(),
-                Some("cargo check")
-            );
-
-            state.stall.tool_call_records = vec![
-                validation_record("cargo check", "success"),
-                activity.clone(),
-            ];
-            assert_eq!(
-                current_work_validation_state(&state),
-                WorkValidationState::Stale
-            );
-
-            let mut unchanged = activity.clone();
-            unchanged.workspace_mutation_scope =
-                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-            unchanged.workspace_mutation_receipt =
-                astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
-                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-                ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
-            state.stall.tool_call_records =
-                vec![validation_record("cargo check", "success"), unchanged];
-            assert_eq!(
-                current_work_validation_state(&state),
-                WorkValidationState::Passed
-            );
-
-            let mut partial = activity;
-            partial.workspace_mutation_partial = Some(true);
-            partial.workspace_mutation_observed = Some(true);
-            partial.runtime_args_full = partial.args_full.clone();
-            partial.workspace_mutation_scope =
-                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-            partial.workspace_mutation_receipt =
-                astra_tools::workspace_observation::changed_receipt_with_ownership(
-                    astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-                )
-                .remove(astra_tools::workspace_observation::RECEIPT_FIELD);
-            state.stall.tool_call_records =
-                vec![validation_record("cargo check", "success"), partial];
-            assert_eq!(
-                current_work_validation_state(&state),
-                WorkValidationState::Stale
+            record.result_class = Some(class.into());
+            record.exit_semantics = Some("domain_negative".into());
+            assert!(
+                !record_verifies_explicit_hook(&record, &hook, None),
+                "{class}"
             );
         }
-    }
-
-    #[test]
-    fn configuration_changed_validation_cannot_reuse_prior_work_proof() {
-        for command in [
-            "GOFLAGS=-n; GOWORK=off go test ./...",
-            "GOFLAGS=-n && GOWORK=off go test ./... || true",
-            "printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
-            "GOFLAGS=$(cat /tmp/flags) && GOWORK=off go test ./...",
-            "mkdir -p /tmp/astra-cache && printf -v GOFLAGS %s -n && GOWORK=off go test ./...",
-        ] {
-            let mut state = make_state();
-            state.hooks.workspace_root_hint = Some("/workspace".into());
-            for (records, expected) in [
-                (
-                    vec![
-                        validation_record("GOWORK=off go test ./...", "success"),
-                        validation_record(command, "success"),
-                    ],
-                    WorkValidationState::Stale,
-                ),
-                (
-                    vec![
-                        validation_record(command, "test_failure"),
-                        validation_record("GOWORK=off go test ./...", "success"),
-                    ],
-                    WorkValidationState::Failed,
-                ),
-                (
-                    vec![
-                        validation_record(command, "test_failure"),
-                        validation_record(command, "success"),
-                    ],
-                    WorkValidationState::Stale,
-                ),
-            ] {
-                state.stall.tool_call_records = records.into_iter().map(|mut record| {
-                    record.runtime_args_full = record.args_full.clone();
-                    record.workspace_mutation_scope = Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-                    record.workspace_mutation_receipt = astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
-                        astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-                    ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
-                    record
-                }).collect();
-                assert_eq!(
-                    WorkValidationEvidence::collect(&state, true).state,
-                    expected,
-                    "{command}"
-                );
-            }
-            state
-                .stall
-                .tool_call_records
-                .push(validation_record("GOWORK=off go test ./...", "success"));
-            assert_eq!(
-                WorkValidationEvidence::collect(&state, true).state,
-                WorkValidationState::Passed
-            );
-        }
-    }
-
-    #[test]
-    fn quoted_output_keeps_completed_work_validation_current() {
-        for command in [
-            r#"echo '<<' "$PWD""#,
-            r#"echo '`literal`' "$PWD""#,
-            r#"echo '# literal' "$PWD""#,
-        ] {
-            let mut state = make_state();
-            state.hooks.workspace_root_hint = Some("/workspace".into());
-            let mut observation = validation_record(command, "success");
-            observation.workspace_mutation_scope =
-                Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-            observation.workspace_mutation_receipt = astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
-                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-            ).remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
-            state.stall.tool_call_records = vec![
-                validation_record("GOWORK=off go test ./...", "success"),
-                observation,
-            ];
-            assert_eq!(
-                WorkValidationEvidence::collect(&state, true).state,
-                WorkValidationState::Passed,
-                "{command}"
-            );
-        }
-    }
-
-    #[test]
-    fn go_work_validation_requires_scoped_success_of_the_same_operation() {
-        let chain = "GOWORK=off go build ./... && GOWORK=off go vet ./...";
-        for (failed, passed) in [
-            (
-                "cat /tmp/missing && GOWORK=off go vet ./...",
-                "GOWORK=off go vet ./...",
-            ),
-            ("GOWORK=off go test ./...", "go test ./..."),
-            ("GOWORK=off go test ./...", "GOWORK=off go build ./..."),
-            (chain, "GOWORK=off go vet ./..."),
-            (
-                "mkdir -p /tmp/astra-cache && go test ./...",
-                "go test ./...",
-            ),
-            (
-                "mkdir -p /tmp/astra-cache && go test ./... && echo OK",
-                "mkdir -p /tmp/astra-cache && go test ./...",
-            ),
-        ] {
-            let mut state = make_state();
-            state.hooks.workspace_root_hint = Some("/workspace".into());
-            state.stall.tool_call_records = vec![
-                validation_record(failed, "test_failure"),
-                validation_record(passed, "success"),
-            ];
-            assert_eq!(
-                WorkValidationEvidence::collect(&state, true).state,
-                WorkValidationState::Failed,
-                "{passed} must not discharge {failed}"
-            );
-            state
-                .stall
-                .tool_call_records
-                .push(validation_record(failed, "success"));
-            assert_eq!(
-                WorkValidationEvidence::collect(&state, true).state,
-                WorkValidationState::Passed
-            );
-        }
-        for root in ["/", "/tmp", "/tmp/astra-cache", "/tmp/astra-cache/repo"] {
-            let mut state = make_state();
-            state.hooks.workspace_root_hint = Some(root.into());
-            state.stall.tool_call_records = vec![validation_record(
-                "mkdir -p /tmp/astra-cache && go test ./...",
-                "success",
-            )];
-            assert_eq!(
-                WorkValidationEvidence::collect(&state, true).state,
-                WorkValidationState::Stale,
-                "{root}"
-            );
-        }
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![validation_record(
-            "GOWORK=off go vet /tmp/other/...",
-            "success",
-        )];
-        assert_eq!(
-            WorkValidationEvidence::collect(&state, true).state,
-            WorkValidationState::Stale
-        );
-        for (failed_args, passed_args) in [
-            (
-                serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/a"}),
-                serde_json::json!({"command": "GOWORK=off go test ./...", "workdir": "pkg/b"}),
-            ),
-            (
-                serde_json::json!({"command": "GOWORK=off go test -run 'Test  Name' ./..."}),
-                serde_json::json!({"command": "GOWORK=off go test -run 'Test Name' ./..."}),
-            ),
-        ] {
-            let mut failed = validation_record("", "test_failure");
-            failed.runtime_args_full = Some(failed_args.to_string());
-            let mut passed = validation_record("", "success");
-            passed.runtime_args_full = Some(passed_args.to_string());
-            state.stall.tool_call_records = vec![failed, passed];
-            assert_eq!(
-                WorkValidationEvidence::collect(&state, true).state,
-                WorkValidationState::Failed
-            );
-            state
-                .stall
-                .tool_call_records
-                .last_mut()
-                .unwrap()
-                .runtime_args_full = Some(failed_args.to_string());
-            assert_eq!(
-                WorkValidationEvidence::collect(&state, true).state,
-                WorkValidationState::Passed
-            );
-        }
-        state.stall.tool_call_records = vec![
-            validation_record("GOWORK=off go test -n ./...", "test_failure"),
-            validation_record("GOWORK=off go build ./...", "success"),
-            validation_record("GOWORK=off go test -n ./...", "success"),
-        ];
-        assert_eq!(
-            WorkValidationEvidence::collect(&state, true).state,
-            WorkValidationState::Stale
-        );
-        let mut external = validation_record("cd /tmp && GOWORK=off go vet ./...", "success");
-        external.runtime_args_full = Some(
-            serde_json::json!({"command": "cd /tmp && GOWORK=off go vet ./...", "mode": "verify"})
-                .to_string(),
-        );
-        external.workspace_mutation_scope =
-            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
-        external.workspace_mutation_receipt =
-            astra_tools::workspace_observation::explicit_workspace_verification_receipt()
-                .remove(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD);
-        state.stall.tool_call_records = vec![external];
-        assert_eq!(
-            WorkValidationEvidence::collect(&state, true).state,
-            WorkValidationState::Stale
-        );
-    }
-
-    #[test]
-    fn explicit_contract_does_not_accept_read_as_verification() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.task_profile.verification_required = true;
-        state
-            .hooks
-            .stop_hooks
-            .push(explicit_verification_hook("quality", "./quality-gate"));
-        state
-            .stall
-            .tool_call_records
-            .push(executed_record("write_file", true, None));
-        assert!(record_is_effective_workspace_repair(
-            state.stall.tool_call_records.last().unwrap()
-        ));
-        state
-            .stall
-            .tool_call_records
-            .push(executed_record("read_file", true, None));
-
-        assert_eq!(
-            missing_explicit_verification_hooks(&state).unwrap(),
-            Some(vec!["quality".to_string()])
-        );
-        assert!(enforce_explicit_verification_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.verification_retries, 1);
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry
-                .payload
-                .get("schema")
-                .and_then(serde_json::Value::as_str)
-                == Some("explicit_verification_required.v1")
-        }));
+        record.result_class = None;
+        record.exit_semantics = Some("success".into());
+        record.result_full = Some(r#"{"result_family":"agent","status":"completed"}"#.into());
+        assert!(!record_verifies_explicit_hook(&record, &hook, None));
+        record.result_class = Some("success".into());
+        record.exit_semantics = Some("success".into());
+        record.ok = false;
+        assert!(!record_verifies_explicit_hook(&record, &hook, None));
     }
 
     #[test]
@@ -10570,7 +8797,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_contract_uses_exact_simple_command_identity() {
+    fn explicit_contract_preserves_command_bytes_and_declared_workdir() {
         let hook = explicit_verification_hook("quality", "./quality-gate");
         let exact = serde_json::json!({"command": "./quality-gate"});
         let extra_args = serde_json::json!({"command": "./quality-gate --quick"});
@@ -10579,41 +8806,65 @@ mod tests {
         assert!(tool_call_verifies_explicit_hook(
             "bash",
             Some(&exact),
-            &hook
+            &hook,
+            None
         ));
         assert!(!tool_call_verifies_explicit_hook(
             "bash",
             Some(&extra_args),
-            &hook
+            &hook,
+            None
         ));
         assert!(!tool_call_verifies_explicit_hook(
             "bash",
             Some(&compound),
-            &hook
+            &hook,
+            None
         ));
         assert!(!tool_call_verifies_explicit_hook(
             "quality",
             Some(&exact),
-            &hook
+            &hook,
+            None
+        ));
+
+        let quoted_hook = explicit_verification_hook("quoted", "printf '%s' 'a  b'");
+        assert!(!tool_call_verifies_explicit_hook(
+            "bash",
+            Some(&serde_json::json!({
+                "command": "printf '%s' 'a b'",
+            })),
+            &quoted_hook,
+            None
+        ));
+        let mut root_hook = explicit_verification_hook("root", "./quality-gate");
+        root_hook.working_dir = Some("/workspace".into());
+        assert!(tool_call_verifies_explicit_hook(
+            "bash",
+            Some(&exact),
+            &root_hook,
+            Some("/workspace")
         ));
 
         let mut scoped_hook = explicit_verification_hook("quality", "./quality-gate");
         scoped_hook.working_dir = Some("/workspace/check".into());
         let scoped_exact = serde_json::json!({
-            "command": "cd /workspace/check && ./quality-gate"
+            "command": "./quality-gate", "workdir": "/workspace/check"
         });
         let scoped_wrong_dir = serde_json::json!({
-            "command": "cd /workspace/other && ./quality-gate"
+            "command": "./quality-gate", "workdir": "/workspace/other"
         });
         assert!(tool_call_verifies_explicit_hook(
             "bash",
             Some(&scoped_exact),
-            &scoped_hook
+            &scoped_hook,
+            None
         ));
         assert!(!tool_call_verifies_explicit_hook(
             "bash",
             Some(&scoped_wrong_dir),
-            &scoped_hook
+            &scoped_hook,
+            None
         ));
     }
 
@@ -10763,48 +9014,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_receipt_is_invalidated_by_unknown_or_failed_writer() {
-        let cases = [(
-            true,
-            r#"{"command":"python3 -c \"open('/workspace/a','w').write('bad')\""}#,
-            ),
-            (
-                false,
-                r#"{"command":"printf bad > /workspace/a && false"}"#,
-        )];
-        for (ok, command) in cases {
-            let mut state = make_state();
-            state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
-                label: "quality".into(),
-                command: "./quality-gate".into(),
-                working_dir: None,
-                depends_on: Vec::new(),
-                timeout_secs: None,
-                authoritative: true,
-            }];
-            state.task_profile.mutates_workspace = true;
-            state
-                .stall
-                .tool_call_records
-                .push(executed_record("write_file", true, None));
-            state.stall.tool_call_records.push(executed_record(
-                "bash",
-                true,
-                Some(r#"{"command":"./quality-gate"}"#),
-            ));
-            state
-                .stall
-                .tool_call_records
-                .push(executed_record("bash", ok, Some(command)));
-            assert_eq!(
-                missing_explicit_verification_hooks(&state).unwrap(),
-                Some(vec!["quality".into()]),
-                "a later uncertain writer invalidates the actual named verifier"
-            );
-        }
-    }
-
-    #[test]
     fn quarantined_workspace_blocks_reader_settlement_and_final_text() {
         let temp = tempfile::tempdir().expect("workspace tempdir");
         let root = temp.path().to_string_lossy().into_owned();
@@ -10858,137 +9067,6 @@ mod tests {
             assert!(message.contains("No checkpoint was saved"), "{message}");
             assert!(message.contains("inspect the current state"), "{message}");
         }
-    }
-
-    #[test]
-    fn live_weak_receipt_can_settle_current_turn_but_not_restored_authority() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/edge-only/workspace".into());
-        let fields = astra_tools::workspace_observation::changed_receipt_with_ownership(
-            astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP,
-        );
-        let receipt = fields
-            .get(astra_tools::workspace_observation::RECEIPT_FIELD)
-            .cloned();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            tool_call_id: Some("edge-call-1".into()),
-            name: "bash".into(),
-            ok: true,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(r#"{"command":"./opaque-writer"}"#.into()),
-            runtime_args_full: Some(r#"{"command":"./opaque-writer"}"#.into()),
-            workspace_mutation_observed: Some(true),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: receipt,
-            ..ToolCallRecord::default()
-        });
-
-        assert!(!workspace_observation_is_quarantined(&state));
-        assert!(record_has_weak_workspace_mutation_receipt(
-            &state.stall.tool_call_records[0]
-        ));
-        assert!(!record_has_trusted_workspace_mutation_receipt(
-            &state.stall.tool_call_records[0]
-        ));
-        assert!(has_executed_positive_workspace_mutation(&state));
-
-        state.stall.workspace_observation_quarantine = Some(
-            astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::weak_process_ownership(
-                Some("edge-call-1".into()),
-            ),
-        );
-
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "read_file".into(),
-            ok: true,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(r#"{"path":"/edge-only/workspace/out.json"}"#.into()),
-            runtime_args_full: Some(r#"{"path":"/edge-only/workspace/out.json"}"#.into()),
-            file_path: Some("/edge-only/workspace/out.json".into()),
-            ..ToolCallRecord::default()
-        });
-
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-        assert!(!completion_action_window_requires_followup(&state));
-        assert!(!workspace_observation_requires_terminal_incomplete(&state));
-        assert!(!reject_unsettled_execution_completion(&mut state));
-        assert!(state.interruption.is_none());
-
-        let restored: Vec<ToolCallRecord> = serde_json::from_str(
-            &serde_json::to_string(&state.stall.tool_call_records).expect("serialize records"),
-        )
-        .expect("restore records");
-        state.stall.tool_call_records = restored;
-        state.stall.workspace_observation_quarantine = Some(
-            astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::weak_process_ownership(
-                Some("edge-call-1".into()),
-            ),
-        );
-        assert!(record_has_weak_workspace_mutation_receipt(
-            &state.stall.tool_call_records[0]
-        ));
-        assert!(workspace_observation_is_quarantined(&state));
-
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-        // Serialized display facts cannot manufacture a ledger binding.
-        let checkpoint = state.stall.verification_frontier.export(
-            Some("/edge-only/workspace"),
-            &[],
-            &state.stall.tool_call_records,
-            Some("chain"),
-        );
-        assert!(matches!(
-            checkpoint,
-            astra_turn_types::VerificationHandoff::Unavailable { .. }
-        ));
-    }
-
-    #[test]
-    fn supervisor_receipt_is_authoritative_and_later_read_closes_mutation_epoch() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = true;
-        state.hooks.workspace_root_hint = Some("/edge-only/workspace".into());
-        let fields = astra_tools::workspace_observation::changed_receipt_with_ownership(
-            astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
-        );
-        state.stall.tool_call_records.push(ToolCallRecord {
-            tool_call_id: Some("supervised-edge-call".into()),
-            name: "bash".into(),
-            ok: true,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(r#"{"command":"python3 update.py"}"#.into()),
-            runtime_args_full: Some(r#"{"command":"python3 update.py"}"#.into()),
-            workspace_mutation_observed: Some(true),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: fields
-                .get(astra_tools::workspace_observation::RECEIPT_FIELD)
-                .cloned(),
-            ..ToolCallRecord::default()
-        });
-
-        assert!(record_has_trusted_workspace_mutation_receipt(
-            &state.stall.tool_call_records[0]
-        ));
-        assert!(!record_has_weak_workspace_mutation_receipt(
-            &state.stall.tool_call_records[0]
-        ));
-
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "read_file".into(),
-            ok: true,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(r#"{"path":"/edge-only/workspace/out.json"}"#.into()),
-            runtime_args_full: Some(r#"{"path":"/edge-only/workspace/out.json"}"#.into()),
-            file_path: Some("/edge-only/workspace/out.json".into()),
-            ..ToolCallRecord::default()
-        });
-
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
     }
 
     #[test]
@@ -11206,33 +9284,6 @@ mod tests {
     }
 
     #[test]
-    fn rejected_bash_receipt_cannot_create_workspace_evidence() {
-        let fields = astra_tools::workspace_observation::changed_receipt_with_ownership(
-            astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP,
-        );
-        let mut state = make_state();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
-            workspace_mutation_observed: Some(true),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: fields
-                .get(astra_tools::workspace_observation::RECEIPT_FIELD)
-                .cloned(),
-            ..ToolCallRecord::default()
-        });
-
-        assert!(!workspace_observation_is_quarantined(&state));
-        assert!(!record_has_weak_workspace_mutation_receipt(
-            &state.stall.tool_call_records[0]
-        ));
-        assert!(!has_executed_positive_workspace_mutation(&state));
-    }
-
-    #[test]
     fn external_scratch_after_workspace_receipt_does_not_reset_observation_watermark() {
         let mut state = make_state();
         state.hooks.workspace_root_hint = Some("/workspace".into());
@@ -11279,47 +9330,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_shapes_without_workspace_receipt_do_not_create_observation_authority() {
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/workspace".into());
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "write_file".into(),
-                ok: true,
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-                args_full: Some(
-                    serde_json::json!({
-                        "path": "/workspace/out.txt",
-                        "content": "x"
-                    })
-                    .to_string(),
-                ),
-                file_path: Some("/workspace/out.txt".into()),
-                ..Default::default()
-            },
-            ToolCallRecord {
-                name: "write_file".into(),
-                ok: true,
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-                args_full: Some(
-                    serde_json::json!({
-                        "path": "/tmp/scratch.txt",
-                        "content": "scratch"
-                    })
-                    .to_string(),
-                ),
-                file_path: Some("/tmp/scratch.txt".into()),
-                ..Default::default()
-            },
-        ];
-
-        assert!(has_executed_positive_workspace_mutation(&state));
-
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-    }
-
-    #[test]
-    fn explicit_contract_receipt_is_invalidated_by_unknown_or_failed_writer() {
+    fn shell_text_without_a_change_receipt_does_not_invalidate_declared_checks() {
         let cases = [(
             true,
             r#"{"command":"python3 -c \"open('/workspace/a','w').write('bad')\""}#,
@@ -11350,7 +9361,7 @@ mod tests {
 
             assert_eq!(
                 missing_explicit_verification_hooks(&state).unwrap(),
-                Some(vec!["quality".to_string()])
+                Some(vec![])
             );
         }
     }
@@ -11375,7 +9386,11 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
-        assert!(state.final_text.contains("not verified"));
+        assert!(
+            state
+                .final_text
+                .contains("Required checks did not complete successfully")
+        );
     }
 
     #[test]
@@ -11447,7 +9462,7 @@ mod tests {
             ));
 
             assert_eq!(
-                pending_terminal_completion_action_for_work_state(&state, false).unwrap(),
+                pending_completion_action(&state).unwrap(),
                 None,
                 "intent={intent:?}: a successful task-facing action already spent the fallback obligation"
             );
@@ -11472,311 +9487,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_work_validation_action_accepts_only_canonical_validator_shape() {
-        let state = make_state();
-        let canonical = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"cargo test"}"#
-            }
-        });
-        let probe = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"echo still-working"}"#
-            }
-        });
-
-        assert!(
-            completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &canonical,
-            )
-            .is_some()
-        );
-        assert!(
-            !completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &probe,
-            )
-            .is_some()
-        );
-        let hint = completion_action_hint(&CompletionAction::CanonicalWorkValidation);
-        assert_eq!(hint["reason_code"], "work_validation_stale_or_failed");
-        assert_eq!(hint["accepted_action_family"], "canonical_work_validation");
-        let shape = &hint["accepted_action_shapes"][0];
-        assert_eq!(
-            shape["evidence_source"],
-            "prior_runtime_recognized_project_validation"
-        );
-        assert_eq!(shape["raw_arguments_projected"], false);
-        assert!(shape["constraint"].as_str().is_some_and(|constraint| {
-            constraint.contains("direct standard project build/test")
-                && constraint.contains("custom inline program")
-        }));
-        let serialized = hint.to_string();
-        assert!(!serialized.contains("cargo test"));
-        assert!(!serialized.contains("/workspace"));
-    }
-
-    #[test]
-    fn recovery_revalidation_must_match_the_failed_validation_operation() {
-        let mut state = make_state();
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = Some("pytest -q".into());
-        let same_operation = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"pytest -q"}"#
-            }
-        });
-        let different_operation = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"cargo check"}"#
-            }
-        });
-
-        assert!(
-            completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &same_operation,
-            )
-            .is_some()
-        );
-        assert!(
-            !completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &different_operation,
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn narrowed_validator_cannot_clear_a_failed_work_validation() {
-        let mut state = make_state();
-        let failed = "python -m pytest tests --ignore=tests/slow.py";
-        let narrowed = "python -m pytest tests --ignore=tests/slow.py -k 'not flaky_case'";
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record(failed, "test_failure"),
-            validation_record(narrowed, "success"),
-        ];
-
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Failed,
-            "a different validator may add evidence but cannot waive the failed operation"
-        );
-        assert_eq!(
-            failed_work_validation_operation(&state).as_deref(),
-            Some(failed)
-        );
-        assert_eq!(
-            pending_completion_action_for_work_state(&state, true).unwrap(),
-            Some(CompletionAction::CanonicalWorkValidation)
-        );
-        // The active Work executor normally pins this operation when it opens
-        // the bounded revalidation window. Keep the matching assertion below
-        // focused on that persisted window contract rather than constructing
-        // a full runtime executor in this unit fixture.
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = Some(failed.to_string());
-
-        let exact_retry = serde_json::json!({
-            "type": "function",
-            "function": {"name": "bash", "arguments": serde_json::json!({"command": failed}).to_string()}
-        });
-        let narrowed_retry = serde_json::json!({
-            "type": "function",
-            "function": {"name": "bash", "arguments": serde_json::json!({"command": narrowed}).to_string()}
-        });
-        assert!(
-            completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &exact_retry,
-            )
-            .is_some()
-        );
-        assert!(
-            !completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &narrowed_retry,
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn fresh_work_attempt_resets_prior_validation_recovery_scope_across_a_mixed_batch() {
-        let mut state = make_state();
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries = 1;
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = Some("pytest -q".into());
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "settle_work_item".into(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        // A duplicate/failing sibling can follow the successful settlement in
-        // one provider batch. It must not hide the attempt boundary.
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("pytest -q", "test_failure"));
-
-        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 0,
-        );
-
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            0
-        );
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .is_none()
-        );
-        let next_attempt_validator = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"cargo check"}"#
-            }
-        });
-        assert!(
-            completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &next_attempt_validator,
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn canonical_validation_mismatch_explains_hidden_shape_then_accepts_direct_retry() {
-        let mut state = make_state();
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test", "test_failure"));
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 1,
-                mismatch_corrections_remaining: 1,
-                consumed: false,
-                matched: false,
-            });
-        let opaque = serde_json::json!({
-            "id": "opaque-self-check",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"python3 -c \"print('PASS')\""}"#
-            }
-        });
-
-        let rejected = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([opaque.clone()]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&opaque),
-        );
-
-        assert!(rejected.admitted.is_empty());
-        assert_eq!(rejected.rejected.len(), 1);
-        let result: serde_json::Value =
-            serde_json::from_str(&rejected.rejected[0].result).expect("structured rejection");
-        assert_eq!(result["retryable"], true);
-        assert!(
-            result["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("direct standard project build/test")
-                    && error.contains("custom inline program"))
-        );
-        assert_eq!(
-            result["action_hint"]["accepted_action_shapes"][0]["evidence_source"],
-            "prior_runtime_recognized_project_validation"
-        );
-        assert!(!result.to_string().contains("/workspace"));
-
-        let retry = serde_json::json!({
-            "id": "direct-project-validator",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"cargo test"}"#
-            }
-        });
-        let admitted = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([retry.clone()]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&retry),
-        );
-
-        assert_eq!(admitted_logical_calls(&admitted), vec![retry]);
-        assert!(admitted.rejected.is_empty());
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("matched validation remains auditable");
-        assert!(window.consumed);
-        assert!(window.matched);
-        assert_eq!(window.attempts_remaining, 0);
-    }
-
-    #[test]
     fn opaque_writer_does_not_create_a_terminal_obligation_without_receipt() {
         let mut state = make_state();
         state.stall.tool_call_records.push(executed_record(
@@ -11786,20 +9496,6 @@ mod tests {
         ));
 
         assert!(!state.task_profile.mutates_workspace);
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-    }
-
-    #[test]
-    fn failed_direct_writer_does_not_create_observation_authority_without_intent() {
-        let mut state = make_state();
-        state
-            .stall
-            .tool_call_records
-            .push(executed_record("write_file", false, None));
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(has_executed_positive_workspace_mutation(&state));
-
         assert_eq!(pending_completion_action(&state).unwrap(), None);
     }
 
@@ -11819,1631 +9515,48 @@ mod tests {
         assert!(!state.task_profile.mutates_workspace);
     }
 
-    #[test]
-    fn active_work_repair_returns_to_canonical_validation() {
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "success"),
-            executed_record("write_file", true, None),
-            validation_record("cargo test", "test_failure"),
-        ];
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 0,
-                consumed: true,
-                matched: true,
-            });
-
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            1
-        );
-
-        state
-            .stall
-            .tool_call_records
-            .push(executed_record("write_file", true, None));
-        assert!(record_is_effective_workspace_repair(
-            state.stall.tool_call_records.last().unwrap()
-        ));
-        let repair_window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-            .unwrap();
-        repair_window.consumed = true;
-        repair_window.matched = true;
-        assert_eq!(
-            pending_completion_action_for_work_state(&state, true).unwrap(),
-            Some(CompletionAction::CanonicalWorkValidation)
-        );
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .unwrap()
-                .action,
-            CompletionAction::CanonicalWorkValidation
-        );
-
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test", "test_failure"));
-        let validation_window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-            .unwrap();
-        validation_window.consumed = true;
-        validation_window.matched = true;
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert_ne!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .map(|window| &window.action),
-            Some(&CompletionAction::CanonicalWorkRepair)
-        );
-    }
-
-    #[test]
-    fn active_work_completion_action_returns_to_typed_work_settlement() {
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                true,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            );
-        state
-            .stall
-            .tool_call_records
-            .push(executed_record("write_file", true, None));
-        state
-            .stall
-            .tool_call_records
-            .push(executed_record("read_file", true, None));
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-        state.hooks.completion_settlement.text_only = true;
-
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert!(
-            state.volatile_pending.iter().any(|entry| {
-                entry.payload["signal"] == "completion_action_attempted_settle_work"
-            })
-        );
-    }
-
-    #[test]
-    fn failed_bounded_work_revalidation_opens_one_repair_then_revalidation_cycle() {
+    fn completed_explicit_check_state(extra_check: Option<&str>) -> AgenticLoopState {
         let mut state = make_state();
         state
             .hooks
             .stop_hooks
-            .push(explicit_verification_hook("quality", "./quality-gate"));
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-        ];
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = Some("cargo test".into());
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-
-        assert_eq!(
-            pending_completion_action_for_work_state(&state, true).unwrap(),
-            Some(CompletionAction::CanonicalWorkValidation)
-        );
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("one repair window");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkRepair);
-        assert!(!window.consumed);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            1
-        );
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert!(
-            state.volatile_pending.iter().any(|entry| {
-                entry.payload["signal"] == "canonical_validation_failed_repair_once"
-            })
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .as_deref(),
-            Some("cargo test")
-        );
-    }
-
-    #[test]
-    fn failed_validation_after_mutation_opens_the_same_bounded_repair_cycle() {
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "success"),
-            executed_record("write_file", true, None),
-            validation_record("cargo test", "test_failure"),
-        ];
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Failed
-        );
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("one repair window");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkRepair);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .as_deref(),
-            Some("cargo test")
-        );
-    }
-
-    #[test]
-    fn rejected_settlement_revalidates_old_failure_after_later_mutation() {
-        let failed = "python -m pytest -rA -x -q";
-        let later = "python -m pytest -rA -q";
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "validation_state": "failed"
-            })
-            .to_string(),
-        );
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record(failed, "test_failure"),
-            validation_record(later, "test_failure"),
-            executed_record("write_file", true, None),
-            validation_record(later, "success"),
-            rejected_settlement,
-        ];
-        state.max_turns = 24;
-        state.remaining_turns = 2;
-
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Failed
-        );
-        assert_eq!(
-            failed_work_validation_operation(&state).as_deref(),
-            Some(failed)
-        );
-        assert_eq!(
-            failed_work_validation_operation_requiring_revalidation(&state).as_deref(),
-            Some(failed)
-        );
-
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 5);
-
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("old failed operation must be revalidated before any repair");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkValidation);
-        assert!(!window.consumed);
-        assert_eq!(state.max_turns, 24);
-        assert_eq!(state.remaining_turns, 2);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            0,
-            "a revalidation retry must not consume the one bounded repair opportunity"
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .as_deref(),
-            Some(failed)
-        );
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.payload["signal"]
-                == "canonical_validation_failed_before_workspace_change_revalidate_exact_operation"
-        }));
-
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record(failed, "success"));
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Passed,
-            "only a typed positive receipt for the exact failed operation clears its debt"
-        );
-    }
-
-    #[test]
-    fn successful_revalidation_does_not_repair_another_old_failure() {
-        let stale = "cargo test -p older-suite";
-        let retried = "cargo test -p current-suite";
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record(stale, "test_failure"),
-            validation_record(retried, "test_failure"),
-            executed_record("write_file", true, None),
-            validation_record(retried, "success"),
-        ];
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = Some(retried.to_string());
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Failed,
-            "the exact retry passes but the older operation remains unresolved"
-        );
-
-        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 4,
-        );
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none(),
-            "a successful exact retry with unrelated historical debt must not open repair"
-        );
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            0
-        );
-
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "validation_state": "failed"
-            })
-            .to_string(),
-        );
-        let rejection_index = state.stall.tool_call_records.len();
-        state.stall.tool_call_records.push(rejected_settlement);
-        advance_rejected_work_settlement_recovery_for_test(&mut state, rejection_index);
-
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("the remaining old failure requires its own exact revalidation");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkValidation);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .as_deref(),
-            Some(stale)
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            0
-        );
-    }
-
-    #[test]
-    fn rejected_work_settlement_opens_repair_before_budget_settlement() {
-        let mut state = make_state();
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.tool_call_id = Some("call-settle".into());
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "retryable": false,
-                "validation_state": "failed"
-            })
-            .to_string(),
-        );
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            rejected_settlement,
-        ];
-        state.max_turns = 24;
-        state.remaining_turns = 2;
-        state.hooks.completion_settlement.work_settlement_only = false;
-
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
-
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("rejected truthful settlement gets one bounded repair");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkRepair);
-        assert!(!window.consumed);
-        assert_eq!(state.max_turns, 24);
-        assert_eq!(state.remaining_turns, 2);
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .as_deref(),
-            Some("cargo test")
-        );
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.payload["signal"] == "canonical_validation_failed_repair_once"
-                && entry.payload["origin"] == "rejected_work_settlement"
-        }));
-        // The same rejection cannot authorize repair after a local suffix
-        // record is lost. Keep the positive control above.
-        state.stall.verification_frontier =
-            super::super::verification_frontier::tests::restored_prefix_with_missing_history(
-                &state.stall.tool_call_records,
-            );
-        state.hooks.completion_settlement = Default::default();
-        state.volatile_pending.clear();
-        state.max_turns = 24;
-        state.remaining_turns = 2;
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
-        assert_eq!((state.max_turns, state.remaining_turns), (24, 2));
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            0
-        );
-        assert!(state.volatile_pending.is_empty());
-        assert_eq!(
-            state.interruption.as_ref().map(|value| value.kind),
-            Some(InterruptionKind::ExecutionIncomplete)
-        );
-    }
-
-    #[test]
-    fn unverified_validation_success_opens_one_proven_revalidation() {
-        let mut state = make_state();
-        let mut rejected = executed_record("settle_work_item", false, None);
-        rejected.disposition = Some(ToolCallDisposition::Rejected);
-        rejected.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "validation_state": "stale"
-            })
-            .to_string(),
-        );
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("tsc --noEmit --help --outDir --help false", "success"),
-            rejected,
-        ];
-        state.remaining_turns = 2;
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Stale
-        );
-
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
-        assert!(matches!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .map(|window| &window.action),
-            Some(CompletionAction::CanonicalWorkValidation)
-        ));
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .is_none()
-        );
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.payload["signal"] == "canonical_validation_success_unverified_revalidate_once"
-        }));
-        let call = |command| {
-            serde_json::json!({
-                "function": {"name": "bash", "arguments": serde_json::json!({"command": command}).to_string()}
-            })
-        };
-        assert!(
-            !completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &call("tsc --noEmit --help --outDir --help false")
-            )
-            .is_some()
-        );
-        assert!(
-            completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &call("tsc --noEmit")
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn attempt_only_retry_does_not_revive_proof_from_before_workspace_change() {
-        let mut state = make_state();
-        let ambiguous = "tsc --noEmit @args.rsp";
-        state.stall.tool_call_records = vec![
-            validation_record("tsc --noEmit", "success"),
-            executed_record("write_file", true, None),
-            validation_record(ambiguous, "test_failure"),
-        ];
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Failed
-        );
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record(ambiguous, "success"));
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Stale
-        );
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("tsc --noEmit", "success"));
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Passed
-        );
-    }
-
-    #[test]
-    fn repaired_attempt_only_failure_can_reach_proven_work_settlement() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = false;
-        let ambiguous = "tsc --noEmit @args.rsp";
-        state.stall.tool_call_records = vec![
-            validation_record(ambiguous, "test_failure"),
-            executed_record("write_file", true, None),
-            validation_record(ambiguous, "success"),
-        ];
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries = 1;
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = Some(ambiguous.into());
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Stale
-        );
-        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 2,
-        );
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("proof step remains available");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkValidation);
-        assert!(!window.consumed);
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .is_none()
-        );
-        let call = |command| {
-            serde_json::json!({
-                "function": {"name": "bash", "arguments": serde_json::json!({"command": command}).to_string()}
-            })
-        };
-        assert!(
-            !completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &call(ambiguous)
-            )
-            .is_some()
-        );
-        assert!(
-            completion_action_match_label(
-                &state,
-                &CompletionAction::CanonicalWorkValidation,
-                &call("tsc --noEmit")
-            )
-            .is_some()
-        );
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("tsc --noEmit", "success"));
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-            .expect("proof step");
-        window.consumed = true;
-        window.matched = true;
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Passed
-        );
-        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 3,
-        );
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    #[test]
-    fn quarantined_attempt_only_retry_cannot_reopen_proof_window() {
-        let mut state = make_state();
-        let ambiguous = "tsc --noEmit @args.rsp";
-        state.stall.tool_call_records = vec![
-            validation_record(ambiguous, "test_failure"),
-            validation_record(ambiguous, "success"),
-        ];
-        state.stall.workspace_observation_quarantine = Some(
-            astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::partial_workspace_mutation(
-                Some("unsettled-call".into()),
-            ),
-        );
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_operation = Some(ambiguous.into());
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-        state.remaining_turns = 2;
-        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 1,
-        );
-        assert!(state.hooks.completion_settlement.text_only);
-        assert_eq!(state.remaining_turns, 2);
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn rejected_work_settlement_does_not_expand_existing_repair_headroom() {
-        let mut state = make_state();
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "validation_state": "failed"
-            })
-            .to_string(),
-        );
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            rejected_settlement,
-        ];
-        state.max_turns = 24;
-        state.remaining_turns = 3;
-
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
-
-        assert!(matches!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .map(|window| &window.action),
-            Some(CompletionAction::CanonicalWorkRepair)
-        ));
-        assert_eq!(state.max_turns, 24);
-        assert_eq!(state.remaining_turns, 3);
-    }
-
-    #[test]
-    fn rejected_settlement_does_not_replace_an_existing_validation_window() {
-        let mut state = make_state();
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "validation_state": "failed"
-            })
-            .to_string(),
-        );
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            rejected_settlement,
-        ];
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 1,
-                mismatch_corrections_remaining: 0,
-                consumed: true,
-                matched: false,
-            });
-
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
-
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("existing validation obligation remains authoritative");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkValidation);
-        assert_eq!(window.mismatch_corrections_remaining, 0);
-        assert!(window.consumed);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            0
-        );
-    }
-
-    #[test]
-    fn historical_rejected_settlement_cannot_reopen_a_later_failure() {
-        let mut state = make_state();
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "validation_state": "failed"
-            })
-            .to_string(),
-        );
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test -p first", "test_failure"),
-            rejected_settlement,
-            validation_record("cargo test -p first", "success"),
-            validation_record("cargo test -p second", "test_failure"),
-            executed_record("read_file", true, None),
-        ];
-
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 5);
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            0
-        );
-    }
-
-    #[test]
-    fn concurrent_mutation_risk_after_rejected_settlement_requires_revalidation() {
-        let mut state = make_state();
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "validation_state": "failed"
-            })
-            .to_string(),
-        );
-        let weak_receipt = astra_tools::workspace_observation::changed_receipt_with_ownership(
-            astra_tools::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP,
-        )
-        .remove(astra_tools::workspace_observation::RECEIPT_FIELD)
-        .expect("weak receipt");
-        let weak_repair = ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Executed),
-            args_full: Some(r#"{"command":"./opaque-writer"}"#.into()),
-            runtime_args_full: Some(r#"{"command":"./opaque-writer"}"#.into()),
-            workspace_mutation_observed: Some(true),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: Some(weak_receipt),
-            ..ToolCallRecord::default()
-        };
-        assert!(record_is_effective_workspace_repair(&weak_repair));
-        let mut restored_weak_repair = weak_repair.clone();
-        restored_weak_repair.runtime_args_full = None;
-        assert!(record_is_effective_workspace_repair(&restored_weak_repair));
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            rejected_settlement,
-            weak_repair,
-        ];
-        state.max_turns = 24;
-        state.remaining_turns = 2;
-
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Stale
-        );
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
-
-        assert!(matches!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .map(|window| &window.action),
-            Some(CompletionAction::CanonicalWorkValidation)
-        ));
-        assert_eq!(state.max_turns, 24);
-        assert_eq!(state.remaining_turns, 2);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            1
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .as_deref(),
-            Some("cargo test")
-        );
-    }
-
-    #[test]
-    fn rejected_writer_does_not_invalidate_current_validation() {
-        let mut state = make_state();
-        let mut rejected_writer = executed_record("write_file", false, None);
-        rejected_writer.disposition = Some(ToolCallDisposition::Rejected);
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            rejected_writer,
-        ];
-
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Failed,
-            "admission-only writer shapes must not invalidate executed validation evidence"
-        );
-    }
-
-    #[test]
-    fn stale_rejected_settlement_reopens_the_latest_canonical_validation() {
-        let mut state = make_state();
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "unresolved_work_validation",
-                "validation_state": "stale"
-            })
-            .to_string(),
-        );
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test -p changed-package", "success"),
-            executed_record("write_file", true, None),
-            rejected_settlement,
-        ];
-        state.max_turns = 24;
-        state.remaining_turns = 2;
-
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Stale
-        );
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 3);
-
-        assert!(matches!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .map(|window| &window.action),
-            Some(CompletionAction::CanonicalWorkValidation)
-        ));
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_operation
-                .as_deref(),
-            Some("cargo test -p changed-package")
-        );
-        assert_eq!(state.max_turns, 24);
-        assert_eq!(state.remaining_turns, 2);
-    }
-
-    #[test]
-    fn rejected_work_settlement_without_failed_canonical_validation_stays_settlement_only() {
-        let mut state = make_state();
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            rejected_settlement,
-        ];
-        state.hooks.completion_settlement.work_settlement_only = true;
-
-        advance_completion_action_window_after_tool_round_for_work_state_from_record_index(
-            &mut state, true, 1,
-        );
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_retries,
-            0
-        );
-    }
-
-    #[test]
-    fn unrelated_rejected_work_settlement_does_not_open_repair_authority() {
-        let mut state = make_state();
-        let mut rejected_settlement = executed_record("settle_work_item", false, None);
-        rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
-        rejected_settlement.result_full = Some(
-            serde_json::json!({
-                "status": "rejected",
-                "error_kind": "work_settlement_only",
-                "validation_state": "failed"
-            })
-            .to_string(),
-        );
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            rejected_settlement,
-        ];
-        state.hooks.completion_settlement.work_settlement_only = true;
-
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    #[test]
-    fn failed_executed_work_settlement_does_not_open_repair_authority() {
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            executed_record("settle_work_item", false, None),
-        ];
-        state.hooks.completion_settlement.work_settlement_only = true;
-
-        advance_rejected_work_settlement_recovery_for_test(&mut state, 2);
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    #[test]
-    fn quarantined_failed_work_validation_cannot_open_repair_authority() {
-        let temp = tempfile::tempdir().expect("workspace tempdir");
-        assert!(
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(temp.path())
-        );
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some(temp.path().to_string_lossy().into_owned());
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-        ];
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-        let turns_before = state.max_turns;
-
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert_eq!(state.max_turns, turns_before);
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_some()
-        );
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-        assert!(state.hooks.completion_settlement.text_only);
-    }
-
-    #[test]
-    fn successful_bounded_work_repair_requires_revalidation_before_settlement() {
-        let mut state = make_state();
-        // This test isolates the validation-recovery chain; the required
-        // workspace-mutation obligation was already satisfied before it.
-        state.task_profile.mutates_workspace = false;
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            executed_record("write_file", true, None),
-        ];
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries = 1;
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkRepair,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Stale
-        );
-        assert_eq!(
-            pending_completion_action_for_work_state(&state, true).unwrap(),
-            Some(CompletionAction::CanonicalWorkValidation)
-        );
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("canonical revalidation window");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkValidation);
-        assert!(!window.consumed);
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    #[test]
-    fn failed_bounded_work_repair_reopens_one_corrective_mutation() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = false;
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            executed_record("str_replace", false, None),
-        ];
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries = 1;
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkRepair,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-        let turns_before = state.max_turns;
-        let remaining_before = state.remaining_turns;
-
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("a failed repair receives one bounded correction");
-        assert_eq!(window.action, CompletionAction::CanonicalWorkRepair);
-        assert!(!window.consumed);
-        assert!(!window.matched);
-        assert_eq!(window.attempts_remaining, 1);
-        assert_eq!(window.mismatch_corrections_remaining, 1);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .canonical_validation_recovery_failed_action_retries,
-            1
-        );
-        assert_eq!(state.max_turns, turns_before);
-        assert_eq!(state.remaining_turns, remaining_before);
-        assert!(
-            state.volatile_pending.iter().any(|entry| {
-                entry.payload["signal"] == "canonical_work_repair_failed_retry_once"
-            })
-        );
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    #[test]
-    fn second_failed_bounded_work_repair_cannot_reopen_the_same_repair() {
-        let mut state = make_state();
-        state.task_profile.mutates_workspace = false;
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-            executed_record("str_replace", false, None),
-        ];
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries = 1;
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_failed_action_retries = 1;
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkRepair,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert!(
-            !state.volatile_pending.iter().any(|entry| {
-                entry.payload["signal"] == "canonical_work_repair_failed_retry_once"
-            }),
-            "a second failed repair must not create another repair retry"
-        );
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert!(
-            state.hooks.completion_settlement.work_settlement_only,
-            "failed bounded repair returns authority to truthful Work settlement"
-        );
-        assert!(!state.hooks.completion_settlement.text_only);
-    }
-
-    #[test]
-    fn second_failed_bounded_work_revalidation_settles_truthfully() {
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            validation_record("cargo test", "test_failure"),
-        ];
-        state
-            .hooks
-            .completion_settlement
-            .canonical_validation_recovery_retries = 1;
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    fn successful_bounded_revalidation_state(stop_hook: Option<&str>) -> AgenticLoopState {
-        let mut state = make_state();
-        if let Some(command) = stop_hook {
+            .push(explicit_verification_hook("completed", "cargo test"));
+        if let Some(command) = extra_check {
             state
                 .hooks
                 .stop_hooks
-                .push(explicit_verification_hook("quality", command));
+                .push(explicit_verification_hook("additional", command));
         }
-        state.stall.tool_call_records = vec![
-            ToolCallRecord {
-                name: "run_next_work_item".into(),
-                ok: true,
-                disposition: Some(ToolCallDisposition::Executed),
-                result_full: Some(
-                    serde_json::json!({
-                        "status": "assigned",
-                        "execution": "primary_session",
-                        "attempt_id": "attempt-a"
-                    })
-                    .to_string(),
-                ),
-                ..Default::default()
-            },
-            executed_record("write_file", true, None),
-            validation_record("cargo test", "test_failure"),
-            validation_record("cargo test", "success"),
-        ];
+        let args = serde_json::json!({"command":"cargo test"}).to_string();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            result_class: Some("success".into()),
+            exit_semantics: Some("success".into()),
+            ..Default::default()
+        });
         state.hooks.completion_settlement.completion_action_window =
             Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
+                action: CompletionAction::ExplicitVerification {
+                    missing_labels: vec!["completed".into()],
+                },
                 attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
+                mismatch_corrections_remaining: 0,
                 consumed: true,
                 matched: true,
             });
-
         state
     }
 
     #[test]
-    fn successful_bounded_work_revalidation_clears_debt_before_settlement() {
-        let mut state = successful_bounded_revalidation_state(None);
-
-        assert_eq!(
-            current_work_validation_state(&state),
-            WorkValidationState::Passed
-        );
-        assert_eq!(
-            pending_completion_action_for_work_state(&state, true).unwrap(),
-            None
-        );
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert!(state.hooks.completion_settlement.work_settlement_only);
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn successful_work_revalidation_cannot_skip_an_independent_verification_hook() {
-        let mut state = successful_bounded_revalidation_state(Some("./quality-gate"));
+    fn completed_check_cannot_skip_an_independent_declared_check() {
+        let mut state = completed_explicit_check_state(Some("./quality-gate"));
 
         assert!(matches!(
-            pending_completion_action_for_work_state(&state, true).unwrap(),
+            pending_completion_action(&state).unwrap(),
             Some(CompletionAction::ExplicitVerification { .. })
         ));
         advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
@@ -13460,13 +9573,10 @@ mod tests {
     }
 
     #[test]
-    fn canonical_revalidation_may_also_satisfy_the_exact_declared_hook() {
-        let mut state = successful_bounded_revalidation_state(Some("cargo test"));
+    fn completed_declared_checks_return_to_the_canonical_work_owner() {
+        let mut state = completed_explicit_check_state(Some("cargo test"));
 
-        assert_eq!(
-            pending_completion_action_for_work_state(&state, true).unwrap(),
-            None
-        );
+        assert_eq!(pending_completion_action(&state).unwrap(), None);
         advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
 
         assert!(state.hooks.completion_settlement.work_settlement_only);
@@ -13477,123 +9587,6 @@ mod tests {
                 .completion_action_window
                 .is_none()
         );
-    }
-
-    #[test]
-    fn active_work_unmatched_completion_action_cannot_settle_work() {
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                true,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            );
-        state
-            .stall
-            .tool_call_records
-            .push(executed_record("write_file", true, None));
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 0,
-                consumed: true,
-                matched: false,
-            });
-
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_some()
-        );
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-        assert!(state.hooks.completion_settlement.text_only);
-    }
-
-    #[test]
-    fn active_work_failed_completion_action_cannot_settle_work() {
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                true,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            );
-        state
-            .stall
-            .tool_call_records
-            .push(executed_record("write_file", true, None));
-        state
-            .stall
-            .tool_call_records
-            .push(validation_record("cargo test", "test_failure"));
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_some()
-        );
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-        assert!(!state.hooks.completion_settlement.text_only);
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .unwrap()
-                .action,
-            CompletionAction::CanonicalWorkRepair
-        );
-        assert_eq!(state.max_turns, 10);
-    }
-
-    #[test]
-    fn active_work_quarantined_completion_action_cannot_settle_work() {
-        let temp = tempfile::tempdir().expect("workspace tempdir");
-        assert!(
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(temp.path())
-        );
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some(temp.path().to_string_lossy().into_owned());
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::CanonicalWorkValidation,
-                attempts_remaining: 0,
-                mismatch_corrections_remaining: 1,
-                consumed: true,
-                matched: true,
-            });
-
-        advance_completion_action_window_after_tool_round_for_work_state(&mut state, true);
-
-        assert!(workspace_observation_is_quarantined(&state));
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_some()
-        );
-        assert!(!state.hooks.completion_settlement.work_settlement_only);
-        assert!(state.hooks.completion_settlement.text_only);
     }
 
     #[test]
@@ -14093,27 +10086,6 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
-    }
-
-    #[test]
-    fn read_only_turn_does_not_observe_a_non_authoritative_mutation_risk() {
-        let mut state = make_state();
-        state.turn_intent = Some(
-            astra_config::user_profile::TurnIntent::default().with_workspace_mutation(
-                astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
-            ),
-        );
-        state.stall.tool_call_records.push(executed_record(
-            "write_file",
-            false,
-            Some(r#"{"path":"/workspace/out.txt","content":"partial"}"#),
-        ));
-
-        assert!(has_executed_positive_workspace_mutation(&state));
-
-        assert!(!reject_unsettled_execution_completion(&mut state));
-
-        assert!(state.interruption.is_none());
     }
 
     #[tokio::test]
@@ -15603,8 +11575,7 @@ mod tests {
                 Some(r#"{"command":"git worktree list"}"#),
             ));
         assert_eq!(
-            pending_terminal_completion_action_for_work_state(&spent_generic_action, false)
-                .unwrap(),
+            pending_completion_action(&spent_generic_action).unwrap(),
             None,
             "the successful action must not manufacture another terminal tool allowance"
         );
@@ -16000,6 +11971,13 @@ mod tests {
             .push(executed_record("write_file", true, None));
         let mut verifier = make_edge_tool("bash", "quality passed");
         verifier.args = serde_json::json!({"command": "./quality-gate"});
+        verifier
+            .tool_result_fields
+            .get_or_insert_with(Default::default)
+            .extend([
+                ("result_class".into(), serde_json::json!("success")),
+                ("exit_semantics".into(), serde_json::json!("success")),
+            ]);
         let mut host = MockHost::new(vec![
             text_result("Premature final.", 10, 5, Some(1)),
             edge_tool_result(vec![verifier], 10, 5, Some(1)),
@@ -16403,169 +12381,6 @@ mod tests {
         // Non-JSON args are treated as missing rather than the raw string,
         // avoiding false positives from corrupted journal entries.
         assert!(!tool_record_is_workspace_mutation(&record));
-    }
-
-    #[test]
-    fn positive_mutation_shape_uses_direct_tool_identity_not_preview_or_parseability() {
-        let with_preview = ToolCallRecord {
-            name: "write_file".into(),
-            args_preview: Some(r#"{"path":"/tmp/out"}"#.into()),
-            ..Default::default()
-        };
-        let malformed_full = ToolCallRecord {
-            name: "write_file".into(),
-            args_full: Some("not-json".into()),
-            ..Default::default()
-        };
-        let bash_preview = ToolCallRecord {
-            name: "bash".into(),
-            args_preview: Some(r#"{"command":"printf x > /workspace/out"}"#.into()),
-            ..Default::default()
-        };
-        let bash_malformed = ToolCallRecord {
-            name: "bash".into(),
-            args_full: Some("not-json".into()),
-            ..Default::default()
-        };
-        let bash_valid = ToolCallRecord {
-            name: "bash".into(),
-            args_full: Some(r#"{"command":"printf x > /workspace/out"}"#.into()),
-            ..Default::default()
-        };
-
-        assert!(tool_record_has_positive_mutation_shape(&with_preview));
-        assert!(tool_record_has_positive_mutation_shape(&malformed_full));
-        assert!(!tool_record_has_positive_mutation_shape(&bash_preview));
-        assert!(!tool_record_has_positive_mutation_shape(&bash_malformed));
-        assert!(tool_record_has_positive_mutation_shape(&bash_valid));
-    }
-
-    #[test]
-    fn trusted_bash_receipt_covers_opaque_writer_without_command_special_case() {
-        let mut state = make_state();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            workspace_mutation_observed: Some(true),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: Some(
-                astra_tools::workspace_observation::changed_receipt()
-                    .remove(astra_tools::workspace_observation::RECEIPT_FIELD)
-                    .expect("receipt field"),
-            ),
-            args_full: Some(serde_json::json!({"command":"./project-writer"}).to_string()),
-            runtime_args_full: Some(serde_json::json!({"command":"./project-writer"}).to_string()),
-            ..Default::default()
-        });
-
-        assert!(has_executed_positive_workspace_mutation(&state));
-
-        let mut failed = state.stall.tool_call_records[0].clone();
-        failed.ok = false;
-        state.task_profile.mutates_workspace = true;
-        state.stall.tool_call_records = vec![failed];
-        assert!(has_executed_positive_workspace_mutation(&state));
-    }
-
-    #[test]
-    fn unscoped_or_non_bash_receipt_never_satisfies_bound_mutation() {
-        for (name, scope) in [("bash", "external"), ("mcp_tool", "bound_workspace")] {
-            let record = ToolCallRecord {
-                name: name.into(),
-                ok: true,
-                workspace_mutation_observed: Some(true),
-                workspace_mutation_scope: Some(scope.into()),
-                ..Default::default()
-            };
-            assert!(!tool_record_has_positive_mutation_shape(&record));
-        }
-    }
-
-    #[test]
-    fn external_scratch_does_not_create_global_mutation_obligation() {
-        let mut state = make_state();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "write_file".into(),
-            ok: true,
-            args_full: Some(r#"{"path":"/tmp/scratch.txt","content":"x"}"#.into()),
-            file_path: Some("/tmp/scratch.txt".into()),
-            ..Default::default()
-        });
-
-        assert!(!has_executed_positive_workspace_mutation(&state));
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-    }
-
-    #[test]
-    fn external_scratch_shell_snapshot_does_not_create_global_mutation_obligation() {
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/workspace/astra".into());
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(
-                serde_json::json!({
-                    "command": "cd /workspace/astra && git show HEAD:src/lib.rs > /tmp/inspected.rs && sed -n '1,20p' /tmp/inspected.rs"
-                })
-                .to_string(),
-            ),
-            ..Default::default()
-        });
-
-        assert!(!has_executed_positive_workspace_mutation(&state));
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-    }
-
-    #[test]
-    fn unchanged_bash_receipt_does_not_prove_external_persistent_write_is_scratch() {
-        let receipt =
-            astra_tools::workspace_observation::unchanged_bash_observation_receipt_with_ownership(
-                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-            )
-            .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-            .cloned();
-        let command = "printf x >> /outside/persistent-state; exit 1";
-        let record = ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(serde_json::json!({"command": command}).to_string()),
-            runtime_args_full: Some(serde_json::json!({"command": command}).to_string()),
-            workspace_mutation_scope: Some(
-                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
-            ),
-            workspace_mutation_receipt: receipt,
-            ..ToolCallRecord::default()
-        };
-
-        assert!(crate::turn::agentic_loop::lifecycle::is_authoritative_unchanged_bash_observation_record(&record));
-        assert!(
-            !record_is_proven_external_scratch_mutation(Some("/workspace"), &record),
-            "a bound-workspace no-change fact cannot clear an untracked persistent external effect"
-        );
-    }
-
-    #[test]
-    fn historical_review_diff_scratch_snapshot_does_not_create_global_mutation_obligation() {
-        let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/workspace/astra".into());
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(
-                serde_json::json!({
-                    "command": "cd \"$(git rev-parse --show-toplevel 2>/dev/null || echo .)\" && git diff 449b13b95f56f57619094fbb8afbc496d31dd7a8^ 449b13b95f56f57619094fbb8afbc496d31dd7a8 > /tmp/review.diff && wc -l /tmp/review.diff"
-                })
-                .to_string(),
-            ),
-            ..Default::default()
-        });
-
-        assert!(!has_executed_positive_workspace_mutation(&state));
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
     }
 
     #[test]
