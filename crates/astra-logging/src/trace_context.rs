@@ -59,30 +59,26 @@ impl Carrier {
     }
 }
 
+/// W3C section 3.2.4, as the SDK propagator parses it: version `00` has exactly
+/// four fields; a higher version keeps the first four and ignores the rest.
 pub(crate) fn valid_traceparent(value: &str) -> bool {
-    let mut parts = value.split('-');
-    let Some(version) = parts.next() else {
+    let mut parts = value.splitn(5, '-');
+    let (Some(version), Some(trace_id), Some(span_id), Some(flags)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return false;
     };
-    let Some(trace_id) = parts.next() else {
-        return false;
-    };
-    let Some(span_id) = parts.next() else {
-        return false;
-    };
-    let Some(flags) = parts.next() else {
-        return false;
-    };
-    parts.next().is_none()
-        && version.len() == 2
+    let extended = parts.next().is_some();
+    version.len() == 2
         && trace_id.len() == 32
         && span_id.len() == 16
         && flags.len() == 2
-        && is_hex(version)
-        && !version.eq_ignore_ascii_case("ff")
-        && is_hex(trace_id)
-        && is_hex(span_id)
-        && is_hex(flags)
+        && is_lower_hex(version)
+        && version != "ff"
+        && !(version == "00" && extended)
+        && is_lower_hex(trace_id)
+        && is_lower_hex(span_id)
+        && is_lower_hex(flags)
         && trace_id.chars().any(|c| c != '0')
         && span_id.chars().any(|c| c != '0')
 }
@@ -171,8 +167,8 @@ fn is_chr(c: char) -> bool {
     c == ' ' || is_nblk(c)
 }
 
-fn is_hex(value: &str) -> bool {
-    value.chars().all(|c| c.is_ascii_hexdigit())
+fn is_lower_hex(value: &str) -> bool {
+    value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
 /// Identifiers of the active `astra.run` span. Child spans use this as parent.
@@ -188,9 +184,9 @@ pub struct RunLink {
 pub struct RunSpan {
     #[cfg(feature = "otel")]
     span: Option<opentelemetry::global::BoxedSpan>,
-    #[cfg(feature = "otel")]
     error_code: Option<&'static str>,
     link: Option<RunLink>,
+    owner: bool,
 }
 
 impl RunSpan {
@@ -207,26 +203,19 @@ impl RunSpan {
     }
 
     /// A child task's view of a run. Dropping it does not end the owning span.
-    pub fn observe(link: RunLink) -> Self {
+    pub fn observe(link: Option<RunLink>) -> Self {
         Self {
             #[cfg(feature = "otel")]
             span: None,
-            #[cfg(feature = "otel")]
             error_code: None,
-            link: Some(link),
+            link,
+            owner: false,
         }
     }
 
     /// Record a stable outcome. The description is the code, not the cause.
     pub fn fail(&mut self, code: &'static str) {
-        #[cfg(feature = "otel")]
-        {
-            self.error_code = Some(code);
-        }
-        #[cfg(not(feature = "otel"))]
-        {
-            let _ = code;
-        }
+        self.error_code = Some(code);
     }
 
     pub fn end(&mut self) {
@@ -234,7 +223,7 @@ impl RunSpan {
         {
             use opentelemetry::trace::{Span, Status};
             if let Some(mut span) = self.span.take() {
-                if let Some(code) = self.error_code.take() {
+                if let Some(code) = self.error_code {
                     span.set_status(Status::error(code));
                     span.set_attribute(opentelemetry::KeyValue::new("error.code", code));
                 }
@@ -256,9 +245,9 @@ impl RunSpan {
         Self {
             #[cfg(feature = "otel")]
             span: None,
-            #[cfg(feature = "otel")]
             error_code: None,
             link: None,
+            owner: true,
         }
     }
 }
@@ -320,29 +309,30 @@ where
     )
 }
 
+/// Let `future` see the caller's current run without owning it. The run is
+/// captured now, so the result can be handed to any task owner (`JoinSet`,
+/// `tokio::spawn`); task-locals do not follow a future onto another task.
+pub fn in_active_run<F>(future: F) -> impl Future<Output = F::Output> + use<F>
+where
+    F: Future,
+{
+    let link = ACTIVE_RUN
+        .try_with(|slot| slot.borrow().link())
+        .ok()
+        .flatten();
+    ACTIVE_RUN.scope(
+        RefCell::new(RunSpan::observe(link)),
+        ATTEMPT_CODE.scope(RefCell::new(None), future),
+    )
+}
+
 /// Run `future` on a new task that can see the current run without owning it.
 pub fn spawn_in_active_run<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let link = ACTIVE_RUN
-        .try_with(|slot| slot.borrow().link())
-        .ok()
-        .flatten();
-    tokio::spawn(async move {
-        match link {
-            Some(link) => {
-                ACTIVE_RUN
-                    .scope(
-                        RefCell::new(RunSpan::observe(link)),
-                        ATTEMPT_CODE.scope(RefCell::new(None), future),
-                    )
-                    .await
-            }
-            None => ATTEMPT_CODE.scope(RefCell::new(None), future).await,
-        }
-    })
+    tokio::spawn(in_active_run(future))
 }
 
 pub fn parent_to_active_run(span: &tracing::Span) {
@@ -355,21 +345,37 @@ pub fn parent_to_active_run(span: &tracing::Span) {
     }
 }
 
+/// Only the task that owns `astra.run` may end or restart it; an observing
+/// child task leaves the parent's span alone.
 pub fn end_active_run() {
-    let _ = ACTIVE_RUN.try_with(|slot| slot.borrow_mut().end());
+    let _ = ACTIVE_RUN.try_with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.owner {
+            slot.end();
+        }
+    });
 }
 
 pub fn reopen_active_run() {
     let _ = ACTIVE_RUN.try_with(|slot| {
         let mut slot = slot.borrow_mut();
-        if !slot.is_open() {
+        if slot.owner && !slot.is_open() {
             *slot = RunSpan::start(&Carrier::default());
         }
     });
 }
 
+/// Record the run outcome. An observing child task has no span to mark.
 pub fn fail_active_run(code: &'static str) {
     let _ = ACTIVE_RUN.try_with(|slot| slot.borrow_mut().fail(code));
+}
+
+/// The outcome recorded on this task's run slot, with or without export.
+pub fn active_run_error_code() -> Option<&'static str> {
+    ACTIVE_RUN
+        .try_with(|slot| slot.borrow().error_code)
+        .ok()
+        .flatten()
 }
 
 pub fn note_attempt_code(code: &'static str) {
@@ -418,6 +424,7 @@ fn start_otel(carrier: &Carrier) -> RunSpan {
         span: Some(span),
         error_code: None,
         link: Some(link),
+        owner: true,
     }
 }
 
@@ -530,6 +537,47 @@ mod carrier_tests {
             None,
         );
         assert!(carrier.traceparent.is_some());
+    }
+
+    #[test]
+    fn traceparent_follows_w3c_versioning() {
+        let parent = |value: &str| Carrier::from_header_values(Some(value), None).traceparent;
+        let higher = "01-11111111111111111111111111111111-0123456789abcdef-01-extra";
+        assert_eq!(parent(higher).as_deref(), Some(higher));
+        assert!(parent("01-11111111111111111111111111111111-0123456789abcdef-01").is_some());
+        assert!(parent("00-11111111111111111111111111111111-0123456789abcdef-01-extra").is_none());
+        assert!(parent("01-11111111111111111111111111111111-0123456789abcdef-01x").is_none());
+        assert!(parent("00-ABCDEF11111111111111111111111111-0123456789abcdef-01").is_none());
+        assert!(parent("00-00000000000000000000000000000000-0123456789abcdef-01").is_none());
+        assert!(parent("00-11111111111111111111111111111111-0000000000000000-01").is_none());
+    }
+
+    #[test]
+    fn child_scope_observes_without_owning_the_run() {
+        use super::{
+            active_run_error_code, bind_run, end_active_run, fail_active_run, in_active_run,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            bind_run(&Carrier::default(), async {
+                let mut tasks = tokio::task::JoinSet::new();
+                tasks.spawn(in_active_run(async {
+                    end_active_run();
+                    fail_active_run("child_failed");
+                    active_run_error_code()
+                }));
+                let child = tasks.join_next().await.expect("child").expect("join");
+                assert_eq!(child, Some("child_failed"));
+                assert_eq!(active_run_error_code(), None);
+                fail_active_run("run_admission_timeout");
+                assert_eq!(active_run_error_code(), Some("run_admission_timeout"));
+            })
+            .await;
+        });
+        assert_eq!(active_run_error_code(), None);
     }
 
     #[test]
@@ -839,5 +887,74 @@ mod tests {
             attribute.key.as_str() == "error.code"
                 && attribute.value.as_str() == "provider_deadline"
         }));
+    }
+
+    #[test]
+    fn joinset_child_joins_the_run_only_through_the_scope() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (exporter, provider) = capture_provider();
+        global::set_tracer_provider(provider.clone());
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        mark_export_ready();
+        let tracer = provider.tracer("astra-test");
+        let filter = EnvFilter::new("astra.run=info,astra.llm=info,astra.tool=info");
+        let subscriber = tracing_subscriber::registry()
+            .with(OpenTelemetryLayer::new(tracer).with_filter(filter));
+        let _default = tracing::subscriber::set_default(subscriber);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        let call = |name: &'static str| async move {
+            let span = tracing::info_span!(target: "astra.llm", "llm.call", probe = name);
+            parent_to_active_run(&span);
+            // A child that parks on user input must not end the parent span.
+            end_active_run();
+            reopen_active_run();
+            drop(span);
+        };
+        runtime.block_on(async {
+            bind_run(&Carrier::from_header_values(Some(parent), None), async {
+                let mut tasks = tokio::task::JoinSet::new();
+                tasks.spawn(in_active_run(call("scoped")));
+                tasks.spawn(call("unscoped"));
+                while let Some(joined) = tasks.join_next().await {
+                    joined.expect("child task");
+                }
+            })
+            .await;
+        });
+
+        let finished = exporter.0.lock().expect("span capture").clone();
+        let runs: Vec<_> = finished
+            .iter()
+            .filter(|span| span.name == "astra.run")
+            .collect();
+        assert_eq!(
+            runs.len(),
+            1,
+            "an observing child must not open another run"
+        );
+        let run = runs[0];
+        let probe = |name: &str| {
+            finished
+                .iter()
+                .find(|span| {
+                    span.name == "llm.call"
+                        && span.attributes.iter().any(|attribute| {
+                            attribute.key.as_str() == "probe" && attribute.value.as_str() == name
+                        })
+                })
+                .expect("llm.call exported")
+        };
+        let scoped = probe("scoped");
+        assert_eq!(scoped.span_context.trace_id(), run.span_context.trace_id());
+        assert_eq!(scoped.parent_span_id, run.span_context.span_id());
+        let unscoped = probe("unscoped");
+        assert_ne!(
+            unscoped.span_context.trace_id(),
+            run.span_context.trace_id()
+        );
     }
 }

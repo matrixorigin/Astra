@@ -175,6 +175,20 @@ pub(crate) fn init_with_otel(config: &LogInitConfig<'_>) -> Result<(), InitError
     res
 }
 
+/// Flush and shutdown the global OpenTelemetry tracer provider.
+pub(crate) fn shutdown_tracer_provider() {
+    let Some(provider) = tracer_provider_slot()
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+    else {
+        return;
+    };
+    if let Err(err) = provider.shutdown() {
+        eprintln!("[astra-logging] OTLP shutdown failed: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::endpoint_accepted;
@@ -222,19 +236,5 @@ mod tests {
             std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317");
         }
         assert!(super::wants_otel_export());
-    }
-}
-
-/// Flush and shutdown the global OpenTelemetry tracer provider.
-pub(crate) fn shutdown_tracer_provider() {
-    let Some(provider) = tracer_provider_slot()
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take())
-    else {
-        return;
-    };
-    if let Err(err) = provider.shutdown() {
-        eprintln!("[astra-logging] OTLP shutdown failed: {err}");
     }
 }

@@ -7762,6 +7762,9 @@ impl AgenticRunLifecycleService {
                 false
             }
         };
+        if committed {
+            crate::server::run_trace::fail_active_run(failure_code.as_str());
+        }
         runs.write().await.remove(run_id);
         committed
     }
@@ -7831,6 +7834,9 @@ impl AgenticRunLifecycleService {
                 false
             }
         };
+        if committed {
+            crate::server::run_trace::fail_active_run("cancelled");
+        }
         runs.write().await.remove(run_id);
         committed.then_some(terminal_events)
     }

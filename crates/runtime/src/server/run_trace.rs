@@ -3,8 +3,8 @@
 //! `spawn_observed` does not inherit the request span. The HTTP handler reads
 //! the inbound carrier before spawn and binds `astra.run` inside that task.
 //! A user-input wait ends the span; the continuation starts a new trace.
-//! `tokio::spawn` does not inherit the run slot, so owned inference tasks use
-//! [`spawn_in_active_run`] and only observe the parent span.
+//! A new task does not inherit the run slot, so owned inference tasks use
+//! [`in_active_run`] or [`spawn_in_active_run`] and only observe the parent span.
 
 use std::future::Future;
 
@@ -64,6 +64,13 @@ pub(crate) fn clear_attempt_code() {
 
 pub(crate) fn attempt_code() -> Option<&'static str> {
     astra_logging::trace_context::attempt_code()
+}
+
+pub(crate) fn in_active_run<F>(future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    astra_logging::trace_context::in_active_run(future)
 }
 
 pub(crate) fn spawn_in_active_run<F>(future: F) -> tokio::task::JoinHandle<F::Output>
