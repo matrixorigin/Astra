@@ -993,8 +993,8 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         ));
     }
     for (scenario, rounds, warm_context, polls, statements) in &budgets {
-        // Preserve the original chat allocation plus the explicit journal
-        // protocol allocation. Count all queries, including periodic controls.
+        // Preserve the original allocation, including canonical observation
+        // discovery/checkpoint work and every periodic control query.
         assert!(
             statements.len() <= 20,
             "{scenario} (warm={warm_context}, polls={polls}) used {} SQL statements including transactions and drained work:\n{}",
@@ -1518,13 +1518,14 @@ async fn configured_auto_finishes_without_authoring_or_rollout_queries() {
         .iter()
         .map(|sample| sample.sql.clone())
         .collect::<Vec<_>>();
+    assert_eq!(sql.iter().filter(|statement| statement.starts_with("SELECT payload_json, event_idx FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_type = ? AND idempotency_key = ?")).count(), 1,
+        "intent judgment and Auto preparation must reuse the same owned-Run decision lookup");
     let control_polls = sql
         .iter()
         .filter(|statement| statement.as_str() == CONTROL_OBSERVATION_SQL)
         .count();
     let authentication_reads = authentication_snapshot_count(&sql);
-    // Keep Auto's existing 29-statement allocation plus the journal protocol
-    // allocation. Only the existing exact authentication/control reads explain
+    // Keep Auto's existing allocation. Only the exact authentication/control reads explain
     // the two-statement envelope; all checkpoint SQL remains in the raw total.
     assert!(
         sql.len() <= 31,
@@ -1658,13 +1659,13 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
     );
     let (lease, pod) = owner.lease_identity();
     let stale = store
-        .next(lease, pod, Some((&b.ctx.user_id, &b.ctx.session_id)))
+        .next(lease, pod, Some((&b.ctx.user_id, &b.ctx.session_id)), None)
         .await
         .unwrap()
         .unwrap();
-    assert!(owner.drive_one().await.is_err());
+    assert!(owner.drive_one().await.unwrap());
     store.finish(lease, pod, &stale, true).await.unwrap();
-    let work: sqlx::types::Json<astra_services::session_memory_lifecycle::SessionMemoryWork> =
+    let mut work: sqlx::types::Json<astra_services::session_memory_lifecycle::SessionMemoryWork> =
         sqlx::query_scalar(
             "SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
         )
@@ -1681,11 +1682,25 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
 
     // Keep the test safely within the persisted backoff even on a loaded CI
     // host. This extends a real failed attempt; it does not fabricate enqueue.
-    sqlx::query("UPDATE agent_session_memory_work SET state_json = JSON_SET(state_json, '$.observation.retry_at_ms', CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + 60000) WHERE user_id = ? AND session_id = ?")
-        .bind(&b.ctx.user_id).bind(&b.ctx.session_id).execute(&b.ctx.pool).await.unwrap();
+    work.0.observation.retry_at_ms += 60_000;
+    sqlx::query(
+        "UPDATE agent_session_memory_work SET state_json = ? WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&work)
+    .bind(&b.ctx.user_id)
+    .bind(&b.ctx.session_id)
+    .execute(&b.ctx.pool)
+    .await
+    .unwrap();
     let before: String = sqlx::query_scalar("SELECT CAST(JSON_EXTRACT(state_json, '$.observation') AS CHAR) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     complete_observation_turn(&b.ctx, &b.auth_header).await;
+    astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore::new(
+        b.ctx.shared_pool.clone(),
+    )
+    .request_extraction(&b.ctx.user_id, &b.ctx.session_id)
+    .await
+    .unwrap();
     let after: String = sqlx::query_scalar("SELECT CAST(JSON_EXTRACT(state_json, '$.observation') AS CHAR) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(
@@ -1704,7 +1719,7 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
     let expired: String = sqlx::query_scalar("SELECT CAST(JSON_EXTRACT(state_json, '$.observation') AS CHAR) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(after, expired, "expired lease owners cannot checkpoint");
-    sqlx::query("UPDATE agent_session_memory_work SET complete = 0, state_json = JSON_SET(state_json, '$.observation.retry_at_ms', 0, '$.finalize_requested', true) WHERE user_id = ? AND session_id = ?")
+    sqlx::query("UPDATE agent_session_memory_work SET state_json = JSON_SET(state_json, '$.observation.retry_at_ms', 0) WHERE user_id = ? AND session_id = ?")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).execute(&b.ctx.pool).await.unwrap();
     let restarted = astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new(
         &state,
@@ -1725,7 +1740,7 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
             .collect::<Vec<_>>(),
         [1, 2]
     );
-    let retained: bool = sqlx::query_scalar("SELECT JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.finalize_requested')) = 'true' FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?")
+    let retained: bool = sqlx::query_scalar("SELECT JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.extraction_requested')) = 'true' FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     assert!(
         retained,
@@ -1797,6 +1812,8 @@ struct HeldCanonicalObserver {
     entered: tokio::sync::Notify,
     permits: tokio::sync::Semaphore,
     seen: Mutex<std::collections::BTreeSet<String>>,
+    fail_once: std::sync::atomic::AtomicBool,
+    failed_session: Mutex<Option<String>>,
 }
 #[async_trait::async_trait]
 impl astra_runtime::TurnObserverWorker for HeldCanonicalObserver {
@@ -1806,6 +1823,13 @@ impl astra_runtime::TurnObserverWorker for HeldCanonicalObserver {
     ) -> Result<astra_runtime::TurnObserverOutcome, String> {
         self.entered.notify_one();
         self.permits.acquire().await.unwrap().forget();
+        if self
+            .fail_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            *self.failed_session.lock().unwrap() = Some(request.session_id);
+            return Err("synthetic first-Session failure".into());
+        }
         self.seen.lock().unwrap().insert(request.session_id);
         Ok(astra_runtime::TurnObserverOutcome::Observed)
     }
@@ -1824,11 +1848,21 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     };
     use futures_util::{StreamExt, stream};
     require_system_e2e_env();
-    let b = bootstrap_isolated_execution_handoff(format!(
-        "astra_test_observation_{}",
+    use sqlx::Connection;
+    let mut settings = astra_core::MatrixOneSettings::from_env();
+    settings.database = "mysql".into();
+    let mut admin = sqlx::MySqlConnection::connect(&settings.database_url_with_password())
+        .await
+        .unwrap();
+    let database = format!(
+        "astra_test_http_handoff_obs_{}",
         uuid::Uuid::new_v4().simple()
-    ))
-    .await;
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    let b = bootstrap_isolated_execution_handoff(database.clone()).await;
     let sessions: Vec<_> = (0..1000)
         .map(|_| uuid::Uuid::new_v4().to_string())
         .collect();
@@ -1874,6 +1908,8 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         entered: tokio::sync::Notify::new(),
         permits: tokio::sync::Semaphore::new(0),
         seen: Default::default(),
+        fail_once: std::sync::atomic::AtomicBool::new(true),
+        failed_session: Default::default(),
     });
     let state = b
         .ctx
@@ -1913,10 +1949,27 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         assert!(restarted.drive_one().await.unwrap());
     }
     assert!(!restarted.drive_one().await.unwrap());
+    assert_eq!(
+        worker.seen.lock().unwrap().len(),
+        999,
+        "a failing earlier Session must not starve the remaining catalog"
+    );
+    let failed = worker.failed_session.lock().unwrap().clone().unwrap();
+    sqlx::query("UPDATE agent_session_memory_work SET state_json = JSON_SET(state_json, '$.observation.retry_at_ms', 0) WHERE user_id = ? AND session_id = ?")
+        .bind(&b.ctx.user_id).bind(&failed).execute(&b.ctx.pool).await.unwrap();
+    worker.permits.add_permits(1);
+    assert!(
+        restarted.drive_one().await.unwrap(),
+        "wrapping the scan must revisit deferred work"
+    );
     let seen = worker.seen.lock().unwrap().clone();
     assert_eq!(seen, sessions.iter().cloned().collect());
     let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_memory_work WHERE JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.observed_turn')) = '1'")
         .fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(receipts, 1000);
     b.ctx.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
 }

@@ -199,6 +199,7 @@ pub(crate) struct SessionObservationRecovery {
     store: astra_services::session_observation::SessionObservationStore,
     lease: super::sweeper_lease::SweeperLease,
     scope: Option<(String, String)>,
+    scan_cursor: tokio::sync::Mutex<Option<(String, String)>>,
 }
 
 impl SessionObservationRecovery {
@@ -210,6 +211,7 @@ impl SessionObservationRecovery {
         Some(Self {
             state,
             scope: None,
+            scan_cursor: Default::default(),
             store: astra_services::session_observation::SessionObservationStore::new(pool.clone()),
             lease: super::sweeper_lease::SweeperLease::new(
                 pool,
@@ -245,6 +247,7 @@ impl SessionObservationRecovery {
     }
 
     pub(crate) async fn drive_one(&self) -> Result<bool, String> {
+        let mut scan_cursor = self.scan_cursor.lock().await;
         if !self.prepare().await {
             return Ok(false);
         }
@@ -256,11 +259,24 @@ impl SessionObservationRecovery {
                 self.scope
                     .as_ref()
                     .map(|(user, session)| (user.as_str(), session.as_str())),
+                scan_cursor
+                    .as_ref()
+                    .map(|(user, session)| (user.as_str(), session.as_str())),
             )
             .await?
         else {
+            *scan_cursor = None;
             return Ok(false);
         };
+        // The cursor is only a scan optimization. Checkpoints and canonical
+        // facts remain durable; restarting or wrapping can never lose work.
+        // Session-scoped Router fixtures have no catalog traversal to advance.
+        if self.scope.is_none() {
+            *scan_cursor = Some((
+                candidate.key.owner_user_id.clone(),
+                candidate.key.session_id.clone(),
+            ));
+        }
         let result = async {
             let materialized = self.store.materialize(&mut candidate).await?;
             let messages =
@@ -292,6 +308,11 @@ impl SessionObservationRecovery {
                 result.is_ok(),
             )
             .await?;
-        result.map(|_| true)
+        if let Err(error) = result {
+            // The failed attempt has a durable retry clock. Continue the bounded
+            // batch so a few failing Sessions cannot starve healthy Sessions.
+            tracing::warn!(%error, "canonical observation attempt deferred");
+        }
+        Ok(true)
     }
 }
