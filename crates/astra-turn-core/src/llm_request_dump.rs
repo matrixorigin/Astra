@@ -121,7 +121,10 @@ pub fn build_llm_request_dump(
         model: model.to_string(),
         provider: provider.to_string(),
         error: error.to_string(),
-        messages: messages.to_vec(),
+        messages: messages
+            .iter()
+            .map(astra_core::model_wire::responses::without_continuation)
+            .collect(),
         tools: tools.to_vec(),
         round,
         max_output_tokens,
@@ -175,6 +178,30 @@ mod tests {
         assert_eq!(j["round"], 2);
         assert!(j["error"].as_str().unwrap().contains("reasoning_content"));
         assert!(j["messages"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn failure_dump_does_not_persist_private_continuation() {
+        let messages = vec![
+            json!({"role":"assistant", "content":"working", "_astra_responses":{
+                "items":[{"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}]
+            }}),
+        ];
+        let dump = build_llm_request_dump(
+            "session",
+            None,
+            "model",
+            "provider",
+            "context limit",
+            &messages,
+            &[],
+            1,
+            None,
+        );
+        let artifact = dump.to_remote_artifact_record("user");
+        assert_eq!(artifact.content["messages"][0]["content"], "working");
+        assert!(!artifact.content.to_string().contains("reasoning_text"));
+        assert!(messages[0].get("_astra_responses").is_some());
     }
 
     #[test]

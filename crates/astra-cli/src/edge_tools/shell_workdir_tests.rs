@@ -253,6 +253,8 @@ async fn cli_bash_workdir_uses_pinned_inferred_sources_and_root_declared_sources
         branch_name: "fixture".into(),
         original_root: original.path().to_path_buf(),
         original_head_commit: None,
+        git_identity: String::new(),
+        recovery_error: None,
     });
     let args = serde_json::json!({"command":"cp input.bin output.bin", "workdir":"nested"});
     let workdir = astra_tools::shell_ops::resolve_bash_workdir(selected.path(), &args).unwrap();

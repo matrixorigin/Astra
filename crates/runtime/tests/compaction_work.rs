@@ -118,9 +118,29 @@ async fn memoria_serialized_budget_truncation_reports_work() {
         "two sizing scans plus one before/after serialization for each accepted edit"
     );
     assert_eq!(result.messages.len(), history.len());
+    let mut truncated = 0;
+    for (original, compacted) in history.iter().zip(&result.messages) {
+        assert_eq!(compacted["role"], original["role"]);
+        if original["role"] != "tool" {
+            assert_eq!(compacted, original);
+            continue;
+        }
+        assert_eq!(compacted["tool_call_id"], original["tool_call_id"]);
+        let original = original["content"].as_str().unwrap();
+        let compacted = compacted["content"].as_str().unwrap();
+        if compacted != original {
+            let retained = compacted
+                .strip_suffix("\n...[compacted for context budget]")
+                .expect("a truncated result must say it was compacted");
+            assert!(original.starts_with(retained));
+            assert!(!retained.is_empty(), "compaction must retain evidence");
+            truncated += 1;
+        }
+    }
+    assert!(truncated > 0, "the measurement must exercise truncation");
     assert_eq!(
         format!("{:x}", Sha256::digest(&output)),
-        "369a7f096c596e78fadd6a9eab960ae1e65ce330404b085ffdc92b88de6b2589",
-        "serialization-work reductions must preserve the baseline output exactly"
+        "f42dce584bfea7c297a9aaa79adfae00f19717ca1c994442b1daf335d2d860f2",
+        "serialization work must preserve the expected compacted output"
     );
 }

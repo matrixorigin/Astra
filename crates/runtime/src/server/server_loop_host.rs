@@ -1985,6 +1985,7 @@ fn record_full_llm_response_event(
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
     inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
+    responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     response_scope: Option<String>,
     subscription: Option<astra_services::chatgpt::ExecutionCredential>,
     model_name: String,
@@ -3267,6 +3268,7 @@ fn resolve_llm_model_for_turn(
     }
     Ok(ResolvedTurnLlmConfig {
         inference_protocol: execution.inference_protocol,
+        responses_reasoning_history: execution.responses_reasoning_history,
         response_scope: execution.response_scope.clone(),
         subscription: execution.subscription.clone(),
         model_name: execution.model_name.clone(),
@@ -3610,6 +3612,7 @@ pub struct ServerAgenticLoopHost {
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
+    private_reasoning_origins: Option<HashSet<String>>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     provider_observations:
         Option<crate::server::provider_test_support::ProviderObservationsFixture>,
@@ -4380,7 +4383,109 @@ impl RuntimeExecutionHandoff {
     }
 }
 
+const PRIVATE_CONTEXT_RECOVERY_MESSAGE: &str = "Model context could not be recovered. Try a new turn; if it still fails, start a new session or choose another model.";
+
 impl ServerAgenticLoopHost {
+    pub(crate) fn set_private_reasoning_origins(&mut self, mut origins: HashSet<String>) {
+        origins.insert(self.session_id.clone());
+        self.private_reasoning_origins = Some(origins);
+    }
+
+    pub(crate) fn completed_responses_reasoning_scope(&self) -> Option<(&str, &str)> {
+        let config = self.resolved_llm_config.as_ref()?;
+        (config.responses_reasoning_history
+            == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn))
+        .then(|| config.responses_budget_scope())
+        .flatten()
+    }
+
+    fn authorize_private_responses(
+        &self,
+        messages: &[Value],
+        scope: &str,
+        model: &str,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        use crate::turn::llm::private_continuation;
+        let projected = if self.resolved_llm_config.as_ref().is_some_and(|config| {
+            config.responses_reasoning_history
+                == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+                && config.responses_budget_scope() == Some((scope, model))
+        }) {
+            let start = messages
+                .iter()
+                .rposition(astra_turn_types::is_human_user_message)
+                .map_or(0, |index| index + 1);
+            &messages[start..]
+        } else {
+            messages
+        };
+        let requested = private_continuation::origins(projected, scope, model);
+        if requested.iter().all(|origin| {
+            origin == &self.session_id
+                || self
+                    .private_reasoning_origins
+                    .as_ref()
+                    .is_some_and(|allowed| allowed.contains(origin))
+        }) {
+            Ok(())
+        } else {
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                PRIVATE_CONTEXT_RECOVERY_MESSAGE,
+            ))
+        }
+    }
+
+    fn open_authorized_private_responses(
+        &self,
+        messages: &mut [Value],
+        scope: &str,
+        model: &str,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let fallback = HashSet::from([self.session_id.clone()]);
+        crate::turn::llm::private_continuation::open(
+            messages,
+            &self.encryptor,
+            &self.user_id,
+            self.private_reasoning_origins.as_ref().unwrap_or(&fallback),
+            scope,
+            model,
+        )
+        .map_err(|_| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                PRIVATE_CONTEXT_RECOVERY_MESSAGE,
+            )
+        })
+    }
+
+    fn open_private_responses(
+        &self,
+        messages: &mut [Value],
+        scope: &str,
+        model: &str,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        self.authorize_private_responses(messages, scope, model)?;
+        self.open_authorized_private_responses(messages, scope, model)
+    }
+
+    fn responses_budget_view(
+        &self,
+        messages: &[Value],
+        config: &ResolvedTurnLlmConfig,
+    ) -> Result<Option<Vec<Value>>, astra_core::ClassifiedError> {
+        let Some((scope, model)) = config.responses_budget_scope() else {
+            return Ok(None);
+        };
+        let mut opened = messages.to_vec();
+        if config.responses_reasoning_history
+            == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+        {
+            crate::turn::llm::private_continuation::discard_completed_turn_reasoning(&mut opened);
+        }
+        self.open_private_responses(&mut opened, scope, model)?;
+        Ok(Some(opened))
+    }
     pub(crate) fn edge_provider_tool_schemas(&self) -> &[Value] {
         &self.edge_provider_tool_schemas
     }
@@ -5352,13 +5457,14 @@ impl crate::turn::llm::client::ProviderAttemptObserver
 
 fn split_canonical_and_provider_budget_messages(
     canonical_messages: Vec<Value>,
+    opened_responses: Option<&[Value]>,
     provider: &str,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
 ) -> (Vec<Value>, Vec<Value>) {
     let provider_budget_messages =
         crate::turn::llm::client::consolidate_system_messages_for_protocol(
-            &canonical_messages,
+            opened_responses.unwrap_or(&canonical_messages),
             provider,
             cache_capability,
             protocol.unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(provider)),
@@ -5375,6 +5481,7 @@ fn fit_physical_retry_wire_budget(
     config: &ResolvedTurnLlmConfig,
     requested_output_tokens: usize,
     state: &AgenticLoopState,
+    prepare_budget_view: impl Fn(&mut [Value]) -> Result<(), astra_core::ClassifiedError>,
 ) -> Result<
     (
         crate::turn::wire_assembly::WireBudgetStatus,
@@ -5383,26 +5490,35 @@ fn fit_physical_retry_wire_budget(
     ),
     astra_core::ClassifiedError,
 > {
-    let measure = |messages: &[Value]| {
+    let measure = |messages: &[Value]| -> Result<_, astra_core::ClassifiedError> {
+        let budget_view = if config.responses_budget_scope().is_some() {
+            let mut view = messages.to_vec();
+            prepare_budget_view(&mut view)?;
+            Some(view)
+        } else {
+            None
+        };
         let provider_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
-            messages,
+            budget_view.as_deref().unwrap_or(messages),
             &config.provider,
             config.cache_capability,
             config
                 .inference_protocol
                 .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&config.provider)),
         );
-        crate::turn::wire_assembly::wire_budget_status_with_metadata(
-            &provider_messages,
-            tools,
-            &config.model_name,
-            config.context_window,
-            config.max_completion_tokens,
-            requested_output_tokens,
-            config.responses_budget_scope(),
+        Ok(
+            crate::turn::wire_assembly::wire_budget_status_with_metadata(
+                &provider_messages,
+                tools,
+                &config.model_name,
+                config.context_window,
+                config.max_completion_tokens,
+                requested_output_tokens,
+                config.responses_budget_scope(),
+            ),
         )
     };
-    let initial = measure(messages);
+    let initial = measure(messages)?;
     if !initial.hard_limit_exceeded() {
         return Ok((initial, requested_output_tokens, None));
     }
@@ -5499,7 +5615,7 @@ fn fit_physical_retry_wire_budget(
         let status = if pass == 0 {
             initial
         } else {
-            measure(&candidate)
+            measure(&candidate)?
         };
         let available = status
             .model_limit
@@ -6374,6 +6490,7 @@ impl ServerAgenticLoopHostBuilder {
             matrixone: self.matrixone,
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
+            private_reasoning_origins: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
             provider_observations: self.provider_observations,
             model_override: self.model_override,
@@ -17726,8 +17843,52 @@ impl ServerAgenticLoopHost {
             model_context_window,
         );
         let cache_cfg = PromptCacheConfig::from_cache_capability(cache_capability, provider);
+        let planning_messages = if let Some(config) = self.resolved_llm_config.as_ref()
+            && let Some((scope, wire_model)) = config.responses_budget_scope()
+            && state.messages.iter().any(|message| {
+                message
+                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                    .is_some()
+            }) {
+            let mut history = state.messages.clone();
+            if config.responses_reasoning_history
+                == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+            {
+                crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
+                    &mut history,
+                );
+            }
+            self.open_authorized_private_responses(&mut history, scope, wire_model)?;
+            let wire = crate::turn::llm::client::consolidate_system_messages_for_protocol(
+                &history,
+                provider,
+                cache_capability,
+                astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+            );
+            let mut items = Vec::new();
+            astra_core::model_wire::responses::visit_input_items(
+                wire_model,
+                &wire,
+                scope,
+                |item| items.push(item),
+            )
+            .map_err(|cause| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::InvalidRequest,
+                    if cause == astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE {
+                        astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE
+                    } else {
+                        "Model continuation is unavailable; start a new turn"
+                    },
+                )
+            })?;
+            Some(items)
+        } else {
+            None
+        };
         crate::turn::llm::context::assemble_context_pipeline(
             crate::turn::llm::context::LlmContextAssemblyInput {
+                planning_messages: planning_messages.as_deref(),
                 state,
                 session_id: &self.session_id,
                 tool_surface: crate::turn::llm::context::ToolSurfacePlan::from_visible_tools(
@@ -17752,6 +17913,10 @@ impl ServerAgenticLoopHost {
                 context_window: model_context_window,
                 max_completion_tokens: model_max_completion_tokens,
                 cache_capability,
+                responses_reasoning_history: self
+                    .resolved_llm_config
+                    .as_ref()
+                    .and_then(|config| config.responses_reasoning_history),
                 user_content,
                 query_source: "agentic_loop",
             },
@@ -17857,6 +18022,7 @@ impl ServerAgenticLoopHost {
             Vec<Value>,
             usize,
             Option<crate::turn::cloud::compaction::CompactBoundary>,
+            Option<Vec<Value>>,
         ),
         astra_core::ClassifiedError,
     > {
@@ -17895,8 +18061,11 @@ impl ServerAgenticLoopHost {
             .inspect_err(|_| {
                 state.restore_volatile_attempt_lease();
             })?;
+            let budget_source = self
+                .responses_budget_view(&candidate.messages, llm_cfg)
+                .inspect_err(|_| state.restore_volatile_attempt_lease())?;
             let wire_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
-                &candidate.messages,
+                budget_source.as_deref().unwrap_or(&candidate.messages),
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
                 llm_cfg.inference_protocol.unwrap_or_else(|| {
@@ -17920,7 +18089,7 @@ impl ServerAgenticLoopHost {
                 // Keep the typed candidate for the caller.  The consolidated
                 // clone above is budget-only; returning it would strip the
                 // runtime provenance that cache-identity projection needs.
-                assembly = Some(candidate);
+                assembly = Some((candidate, budget_source));
                 selected_output_tokens = requested_output_tokens.min(available_output_tokens);
                 break;
             }
@@ -17973,12 +18142,12 @@ impl ServerAgenticLoopHost {
                     .as_ref()
                     .is_none_or(|(_, output, _)| current_output >= *output)
             {
-                assembly = Some(candidate);
+                assembly = Some((candidate, budget_source));
                 selected_output_tokens = current_output;
                 break;
             }
             if let Some((previous, output, boundary)) = fallback.take() {
-                assembly = Some(previous);
+                assembly = Some((previous, None));
                 selected_output_tokens = output;
                 final_wire_compaction_boundary = boundary;
                 break;
@@ -18002,7 +18171,14 @@ impl ServerAgenticLoopHost {
             ));
         }
 
-        let candidate = assembly.expect("bounded wire assembly must settle");
+        let (candidate, mut budget_source) = assembly.expect("bounded wire assembly must settle");
+        if budget_source.is_none() && llm_cfg.responses_budget_scope().is_some() {
+            // A fallback stays sealed while later candidates are tried, so
+            // concurrent requests do not retain an extra plaintext copy.
+            budget_source = self
+                .responses_budget_view(&candidate.messages, llm_cfg)
+                .inspect_err(|_| state.restore_volatile_attempt_lease())?;
+        }
         let wire_messages = candidate.messages;
         if let Err(error) =
             state.extend_append_only_runtime_messages(candidate.new_append_only_runtime_messages)
@@ -18014,6 +18190,7 @@ impl ServerAgenticLoopHost {
             wire_messages,
             selected_output_tokens,
             final_wire_compaction_boundary,
+            budget_source,
         ))
     }
 
@@ -20303,6 +20480,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Runtime no longer re-derives any of these.
         let context_assembly_node_id =
             self.start_explain_analyze_context_assembly(state, Instant::now());
+        if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+            self.authorize_private_responses(&state.messages, scope, model)?;
+        }
         let turn_pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             context_tool_surface,
@@ -20555,7 +20735,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Canonical messages appended by the wire assembler are staged from
         // this exact prefix. A matching WAL transition is bound to provider
         // attempt admission before HTTP is authorized.
-        let (llm_messages, max_output_tokens, final_wire_compaction_boundary) = match self
+        let (llm_messages, max_output_tokens, final_wire_compaction_boundary, mut first_responses_messages) = match self
             .assemble_llm_messages_with_final_budget(
                 final_system_messages,
                 final_volatile_preamble,
@@ -20608,9 +20788,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // provider-visible projection. Keep the canonical messages separate
         // so artifact metadata remains available for recovery and audit; the
         // provider projection strips it at the wire boundary.
+        // Reuse the selected candidate's authorized private view for both
+        // diagnostics and the first dispatch. The canonical copy stays sealed.
         let (canonical_llm_messages, provider_budget_messages) =
             split_canonical_and_provider_budget_messages(
                 llm_messages,
+                first_responses_messages.as_deref(),
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
                 llm_cfg.inference_protocol,
@@ -20688,6 +20871,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 llm_cfg.cache_capability,
             );
         }
+        drop(provider_budget_messages);
         // Runtime admission must mirror the exact tool schemas sent on the
         // wire. Pipeline pruning, sticky schema stabilization, and cache
         // annotation all happen after the broad edge-tool candidate set is
@@ -20847,6 +21031,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else {
                 let budget = fit_physical_retry_wire_budget(
                     &mut llm_messages, &final_tools, &llm_cfg, effective_max_output, state,
+                    |view| {
+                        if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+                            if llm_cfg.responses_reasoning_history == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn) {
+                                crate::turn::llm::private_continuation::discard_completed_turn_reasoning(view);
+                            }
+                            self.open_authorized_private_responses(view, scope, model)?;
+                        }
+                        Ok(())
+                    },
                 ).and_then(|(status, output, boundary)| {
                     primary_thinking.validate_output_budget(output as u64).map_err(|message| {
                         astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, message)
@@ -21021,7 +21214,21 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // providers, durably staged the execution deadline.  Keep this
             // exact vector immutable through provider dispatch; only the
             // timeout is sampled at the dispatch boundary.
-            let attempt_llm_messages_owned = llm_messages.clone();
+            let mut attempt_llm_messages_owned = if attempt_in_round == 0 {
+                first_responses_messages.take().unwrap_or_else(|| llm_messages.clone())
+            } else {
+                llm_messages.clone()
+            };
+            if attempt_in_round > 0 && let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+                if llm_cfg.responses_reasoning_history
+                    == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+                {
+                    crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
+                        &mut attempt_llm_messages_owned,
+                    );
+                }
+                self.open_private_responses(&mut attempt_llm_messages_owned, scope, model)?;
+            }
             let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
             let execution_route = llm_cfg.execution_route();
             let prepared_call = match prepare_streaming_call(
@@ -21632,6 +21839,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
             };
 
+            if let Some(continuation) = r.provider_continuation.as_mut() {
+                crate::turn::llm::private_continuation::seal(
+                    continuation,
+                    &self.encryptor,
+                    &self.user_id,
+                    &self.session_id,
+                )
+                .map_err(|_| astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::InvalidRequest,
+                    "Model continuation exceeds the supported limit or could not be protected",
+                ))?;
+            }
             let raw_provider_finish_reason = r.finish_reason.clone();
             let will_retry_for_length;
             {
@@ -22644,6 +22863,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 config.cache_capability,
                 &config.provider,
             );
+        if let Some((scope, model)) = config.responses_budget_scope()
+            && self
+                .authorize_private_responses(&state.messages, scope, model)
+                .is_err()
+        {
+            tracing::warn!(
+                "skipping pre-turn compaction because continuation authorization failed"
+            );
+            return None;
+        }
         let pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             &visible_tools,
@@ -24470,6 +24699,232 @@ mod tests {
     }
 
     #[test]
+    fn retry_budget_measures_opened_responses_without_rewriting_history() {
+        let host = test_host_builder("budget-owner", "budget-session").build();
+        let scope = uuid::Uuid::new_v4().to_string();
+        let mut cfg = summary_test_config(String::new());
+        cfg.inference_protocol = Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses);
+        cfg.response_scope = Some(scope.clone());
+        cfg.context_window = Some(1_000_000);
+        cfg.max_completion_tokens = Some(256);
+        let mut continuation = json!({"connection_id":scope, "model":cfg.model_name, "items":[
+            {"type":"reasoning", "id":"r", "summary":[], "content":[{"type":"reasoning_text", "text":"reasoning ".repeat(5000)}]},
+            {"type":"message", "id":"m", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut continuation,
+            &host.encryptor,
+            "budget-owner",
+            "budget-session",
+        )
+        .unwrap();
+        let mut wire = vec![
+            json!({"role":"user", "content":"question"}),
+            json!({"role":"assistant", "content":"answer", astra_core::model_wire::responses::CONTINUATION_KEY:continuation}),
+            json!({"role":"user", "content":"continue"}),
+        ];
+        let original = wire.clone();
+        let mut opened = wire.clone();
+        host.open_authorized_private_responses(&mut opened, &scope, &cfg.model_name)
+            .unwrap();
+        let expected = crate::turn::wire_assembly::wire_budget_status_with_metadata(
+            &opened,
+            &[],
+            &cfg.model_name,
+            cfg.context_window,
+            cfg.max_completion_tokens,
+            256,
+            cfg.responses_budget_scope(),
+        );
+        let (actual, _, _) = fit_physical_retry_wire_budget(
+            &mut wire,
+            &[],
+            &cfg,
+            256,
+            &create_test_state(),
+            |view| host.open_authorized_private_responses(view, &scope, &cfg.model_name),
+        )
+        .unwrap();
+        assert_eq!(
+            actual.estimated_input_tokens,
+            expected.estimated_input_tokens
+        );
+        assert_eq!(
+            wire, original,
+            "budgeting must retain sealed canonical bytes"
+        );
+    }
+
+    #[test]
+    fn private_reasoning_uses_materialized_lineage_without_database_reads() {
+        let mut host = test_host_builder("owner", "current").build();
+        host.set_private_reasoning_origins((0..100).map(|n| format!("ancestor-{n}")).collect());
+        let scope = uuid::Uuid::new_v4().to_string();
+        let mut continuation = json!({"connection_id":scope, "model":"model", "items":[
+            {"type":"reasoning", "id":"r", "summary":[], "content":[{"type":"reasoning_text", "text":"private"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut continuation,
+            &host.encryptor,
+            "owner",
+            "ancestor-0",
+        )
+        .unwrap();
+        let unopened = continuation.clone();
+        let mut messages = vec![
+            json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:continuation}),
+        ];
+        host.open_private_responses(&mut messages, &scope, "model")
+            .unwrap();
+        assert_eq!(
+            messages[0][astra_core::model_wire::responses::CONTINUATION_KEY]["items"][0]["content"]
+                [0]["text"],
+            "private"
+        );
+        let fresh = test_host_builder("owner", "current").build();
+        let mut messages = vec![
+            json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:unopened}),
+        ];
+        assert!(
+            fresh
+                .open_private_responses(&mut messages, &scope, "model")
+                .is_err()
+        );
+
+        let mut own = json!({"connection_id":scope, "model":"model", "items":[
+            {"type":"reasoning", "id":"own", "summary":[], "content":[{"type":"reasoning_text", "text":"private"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut own,
+            &fresh.encryptor,
+            "owner",
+            "current",
+        )
+        .unwrap();
+        let mut messages = vec![
+            json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:own}),
+        ];
+        assert!(
+            fresh
+                .open_private_responses(&mut messages, &scope, "model")
+                .is_ok()
+        );
+
+        let mut foreign = json!({"connection_id":scope, "model":"model", "items":[
+            {"type":"reasoning", "id":"r2", "summary":[], "content":[{"type":"reasoning_text", "text":"private"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut foreign,
+            &host.encryptor,
+            "owner",
+            "unrelated",
+        )
+        .unwrap();
+        let mut messages = vec![
+            json!({"role":"assistant", astra_core::model_wire::responses::CONTINUATION_KEY:foreign}),
+        ];
+        assert!(
+            host.open_private_responses(&mut messages, &scope, "model")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn final_wire_keeps_sealed_history_and_reuses_the_selected_responses_view() {
+        use astra_core::model_wire::responses::{CONTINUATION_KEY, ReasoningHistory};
+
+        for policy in [None, Some(ReasoningHistory::CurrentTurn)] {
+            let mut host = test_host_builder("view-owner", "view-session").build();
+            let scope = uuid::Uuid::new_v4().to_string();
+            let mut cfg = summary_test_config(String::new());
+            cfg.inference_protocol =
+                Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses);
+            cfg.response_scope = Some(scope.clone());
+            cfg.responses_reasoning_history = policy;
+            cfg.context_window = Some(100_000);
+            cfg.max_completion_tokens = Some(256);
+            let mut continuation = json!({"connection_id":scope, "model":cfg.model_name, "items":[
+                {"type":"reasoning", "id":"r", "summary":[], "content":[{"type":"reasoning_text", "text":"private reasoning"}]},
+                {"type":"message", "id":"m", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+            ]});
+            crate::turn::llm::private_continuation::seal(
+                &mut continuation,
+                &host.encryptor,
+                "view-owner",
+                "view-session",
+            )
+            .unwrap();
+            let mut state = create_test_state();
+            state.messages = vec![
+                json!({"role":"user", "content":"question"}),
+                json!({"role":"assistant", "content":"answer", CONTINUATION_KEY:continuation.clone()}),
+                json!({"role":"user", "content":"continue"}),
+            ];
+            let (canonical, _, _, opened) = host
+                .assemble_llm_messages_with_final_budget(
+                    vec![json!({"role":"system", "content":"stable"})],
+                    Vec::new(),
+                    state.messages.clone(),
+                    &mut state,
+                    &cfg,
+                    &PromptCacheConfig::default(),
+                    &[],
+                    256,
+                )
+                .unwrap();
+            let saved = canonical
+                .iter()
+                .find_map(|message| message.get(CONTINUATION_KEY))
+                .expect("assistant continuation survives wire assembly");
+            assert_eq!(saved, &continuation, "canonical history stays sealed");
+            let opened = opened.expect("Responses budget returns its selected opened view");
+            let saved = opened
+                .iter()
+                .find_map(|message| message.get(CONTINUATION_KEY))
+                .unwrap();
+            let reasoning = saved["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "reasoning");
+            if policy == Some(ReasoningHistory::CurrentTurn) {
+                assert!(reasoning.is_none());
+            } else {
+                assert_eq!(
+                    reasoning.unwrap()["content"][0]["text"],
+                    "private reasoning"
+                );
+            }
+
+            if policy.is_none() {
+                let mut foreign = continuation;
+                foreign["items"][0][astra_core::model_wire::responses::SEALED_ITEM]["origin"] =
+                    json!("unrelated-session");
+                let mut state = create_test_state();
+                state.messages = vec![
+                    json!({"role":"user", "content":"question"}),
+                    json!({"role":"assistant", "content":"answer", CONTINUATION_KEY:foreign}),
+                ];
+                let before = state.messages.clone();
+                let error = host
+                    .assemble_llm_messages_with_final_budget(
+                        vec![json!({"role":"system", "content":"stable"})],
+                        Vec::new(),
+                        before.clone(),
+                        &mut state,
+                        &cfg,
+                        &PromptCacheConfig::default(),
+                        &[],
+                        256,
+                    )
+                    .unwrap_err();
+                assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+                assert_eq!(state.messages, before);
+            }
+        }
+    }
+
+    #[test]
     fn final_wire_budget_includes_deadline_authority_once_for_append_only_provider() {
         let capability = append_only_test_cache_capability();
         let mut host = test_host_builder("u-budget-wire", "s-budget-wire")
@@ -24491,7 +24946,7 @@ mod tests {
             .current_execution_time_budget_preamble(state.current_round_index)
             .expect("configured deadline is assembled before budgeting");
 
-        let (wire, output_tokens, boundary) = host
+        let (wire, output_tokens, boundary, _) = host
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role": "system", "content": "stable"})],
                 vec![budget_preamble],
@@ -24558,7 +25013,7 @@ mod tests {
         llm_cfg.context_window = Some(4_000);
         llm_cfg.max_completion_tokens = Some(256);
 
-        let (wire, _output_tokens, boundary) = host
+        let (wire, _output_tokens, boundary, _) = host
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role": "system", "content": "stable"})],
                 Vec::new(),
@@ -24629,7 +25084,7 @@ mod tests {
         llm_cfg.context_window = Some(4_000);
         llm_cfg.max_completion_tokens = Some(256);
 
-        let (wire, output_tokens, boundary) = host
+        let (wire, output_tokens, boundary, _) = host
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role":"system", "content":"stable"})],
                 Vec::new(),
@@ -24693,7 +25148,7 @@ mod tests {
         llm_cfg.context_window = Some(4_000);
         llm_cfg.max_completion_tokens = Some(256);
 
-        let (wire, output_tokens, boundary) = host
+        let (wire, output_tokens, boundary, _) = host
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role":"system", "content":"stable"})],
                 vec![runtime_system_context_message(&selected_context, false).unwrap()],
@@ -24787,7 +25242,7 @@ mod tests {
         cfg.cache_capability = Some(capability);
         cfg.context_window = Some(5_000);
         cfg.max_completion_tokens = Some(2_000);
-        let (wire, output, boundary) = host
+        let (wire, output, boundary, _) = host
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role":"system", "content":"stable"})],
                 vec![
@@ -24809,7 +25264,7 @@ mod tests {
         let mut state = create_test_state();
         state.message = "u".repeat(14_000);
         state.messages = vec![json!({"role":"user", "content":state.message})];
-        let (wire, output, boundary) = host
+        let (wire, output, boundary, _) = host
             .assemble_llm_messages_with_final_budget(
                 vec![json!({"role":"system", "content":"stable"})],
                 Vec::new(),
@@ -24869,8 +25324,16 @@ mod tests {
                 }
                 for index in 0..10 {
                     let id = format!("call-{index}");
-                    messages.push(json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}));
-                    messages.push(json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(800)}));
+                    let mut call = json!({"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}});
+                    let mut result = json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(800)});
+                    if index == 9 {
+                        call[astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] =
+                            json!("original-call-9");
+                        result[astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD] =
+                            json!(["Tool outcome: {\"execution\":\"failed\"}"]);
+                    }
+                    messages.push(json!({"role":"assistant", "tool_calls":[call]}));
+                    messages.push(result);
                 }
                 let assistant = json!({"role":"assistant", "content":"partial response"});
                 messages.push(assistant.clone());
@@ -24885,9 +25348,15 @@ mod tests {
                 )
                 .unwrap();
                 let original_len = wire.len();
-                let (status, output, boundary) =
-                    fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
-                        .unwrap();
+                let (status, output, boundary) = fit_physical_retry_wire_budget(
+                    &mut wire,
+                    &[],
+                    &cfg,
+                    256,
+                    &create_test_state(),
+                    |_| Ok(()),
+                )
+                .unwrap();
                 assert!(!status.hard_limit_exceeded());
                 assert_eq!(
                     output,
@@ -24906,6 +25375,20 @@ mod tests {
                 let text = serde_json::to_string(&wire).unwrap();
                 assert!(text.contains("required contract") && text.contains("retry control"));
                 astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
+                let projected = crate::turn::llm::client::consolidate_system_messages_for_protocol(
+                    &wire,
+                    &cfg.provider,
+                    cfg.cache_capability,
+                    cfg.inference_protocol.unwrap_or_else(|| {
+                        astra_core::model_wire::llm_provider_protocol(&cfg.provider)
+                    }),
+                );
+                assert!(projected.iter().any(|message| {
+                    message["tool_call_id"] == "original-call-9"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("\"execution\":\"failed\""))
+                }));
             }
         }
 
@@ -24916,7 +25399,10 @@ mod tests {
             json!({"role":"assistant", "content":"partial"}),
         ];
         let original = wire.clone();
-        let error = fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
+        let error =
+            fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state(), |_| {
+                Ok(())
+            })
             .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
         assert_eq!(wire, original);
@@ -24956,8 +25442,10 @@ mod tests {
         )
         .unwrap();
         let (status, output, boundary) =
-            fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state())
-                .unwrap();
+            fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state(), |_| {
+                Ok(())
+            })
+            .unwrap();
         assert!(!status.hard_limit_exceeded());
         assert_eq!(output, 256);
         assert!(boundary.is_some());
@@ -25021,7 +25509,8 @@ mod tests {
             }
             let original = candidate.clone();
             let (status, output, boundary) =
-                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state).unwrap();
+                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state, |_| Ok(()))
+                    .unwrap();
             assert!(!status.hard_limit_exceeded());
             assert_eq!(output, 256);
             assert!(boundary.is_some());
@@ -25062,7 +25551,8 @@ mod tests {
         oversized = projected;
         let original = oversized.clone();
         let error =
-            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state).unwrap_err();
+            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state, |_| Ok(()))
+                .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
         assert_eq!(oversized, original);
     }
@@ -29718,6 +30208,7 @@ mod tests {
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
             inference_protocol: None,
+            responses_reasoning_history: None,
             response_scope: None,
             subscription: None,
             model_name: "gpt-4o-mini".to_string(),
@@ -32295,18 +32786,20 @@ mod tests {
             &mut state,
             admission.rejected,
         );
-        crate::turn::agentic_loop::tool_phase::settle_non_retryable_tool_rejections(
-            &mut state,
-            &[settle],
-            0,
-            false,
-            false,
-            false,
+        let read = json!({
+            "id":"independent-read", "type":"function",
+            "function":{"name":"read_file", "arguments":"{\"path\":\"notes.txt\"}"}
+        });
+        let alternative = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: ordinary_admitted([read]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
         );
-        assert!(
-            state.hooks.completion_settlement.text_only,
-            "without an outstanding run dependency the ordinary non-retryable boundary remains"
-        );
+        assert_eq!(alternative.admitted.len(), 1);
+        assert!(alternative.rejected.is_empty());
 
         let carrier = json!({
             "id": "settle-carrier-while-child-runs",
@@ -46322,7 +46815,22 @@ mod tests {
         state.message = "complete several independently verifiable outcomes".into();
         state.user_intent = state.message.clone();
         state.thinking = ThinkingConfig::ModelDefault;
-        state.messages = vec![json!({"role":"user", "content":"earlier goal"})];
+        let mut previous = json!({"connection_id":scope, "model":"gpt-5-mini", "items":[
+            {"type":"reasoning", "id":"rs-previous", "summary":[], "encrypted_content":"prior-opaque-reasoning"},
+            {"type":"message", "id":"msg-previous", "role":"assistant", "content":[{"type":"output_text", "text":"previous answer"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(
+            &mut previous,
+            &host.encryptor,
+            "user-responses-work-retry",
+            session_id,
+        )
+        .unwrap();
+        state.messages = vec![
+            json!({"role":"user", "content":"earlier goal"}),
+            json!({"role":"assistant", "content":"previous answer", astra_core::model_wire::responses::CONTINUATION_KEY:previous}),
+            json!({"role":"user", "content":"continue"}),
+        ];
         for index in 0..10 {
             let id = format!("earlier-{index}");
             state
@@ -46349,6 +46857,23 @@ mod tests {
             requests.len(),
             2,
             "unexpected pre-dispatch error: {error:?}"
+        );
+        assert!(
+            requests[0].body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["type"] == "reasoning"
+                        && item["encrypted_content"] == "prior-opaque-reasoning"
+                }),
+            "the first dispatch uses the selected opened history"
+        );
+        assert!(
+            !serde_json::to_string(&state.messages)
+                .unwrap()
+                .contains("prior-opaque-reasoning"),
+            "canonical history remains sealed after dispatch"
         );
         let trace = state
             .last_llm_context_manifest_trace
@@ -46384,7 +46909,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+        let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
             committed,
         ).unwrap();
         assert!(restored.iter().any(|message| {
@@ -46393,6 +46918,8 @@ mod tests {
                     .get(astra_core::model_wire::responses::CONTINUATION_KEY)
                     .is_some()
         }));
+        host.open_private_responses(&mut restored, &scope, "gpt-5-mini")
+            .expect("the owning session can open its restored private reasoning");
         let replay = astra_core::model_wire::responses::request(
             "gpt-5-mini",
             &restored,
@@ -50338,6 +50865,7 @@ mod tests {
         astra_services::ResolvedModelOffering {
             offering_id: "offer-primary".to_string(),
             model: astra_services::ResolvedActiveLlmModel {
+                responses_reasoning_history: None,
                 inference_protocol: None,
                 response_scope_key: None,
                 supported_reasoning_efforts: None,

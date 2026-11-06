@@ -76,52 +76,6 @@ pub(crate) async fn execute_server_bash(
         return workspace_path_mismatch_tool_result(reason);
     }
 
-    // Explicit source_artifacts is a transactional evidence-preservation
-    // contract.  Validate and persist the preimage before any shell process
-    // can open the workspace.  An absent declaration keeps ordinary bash
-    // unchanged; a declaration without trusted invocation identity fails
-    // closed instead of creating an unscoped receipt.
-    let explicit_source_artifacts = args
-        .get(astra_tools::source_preimage::SOURCE_ARTIFACTS_FIELD)
-        .is_some();
-    let mut source_preimages = match astra_tools::source_preimage::prepare_with_inspection(
-        workspace_root,
-        args,
-        source_scope.unwrap_or_default(),
-        #[cfg(unix)]
-        workdir.inspection(),
-    ) {
-        Ok(plan) => plan,
-        Err(reason) => return pre_dispatch_rejection_tool_result(format!("Error: {reason}")),
-    };
-    if source_preimages.is_none() && !explicit_source_artifacts {
-        // This is intentionally advisory. A missing identity, ambiguous
-        // operand, or unavailable durable store must never make ordinary
-        // server bash unavailable; only an explicit declaration is fail-closed.
-        if let Some(scope) = source_scope {
-            #[cfg(unix)]
-            {
-                source_preimages = astra_tools::source_preimage::prepare_inferred_with_inspection(
-                    workspace_root,
-                    workdir.inspection(),
-                    command,
-                    scope,
-                )
-                .unwrap_or(None);
-            }
-            #[cfg(not(unix))]
-            {
-                source_preimages = astra_tools::source_preimage::prepare_inferred(
-                    workspace_root,
-                    workdir.path(),
-                    command,
-                    scope,
-                )
-                .unwrap_or(None);
-            }
-        }
-    }
-
     let timeout_secs = args
         .get("timeout")
         .and_then(|value| value.as_f64())
@@ -155,10 +109,53 @@ pub(crate) async fn execute_server_bash(
     if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         return astra_tools::cancelled_tool_result("bash", false);
     }
-    // Capture only commands outside the strict cache-safe allowlist.  This is
-    // an executor-owned observation, not a parser for Python/SQLite/etc.; an
-    // unknown or compound command simply enters the bounded snapshot lane.
-    let workspace_before = if observation_lease.is_some() {
+    // The preimage and the command must share the same ownership interval;
+    // otherwise an intervening writer could be undone by a later restore.
+    let explicit_source_artifacts = args
+        .get(astra_tools::source_preimage::SOURCE_ARTIFACTS_FIELD)
+        .is_some();
+    let mut source_preimages = match astra_tools::source_preimage::prepare_with_inspection(
+        workspace_root,
+        args,
+        source_scope.unwrap_or_default(),
+        #[cfg(unix)]
+        workdir.inspection(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return pre_dispatch_rejection_tool_result(format!("Error: {reason}")),
+    };
+    if source_preimages.is_none() && !explicit_source_artifacts {
+        // Inference is advisory; only an explicit declaration is fail-closed.
+        if let Some(scope) = source_scope {
+            #[cfg(unix)]
+            {
+                source_preimages = astra_tools::source_preimage::prepare_inferred_with_inspection(
+                    workspace_root,
+                    workdir.inspection(),
+                    command,
+                    scope,
+                )
+                .unwrap_or(None);
+            }
+            #[cfg(not(unix))]
+            {
+                source_preimages = astra_tools::source_preimage::prepare_inferred(
+                    workspace_root,
+                    workdir.path(),
+                    command,
+                    scope,
+                )
+                .unwrap_or(None);
+            }
+        }
+    }
+    let explicit_verification =
+        astra_tools::workspace_observation::is_explicit_workspace_verification_request(
+            "bash", args,
+        );
+    // Normal commands report their own result; only an explicit verification
+    // needs a workspace-wide comparison.
+    let workspace_before = if explicit_verification && observation_lease.is_some() {
         let root = workspace_root.to_path_buf();
         tokio::task::spawn_blocking(move || {
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root)
@@ -221,7 +218,7 @@ pub(crate) async fn execute_server_bash(
             }
         }
     };
-    let workspace_after = if observation_lease.is_some() {
+    let workspace_after = if workspace_before.is_some() {
         let root = workspace_root.to_path_buf();
         tokio::task::spawn_blocking(move || {
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root)
@@ -275,10 +272,6 @@ pub(crate) async fn execute_server_bash(
     );
     let quarantine_weak_after_current = !nested_run_script_callback
         && astra_tools::shell_ops::bash_scope_requires_attribution_quarantine(scope_ownership);
-    let explicit_verification =
-        astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-            "bash", args,
-        );
     let mut result = attach_workspace_observation(
         result,
         workspace_root,
@@ -391,27 +384,8 @@ fn attach_workspace_observation(
         .as_ref()
         .map(|before| before.compare_with(after.as_ref()))
         .unwrap_or(astra_tools::workspace_observation::WorkspaceFingerprintComparison::Unknown);
-    let workspace_changed =
-        comparison == astra_tools::workspace_observation::WorkspaceFingerprintComparison::Changed;
-    if receipt_authority_valid && before.filter(|_| scope_settled).is_some() && workspace_changed {
-        if let Some(ownership) = scope_ownership {
-            result.metadata.get_or_insert_with(Default::default).extend(
-                astra_tools::workspace_observation::changed_receipt_with_ownership(
-                    ownership.as_str(),
-                ),
-            );
-            if !ownership.is_authoritative() {
-                astra_tools::workspace_observation::quarantine_after_weak_receipt(
-                    workspace_root,
-                    Some(ownership.as_str()),
-                );
-            }
-        } else {
-            astra_tools::workspace_observation::quarantine_after_weak_receipt(workspace_root, None);
-        }
-    }
-    // Preserve the current chain's truthful post-state before making weak
-    // ownership quarantine sticky. A foreground process group cannot rule
+    // A changed snapshot cannot identify its writer. A foreground process
+    // group also cannot rule
     // out a setsid/double-fork descendant that writes after this function
     // returns, even when the immediate fingerprint delta is empty.
     if quarantine_weak_after_current {
@@ -771,6 +745,65 @@ mod tests {
                 .display()
                 .to_string()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(source_preimage_env)]
+    async fn server_source_receipt_captures_after_workspace_admission() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let old_store = std::env::var_os("_ASTRA_SOURCE_PREIMAGE_ROOT");
+        unsafe { std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
+        let path = workspace.path().join("input.txt");
+        std::fs::write(&path, "old").unwrap();
+        let lease =
+            astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                workspace.path(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let policy = SandboxPolicy::permissive(workspace.path());
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+        let args = serde_json::json!({"command":"printf after > input.txt", "source_artifacts":["input.txt"]});
+        let mut request = Box::pin(execute_server_bash(
+            &policy,
+            workspace.path(),
+            &binding,
+            Some("test:source-admission"),
+            &args,
+            None,
+        ));
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), cx))
+        })
+        .await;
+        assert!(first_poll.is_pending());
+        std::fs::write(&path, "intervening").unwrap();
+        drop(lease);
+        let result = request.await;
+        assert!(!result.is_error, "{result:?}");
+        let receipt_id = result.metadata.as_ref().unwrap()["source_preimage"]["receipt_id"]
+            .as_str()
+            .unwrap();
+        astra_tools::source_preimage::prepare_receipt_restore(
+            workspace.path(),
+            "test:source-admission",
+            receipt_id,
+        )
+        .unwrap()
+        .restore()
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "intervening");
+        unsafe {
+            if let Some(value) = old_store {
+                std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", value);
+            } else {
+                std::env::remove_var("_ASTRA_SOURCE_PREIMAGE_ROOT");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1237,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_observation_attaches_receipt_even_after_partial_failure() {
+    fn workspace_observation_does_not_attribute_a_partial_failure() {
         let workspace = tempfile::tempdir().expect("workspace");
         let before =
             astra_tools::workspace_observation::WorkspaceFingerprint::capture(workspace.path())
@@ -1260,15 +1293,9 @@ mod tests {
             false,
             false,
         );
-        let metadata = result.metadata.expect("typed receipt");
         assert!(result.is_error);
-        assert_eq!(
-            metadata[astra_tools::workspace_observation::OBSERVED_FIELD],
-            true
-        );
-        assert_eq!(
-            metadata[astra_tools::workspace_observation::SCOPE_FIELD],
-            astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE
-        );
+        assert!(result.metadata.as_ref().is_none_or(|fields| {
+            !fields.contains_key(astra_tools::workspace_observation::RECEIPT_FIELD)
+        }));
     }
 }

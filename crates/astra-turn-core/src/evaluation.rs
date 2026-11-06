@@ -1277,6 +1277,21 @@ fn active_failure_keys<K: Ord>(
     unresolved
 }
 
+/// A lost mutation result remains unresolved because repeating a mutation
+/// cannot establish the first outcome. Reads can be retried or replaced by
+/// another observation; leave that choice to the agent.
+pub fn has_unresolved_tool_result_delivery_failure(records: &[ToolCallRecord]) -> bool {
+    records.iter().any(|record| {
+        if !record.was_executed() || record.ok || record.execution_ok.is_none() {
+            return false;
+        }
+        let args = record
+            .authoritative_args_full()
+            .and_then(|args| serde_json::from_str(args).ok());
+        !crate::tool::categories::registry().is_read_only_for_recovery(&record.name, args.as_ref())
+    })
+}
+
 pub fn active_execution_failure_fact_keys(
     facts: &[ToolEvaluationFact],
 ) -> std::collections::BTreeSet<EvaluationIdentity> {
@@ -4001,12 +4016,13 @@ fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
         // Prefer JSON parsing — `read_file` args_full is always JSON.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
             let path = v.get("path").and_then(|p| p.as_str())?.to_string();
-            let s = v
-                .get("start_line")
-                .and_then(|n| n.as_u64())
-                .map(|n| n as u32);
-            let e = v.get("end_line").and_then(|n| n.as_u64()).map(|n| n as u32);
-            let range = s.zip(e);
+            let (s, e) = astra_text_utils::line_range::ordered_bounds(
+                v.get("start_line").and_then(|n| n.as_u64()),
+                v.get("end_line").and_then(|n| n.as_u64()),
+            );
+            let range = s
+                .zip(e)
+                .and_then(|(s, e)| Some((u32::try_from(s).ok()?, u32::try_from(e).ok()?)));
             return Some(ReadRange { file: path, range });
         }
         return None;
@@ -4810,6 +4826,50 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn read_delivery_failure_does_not_permanently_block_the_turn() {
+        let mut failed = journal_ok_call("read_file");
+        failed.ok = false;
+        failed.execution_ok = Some(true);
+        failed.args_full = Some(r#"{"path":"one.txt"}"#.into());
+        let mut other = journal_ok_call("read_file");
+        other.args_full = Some(r#"{"path":"two.txt"}"#.into());
+        assert!(!has_unresolved_tool_result_delivery_failure(&[
+            failed.clone(),
+            other
+        ]));
+        let mut recovered = journal_ok_call("read_file");
+        recovered.args_full = failed.args_full.clone();
+        assert!(!has_unresolved_tool_result_delivery_failure(&[
+            failed.clone(),
+            recovered.clone()
+        ]));
+        failed.name = "write_file".into();
+        recovered.name = "write_file".into();
+        assert!(has_unresolved_tool_result_delivery_failure(&[
+            failed,
+            recovered.clone()
+        ]));
+        assert!(!has_unresolved_tool_result_delivery_failure(&[recovered]));
+
+        let mut database_write = journal_ok_call("mo_query");
+        database_write.ok = false;
+        database_write.execution_ok = Some(true);
+        database_write.args_full = Some(r#"{"sql":"DELETE FROM example"}"#.into());
+        assert!(has_unresolved_tool_result_delivery_failure(&[
+            database_write
+        ]));
+        let mut rename = journal_ok_call("lsp");
+        rename.ok = false;
+        rename.execution_ok = Some(true);
+        rename.args_full = Some(r#"{"action":"rename","dry_run":false}"#.into());
+        assert!(has_unresolved_tool_result_delivery_failure(&[rename]));
+        let mut symbols = journal_ok_call("symbols");
+        symbols.ok = false;
+        symbols.execution_ok = Some(true);
+        assert!(!has_unresolved_tool_result_delivery_failure(&[symbols]));
     }
 
     #[test]
@@ -7988,6 +8048,26 @@ mod tests {
             count_active_redundant_overlapping_reads(&failed_reads),
             0,
             "failed reads never become online behavioral evidence"
+        );
+    }
+
+    #[test]
+    fn reversed_read_ranges_use_ordered_coverage() {
+        let narrow = r#"{"path":"src/lib.rs","start_line":300,"end_line":400}"#;
+        let wide_reversed = r#"{"path":"src/lib.rs","start_line":600,"end_line":200}"#;
+        let records = |first, second| {
+            vec![
+                record_with_args("read_file", 0, first),
+                record_with_args("read_file", 1, second),
+            ]
+        };
+        assert_eq!(
+            count_redundant_overlapping_reads(&records(narrow, wide_reversed)),
+            0
+        );
+        assert_eq!(
+            count_redundant_overlapping_reads(&records(wide_reversed, narrow)),
+            1
         );
     }
 

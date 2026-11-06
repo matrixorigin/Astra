@@ -28,6 +28,7 @@ struct Grant {
 }
 pub struct ProviderState {
     pub allow_test_api_key: AtomicBool,
+    pub plaintext_reasoning: AtomicBool,
     base: Mutex<String>,
     key: EncodingKey,
     jwks: Value,
@@ -79,6 +80,7 @@ impl ProviderFixture {
             "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())}]});
         let state = Arc::new(ProviderState {
             allow_test_api_key: AtomicBool::new(false),
+            plaintext_reasoning: AtomicBool::new(false),
             base: Mutex::new(String::new()),
             key: EncodingKey::from_rsa_der(der.as_bytes()),
             jwks,
@@ -185,6 +187,7 @@ fn spawn_provider(
         .route("/revoke", post(revoke))
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses))
+        .route("/responses", post(responses))
         .with_state(state.clone());
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -428,7 +431,13 @@ async fn responses(
     };
     let mut output = if let Some((name, arguments)) = action {
         let index = state.responses_calls.load(Ordering::SeqCst);
-        json!([{"type":"reasoning","id":format!("reasoning-{index}"),"encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]},
+        let reasoning = if state.plaintext_reasoning.load(Ordering::SeqCst) {
+            json!({"type":"reasoning","id":format!("reasoning-{index}"),"summary":[],
+                "content":[{"type":"reasoning_text","text":"private-journey-sentinel AKIAIOSFODNN7EXAMPLE"}]})
+        } else {
+            json!({"type":"reasoning","id":format!("reasoning-{index}"),"encrypted_content":"sk-fixtureciphertextciphertextciphertext","summary":[]})
+        };
+        json!([reasoning,
             {"type":"function_call","id":format!("function-{index}"),"name":name,"call_id":format!("call-{index}"),"arguments":arguments.to_string(),"status":"completed"}])
     } else if !state.scripted.load(Ordering::SeqCst)
         && body.get("tools").is_some()

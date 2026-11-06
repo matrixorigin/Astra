@@ -611,13 +611,29 @@ fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
 pub(crate) fn workspace_lease_failure_tool_execution_outcome(
     name: &str,
     failure: astra_tools::workspace_observation::WorkspaceLeaseFailure,
+    root: &std::path::Path,
 ) -> ToolExecutionOutcome {
-    let result = astra_tools::workspace_lease_failure_tool_result(name, failure);
+    let result = local_workspace_lease_failure(name, failure, root);
     ToolExecutionOutcome {
         output: result.output,
         tool_result_fields: result.metadata,
         is_error: result.is_error,
     }
+}
+
+fn local_workspace_lease_failure(
+    name: &str,
+    failure: astra_tools::workspace_observation::WorkspaceLeaseFailure,
+    root: &std::path::Path,
+) -> astra_tools::ToolResult {
+    let mut result = astra_tools::workspace_lease_failure_tool_result(name, failure);
+    if failure == astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled {
+        result.output.push_str(&format!(
+            " After checking that all commands stopped, run `astra workspace confirm-stopped` from {} and resume the session from that same workspace. If another system user started the work, that user must confirm it or ask the host administrator for help.",
+            root.display()
+        ));
+    }
+    result
 }
 
 /// Parse a grep output line to extract the file path and line number.
@@ -1419,7 +1435,8 @@ pub struct ToolExecutor {
     pub journal_turn_index: std::sync::atomic::AtomicU32,
     /// Active worktree session state. When set, `effective_project_root()` returns
     /// the worktree path instead of the original `project_root`.
-    worktree_session: std::sync::Mutex<Option<WorktreeSession>>,
+    worktree_session: std::sync::Arc<std::sync::Mutex<Option<WorktreeSession>>>,
+    worktree_transition: std::sync::Arc<tokio::sync::RwLock<()>>,
     /// Command queue for background task operations. Drained by the
     /// TUI event loop each tick. Allows the tool executor (which runs
     /// inside the agentic loop) to spawn/kill background tasks without
@@ -1509,6 +1526,8 @@ pub struct ToolExecutor {
     /// before each turn so the `ask_user` tool can reach the
     /// bottom-pane overlay.
     ask_user_request_tx: std::sync::Mutex<Option<crate::cli::chat_stream::AskUserRequestTx>>,
+    /// Avoid presenting the same recovery prompt for parallel tool calls.
+    workspace_recovery_prompt: tokio::sync::Mutex<Option<PathBuf>>,
     /// Per-turn plan-review channel — installed by the host before
     /// each turn so `exit_plan_mode` can surface the dedicated
     /// plan-review overlay (scrollable plan body + 4-way radio).
@@ -1551,9 +1570,30 @@ impl ToolExecutor {
         *astra_core::sync_poison::recover_rwlock_write(&self.sandbox_policy) = next;
     }
 
+    /// Retain explicitly added directories when bypass mode removes the
+    /// active sandbox overlay for a turn.
+    fn additional_workspace_paths(&self) -> Vec<PathBuf> {
+        let basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
+        let policy = astra_core::sync_poison::recover_rwlock_read(&self.sandbox_policy);
+        policy
+            .as_ref()
+            .or_else(|| basis.as_ref().and_then(|basis| basis.baseline.as_ref()))
+            .map(|policy| policy.non_default_allowed_paths().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
+        let worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
+            worktree::GitWorktreeRollbackJournal::default(),
+        ));
+        let (worktree_session, worktree_transition) = {
+            let owner = worktree_journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (owner.active_session.clone(), owner.transition.clone())
+        };
         let executor = Self {
             project_root: root.clone(),
             cloud_base: None,
@@ -1588,14 +1628,13 @@ impl ToolExecutor {
                 mo_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
 
-            git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                worktree::GitWorktreeRollbackJournal::default(),
-            )),
+            git_worktree_journal: worktree_journal,
             session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 session_state::SessionStateRollbackJournal::default(),
             )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
-            worktree_session: std::sync::Mutex::new(None),
+            worktree_session,
+            worktree_transition,
             bg_task_commands: None,
             bg_task_list_cache: None,
             bash_detach_slot: None,
@@ -1624,6 +1663,7 @@ impl ToolExecutor {
             .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),
+            workspace_recovery_prompt: tokio::sync::Mutex::new(None),
             plan_review_request_tx: std::sync::Mutex::new(None),
             pending_permission_mode_change: std::sync::Mutex::new(None),
             pending_round_tool_boost: std::sync::Mutex::new(None),
@@ -1665,6 +1705,248 @@ impl ToolExecutor {
             e.into_inner()
         });
         *guard = tx;
+    }
+
+    async fn confirm_workspace_recovery_in_tui(
+        &self,
+        root: &std::path::Path,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> bool {
+        use crate::cli::chat_stream::{AskUserRequest, AskUserResponse};
+
+        let Some(tx) = self
+            .ask_user_request_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return false;
+        };
+        let root_key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let (mut prompt_guard, waited) = match self.workspace_recovery_prompt.try_lock() {
+            Ok(guard) => (guard, false),
+            Err(_) => {
+                let guard = if let Some(cancel) = cancel {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return false,
+                        guard = self.workspace_recovery_prompt.lock() => guard,
+                    }
+                } else {
+                    self.workspace_recovery_prompt.lock().await
+                };
+                (guard, true)
+            }
+        };
+        let recovery = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return false,
+                result = astra_tools::workspace_observation::begin_workspace_recovery(root) => result,
+            }
+        } else {
+            astra_tools::workspace_observation::begin_workspace_recovery(root).await
+        };
+        let Ok(recovery) = recovery else {
+            return false;
+        };
+        if !recovery.ownership_is_unsettled() {
+            return true;
+        }
+        if waited && prompt_guard.as_ref() == Some(&root_key) {
+            return false;
+        }
+        *prompt_guard = None;
+        let prompt = astra_tools::AskUserPrompt {
+            context: Some(format!("Workspace: {}", root.display())),
+            questions: vec![astra_tools::AskUserQuestion {
+                id: Some("workspace_recovery".into()),
+                header: "Earlier work".into(),
+                question: "Earlier work may still be changing files. Has it stopped?".into(),
+                options: ["Not sure", "It has stopped"]
+                    .into_iter()
+                    .map(|label| astra_tools::AskUserChoice {
+                        label: label.into(),
+                        description: None,
+                        preview: None,
+                    })
+                    .collect(),
+                multi_select: false,
+                allow_freeform: false,
+            }],
+            timeout_ms: None,
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if crate::cli::chat_stream::enqueue_interactive_request(
+            &tx,
+            AskUserRequest {
+                prompt,
+                response_tx,
+            },
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let response = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return false,
+                response = response_rx => response,
+            }
+        } else {
+            response_rx.await
+        };
+        let Ok(AskUserResponse::Submitted(answers)) = response else {
+            return false;
+        };
+        if !answers.answers.iter().any(|answer| {
+            answer.id.as_deref() == Some("workspace_recovery")
+                && answer.answers.as_slice() == ["It has stopped"]
+        }) {
+            *prompt_guard = Some(root_key);
+            return false;
+        }
+        recovery.confirm().await.is_ok()
+    }
+
+    async fn confirm_current_workspace_in_tui(
+        &self,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> bool {
+        use crate::cli::chat_stream::{AskUserRequest, AskUserResponse};
+        let Some(tx) = self
+            .ask_user_request_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return false;
+        };
+        let Ok(workspace) =
+            astra_tools::workspace_observation::begin_workspace_recovery(&self.project_root).await
+        else {
+            return false;
+        };
+        let prompt = astra_tools::AskUserPrompt {
+            context: Some(format!("Current directory: {}", self.project_root.display())),
+            questions: vec![astra_tools::AskUserQuestion {
+                id: Some("workspace_selection".into()),
+                header: "Workspace".into(),
+                question: "The saved workspace could not be recovered. Use this directory for the session?".into(),
+                options: ["Not now", "Use this directory"].into_iter().map(|label| astra_tools::AskUserChoice {
+                    label: label.into(), description: None, preview: None,
+                }).collect(),
+                multi_select: false,
+                allow_freeform: false,
+            }],
+            timeout_ms: None,
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if crate::cli::chat_stream::enqueue_interactive_request(
+            &tx,
+            AskUserRequest {
+                prompt,
+                response_tx,
+            },
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let response = if let Some(cancel) = cancel {
+            tokio::select! { biased; _ = cancel.cancelled() => return false, response = response_rx => response }
+        } else {
+            response_rx.await
+        };
+        workspace.binding_is_unchanged()
+            && matches!(response, Ok(AskUserResponse::Submitted(answers)) if answers.answers.iter().any(|answer| {
+                answer.id.as_deref() == Some("workspace_selection") && answer.answers.as_slice() == ["Use this directory"]
+            }))
+    }
+
+    pub(super) async fn acquire_local_workspace_lease(
+        &self,
+        root: &std::path::Path,
+        additional_roots: &[PathBuf],
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+        max_wait: std::time::Duration,
+        admission_deadline: Option<std::time::Instant>,
+    ) -> Result<
+        astra_tools::workspace_observation::WorkspaceObservationLease,
+        astra_tools::workspace_observation::WorkspaceLeaseFailure,
+    > {
+        use astra_tools::workspace_observation::{
+            WorkspaceLeaseFailure, acquire_workspace_mutation_lease_with_paths,
+        };
+
+        let mut remaining = max_wait;
+        let mut confirmed = std::collections::HashSet::new();
+        loop {
+            if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err(WorkspaceLeaseFailure::Cancelled);
+            }
+            let attempt_wait = admission_deadline
+                .map(|deadline| {
+                    remaining.min(deadline.saturating_duration_since(std::time::Instant::now()))
+                })
+                .unwrap_or(remaining);
+            if attempt_wait.is_zero() {
+                return Err(WorkspaceLeaseFailure::Contended);
+            }
+            let started = std::time::Instant::now();
+            let result = acquire_workspace_mutation_lease_with_paths(
+                root,
+                additional_roots,
+                cancel,
+                attempt_wait,
+            )
+            .await;
+            remaining = remaining.saturating_sub(started.elapsed());
+            if !matches!(&result, Err(WorkspaceLeaseFailure::OwnershipUnsettled)) {
+                return result;
+            }
+            let blocked = self.unsettled_workspace_root(root, additional_roots);
+            let key = blocked.canonicalize().unwrap_or_else(|_| blocked.clone());
+            if !confirmed.insert(key) {
+                return result;
+            }
+            // Human confirmation does not consume a command's execution or
+            // lock-contention budget. A server admission deadline still applies.
+            let confirmation = self.confirm_workspace_recovery_in_tui(&blocked, cancel);
+            let accepted = if let Some(deadline) = admission_deadline {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), confirmation)
+                    .await
+                    .map_err(|_| WorkspaceLeaseFailure::Contended)?
+            } else {
+                confirmation.await
+            };
+            if !accepted {
+                return if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    Err(WorkspaceLeaseFailure::Cancelled)
+                } else {
+                    result
+                };
+            }
+        }
+    }
+
+    fn unsettled_workspace_root(&self, root: &Path, additional_roots: &[PathBuf]) -> PathBuf {
+        std::iter::once(root)
+            .chain(additional_roots.iter().map(PathBuf::as_path))
+            .map(|path| {
+                if path.is_file() {
+                    path.parent().unwrap_or(path)
+                } else {
+                    path
+                }
+            })
+            .find(|path| {
+                astra_tools::workspace_observation::workspace_ownership_is_unsettled(path)
+                    == Some(true)
+            })
+            .unwrap_or(root)
+            .to_path_buf()
     }
 
     /// Install the per-turn plan-review channel so `exit_plan_mode`
@@ -2071,7 +2353,7 @@ impl ToolExecutor {
         }
 
         astra_runtime_env::RunBinding::local_developer(
-            self.project_root.display().to_string(),
+            self.effective_project_root().display().to_string(),
             registry,
         )
     }
@@ -2432,6 +2714,12 @@ impl ToolExecutor {
             }
         }
         if session_changed {
+            if previous_session_id.is_some() {
+                *self
+                    .worktree_session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
             if let Ok(mut pending_mode) = self.pending_permission_mode_change.lock() {
                 *pending_mode = None;
             }
@@ -2454,6 +2742,7 @@ impl ToolExecutor {
         if let Ok(mut guard) = self.active_session_id.lock() {
             *guard = Some(session_id);
         }
+        self.restore_selected_worktree();
     }
 
     pub(crate) fn active_session_id(&self) -> Option<String> {
@@ -2601,7 +2890,15 @@ impl ToolExecutor {
         mut self,
         journal: std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
     ) -> Self {
+        {
+            let owner = journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.worktree_session = owner.active_session.clone();
+            self.worktree_transition = owner.transition.clone();
+        }
         self.git_worktree_journal = journal;
+        self.restore_selected_worktree();
         self
     }
 
@@ -4284,6 +4581,12 @@ impl ToolExecutor {
         // which validates and admits exactly once.
         let is_blocking_shell = name == "bash" || (cfg!(windows) && name == "powershell");
         if is_blocking_shell {
+            if let Some(error) = self.worktree_recovery_error(name, args) {
+                return EdgeToolRun::from_tool_result(
+                    astra_tools::ToolResult::error(error).with_execution_not_started(),
+                )
+                .into_outcome();
+            }
             if let Some(denied) = self.tool_admission_denial(name, args) {
                 return denied.into_outcome();
             }
@@ -4367,6 +4670,14 @@ impl ToolExecutor {
         if let Some(denied) = self.tool_admission_denial(name, args) {
             return denied.into_outcome();
         }
+        if matches!(name, "bash" | "mo_query")
+            && let Some(error) = self.worktree_recovery_error(name, args)
+        {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::ToolResult::error(error).with_execution_not_started(),
+            )
+            .into_outcome();
+        }
         if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return cancelled_tool_execution_outcome(name, false);
         }
@@ -4429,6 +4740,7 @@ impl ToolExecutor {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4462,6 +4774,7 @@ impl ToolExecutor {
             runtime_approval,
             Some(input_rx),
             Some(validate_dispatch),
+            None,
         )
         .await
         .into_outcome()
@@ -4481,7 +4794,13 @@ impl ToolExecutor {
         runtime_approval: Option<&ApprovedNativeRuntime>,
         input_rx: Option<tokio::sync::mpsc::Receiver<astra_edge::EdgeInvocationInput>>,
         validate_dispatch: Option<&(dyn Fn() -> Result<(), astra_tools::ToolResult> + Send + Sync)>,
+        workspace_transition: Option<&tokio::sync::RwLockWriteGuard<'_, ()>>,
     ) -> EdgeToolRun {
+        if let Some(error) = self.worktree_recovery_error(name, args) {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::ToolResult::error(error).with_execution_not_started(),
+            );
+        }
         let canonical_native = runtime_approval.filter(|approval| {
             native_protocol.is_none_or(|protocol| protocol == approval.protocol)
         });
@@ -4560,6 +4879,89 @@ impl ToolExecutor {
                 "run_script cannot recursively start another opaque script writer".to_string(),
             );
         }
+        if name == "worktree" && nested_run_script_callback {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::ToolResult::error(
+                    "A running script cannot change the session workspace".to_string(),
+                )
+                .with_execution_not_started(),
+            );
+        }
+        // A session transition must not race another operation resolving the
+        // effective root. Nested script callbacks inherit their parent's guard.
+        let _transition = if name == "worktree" && workspace_transition.is_none() {
+            if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(
+                    name, false,
+                ));
+            }
+            match self.worktree_transition.try_write() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    let mut rejected = EdgeToolRun::classified_error(
+                        "The workspace is still in use. Finish or stop its running work before switching worktrees; no switch was made.".to_string(),
+                        astra_core::ErrorKind::ToolUnavailable,
+                    );
+                    astra_tools::execution_outcome::insert_not_executed_fact(
+                        rejected
+                            .tool_result_fields
+                            .get_or_insert_with(serde_json::Map::new),
+                    );
+                    return rejected;
+                }
+            }
+        } else {
+            None
+        };
+        // A chain owns the workspace guard across its steps itself so it can
+        // release it before an exclusive rollback.
+        let chain_owns_workspace = name == "agent"
+            && matches!(
+                astra_tools::agent_tool_contract::agent_action_from_args(args),
+                Ok(astra_tools::agent_tool_contract::AgentAction::RunChain)
+            );
+        let _workspace = if name != "worktree"
+            && !chain_owns_workspace
+            && (name != "bash" || native_protocol.is_some())
+            && !nested_run_script_callback
+        {
+            Some(if let Some(cancel) = cancel_token {
+                tokio::select! {
+                    guard = self.worktree_transition.read() => guard,
+                    _ = cancel.cancelled() => return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false)),
+                }
+            } else {
+                self.worktree_transition.read().await
+            })
+        } else {
+            None
+        };
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false));
+        }
+        if name == "worktree"
+            && args.get("action").and_then(Value::as_str) == Some("exit")
+            && args
+                .get("exit_action")
+                .and_then(Value::as_str)
+                .unwrap_or("keep")
+                == "keep"
+            && self.workspace_selection_is_unknown()
+        {
+            if !self.confirm_current_workspace_in_tui(cancel_token).await {
+                return EdgeToolRun::from_tool_result(astra_tools::ToolResult::error(
+                    "The workspace is unknown. Resume this session interactively and confirm the directory before running local tools.".into(),
+                ).with_execution_not_started());
+            }
+            return match self.accept_current_workspace() {
+                Ok(message) => {
+                    EdgeToolRun::from_tool_result(astra_tools::ToolResult::text(message))
+                }
+                Err(error) => EdgeToolRun::from_tool_result(
+                    astra_tools::ToolResult::error(error).with_execution_not_started(),
+                ),
+            };
+        }
         let convergence_authority = invocation
             .run_id
             .filter(|identity| !identity.trim().is_empty())
@@ -4571,13 +4973,17 @@ impl ToolExecutor {
             .map(|(run_id, turn_chain_id)| {
                 format!("{run_id}:{turn_chain_id}:{}", self.convergence_authority)
             });
+        // The worktree lifecycle mutates the original repository and may
+        // remove the selected checkout; its coordination root must survive
+        // the operation itself.
+        let execution_root = if matches!(name, "worktree" | "rollback_git_worktrees") {
+            self.session_project_root()
+        } else {
+            self.effective_project_root()
+        };
         let targeted_observer = convergence_authority.as_deref().is_some_and(|authority| {
-            self.convergence_tracker.requires_snapshot_lease(
-                authority,
-                name,
-                args,
-                &self.project_root,
-            )
+            self.convergence_tracker
+                .requires_snapshot_lease(authority, name, args, &execution_root)
         });
         let mcp_prepared = if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
             match self.prepare_mcp_tool_call(name).await {
@@ -4593,11 +4999,6 @@ impl ToolExecutor {
         let mcp_workspace_effect = mcp_prepared
             .as_ref()
             .map(|(_, prepared)| prepared.policy().effect);
-        let execution_root = if native_protocol.is_some() {
-            self.effective_project_root()
-        } else {
-            self.project_root.clone()
-        };
         // Freeze the native write ceiling before choosing workspace ownership.
         // Read-only native work reads the live root; it is not a snapshot.
         let native_read_only = native_protocol.is_some()
@@ -4612,8 +5013,15 @@ impl ToolExecutor {
                 astra_tools::mcp_workspace_effect_undeclared_tool_result(name),
             );
         }
+        // Exiting while keeping a checkout only changes session state, which
+        // is already protected by the transition guard; do not wait for Git.
+        let keeping_worktree = name == "worktree"
+            && args.get("action").and_then(Value::as_str) == Some("exit")
+            && (cfg!(target_os = "macos")
+                || args.get("exit_action").and_then(Value::as_str) != Some("remove"));
         let _workspace_mutation_lease = if name != "bash"
             && name != "run_script"
+            && !keeping_worktree
             // MCP effects are resolved once from the discovered provider
             // declaration; typed tools use the shared built-in predicate.
             && ((native_protocol.is_some() && !native_read_only)
@@ -4622,16 +5030,47 @@ impl ToolExecutor {
                 || targeted_observer)
             && !nested_run_script_callback
         {
-            match astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-                &execution_root,
-                cancel_token,
-                invocation
-                    .admission_deadline
-                    .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
-                    .unwrap_or(std::time::Duration::from_secs(120))
-                    .min(std::time::Duration::from_secs(120)),
-            )
-            .await
+            // Worktree operations acquire checkout leases below. File
+            // rollback acquires its target scopes separately after admission.
+            let mut additional_roots = if matches!(
+                name,
+                "worktree" | "rollback_git_worktrees" | "rollback_file_edits"
+            ) {
+                Vec::new()
+            } else {
+                self.additional_workspace_paths()
+            };
+            // A single-file operation only needs the extra roots containing
+            // its actual target. Opaque or multi-file operations retain the
+            // conservative all-root admission.
+            if matches!(
+                name,
+                "write_file" | "str_replace" | "multi_edit" | "delete_file"
+            ) && let Some(target) = args
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| self.resolve_checked(path).ok())
+                .and_then(|path| self.bind_file_mutation_target(&path).ok())
+            {
+                additional_roots.retain(|root| {
+                    target.starts_with(root.canonicalize().unwrap_or_else(|_| root.clone()))
+                });
+            }
+            match self
+                .acquire_local_workspace_lease(
+                    &execution_root,
+                    &additional_roots,
+                    cancel_token,
+                    invocation
+                        .admission_deadline
+                        .map(|deadline| {
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                        })
+                        .unwrap_or(std::time::Duration::from_secs(120))
+                        .min(std::time::Duration::from_secs(120)),
+                    invocation.admission_deadline,
+                )
+                .await
             {
                 Ok(guard) => Some(guard),
                 Err(failure) => {
@@ -4641,55 +5080,69 @@ impl ToolExecutor {
                         }
                         return cancelled_edge_tool_run(name, false);
                     }
-                    return EdgeToolRun::from_tool_result(
-                        astra_tools::workspace_lease_failure_tool_result(name, failure),
-                    );
+                    return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        failure,
+                        &self.unsettled_workspace_root(&execution_root, &additional_roots),
+                    ));
                 }
             }
         } else {
             None
         };
-        if let Some(validate) = validate_dispatch
-            && let Err(result) = validate()
+        // Removing a linked checkout affects both the parent repository and
+        // the checkout itself. An independent executor can own the latter,
+        // so hold its existing cross-process lease until removal completes.
+        let _checkout_lease = if name == "worktree"
+            && !keeping_worktree
+            && args.get("action").and_then(Value::as_str) == Some("exit")
+            && args.get("exit_action").and_then(Value::as_str) == Some("remove")
+            && let Some(session) = self.get_worktree_session()
         {
-            return EdgeToolRun::from_tool_result(result);
-        }
-        // Structured writers have no trustworthy success fact in their
-        // display string. Capture an owner-side bounded preimage while the
-        // workspace lease is held, then stamp the result only if the bound
-        // workspace actually changed. An unavailable/ambiguous capture is
-        // deliberately not upgraded to a mutation receipt.
-        // Direct file writers below have an exact owner-side applied/no-op
-        // result and must never pay for (or depend on) a whole-tree scan.
-        // Other mutation-capable handlers retain the bounded fingerprint as
-        // a conservative fallback until their own commit boundary reports the
-        // same typed fact.
-        let owner_reports_structured_writer_fact = matches!(name, "write_file" | "str_replace");
-        let writer_fingerprint_before =
-            if astra_tools::executor::is_workspace_mutation_tool(name, args)
-                && !owner_reports_structured_writer_fact
-            {
-                astra_tools::workspace_observation::WorkspaceFingerprint::capture(
-                    &self.project_root,
+            let checkout_lease = if let Some(parent) = _workspace_mutation_lease.as_ref() {
+                astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_parent(
+                    &session.worktree_path,
+                    parent,
+                    cancel_token,
+                    invocation
+                        .admission_deadline
+                        .map(|deadline| {
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                        })
+                        .unwrap_or(std::time::Duration::from_secs(120))
+                        .min(std::time::Duration::from_secs(120)),
                 )
+                .await
             } else {
-                None
+                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable)
             };
-        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            if let Some(authority) = convergence_authority.as_deref() {
-                self.convergence_tracker.clear_authority(authority);
-            }
-            return cancelled_edge_tool_run(name, false);
-        }
-        let _recursive_writer_epoch = if name == "run_script" {
-            match astra_tools::workspace_observation::begin_workspace_writer_with_options(
-                &self.project_root,
-                cancel_token,
-                std::time::Duration::from_secs(120),
-            )
-            .await
-            {
+            match checkout_lease {
                 Ok(guard) => Some(guard),
+                Err(failure) => {
+                    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                        return cancelled_edge_tool_run(name, false);
+                    }
+                    return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        failure,
+                        &session.worktree_path,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let _rollback_checkout_leases = if name == "rollback_git_worktrees" {
+            let Some(parent) = _workspace_mutation_lease.as_ref() else {
+                return EdgeToolRun::from_tool_result(astra_tools::workspace_lease_failure_tool_result(
+                    name, astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable,
+                ));
+            };
+            match self
+                .acquire_git_worktree_rollback_leases(args, None, parent, cancel_token)
+                .await
+            {
+                Ok(leases) => leases,
                 Err(failure) => {
                     return EdgeToolRun::from_tool_result(
                         astra_tools::workspace_lease_failure_tool_result(name, failure),
@@ -4697,8 +5150,59 @@ impl ToolExecutor {
                 }
             }
         } else {
+            Vec::new()
+        };
+        if let Some(validate) = validate_dispatch
+            && let Err(result) = validate()
+        {
+            return EdgeToolRun::from_tool_result(result);
+        }
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            if let Some(authority) = convergence_authority.as_deref() {
+                self.convergence_tracker.clear_authority(authority);
+            }
+            return cancelled_edge_tool_run(name, false);
+        }
+        let _recursive_writer_epoch = if name == "run_script" {
+            let additional_roots = self.additional_workspace_paths();
+            match self.acquire_local_workspace_lease(
+                &execution_root,
+                &additional_roots,
+                cancel_token,
+                std::time::Duration::from_secs(120),
+                invocation.admission_deadline,
+            ).await {
+                Ok(lease) => match astra_tools::workspace_observation::begin_workspace_writer_after_lease(
+                    &execution_root,
+                    lease,
+                ) {
+                    Some(guard) => Some(guard),
+                    None => return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable,
+                        &execution_root,
+                    )),
+                },
+                Err(failure) => {
+                    return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        failure,
+                        &self.unsettled_workspace_root(&execution_root, &additional_roots),
+                    ));
+                }
+            }
+        } else {
             None
         };
+        // Admission can wait for a prior command or a user's confirmation.
+        // Recheck the selected checkout after that wait, before dispatch.
+        if (_workspace_mutation_lease.is_some() || _recursive_writer_epoch.is_some())
+            && let Some(error) = self.worktree_recovery_error(name, args)
+        {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::ToolResult::error(error).with_execution_not_started(),
+            );
+        }
         let mut facts = ToolExecutionFacts::default();
         let mut output = self
             .execute_raw(
@@ -4748,9 +5252,13 @@ impl ToolExecutor {
                 .and_then(Value::as_bool)
                 == Some(true);
             let result = if dispatched && !settled {
-                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                    &execution_root,
-                );
+                if let Some(lease) = &_workspace_mutation_lease {
+                    lease.mark_unsettled();
+                } else {
+                    astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                        &execution_root,
+                    );
+                }
                 astra_tools::workspace_effect_unsettled_tool_result(name, result)
             } else {
                 result
@@ -4781,9 +5289,15 @@ impl ToolExecutor {
             fields.remove(astra_tools::workspace_observation::RECEIPT_FIELD);
         }
         if !coordination_integrity_valid {
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                &self.project_root,
-            );
+            if let Some(lease) = &_workspace_mutation_lease {
+                lease.mark_unsettled();
+            } else if let Some(writer) = &_recursive_writer_epoch {
+                writer.mark_unsettled();
+            } else {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    &execution_root,
+                );
+            }
             if let Some(fields) = tool_result_fields.as_mut() {
                 fields.remove("workspace_mutation_applied");
                 astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(fields);
@@ -4802,19 +5316,6 @@ impl ToolExecutor {
                 .and_then(|fields| fields.get("workspace_mutation_applied"))
                 .and_then(Value::as_bool)
                 == Some(true);
-        let writer_applied_by_owner = receipt_authority_valid && direct_writer_applied;
-        let writer_applied_by_fingerprint = if writer_applied_by_owner {
-            false
-        } else {
-            receipt_authority_valid
-                && writer_fingerprint_before
-                    .zip(
-                        astra_tools::workspace_observation::WorkspaceFingerprint::capture(
-                            &self.project_root,
-                        ),
-                    )
-                    .is_some_and(|(before, after)| before.changed_from(Some(after)))
-        };
         // Redact before constructing EdgeToolRun.  This is deliberately
         // before status classification, event emission, callback posting, and
         // cache insertion: tool_call_end and the Edge→server transport must
@@ -4837,12 +5338,9 @@ impl ToolExecutor {
         // retain their status adapter, but cannot invent an error category.
         let mut is_error = source_is_error.unwrap_or_else(|| cli_tool_output_is_error(&output))
             || !coordination_integrity_valid;
-        // Owner metadata is the primary structured-writer fact. A whole-tree
-        // fingerprint remains only a conservative fallback for older/opaque
-        // handlers: large non-Git task roots can legitimately exceed its
-        // bounded scan even when a one-file write committed successfully.
-        // No output prose or exit-zero result participates in this decision.
-        let writer_applied = writer_applied_by_owner || writer_applied_by_fingerprint;
+        // Only the writer can report that it applied a change. A whole-tree
+        // snapshot cannot attribute concurrent edits to this invocation.
+        let writer_applied = receipt_authority_valid && direct_writer_applied;
         // Execution failure does not erase the producer's execution facts.
         // In particular, timeout and partial mutation remain independently
         // observable. Do not reconstruct a second metadata schema here.
@@ -4857,7 +5355,7 @@ impl ToolExecutor {
         let desired_state = match astra_tools::workspace_observation::consume_workspace_desired_state_convergence_marker(
             &mut tool_result_fields,
             args,
-            &self.project_root,
+            &execution_root,
         ) {
             Ok(desired_state) => desired_state,
             Err(error) => {
@@ -4870,7 +5368,7 @@ impl ToolExecutor {
             && astra_tools::workspace_observation::typed_workspace_tool_applied_bound(
                 name,
                 args,
-                &self.project_root,
+                &execution_root,
                 is_error,
                 direct_writer_applied,
             )
@@ -4891,7 +5389,7 @@ impl ToolExecutor {
             astra_tools::workspace_observation::typed_workspace_tool_receipt_for_applied(
                 name,
                 args,
-                &self.project_root,
+                &execution_root,
                 is_error,
                 writer_applied,
             )
@@ -4905,7 +5403,7 @@ impl ToolExecutor {
             convergence_authority.as_deref(),
             name,
             args,
-            &self.project_root,
+            &execution_root,
             is_error,
             desired_state.as_ref(),
             receipt_authority_valid && !nested_run_script_callback,
@@ -5045,7 +5543,7 @@ impl ToolExecutor {
                             );
                         if let Some(desired_state) =
                             astra_tools::fs_ops::write_file_desired_state_identity(
-                                &self.project_root,
+                                execution_root,
                                 args,
                             )
                         {
@@ -5072,9 +5570,22 @@ impl ToolExecutor {
                     }
                     output
                 }
-                "rollback_database_snapshots" => self.rollback_database_snapshots(args),
-                "rollback_file_edits" => self.rollback_file_edits(args),
-                "rollback_session_state" => self.rollback_session_state(args).await,
+                "rollback_database_snapshots"
+                | "rollback_file_edits"
+                | "rollback_session_state" => {
+                    let result = match name {
+                        "rollback_database_snapshots" => self.rollback_database_snapshots(args),
+                        "rollback_file_edits" => self.rollback_file_edits(args).await,
+                        _ => self.rollback_session_state(args).await,
+                    };
+                    if let Some(success) = serde_json::from_str::<Value>(&result)
+                        .ok()
+                        .and_then(|value| value.get("success").and_then(Value::as_bool))
+                    {
+                        *source_is_error = Some(!success);
+                    }
+                    result
+                }
                 "str_replace" => {
                     let args =
                         match astra_tools::fs_ops::normalize_str_replace_invocation_args(args) {
@@ -5124,12 +5635,13 @@ impl ToolExecutor {
                 // CLI+Server edge callbacks, and pure Server runs have one
                 // traversal, ignore, pagination, and failure contract.
                 "glob" => {
-                    let result = astra_tools::ToolExecutor::execute_with_metadata(
-                        &self.default_executor,
-                        "glob",
-                        args,
-                    )
-                    .await;
+                    let mut context = self.default_executor.context().clone();
+                    context.project_root = execution_root.to_path_buf();
+                    context.workspace_root = execution_root.to_path_buf();
+                    context.sandbox.project_root = execution_root.to_path_buf();
+                    context.cancel_token =
+                        cancel_token.map(|token| std::sync::Arc::new(token.clone()));
+                    let result = astra_tools::shell_ops::glob(&context, args).await;
                     *source_is_error = Some(result.is_error);
                     *tool_result_fields = result.metadata.clone();
                     result.output
@@ -5171,8 +5683,21 @@ impl ToolExecutor {
                     result.output
                 }
                 "display_sixel" => {
+                    let mut resolved = args.clone();
+                    if let Some(path) = args.get("path").and_then(Value::as_str) {
+                        match self.resolve_checked(path) {
+                            Ok(path) => {
+                                resolved["path"] =
+                                    Value::String(path.to_string_lossy().into_owned())
+                            }
+                            Err(error) => {
+                                *source_is_error = Some(true);
+                                return error;
+                            }
+                        }
+                    }
                     let result =
-                        astra_tools::ToolExecutor::execute(&self.default_executor, name, args)
+                        astra_tools::ToolExecutor::execute(&self.default_executor, name, &resolved)
                             .await;
                     *source_is_error = Some(result.is_error);
                     result.output
@@ -5180,7 +5705,10 @@ impl ToolExecutor {
                 "run_script" => {
                     #[cfg(unix)]
                     {
-                        let config = astra_tools::run_script::RunScriptConfig::default();
+                        let config = astra_tools::run_script::RunScriptConfig {
+                            session_cwd: Some(self.effective_project_root()),
+                            ..Default::default()
+                        };
                         let result = astra_tools::run_script::handle_run_script(
                             args,
                             self,
@@ -5189,6 +5717,7 @@ impl ToolExecutor {
                         )
                         .await;
                         *source_is_error = Some(result.is_error);
+                        *tool_result_fields = result.metadata;
                         result.output
                     }
                     #[cfg(not(unix))]
@@ -5333,6 +5862,13 @@ impl ToolExecutor {
                     };
                     match action {
                         astra_tools::agent_tool_contract::AgentAction::RunChain => {
+                            if args.get("rollback_on_failure").is_some() {
+                                *source_is_error = Some(true);
+                                astra_tools::execution_outcome::insert_not_executed_fact(
+                                    tool_result_fields.get_or_insert_with(Default::default),
+                                );
+                                return "Error: run_chain does not support automatic rollback; completed steps remain in the workspace if a later step fails.".to_string();
+                            }
                             match serde_json::from_value::<
                                 astra_turn_core::tool_registry_chain::ToolChain,
                             >(args.clone())
@@ -5353,7 +5889,9 @@ impl ToolExecutor {
                                         .get("input")
                                         .cloned()
                                         .unwrap_or_else(|| serde_json::json!({}));
-                                    let outcome = self.execute_chain_outcome(&chain, input).await;
+                                    let outcome = self
+                                        .execute_chain_outcome(&chain, input, cancel_token)
+                                        .await;
                                     *source_is_error = Some(outcome.is_error);
                                     outcome.output
                                 }
@@ -5574,7 +6112,7 @@ impl ToolExecutor {
         chain: &astra_turn_core::tool_registry_chain::ToolChain,
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
-        let outcome = self.execute_chain_outcome(chain, input);
+        let outcome = self.execute_chain_outcome(chain, input, None);
         Box::pin(async move { outcome.await.output })
     }
 
@@ -5582,11 +6120,12 @@ impl ToolExecutor {
     ///
     /// Returns a JSON summary with per-step outputs and the final result.
     /// Execution stops on the first error unless the step has a skip condition.
-    fn execute_chain_outcome(
-        &self,
+    fn execute_chain_outcome<'a>(
+        &'a self,
         chain: &astra_turn_core::tool_registry_chain::ToolChain,
         input: Value,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionOutcome> + Send + '_>>
+        cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionOutcome> + Send + 'a>>
     {
         use astra_turn_core::tool_registry_chain::{ChainContext, resolve_args};
 
@@ -5608,27 +6147,27 @@ impl ToolExecutor {
         }
 
         let chain_name = chain.name.clone();
-        let rollback_on_failure = chain.rollback_on_failure;
-        let rollback_turn_index = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Acquire);
-        let file_checkpoint = rollback_on_failure.then(|| self.file_journal_checkpoint());
-        let database_checkpoint =
-            rollback_on_failure.then(|| self.database_snapshot_journal_checkpoint());
-
-        let worktree_checkpoint =
-            rollback_on_failure.then(|| self.git_worktree_journal_checkpoint());
-        let session_state_checkpoint =
-            rollback_on_failure.then(|| self.session_state_journal_checkpoint());
         let steps = chain.steps.clone();
 
         Box::pin(async move {
+            let mut workspace = Some(if let Some(cancel) = cancel_token {
+                tokio::select! {
+                    guard = self.worktree_transition.read() => guard,
+                    _ = cancel.cancelled() => return cancelled_tool_execution_outcome("agent", false),
+                }
+            } else {
+                self.worktree_transition.read().await
+            });
             let mut ctx = ChainContext::new(input);
             let mut step_results = Vec::new();
-            let mut rollback = None;
             let mut failed = false;
 
             for (idx, step) in steps.iter().enumerate() {
+                if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    failed = true;
+                    ctx.prev_output = "Chain cancelled; remaining steps were not run.".into();
+                    break;
+                }
                 if ctx.should_skip(step) {
                     step_results.push(serde_json::json!({
                         "step": idx,
@@ -5639,7 +6178,46 @@ impl ToolExecutor {
                 }
 
                 let resolved = resolve_args(&step.args, &ctx);
-                let outcome = self.execute_with_metadata(&step.tool, &resolved).await;
+                let outcome = if step.tool == "worktree" {
+                    drop(workspace.take());
+                    match self.worktree_transition.try_write() {
+                        Ok(transition) => {
+                            let outcome = self
+                                .execute_run_with_native_interaction(
+                                    &step.tool,
+                                    &resolved,
+                                    astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                                    cancel_token,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(&transition),
+                                )
+                                .await
+                                .into_outcome();
+                            workspace = Some(tokio::sync::RwLockWriteGuard::downgrade(transition));
+                            outcome
+                        }
+                        Err(_) => {
+                            let mut rejected = EdgeToolRun::classified_error(
+                                "The workspace is still in use; no switch was made.".to_string(),
+                                astra_core::ErrorKind::ToolUnavailable,
+                            );
+                            astra_tools::execution_outcome::insert_not_executed_fact(
+                                rejected
+                                    .tool_result_fields
+                                    .get_or_insert_with(Default::default),
+                            );
+                            rejected.into_outcome()
+                        }
+                    }
+                } else {
+                    self.execute_with_metadata_cancelable(&step.tool, &resolved, cancel_token)
+                        .await
+                };
                 let is_err = outcome.is_error;
                 let output = outcome.output;
 
@@ -5659,68 +6237,14 @@ impl ToolExecutor {
                 }));
 
                 if is_err {
+                    // Completed steps can contain useful work. Undoing them here
+                    // could also overwrite edits made since those steps ran.
                     failed = true;
-                    if rollback_on_failure {
-                        if let (
-                            Some(file_checkpoint),
-                            Some(database_checkpoint),
-                            Some(worktree_checkpoint),
-                            Some(session_state_checkpoint),
-                        ) = (
-                            file_checkpoint,
-                            database_checkpoint,
-                            worktree_checkpoint,
-                            session_state_checkpoint,
-                        ) {
-                            let file_entries_added = self
-                                .file_journal_checkpoint()
-                                .saturating_sub(file_checkpoint);
-                            let database_entries_added = self
-                                .database_snapshot_journal_checkpoint()
-                                .saturating_sub(database_checkpoint);
-
-                            let worktree_entries_added = self
-                                .git_worktree_journal_checkpoint()
-                                .saturating_sub(worktree_checkpoint);
-                            let session_state_entries_added = self
-                                .session_state_journal_checkpoint()
-                                .saturating_sub(session_state_checkpoint);
-                            if file_entries_added > 0
-                                || database_entries_added > 0
-                                || worktree_entries_added > 0
-                                || session_state_entries_added > 0
-                            {
-                                let rollback_output = self
-                                    .rollback_recorded_turn_mutations(&serde_json::json!({
-                                        "scope": "turn",
-                                        "turn_index": rollback_turn_index,
-                                        "file_after_sequence": file_checkpoint,
-                                        "database_after_sequence": database_checkpoint,
-
-
-                                        "worktree_after_sequence": worktree_checkpoint,
-                                        "session_state_after_sequence": session_state_checkpoint,
-                                    }))
-                                    .await;
-                                rollback = Some(
-                                    serde_json::from_str(&rollback_output).unwrap_or_else(
-                                        |error| {
-                                            serde_json::json!({
-                                                "success": false,
-                                                "error": format!("invalid recorded turn rollback output: {error}"),
-                                                "raw_output": rollback_output,
-                                            })
-                                        },
-                                    ),
-                                );
-                            }
-                        }
-                    }
                     break;
                 }
             }
 
-            let mut result = serde_json::Map::from_iter([
+            let result = serde_json::Map::from_iter([
                 ("chain".to_string(), serde_json::json!(chain_name)),
                 (
                     "steps_executed".to_string(),
@@ -5733,9 +6257,6 @@ impl ToolExecutor {
                 ),
                 ("steps".to_string(), serde_json::json!(step_results)),
             ]);
-            if let Some(rollback) = rollback {
-                result.insert("rollback".to_string(), rollback);
-            }
             ToolExecutionOutcome {
                 output: Value::Object(result).to_string(),
                 tool_result_fields: None,
@@ -6219,8 +6740,8 @@ impl astra_tools::ToolExecutor for ToolExecutor {
         &self.project_root
     }
 
-    fn workspace_root(&self) -> &Path {
-        &self.project_root
+    fn workspace_root(&self) -> PathBuf {
+        self.effective_project_root()
     }
 
     async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
@@ -6231,6 +6752,41 @@ impl astra_tools::ToolExecutor for ToolExecutor {
 #[cfg(test)]
 pub(crate) mod tests {
     use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn typed_write_ignores_unrelated_unsettled_directory() {
+        let (workspace, executor) = temp_executor();
+        let additional = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = additional.path().canonicalize().unwrap();
+        executor.expand_sandbox_path(root.clone()).unwrap();
+        assert!(astra_tools::workspace_observation::mark_workspace_observation_unsettled(&root));
+
+        let local = executor
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path":"local.txt", "content":"local"}),
+            )
+            .await;
+        let blocked = executor
+            .execute_with_metadata(
+                "write_file",
+                &json!({"path":root.join("shared.txt"), "content":"shared"}),
+            )
+            .await;
+        astra_tools::workspace_observation::begin_workspace_recovery(&root)
+            .await
+            .unwrap()
+            .confirm()
+            .await
+            .unwrap();
+        assert!(!local.is_error, "{local:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("local.txt")).unwrap(),
+            "local\n"
+        );
+        assert!(blocked.is_error, "{blocked:?}");
+        assert!(!root.join("shared.txt").exists());
+    }
     #[tokio::test]
     async fn sandbox_path_refusals_preserve_non_execution_through_dispatch() {
         let (directory, executor) = temp_executor();
@@ -11177,6 +11733,9 @@ pub(crate) mod tests {
         let prior = astra_turn_core::file_edit_journal::FileEditEntry {
             sequence: 0,
             path: PathBuf::from("/tmp/prior.txt"),
+            workspace_root: None,
+            #[cfg(unix)]
+            parent_binding: None,
             turn_index: 5,
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             before_content: Some(b"p".to_vec()),
@@ -11222,6 +11781,9 @@ pub(crate) mod tests {
             let entry = astra_turn_core::file_edit_journal::FileEditEntry {
                 sequence: i,
                 path: PathBuf::from(format!("/tmp/prior-{i}.txt")),
+                workspace_root: None,
+                #[cfg(unix)]
+                parent_binding: None,
                 turn_index: 0,
                 timestamp: std::time::SystemTime::UNIX_EPOCH,
                 before_content: None,

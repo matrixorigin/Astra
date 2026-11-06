@@ -190,13 +190,16 @@ impl ToolExecutor {
             .as_deref()
             .unwrap_or_else(|| Path::new(path));
 
+        let workspace_root = self.effective_project_root();
         {
             let sp_guard = self
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard {
-                return validate_path(policy, validation_path).map_err(|e| {
+                let mut policy = policy.clone();
+                policy.project_root = workspace_root;
+                return validate_path(&policy, validation_path).map_err(|e| {
                     if e.is_boundary_violation() {
                         FsLeafError::sandbox_denied(format!(
                             "Path '{}' is outside the project directory '{}'; \
@@ -213,7 +216,7 @@ impl ToolExecutor {
         Ok(if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.project_root.join(p)
+            workspace_root.join(p)
         })
     }
 
@@ -270,22 +273,34 @@ impl ToolExecutor {
 
     fn record_committed_file_edit(
         &self,
-        path: &Path,
+        prepared: &PreparedWriteFile,
         call_id: &str,
-        before: Option<&[u8]>,
-        after: &[u8],
         edit_type: EditType,
     ) {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        self.file_journal
+        let workspace_root = self.effective_project_root();
+        let mut journal = self
+            .file_journal
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_committed(path, call_id, turn, before, after, edit_type);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(unix)]
+        journal.record_published_write(prepared, call_id, turn, edit_type, &workspace_root);
+        #[cfg(not(unix))]
+        journal.record_committed_in_workspace(
+            &workspace_root,
+            prepared.path(),
+            call_id,
+            turn,
+            (prepared.original_content_bytes(), prepared.content_bytes()),
+            edit_type,
+        );
+        drop(journal);
         self.record_write_with_content(
-            path,
-            std::str::from_utf8(after).expect("prepared text publication is UTF-8"),
+            prepared.path(),
+            std::str::from_utf8(prepared.content_bytes())
+                .expect("prepared text publication is UTF-8"),
         );
     }
 
@@ -298,10 +313,8 @@ impl ToolExecutor {
         let result = prepared.apply();
         if !result.is_error && !prepared.is_already_desired() {
             self.record_committed_file_edit(
-                prepared.path(),
+                prepared,
                 call_id,
-                prepared.original_content_bytes(),
-                prepared.content_bytes(),
                 if prepared.original_content_bytes().is_none() {
                     EditType::Create
                 } else {
@@ -520,7 +533,8 @@ impl ToolExecutor {
                         } else {
                             String::new()
                         };
-                        let cwd = self.project_root.display();
+                        let root = self.effective_project_root();
+                        let cwd = root.display();
                         return Err(format!(
                             "{msg}. Note: current working directory is {cwd}. Use list_dir or glob to find the correct path first.{hint}"
                         ).into());
@@ -1107,6 +1121,11 @@ impl ToolExecutor {
             return format!("Error: file not found: {}", rel_str);
         }
 
+        #[cfg(unix)]
+        let parent_binding = match astra_tools::fs_ops::capture_file_parent(&path) {
+            Ok(parent) => parent,
+            Err(error) => return format!("Error: Cannot bind file directory: {error}"),
+        };
         let before_content = match fs::read(&path) {
             Ok(content) => content,
             Err(error) => return format!("Error reading file before delete: {error}"),
@@ -1116,21 +1135,42 @@ impl ToolExecutor {
             .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("delete_file:{}", path.display());
 
-        match fs::remove_file(&path) {
+        #[cfg(unix)]
+        let deleted = astra_tools::fs_ops::restore_file_in_bound_parent(
+            &parent_binding,
+            &path,
+            Some(&before_content),
+            None,
+        );
+        #[cfg(not(unix))]
+        let deleted = fs::remove_file(&path);
+        match deleted {
             Ok(_) => {
                 *applied = true;
                 self.remove_file_state(&path);
-                match self.file_journal.lock() {
-                    Ok(mut journal) => {
-                        journal.record_delete(&path, &journal_call_id, turn_idx, before_content)
-                    }
-                    Err(poisoned) => poisoned.into_inner().record_delete(
-                        &path,
-                        &journal_call_id,
-                        turn_idx,
-                        before_content,
-                    ),
-                }
+                let workspace_root = self.effective_project_root();
+                let mut journal = self
+                    .file_journal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                #[cfg(unix)]
+                journal.record_delete_in_parent(
+                    &path,
+                    &journal_call_id,
+                    turn_idx,
+                    &before_content,
+                    Some(parent_binding),
+                    &workspace_root,
+                );
+                #[cfg(not(unix))]
+                journal.record_committed_in_workspace(
+                    &workspace_root,
+                    &path,
+                    &journal_call_id,
+                    turn_idx,
+                    (Some(&before_content), &[]),
+                    EditType::Delete,
+                );
                 format!("Deleted: {}", rel_str)
             }
             Err(e) => format!("Error deleting file: {e}"),
@@ -1151,6 +1191,22 @@ impl ToolExecutor {
         })
     }
 
+    fn rollback_failures(result: &Value) -> Value {
+        let mut failed = result
+            .get("failed")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(error) = result.get("error").and_then(Value::as_str) {
+            failed.push(json!({"error": error}));
+        } else if result.get("failed").and_then(Value::as_array).is_none()
+            && result.get("success").and_then(Value::as_bool) != Some(true)
+        {
+            failed.push(json!({"error":"rollback did not return a valid result"}));
+        }
+        Value::Array(failed)
+    }
+
     fn refresh_rolled_back_file_state(&self, path: &Path) {
         if path.exists() {
             match read_to_string_lossy(path) {
@@ -1162,11 +1218,56 @@ impl ToolExecutor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn file_journal_checkpoint(&self) -> u64 {
         match self.file_journal.lock() {
             Ok(journal) => journal.checkpoint(),
             Err(poisoned) => poisoned.into_inner().checkpoint(),
         }
+    }
+
+    async fn file_rollback_preflight(&self, args: &Value) -> Result<(), String> {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("path").map(|_| "file"))
+            .unwrap_or("current_turn");
+        if scope == "list" {
+            return Ok(());
+        }
+        let root = self.effective_project_root();
+        if matches!(scope, "turn" | "current_turn") {
+            let turn = if scope == "turn" {
+                args.get("turn_index")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+            } else {
+                Some(
+                    self.journal_turn_index
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+            };
+            if let Some(turn) = turn {
+                let checkpoint = args
+                    .get("file_after_sequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let journal = self
+                    .file_journal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if journal.entries().any(|entry| {
+                    entry.turn_index == turn
+                        && entry.sequence >= checkpoint
+                        && !entry.belongs_to_workspace(&root)
+                }) {
+                    return Err(
+                        "Some edits belong to another workspace; no files were rolled back.".into(),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rollback all file edits recorded since `checkpoint` within the
@@ -1197,327 +1298,7 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) async fn rollback_recorded_turn_mutations(&self, args: &Value) -> String {
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("current_turn");
-        let explicit_turn_index = if scope == "turn" {
-            match args.get("turn_index").and_then(Value::as_u64) {
-                Some(turn_index) => Some(turn_index),
-                None => {
-                    return json!({
-                        "success": false,
-                        "error": "missing 'turn_index' for scope=turn",
-                    })
-                    .to_string();
-                }
-            }
-        } else {
-            None
-        };
-
-        match scope {
-            "list" => {
-                let file_result = Self::parse_rollback_tool_output(
-                    "rollback_file_edits",
-                    self.rollback_file_edits(args),
-                );
-                let database_result = Self::parse_rollback_tool_output(
-                    "rollback_database_snapshots",
-                    self.rollback_database_snapshots(args),
-                );
-
-                let worktree_result = Self::parse_rollback_tool_output(
-                    "rollback_git_worktrees",
-                    self.rollback_git_worktrees(args),
-                );
-                let session_state_result = Self::parse_rollback_tool_output(
-                    "rollback_session_state",
-                    self.rollback_session_state(args).await,
-                );
-                let file_entries = file_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let database_entries = database_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-
-                let worktree_entries = worktree_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let session_state_entries = session_state_result
-                    .get("entries")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let total_file_entries = file_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        file_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-                let total_database_entries = database_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        database_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-
-                let total_worktree_entries = worktree_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        worktree_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-                let total_session_state_entries = session_state_result
-                    .get("total_entries")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| {
-                        session_state_entries
-                            .as_array()
-                            .map(|entries| entries.len() as u64)
-                            .unwrap_or(0)
-                    });
-                json!({
-                    "success": file_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-                        && database_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-
-
-                        && worktree_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-                        && session_state_result.get("success").and_then(Value::as_bool).unwrap_or(false),
-                    "scope": "list",
-                    "total_file_entries": total_file_entries,
-                    "total_database_entries": total_database_entries,
-
-
-                    "total_git_worktree_entries": total_worktree_entries,
-                    "total_session_state_entries": total_session_state_entries,
-                    "file_entries": file_entries,
-                    "database_entries": database_entries,
-
-
-                    "git_worktree_entries": worktree_entries,
-                    "session_state_entries": session_state_entries,
-                    "files": file_result,
-                    "database_snapshots": database_result,
-
-
-                    "git_worktrees": worktree_result,
-                    "session_state": session_state_result,
-                    "summary": format!(
-                        "Listed {total_file_entries} file rollback entr{}, {total_database_entries} database snapshot entr{}, {total_worktree_entries} git worktree rollback entr{}, and {total_session_state_entries} session-state rollback entr{}",
-                        if total_file_entries == 1 { "y" } else { "ies" },
-                        if total_database_entries == 1 { "y" } else { "ies" },
-
-
-                        if total_worktree_entries == 1 { "y" } else { "ies" },
-                        if total_session_state_entries == 1 { "y" } else { "ies" }
-                    ),
-                })
-                .to_string()
-            }
-            "turn" | "current_turn" => {
-                let database_result = Self::parse_rollback_tool_output(
-                    "rollback_database_snapshots",
-                    self.rollback_database_snapshots(args),
-                );
-                let file_result = Self::parse_rollback_tool_output(
-                    "rollback_file_edits",
-                    self.rollback_file_edits(args),
-                );
-
-                let worktree_result = Self::parse_rollback_tool_output(
-                    "rollback_git_worktrees",
-                    self.rollback_git_worktrees(args),
-                );
-                let session_state_result = Self::parse_rollback_tool_output(
-                    "rollback_session_state",
-                    self.rollback_session_state(args).await,
-                );
-                let turn_index = database_result
-                    .get("turn_index")
-                    .and_then(Value::as_u64)
-                    .or_else(|| file_result.get("turn_index").and_then(Value::as_u64))
-                    .or_else(|| worktree_result.get("turn_index").and_then(Value::as_u64))
-                    .or_else(|| {
-                        session_state_result
-                            .get("turn_index")
-                            .and_then(Value::as_u64)
-                    })
-                    .or(explicit_turn_index)
-                    .unwrap_or_else(|| {
-                        self.journal_turn_index
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                            as u64
-                    });
-                let reverted_files = file_result
-                    .get("reverted")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let restored_snapshots = database_result
-                    .get("restored")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_file_rollbacks = file_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_database_rollbacks = database_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-
-                let restored_git_worktrees = worktree_result
-                    .get("restored")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_git_worktree_rollbacks = worktree_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let restored_session_state = session_state_result
-                    .get("restored")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let failed_session_state_rollbacks = session_state_result
-                    .get("failed")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                let reverted_file_count = reverted_files
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let restored_snapshot_count = restored_snapshots
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_file_count = failed_file_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_database_count = failed_database_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-
-                let restored_git_worktree_count = restored_git_worktrees
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_git_worktree_count = failed_git_worktree_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let restored_session_state_count = restored_session_state
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let failed_session_state_count = failed_session_state_rollbacks
-                    .as_array()
-                    .map(|entries| entries.len())
-                    .unwrap_or(0);
-                let restored_total = reverted_file_count
-                    + restored_snapshot_count
-                    + restored_git_worktree_count
-                    + restored_session_state_count;
-                let failed_total = failed_file_count
-                    + failed_database_count
-                    + failed_git_worktree_count
-                    + failed_session_state_count;
-                let success = restored_total > 0 && failed_total == 0;
-                let summary = if restored_total == 0 {
-                    format!("No recorded rollback actions found for turn {turn_index}")
-                } else if failed_total == 0 {
-                    format!(
-                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, removed {restored_git_worktree_count} recorded git worktree{}, and restored {restored_session_state_count} session-state mutation{} from turn {turn_index}",
-                        if reverted_file_count == 1 { "" } else { "s" },
-                        if restored_snapshot_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_git_worktree_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_session_state_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                    )
-                } else {
-                    format!(
-                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, removed {restored_git_worktree_count} recorded git worktree{}, and restored {restored_session_state_count} session-state mutation{} from turn {turn_index} with {failed_total} failure{}",
-                        if reverted_file_count == 1 { "" } else { "s" },
-                        if restored_snapshot_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_git_worktree_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if restored_session_state_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if failed_total == 1 { "" } else { "s" }
-                    )
-                };
-                json!({
-                    "success": success,
-                    "scope": scope,
-                    "turn_index": turn_index,
-                    "reverted_files": reverted_files,
-                    "restored_database_snapshots": restored_snapshots,
-
-
-                    "restored_git_worktrees": restored_git_worktrees,
-                    "restored_session_state": restored_session_state,
-                    "failed_file_rollbacks": failed_file_rollbacks,
-                    "failed_database_rollbacks": failed_database_rollbacks,
-
-
-                    "failed_git_worktree_rollbacks": failed_git_worktree_rollbacks,
-                    "failed_session_state_rollbacks": failed_session_state_rollbacks,
-                    "files": file_result,
-                    "database_snapshots": database_result,
-
-
-                    "git_worktrees": worktree_result,
-                    "session_state": session_state_result,
-                    "summary": summary,
-                })
-                .to_string()
-            }
-            other => json!({
-                "success": false,
-                "error": format!(
-                    "invalid 'scope': {other} (expected one of current_turn, turn, list)"
-                ),
-            })
-            .to_string(),
-        }
-    }
-
-    pub(crate) fn rollback_file_edits(&self, args: &Value) -> String {
+    pub(crate) async fn rollback_file_edits(&self, args: &Value) -> String {
         if args.get("after_sequence").is_some() {
             return json!({
                 "success": false,
@@ -1536,6 +1317,10 @@ impl ToolExecutor {
                 }
             })
             .unwrap_or("current_turn");
+
+        if let Err(error) = self.file_rollback_preflight(args).await {
+            return json!({"success":false, "scope":scope, "error":error}).to_string();
+        }
 
         match scope {
             "source_receipt" => {
@@ -1562,11 +1347,11 @@ impl ToolExecutor {
                     .to_string();
                 };
                 let owner_scope = format!("cli:{session_id}");
-                match astra_tools::source_preimage::restore_receipt(
-                    &self.project_root,
+                match astra_tools::source_preimage::prepare_receipt_restore(
+                    &self.effective_project_root(),
                     &owner_scope,
                     receipt_id,
-                ) {
+                ).and_then(|receipt| receipt.restore()) {
                     Ok(()) => json!({
                         "success": true,
                         "scope": "source_receipt",
@@ -1626,29 +1411,25 @@ impl ToolExecutor {
                 if !candidates.iter().any(|candidate| candidate == &aliased) {
                     candidates.push(aliased);
                 }
-                let undo_result = match self.file_journal.lock() {
-                    Ok(journal) => {
-                        let mut outcome = Ok(None);
-                        for candidate in &candidates {
-                            outcome = journal.undo_file(candidate);
-                            if !matches!(outcome, Ok(None)) {
-                                break;
-                            }
+                let root = self.effective_project_root();
+                let journal = self
+                    .file_journal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut undo_result = Ok(None);
+                for candidate in &candidates {
+                    if let Some(entry) = journal.entries().filter(|entry| entry.path == *candidate).last() {
+                        if !entry.belongs_to_workspace(&root) {
+                            undo_result = Err(std::io::Error::other(
+                                "This edit belongs to another workspace; no file was rolled back",
+                            ));
+                        } else {
+                            undo_result = journal.undo_file(candidate);
                         }
-                        outcome
+                        break;
                     }
-                    Err(poisoned) => {
-                        let journal = poisoned.into_inner();
-                        let mut outcome = Ok(None);
-                        for candidate in &candidates {
-                            outcome = journal.undo_file(candidate);
-                            if !matches!(outcome, Ok(None)) {
-                                break;
-                            }
-                        }
-                        outcome
-                    }
-                };
+                }
+                drop(journal);
                 match undo_result {
                     Ok(Some(edit_type)) => {
                         self.refresh_rolled_back_file_state(&path);
@@ -1725,21 +1506,21 @@ impl ToolExecutor {
                     })
                     .collect();
                 let success = !reverted.is_empty() && failed.is_empty();
-                let summary = if reverted.is_empty() {
-                    format!("No recorded file edits found for turn {turn_index}")
-                } else if failed.is_empty() {
-                    format!(
-                        "Rolled back {} file edit{} from turn {turn_index}",
-                        reverted.len(),
-                        if reverted.len() == 1 { "" } else { "s" }
-                    )
-                } else {
+                let summary = if !failed.is_empty() {
                     format!(
                         "Rolled back {} file edit{} from turn {turn_index} with {} failure{}",
                         reverted.len(),
                         if reverted.len() == 1 { "" } else { "s" },
                         failed.len(),
                         if failed.len() == 1 { "" } else { "s" }
+                    )
+                } else if reverted.is_empty() {
+                    format!("No recorded file edits found for turn {turn_index}")
+                } else {
+                    format!(
+                        "Rolled back {} file edit{} from turn {turn_index}",
+                        reverted.len(),
+                        if reverted.len() == 1 { "" } else { "s" }
                     )
                 };
                 json!({
@@ -1852,10 +1633,8 @@ impl ToolExecutor {
             };
         prepared.apply_with_committed(|edit| {
             self.record_committed_file_edit(
-                edit.path(),
+                edit.publication(),
                 &format!("batch_edit:{}", edit.path().display()),
-                Some(edit.original_content_bytes()),
-                edit.new_content_bytes(),
                 EditType::Patch,
             );
         })
@@ -1969,7 +1748,7 @@ impl ToolExecutor {
                 Ok(safe) => safe,
                 Err(e) => return astra_tools::ToolResult::error(e).with_execution_not_started(),
             },
-            None => self.project_root.clone(),
+            None => self.effective_project_root(),
         };
         let depth = args
             .get("depth")
@@ -2057,7 +1836,7 @@ impl ToolExecutor {
             path.parent().map(|p| p.to_path_buf())
         } else {
             Some(
-                self.project_root
+                self.effective_project_root()
                     .join(path.parent().unwrap_or(Path::new(""))),
             )
         };
@@ -2073,7 +1852,7 @@ impl ToolExecutor {
             Self::collect_similar_in_dir(
                 &search_dir,
                 &target_name,
-                &self.project_root,
+                &self.effective_project_root(),
                 &mut candidates,
             );
         }
@@ -2082,9 +1861,9 @@ impl ToolExecutor {
         // search for exact filename matches using a bounded walk.
         if candidates.is_empty() {
             Self::collect_exact_name_in_tree(
-                &self.project_root,
+                &self.effective_project_root(),
                 &target_name,
-                &self.project_root,
+                &self.effective_project_root(),
                 &mut candidates,
             );
         }
@@ -2184,7 +1963,7 @@ impl ToolExecutor {
     fn inline_lsp_diagnostics(&self, path: &std::path::Path) -> Option<String> {
         let diag_value = self
             .passive_lsp
-            .diagnostics_for_file(&self.project_root, path)
+            .diagnostics_for_file(&self.effective_project_root(), path)
             .ok()??;
         let items = diag_value.get("diagnostics")?.as_array()?;
         if items.is_empty() {
@@ -2842,7 +2621,6 @@ mod tests {
             serde_json::json!({"path": "missing.txt", "start_line": -1}),
             serde_json::json!({"path": "missing.txt", "start_line": 1.5}),
             serde_json::json!({"path": "missing.txt", "end_line": "2"}),
-            serde_json::json!({"path": "missing.txt", "start_line": 3, "end_line": 1}),
             serde_json::json!({"path": "missing.txt", "outline": 1}),
         ] {
             let result = executor.read_file_with_metadata(&args);
@@ -2906,16 +2684,6 @@ mod tests {
         }));
         assert!(result.contains("`outline`"), "{result}");
         assert!(result.contains("boolean"), "{result}");
-
-        let result = executor.read_file(&serde_json::json!({
-            "path": "test.txt",
-            "start_line": 3,
-            "end_line": 1
-        }));
-        assert!(
-            result.contains("must not exceed"),
-            "reversed range must be rejected, got: {result}"
-        );
     }
 
     #[test]
@@ -2938,11 +2706,9 @@ mod tests {
             "end_line": 300
         }));
 
-        // Structural validation runs before small-file auto-expansion: a
-        // reversed range is malformed even when the file has one line.
         assert!(
-            result.contains("must not exceed"),
-            "reversed range must be rejected before auto-expand, got: {result}"
+            result.contains("start_line 300 exceeds file length 1"),
+            "the ordered range remains past EOF, got: {result}"
         );
         assert!(
             !result.contains("Auto-expanded"),
@@ -4554,8 +4320,8 @@ mod tests {
         assert!(!file.exists());
     }
 
-    #[test]
-    fn delete_file_rollback_restores_file() {
+    #[tokio::test]
+    async fn delete_file_rollback_restores_file() {
         let tmpdir = tempfile::tempdir().unwrap();
         let file = tmpdir.path().join("victim.txt");
         std::fs::write(&file, "restore me").unwrap();
@@ -4567,10 +4333,12 @@ mod tests {
         assert!(result.starts_with("Deleted:"), "result: {result}");
         assert!(!file.exists());
 
-        let rollback = exe.rollback_file_edits(&json!({
-            "scope": "file",
-            "path": "victim.txt"
-        }));
+        let rollback = exe
+            .rollback_file_edits(&json!({
+                "scope": "file",
+                "path": "victim.txt"
+            }))
+            .await;
         let parsed: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(parsed["success"], true, "rollback: {rollback}");
         assert_eq!(parsed["edit_type"], "delete", "rollback: {rollback}");

@@ -74,6 +74,12 @@ pub struct FileEditEntry {
     pub sequence: u64,
     /// Absolute path of the edited file.
     pub path: PathBuf,
+    /// Workspace selected when the edit was made, including edits to an
+    /// authorized directory outside that workspace.
+    pub workspace_root: Option<PathBuf>,
+    /// The original directory identity anchors later rollback operations.
+    #[cfg(unix)]
+    pub parent_binding: Option<astra_tools::fs_ops::FileParentBinding>,
     /// Agentic loop turn index when the edit occurred.
     pub turn_index: u32,
     /// Wall-clock timestamp.
@@ -86,6 +92,19 @@ pub struct FileEditEntry {
     pub tool_call_id: String,
     /// What kind of edit this was.
     pub edit_type: EditType,
+}
+
+impl FileEditEntry {
+    pub fn belongs_to_workspace(&self, root: &Path) -> bool {
+        self.workspace_root.as_ref().is_some_and(|origin| {
+            origin == root
+                || origin
+                    .canonicalize()
+                    .ok()
+                    .zip(root.canonicalize().ok())
+                    .is_some_and(|(origin, root)| origin == root)
+        })
+    }
 }
 
 /// Result of an undo operation.
@@ -183,16 +202,93 @@ impl FileEditJournal {
         after_content: &[u8],
         edit_type: EditType,
     ) {
-        self.push(FileEditEntry {
+        let entry = Self::committed_entry(
+            path,
+            tool_call_id,
+            turn_index,
+            before_content,
+            after_content,
+            edit_type,
+        );
+        self.push_committed_entry(entry);
+    }
+
+    /// Record a mutation together with the workspace that owns the turn.
+    pub fn record_committed_in_workspace(
+        &mut self,
+        workspace_root: &Path,
+        path: &Path,
+        tool_call_id: &str,
+        turn_index: u32,
+        contents: (Option<&[u8]>, &[u8]),
+        edit_type: EditType,
+    ) {
+        let mut entry = Self::committed_entry(
+            path,
+            tool_call_id,
+            turn_index,
+            contents.0,
+            contents.1,
+            edit_type,
+        );
+        entry.workspace_root = Some(workspace_root.to_owned());
+        self.push_committed_entry(entry);
+    }
+
+    fn push_committed_entry(&mut self, entry: FileEditEntry) {
+        #[cfg(unix)]
+        let entry = {
+            let mut entry = entry;
+            entry.parent_binding = astra_tools::fs_ops::capture_file_parent(&entry.path).ok();
+            entry
+        };
+        self.push(entry);
+    }
+
+    /// Record the parent bound by the publishing owner before mutation.
+    #[cfg(unix)]
+    pub fn record_published_write(
+        &mut self,
+        prepared: &astra_tools::fs_ops::PreparedWriteFile,
+        tool_call_id: &str,
+        turn_index: u32,
+        edit_type: EditType,
+        workspace_root: &Path,
+    ) {
+        let mut entry = Self::committed_entry(
+            prepared.path(),
+            tool_call_id,
+            turn_index,
+            prepared.original_content_bytes(),
+            prepared.content_bytes(),
+            edit_type,
+        );
+        entry.workspace_root = Some(workspace_root.to_owned());
+        entry.parent_binding = prepared.parent_binding().cloned();
+        self.push(entry);
+    }
+
+    fn committed_entry(
+        path: &Path,
+        tool_call_id: &str,
+        turn_index: u32,
+        before_content: Option<&[u8]>,
+        after_content: &[u8],
+        edit_type: EditType,
+    ) -> FileEditEntry {
+        FileEditEntry {
             sequence: 0,
             path: path.to_owned(),
+            workspace_root: None,
+            #[cfg(unix)]
+            parent_binding: None,
             turn_index,
             timestamp: SystemTime::now(),
             before_content: before_content.map(ToOwned::to_owned),
             after_content: after_content.to_vec(),
             tool_call_id: tool_call_id.to_string(),
             edit_type,
-        });
+        }
     }
 
     /// Record a successful file deletion with the deleted file's prior content.
@@ -211,6 +307,29 @@ impl FileEditJournal {
             &[],
             EditType::Delete,
         );
+    }
+
+    #[cfg(unix)]
+    pub fn record_delete_in_parent(
+        &mut self,
+        path: &Path,
+        tool_call_id: &str,
+        turn_index: u32,
+        before_content: &[u8],
+        parent_binding: Option<astra_tools::fs_ops::FileParentBinding>,
+        workspace_root: &Path,
+    ) {
+        let mut entry = Self::committed_entry(
+            path,
+            tool_call_id,
+            turn_index,
+            Some(before_content),
+            &[],
+            EditType::Delete,
+        );
+        entry.workspace_root = Some(workspace_root.to_owned());
+        entry.parent_binding = parent_binding;
+        self.push(entry);
     }
 
     /// Revert the most recent edit to a specific file.
@@ -584,6 +703,13 @@ impl FileEditJournal {
         self.entries.iter()
     }
 
+    pub fn paths_for_turn_since(&self, turn: u32, checkpoint: u64) -> impl Iterator<Item = &Path> {
+        self.entries
+            .iter()
+            .filter(move |entry| entry.turn_index == turn && entry.sequence >= checkpoint)
+            .map(|entry| entry.path.as_path())
+    }
+
     /// Test-only convenience: collect all entries into a Vec for
     /// assertion helpers. Prefer [`Self::entries`] in production code.
     #[cfg(test)]
@@ -654,33 +780,99 @@ impl FileEditJournal {
     }
 
     fn apply_revert(entry: &FileEditEntry) -> io::Result<()> {
-        match &entry.before_content {
-            Some(content) => {
-                // Restore original content
-                std::fs::write(&entry.path, content)?;
-            }
-            None => {
-                // File was created by the agent — remove it
-                if entry.path.exists() {
-                    std::fs::remove_file(&entry.path)?;
+        let expected = match entry.edit_type {
+            EditType::Delete => None,
+            _ => Some(entry.after_content.as_slice()),
+        };
+        #[cfg(unix)]
+        {
+            let parent = entry.parent_binding.as_ref().ok_or_else(|| {
+                io::Error::other("the original file directory could not be verified")
+            })?;
+            astra_tools::fs_ops::restore_file_in_bound_parent(
+                parent,
+                &entry.path,
+                expected,
+                entry.before_content.as_deref(),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            Self::require_current_content(&entry.path, expected)?;
+            match &entry.before_content {
+                Some(content) => {
+                    Self::write_if_unchanged(&entry.path, content, expected)?;
+                }
+                None => {
+                    // File was created by the agent — remove it
+                    if entry.path.exists() {
+                        std::fs::remove_file(&entry.path)?;
+                    }
                 }
             }
+            Ok(())
         }
-        Ok(())
     }
 
     fn apply_forward(entry: &FileEditEntry) -> io::Result<()> {
-        match entry.edit_type {
-            EditType::Delete => {
-                if entry.path.exists() {
-                    std::fs::remove_file(&entry.path)?;
+        #[cfg(unix)]
+        {
+            let parent = entry.parent_binding.as_ref().ok_or_else(|| {
+                io::Error::other("the original file directory could not be verified")
+            })?;
+            let replacement = match entry.edit_type {
+                EditType::Delete => None,
+                _ => Some(entry.after_content.as_slice()),
+            };
+            astra_tools::fs_ops::restore_file_in_bound_parent(
+                parent,
+                &entry.path,
+                entry.before_content.as_deref(),
+                replacement,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            Self::require_current_content(&entry.path, entry.before_content.as_deref())?;
+            match entry.edit_type {
+                EditType::Delete => {
+                    if entry.path.exists() {
+                        std::fs::remove_file(&entry.path)?;
+                    }
+                }
+                _ => {
+                    Self::write_if_unchanged(
+                        &entry.path,
+                        &entry.after_content,
+                        entry.before_content.as_deref(),
+                    )?;
                 }
             }
-            _ => {
-                std::fs::write(&entry.path, &entry.after_content)?;
-            }
+            Ok(())
         }
-        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn require_current_content(path: &Path, expected: Option<&[u8]>) -> io::Result<()> {
+        let current = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => Some(std::fs::read(path)?),
+            Ok(_) => return Err(io::Error::other("file changed since the recorded edit")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if current.as_deref() == expected {
+            Ok(())
+        } else {
+            Err(io::Error::other("file changed since the recorded edit"))
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn write_if_unchanged(path: &Path, content: &[u8], expected: Option<&[u8]>) -> io::Result<()> {
+        use sha2::{Digest, Sha256};
+        let expected_hash = expected.map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+        astra_tools::fs_ops::write_file_atomic(path, content, expected_hash.as_deref())
+            .map_err(io::Error::other)
     }
 
     fn apply_entries_transactionally(
@@ -837,6 +1029,48 @@ mod tests {
         assert_eq!(std::fs::read(&created).unwrap(), b"brand-new");
     }
 
+    #[test]
+    fn undo_preserves_later_changes_to_a_recorded_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("edited.txt");
+        let mut journal = FileEditJournal::new(10);
+        std::fs::write(&path, b"agent edit").unwrap();
+        journal.record_committed(
+            &path,
+            "edit",
+            1,
+            Some(b"original"),
+            b"agent edit",
+            EditType::Overwrite,
+        );
+        std::fs::write(&path, b"later user work").unwrap();
+        let error = journal.undo_turn_transactional(1).unwrap_err();
+        assert!(error.contains("changed since the recorded edit"), "{error}");
+        assert_eq!(std::fs::read(path).unwrap(), b"later user work");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_preserves_a_file_linked_elsewhere_after_the_edit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("edited.txt");
+        let alias = dir.path().join("linked.txt");
+        std::fs::write(&path, b"agent edit").unwrap();
+        let mut journal = FileEditJournal::new(10);
+        journal.record_committed(
+            &path,
+            "edit",
+            1,
+            Some(b"original"),
+            b"agent edit",
+            EditType::Overwrite,
+        );
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(journal.undo_turn_transactional(1).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"agent edit");
+        assert_eq!(std::fs::read(alias).unwrap(), b"agent edit");
+    }
+
     /// When combined length exceeds max_entries, oldest entries are evicted
     /// (ring-buffer semantics preserved across merges).
     #[test]
@@ -927,6 +1161,9 @@ mod tests {
         let original = FileEditEntry {
             sequence: 42,
             path: PathBuf::from("/tmp/a.txt"),
+            workspace_root: Some(PathBuf::from("/tmp/workspace")),
+            #[cfg(unix)]
+            parent_binding: None,
             turn_index: 7,
             timestamp: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
             before_content: Some(vec![0x00, 0x01, 0xff, b'h', b'i']),
@@ -940,6 +1177,7 @@ mod tests {
 
         assert_eq!(back.sequence, original.sequence);
         assert_eq!(back.path, original.path);
+        assert_eq!(back.workspace_root, original.workspace_root);
         assert_eq!(back.turn_index, original.turn_index);
         assert_eq!(back.timestamp, original.timestamp);
         assert_eq!(back.before_content, original.before_content);
@@ -954,6 +1192,9 @@ mod tests {
         let original = FileEditEntry {
             sequence: 1,
             path: PathBuf::from("/tmp/new.txt"),
+            workspace_root: None,
+            #[cfg(unix)]
+            parent_binding: None,
             turn_index: 0,
             timestamp: SystemTime::now(),
             before_content: None,
@@ -1109,6 +1350,9 @@ mod tests {
             let entry = FileEditEntry {
                 sequence: i,
                 path: PathBuf::from(format!("/tmp/{i}.txt")),
+                workspace_root: None,
+                #[cfg(unix)]
+                parent_binding: None,
                 turn_index: 0,
                 timestamp: SystemTime::UNIX_EPOCH,
                 before_content: None,
@@ -1225,6 +1469,9 @@ mod tests {
             journal.push(FileEditEntry {
                 sequence: 0,
                 path,
+                workspace_root: None,
+                #[cfg(unix)]
+                parent_binding: None,
                 turn_index: i,
                 timestamp: SystemTime::now(),
                 before_content: None,
@@ -1245,6 +1492,9 @@ mod tests {
             j.push(FileEditEntry {
                 sequence: 0,
                 path: PathBuf::from(path),
+                workspace_root: None,
+                #[cfg(unix)]
+                parent_binding: None,
                 turn_index: turn,
                 timestamp: SystemTime::now(),
                 before_content: None,
@@ -1278,6 +1528,84 @@ mod tests {
         );
 
         assert_eq!(journal.entries.back().unwrap().edit_type, EditType::Patch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_refuses_a_retargeted_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = workspace.path().join("sub");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("file.txt");
+        std::fs::write(&path, b"agent edit").unwrap();
+        let mut journal = FileEditJournal::new(10);
+        journal.record_committed(
+            &path,
+            "edit",
+            0,
+            Some(b"before"),
+            b"agent edit",
+            EditType::Overwrite,
+        );
+
+        let saved_parent = workspace.path().join("saved");
+        std::fs::rename(&parent, &saved_parent).unwrap();
+        std::fs::write(outside.path().join("file.txt"), b"agent edit").unwrap();
+        symlink(outside.path(), &parent).unwrap();
+
+        let result = journal.undo_turn(0);
+        assert!(result.reverted.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(
+            std::fs::read(outside.path().join("file.txt")).unwrap(),
+            b"agent edit"
+        );
+        assert_eq!(
+            std::fs::read(saved_parent.join("file.txt")).unwrap(),
+            b"agent edit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_edit_keeps_its_parent_when_path_changes_before_recording() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = workspace.path().join("sub");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("file");
+        std::fs::write(&path, b"before").unwrap();
+        let prepared = astra_tools::fs_ops::PreparedWriteFile::from_authorized_preimage(
+            path,
+            "file",
+            "agent edit",
+            Some(b"before".to_vec()),
+        );
+        let result = prepared.apply();
+        assert!(!result.is_error, "{result:?}");
+        let saved_parent = workspace.path().join("saved");
+        std::fs::rename(&parent, &saved_parent).unwrap();
+        std::fs::write(outside.path().join("file"), b"agent edit").unwrap();
+        symlink(outside.path(), &parent).unwrap();
+
+        let mut journal = FileEditJournal::new(10);
+        journal.record_published_write(&prepared, "edit", 0, EditType::Overwrite, workspace.path());
+        let result = journal.undo_turn(0);
+        assert!(result.reverted.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(
+            std::fs::read(outside.path().join("file")).unwrap(),
+            b"agent edit"
+        );
+        assert_eq!(
+            std::fs::read(saved_parent.join("file")).unwrap(),
+            b"agent edit"
+        );
     }
 
     #[test]

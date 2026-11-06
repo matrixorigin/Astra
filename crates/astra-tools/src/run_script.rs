@@ -119,6 +119,55 @@ pub const STDERR_CAP_BYTES: usize = 10_000;
 /// invocation is treated as unsettled and the workspace observer remains
 /// quarantined.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const RPC_SETTLEMENT_GRACE: Duration = Duration::from_secs(1);
+
+// The outer script lease also covers authenticated callbacks. If the caller
+// drops a callback before its worker settles, fence the workspace rather than
+// attributing a late write to a later invocation.
+struct PendingScriptRpc<'a> {
+    workspace: &'a Path,
+    cancel: CancellationToken,
+    settled: bool,
+}
+
+impl Drop for PendingScriptRpc<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.cancel.cancel();
+            let _ =
+                crate::workspace_observation::mark_workspace_observation_unsettled(self.workspace);
+        }
+    }
+}
+
+// The process owner must settle before its caller releases the workspace
+// lease, including when the entire future is dropped between RPCs.
+struct ScriptScope<'a> {
+    cgroup: astra_sandbox::CgroupGuard,
+    leader_pid: Option<u32>,
+    workspace: &'a Path,
+    settled: bool,
+}
+
+impl ScriptScope<'_> {
+    fn settle(&mut self) -> bool {
+        let settled = self.cgroup.terminate_all_for(self.leader_pid);
+        self.settled = true;
+        if !settled {
+            let _ =
+                crate::workspace_observation::mark_workspace_observation_unsettled(self.workspace);
+        }
+        settled
+    }
+}
+
+impl Drop for ScriptScope<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle();
+        }
+    }
+}
 
 // Note: we don't need a secret-substring env filter because we `env_clear()`
 // the child and only set a fixed, hand-curated allowlist (see
@@ -186,10 +235,15 @@ impl Default for RunScriptConfig {
 }
 
 impl RunScriptConfig {
-    /// Build an `RpcPolicy` that mirrors this config's policy-relevant fields.
-    fn rpc_policy(&self) -> RpcPolicy {
+    /// Build the RPC policy within the canonical script tool surface.
+    pub(crate) fn rpc_policy(&self) -> RpcPolicy {
         RpcPolicy {
-            allowed_tools: self.allowed_tools.clone(),
+            allowed_tools: self
+                .allowed_tools
+                .iter()
+                .filter(|tool| RPC_ALLOWED_TOOLS.contains(&tool.as_str()))
+                .cloned()
+                .collect(),
             max_tool_calls: self.max_tool_calls,
             max_response_bytes: self.max_response_bytes,
         }
@@ -851,7 +905,8 @@ async fn run_script(
     tool_executor: &dyn ToolExecutor,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<String, RunScriptError> {
-    let workspace_root = tool_executor.workspace_root().to_path_buf();
+    let workspace_root = tool_executor.workspace_root();
+    let policy = config.rpc_policy();
     let tmp_dir = tempfile::tempdir().map_err(|e| io_context("run_script tmpdir", e))?;
     let tmp_path = tmp_dir.path().to_path_buf();
 
@@ -872,7 +927,7 @@ async fn run_script(
 
     let auth_token = AuthToken::generate();
 
-    std::fs::write(&stub_path, generate_python_stub(&config.allowed_tools))
+    std::fs::write(&stub_path, generate_python_stub(&policy.allowed_tools))
         .map_err(|e| io_context("run_script write astra_tools.py", e))?;
     std::fs::write(&script_path, script)
         .map_err(|e| io_context("run_script write script.py", e))?;
@@ -938,21 +993,27 @@ async fn run_script(
     // creation is unavailable, and descendants must be terminated before the
     // workspace writer epoch is released.
     let leader_pid = child.id();
+    let mut scope = ScriptScope {
+        cgroup: cgroup_guard,
+        leader_pid,
+        workspace: &workspace_root,
+        settled: false,
+    };
 
     // Post-spawn: join child to cgroup by writing its real PID.
     if let Some(pid) = child.id()
-        && let Err(e) = cgroup_guard.join_child(pid)
+        && let Err(e) = scope.cgroup.join_child(pid)
     {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+        scope.settle();
         return Err(io_context("cgroup join_child", e).into());
     }
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         kill_process_group(&child);
         let _ = child.kill().await;
         let _ = child.wait().await;
-        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+        scope.settle();
         return Err(RunScriptError::Cancelled);
     }
 
@@ -964,73 +1025,81 @@ async fn run_script(
     let stderr = child.stderr.take().expect("stderr piped");
     let mut stderr_handle = tokio::spawn(async move { collect_stderr_with_notice(stderr).await });
 
-    let policy = config.rpc_policy();
-    let timeout_result = tokio::time::timeout(config.timeout, async {
-        loop {
-            tokio::select! {
-                _ = async {
-                    if let Some(token) = cancel_token {
-                        token.cancelled().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "run_script cancelled",
-                    ));
-                }
-                accept = listener.accept() => {
-                    match accept {
-                        Ok((stream, _)) => {
-                            let outcome = handle_rpc_connection(
-                                stream,
-                                tool_executor,
-                                &call_count,
-                                &policy,
-                                &auth_token,
-                                cancel_token,
-                            )
-                            .await;
-                            if matches!(outcome, RpcOutcome::ExceededCallLimit) {
-                                kill_process_group(&child);
-                                let _ = child.kill().await;
-                                let result = child.wait().await;
-                                let scope_settled = settle_run_script_scope(
-                                    &cgroup_guard,
-                                    leader_pid,
-                                    &workspace_root,
-                                );
-                                return if scope_settled {
-                                    result
-                                } else {
-                                    Err(std::io::Error::other(
-                                        "run_script process ownership did not settle",
-                                    ))
-                                };
+    let deadline = tokio::time::sleep(config.timeout);
+    tokio::pin!(deadline);
+    let timeout_result = loop {
+        tokio::select! {
+            _ = &mut deadline => break Err(()),
+            _ = async {
+                if let Some(token) = cancel_token { token.cancelled().await; }
+                else { std::future::pending::<()>().await; }
+            } => break Ok(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted, "run_script cancelled",
+            ))),
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _)) => {
+                        let rpc_cancel = cancel_token.map(CancellationToken::child_token)
+                            .unwrap_or_default();
+                        let mut pending = PendingScriptRpc {
+                            workspace: &workspace_root,
+                            cancel: rpc_cancel.clone(),
+                            settled: false,
+                        };
+                        let callback = handle_rpc_connection(
+                            stream, tool_executor, &call_count, &policy, &auth_token,
+                            Some(&rpc_cancel),
+                        );
+                        tokio::pin!(callback);
+                        // A deadline cancels the nested operation first. Wait briefly
+                        // for its existing owner to settle before releasing the
+                        // script lease; an unresolved callback keeps the fence.
+                        let callback_result = tokio::select! {
+                            outcome = &mut callback => Ok(outcome),
+                            _ = &mut deadline => Err(true),
+                            _ = async {
+                                if let Some(token) = cancel_token { token.cancelled().await; }
+                                else { std::future::pending::<()>().await; }
+                            } => Err(false),
+                        };
+                        let outcome = match callback_result {
+                            Ok(outcome) => { pending.settled = true; outcome }
+                            Err(timed_out) => {
+                                rpc_cancel.cancel();
+                                pending.settled = tokio::time::timeout(
+                                    RPC_SETTLEMENT_GRACE, &mut callback,
+                                ).await.is_ok();
+                                if timed_out { break Err(()); }
+                                break Ok(Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted, "run_script cancelled",
+                                )));
                             }
-                            if matches!(outcome, RpcOutcome::Cancelled) {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Interrupted,
-                                    "run_script RPC cancelled",
-                                ));
-                            }
-                            // IoError and Ok both just loop.
+                        };
+                        if matches!(outcome, RpcOutcome::ExceededCallLimit) {
+                            kill_process_group(&child);
+                            let _ = child.kill().await;
+                            let result = child.wait().await;
+                            let scope_settled = scope.settle();
+                            break Ok(if scope_settled { result } else {
+                                Err(std::io::Error::other("run_script process ownership did not settle"))
+                            });
                         }
-                        Err(_) => return child.wait().await,
+                        if matches!(outcome, RpcOutcome::Cancelled) {
+                            break Ok(Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted, "run_script RPC cancelled",
+                            )));
+                        }
                     }
-                }
-                wait_result = child.wait() => {
-                    return wait_result;
+                    Err(_) => break Ok(child.wait().await),
                 }
             }
+            wait_result = child.wait() => break Ok(wait_result),
         }
-    })
-    .await;
+    };
 
     match timeout_result {
         Ok(Ok(status)) => {
-            let scope_settled = settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            let scope_settled = scope.settle();
             // Await both IO tasks concurrently, but never let an inherited
             // pipe from an escaped descendant hold the writer epoch forever.
             let (stdout_content, stderr_content) =
@@ -1058,14 +1127,14 @@ async fn run_script(
             if e.kind() == std::io::ErrorKind::Interrupted {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+                scope.settle();
                 let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
                 return Err(RunScriptError::Cancelled);
             }
             kill_process_group(&child);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            scope.settle();
             let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
             Err(RunScriptError::Io(e))
         }
@@ -1073,31 +1142,11 @@ async fn run_script(
             kill_process_group(&child);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            scope.settle();
             let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
             Err(RunScriptError::Timeout(config.timeout))
         }
     }
-}
-
-/// Finish an invocation-owned process scope before the workspace writer epoch
-/// can be released. A scope that cannot be proven empty quarantines future
-/// observations rather than allowing a late descendant write to look like a
-/// later Bash mutation.
-fn settle_run_script_scope(
-    cgroup_guard: &astra_sandbox::CgroupGuard,
-    leader_pid: Option<u32>,
-    workspace_root: &Path,
-) -> bool {
-    let settled = cgroup_guard.terminate_all_for(leader_pid);
-    if !settled {
-        let _ = crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
-        tracing::warn!(
-            workspace = %workspace_root.display(),
-            "run_script process ownership was not provably settled; workspace observation quarantined"
-        );
-    }
-    settled
 }
 
 /// Join stdout/stderr collectors under a hard bound. Borrowing the handles
@@ -3180,4 +3229,41 @@ print(f"allocated {len(data)} bytes — cgroup did not enforce limit")
             }
         }
     }
+}
+#[tokio::test]
+async fn dropped_rpc_cancels_work_and_fences_the_workspace_until_recovery() {
+    let workspace = tempfile::tempdir().unwrap();
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let worker = tokio::spawn(async move {
+        worker_cancellation.cancelled().await;
+    });
+    let pending = PendingScriptRpc {
+        workspace: workspace.path(),
+        cancel: cancellation,
+        settled: false,
+    };
+    drop(pending);
+    worker.await.unwrap();
+    assert!(matches!(
+        crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_millis(100),
+        )
+        .await,
+        Err(crate::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
+    ));
+    crate::workspace_observation::confirm_workspace_stopped(workspace.path())
+        .await
+        .unwrap();
+    assert!(
+        crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
+            workspace.path(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_ok()
+    );
 }

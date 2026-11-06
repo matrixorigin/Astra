@@ -103,6 +103,7 @@ impl ContextPipeline {
         let compatibility_limits = OptimizeLimits::all_closed();
         let full_input = PipelineRunInput {
             sources: input.sources,
+            planning_messages: input.planning_messages,
             tokens: input.tokens,
             model_limit: input.model_limit,
             recovery: input.recovery,
@@ -170,7 +171,9 @@ impl ContextPipeline {
         // direct callers with a more accurate tokenizer.
         let measured_input_tokens = estimate_bound_input_tokens(
             &preliminary_sections,
-            &input.sources.turn.messages,
+            input
+                .planning_messages
+                .unwrap_or(&input.sources.turn.messages),
             &input.sources.agent.tool_schemas,
         )
         .max(input.tokens.total_input_u32_saturating());
@@ -324,6 +327,7 @@ fn estimate_json_values_tokens(values: &[serde_json::Value]) -> u32 {
 
 pub struct PipelineRunInput<'a> {
     pub sources: &'a ContextSources<'a>,
+    pub planning_messages: Option<&'a [serde_json::Value]>,
     pub tokens: &'a TokenAccounting,
     pub model_limit: u32,
     pub recovery: &'a RecoveryState,
@@ -335,6 +339,7 @@ pub struct PipelineRunInput<'a> {
 
 pub struct AdaptivePipelineRunInput<'a> {
     pub sources: &'a ContextSources<'a>,
+    pub planning_messages: Option<&'a [serde_json::Value]>,
     pub tokens: &'a TokenAccounting,
     pub model_limit: u32,
     pub recovery: &'a RecoveryState,

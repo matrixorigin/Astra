@@ -739,6 +739,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_script_tools_cannot_expand_the_canonical_allowlist() {
+        let mut config = crate::run_script::RunScriptConfig::default();
+        config.allowed_tools.insert("rollback_file_edits".into());
+        let token = AuthToken::from_str_for_test("tok");
+        let exec = MockExecutor::new();
+        let counter = AtomicUsize::new(0);
+        let request = r#"{"tool":"rollback_file_edits","args":{},"auth_token":"tok"}"#;
+        let (response, _) =
+            rpc_roundtrip(request, &config.rpc_policy(), &token, &exec, &counter).await;
+        assert!(response.contains("not allowed"), "{response}");
+        assert_eq!(exec.call_count(), 0);
+    }
+
+    #[tokio::test]
     async fn authenticated_nested_writers_reuse_parent_without_minting_receipts() {
         struct CapturingExecutor {
             inner: crate::executor::DefaultToolExecutor,
@@ -823,6 +837,40 @@ mod tests {
             "only the parent may sign after its complete generation settles: {metadata:?}"
         );
         drop(parent_writer);
+    }
+
+    #[tokio::test]
+    async fn nested_source_receipt_is_rejected_before_command_runs() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("input.txt"), "original").unwrap();
+        let _parent = crate::workspace_observation::begin_workspace_writer_with_options(
+            workspace.path(),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let executor =
+            crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(workspace.path()));
+        let policy = RpcPolicy {
+            allowed_tools: ["bash".to_string()].into_iter().collect(),
+            max_tool_calls: 1,
+            max_response_bytes: 16 * 1024,
+        };
+        let token = AuthToken::from_str_for_test("tok");
+        let counter = AtomicUsize::new(0);
+        let request = r#"{"tool":"bash","args":{"command":"printf changed > input.txt","source_artifacts":["input.txt"]},"auth_token":"tok"}"#;
+        let (response, outcome) =
+            rpc_roundtrip(request, &policy, &token, &executor, &counter).await;
+        assert!(matches!(outcome, RpcOutcome::Ok));
+        assert!(
+            response.contains("separate foreground command"),
+            "{response}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("input.txt")).unwrap(),
+            "original"
+        );
     }
 
     #[tokio::test]

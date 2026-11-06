@@ -323,6 +323,8 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub context_window: Option<u32>,
     pub max_completion_tokens: Option<u32>,
     pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    pub responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
+    pub planning_messages: Option<&'a [Value]>,
     pub user_content: &'a str,
     pub query_source: &'a str,
 }
@@ -1020,6 +1022,15 @@ pub(crate) fn assemble_context_pipeline(
             input.runtime_signals.edge_profile,
         );
     let mut turn_state = build_turn_state(state, input.user_content);
+    if input.responses_reasoning_history
+        == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
+    {
+        // This is the disposable context view. Preserve canonical messages
+        // and their hashes while excluding reasoning the route will not send.
+        crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
+            &mut turn_state.messages,
+        );
+    }
     let rehomed_append_only_authority = if matches!(
         cache_cap.volatile_placement,
         VolatilePlacement::AppendOnlyUserTail
@@ -1082,6 +1093,7 @@ pub(crate) fn assemble_context_pipeline(
     };
 
     let adaptive = AdaptiveTurnInput {
+        planning_messages: input.planning_messages,
         statics: &statics,
         agent: &agent,
         session: &session_ctx,
@@ -2130,6 +2142,7 @@ mod context_cache_contract_tests {
         cache_cfg: &'a PromptCacheConfig,
     ) -> LlmContextAssemblyInput<'a> {
         LlmContextAssemblyInput {
+            planning_messages: None,
             state,
             session_id: "sid-context-contract",
             tool_surface,
@@ -2140,6 +2153,7 @@ mod context_cache_contract_tests {
             context_window: Some(200_000),
             max_completion_tokens: None,
             cache_capability: None,
+            responses_reasoning_history: None,
             user_content: "continue the task",
             query_source: "test",
         }
@@ -3038,6 +3052,7 @@ mod context_cache_contract_tests {
         };
 
         let output = assemble_context_pipeline(LlmContextAssemblyInput {
+            planning_messages: None,
             state: &mut state,
             session_id: "sid-deepseek",
             tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
@@ -3048,6 +3063,7 @@ mod context_cache_contract_tests {
             context_window: Some(1_000_000),
             max_completion_tokens: Some(64_000),
             cache_capability: Some(strict_history),
+            responses_reasoning_history: None,
             user_content: "which model are you?",
             query_source: "test",
         })
@@ -3213,6 +3229,7 @@ mod context_cache_contract_tests {
         };
 
         let err = match assemble_context_pipeline(LlmContextAssemblyInput {
+            planning_messages: None,
             state: &mut state,
             session_id: "sid-missing-pipeline",
             tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
@@ -3223,6 +3240,7 @@ mod context_cache_contract_tests {
             context_window: Some(200_000),
             max_completion_tokens: Some(16_384),
             cache_capability: None,
+            responses_reasoning_history: None,
             user_content: "hello",
             query_source: "test",
         }) {
@@ -3826,6 +3844,7 @@ mod context_cache_contract_tests {
             let restricted_tools = HashSet::new();
             let cache_cfg = PromptCacheConfig::latch("openai");
             let output = assemble_context_pipeline(LlmContextAssemblyInput {
+                planning_messages: None,
                 state: &mut state,
                 session_id: "sid-edge-frame",
                 tool_surface: ToolSurfacePlan::from_visible_tools(
@@ -3839,6 +3858,7 @@ mod context_cache_contract_tests {
                 context_window: Some(200_000),
                 max_completion_tokens: Some(16_384),
                 cache_capability: Some(cache_cap),
+                responses_reasoning_history: None,
                 user_content: "summarize it",
                 query_source: "test",
             })
