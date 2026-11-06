@@ -330,9 +330,19 @@ pub(super) fn inspect_line(line: &str, previous_paragraph: bool) -> Boundary {
     }
 }
 
+/// The opening run alone is provisional. The info string can turn a backtick
+/// fence into inline text; use the same CommonMark grammar for both decisions.
+pub(super) fn opens_fence(line: &str) -> bool {
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
+    matches!(
+        Parser::new(line).next(),
+        Some(Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))))
+    )
+}
+
 /// Every punctuation/digit/whitespace prefix is a candidate, rather than a
 /// second enumeration of Markdown markers. Only safe leading letters bypass
-/// complete-line classification; the actual decision remains CommonMark's.
+/// structural-prefix classification; the actual decision remains CommonMark's.
 pub(super) fn may_interrupt(text: &str) -> bool {
     text.chars()
         .take(4)

@@ -1055,7 +1055,11 @@ Container prefixes and reserved tags use resumable cursors, with completed
 prefix bytes checkpointed across chunks. One exact incremental grammar owns
 both complete and partial tag recognition; suffixed DSML names such as
 `invoke-example` are ordinary text. A fence consumes only its opening containers;
-blank lines may omit list indentation without ending that fence. Tabs retain
+blank lines may omit list indentation without ending that fence.
+CommonMark also validates its opening line and info string. A provisional
+backtick fence that becomes a closed inline span cannot retain later calls.
+Opening-line text still streams while this distinction is unresolved.
+Tabs retain
 physical columns and virtual padding; active inline spans ignore block indentation.
 Indented paragraph continuations retain their inline delimiter state; actual
 indented code blocks remain literal.
@@ -1065,6 +1069,10 @@ invocation owns its full subtree before name/argument validation, including
 malformed unnamed openers and nested wrappers from another syntax family;
 nested content cannot escape as another call. Only DSML invocations can be
 recovered independently inside a DSML calls wrapper.
+Invocation and parameter attributes come only from their own lexical opening
+tags; descendants and quoted values of other attributes cannot supply a name.
+Both invocation families use the shared bounded argument decoder, retaining
+invalid named bodies for existing pre-execution feedback.
 Complete-input scans use a cursor and compact once per batch; long indentation,
 delimiter runs, closing-fence whitespace, and unfinished tags do not rescan their
 accumulated prefix on each delta. Candidate decoding walks the ordered tokens

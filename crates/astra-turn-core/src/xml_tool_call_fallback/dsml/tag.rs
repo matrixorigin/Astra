@@ -25,6 +25,59 @@ pub(super) struct Scanner {
     family: Family,
     name: String,
     quote: Option<char>,
+    attributes_start: Option<usize>,
+}
+
+/// Only attributes lexically present on this opening tag can supply call facts.
+/// Values inside another attribute or descendant content are never searched.
+#[derive(Debug, Default)]
+pub(super) struct Attributes {
+    pub name: Option<String>,
+    pub string: Option<String>,
+}
+
+impl Attributes {
+    fn parse(mut text: &str) -> Option<Self> {
+        text = text.trim().strip_suffix('/').unwrap_or(text.trim()).trim();
+        let mut attributes = Self::default();
+        while !text.is_empty() {
+            let end = text
+                .bytes()
+                .take_while(|ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'-' | b':' | b'.')
+                })
+                .count();
+            if end == 0 {
+                return None;
+            }
+            let key = &text[..end];
+            text = text[end..].trim_start().strip_prefix('=')?.trim_start();
+            let quote = text.chars().next()?;
+            if !matches!(quote, '\'' | '"') {
+                return None;
+            }
+            text = &text[1..];
+            let end = text.find(quote)?;
+            let value = &text[..end];
+            let field = match key {
+                "name" => Some(&mut attributes.name),
+                "string" => Some(&mut attributes.string),
+                _ => None,
+            };
+            if let Some(field) = field {
+                if field.is_some() {
+                    return None;
+                }
+                *field = Some(value.to_owned());
+            }
+            text = &text[end + 1..];
+            if text.chars().next().is_some_and(|ch| !ch.is_whitespace()) {
+                return None;
+            }
+            text = text.trim_start();
+        }
+        Some(attributes)
+    }
 }
 
 pub(super) enum Scan {
@@ -45,6 +98,7 @@ pub(super) enum Scan {
         kind: Kind,
         family: Family,
         closing: bool,
+        attributes: Option<Attributes>,
     },
 }
 
@@ -65,6 +119,10 @@ impl Scanner {
                 kind,
                 family: self.family,
                 closing: self.closing,
+                attributes: self.attributes_start.map_or_else(
+                    || Some(Attributes::default()),
+                    |start| Attributes::parse(&text[start..end - 1]),
+                ),
             }
         } else if self.family == Family::Dsml {
             Scan::Ordinary
@@ -164,6 +222,7 @@ impl Scanner {
                     } else if ch == '>' {
                         return self.complete(end, text);
                     } else if ch.is_whitespace() || ch == '/' {
+                        self.attributes_start = Some(end - ch.len_utf8());
                         self.stage = Stage::Attributes;
                     } else {
                         return Scan::Ordinary;

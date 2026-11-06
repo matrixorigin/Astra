@@ -38,6 +38,7 @@ struct Tag {
     raw: String,
     literal: bool,
     literal_block: usize,
+    attributes: Option<tag::Attributes>,
 }
 
 enum Fragment {
@@ -71,6 +72,7 @@ struct Lexer {
     opaque: Option<Opaque>,
     delimiter_run: usize,
     fence_close_candidate: bool,
+    fence_opening: Option<String>,
     literal: Option<(char, usize, bool)>,
     line_has_text: bool,
     escaped: bool,
@@ -427,6 +429,7 @@ impl Lexer {
                         kind,
                         family,
                         closing,
+                        attributes,
                     } if self.html.active()
                         || !matches!(self.open.kind(), Some((_, Kind::Parameter)))
                         || (closing && self.open.kind() == Some((family, kind))) =>
@@ -461,6 +464,7 @@ impl Lexer {
                             raw,
                             literal,
                             literal_block,
+                            attributes,
                         }));
                         continue;
                     }
@@ -483,6 +487,22 @@ impl Lexer {
                     break;
                 }
                 self.delimiter_run = 0;
+                if first == '`'
+                    && let Some(opening) = &self.fence_opening
+                {
+                    // Both a possible fence and a code span are literal while
+                    // their opening line streams. Let CommonMark resolve the
+                    // info string when a later backtick can change its kind.
+                    let probe = format!("{opening}{}", &self.remaining()[..count]);
+                    if !markdown::opens_fence(&probe) {
+                        self.fence_opening = None;
+                        if let Some(literal) = &mut self.literal {
+                            literal.2 = false;
+                        }
+                        self.line_paragraph = markdown::inspect_line(&probe, false).paragraph;
+                        self.paragraph_open = self.line_paragraph;
+                    }
+                }
                 let fence_end = matches!(self.literal,Some((delimiter,length,true)) if first == delimiter && !self.line_has_text && count >= length);
                 match self.literal {
                     Some((delimiter, length, fence))
@@ -495,12 +515,16 @@ impl Lexer {
                             self.literal = None;
                         }
                     }
-                    None if first == '`' || (count >= 3 && !self.line_has_text) => {
-                        let fence = count >= 3 && !self.line_has_text;
-                        self.literal = Some((first, count, fence));
-                        if fence {
-                            self.fence_containers = self.line_containers.clone();
-                            self.paragraph_open = false;
+                    None => {
+                        let fence = !self.line_has_text
+                            && markdown::opens_fence(&self.remaining()[..count]);
+                        if first == '`' || fence {
+                            self.literal = Some((first, count, fence));
+                            if fence {
+                                self.fence_containers = self.line_containers.clone();
+                                self.fence_opening = Some(String::new());
+                                self.paragraph_open = false;
+                            }
                         }
                     }
                     _ => {}
@@ -545,6 +569,14 @@ impl Lexer {
     }
 
     fn consume(&mut self, end: usize) {
+        if self.fence_opening.is_some() {
+            let text = &self.pending[self.cursor..self.cursor + end];
+            if text.contains('\n') {
+                self.fence_opening = None;
+            } else {
+                self.fence_opening.as_mut().unwrap().push_str(text);
+            }
+        }
         for ch in self.pending[self.cursor..self.cursor + end].chars() {
             if ch == '\n' {
                 let blank = !self.line_has_text;
@@ -707,18 +739,17 @@ pub(super) fn decode(text: &str) -> Decoded {
             boundary.map(|i| tags[i].span.start).unwrap_or(text.len())
         };
         let span_end = closer.map(|tag| tag.span.end).unwrap_or(body_end);
-        let call = if opener.family == Family::Bare {
-            if opener.kind == Kind::ToolCall {
-                super::parse_single_tool_call_tag(
-                    text[opener.span.end..body_end].replace('\0', "").trim(),
-                )
-            } else if self_closed || closer.is_some() {
-                super::parse_single_invoke(&text[opener.span.start..span_end])
-            } else {
-                None
-            }
+        let call = if opener.kind == Kind::ToolCall {
+            super::parse_single_tool_call_tag(
+                text[opener.span.end..body_end].replace('\0', "").trim(),
+            )
+        } else if opener.family == Family::Bare && !self_closed && closer.is_none() {
+            None
         } else {
-            super::extract_attr(&opener.raw, "name")
+            opener
+                .attributes
+                .as_ref()
+                .and_then(|attributes| attributes.name.as_ref())
                 .filter(|name| !name.is_empty())
                 .map(|name| {
                     let parameters = tags[index + 1..]
@@ -789,20 +820,22 @@ fn arguments(body: &str, base: usize, tags: &[&Tag]) -> Option<Value> {
         if close.kind != Kind::Parameter || !close.closing {
             return None;
         }
-        let name = super::extract_attr(&tag.raw, "name")?;
-        if args.contains_key(&name) {
+        let attributes = tag.attributes.as_ref()?;
+        let name = attributes.name.as_ref()?;
+        if args.contains_key(name) {
             return None;
         }
         if !body.get(cursor..tag.span.start - base)?.trim().is_empty() {
             return None;
         }
         let value = body.get(tag.span.end - base..close.span.start - base)?;
-        let value = match super::extract_attr(&tag.raw, "string").as_deref() {
-            Some("false") => serde_json::from_str(value).ok()?,
-            Some("true") | None => Value::String(value.to_owned()),
+        let value = match (tag.family, attributes.string.as_deref()) {
+            (Family::Bare, _) => Value::String(value.to_owned()),
+            (_, Some("false")) => serde_json::from_str(value).ok()?,
+            (_, Some("true") | None) => Value::String(value.to_owned()),
             _ => return None,
         };
-        args.insert(name, value);
+        args.insert(name.to_owned(), value);
         cursor = close.span.end - base;
         index += 2;
     }

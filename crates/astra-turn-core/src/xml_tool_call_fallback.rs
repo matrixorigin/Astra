@@ -520,58 +520,6 @@ fn cleanup_residual_run(text: &str) -> Option<String> {
     Some(result)
 }
 
-// ─── <invoke> Parsing Helpers ───────────────────────────────────────────────
-
-/// Parse one `<invoke name="tool_name">…</invoke>` block.
-fn parse_single_invoke(block: &str) -> Option<Value> {
-    // Extract tool name from <invoke name="...">
-    let name = extract_attr(block, "name")?;
-    if name.is_empty() {
-        return None;
-    }
-
-    // Collect <parameter name="key">value</parameter> pairs
-    let mut args = serde_json::Map::new();
-    let mut search = 0;
-    while let Some(ps) = block[search..].find("<parameter") {
-        let abs_ps = search + ps;
-        let Some(pe) = block[abs_ps..].find("</parameter>") else {
-            search = abs_ps + 1;
-            continue;
-        };
-        let param_block = &block[abs_ps..abs_ps + pe + "</parameter>".len()];
-        if let Some(pname) = extract_attr(param_block, "name") {
-            // Value is between first '>' and '</parameter>'
-            if let Some(gt) = param_block.find('>') {
-                let inner = &param_block[gt + 1..];
-                let value = inner.strip_suffix("</parameter>").unwrap_or(inner);
-                args.insert(pname, Value::String(value.to_string()));
-            }
-        }
-        search = abs_ps + pe + "</parameter>".len();
-    }
-
-    let arguments = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
-    let id = format!("xmlfb_{}", &Uuid::new_v4().to_string()[..8]);
-
-    Some(json!({
-        "id": id,
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": arguments,
-        }
-    }))
-}
-
-/// Extract `attr="value"` from an XML opening tag.
-fn extract_attr(tag: &str, attr: &str) -> Option<String> {
-    let pattern = format!("{attr}=\"");
-    let start = tag.find(&pattern)? + pattern.len();
-    let end = tag[start..].find('"')? + start;
-    Some(tag[start..end].to_string())
-}
-
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -986,6 +934,101 @@ mod tests {
                 parse_degraded_tool_calls(&text).is_none(),
                 "nested example executed: {text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn degraded_invocations_keep_their_own_opening_attributes() {
+        let inner =
+            r#"<|DSML|invoke name="bash"><parameter name="command">pwd</parameter></|DSML|invoke>"#;
+        for (open, close) in [
+            ("<Invoke", "</Invoke>"),
+            ("< invoke", "</invoke>"),
+            ("<invoke", "</invoke>"),
+        ] {
+            for attributes in [
+                "",
+                " name=\"\"",
+                " label='name=\"bash\"'",
+                " tool_name=\"bash\"",
+                " name=\"bash\" name=\"read_file\"",
+            ] {
+                let text = format!("{open}{attributes}>{inner}{close}");
+                assert!(parse_degraded_tool_calls(&text).is_none(), "{text:?}");
+            }
+            let text =
+                format!("{open} name=\"bash\"><parameter name=\"command\">pwd</parameter>{close}");
+            let calls = parse_degraded_tool_calls(&text).unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| (
+                        call["function"]["name"].clone(),
+                        serde_json::from_str::<Value>(
+                            call["function"]["arguments"].as_str().unwrap()
+                        )
+                        .unwrap()
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(json!("bash"), json!({"command":"pwd"}))]
+            );
+            let text = format!("{open} name=\"read_file\">{inner}{close}");
+            let calls = parse_degraded_tool_calls(&text).unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("read_file")]
+            );
+            assert!(
+                serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap())
+                    .is_err(),
+                "invalid nested body must reach argument rejection"
+            );
+        }
+        let text = r#"<invoke name="read_file"><parameter name="path" string="false">123</parameter></invoke>"#;
+        let calls = parse_degraded_tool_calls(text).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap())
+                .unwrap(),
+            json!({"path":"123"})
+        );
+    }
+
+    #[test]
+    fn dsml_closed_inline_code_at_line_start_does_not_own_later_calls() {
+        use pulldown_cmark::{Event, Parser};
+        let call = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        for prefix in [
+            "```example```\n",
+            "``example``\n",
+            "Text ```example```\n",
+            "````a`b````\n",
+            "> ```example```\n",
+            "- ```example```\n",
+        ] {
+            assert!(
+                Parser::new(prefix).any(|event| matches!(event, Event::Code(_))),
+                "{prefix:?}"
+            );
+            let text = format!("{prefix}{call}");
+            let calls = parse_degraded_tool_calls(&text).expect("call after closed inline span");
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("bash")]
+            );
+            assert_eq!(strip_degraded_tool_calls(&text), prefix);
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut published = String::new();
+            for ch in text.chars() {
+                published.push_str(&filter.push(&ch.to_string()));
+            }
+            published.push_str(&filter.finish());
+            assert_eq!(published, prefix);
         }
     }
 

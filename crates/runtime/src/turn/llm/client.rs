@@ -13372,6 +13372,26 @@ mod tests {
         let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
         for (content, expected, paths) in [
             (
+                format!("```example```\n{call}"),
+                "```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("``example``\n{call}"),
+                "``example``\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Text ```example```\n{call}"),
+                "Text ```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("```text\n{call}\n```\n{call}"),
+                format!("```text\n{call}\n```\n"),
+                vec!["README.md"],
+            ),
+            (
                 format!("<pre>\n{call}\n</pre>\n{call}"),
                 format!("<pre>\n{call}\n</pre>\n"),
                 vec!["README.md"],
@@ -13560,8 +13580,22 @@ mod tests {
     #[tokio::test]
     async fn collect_llm_stream_degraded_markup_respects_literal_and_outer_ownership() {
         let call = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        let nested =
+            r#"<|DSML|invoke name="bash"><parameter name="command">pwd</parameter></|DSML|invoke>"#;
         let legacy = "<tool_call>bash)(pwd)</tool_call>";
-        for (content, literal) in [
+        for (content, literal, expected) in [
+            (format!("<Invoke>{nested}</Invoke>"), false),
+            (format!("< invoke>{nested}</invoke>"), false),
+            (format!("<invoke>{nested}</invoke>"), false),
+            (format!("<Invoke name=\"\">{nested}</Invoke>"), false),
+            (
+                format!("<invoke label='name=\"bash\"'>{nested}</invoke>"),
+                false,
+            ),
+            (
+                format!("<invoke tool_name=\"bash\">{nested}</invoke>"),
+                false,
+            ),
             ("<!--\n<invoke name=\"bash\">\n-->".to_owned(), true),
             (
                 "Text <code><parameter=example> pwd</code>.".to_owned(),
@@ -13588,7 +13622,18 @@ mod tests {
                 false,
             ),
             (format!("<|DSML|calls>{legacy}</|DSML|calls>"), false),
-        ] {
+        ]
+        .into_iter()
+        .map(|(content, literal)| (content, literal, None))
+        .chain(
+            [
+                r#"<Invoke name="bash"><parameter name="command">pwd</parameter></Invoke>"#,
+                r#"< invoke name="bash"><parameter name="command">pwd</parameter></invoke>"#,
+                r#"<invoke name="bash"><parameter name="command">pwd</parameter></invoke>"#,
+                r#"<invoke name='bash'><parameter name='command'>pwd</parameter></invoke>"#,
+            ]
+            .map(|content| (content.to_owned(), false, Some(json!({"command":"pwd"})))),
+        ) {
             for character_chunks in [false, true] {
                 let chunks = if character_chunks {
                     content.chars().map(|c| c.to_string()).collect()
@@ -13623,18 +13668,25 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert!(
-                    result.tool_calls.is_empty(),
-                    "example escaped ownership: {content:?}"
-                );
                 let nonstream = parse_openai_compatible_nonstream_response(
                     &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
                     "deepseek-test",
                 );
-                assert!(
-                    nonstream.tool_calls.is_empty(),
-                    "nonstream example escaped ownership: {content:?}"
-                );
+                for calls in [&result.tool_calls, &nonstream.tool_calls] {
+                    let actual = calls
+                        .iter()
+                        .map(|call| {
+                            assert_eq!(call["function"]["name"], "bash");
+                            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual,
+                        expected.iter().cloned().collect::<Vec<_>>(),
+                        "{content:?}"
+                    );
+                }
                 if literal {
                     assert_eq!(result.full_text, content);
                     assert_eq!(published, content);
