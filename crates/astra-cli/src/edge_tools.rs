@@ -1871,6 +1871,7 @@ impl ToolExecutor {
         additional_roots: &[PathBuf],
         cancel: Option<&tokio_util::sync::CancellationToken>,
         max_wait: std::time::Duration,
+        admission_deadline: Option<std::time::Instant>,
     ) -> Result<
         astra_tools::workspace_observation::WorkspaceObservationLease,
         astra_tools::workspace_observation::WorkspaceLeaseFailure,
@@ -1879,21 +1880,54 @@ impl ToolExecutor {
             WorkspaceLeaseFailure, acquire_workspace_mutation_lease_with_paths,
         };
 
-        let result =
-            acquire_workspace_mutation_lease_with_paths(root, additional_roots, cancel, max_wait)
-                .await;
-        if matches!(result, Err(WorkspaceLeaseFailure::OwnershipUnsettled))
-            && self
-                .confirm_workspace_recovery_in_tui(
-                    &self.unsettled_workspace_root(root, additional_roots),
-                    cancel,
-                )
-                .await
-        {
-            acquire_workspace_mutation_lease_with_paths(root, additional_roots, cancel, max_wait)
-                .await
-        } else {
-            result
+        let mut remaining = max_wait;
+        let mut confirmed = std::collections::HashSet::new();
+        loop {
+            if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err(WorkspaceLeaseFailure::Cancelled);
+            }
+            let attempt_wait = admission_deadline
+                .map(|deadline| {
+                    remaining.min(deadline.saturating_duration_since(std::time::Instant::now()))
+                })
+                .unwrap_or(remaining);
+            if attempt_wait.is_zero() {
+                return Err(WorkspaceLeaseFailure::Contended);
+            }
+            let started = std::time::Instant::now();
+            let result = acquire_workspace_mutation_lease_with_paths(
+                root,
+                additional_roots,
+                cancel,
+                attempt_wait,
+            )
+            .await;
+            remaining = remaining.saturating_sub(started.elapsed());
+            if !matches!(&result, Err(WorkspaceLeaseFailure::OwnershipUnsettled)) {
+                return result;
+            }
+            let blocked = self.unsettled_workspace_root(root, additional_roots);
+            let key = blocked.canonicalize().unwrap_or_else(|_| blocked.clone());
+            if !confirmed.insert(key) {
+                return result;
+            }
+            // Human confirmation does not consume a command's execution or
+            // lock-contention budget. A server admission deadline still applies.
+            let confirmation = self.confirm_workspace_recovery_in_tui(&blocked, cancel);
+            let accepted = if let Some(deadline) = admission_deadline {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), confirmation)
+                    .await
+                    .map_err(|_| WorkspaceLeaseFailure::Contended)?
+            } else {
+                confirmation.await
+            };
+            if !accepted {
+                return if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    Err(WorkspaceLeaseFailure::Cancelled)
+                } else {
+                    result
+                };
+            }
         }
     }
 
@@ -4947,14 +4981,6 @@ impl ToolExecutor {
         } else {
             self.effective_project_root()
         };
-        if name == "run_script"
-            && astra_tools::workspace_observation::workspace_ownership_is_unsettled(&execution_root)
-                == Some(true)
-        {
-            let _ = self
-                .confirm_workspace_recovery_in_tui(&execution_root, cancel_token)
-                .await;
-        }
         let targeted_observer = convergence_authority.as_deref().is_some_and(|authority| {
             self.convergence_tracker
                 .requires_snapshot_lease(authority, name, args, &execution_root)
@@ -5042,6 +5068,7 @@ impl ToolExecutor {
                         })
                         .unwrap_or(std::time::Duration::from_secs(120))
                         .min(std::time::Duration::from_secs(120)),
+                    invocation.admission_deadline,
                 )
                 .await
             {
@@ -5138,15 +5165,24 @@ impl ToolExecutor {
         }
         let _recursive_writer_epoch = if name == "run_script" {
             let additional_roots = self.additional_workspace_paths();
-            match astra_tools::workspace_observation::begin_workspace_writer_with_paths(
+            match self.acquire_local_workspace_lease(
                 &execution_root,
                 &additional_roots,
                 cancel_token,
                 std::time::Duration::from_secs(120),
-            )
-            .await
-            {
-                Ok(guard) => Some(guard),
+                invocation.admission_deadline,
+            ).await {
+                Ok(lease) => match astra_tools::workspace_observation::begin_workspace_writer_after_lease(
+                    &execution_root,
+                    lease,
+                ) {
+                    Some(guard) => Some(guard),
+                    None => return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
+                        name,
+                        astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable,
+                        &execution_root,
+                    )),
+                },
                 Err(failure) => {
                     return EdgeToolRun::from_tool_result(local_workspace_lease_failure(
                         name,

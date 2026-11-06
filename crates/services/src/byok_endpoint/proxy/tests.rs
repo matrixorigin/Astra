@@ -96,7 +96,15 @@ async fn mock_proxy(
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let Ok((tcp, _)) = accepted else { break; };
+                    let (tcp, _) = match accepted {
+                        Ok(connection) => connection,
+                        #[cfg(unix)]
+                        Err(error) if matches!(error.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE)) => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        Err(error) => panic!("test proxy failed to accept a connection: {error}"),
+                    };
                     let (tls, tx, scheme) = (server_tls.clone(), tx.clone(), scheme.clone());
                     connections.spawn(async move {
                         let mut stream: Stream = if scheme == "https" {
@@ -152,6 +160,233 @@ fn endpoint() -> reqwest::Url {
 }
 fn target() -> SocketAddr {
     "8.8.8.8:443".parse().unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn proxy_registrations_share_one_listener_under_descriptor_pressure() {
+    const CHILD: &str = "ASTRA_TEST_PROXY_SCALE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "byok_endpoint::proxy::tests::proxy_registrations_share_one_listener_under_descriptor_pressure"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // The limit belongs only to this subprocess, never to the test runner.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(256);
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    let proxy = EgressProxy::parse(Some("http://127.0.0.1:1"))
+        .unwrap()
+        .unwrap();
+    // This test measures listener descriptors, independently of native
+    // trust-store loading, which the other TLS tests exercise separately.
+    let tls = test_tls();
+    let mut clients = Vec::new();
+    for _ in 0..1000 {
+        clients.push(
+            client(
+                &endpoint(),
+                &[target()],
+                proxy.clone(),
+                super::super::transport_builder().use_preconfigured_tls((*tls.client).clone()),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let gateway = clients[0]._tunnel.as_ref().unwrap().gateway.clone();
+    assert_eq!(gateway.routes.lock().unwrap().len(), 1000);
+    assert!(
+        clients
+            .iter()
+            .all(|client| Arc::ptr_eq(&gateway, &client._tunnel.as_ref().unwrap().gateway))
+    );
+    drop(clients);
+    assert!(gateway.routes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn proxy_capability_cannot_be_used_for_another_origin() {
+    let proxy = EgressProxy::parse(Some("http://127.0.0.1:1"))
+        .unwrap()
+        .unwrap();
+    let first = client(
+        &endpoint(),
+        &[target()],
+        proxy.clone(),
+        super::super::transport_builder(),
+    )
+    .await
+    .unwrap();
+    let other_url = super::super::parse_endpoint("https://other.test/v1").unwrap();
+    let other = client(
+        &other_url,
+        &[target()],
+        proxy,
+        super::super::transport_builder(),
+    )
+    .await
+    .unwrap();
+    let first_route = first._tunnel.as_ref().unwrap();
+    let other_route = other._tunnel.as_ref().unwrap();
+    assert!(Arc::ptr_eq(&first_route.gateway, &other_route.gateway));
+    let mut socket = TcpStream::connect(first_route.gateway.address)
+        .await
+        .unwrap();
+    socket
+        .write_all(
+            format!(
+                "CONNECT byok.test:443 HTTP/1.1\r\nProxy-Authorization: {}\r\n\r\n",
+                other_route.authorization
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        read_head(&mut socket)
+            .await
+            .unwrap()
+            .starts_with("HTTP/1.1 502")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn proxy_listener_recovers_from_descriptor_exhaustion_without_dropping_streams() {
+    const CHILD: &str = "ASTRA_TEST_PROXY_OVERLOAD_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "byok_endpoint::proxy::tests::proxy_listener_recovers_from_descriptor_exhaustion_without_dropping_streams"])
+            .env(CHILD, "1").status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(256);
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        loop {
+            match origin.accept().await {
+                Ok((mut stream, _)) => {
+                    tokio::spawn(async move {
+                        let mut bytes = [0; 32];
+                        while let Ok(count) = stream.read(&mut bytes).await {
+                            if count == 0 || stream.write_all(&bytes[..count]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EMFILE) | Some(libc::ENFILE)
+                    ) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("test origin failed to accept a connection: {error}"),
+            }
+        }
+    });
+    let tls = test_tls();
+    let (proxy, mut forwarded, proxy_task) = mock_proxy("http", &tls, origin_address, false).await;
+    let client = client(&endpoint(), &[target()], proxy, test_builder(&tls))
+        .await
+        .unwrap();
+    let route = client._tunnel.as_ref().unwrap();
+    let address = route.gateway.address;
+    let request = format!(
+        "CONNECT byok.test:443 HTTP/1.1\r\nProxy-Authorization: {}\r\n\r\n",
+        route.authorization
+    );
+    let mut established = TcpStream::connect(address).await.unwrap();
+    established.write_all(request.as_bytes()).await.unwrap();
+    assert!(
+        read_head(&mut established)
+            .await
+            .unwrap()
+            .starts_with("HTTP/1.1 200")
+    );
+    forwarded.recv().await.unwrap();
+
+    let mut slow = Vec::new();
+    for _ in 0..MAX_PENDING_HANDSHAKES {
+        slow.push(TcpStream::connect(address).await.unwrap());
+    }
+    let mut queued = TcpStream::connect(address).await.unwrap();
+    queued.write_all(request.as_bytes()).await.unwrap();
+    established.write_all(b"before overload").await.unwrap();
+    let mut reply = [0; 15];
+    tokio::time::timeout(Duration::from_secs(2), established.read_exact(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&reply, b"before overload");
+    drop(slow);
+    let head = tokio::time::timeout(Duration::from_secs(3), read_head(&mut queued))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    forwarded.recv().await.unwrap();
+    drop(queued);
+
+    let reserve = std::fs::File::open("/dev/null").unwrap();
+    let mut files = Vec::new();
+    while let Ok(file) = std::fs::File::open("/dev/null") {
+        files.push(file);
+    }
+    drop(reserve);
+    let waiting = std::net::TcpStream::connect(address).unwrap();
+    waiting.set_nonblocking(true).unwrap();
+    let waiting = TcpStream::from_std(waiting).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    established.write_all(b"still alive").await.unwrap();
+    let mut reply = [0; 11];
+    tokio::time::timeout(Duration::from_secs(2), established.read_exact(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&reply, b"still alive");
+    assert!(!route.gateway.task.is_finished());
+
+    drop(files);
+    // The OS may discard a connection whose accept hit EMFILE. Recovery
+    // means a fresh request can connect; an established stream stayed alive.
+    drop(waiting);
+    let mut after = TcpStream::connect(address).await.unwrap();
+    after.write_all(request.as_bytes()).await.unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(3), read_head(&mut after))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    forwarded.recv().await.unwrap();
+    origin_task.abort();
+    proxy_task.abort();
 }
 
 #[tokio::test]

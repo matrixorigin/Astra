@@ -4935,7 +4935,7 @@ mod model_catalog_loading_tests {
             .respond_with(if succeeds {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"model_id":"fixture"}))
             } else {
-                ResponseTemplate::new(502).set_body_json(serde_json::json!({"detail":"Could not connect","error_code":"model_probe_network"}))
+                ResponseTemplate::new(502).set_body_json(serde_json::json!({"detail":"Could not connect","error_code":"model_probe_network", "metadata":{"model_saved":false}}))
             })
             .expect(1)
             .mount(&server)
@@ -4947,23 +4947,27 @@ mod model_catalog_loading_tests {
                 .mount(&server)
                 .await;
             let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+            let owner = cli_owner_auth_snapshot();
             let result = model_setup::run(
-                Action::Create(astra_services::UserModelCreateRequestData {
-                    connection_id: None,
-                    responses_reasoning_history: None,
-                    name: "mine".into(),
-                    provider: "openai".into(),
-                    inference_protocol: Some(
-                        astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
-                    ),
-                    model: "fixture".into(),
-                    base_url: None,
-                    api_key: "synthetic-key".into(),
-                    context_window: 128000,
-                    is_default: false,
-                }),
+                Action::Create {
+                    request: astra_services::UserModelCreateRequestData {
+                        connection_id: None,
+                        responses_reasoning_history: None,
+                        name: "mine".into(),
+                        provider: "openai".into(),
+                        inference_protocol: Some(
+                            astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                        ),
+                        model: "fixture".into(),
+                        base_url: None,
+                        api_key: "synthetic-key".into(),
+                        context_window: 128000,
+                        is_default: false,
+                    },
+                    owner: owner.clone(),
+                },
                 astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
-                cli_owner_auth_snapshot(),
+                owner,
                 tokio_util::sync::CancellationToken::new(),
                 std::sync::Arc::new(LoginControl::default()),
                 progress,
@@ -4974,11 +4978,62 @@ mod model_catalog_loading_tests {
                     matches!(result, Ok(Outcome::Saved { model_id, .. }) if model_id == "fixture")
                 );
             } else {
-                let error = result.err().expect("probe failure must be visible");
-                assert!(error.contains("model was not saved"), "{error}");
-                assert!(error.contains("DNS, proxy and TLS"), "{error}");
+                let Ok(Outcome::CreateRejected { request, message }) = result else {
+                    panic!("probe failure must retain the editable request");
+                };
+                assert!(message.contains("model was not saved"), "{message}");
+                assert!(message.contains("DNS, proxy and TLS"), "{message}");
+                assert_eq!(request.api_key, "synthetic-key");
+                assert_eq!(request.model, "fixture");
+                assert_eq!(
+                    request.inference_protocol,
+                    Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses)
+                );
+                assert!(!message.contains("synthetic-key"));
             }
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn model_setup_never_sends_a_form_under_a_different_account() {
+        use crate::tui::{
+            login_control::LoginControl,
+            model_setup::{self, Action},
+        };
+        let _credentials = isolate_credentials();
+        let _env = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        save_profile("valid-access", "refresh-unused");
+        let _first = install_cli_profile_identity_for_test("default", Some("user-id-1")).unwrap();
+        let form_owner = cli_owner_auth_snapshot();
+        let _second = install_cli_profile_identity_for_test("other", Some("user-id-2")).unwrap();
+        let server = MockServer::start().await;
+        let (progress, _) = tokio::sync::mpsc::unbounded_channel();
+        let result = model_setup::run(
+            Action::Create {
+                request: astra_services::UserModelCreateRequestData {
+                    connection_id: None,
+                    responses_reasoning_history: None,
+                    name: "mine".into(),
+                    provider: "openai".into(),
+                    inference_protocol: None,
+                    model: "fixture".into(),
+                    base_url: None,
+                    api_key: "synthetic-key".into(),
+                    context_window: 128000,
+                    is_default: false,
+                },
+                owner: form_owner,
+            },
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            cli_owner_auth_snapshot(),
+            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(LoginControl::default()),
+            progress,
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error.contains("Account changed")));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]

@@ -644,23 +644,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     if !state.final_output_ready_notified {
         super::execution_phase::fence_direct_child_finalization(host, state).await;
     }
-    if state.interruption.is_none()
-        && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
-            &state.stall.tool_call_records,
-        )
-    {
-        use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
-        let mut interruption = InterruptionRecord::new(
-            InterruptionKind::ExecutionIncomplete,
-            ResumeAction::ContinueImmediately,
-            interruption_state_summary(
-                state,
-                Some("A tool result could not be saved or delivered.".into()),
-            ),
-        );
-        interruption.user_message = "A tool result could not be saved or delivered. Check what completed before continuing; do not repeat an action just to recover its output.".into();
-        state.interruption = Some(interruption);
-    }
     // The answer itself belongs to the interactive critical path. Everything
     // below this boundary is durable/derived settlement and must never keep a
     // displayed answer looking live just because a database, workspace, or
@@ -747,7 +730,7 @@ fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
     }
 }
 
-const OVERSIZED_TERMINAL_DETAIL: &str = "The response was too large to retain for future turns. Its full text will not be available to the model if you continue.";
+const OVERSIZED_TERMINAL_DETAIL: &str = "Some response context was too large to save. If this conversation cannot continue, start a new session or choose another model.";
 const OVERSIZED_TERMINAL_CONTEXT: &str =
     "[The preceding assistant response exceeded the context limit and was omitted.]";
 const OVERSIZED_TERMINAL_MARKER: &str = "_astra_omitted_terminal_response";
@@ -804,17 +787,39 @@ pub(crate) fn bound_ingested_terminal_message(state: &mut AgenticLoopState, star
     if message[OVERSIZED_TERMINAL_MARKER] != true && !terminal_message_fits(state, &message) {
         note_oversized_terminal(state);
         state.pending_provider_continuation = None;
-        let model_item_id = message.get(astra_turn_types::MODEL_ITEM_ID_FIELD).cloned();
-        let turn_provenance = message
-            .get(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD)
-            .cloned();
-        message = serde_json::json!({"role":"assistant", "content":OVERSIZED_TERMINAL_CONTEXT});
-        message[OVERSIZED_TERMINAL_MARKER] = serde_json::json!(true);
-        if let Some(id) = model_item_id {
-            message[astra_turn_types::MODEL_ITEM_ID_FIELD] = id;
+        // The answer remains visible in the transcript. Preserve only a
+        // scoped loss fact when provider reasoning cannot fit in context.
+        let lost_reasoning =
+            astra_core::model_wire::responses::has_reasoning_continuation(&message)
+                .then(|| &message[astra_core::model_wire::responses::CONTINUATION_KEY])
+                .and_then(|saved| {
+                    Some((saved["connection_id"].as_str()?, saved["model"].as_str()?))
+                })
+                .map(|(connection, model)| {
+                    serde_json::json!({
+                        "connection_id":connection, "model":model,
+                        astra_core::model_wire::responses::HISTORY_INCOMPLETE:true
+                    })
+                });
+        if let Some(object) = message.as_object_mut() {
+            object.remove(astra_core::model_wire::responses::CONTINUATION_KEY);
         }
-        if let Some(provenance) = turn_provenance {
-            message[astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD] = provenance;
+        if let Some(saved) = lost_reasoning {
+            message[astra_core::model_wire::responses::CONTINUATION_KEY] = saved;
+        }
+        message[OVERSIZED_TERMINAL_MARKER] = serde_json::json!(true);
+        if !terminal_message_fits(state, &message) {
+            let mut bounded = serde_json::json!({"role":"assistant", "content":OVERSIZED_TERMINAL_CONTEXT, OVERSIZED_TERMINAL_MARKER:true});
+            for field in [
+                astra_core::model_wire::responses::CONTINUATION_KEY,
+                astra_turn_types::MODEL_ITEM_ID_FIELD,
+                astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD,
+            ] {
+                if let Some(value) = message.get(field) {
+                    bounded[field] = value.clone();
+                }
+            }
+            message = bounded;
         }
     }
     state.messages[index] = message;
@@ -1091,6 +1096,69 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_private_continuation_preserves_the_delivered_answer() {
+        let key = astra_services::FernetTokenEncryptor::new("fixture-key").unwrap();
+        let route = "11111111-1111-4111-8111-111111111111";
+        let mut continuation = serde_json::json!({"connection_id":route, "model":"model", "items":[
+            {"type":"reasoning", "id":"reason", "content":[{"type":"reasoning_text", "text":"x".repeat(6 * 1024 * 1024)}]},
+            {"type":"message", "id":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]});
+        crate::turn::llm::private_continuation::seal(&mut continuation, &key, "owner", "session")
+            .unwrap();
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        let user = serde_json::json!({"role":"user", "content":"question"});
+        state.messages = vec![user.clone()];
+        state.initialize_provider_canonical_wal_base(&[user]);
+        state.final_text = "answer".into();
+        state.final_text_streamed = true;
+        state.final_text_model_item_id = Some("message".into());
+        state.current_model_item_id = Some("message".into());
+        state.pending_provider_continuation = Some(continuation);
+        state.begin_run_transcript_capture(std::iter::empty());
+        finalize_and_render(&mut host, &mut state).await;
+        assert_eq!(state.final_text, "answer");
+        assert!(state.interruption.is_some());
+        assert!(state.pending_provider_continuation.is_none());
+        assert_eq!(state.take_run_transcript_capture()[0]["content"], "answer");
+        let (_, segments) = crate::turn::canonical_commit::canonical_commit_delta(
+            &[],
+            false,
+            &state.messages,
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(segments.concat()).unwrap();
+        assert!(
+            restored
+                .iter()
+                .any(|message| message["content"] == "answer")
+        );
+        restored.push(serde_json::json!({"role":"user", "content":"continue"}));
+        crate::turn::llm::private_continuation::open(
+            &mut restored,
+            &key,
+            "owner",
+            &std::collections::HashSet::from(["session".to_owned()]),
+            route,
+            "model",
+        )
+        .unwrap();
+        let request = |messages: &[serde_json::Value], scope| {
+            astra_core::model_wire::responses::request("model", messages, None, scope, false, None)
+        };
+        assert_eq!(
+            request(&restored, route).unwrap_err(),
+            astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE
+        );
+        assert!(request(&restored, "another-route").is_ok());
+        crate::turn::llm::private_continuation::discard_completed_turn_reasoning(&mut restored);
+        assert!(request(&restored, route).is_ok());
+    }
 
     #[tokio::test]
     async fn oversized_terminal_response_preserves_answer_and_prior_tool_results() {
@@ -1694,37 +1762,6 @@ mod tests {
         assert!(host.rendered_final_text.is_empty());
         assert_eq!(state.messages, before);
         assert!(state.take_run_transcript_capture().is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_result_delivery_prevents_a_false_completed_terminal() {
-        let mut host = MockHost::new(vec![]);
-        let mut state = make_state();
-        state.final_text = "Finished.".into();
-        state
-            .stall
-            .tool_call_records
-            .push(astra_services::session_journal::ToolCallRecord {
-                name: "write_file".into(),
-                ok: false,
-                execution_ok: Some(true),
-                args_full: Some(r#"{"path":"data.txt"}"#.into()),
-                ..Default::default()
-            });
-        finalize_and_render(&mut host, &mut state).await;
-        let interruption = state
-            .interruption
-            .expect("delivery failure must be visible");
-        assert_eq!(
-            interruption.kind,
-            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
-        );
-        assert!(
-            interruption
-                .user_message
-                .contains("result could not be saved or delivered")
-        );
-        assert_eq!(state.final_text, "Finished.");
     }
 
     #[tokio::test]

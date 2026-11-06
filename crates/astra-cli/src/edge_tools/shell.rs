@@ -5247,6 +5247,7 @@ impl ToolExecutor {
                     &self.additional_workspace_paths(),
                     cancel_token,
                     std::time::Duration::from_secs_f64(timeout_secs.max(0.1)),
+                    invocation.admission_deadline,
                 )
                 .await;
             match lease {

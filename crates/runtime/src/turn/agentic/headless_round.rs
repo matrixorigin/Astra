@@ -139,6 +139,8 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub provider_continuation: Option<&'a Value>,
     /// Aggregate canonical space available to this batch's tool results.
     pub canonical_result_budget: u64,
+    /// First record belonging to this batch, including pre-dispatch results.
+    pub round_records_start: usize,
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
@@ -315,6 +317,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         reasoning_signature,
         provider_continuation,
         canonical_result_budget,
+        round_records_start,
         messages,
         tool_results,
         valid_tool_names,
@@ -347,6 +350,13 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
     // step so every result that may later be compacted has an owner without
     // teaching each unhappy-path helper a second identity protocol.
     let history_start = messages.len();
+    let results_start = tool_results.len();
+    if round_records_start > tool_call_records.len() {
+        return HeadlessRoundOutcome {
+            action_admission_error: Some("invalid tool-round record boundary".into()),
+            ..Default::default()
+        };
+    }
     let views = match (HeadlessToolCallViews {
         physical: physical_tool_calls,
         logical: logical_tool_calls,
@@ -558,6 +568,48 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         }
     }
     let outcome = pipeline.into_round_outcome();
+    // Index only this batch: provider call IDs can recur in later rounds, and
+    // scanning the full journal for every result is quadratic for large batches.
+    #[derive(Default)]
+    struct BatchResult<'a> {
+        name: Option<&'a str>,
+        record: Option<usize>,
+        result: Option<usize>,
+        advisory: Option<String>,
+    }
+    let mut batch: HashMap<&str, BatchResult<'_>> = physical_tool_calls
+        .iter()
+        .filter_map(|call| {
+            Some((
+                call["id"].as_str()?,
+                BatchResult {
+                    name: call["function"]["name"].as_str(),
+                    ..Default::default()
+                },
+            ))
+        })
+        .collect();
+    for (index, record) in tool_call_records
+        .iter()
+        .enumerate()
+        .skip(round_records_start)
+    {
+        if let Some(entry) = record
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| batch.get_mut(id))
+        {
+            entry.record = Some(index);
+        }
+    }
+    for (index, result) in tool_results.iter().enumerate().skip(results_start) {
+        if let Some(entry) = result["tool_call_id"]
+            .as_str()
+            .and_then(|id| batch.get_mut(id))
+        {
+            entry.result = Some(index);
+        }
+    }
     let mut reservations = Vec::new();
     for message in messages.iter_mut().skip(history_start) {
         if message.get("role").and_then(Value::as_str) != Some("tool") {
@@ -571,6 +623,17 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
                 error = %error,
                 "headless tool result could not be assigned its canonical run identity"
             );
+        }
+        if let Some(entry) = message["tool_call_id"]
+            .as_str()
+            .and_then(|id| batch.get_mut(id))
+            && let Some(index) = entry.record
+        {
+            let result = entry.result.map(|index| &tool_results[index]);
+            if let Some(fact) = tool_outcome_advisory(&tool_call_records[index], result) {
+                entry.advisory = Some(fact.clone());
+                set_tool_outcome_advisory(message, fact, false);
+            }
         }
         reservations.push(canonical_result_reservation(message));
     }
@@ -587,6 +650,13 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         remaining_reservations =
             remaining_reservations.saturating_sub(reservations.next().unwrap_or_default());
         let budget = available_canonical_result_budget(remaining_budget, remaining_reservations);
+        let entry = message["tool_call_id"]
+            .as_str()
+            .and_then(|id| batch.get_mut(id));
+        let record_index = entry.as_ref().and_then(|entry| entry.record);
+        let result_index = entry.as_ref().and_then(|entry| entry.result);
+        let previously_had_advisory = entry.as_ref().is_some_and(|entry| entry.advisory.is_some());
+        let mut entry = entry;
         if !astra_turn_types::json_serialized_fits(message, budget).unwrap_or(false)
             && astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message)
                 .is_none()
@@ -595,16 +665,10 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
                 message["content"].as_str(),
             )
         {
-            let name = tool_call_records
-                .iter()
-                .find(|record| record.tool_call_id.as_deref() == Some(call_id))
+            let name = record_index
+                .map(|index| &tool_call_records[index])
                 .map(|record| record.name.as_str())
-                .or_else(|| {
-                    physical_tool_calls
-                        .iter()
-                        .find(|call| call["id"] == call_id)
-                        .and_then(|call| call["function"]["name"].as_str())
-                });
+                .or_else(|| entry.as_ref().and_then(|entry| entry.name));
             let descriptor = name.and_then(|name| {
                 crate::turn::headless_tool_pipeline::record::retain_canonical_tool_result(
                     current_user_id,
@@ -615,68 +679,89 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
                     content,
                 )
             });
-            let call_id = call_id.to_string();
-            if let Some(descriptor) = descriptor {
+            let retained = descriptor.is_some_and(|descriptor| {
                 if astra_turn_core::tool_result_storage::mark_tool_result_artifact_descriptor(
                     message,
                     Some(&descriptor),
                 )
                 .is_ok()
-                    && let Some(record) = tool_call_records
-                        .iter_mut()
-                        .find(|record| record.tool_call_id.as_deref() == Some(&call_id))
                 {
-                    record.result_artifact = Some(descriptor);
+                    if let Some(index) = record_index {
+                        tool_call_records[index].result_artifact = Some(descriptor);
+                    }
+                    true
+                } else {
+                    false
                 }
-            } else if let Some(record) = tool_call_records
-                .iter_mut()
-                .find(|record| record.tool_call_id.as_deref() == Some(&call_id))
-            {
+            });
+            if !retained && let Some(index) = record_index {
+                let record = &mut tool_call_records[index];
                 if record.was_executed() && record.execution_ok.is_none() {
                     record.execution_ok = Some(record.ok);
                 }
                 record.ok = false;
                 record.error = Some("The tool result could not be retained for delivery.".into());
-                record.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                record.error_kind = record
+                    .error_kind
+                    .or(Some(astra_core::ErrorKind::ContractViolation));
+                if let Some(fact) =
+                    tool_outcome_advisory(record, result_index.map(|index| &tool_results[index]))
+                {
+                    if let Some(entry) = entry.as_mut() {
+                        entry.advisory = Some(fact.clone());
+                    }
+                    set_tool_outcome_advisory(message, fact, previously_had_advisory);
+                }
             }
         }
         // Retention can itself fail above; derive the displayed status only
         // after that attempt has updated the authoritative record.
-        let result_status = tool_call_records
-            .iter()
-            .find(|record| record.tool_call_id.as_deref() == message["tool_call_id"].as_str())
+        let result_status = record_index
+            .map(|index| &tool_call_records[index])
             .map(|record| {
                 if !record.was_executed() {
                     "The call was not executed."
                 } else if record.ok {
                     "The call completed successfully."
+                } else if matches!(
+                    record.error_kind,
+                    Some(
+                        astra_core::ErrorKind::Cancelled
+                            | astra_core::ErrorKind::ToolTimeout
+                            | astra_core::ErrorKind::ToolOutcomeUnknown
+                    )
+                ) {
+                    "The call started, but its effects could not be confirmed."
+                } else if record.execution_ok == Some(true) {
+                    "The call completed successfully, but its full result could not be delivered."
+                } else if record.execution_ok == Some(false) {
+                    "The call failed, and its full result could not be delivered."
                 } else {
-                    "The call ran, but its result or delivery failed."
+                    "The call failed."
                 }
             })
             .unwrap_or("The execution outcome is unavailable.");
-        if bound_canonical_tool_result(message, budget, result_status) {
-            let id = message["tool_call_id"].as_str().unwrap_or_default();
-            let delivery_failed = tool_call_records
-                .iter()
-                .any(|record| record.tool_call_id.as_deref() == Some(id) && !record.ok);
-            if let Some(result) = tool_results
-                .iter_mut()
-                .find(|result| result["tool_call_id"] == id)
-            {
+        let required_advisory = entry.as_ref().and_then(|entry| entry.advisory.as_deref());
+        if bound_canonical_tool_result(message, budget, result_status, required_advisory) {
+            let delivery_failed = record_index.is_some_and(|index| !tool_call_records[index].ok);
+            if let Some(index) = result_index {
+                let result = &mut tool_results[index];
                 result["result"] = message["content"].clone();
                 if delivery_failed {
                     result["status"] = Value::String("failed".into());
                 }
             }
-            if let Some(record) = tool_call_records
-                .iter_mut()
-                .find(|record| record.tool_call_id.as_deref() == Some(id))
-            {
+            if let Some(index) = record_index {
                 // The original execution record remains authoritative, but
                 // the full result was not delivered to the model.
-                record.runtime_model_result_full = None;
+                tool_call_records[index].runtime_model_result_full = None;
             }
+        }
+        if let Some(index) = result_index
+            && let Some(result) = tool_results[index].as_object_mut()
+        {
+            let guidance = astra_turn_core::tool::result::advisory::advisories(message.as_object());
+            astra_turn_core::tool::result::advisory::set_advisories(result, &guidance);
         }
         remaining_budget = remaining_budget.saturating_sub(
             astra_turn_types::json_serialized_len(message)
@@ -685,6 +770,71 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         );
     }
     outcome
+}
+
+/// Put execution and delivery facts next to the result the model receives.
+/// The journal remains authoritative; this bounded projection also survives
+/// body compaction and handoff without introducing another recovery state.
+fn tool_outcome_advisory(record: &ToolCallRecord, result: Option<&Value>) -> Option<String> {
+    use astra_services::session_journal::ToolCallDisposition;
+
+    let disposition = record.effective_disposition();
+    if record.ok && disposition != ToolCallDisposition::Deferred {
+        return None;
+    }
+    let unknown = matches!(
+        record.error_kind,
+        Some(
+            astra_core::ErrorKind::Cancelled
+                | astra_core::ErrorKind::ToolTimeout
+                | astra_core::ErrorKind::ToolOutcomeUnknown
+        )
+    );
+    let execution = match disposition {
+        ToolCallDisposition::Executed if unknown => "unknown",
+        ToolCallDisposition::Executed if record.execution_ok == Some(true) => "completed",
+        ToolCallDisposition::Executed => "failed",
+        _ => "not_executed",
+    };
+    let detail = record.error.as_deref().map(|error| {
+        astra_text_utils::credential_redaction::redact_credentials_for_display(error)
+            .0
+            .chars()
+            .take(256)
+            .collect::<String>()
+    });
+    let evidence = result
+        .and_then(|value| value.get("recovery_evidence"))
+        .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
+        .and_then(|value| {
+            serde_json::from_value::<astra_core::ToolFailureEvidence>(value.clone()).ok()
+        });
+    let mut facts = serde_json::json!({
+        "disposition": disposition,
+        "execution": execution,
+        "result_delivery": record.execution_ok.map(|_| "incomplete"),
+        "error_kind": record.error_kind.map(|kind| kind.as_str()),
+        "detail": detail,
+        "retryable": result.and_then(|value| value.get("retryable")).and_then(Value::as_bool),
+        "recovery_evidence": evidence,
+    });
+    facts
+        .as_object_mut()
+        .unwrap()
+        .retain(|_, value| !value.is_null());
+    Some(format!("Tool outcome: {facts}"))
+}
+
+fn set_tool_outcome_advisory(message: &mut Value, fact: String, replace: bool) {
+    let Some(fields) = message.as_object_mut() else {
+        return;
+    };
+    let mut guidance = astra_turn_core::tool::result::advisory::advisories(Some(fields));
+    if replace {
+        guidance.pop();
+    }
+    guidance.push(fact);
+    astra_turn_core::tool::result::advisory::set_advisories(fields, &guidance);
 }
 
 fn canonical_result_reservation(message: &Value) -> u64 {
@@ -712,10 +862,16 @@ fn available_canonical_result_budget(remaining: u64, later_reservations: u64) ->
 /// Keep a result committable even when a producer returns unexpectedly large
 /// output. The already-recorded execution remains authoritative. If the
 /// existing artifact owner persisted the result, expose its normal handle.
-fn bound_canonical_tool_result(message: &mut Value, budget: u64, result_status: &str) -> bool {
+fn bound_canonical_tool_result(
+    message: &mut Value,
+    budget: u64,
+    result_status: &str,
+    required_advisory: Option<&str>,
+) -> bool {
     if astra_turn_types::json_serialized_fits(message, budget).unwrap_or(false) {
         return false;
     }
+    use astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD;
     use astra_turn_core::tool_result_storage::{
         TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD, TOOL_RESULT_RUN_ID_FIELD,
         session_tool_result_artifact_uri_for_descriptor, tool_result_artifact_descriptor,
@@ -739,6 +895,7 @@ fn bound_canonical_tool_result(message: &mut Value, budget: u64, result_status: 
                     | "tool_call_id"
                     | "_round_index"
                     | "_tool_name"
+                    | TOOL_RESULT_ADVISORIES_FIELD
                     | TOOL_RESULT_RUN_ID_FIELD
                     | TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD
             )
@@ -754,6 +911,9 @@ fn bound_canonical_tool_result(message: &mut Value, budget: u64, result_status: 
             .to_string();
         let content = message["content"].clone();
         *message = serde_json::json!({"role":"tool", "tool_call_id":id, "content":content});
+        if let Some(fact) = required_advisory {
+            set_tool_outcome_advisory(message, fact.to_owned(), false);
+        }
     }
     true
 }
@@ -857,7 +1017,8 @@ mod tests {
         assert!(bound_canonical_tool_result(
             &mut message,
             8192,
-            "The call completed successfully."
+            "The call completed successfully.",
+            None,
         ));
         assert!(astra_turn_types::json_serialized_fits(&message, 8192).unwrap());
         assert!(
@@ -874,7 +1035,8 @@ mod tests {
         assert!(!bound_canonical_tool_result(
             &mut message,
             8192,
-            "The call completed successfully."
+            "The call completed successfully.",
+            None,
         ));
     }
 
@@ -889,13 +1051,93 @@ mod tests {
             assert!(!bound_canonical_tool_result(
                 message,
                 budget,
-                "The call completed successfully."
+                "The call completed successfully.",
+                None,
             ));
             remaining -= astra_turn_types::json_serialized_len(message).unwrap()
                 + astra_core::runtime_limits::CANONICAL_TOOL_RESULT_PROVENANCE_BYTES;
         }
         assert_eq!(first["content"].as_str().unwrap().len(), 23_000);
         assert_eq!(second["content"], "small");
+    }
+
+    #[test]
+    fn model_receives_distinct_bounded_execution_and_delivery_facts() {
+        use astra_services::session_journal::ToolCallDisposition as Disposition;
+
+        for (disposition, ok, execution_ok, error_kind, expected) in [
+            (Disposition::Rejected, false, None, None, "not_executed"),
+            (Disposition::Executed, false, None, None, "failed"),
+            (Disposition::Executed, false, Some(true), None, "completed"),
+            (Disposition::Executed, false, Some(false), None, "failed"),
+            (
+                Disposition::Executed,
+                false,
+                None,
+                Some(astra_core::ErrorKind::ToolTimeout),
+                "unknown",
+            ),
+            (Disposition::Deferred, true, None, None, "not_executed"),
+        ] {
+            let record = ToolCallRecord {
+                disposition: Some(disposition),
+                ok,
+                execution_ok,
+                error_kind,
+                error: Some("provider unavailable".into()),
+                ..Default::default()
+            };
+            let advisory = tool_outcome_advisory(&record, Some(&json!({"retryable": false})))
+                .expect("failure facts");
+            let facts: Value =
+                serde_json::from_str(advisory.strip_prefix("Tool outcome: ").unwrap()).unwrap();
+            assert_eq!(facts["execution"], expected);
+            assert_eq!(facts["retryable"], false);
+            assert_eq!(
+                facts.get("result_delivery").and_then(Value::as_str),
+                execution_ok.map(|_| "incomplete")
+            );
+            assert_eq!(facts["detail"], "provider unavailable");
+        }
+        let ok = ToolCallRecord {
+            disposition: Some(Disposition::Executed),
+            ok: true,
+            ..Default::default()
+        };
+        assert!(tool_outcome_advisory(&ok, None).is_none());
+
+        let fact = tool_outcome_advisory(
+            &ToolCallRecord {
+                disposition: Some(Disposition::Executed),
+                execution_ok: Some(true),
+                error: Some("result unavailable".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let mut message = json!({"role":"tool", "tool_call_id":"c", "content":"x".repeat(20_000)});
+        set_tool_outcome_advisory(&mut message, fact.clone(), false);
+        assert!(bound_canonical_tool_result(
+            &mut message,
+            8192,
+            "The result was unavailable.",
+            Some(&fact)
+        ));
+        assert!(astra_turn_types::json_serialized_fits(&message, 8192).unwrap());
+        astra_turn_core::tool::result::advisory::project_advisories(&mut message);
+        assert!(
+            message["content"]
+                .as_str()
+                .unwrap()
+                .contains("\"execution\":\"completed\"")
+        );
+        assert!(
+            message["content"]
+                .as_str()
+                .unwrap()
+                .contains("\"result_delivery\":\"incomplete\"")
+        );
     }
 
     struct TestSkillResolver(usize);

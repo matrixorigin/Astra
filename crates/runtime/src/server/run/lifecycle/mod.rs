@@ -5913,13 +5913,10 @@ impl AgenticRunLifecycleService {
             else {
                 return Ok(None);
             };
-            // A completed turn on a route which needs only current-turn
-            // reasoning has no future use for its private reasoning.  Only
-            // strip the newly appended suffix: replacement commits may
-            // contain immutable history from other routes or interrupted runs.
-            if mode == astra_turn_types::CanonicalDeltaModeV1::Append
-                && let Some(route) = completed_reasoning_scope
-            {
+            // A completed CurrentTurn route no longer needs its reasoning in
+            // either an appended suffix or an authorized replacement. Other
+            // routes' continuation state stays untouched.
+            if let Some(route) = completed_reasoning_scope {
                 for message in logical_segments.iter_mut().flatten() {
                     crate::turn::llm::private_continuation::discard_reasoning(message, Some(route));
                 }

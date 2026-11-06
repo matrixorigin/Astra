@@ -8565,6 +8565,110 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn failed_sibling_reaches_model_before_success_can_end_turn() {
+        let mut failed = make_edge_tool("read_file", "source unavailable");
+        failed.status = "failed".into();
+        let mut repaired = make_edge_tool("read_file", "source recovered");
+        repaired.request_id = "req-read-repair".into();
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![failed, make_edge_tool("catalog", "catalog ready")],
+                20,
+                10,
+                Some(50),
+            ),
+            edge_tool_result(vec![repaired], 20, 10, Some(30)),
+            text_result("recovered", 15, 5, Some(30)),
+        ])
+        .with_stop_after_success_completion("catalog", Some("premature success"));
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected recovery: {outcome:?}");
+        assert!(
+            state.interruption.is_none(),
+            "recovery must finish normally"
+        );
+        assert_eq!(host.current_turn, 3);
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"] == "req-read_file"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("source unavailable"))
+                && message["_astra_tool_result_advisories"]
+                    .as_array()
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.as_str()
+                                .is_some_and(|text| text.contains("\"execution\":\"failed\""))
+                        })
+                    })
+        }));
+        assert_eq!(state.final_text, "recovered");
+    }
+
+    fn completed_write_with_lost_result() -> EdgeToolExecResult {
+        let mut write = make_edge_tool_with_args(
+            "write_file",
+            json!({"path":"output.txt", "content":"expected"}),
+            "the result could not be saved",
+        );
+        write.status = "failed".into();
+        write.tool_result_fields.as_mut().unwrap().extend([
+            ("error_kind".into(), json!("contract_violation")),
+            ("provider_outcome_acknowledged".into(), json!(true)),
+            ("provider_result_was_error".into(), json!(false)),
+            ("durable_result_complete".into(), json!(false)),
+        ]);
+        write
+    }
+
+    #[tokio::test]
+    async fn model_can_verify_a_completed_write_whose_result_was_lost() {
+        let read = make_edge_tool_with_args("read_file", json!({"path":"output.txt"}), "expected");
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![completed_write_with_lost_result()], 20, 10, Some(50)),
+            edge_tool_result(vec![read], 20, 10, Some(30)),
+            text_result("verified", 15, 5, Some(30)),
+        ]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok(), "expected recovery: {outcome:?}");
+        assert!(
+            state.interruption.is_none(),
+            "verified work must not remain blocked"
+        );
+        assert_eq!(host.current_turn, 3);
+        assert_eq!(state.final_text, "verified");
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["tool_call_id"] == "req-write_file"
+                && message["_astra_tool_result_advisories"]
+                    .to_string()
+                    .contains("result_delivery")
+        }));
+    }
+
+    #[tokio::test]
+    async fn lost_result_without_model_followup_does_not_complete_the_turn() {
+        let mut host = MockHost::new(vec![edge_tool_result(
+            vec![completed_write_with_lost_result()],
+            20,
+            10,
+            Some(50),
+        )]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_err() || state.interruption.is_some());
+        assert_eq!(host.current_turn, 1);
+    }
+
+    #[tokio::test]
     async fn edge_completion_window_accepts_independent_verifier_batch() {
         let write =
             make_edge_tool_with_args("write_file", json!({"path": "src/output.txt"}), "written");

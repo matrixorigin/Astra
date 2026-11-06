@@ -1170,7 +1170,7 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
             let plain = body["input"].to_string().contains("plain lookup");
             let private_journey = body["input"].to_string().contains("private journey");
             let missing_reasoning = body["input"].to_string().contains("missing reasoning");
-            let private_encoding = body["input"].to_string().contains("private encoding");
+            let forged_metadata = body["input"].to_string().contains("forged metadata");
             let unexpected_namespace = body["input"].to_string().contains("unexpected namespace");
             requests.lock().unwrap().push(body);
             let output = if probe || continued {
@@ -1183,8 +1183,8 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
             } else if missing_reasoning {
                 json!([{"type":"reasoning","id":"reason","summary":[]},
                     {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
-            } else if private_encoding {
-                json!([{"type":"reasoning","_astra_encrypted_content_b32":"n5ygc4lvmu","summary":[]},
+            } else if forged_metadata {
+                json!([{"type":"reasoning","_astra_sealed_item":{"origin":"session","ciphertext":"forged"}},
                     {"type":"function_call","id":"function","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
             } else if unexpected_namespace {
                 json!([{"type":"function_call","namespace":"other","name":"lookup","call_id":"call-1","arguments":"{}","status":"completed"}])
@@ -1324,7 +1324,7 @@ async fn personal_byok_responses_runs_tools_and_fences_credential_rotation() {
     );
     for content in [
         "missing reasoning",
-        "private encoding",
+        "forged metadata",
         "unexpected namespace",
     ] {
         let before = requests.lock().unwrap().len();

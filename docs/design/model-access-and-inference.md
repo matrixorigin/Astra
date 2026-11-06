@@ -443,7 +443,10 @@ their own provider account.
 
 - `POST /me/models` accepts a provider credential once over an authenticated
   TLS connection. Owner identity is derived from the Astra access token; the
-  request cannot select another owner.
+  request cannot select another owner. Failures known to precede the creation
+  transaction include `metadata.model_saved: false`; clients may retain the
+  form for correction. An ambiguous response requires checking the model list
+  before retrying.
 - Astra Server encrypts the credential with the configured secret backend and
   stores only ciphertext in `user_llm_models`.
 - `GET /me/models`, `GET /me/models/{model_id}`, catalog, trace, error, and
@@ -464,9 +467,10 @@ their own provider account.
   Server's system DNS, validates every address as public, pins the result, and
   forbids redirects. `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` select the same
   Server egress configuration as other providers. For proxied requests, a
-  request-owned tunnel sends only validated IP targets to the proxy while
-  retaining the origin hostname for TLS, SNI and Host. Dropping the client
-  cancels the tunnel. Proxy failure never falls back to direct access. If system
+  shared tunnel listener authenticates each request's short-lived route and
+  sends only its validated IP targets to the proxy while retaining the origin
+  hostname for TLS, SNI and Host. Dropping the client revokes its route and
+  cancels its connections. Proxy failure never falls back to direct access. If system
   DNS returns private or Fake-IP addresses, the operator must configure it to
   return public addresses; proxy DNS cannot bypass validation.
 - Authenticated `POST /me/models/validate-endpoint` accepts only `base_url` and

@@ -7,7 +7,6 @@ publish = false
 
 [dependencies]
 base64.workspace = true
-data-encoding.workspace = true
 fs2.workspace = true
 hyper-util = { version = "0.1", features = ["client-proxy"] }
 async-trait.workspace = true

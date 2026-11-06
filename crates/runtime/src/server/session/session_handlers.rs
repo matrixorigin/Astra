@@ -2076,7 +2076,7 @@ fn ensure_private_continuation_is_sealed(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if messages
         .iter()
-        .any(astra_core::model_wire::responses::has_unsealed_reasoning)
+        .any(astra_core::model_wire::responses::has_unsealed_continuation)
     {
         return Err(error_response(
             StatusCode::CONFLICT,
@@ -4046,11 +4046,16 @@ mod tests {
         let error = ensure_private_continuation_is_sealed(&[raw]).unwrap_err();
         assert_eq!(error.0, StatusCode::CONFLICT);
         assert!(!error.1.0.detail.contains("private"));
-        let sealed = json!({"role":"assistant", key:{"items":[
-            {"type":"reasoning", astra_core::model_wire::responses::SEALED_REASONING:
+        let sealed = json!({"role":"assistant", key:{
+            "connection_id":"11111111-1111-4111-8111-111111111111",
+            "model":astra_core::model_wire::responses::model_binding("model"), "items":[
+            {"type":"reasoning", astra_core::model_wire::responses::SEALED_ITEM:
                 {"origin":"session", "ciphertext":"opaque"}}
         ]}});
-        assert!(ensure_private_continuation_is_sealed(&[sealed]).is_ok());
+        assert!(ensure_private_continuation_is_sealed(std::slice::from_ref(&sealed)).is_ok());
+        let mut forged = sealed;
+        forged[key]["items"][0]["summary"] = json!([{"type":"summary_text", "text":"private"}]);
+        assert!(ensure_private_continuation_is_sealed(&[forged]).is_err());
     }
 
     #[test]

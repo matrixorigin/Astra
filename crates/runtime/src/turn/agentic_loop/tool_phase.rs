@@ -358,18 +358,16 @@ fn has_pending_run_dependency<H: AgenticLoopHost>(host: &H, state: &AgenticLoopS
         || state.messaging.reply_obligations.has_pending(run_id)
 }
 
-/// A settled failure in the same provider batch must be visible before an
-/// optional observation wait. The wait receipt is still authoritative for
-/// live child/reply ownership; this predicate only prevents a failed sibling
-/// from hiding the next repair decision behind an observation timeout.
+/// A failed or deferred call in the same provider batch must be visible before
+/// an optional wait or automatic completion. Reused and suppressed calls can
+/// still represent successful observations; their `ok` status is authoritative.
 fn settled_round_has_failed_call(settled_tool_calls: &[ToolCallRecord]) -> bool {
     settled_tool_calls.iter().any(|record| {
         matches!(
             record.effective_disposition(),
             astra_services::session_journal::ToolCallDisposition::Rejected
-        ) || (record.effective_disposition()
-            == astra_services::session_journal::ToolCallDisposition::Executed
-            && !record.ok)
+                | astra_services::session_journal::ToolCallDisposition::Deferred
+        ) || !record.ok
     })
 }
 
@@ -1960,8 +1958,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 record.start_offset_ms = Some(tool_record_turn_start.elapsed().as_millis() as u64);
             }
         }
-        let pre_execution_tool_calls =
-            state.stall.tool_call_records[round_records_start..].to_vec();
         let transcript_append_start = state.messages.len();
         let edge_round_superseded = matches!(
             admitted_tool_call_control,
@@ -2078,6 +2074,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             reasoning_signature: turn_result.accum.reasoning_signature.as_str(),
             provider_continuation: state.pending_provider_continuation.as_ref(),
             canonical_result_budget,
+            round_records_start,
             messages: &mut state.messages,
             tool_results: &mut state.tool_results,
             valid_tool_names: &valid_tool_names,
@@ -2119,6 +2116,8 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 superseded_before_action,
             )
         };
+        let pre_execution_tool_calls =
+            state.stall.tool_call_records[round_records_start..evo_records_before].to_vec();
         if superseded_before_action {
             tool_round_superseded = true;
         }
@@ -2409,12 +2408,13 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 );
             }
         }
-        if observe_foreground_fanout_completion(
+        let foreground_fanout_completed = observe_foreground_fanout_completion(
             state,
             all_tool_calls,
             &pre_resolved_results,
             &edge_tool_round,
-        ) {
+        );
+        if foreground_fanout_completed && !settled_round_has_failure {
             state.hooks.completion_settlement.text_only = true;
             state.push_volatile_payload(
             super::host::VolatileKind::FinalAnswerSettlement,
@@ -2488,11 +2488,19 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         // Bound unchanged live observations using the shared work-unit protocol.
         // Historical pagination and diagnostics are excluded by the protocol;
         // a producer version advance resets the counter for that work unit.
+        // A successful sibling or an older deferred completion cannot settle a
+        // failure the model has not seen yet.
+        if settled_round_has_failure {
+            state
+                .hooks
+                .completion_settlement
+                .deferred_success_completion = None;
+        }
         let unchanged_work_ids = state
             .stall
             .work_unit_observations
             .repeatedly_unchanged_ids(2);
-        if !unchanged_work_ids.is_empty() {
+        if !settled_round_has_failure && !unchanged_work_ids.is_empty() {
             let work_ids = unchanged_work_ids.join(", ");
             let caller_owned_ids = state
                 .stall
@@ -2524,8 +2532,11 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
         }
 
-        let current_completion =
-            host.stop_after_successful_tool_round(&round_tool_calls, &new_tool_results);
+        let current_completion = if settled_round_has_failure {
+            None
+        } else {
+            host.stop_after_successful_tool_round(&round_tool_calls, &new_tool_results)
+        };
         if let Some(completion) = current_completion {
             if super::execution_phase::tool_terminal_requires_followup(state) {
                 tracing::debug!(
@@ -2565,7 +2576,8 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         // consume the retained terminal template only after the next action has
         // settled the typed obligation; the following host round may legitimately
         // return no descriptor at all.
-        if !super::execution_phase::tool_terminal_requires_followup(state)
+        if !settled_round_has_failure
+            && !super::execution_phase::tool_terminal_requires_followup(state)
             && let Some(completion) = state
                 .hooks
                 .completion_settlement
@@ -4524,6 +4536,28 @@ mod tests {
             true,
         )];
         assert!(!settled_round_has_failed_call(&records));
+    }
+
+    #[test]
+    fn deferred_or_failed_reused_call_requires_model_followup() {
+        use astra_services::session_journal::ToolCallDisposition;
+
+        for (disposition, ok, needs_followup) in [
+            (ToolCallDisposition::Deferred, true, true),
+            (ToolCallDisposition::Rejected, false, true),
+            (ToolCallDisposition::Executed, false, true),
+            (ToolCallDisposition::Reused, false, true),
+            (ToolCallDisposition::Reused, true, false),
+            (ToolCallDisposition::Suppressed, true, false),
+            (ToolCallDisposition::Executed, true, false),
+        ] {
+            let record = ToolCallRecord {
+                disposition: Some(disposition),
+                ok,
+                ..Default::default()
+            };
+            assert_eq!(settled_round_has_failed_call(&[record]), needs_followup);
+        }
     }
 
     #[test]

@@ -2015,6 +2015,7 @@ mod tests {
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2104,6 +2105,7 @@ mod tests {
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2223,6 +2225,7 @@ mod tests {
             let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
                 provider_continuation: None,
                 canonical_result_budget: 1024 * 1024,
+                round_records_start: 0,
                 turn_index: 0,
                 session_turn: 1,
                 quiet: true,
@@ -2329,6 +2332,7 @@ mod tests {
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2473,6 +2477,7 @@ mod tests {
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2605,6 +2610,7 @@ mod tests {
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2716,6 +2722,7 @@ mod tests {
         let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -2857,6 +2864,7 @@ mod tests {
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -3000,6 +3008,7 @@ mod tests {
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -3097,6 +3106,7 @@ mod tests {
         let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             provider_continuation: None,
             canonical_result_budget: 1024 * 1024,
+            round_records_start: 0,
             turn_index: 0,
             session_turn: 1,
             quiet: true,

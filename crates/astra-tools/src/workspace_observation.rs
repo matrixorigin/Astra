@@ -687,28 +687,16 @@ pub async fn begin_workspace_writer_with_options(
         .ok_or(WorkspaceLeaseFailure::BindingUnavailable)
 }
 
-/// Admit an opaque writer with its explicitly authorized additional roots.
-pub async fn begin_workspace_writer_with_paths(
-    workspace_root: &Path,
-    additional_roots: &[PathBuf],
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Result<WorkspaceWriterGuard, WorkspaceLeaseFailure> {
-    let lease = acquire_workspace_mutation_lease_with_paths(
-        workspace_root,
-        additional_roots,
-        cancel_token,
-        max_wait,
-    )
-    .await?;
-    begin_workspace_writer_after_lease(workspace_root, lease)
-        .ok_or(WorkspaceLeaseFailure::BindingUnavailable)
-}
-
-fn begin_workspace_writer_after_lease(
+/// Turn an already admitted workspace lease into the opaque writer owner.
+pub fn begin_workspace_writer_after_lease(
     workspace_root: &Path,
     lease: WorkspaceObservationLease,
 ) -> Option<WorkspaceWriterGuard> {
+    if workspace_root.canonicalize().ok()? != lease.binding_identity.canonical
+        || !lease.coordination_integrity_valid()
+    {
+        return None;
+    }
     let state = writer_epoch_state(workspace_root)?;
     state
         .active
@@ -7954,10 +7942,15 @@ mod tests {
         let primary = tempfile::tempdir().unwrap();
         let extra = tempfile::tempdir().unwrap();
         let roots = [extra.path().to_path_buf()];
-        let writer =
-            begin_workspace_writer_with_paths(primary.path(), &roots, None, Duration::from_secs(1))
-                .await
-                .unwrap();
+        let lease = acquire_workspace_mutation_lease_with_paths(
+            primary.path(),
+            &roots,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let writer = begin_workspace_writer_after_lease(primary.path(), lease).unwrap();
         assert!(mark_workspace_observation_unsettled(primary.path()));
         drop(writer);
 

@@ -4383,6 +4383,8 @@ impl RuntimeExecutionHandoff {
     }
 }
 
+const PRIVATE_CONTEXT_RECOVERY_MESSAGE: &str = "Model context could not be recovered. Try a new turn; if it still fails, start a new session or choose another model.";
+
 impl ServerAgenticLoopHost {
     pub(crate) fn set_private_reasoning_origins(&mut self, mut origins: HashSet<String>) {
         origins.insert(self.session_id.clone());
@@ -4429,7 +4431,7 @@ impl ServerAgenticLoopHost {
         } else {
             Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::InvalidRequest,
-                "Model continuation is unavailable; start a new turn",
+                PRIVATE_CONTEXT_RECOVERY_MESSAGE,
             ))
         }
     }
@@ -4452,7 +4454,7 @@ impl ServerAgenticLoopHost {
         .map_err(|_| {
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::InvalidRequest,
-                "Model continuation is unavailable; start a new turn",
+                PRIVATE_CONTEXT_RECOVERY_MESSAGE,
             )
         })
     }
@@ -17851,10 +17853,14 @@ impl ServerAgenticLoopHost {
                 scope,
                 |item| items.push(item),
             )
-            .map_err(|_| {
+            .map_err(|cause| {
                 astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::InvalidRequest,
-                    "Model continuation is unavailable; start a new turn",
+                    if cause == astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE {
+                        astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE
+                    } else {
+                        "Model continuation is unavailable; start a new turn"
+                    },
                 )
             })?;
             Some(items)
@@ -20772,6 +20778,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 llm_cfg.cache_capability,
                 llm_cfg.inference_protocol,
             );
+        let mut first_responses_messages = None;
         if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
             let mut budget_source = canonical_llm_messages.clone();
             if llm_cfg.responses_reasoning_history
@@ -20786,6 +20793,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &budget_source, &llm_cfg.provider, llm_cfg.cache_capability,
                 astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
             );
+            // The first dispatch uses the same immutable canonical messages.
+            // Reuse their authorized plaintext projection instead of opening
+            // every encrypted continuation a second time.
+            first_responses_messages = Some(budget_source);
         }
         let final_wire_budget_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
             &provider_budget_messages,
@@ -20860,6 +20871,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 llm_cfg.cache_capability,
             );
         }
+        drop(provider_budget_messages);
         // Runtime admission must mirror the exact tool schemas sent on the
         // wire. Pipeline pruning, sticky schema stabilization, and cache
         // annotation all happen after the broad edge-tool candidate set is
@@ -21202,8 +21214,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // providers, durably staged the execution deadline.  Keep this
             // exact vector immutable through provider dispatch; only the
             // timeout is sampled at the dispatch boundary.
-            let mut attempt_llm_messages_owned = llm_messages.clone();
-            if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
+            let mut attempt_llm_messages_owned = if attempt_in_round == 0 {
+                first_responses_messages.take().unwrap_or_else(|| llm_messages.clone())
+            } else {
+                llm_messages.clone()
+            };
+            if attempt_in_round > 0 && let Some((scope, model)) = llm_cfg.responses_budget_scope() {
                 if llm_cfg.responses_reasoning_history
                     == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
                 {
@@ -25213,8 +25229,16 @@ mod tests {
                 }
                 for index in 0..10 {
                     let id = format!("call-{index}");
-                    messages.push(json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}));
-                    messages.push(json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(800)}));
+                    let mut call = json!({"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}});
+                    let mut result = json!({"role":"tool", "tool_call_id":id, "content":"evidence ".repeat(800)});
+                    if index == 9 {
+                        call[astra_turn_core::tool::args::shape::PROVIDER_TOOL_CALL_ID_FIELD] =
+                            json!("original-call-9");
+                        result[astra_turn_core::tool::result::advisory::TOOL_RESULT_ADVISORIES_FIELD] =
+                            json!(["Tool outcome: {\"execution\":\"failed\"}"]);
+                    }
+                    messages.push(json!({"role":"assistant", "tool_calls":[call]}));
+                    messages.push(result);
                 }
                 let assistant = json!({"role":"assistant", "content":"partial response"});
                 messages.push(assistant.clone());
@@ -25256,6 +25280,20 @@ mod tests {
                 let text = serde_json::to_string(&wire).unwrap();
                 assert!(text.contains("required contract") && text.contains("retry control"));
                 astra_turn_types::validate_canonical_tool_pairing(&wire).unwrap();
+                let projected = crate::turn::llm::client::consolidate_system_messages_for_protocol(
+                    &wire,
+                    &cfg.provider,
+                    cfg.cache_capability,
+                    cfg.inference_protocol.unwrap_or_else(|| {
+                        astra_core::model_wire::llm_provider_protocol(&cfg.provider)
+                    }),
+                );
+                assert!(projected.iter().any(|message| {
+                    message["tool_call_id"] == "original-call-9"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("\"execution\":\"failed\""))
+                }));
             }
         }
 

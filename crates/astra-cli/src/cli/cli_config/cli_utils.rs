@@ -295,6 +295,24 @@ pub(crate) struct CliOwnerAuthSnapshot {
     pub(crate) native_binding: Option<std::sync::Arc<crate::cli::native_auth::Binding>>,
 }
 
+impl PartialEq for CliOwnerAuthSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        fn same<T>(a: &Option<std::sync::Arc<T>>, b: &Option<std::sync::Arc<T>>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        self.owner_scope == other.owner_scope
+            && self.profile_name == other.profile_name
+            && self.server_account_id == other.server_account_id
+            && same(&self.legacy_binding, &other.legacy_binding)
+            && same(&self.native_binding, &other.native_binding)
+    }
+}
+impl Eq for CliOwnerAuthSnapshot {}
+
 impl CliOwnerAuthSnapshot {
     pub(crate) fn is_current(&self) -> bool {
         self.owner_scope == astra_services::local_owner_scope()
@@ -1048,18 +1066,24 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
     }
 }
 
-pub(crate) fn model_creation_error(error: astra_thin_client::ThinClientError) -> String {
-    let rejected_probe = match &error {
+pub(crate) fn model_creation_definitely_rejected(
+    error: &astra_thin_client::ThinClientError,
+) -> bool {
+    match error {
         astra_thin_client::ThinClientError::Api { body, .. } => {
             serde_json::from_str::<serde_json::Value>(body)
                 .ok()
-                .and_then(|value| value.get("error_code")?.as_str().map(str::to_owned))
-                .is_some_and(|code| code.starts_with("model_probe_"))
+                .and_then(|value| value.pointer("/metadata/model_saved")?.as_bool())
+                == Some(false)
         }
         _ => false,
-    };
+    }
+}
+
+pub(crate) fn model_creation_error(error: astra_thin_client::ThinClientError) -> String {
+    let not_saved = model_creation_definitely_rejected(&error);
     let detail = map_thin_err(error);
-    if rejected_probe {
+    if not_saved {
         format!("Model setup failed; the model was not saved. {detail}")
     } else {
         format!("Could not confirm model setup. {detail}\nCheck your model list before retrying.")
@@ -1716,7 +1740,8 @@ mod tests {
             body: serde_json::json!({
                 "detail": "Could not connect",
                 "error_code": "model_probe_network",
-                "request_id": "test-request"
+                "request_id": "test-request",
+                "metadata": {"model_saved": false}
             })
             .to_string(),
         });

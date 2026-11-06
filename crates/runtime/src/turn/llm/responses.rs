@@ -22,6 +22,9 @@ pub(super) fn error(kind: astra_core::ErrorKind, code: &str) -> astra_core::Clas
                 .to_string()
         }
         "responses_continuation_incomplete" => INCOMPLETE_TOOL_CONTINUATION_MESSAGE.to_string(),
+        "responses_continuation_history_incomplete" => {
+            astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE.to_string()
+        }
         "responses_reasoning_continuation_missing" | "responses_invalid_output" => {
             "The selected model returned an incomplete response. Check the model configuration or choose another model."
                 .to_string()
@@ -154,6 +157,8 @@ pub(super) fn prepare(
             astra_core::ErrorKind::InvalidRequest,
             if cause == astra_core::model_wire::responses::CONTINUATION_SCOPE_CHANGED {
                 "responses_continuation_scope_changed"
+            } else if cause == astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE {
+                "responses_continuation_history_incomplete"
             } else {
                 "responses_continuation_incomplete"
             },
@@ -186,6 +191,8 @@ pub(super) fn prepare(
                 "responses_continuation_scope_changed"
             } else if cause == astra_core::model_wire::responses::CONTINUATION_INCOMPLETE {
                 "responses_continuation_incomplete"
+            } else if cause == astra_core::model_wire::responses::CONTINUATION_HISTORY_INCOMPLETE {
+                "responses_continuation_history_incomplete"
             } else if call.route.subscription.is_some() {
                 "unsupported_subscription_input"
             } else {

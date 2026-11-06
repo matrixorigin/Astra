@@ -1,12 +1,17 @@
 //! The Responses wire codec shared by subscription probes and runtime calls.
 //! It owns no conversation, tool execution, credential, or retry lifecycle.
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const CONTINUATION_KEY: &str = "_astra_responses";
+/// Scoped evidence that provider reasoning could not be retained.
+pub const HISTORY_INCOMPLETE: &str = "history_incomplete";
 pub const CONTINUATION_SCOPE_CHANGED: &str =
     "Model configuration changed during tool continuation; start a new turn";
 pub const CONTINUATION_INCOMPLETE: &str = "Tool continuation is incomplete; start a new turn";
+pub const CONTINUATION_HISTORY_INCOMPLETE: &str =
+    "Saved model context is incomplete; start a new session or choose a different model";
 pub const REASONING_CONTINUATION_MISSING: &str = "responses_reasoning_continuation_missing";
 pub const INVALID_OUTPUT: &str = "responses_invalid_output";
 /// Provider-declared retention policy for completed human turns.
@@ -24,25 +29,26 @@ impl ReasoningHistory {
         }
     }
 }
-/// Server-sealed private reasoning, opened only by the trusted inference owner.
-pub const SEALED_REASONING: &str = "_astra_sealed_reasoning";
-pub const ENCODED_REASONING: &str = "_astra_encrypted_content_b32";
+/// Server-sealed provider item metadata, opened only by the inference owner.
+pub const SEALED_ITEM: &str = "_astra_sealed_item";
 const MAX_CONTINUATION_ITEMS: usize = 4096;
 const MAX_REASONING_PARTS: usize = 4096;
 const MAX_REASONING_BYTES: usize = 16 * 1024 * 1024;
 
-/// Encode opaque provider state without credential-shaped substrings that a
-/// generic durable text sanitizer could otherwise rewrite.
-pub fn encode_opaque_reasoning(bytes: &[u8]) -> String {
-    data_encoding::BASE32_NOPAD
-        .encode(bytes)
-        .to_ascii_lowercase()
+pub fn model_binding(model: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"astra.responses.model.v1\0");
+    digest.update(model.as_bytes());
+    format!("sha256:{:x}", digest.finalize())
 }
 
-pub fn decode_opaque_reasoning(encoded: &str) -> Result<Vec<u8>, &'static str> {
-    data_encoding::BASE32_NOPAD
-        .decode(encoded.to_ascii_uppercase().as_bytes())
-        .map_err(|_| "Invalid opaque reasoning encoding")
+pub fn is_model_binding(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// Project a conversation message for consumers that do not own replay.
@@ -59,18 +65,49 @@ pub fn without_continuation(message: &Value) -> Value {
     }
 }
 
-/// Detect unsealed private reasoning before returning canonical history to a client.
-pub fn has_unsealed_reasoning(message: &Value) -> bool {
-    message[CONTINUATION_KEY]["items"]
-        .as_array()
-        .is_some_and(|items| {
-            items.iter().any(|item| {
-                item["type"] == "reasoning"
-                    && ["content", "encrypted_content", ENCODED_REASONING]
-                        .iter()
-                        .any(|key| item.get(*key).is_some_and(|value| !value.is_null()))
-            })
-        })
+/// Detect provider reasoning fields that have not crossed the sealing boundary.
+pub fn has_unsealed_reasoning_item(item: &Value) -> bool {
+    item["type"] == "reasoning"
+        && ["id", "content", "summary", "encrypted_content"]
+            .iter()
+            .any(|key| item.get(*key).is_some_and(|value| !value.is_null()))
+}
+
+/// Reject unprotected or noncanonical provider metadata at user-facing reads.
+pub fn has_unsealed_continuation(message: &Value) -> bool {
+    let Some(saved) = message.get(CONTINUATION_KEY) else {
+        return false;
+    };
+    if saved
+        .as_object()
+        .is_some_and(|object| object.len() == 1 && saved["invalid"] == true)
+    {
+        return false;
+    }
+    if !saved["model"].as_str().is_some_and(is_model_binding) {
+        return true;
+    }
+    let Some(validated) = validated_continuation(message) else {
+        return true;
+    };
+    if &validated != saved {
+        return true;
+    }
+    saved[HISTORY_INCOMPLETE] != true
+        && saved["items"]
+            .as_array()
+            .is_none_or(|items| items.iter().any(|item| item.get(SEALED_ITEM).is_none()))
+}
+
+/// Whether this message carries, or records the loss of, provider reasoning.
+pub fn has_reasoning_continuation(message: &Value) -> bool {
+    let saved = &message[CONTINUATION_KEY];
+    message["role"] == "assistant"
+        && (saved[HISTORY_INCOMPLETE] == true
+            || saved["invalid"] == true
+            || saved["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["type"] == "reasoning")))
 }
 
 /// Whether a saved Responses item belongs to a tool round.
@@ -111,6 +148,9 @@ pub fn validated_continuation(message: &Value) -> Option<Value> {
     let model = saved["model"].as_str()?;
     if model.is_empty() || model.len() > 255 || model.chars().any(char::is_control) {
         return None;
+    }
+    if saved[HISTORY_INCOMPLETE] == true {
+        return Some(json!({"connection_id":connection, "model":model, HISTORY_INCOMPLETE:true}));
     }
     let raw = saved["items"].as_array()?;
     if raw.is_empty() || raw.len() > MAX_CONTINUATION_ITEMS {
@@ -174,7 +214,7 @@ fn reasoning_size(item: &Value) -> Result<(usize, usize), &'static str> {
     if item["type"] != "reasoning" {
         return Ok((0, 0));
     }
-    if let Some(sealed) = item.get(SEALED_REASONING) {
+    if let Some(sealed) = item.get(SEALED_ITEM) {
         let size = sealed["ciphertext"]
             .as_str()
             .ok_or("Invalid sealed Responses reasoning")?
@@ -230,10 +270,8 @@ fn validate_reasoning_budget<'a>(
     Ok(())
 }
 
-fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, String> {
-    if !decode_stored_reasoning
-        && (item.get(SEALED_REASONING).is_some() || item.get(ENCODED_REASONING).is_some())
-    {
+fn replay_item(item: &Value, allow_sealed: bool) -> Result<Value, String> {
+    if !allow_sealed && item.get(SEALED_ITEM).is_some() {
         return Err("Provider output contains reserved continuation metadata".into());
     }
     if item
@@ -246,6 +284,13 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
         && item.get("namespace").is_some_and(|value| !value.is_null())
     {
         return Err("Provider function call has an unexpected namespace".into());
+    }
+    if item["type"] == "reasoning"
+        && item
+            .get("encrypted_content")
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("Invalid encrypted Responses reasoning".into());
     }
     validate_reasoning_budget(std::iter::once(item))?;
     // Reasoning text is ordinary provider content, not an opaque encrypted
@@ -274,16 +319,14 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
     } else {
         None
     };
-    if item.get(SEALED_REASONING).is_some()
-        && (item["type"] != "reasoning"
-            || item.get("content").is_some_and(|value| !value.is_null())
-            || item
-                .get("encrypted_content")
-                .is_some_and(|value| !value.is_null())
-            || item
-                .get(ENCODED_REASONING)
-                .is_some_and(|value| !value.is_null())
-            || item[SEALED_REASONING].as_object().is_none_or(|value| {
+    if item.get(SEALED_ITEM).is_some()
+        && (!matches!(
+            item["type"].as_str(),
+            Some("reasoning" | "message" | "function_call")
+        ) || item.get("id").is_some_and(|value| !value.is_null())
+            || item.get("phase").is_some_and(|value| !value.is_null())
+            || has_unsealed_reasoning_item(item)
+            || item[SEALED_ITEM].as_object().is_none_or(|value| {
                 value
                     .get("origin")
                     .and_then(Value::as_str)
@@ -297,16 +340,32 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
         return Err("Invalid sealed Responses reasoning".into());
     }
     let keys: &[&str] = match item["type"].as_str() {
-        Some("message") => &["id", "type", "role", "status", "phase", "content"],
+        Some("message") => &[
+            "id",
+            "type",
+            "role",
+            "status",
+            "phase",
+            "content",
+            SEALED_ITEM,
+        ],
         Some("reasoning") => &[
             "id",
             "type",
             "status",
             "summary",
             "encrypted_content",
-            SEALED_REASONING,
+            SEALED_ITEM,
         ],
-        Some("function_call") => &["id", "type", "status", "name", "arguments", "call_id"],
+        Some("function_call") => &[
+            "id",
+            "type",
+            "status",
+            "name",
+            "arguments",
+            "call_id",
+            SEALED_ITEM,
+        ],
         _ => return Err("Unsupported provider continuation item".into()),
     };
     let mut object = Map::new();
@@ -314,20 +373,18 @@ fn replay_item(item: &Value, decode_stored_reasoning: bool) -> Result<Value, Str
         // Optional null metadata is unexpressed; omit it on replay rather
         // than turning a valid output null into an invalid input control.
         if let Some(value) = item.get(*key).filter(|value| !value.is_null()) {
-            object.insert((*key).into(), value.clone());
+            if *key == SEALED_ITEM {
+                object.insert(
+                    (*key).into(),
+                    json!({"origin":value["origin"], "ciphertext":value["ciphertext"]}),
+                );
+            } else {
+                object.insert((*key).into(), value.clone());
+            }
         }
     }
     if let Some(content) = reasoning_content {
         object.insert("content".into(), Value::Array(content));
-    }
-    if decode_stored_reasoning
-        && item["type"] == "reasoning"
-        && object.get("encrypted_content").is_none()
-        && let Some(encoded) = item.get(ENCODED_REASONING).and_then(Value::as_str)
-    {
-        let bytes = decode_opaque_reasoning(encoded)?;
-        let value = String::from_utf8(bytes).map_err(|_| "Invalid encrypted reasoning encoding")?;
-        object.insert("encrypted_content".into(), json!(value));
     }
     let item = Value::Object(object);
     if item["type"] == "message" {
@@ -365,10 +422,7 @@ fn has_replayable_reasoning(item: &Value) -> bool {
         || item["encrypted_content"]
             .as_str()
             .is_some_and(|content| !content.is_empty())
-        || item[ENCODED_REASONING]
-            .as_str()
-            .is_some_and(|content| !content.is_empty())
-        || item[SEALED_REASONING].is_object()
+        || item[SEALED_ITEM].is_object()
         || item["content"].as_array().is_some_and(|parts| {
             !parts.is_empty()
                 && parts
@@ -488,6 +542,12 @@ pub fn validate_active_continuations<'a>(
             }
             continue;
         };
+        if saved[HISTORY_INCOMPLETE] == true
+            && saved["connection_id"] == connection
+            && saved["model"] == model
+        {
+            return Err(CONTINUATION_HISTORY_INCOMPLETE.into());
+        }
         if saved["invalid"] == true
             || saved["connection_id"].as_str().is_none_or(str::is_empty)
             || saved["model"].as_str().is_none_or(str::is_empty)
@@ -515,7 +575,7 @@ fn replay_continuation(
     let items = saved["items"].as_array().ok_or(CONTINUATION_INCOMPLETE)?;
     let mut replayed = Vec::with_capacity(items.len());
     for item in items {
-        if item.get(SEALED_REASONING).is_some() {
+        if item.get(SEALED_ITEM).is_some() {
             return Err(CONTINUATION_INCOMPLETE.into());
         }
         let mut replay = replay_item(item, true)?;
@@ -545,6 +605,9 @@ pub fn visit_input_items(
             .get("role")
             .and_then(Value::as_str)
             .ok_or("Message role is missing")?;
+        if role == "assistant" && message[CONTINUATION_KEY]["invalid"] == true {
+            return Err(CONTINUATION_HISTORY_INCOMPLETE.into());
+        }
         if role == "assistant"
             && let Some(saved) = message.get(CONTINUATION_KEY)
             && (saved["connection_id"] != connection || saved["model"] != model)
@@ -564,23 +627,31 @@ pub fn visit_input_items(
             && saved["connection_id"] == connection
             && saved["model"] == model
         {
+            if saved[HISTORY_INCOMPLETE] == true {
+                return Err(CONTINUATION_HISTORY_INCOMPLETE.into());
+            }
             match replay_continuation(message, saved, &messages[index + 1..]) {
                 Ok(items) => {
                     items.into_iter().for_each(&mut visit);
                     continue;
                 }
-                Err(error)
-                    if !last_user
+                Err(error) => {
+                    let has_later_user = last_user
                         .get_or_insert_with(|| {
                             messages
                                 .iter()
                                 .rposition(|message| message["role"] == "user")
                         })
-                        .is_some_and(|user_index| user_index > index) =>
-                {
-                    return Err(error);
+                        .is_some_and(|user_index| user_index > index);
+                    if !has_later_user {
+                        return Err(error);
+                    }
+                    // A route may require its earlier reasoning. Falling back
+                    // to ordinary chat messages would silently discard it.
+                    if has_reasoning_continuation(message) {
+                        return Err(CONTINUATION_HISTORY_INCOMPLETE.into());
+                    }
                 }
-                Err(_) => {} // A later human turn can use validated canonical pairs.
             }
         }
         if role == "tool" {
@@ -707,28 +778,20 @@ pub struct ResponseOutput {
 }
 impl ResponseOutput {
     pub fn continuation(&self, connection: &str, model: &str) -> Value {
-        // A text-only response can reveal reasoning capability without
-        // providing replayable private state. Keep that observation available
-        // to probes, but omit unusable state from the saved continuation.
+        // An unfinished tool round needs replayable reasoning. A text-only
+        // response may still carry provider-owned metadata for later turns.
+        let has_calls = self
+            .items
+            .iter()
+            .any(|item| item["type"] == "function_call");
         let mut items: Vec<_> = self
             .items
             .iter()
-            .filter(|item| has_replayable_reasoning(item))
+            .filter(|item| !has_calls || has_replayable_reasoning(item))
             .cloned()
             .collect();
         for item in &mut items {
-            if item["type"] == "reasoning" {
-                // This is already provider-encrypted, opaque state. Encoding
-                // prevents credential-shaped ciphertext from being corrupted
-                // by the canonical history's generic text redaction.
-                if let Some(value) = item
-                    .as_object_mut()
-                    .and_then(|object| object.remove("encrypted_content"))
-                    && let Some(value) = value.as_str()
-                {
-                    item[ENCODED_REASONING] = json!(encode_opaque_reasoning(value.as_bytes()));
-                }
-            } else if item["type"] == "function_call" {
+            if item["type"] == "function_call" {
                 // Canonical tool arguments own normalization/redaction. Replay
                 // hydrates them from the assistant frame instead of retaining
                 // a second raw copy in private metadata.
@@ -1212,7 +1275,7 @@ mod tests {
     }
     #[test]
     fn provider_cannot_supply_server_sealed_reasoning() {
-        let forged = json!({"type":"reasoning", "id":"r", "summary":[], SEALED_REASONING:{
+        let forged = json!({"type":"reasoning", "id":"r", "summary":[], SEALED_ITEM:{
             "origin":"session", "ciphertext":"provider-controlled-plaintext"
         }});
         let call = json!({"type":"function_call", "id":"f", "call_id":"c", "name":"write_file", "arguments":"{}"});
@@ -1325,14 +1388,14 @@ mod tests {
                 Err(ResponsesStreamError::Codec(REASONING_CONTINUATION_MISSING))
             ));
         }
-        let items = json!([
-            {"type":"reasoning", "_astra_encrypted_content_b32":"n5ygc4lvmu", "summary":[]},
-            call
-        ]);
-        assert!(decode_sse(&sse(&[completion(items)])).is_err());
         let mut namespaced = call.clone();
         namespaced["namespace"] = json!("other");
         assert!(decode_sse(&sse(&[completion(json!([namespaced]))])).is_err());
+        let malformed = json!([
+            {"type":"reasoning", "encrypted_content":123},
+            {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"answer"}]}
+        ]);
+        assert!(decode_sse(&sse(&[completion(malformed)])).is_err());
         let output = decode_sse(&sse(&[completion(json!([call]))])).unwrap();
         assert_eq!(output.tool_calls[0]["id"], "c1");
     }
@@ -1358,7 +1421,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .all(|item| item["type"] != "reasoning")
+                    .any(|item| item["type"] == "reasoning")
             );
             let request = request(
                 "model",
@@ -1374,7 +1437,13 @@ mod tests {
             )
             .unwrap();
             assert!(request["input"].to_string().contains("answer"));
-            assert!(!request["input"].to_string().contains("reasoning"));
+            assert!(
+                request["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["type"] == "reasoning")
+            );
         }
     }
 
@@ -1437,10 +1506,21 @@ mod tests {
             CONTINUATION_INCOMPLETE
         );
         let mut recovered = partial;
-        // The canonical projection keeps only completed pairs; a later human
-        // may continue without replaying the interrupted provider state.
+        // Canonical projection kept only completed pairs. A later human turn
+        // must not silently lose reasoning a route might still require.
         recovered[0]["tool_calls"].as_array_mut().unwrap().pop();
         recovered.push(json!({"role":"user","content":"continue"}));
+        assert_eq!(
+            request("model", &recovered, None, "scope", false, None).unwrap_err(),
+            CONTINUATION_HISTORY_INCOMPLETE
+        );
+        // Other routes have no claim to this state. Current-turn-only routes
+        // remove old reasoning before projection and can recover as before.
+        assert!(request("model", &recovered, None, "other", false, None).is_ok());
+        recovered[0][CONTINUATION_KEY]["items"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item["type"] != "reasoning");
         let body = request("model", &recovered, None, "scope", false, None).unwrap();
         assert!(!body.to_string().contains("opaque"));
     }

@@ -12,13 +12,13 @@ mod proxy;
 /// Keeps any private CONNECT tunnel alive for the entire response/stream lifetime.
 pub struct EndpointClient {
     client: reqwest::Client,
-    tunnel: Option<tokio::task::JoinHandle<()>>,
+    _tunnel: Option<proxy::RouteLease>,
 }
 impl From<reqwest::Client> for EndpointClient {
     fn from(client: reqwest::Client) -> Self {
         Self {
             client,
-            tunnel: None,
+            _tunnel: None,
         }
     }
 }
@@ -28,14 +28,6 @@ impl std::ops::Deref for EndpointClient {
         &self.client
     }
 }
-impl Drop for EndpointClient {
-    fn drop(&mut self) {
-        if let Some(task) = &self.tunnel {
-            task.abort();
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointPolicy {
     PublicHttps,
@@ -243,15 +235,24 @@ fn pinned_client(url: &reqwest::Url, addresses: &[SocketAddr]) -> Result<reqwest
 
 /// Resolve and pin a fresh public address set for each outbound attempt.
 /// TLS still validates the original hostname. Redirects never forward keys.
-pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, String> {
-    let url = parse_endpoint(raw)?;
-    let proxy_url = astra_core::net::configured_https_proxy_url_for(&url)?;
-    let proxy = proxy::EgressProxy::parse(proxy_url.as_deref())?;
-    let addresses = resolve_addresses(&url).await?;
-    validate_addresses(&addresses)?;
+pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, astra_core::ClassifiedError> {
+    use astra_core::{ClassifiedError, ErrorKind};
+    let invalid = |message| ClassifiedError::new(ErrorKind::InvalidRequest, message);
+    let network = |message| ClassifiedError::new(ErrorKind::Network, message);
+    let url = parse_endpoint(raw).map_err(invalid)?;
+    let proxy_url = astra_core::net::configured_https_proxy_url_for(&url)
+        .map_err(|message| invalid(message.to_owned()))?;
+    let proxy = proxy::EgressProxy::parse(proxy_url.as_deref()).map_err(invalid)?;
+    let addresses = resolve_addresses(&url).await.map_err(network)?;
+    validate_addresses(&addresses)
+        .map_err(|message| ClassifiedError::new(ErrorKind::PolicyDenied, message))?;
     match proxy {
-        Some(proxy) => proxy::client(&url, &addresses, proxy, transport_builder()).await,
-        None => pinned_client(&url, &addresses).map(EndpointClient::from),
+        Some(proxy) => proxy::client(&url, &addresses, proxy, transport_builder())
+            .await
+            .map_err(network),
+        None => pinned_client(&url, &addresses)
+            .map(EndpointClient::from)
+            .map_err(network),
     }
 }
 

@@ -1167,6 +1167,147 @@ async fn interactive_workspace_recovery_resumes_the_same_executor() {
 }
 
 #[tokio::test]
+async fn shell_recovers_each_unsettled_workspace_before_running() {
+    let primary = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let exe = std::sync::Arc::new(ToolExecutor::new(primary.path()));
+    exe.expand_sandbox_path(extra.path().to_path_buf()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    exe.set_ask_user_request_tx(Some(tx));
+    for root in [primary.path(), extra.path()] {
+        assert!(astra_tools::workspace_observation::mark_workspace_observation_unsettled(root));
+    }
+
+    let run = |exe: std::sync::Arc<ToolExecutor>| {
+        tokio::spawn(async move {
+            exe.execute_with_metadata("bash", &json!({"command":"touch completed"}))
+                .await
+        })
+    };
+    let first = run(exe.clone());
+    for answer in ["It has stopped", "Not sure"] {
+        let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!primary.path().join("completed").exists());
+        answer_workspace_recovery(prompt, answer);
+    }
+    assert!(first.await.unwrap().is_error);
+    assert!(!primary.path().join("completed").exists());
+
+    let second = run(exe);
+    let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    answer_workspace_recovery(prompt, "It has stopped");
+    let result = second.await.unwrap();
+    assert!(!result.is_error, "{result:?}");
+    assert!(primary.path().join("completed").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn script_recovers_each_workspace_before_platform_admission() {
+    let primary = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let exe = std::sync::Arc::new(ToolExecutor::new(primary.path()));
+    exe.expand_sandbox_path(extra.path().to_path_buf()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    exe.set_ask_user_request_tx(Some(tx));
+    for root in [primary.path(), extra.path()] {
+        assert!(astra_tools::workspace_observation::mark_workspace_observation_unsettled(root));
+    }
+    let worker = exe.clone();
+    let attempt = tokio::spawn(async move {
+        worker
+            .execute_with_metadata(
+                "run_script",
+                &json!({"script":"open('completed','w').write('yes')"}),
+            )
+            .await
+    });
+    for answer in ["It has stopped", "Not sure"] {
+        let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        answer_workspace_recovery(prompt, answer);
+    }
+    assert!(attempt.await.unwrap().is_error);
+    assert!(!primary.path().join("completed").exists());
+
+    let worker = exe.clone();
+    let attempt = tokio::spawn(async move {
+        worker
+            .execute_with_metadata(
+                "run_script",
+                &json!({"script":"open('completed','w').write('yes')"}),
+            )
+            .await
+    });
+    let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    answer_workspace_recovery(prompt, "It has stopped");
+    let result = attempt.await.unwrap();
+    assert!(
+        result.is_error,
+        "macOS cannot prove the script process boundary: {result:?}"
+    );
+    assert!(!result.output.contains("confirm-stopped"), "{result:?}");
+    assert!(!primary.path().join("completed").exists());
+}
+
+#[tokio::test]
+async fn workspace_recovery_honors_admission_deadline() {
+    let primary = tempfile::tempdir().unwrap();
+    let exe = std::sync::Arc::new(ToolExecutor::new(primary.path()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    exe.set_ask_user_request_tx(Some(tx));
+    assert!(
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(primary.path())
+    );
+    let worker = exe.clone();
+    let attempt = tokio::spawn(async move {
+        let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
+            admission_deadline: Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(200),
+            ),
+            ..Default::default()
+        };
+        worker
+            .execute_with_invocation_metadata_cancelable(
+                "bash",
+                &json!({"command":"touch completed"}),
+                invocation,
+                None,
+            )
+            .await
+    });
+    let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_error, "{result:?}");
+    assert!(!primary.path().join("completed").exists());
+    assert!(prompt.response_tx.is_closed());
+    assert_eq!(
+        astra_tools::workspace_observation::workspace_ownership_is_unsettled(primary.path()),
+        Some(true)
+    );
+    astra_tools::workspace_observation::confirm_workspace_stopped(primary.path())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_recovery_waits_cancellably_and_keeps_distinct_roots_separate() {
     let first_root = tempfile::tempdir().unwrap();
     let second_root = tempfile::tempdir().unwrap();

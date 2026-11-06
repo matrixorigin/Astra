@@ -955,6 +955,7 @@ fn one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode) -> Option
     } else if sr.local_continuation_omitted {
         Some("Local conversation content omitted by privacy policy; this turn cannot be recovered or automatically resumed locally.".into())
     } else if !sr.server_terminal_authoritative
+        && exit_code != ExitCode::Success
         && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
             &sr.tool_call_records,
         )
@@ -3836,6 +3837,11 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
     if sr.final_state == "interrupted" {
         return ExitCode::Partial;
     }
+    // The shared loop's completed response follows its tool-result feedback.
+    // An earlier failed call remains audit evidence, not an exit-code veto.
+    if sr.final_state == "completed" && !sr.full_text.trim().is_empty() {
+        return ExitCode::Success;
+    }
     if !sr.server_terminal_authoritative
         && astra_turn_core::evaluation::has_unresolved_tool_result_delivery_failure(
             &sr.tool_call_records,
@@ -5568,6 +5574,27 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+    }
+
+    #[test]
+    fn completed_model_response_is_not_overridden_by_an_earlier_delivery_failure() {
+        let mut sr = empty_stream_result();
+        sr.full_text = "I verified the output.".into();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "write_file".into(),
+                ok: false,
+                execution_ok: Some(true),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::one_shot_completion_warning(&sr, ExitCode::Success),
+            None
+        );
+
+        sr.final_state = "interrupted".into();
+        assert_eq!(compute_exit_code(&sr), ExitCode::Partial);
     }
 
     #[test]

@@ -3871,6 +3871,7 @@ impl DatabaseModelService {
         user_id: String,
         request: UserModelCreateRequestData,
     ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        let (connection_id, name, model, binding, thinking_snapshot, pool) = async {
         if request.provider != crate::chatgpt::PROVIDER
             || !request.api_key.is_empty()
             || request.base_url.is_some()
@@ -3915,6 +3916,8 @@ impl DatabaseModelService {
                 "Model alias already exists",
             ));
         }
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>((connection_id, name, model, binding, thinking_snapshot, pool))
+        }.await.map_err(model_not_saved)?;
         let model_id = Uuid::new_v4().to_string();
         let mut tx = pool.begin().await.map_err(internal_error)?;
         binding.lock_current(&mut tx).await?;
@@ -4427,6 +4430,39 @@ async fn ensure_probed_admin_model_is_current(
     Ok(())
 }
 
+async fn ensure_probed_user_model_is_current(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let model_id: String = row.try_get("model_id").map_err(internal_error)?;
+    let model: String = row.try_get("model_name").map_err(internal_error)?;
+    let provider: String = row.try_get("provider").map_err(internal_error)?;
+    let base_url: String = row.try_get("base_url").map_err(internal_error)?;
+    let key: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
+    let protocol: Option<String> = row.try_get("inference_protocol").map_err(internal_error)?;
+    let history: Option<String> = row
+        .try_get("responses_reasoning_history")
+        .map_err(internal_error)?;
+    let connection: Option<String> = row.try_get("connection_id").map_err(internal_error)?;
+    let current = query(astra_core::matrixone_statement_with_null_shape(
+        "SELECT 1 FROM user_llm_models WHERE user_id = ? AND model_id = ? \
+         AND model_name = ? AND provider = ? AND base_url = ? AND api_key_encrypted <=> ? \
+         AND inference_protocol <=> ? AND responses_reasoning_history <=> ? AND connection_id <=> ?",
+        [key.is_some(), protocol.is_some(), history.is_some(), connection.is_some()],
+    ))
+    .bind(user_id).bind(model_id).bind(model).bind(provider).bind(base_url)
+    .bind(key).bind(protocol).bind(history).bind(connection)
+    .fetch_optional(pool).await.map_err(internal_error)?;
+    if current.is_none() {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Model changed during connectivity check; check again",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ModelService for DatabaseModelService {
     async fn model_connection_operation(
@@ -4676,11 +4712,12 @@ impl ModelService for DatabaseModelService {
         crate::byok_endpoint::endpoint_client(&base_url)
             .await
             .map_err(|error| {
-                astra_core::error_response_coded(
-                    StatusCode::BAD_GATEWAY,
-                    error,
-                    "model_endpoint_network",
-                )
+                let (status, code) = if error.kind == astra_core::ErrorKind::InvalidRequest {
+                    (StatusCode::BAD_REQUEST, "model_endpoint_invalid")
+                } else {
+                    (StatusCode::BAD_GATEWAY, "model_endpoint_network")
+                };
+                astra_core::error_response_coded(status, error.message, code)
             })?;
         Ok(())
     }
@@ -4694,64 +4731,80 @@ impl ModelService for DatabaseModelService {
         if request.connection_id.is_some() || request.provider == crate::chatgpt::PROVIDER {
             return self.create_subscription_model(user_id, request).await;
         }
-        let name = validate_user_model_identifier("name", &request.name)?;
-        let model = validate_user_model_identifier("model", &request.model)?;
-        let provider = request.provider.trim().to_ascii_lowercase();
-        validate_inference_config(
-            &provider,
-            &QuirksData {
-                inference_protocol: request.inference_protocol,
-                responses_reasoning_history: request.responses_reasoning_history,
-                ..Default::default()
-            },
-        )
-        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-        let base_url = user_byok_base_url(&provider, request.base_url.as_deref())?;
-        #[cfg(any(test, feature = "e2e-hooks", feature = "external-contract-tests"))]
-        let base_url = match (provider.as_str(), self.deepseek_test_endpoint) {
-            ("deepseek", Some(endpoint)) => format!("http://{endpoint}"),
-            _ => base_url,
-        };
-        validate_context_window_value(request.context_window, "context_window")
+        // Only failures before the creation transaction can be retried
+        // without an ambiguous commit outcome.
+        let (name, model, provider, base_url, encrypted_key, pool) = async {
+            let name = validate_user_model_identifier("name", &request.name)?;
+            let model = validate_user_model_identifier("model", &request.model)?;
+            let provider = request.provider.trim().to_ascii_lowercase();
+            validate_inference_config(
+                &provider,
+                &QuirksData {
+                    inference_protocol: request.inference_protocol,
+                    responses_reasoning_history: request.responses_reasoning_history,
+                    ..Default::default()
+                },
+            )
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-        validate_user_model_api_key(&request.api_key)?;
-
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let duplicate =
-            query("SELECT 1 FROM user_llm_models WHERE user_id = ? AND model_alias = ? LIMIT 1")
-                .bind(&user_id)
-                .bind(&name)
-                .fetch_optional(&pool)
-                .await
-                .map_err(internal_error)?;
-        if duplicate.is_some() {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                format!("User model '{name}' already exists"),
-            ));
-        }
-
-        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-            crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
-                .await
+            let base_url = user_byok_base_url(&provider, request.base_url.as_deref())?;
+            #[cfg(any(test, feature = "e2e-hooks", feature = "external-contract-tests"))]
+            let base_url = match (provider.as_str(), self.deepseek_test_endpoint) {
+                ("deepseek", Some(endpoint)) => format!("http://{endpoint}"),
+                _ => base_url,
+            };
+            validate_context_window_value(request.context_window, "context_window")
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-        }
+            validate_user_model_api_key(&request.api_key)?;
 
-        let encrypted_key = self
-            .encryptor
-            .encrypt(&request.api_key)
+            let pool = self.get_pool().await.map_err(internal_error)?;
+            let duplicate = query(
+                "SELECT 1 FROM user_llm_models WHERE user_id = ? AND model_alias = ? LIMIT 1",
+            )
+            .bind(&user_id)
+            .bind(&name)
+            .fetch_optional(&pool)
+            .await
             .map_err(internal_error)?;
-        validate_connectivity_for_protocol(
-            &provider,
-            &model,
-            &request.api_key,
-            Some(&base_url),
-            None,
-            None,
-            request.inference_protocol,
-        )
+            if duplicate.is_some() {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!("User model '{name}' already exists"),
+                ));
+            }
+
+            if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+                crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
+                    .await
+                    .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+            }
+
+            let encrypted_key = self
+                .encryptor
+                .encrypt(&request.api_key)
+                .map_err(internal_error)?;
+            validate_connectivity_for_protocol(
+                &provider,
+                &model,
+                &request.api_key,
+                Some(&base_url),
+                None,
+                None,
+                request.inference_protocol,
+            )
+            .await
+            .map_err(|error| error.response(&provider, Some(&base_url)))?;
+
+            Ok::<_, (StatusCode, Json<ErrorResponse>)>((
+                name,
+                model,
+                provider,
+                base_url,
+                encrypted_key,
+                pool,
+            ))
+        }
         .await
-        .map_err(|error| error.response(&provider, Some(&base_url)))?;
+        .map_err(model_not_saved)?;
 
         let model_id = Uuid::new_v4().to_string();
         let mut tx = pool.begin().await.map_err(internal_error)?;
@@ -4931,7 +4984,7 @@ impl ModelService for DatabaseModelService {
                     )
                     .map_err(internal_error)?,
             };
-            validate_connectivity_for_protocol(
+            if let Err(error) = validate_connectivity_for_protocol(
                 &provider,
                 &model,
                 &api_key,
@@ -4941,7 +4994,10 @@ impl ModelService for DatabaseModelService {
                 inference_protocol,
             )
             .await
-            .map_err(|error| error.response(&provider, Some(&base_url)))?;
+            {
+                ensure_probed_user_model_is_current(&pool, &user_id, &existing).await?;
+                return Err(error.response(&provider, Some(&base_url)));
+            }
             Some(if request.api_key.is_some() {
                 self.encryptor.encrypt(&api_key).map_err(internal_error)?
             } else {
@@ -5109,7 +5165,7 @@ impl ModelService for DatabaseModelService {
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
         let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
-        validate_connectivity_for_protocol(
+        if let Err(error) = validate_connectivity_for_protocol(
             &provider,
             &model,
             &api_key,
@@ -5119,7 +5175,10 @@ impl ModelService for DatabaseModelService {
             inference_protocol,
         )
         .await
-        .map_err(|error| error.response(&provider, Some(&base_url)))?;
+        {
+            ensure_probed_user_model_is_current(&pool, &user_id, &row).await?;
+            return Err(error.response(&provider, Some(&base_url)));
+        }
         let protocol = model_thinking_protocol(inference_protocol, &provider, &base_url, &model);
         let result = probe_thinking_behavior_with_protocol(
             &provider,
@@ -6125,6 +6184,16 @@ fn validate_user_model_api_key(api_key: &str) -> Result<(), (StatusCode, Json<Er
     Ok(())
 }
 
+fn model_not_saved(
+    (status, Json(mut error)): (StatusCode, Json<ErrorResponse>),
+) -> (StatusCode, Json<ErrorResponse>) {
+    let metadata = error.metadata.get_or_insert_with(|| serde_json::json!({}));
+    if let Some(metadata) = metadata.as_object_mut() {
+        metadata.insert("model_saved".into(), serde_json::json!(false));
+    }
+    (status, Json(error))
+}
+
 fn user_model_not_found() -> (StatusCode, Json<ErrorResponse>) {
     error_response(StatusCode::NOT_FOUND, "User model not found")
 }
@@ -6400,7 +6469,9 @@ async fn validate_connectivity_for_protocol(
     // below, matching their runtime path without delegating destination DNS.
     let make_client = async || {
         let result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-            crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
+            crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default())
+                .await
+                .map_err(|error| error.message)
         } else {
             astra_core::net::apply_env_proxy(
                 reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
@@ -6767,7 +6838,9 @@ async fn probe_thinking_behavior_with_protocol_inner(
     }
 
     let client_result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-        crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
+        crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default())
+            .await
+            .map_err(|error| error.message)
     } else {
         astra_core::net::apply_env_proxy(
             reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),

@@ -1004,7 +1004,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         }
                     }
                     is_err = true;
-                    error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                    // Delivery failure does not erase the producer's execution
+                    // outcome, especially an uncertain timeout or cancellation.
+                    error_kind = error_kind.or(Some(astra_core::ErrorKind::ContractViolation));
                     (
                         PersistedRecordResult {
                             delivery_unavailable: false,
@@ -1026,7 +1028,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         if result_delivery_failed {
             execution_ok_on_delivery_error.get_or_insert(!is_err);
             is_err = true;
-            error_kind = Some(astra_core::ErrorKind::ContractViolation);
+            error_kind = error_kind.or(Some(astra_core::ErrorKind::ContractViolation));
         }
 
         // The final governed source is still complete here, even if persistence

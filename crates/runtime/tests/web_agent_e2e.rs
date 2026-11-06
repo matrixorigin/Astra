@@ -6507,8 +6507,9 @@ async fn responses_agent_uses_catalog_and_continues_persisted_session(
         } else {
             "sk-fixtureciphertextciphertextciphertext"
         };
-        let encoded =
-            astra_core::model_wire::responses::encode_opaque_reasoning(private.as_bytes());
+        let encoded = data_encoding::BASE32_NOPAD
+            .encode(private.as_bytes())
+            .to_ascii_lowercase();
         let resumed = post(
             &app,
             &format!("/sessions/{session_id}/resume?continuation_only=true"),

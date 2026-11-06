@@ -8345,6 +8345,10 @@ pub(crate) async fn run_tui_session(
                                     chat_widget.commit_system(history_cell::system::SystemCell::response("Model change saved. The model is unavailable in the current catalog; reopen /model to choose a usable model."));
                                 }
                             }
+                            Ok(super::model_setup::Outcome::CreateRejected { request, message }) => {
+                                chat_widget.commit_system(history_cell::system::SystemCell::error(message));
+                                super::model_setup::retry_model_form(&mut bottom_pane, request, owner);
+                            }
                             Ok(super::model_setup::Outcome::Removed) => {
                                 bottom_pane.clear_model_catalog();
                                 chat_widget.commit_system(history_cell::system::SystemCell::response("Personal model removed. Conversation history is retained. Use /model to select a usable model."));
@@ -11995,7 +11999,10 @@ pub(crate) async fn run_tui_session(
                                             action => {
                                                 model_setup_phase.reset();
                                                 model_setup_cancel = tokio_util::sync::CancellationToken::new();
-                                                let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                                                let owner = match &action {
+                                                    Action::Create { owner, .. } => owner.clone(),
+                                                    _ => crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                                                };
                                                 let epoch = state.session_attachment_epoch;
                                                 let api = api.clone();
                                                 let cancel = model_setup_cancel.clone();

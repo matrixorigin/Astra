@@ -217,6 +217,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert_eq!(error.1.0.error_code.as_deref(), Some(code));
+        assert_eq!(error.1.0.metadata.as_ref().unwrap()["model_saved"], false);
         assert!(
             service
                 .list_user_models(owner.clone())
@@ -272,6 +273,18 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         )
         .await
         .unwrap();
+    let duplicate = service
+        .create_user_model(
+            owner.clone(),
+            make_request("fixture", "deepseek-chat", "valid-key"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.0, StatusCode::CONFLICT);
+    assert_eq!(
+        duplicate.1.0.metadata.as_ref().unwrap()["model_saved"],
+        false
+    );
     hold.next.store(5, std::sync::atomic::Ordering::SeqCst);
     let failure = service
         .check_user_model(owner.clone(), created.model_id.clone())
@@ -284,6 +297,72 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         .unwrap();
     assert!(after.is_active);
     assert!(after.thinking_probe.is_none());
+    // A provider failure belongs to the snapshot actually probed. A later
+    // credential rotation must not make that old failure look current.
+    for update in [false, true] {
+        hold.next.store(2, std::sync::atomic::Ordering::SeqCst);
+        let stale = async {
+            if update {
+                service
+                    .update_user_model(
+                        owner.clone(),
+                        created.model_id.clone(),
+                        UserModelUpdateRequestData {
+                            api_key: Some("valid-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            } else {
+                service
+                    .check_user_model(owner.clone(), created.model_id.clone())
+                    .await
+            }
+        };
+        let rotate = async {
+            hold.started.notified().await;
+            let result = service
+                .update_user_model(
+                    owner.clone(),
+                    created.model_id.clone(),
+                    UserModelUpdateRequestData {
+                        api_key: Some("rotated-key".into()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            hold.release.notify_one();
+            result.unwrap();
+        };
+        let (stale, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(stale, rotate)
+        })
+        .await
+        .unwrap();
+        assert_eq!(stale.unwrap_err().0, StatusCode::CONFLICT);
+    }
+    let mut disposable = make_request("disposable", "deepseek-chat", "valid-key");
+    disposable.is_default = false;
+    let disposable = service
+        .create_user_model(owner.clone(), disposable)
+        .await
+        .unwrap();
+    hold.next.store(2, std::sync::atomic::Ordering::SeqCst);
+    let stale = service.check_user_model(owner.clone(), disposable.model_id.clone());
+    let delete = async {
+        hold.started.notified().await;
+        let result = service
+            .delete_user_model(owner.clone(), disposable.model_id.clone())
+            .await;
+        hold.release.notify_one();
+        result.unwrap();
+    };
+    let (stale, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(stale, delete)
+    })
+    .await
+    .unwrap();
+    assert_eq!(stale.unwrap_err().0, StatusCode::CONFLICT);
     // The selected protocol is durable configuration, independent of checks
     // and key encryption, and route identity follows the actual credential.
     use astra_core::model_wire::LlmProviderProtocol;
