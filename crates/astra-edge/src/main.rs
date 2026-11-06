@@ -1022,6 +1022,18 @@ async fn runtime() {
         if managed_background::shutdown_requested() {
             break;
         }
+        // A refreshed MOI command queues its token here. The open connection
+        // and its admitted work keep running; this only changes the credential
+        // the next attempt uses. A candidate that fails authentication falls
+        // back through the existing one-shot swap below.
+        if let Some(pending) = managed_background::read_pending_credential()
+            && config
+                .token_manager
+                .stage_unproven_candidate(pending.token)
+                .await
+        {
+            managed_background::remove_pending_credential(&pending.path);
+        }
         let edge_span = tracing::info_span!(
             "edge.agent",
             edge_id = %config.edge_id,
@@ -1769,5 +1781,149 @@ mod tests {
             token_from_credentials(&creds, Some("other")).unwrap(),
             ("other".to_string(), "other-token".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn refreshed_credential_leaves_admitted_work_running_when_it_cannot_authenticate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BlockingExecutor {
+            started: Arc<AtomicUsize>,
+            cancelled: Arc<AtomicUsize>,
+            finished: Arc<AtomicUsize>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        impl astra_edge::EdgeInvocationExecutor for BlockingExecutor {
+            fn execute(
+                &self,
+                _: astra_edge::EdgeInvocation,
+                cancel: CancellationToken,
+            ) -> futures_util::future::BoxFuture<'_, astra_tools::ToolResult> {
+                let started = self.started.clone();
+                let cancelled = self.cancelled.clone();
+                let finished = self.finished.clone();
+                let release = self.release.clone();
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            cancelled.fetch_add(1, Ordering::SeqCst);
+                        }
+                        _ = release.notified() => {}
+                    }
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    astra_tools::ToolResult::text("done".to_string())
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let executor = Arc::new(BlockingExecutor {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+            finished: finished.clone(),
+            release: release.clone(),
+        });
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let workspace = directory.path().to_owned();
+        let journal = directory.path().join("journal.json");
+        let server = tokio::spawn(async move {
+            let context = astra_edge::EdgeConnectionContext {
+                account_id: "user".into(),
+                edge_agent_id: "edge".into(),
+                workspace_dir: workspace,
+                journal_path: journal,
+                ready: None,
+            };
+            let mut owner = astra_edge::EdgeInvocationOwner::open(&context, executor)
+                .await
+                .unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
+                .await
+                .unwrap();
+            let result = owner
+                .serve_connection(socket, context, server_shutdown.clone(), None)
+                .await;
+            if !server_shutdown.is_cancelled() {
+                result.expect("connection ended before the test released it");
+            }
+        });
+
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+            "user", "session", "run", "turn", "call",
+        )
+        .unwrap();
+        let request = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+            request_id: identity.storage_key(),
+            identity: Box::new(identity),
+            delivery_generation: 1,
+            tool: "native_provider".into(),
+            args: serde_json::json!({}),
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            timeout_secs: Some(60),
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
+            execution_ceiling: None,
+        };
+        client
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted work did not start");
+
+        let token_file = directory.path().join("token");
+        token_renewal::write_token_atomic(&token_file, "working-token").unwrap();
+        let manager =
+            token_manager::TokenManager::new("working-token".into(), None, token_file.clone());
+        assert!(
+            manager
+                .stage_unproven_candidate("rejected-token".into())
+                .await
+        );
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, "working-token");
+        assert_eq!(
+            std::fs::read_to_string(&token_file).unwrap(),
+            "working-token"
+        );
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while finished.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted work did not finish");
+        assert_eq!(cancelled.load(Ordering::SeqCst), 0);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

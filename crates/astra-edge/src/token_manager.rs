@@ -178,6 +178,38 @@ impl TokenManager {
         RenewApply::Applied
     }
 
+    /// Try `candidate` on the next connection without writing it to the token
+    /// file. The credential that is current now becomes the one-shot fallback,
+    /// so a candidate that cannot authenticate does not replace a working one.
+    /// Returns false when the candidate cannot be staged; the caller keeps any
+    /// queued copy and retries.
+    pub async fn stage_unproven_candidate(&self, candidate: String) -> bool {
+        if candidate.is_empty() {
+            return false;
+        }
+        let mut state = self.state.lock().await;
+        if state.current == candidate {
+            return true;
+        }
+        if state.dirty {
+            match write_token_atomic(&self.token_file, &state.current) {
+                Ok(()) => state.dirty = false,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra.edge",
+                        path = %self.token_file.display(),
+                        error = %error,
+                        "kept the working edge token; the refreshed credential was not staged"
+                    );
+                    return false;
+                }
+            }
+        }
+        let previous = std::mem::replace(&mut state.current, candidate);
+        state.fallback = Some(previous);
+        true
+    }
+
     /// Swap to the one-shot fallback credential after a permanent auth
     /// failure. Returns false when no fallback is available (caller gives up).
     /// The fallback is not persisted here: it must prove itself first
@@ -520,6 +552,24 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), a);
         // Second failure: no more candidates.
         assert!(!manager.swap_to_fallback().await);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn unproven_candidate_restores_the_working_token_without_writing_it() {
+        let working = make_moi_token(100, 200, "working");
+        let rejected = make_moi_token(300, 400, "rejected");
+        let path = temp_token_path("stage");
+        write_token_atomic(&path, &working).unwrap();
+        let manager = TokenManager::new(working.clone(), None, path.clone());
+        assert!(manager.stage_unproven_candidate(rejected.clone()).await);
+        assert_eq!(manager.snapshot().await, rejected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), working);
+        assert!(manager.retry_persist().await);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), working);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, working);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), working);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
