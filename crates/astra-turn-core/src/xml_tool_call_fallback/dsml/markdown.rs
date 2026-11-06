@@ -8,6 +8,7 @@ pub(super) enum Container {
     List(usize),
 }
 
+#[derive(Debug)]
 pub(super) struct Prefix {
     pub end: usize,
     pub indented: bool,
@@ -337,4 +338,18 @@ pub(super) fn may_interrupt(text: &str) -> bool {
         .take(4)
         .find(|ch| !matches!(ch, ' ' | '\t'))
         .is_none_or(|ch| !ch.is_alphabetic())
+}
+
+/// Probe a resolved container prefix only through its first inline payload.
+/// Ordinary numbered/bulleted/heading text need not wait for newline or EOF.
+/// Marker-only input remains ambiguous; its scan cursor is checkpointed.
+pub(super) fn classification_end(text: &str, start: usize, finish: bool) -> Option<usize> {
+    text[start..]
+        .char_indices()
+        .find(|(_, ch)| {
+            *ch == '\n'
+                || (!ch.is_whitespace() && !matches!(ch, '#' | '*' | '-' | '_' | '=' | '~' | '`'))
+        })
+        .map(|(at, ch)| start + at + ch.len_utf8())
+        .or_else(|| finish.then_some(text.len()))
 }

@@ -1,31 +1,19 @@
-//! Incremental grammar for reserved DSML tags. Both complete and fragmented
-//! input take this path; each byte is inspected once while a tag is pending.
-
-use super::Kind;
+//! One resumable lexical grammar for tool markup and surrounding HTML.
+//! Each pending tag byte is consumed once, including quoted attributes.
+use super::{Family, Kind};
 
 const MARKERS: [&str; 4] = ["｜DSML｜", "｜｜DSML｜｜", "|DSML|", "||DSML||"];
-const NAMES: [(&str, Kind); 5] = [
-    ("tool_calls", Kind::Calls),
-    ("function_calls", Kind::Calls),
-    ("calls", Kind::Calls),
-    ("invoke", Kind::Invoke),
-    ("parameter", Kind::Parameter),
-];
 
 #[derive(Debug, Default)]
 enum Stage {
     #[default]
-    Slash,
-    Marker,
-    MarkerWord {
+    Start,
+    Marker {
         candidates: u8,
         position: usize,
     },
+    NameStart,
     Name,
-    NameWord {
-        candidates: u8,
-        position: usize,
-    },
     Attributes,
 }
 
@@ -34,52 +22,108 @@ pub(super) struct Scanner {
     checked: usize,
     stage: Stage,
     closing: bool,
-    reserved: bool,
-    kind: Option<Kind>,
+    family: Family,
+    name: String,
+    quote: Option<char>,
 }
 
 pub(super) enum Scan {
     Pending,
     Ordinary,
     Incomplete,
+    Opaque {
+        end: usize,
+        terminator: &'static str,
+    },
+    Html {
+        end: usize,
+        name: String,
+        closing: bool,
+    },
     Tag {
         end: usize,
         kind: Kind,
+        family: Family,
         closing: bool,
     },
 }
 
 impl Scanner {
+    fn complete(&self, end: usize, text: &str) -> Scan {
+        let kind = match self.name.as_str() {
+            "invoke" => Some(Kind::Invoke),
+            "parameter" => Some(Kind::Parameter),
+            "tool_call" if self.family == Family::Bare => Some(Kind::ToolCall),
+            "tool_calls" | "function_calls" | "calls" if self.family == Family::Dsml => {
+                Some(Kind::Calls)
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            Scan::Tag {
+                end,
+                kind,
+                family: self.family,
+                closing: self.closing,
+            }
+        } else if self.family == Family::Dsml {
+            Scan::Ordinary
+        } else {
+            use pulldown_cmark::{Event, Parser};
+            if Parser::new(&text[..end])
+                .any(|event| matches!(event, Event::Html(_) | Event::InlineHtml(_)))
+            {
+                Scan::Html {
+                    end,
+                    name: self.name.clone(),
+                    closing: self.closing,
+                }
+            } else {
+                Scan::Ordinary
+            }
+        }
+    }
+
     pub(super) fn scan(&mut self, text: &str, finish: bool) -> Scan {
         if self.checked == 0 {
-            debug_assert!(text.starts_with('<'));
+            for (opener, terminator) in [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")] {
+                if text.starts_with(opener) {
+                    return Scan::Opaque {
+                        end: opener.len(),
+                        terminator,
+                    };
+                }
+                if opener.starts_with(text) && !finish {
+                    return Scan::Pending;
+                }
+            }
             self.checked = 1;
         }
         for (index, ch) in text[self.checked..].char_indices() {
             let end = self.checked + index + ch.len_utf8();
             match &mut self.stage {
-                Stage::Slash if ch.is_whitespace() => {}
-                Stage::Slash if ch == '/' => {
+                Stage::Start if ch.is_whitespace() => {}
+                Stage::Start if ch == '/' && !self.closing => {
                     self.closing = true;
-                    self.stage = Stage::Marker;
                 }
-                Stage::Slash | Stage::Marker => {
-                    if ch.is_whitespace() {
-                        continue;
-                    }
+                Stage::Start => {
                     let candidates = MARKERS.iter().enumerate().fold(0, |bits, (i, marker)| {
                         bits | if marker.starts_with(ch) { 1 << i } else { 0 }
                     });
-                    if candidates == 0 {
+                    if candidates != 0 {
+                        self.family = Family::Dsml;
+                        self.stage = Stage::Marker {
+                            candidates,
+                            position: 1,
+                        };
+                    } else if ch.is_ascii_alphabetic() || ch == '!' {
+                        self.name.push(ch.to_ascii_lowercase());
+                        self.stage = Stage::Name;
+                    } else {
                         return Scan::Ordinary;
                     }
-                    self.reserved = true;
-                    self.stage = Stage::MarkerWord {
-                        candidates,
-                        position: 1,
-                    };
                 }
-                Stage::MarkerWord {
+                Stage::Marker {
                     candidates,
                     position,
                 } => {
@@ -100,83 +144,49 @@ impl Scanner {
                         return Scan::Ordinary;
                     }
                     if complete {
-                        self.stage = Stage::Name;
+                        self.stage = Stage::NameStart;
                     } else {
                         *candidates = remaining;
                         *position += 1;
                     }
                 }
-                Stage::Name if ch.is_whitespace() => {}
-                Stage::Name => {
-                    let candidates = NAMES.iter().enumerate().fold(0, |bits, (i, (name, _))| {
-                        bits | if name.chars().next().unwrap().eq_ignore_ascii_case(&ch) {
-                            1 << i
-                        } else {
-                            0
-                        }
-                    });
-                    if candidates == 0 {
+                Stage::NameStart if ch.is_whitespace() => {}
+                Stage::NameStart => {
+                    if !ch.is_ascii_alphabetic() {
                         return Scan::Ordinary;
                     }
-                    self.stage = Stage::NameWord {
-                        candidates,
-                        position: 1,
-                    };
+                    self.name.push(ch.to_ascii_lowercase());
+                    self.stage = Stage::Name;
                 }
-                Stage::NameWord {
-                    candidates,
-                    position,
-                } => {
-                    if ch.is_whitespace() || matches!(ch, '/' | '>') {
-                        let Some((_, kind)) =
-                            NAMES.iter().enumerate().find_map(|(i, (name, kind))| {
-                                (*candidates & (1 << i) != 0 && name.len() == *position)
-                                    .then_some((name, *kind))
-                            })
-                        else {
-                            return Scan::Ordinary;
-                        };
-                        self.kind = Some(kind);
-                        if ch == '>' {
-                            return Scan::Tag {
-                                end,
-                                kind,
-                                closing: self.closing,
-                            };
-                        }
+                Stage::Name => {
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.') {
+                        self.name.push(ch.to_ascii_lowercase());
+                    } else if ch == '>' {
+                        return self.complete(end, text);
+                    } else if ch.is_whitespace() || ch == '/' {
                         self.stage = Stage::Attributes;
                     } else {
-                        let remaining = NAMES.iter().enumerate().fold(0, |bits, (i, (name, _))| {
-                            bits | if *candidates & (1 << i) != 0
-                                && name.as_bytes().get(*position).is_some_and(|expected| {
-                                    ch.is_ascii() && expected.eq_ignore_ascii_case(&(ch as u8))
-                                }) {
-                                1 << i
-                            } else {
-                                0
-                            }
-                        });
-                        if remaining == 0 {
-                            return Scan::Ordinary;
-                        }
-                        *candidates = remaining;
-                        *position += 1;
+                        return Scan::Ordinary;
                     }
                 }
-                Stage::Attributes if ch == '<' => return Scan::Ordinary,
-                Stage::Attributes if ch == '>' => {
-                    return Scan::Tag {
-                        end,
-                        kind: self.kind.unwrap(),
-                        closing: self.closing,
-                    };
+                Stage::Attributes => {
+                    if let Some(quote) = self.quote {
+                        if ch == quote {
+                            self.quote = None;
+                        }
+                    } else if matches!(ch, '\'' | '"') {
+                        self.quote = Some(ch);
+                    } else if ch == '>' {
+                        return self.complete(end, text);
+                    } else if ch == '<' {
+                        return Scan::Ordinary;
+                    }
                 }
-                Stage::Attributes => {}
             }
         }
         self.checked = text.len();
         if finish {
-            if self.reserved {
+            if self.family == Family::Dsml {
                 Scan::Incomplete
             } else {
                 Scan::Ordinary

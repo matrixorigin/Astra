@@ -42,9 +42,11 @@ const MAX_NON_XML_RATIO: f64 = 0.20;
 /// { "id": "...", "type": "function", "function": { "name": "...", "arguments": "{...}" } }
 /// ```
 pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
-    let calls = select_non_overlapping(parse_invokes_with_positions(text, &dsml::decode(text)))
+    let calls = dsml::decode(text)
+        .calls
         .into_iter()
-        .map(|parsed| parsed.call)
+        .filter(|call| call.format == DegradedCallFormat::Invoke)
+        .map(|call| call.call)
         .collect::<Vec<_>>();
     (!calls.is_empty()).then_some(calls)
 }
@@ -53,10 +55,7 @@ pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
 /// before it is rendered or embedded in an interruption message.
 #[must_use]
 pub fn filter_dsml_tool_call_markup_for_display(text: &str) -> String {
-    let mut filter = DsmlToolCallStreamFilter::default();
-    let mut visible = filter.push(text);
-    visible.push_str(&filter.finish());
-    visible
+    dsml::project_complete(text).text
 }
 
 // ─── <tool_call> Fallback ────────────────────────────────────────────────────
@@ -185,7 +184,7 @@ fn extract_balanced_braces(s: &str) -> Option<&str> {
     None
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DegradedCallFormat {
     Invoke,
     ToolCallTag,
@@ -210,102 +209,6 @@ struct ParsedDegradedResponse {
     /// these same ranges, so it cannot remove a candidate rejected by the
     /// parse/ambiguity policy.
     strip_ranges: Vec<Range<usize>>,
-}
-
-fn next_invoke_start(text: &str, from: usize) -> Option<usize> {
-    text[from..].find("<invoke").map(|offset| from + offset)
-}
-
-fn invoke_block_end(text: &str, start: usize) -> usize {
-    let tail = &text[start..];
-    let plain_close = tail
-        .find("</invoke>")
-        .map(|offset| start + offset + "</invoke>".len());
-    let self_close = tail.find("/>").map(|offset| start + offset + 2);
-    [plain_close, self_close]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(text.len())
-}
-
-fn parse_invokes_with_positions(text: &str, decoded: &dsml::Decoded) -> Vec<ParsedDegradedCall> {
-    let mut calls = decoded
-        .calls
-        .iter()
-        .cloned()
-        .map(|(span, call)| ParsedDegradedCall {
-            span,
-            format: DegradedCallFormat::Invoke,
-            call,
-            explicit_dsml: true,
-        })
-        .collect::<Vec<_>>();
-    let mut search_from = 0;
-    while let Some(start) = next_invoke_start(text, search_from) {
-        let end = invoke_block_end(text, start);
-        if decoded.owned.iter().any(|span| span.contains(&start)) {
-            search_from = end.max(start + 1);
-            continue;
-        }
-        let block = &text[start..end];
-        if (block.ends_with("</invoke>") || block.ends_with("/>"))
-            && let Some(call) = parse_single_invoke(block)
-        {
-            let span = start..end;
-            calls.push(ParsedDegradedCall {
-                explicit_dsml: false,
-                span,
-                format: DegradedCallFormat::Invoke,
-                call,
-            });
-        }
-        // Always move forward, including malformed blocks, so a bad block
-        // cannot make the fallback parser spin forever.
-        search_from = end.max(start.saturating_add(1));
-    }
-    calls
-}
-
-fn parse_tool_call_tags_with_positions(
-    text: &str,
-    owned: &[Range<usize>],
-) -> Vec<ParsedDegradedCall> {
-    if !text.contains("<tool_call>") {
-        return Vec::new();
-    }
-
-    let mut calls = Vec::new();
-    let mut search_from = 0;
-    while let Some(start_offset) = text[search_from..].find("<tool_call>") {
-        let start = search_from + start_offset;
-        let content_start = start + "<tool_call>".len();
-        let end = text[content_start..]
-            .find("</tool_call>")
-            .map(|offset| content_start + offset + "</tool_call>".len())
-            .or_else(|| {
-                text[content_start..]
-                    .find("<tool_call>")
-                    .map(|offset| content_start + offset)
-            })
-            .unwrap_or(text.len());
-        let inner = text[content_start..end]
-            .trim_end_matches("</tool_call>")
-            .replace('\0', "");
-        if !owned.iter().any(|span| span.contains(&start))
-            && let Some(call) = parse_single_tool_call_tag(inner.trim())
-        {
-            calls.push(ParsedDegradedCall {
-                span: start..end,
-                format: DegradedCallFormat::ToolCallTag,
-                call,
-                explicit_dsml: false,
-            });
-        }
-        search_from = end.max(start.saturating_add(1));
-    }
-
-    calls
 }
 
 fn degraded_call_identity(call: &Value) -> Option<(String, String)> {
@@ -381,10 +284,7 @@ fn remove_ranges(text: &str, ranges: &[Range<usize>]) -> String {
 }
 
 fn parse_degraded_response(text: &str) -> ParsedDegradedResponse {
-    let decoded = dsml::decode(text);
-    let mut candidates = parse_invokes_with_positions(text, &decoded);
-    candidates.extend(parse_tool_call_tags_with_positions(text, &decoded.owned));
-    let candidates = select_non_overlapping(candidates);
+    let candidates = dsml::decode(text).calls;
     let bare_suffix = bare_invokes_form_terminal_suffix(text, &candidates);
     let accepted_invokes: Vec<ParsedDegradedCall> = candidates
         .iter()
@@ -401,11 +301,6 @@ fn parse_degraded_response(text: &str) -> ParsedDegradedResponse {
     let mut tool_tags = candidates
         .into_iter()
         .filter(|candidate| candidate.format == DegradedCallFormat::ToolCallTag)
-        .filter(|tag| {
-            !accepted_invoke_ranges
-                .iter()
-                .any(|invoke| tag.span.start < invoke.end && invoke.start < tag.span.end)
-        })
         .collect::<Vec<_>>();
 
     // Apply the ambiguity guard only to residual text outside accepted invoke
@@ -439,28 +334,22 @@ fn parse_degraded_response(text: &str) -> ParsedDegradedResponse {
     let mut calls = Vec::with_capacity(parsed.len());
     // One occurrence can cancel at most one occurrence from the other syntax
     // family. Same-family duplicates remain intact.
-    let mut seen_identities = Vec::<(DegradedCallFormat, (String, String), usize)>::new();
+    let mut seen_identities =
+        std::collections::HashMap::<(DegradedCallFormat, (String, String)), usize>::new();
     for entry in &parsed {
-        let identity = degraded_call_identity(&entry.call);
         let mut duplicate = false;
-        if let Some(identity) = identity.as_ref() {
-            let current_count = seen_identities
-                .iter()
-                .find(|(format, seen, _)| *format == entry.format && *seen == *identity)
-                .map(|(_, _, count)| *count)
+        if let Some(identity) = degraded_call_identity(&entry.call) {
+            let other = match entry.format {
+                DegradedCallFormat::Invoke => DegradedCallFormat::ToolCallTag,
+                DegradedCallFormat::ToolCallTag => DegradedCallFormat::Invoke,
+            };
+            let other_count = seen_identities
+                .get(&(other, identity.clone()))
+                .copied()
                 .unwrap_or(0);
-            let other_available = seen_identities.iter().any(|(format, seen, count)| {
-                *format != entry.format && *seen == *identity && *count > 0
-            });
-            duplicate = current_count == 0 && other_available;
-            if let Some((_, _, count)) = seen_identities
-                .iter_mut()
-                .find(|(format, seen, _)| *format == entry.format && *seen == *identity)
-            {
-                *count += 1;
-            } else {
-                seen_identities.push((entry.format, identity.clone(), 1));
-            }
+            let occurrence = seen_identities.entry((entry.format, identity)).or_default();
+            *occurrence += 1;
+            duplicate = other_count >= *occurrence;
         }
         if !duplicate {
             calls.push(entry.call.clone());
@@ -502,23 +391,31 @@ pub fn strip_degraded_tool_calls(text: &str) -> String {
     let after_accepted = remove_ranges(text, &parsed.strip_ranges);
     // DSML owns its parameter bytes. Remove protocol spans before the legacy
     // bare-XML cleanup can interpret markup inside an argument as answer text.
-    let after_dsml = filter_dsml_tool_call_markup_for_display(&after_accepted);
-    let after_truncated_tail = strip_truncated_degraded_tool_call_tail(&after_dsml);
-    strip_residual_xml_fragments(&after_truncated_tail)
-}
-
-fn strip_truncated_degraded_tool_call_tail(text: &str) -> String {
-    let Some(start) = truncated_degraded_tool_call_tail_start(text) else {
-        return text.to_string();
+    let projection = dsml::project_complete(&after_accepted);
+    let text = if let Some(start) =
+        truncated_degraded_tool_call_tail_start(&projection.text, &projection.literal)
+    {
+        projection.text[..start].trim_end()
+    } else {
+        &projection.text
     };
-    text[..start].trim_end().to_string()
+    strip_residual_outside_literals(text, &projection.literal)
 }
 
-fn truncated_degraded_tool_call_tail_start(text: &str) -> Option<usize> {
+fn in_literal(ranges: &[Range<usize>], pos: usize) -> bool {
+    ranges
+        .get(ranges.partition_point(|range| range.end <= pos))
+        .is_some_and(|range| range.contains(&pos))
+}
+
+fn truncated_degraded_tool_call_tail_start(text: &str, literal: &[Range<usize>]) -> Option<usize> {
     ["<invoke", "<tool_call"]
         .into_iter()
         .filter_map(|marker| text.rfind(marker).map(|pos| (marker, pos)))
         .filter(|(marker, pos)| {
+            if in_literal(literal, *pos) {
+                return false;
+            }
             let tail = &text[*pos..];
             let closing = if *marker == "<invoke" {
                 "</invoke>"
@@ -554,11 +451,45 @@ fn tail_looks_like_tool_block(tail: &str) -> bool {
 ///
 /// Without this cleanup, the user sees raw tool-call markup leaking into the
 /// transcript alongside the assistant's natural-language response.
+#[cfg(test)]
 fn strip_residual_xml_fragments(text: &str) -> String {
+    strip_residual_outside_literals(text, &[])
+}
+
+fn strip_residual_outside_literals(text: &str, literal: &[Range<usize>]) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut changed = false;
+    let mut append = |run: &str, output: &mut String| {
+        if let Some(clean) = cleanup_residual_run(run) {
+            changed = true;
+            output.push_str(&clean);
+        } else {
+            output.push_str(run);
+        }
+    };
+    for range in literal {
+        if range.start >= text.len() {
+            break;
+        }
+        append(&text[cursor..range.start], &mut output);
+        let end = range.end.min(text.len());
+        output.push_str(&text[range.start..end]);
+        cursor = end;
+    }
+    append(&text[cursor..], &mut output);
+    if changed {
+        output.trim().to_owned()
+    } else {
+        output
+    }
+}
+
+fn cleanup_residual_run(text: &str) -> Option<String> {
     use regex::Regex;
 
     if !text.contains("<parameter=") && !text.contains("<function=") {
-        return text.to_string();
+        return None;
     }
 
     // `<parameter=KEY>` or `<parameter=KEY>VALUE` — strip tag and the
@@ -570,6 +501,9 @@ fn strip_residual_xml_fragments(text: &str) -> String {
     static RE_FUNC: OnceLock<Regex> = OnceLock::new();
     let re_func = RE_FUNC.get_or_init(|| Regex::new(r"<function=[^>]+>").unwrap());
 
+    if !re_param.is_match(text) && !re_func.is_match(text) {
+        return None;
+    }
     let mut result = re_param.replace_all(text, "").to_string();
     result = re_func.replace_all(&result, "").to_string();
 
@@ -583,7 +517,7 @@ fn strip_residual_xml_fragments(text: &str) -> String {
     let re_blank = RE_BLANK.get_or_init(|| Regex::new(r"\n{3,}").unwrap());
     result = re_blank.replace_all(&result, "\n\n").to_string();
 
-    result.trim().to_string()
+    Some(result)
 }
 
 // ─── <invoke> Parsing Helpers ───────────────────────────────────────────────
@@ -1032,6 +966,89 @@ mod tests {
             }
             published.push_str(&filter.finish());
             assert_eq!(published, visible);
+        }
+    }
+
+    #[test]
+    fn degraded_markup_never_promotes_literal_or_owned_nested_calls() {
+        let call = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        let legacy = "<tool_call>bash)(pwd)</tool_call>";
+        for text in [
+            format!("<pre>\n{call}\n</pre>\n"),
+            format!("<!-- {call} -->"),
+            format!("<code>{call}</code>"),
+            format!("<invoke name=\"\">{call}</invoke>"),
+            format!("<parameter name=\"example\">{call}</parameter>"),
+            format!("<|DSML|parameter name=\"example\">{legacy}</|DSML|parameter>"),
+            format!("<|DSML|calls>{legacy}</|DSML|calls>"),
+        ] {
+            assert!(
+                parse_degraded_tool_calls(&text).is_none(),
+                "nested example executed: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn degraded_markup_html_lifetimes_preserve_later_real_calls() {
+        let call = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        for (prefix, literal) in [
+            ("<pre>\nexample\n</pre>\n", false),
+            ("<!--\nexample\n-->\n", false),
+            ("<pre>\nexample\n</pre>\n    ", true),
+            ("<!--\nexample\n-->\n    ", true),
+            ("<div>\nexample\n</div>\n", true),
+            ("<div>\nexample\n</div>\n\n", false),
+            ("> <pre>\n> example\n", false),
+            ("> <!--\n> example\n", false),
+            ("Answer <code>example</code>. ", false),
+            ("Answer <br>", false),
+        ] {
+            let text = format!("{prefix}{call}");
+            let calls = parse_degraded_tool_calls(&text).unwrap_or_default();
+            let actual = calls
+                .iter()
+                .map(|call| call["function"]["name"].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                if literal { vec![] } else { vec![Some("bash")] },
+                "{text:?}"
+            );
+            let expected = if literal {
+                text.clone()
+            } else {
+                prefix.to_owned()
+            };
+            assert_eq!(strip_degraded_tool_calls(&text), expected);
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut visible = String::new();
+            for ch in text.chars() {
+                visible.push_str(&filter.push(&ch.to_string()));
+            }
+            visible.push_str(&filter.finish());
+            assert_eq!(visible, expected);
+        }
+        for text in [
+            "<!--\n<invoke name=\"bash\">\n-->",
+            "Text <code><parameter=example> pwd</code>.",
+        ] {
+            assert_eq!(strip_degraded_tool_calls(text), text);
+        }
+    }
+
+    #[test]
+    fn degraded_markup_mixed_unrecoverable_scopes_remain_bounded() {
+        for inner in ["<invoke/>", "<tool_call/>"] {
+            for pairs in [8_000, 16_000, 32_000] {
+                let text = format!("{}{}", "<|DSML|invoke/>".repeat(pairs), inner.repeat(pairs));
+                let started = std::time::Instant::now();
+                assert!(parse_degraded_tool_calls(&text).is_none());
+                eprintln!(
+                    "mixed malformed {inner} scopes {pairs}: {:?}",
+                    started.elapsed()
+                );
+            }
         }
     }
 

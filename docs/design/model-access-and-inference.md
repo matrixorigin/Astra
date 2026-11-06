@@ -1044,25 +1044,34 @@ deduplication keep their independent contracts.
 
 The OpenAI-compatible response boundary uses the existing turn-core tool-call
 decoder for explicit DeepSeek DSML emitted in the text channel. Call recovery
-and streaming/final visible-text projection share one DSML lexer. It recognizes
+and streaming/final visible-text projection share one markup lexer. It recognizes
 `tool_calls`, `function_calls`, and V4.1 `calls` wrappers with the published
 single-delimiter format and the observed doubled-delimiter spelling. Markdown
 code spans, quote/list-contained fences, and indented code remain literal data.
+HTML elements, comments, CDATA and processing instructions also own literal
+content. CommonMark determines HTML block lifetimes; matching inline elements
+and quote/list exits release that context so a later real call can be recovered.
 Container prefixes and reserved tags use resumable cursors, with completed
 prefix bytes checkpointed across chunks. One exact incremental grammar owns
-both complete and partial DSML tag recognition; suffixed names such as
+both complete and partial tag recognition; suffixed DSML names such as
 `invoke-example` are ordinary text. A fence consumes only its opening containers;
 blank lines may omit list indentation without ending that fence. Tabs retain
 physical columns and virtual padding; active inline spans ignore block indentation.
 Indented paragraph continuations retain their inline delimiter state; actual
 indented code blocks remain literal.
-Parameter bodies are not independent tool-call sources. Every invocation owns
-its full subtree before name/argument validation, including malformed unnamed
-openers and nested wrappers; nested content cannot escape as another call.
+DSML, bare `invoke`/`parameter`, and legacy `tool_call` tags share one indexed
+scope stack. Parameter bodies are not independent tool-call sources. Every
+invocation owns its full subtree before name/argument validation, including
+malformed unnamed openers and nested wrappers from another syntax family;
+nested content cannot escape as another call. Only DSML invocations can be
+recovered independently inside a DSML calls wrapper.
 Complete-input scans use a cursor and compact once per batch; long indentation,
 delimiter runs, closing-fence whitespace, and unfinished tags do not rescan their
-accumulated prefix on each delta. DSML projection precedes legacy bare-XML cleanup
-so argument markup cannot consume answer text. Escaped tag openers and their
+accumulated prefix on each delta. Candidate decoding walks the ordered tokens
+instead of rescanning earlier families' owned ranges for each candidate.
+DSML projection precedes legacy bare-XML cleanup, and carries literal ranges
+through that cleanup so argument markup cannot consume answer text and examples
+remain unchanged. Escaped tag openers and their
 matching markup are literal scopes within their CommonMark block, never
 executable invocations. An unmatched escaped opener cannot absorb a real call in
 a later block. Per-kind scope
@@ -1071,9 +1080,11 @@ Physical line-prefix state follows every byte consumed, including newlines insid
 tags. List context survives continuation lines; unmatched inline delimiters end at
 their CommonMark block boundary. The existing CommonMark parser determines
 paragraph continuation, heading boundaries and new container facts rather than a
-second set of block rules. Lines beginning with punctuation, digits or indentation
-wait for the line boundary for classification; ordinary leading-letter prose continues
-streaming, and this does not change tool dispatch or admission.
+second set of block rules. Structural prefixes are classified through their
+first inline payload character: ordinary list, heading and punctuation-led
+prose streams before newline or EOF. Ambiguous marker-only prefixes remain
+pending until their structure can be determined. This does not change tool
+dispatch or admission.
 
 Native structured calls take precedence. Recovered calls remain subject to the
 exact request tool surface and the ordinary argument, capability, policy and

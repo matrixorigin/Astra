@@ -1,11 +1,12 @@
-//! DSML token boundaries shared by call recovery and visible-text projection.
-//! Markdown literals are data; only explicit protocol tags outside them carry
+//! Markup token boundaries shared by call recovery and visible-text projection.
+//! Markdown and HTML literals are data; only explicit protocol tags outside them carry
 //! tool intent. Raw provider bytes remain available to the existing admission
 //! path, including named calls whose arguments cannot be decoded.
 
 use serde_json::{Value, json};
 use std::{ops::Range, sync::Arc};
 
+mod html;
 mod markdown;
 mod tag;
 use markdown::Container;
@@ -16,11 +17,22 @@ enum Kind {
     Calls,
     Invoke,
     Parameter,
+    ToolCall,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Family {
+    #[default]
+    Bare,
+    Dsml,
 }
 
 #[derive(Debug)]
 struct Tag {
     kind: Kind,
+    family: Family,
+    recoverable: bool,
+    visible: bool,
     closing: bool,
     span: Range<usize>,
     raw: String,
@@ -29,7 +41,11 @@ struct Tag {
 }
 
 enum Fragment {
-    Text { text: String, visible: bool },
+    Text {
+        text: String,
+        visible: bool,
+        literal: bool,
+    },
     Tag(Tag),
     Incomplete,
 }
@@ -50,6 +66,9 @@ struct Lexer {
     fence_containers: Arc<[Container]>,
     prefix_cursor: markdown::Cursor,
     tag_scanner: Option<tag::Scanner>,
+    prepared_prefix: Option<markdown::Prefix>,
+    html: html::Context,
+    opaque: Option<Opaque>,
     delimiter_run: usize,
     fence_close_candidate: bool,
     literal: Option<(char, usize, bool)>,
@@ -59,49 +78,77 @@ struct Lexer {
 }
 
 #[derive(Debug)]
-struct Scope {
-    kind: Kind,
-    previous_same: Option<usize>,
-    literal: bool,
+struct Opaque {
+    terminator: &'static str,
+    containers: Arc<[Container]>,
 }
 
-/// Each push/pop updates a per-kind index. Missing closers take constant time;
-/// matching a parent pops each intervening scope at most once.
+#[derive(Debug)]
+struct Scope {
+    kind: Kind,
+    family: Family,
+    previous_same: Option<usize>,
+    literal: bool,
+    hidden: bool,
+}
+
+/// One indexed stack owns every protocol family before candidate validation.
+/// A parameter or invocation is opaque to independent nested recovery.
 #[derive(Debug, Default)]
 struct Scopes {
     frames: Vec<Scope>,
-    last: [Option<usize>; 3],
+    last: [Option<usize>; 8],
+    blocking: usize,
 }
-
 impl Scopes {
     fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
-    fn kind(&self) -> Option<Kind> {
-        self.frames.last().map(|scope| scope.kind)
+    fn kind(&self) -> Option<(Family, Kind)> {
+        self.frames.last().map(|scope| (scope.family, scope.kind))
     }
     fn visible(&self) -> bool {
-        self.frames.last().is_none_or(|scope| scope.literal)
+        self.frames.last().is_none_or(|scope| !scope.hidden)
     }
-    fn push(&mut self, kind: Kind, literal: bool) {
-        let previous_same = self.last[kind as usize];
-        self.last[kind as usize] = Some(self.frames.len());
+    fn literal(&self) -> bool {
+        self.frames.last().is_some_and(|scope| scope.literal)
+    }
+    fn markdown_active(&self) -> bool {
+        self.is_empty() || self.literal()
+    }
+    fn allows_call(&self, family: Family, kind: Kind) -> bool {
+        self.blocking == 0 && (self.is_empty() || (family == Family::Dsml && kind == Kind::Invoke))
+    }
+    fn push(&mut self, family: Family, kind: Kind, literal: bool) {
+        let key = family as usize * 4 + kind as usize;
+        let previous_same = self.last[key];
+        self.last[key] = Some(self.frames.len());
+        let hidden = !literal && (family == Family::Dsml || !self.visible());
+        if kind != Kind::Calls {
+            self.blocking += 1;
+        }
         self.frames.push(Scope {
             kind,
+            family,
             previous_same,
             literal,
+            hidden,
         });
     }
     fn clear(&mut self) {
         self.frames.clear();
-        self.last = [None; 3];
+        self.last = [None; 8];
+        self.blocking = 0;
     }
-    fn close(&mut self, kind: Kind) -> Option<bool> {
-        let index = self.last[kind as usize]?;
+    fn close(&mut self, family: Family, kind: Kind) -> Option<bool> {
+        let index = self.last[family as usize * 4 + kind as usize]?;
         let literal = self.frames[index].literal;
         while self.frames.len() > index {
             let scope = self.frames.pop().unwrap();
-            self.last[scope.kind as usize] = scope.previous_same;
+            self.last[scope.family as usize * 4 + scope.kind as usize] = scope.previous_same;
+            if scope.kind != Kind::Calls {
+                self.blocking -= 1;
+            }
         }
         Some(literal)
     }
@@ -116,43 +163,96 @@ impl Lexer {
         self.pending.push_str(chunk);
         let mut fragments = Vec::new();
         while !self.remaining().is_empty() {
+            if let Some(opaque) = &self.opaque {
+                if !self.line_prefix_done {
+                    let Some(prefix) = self.prefix_cursor.fence(
+                        &self.pending[self.cursor..],
+                        finish,
+                        &opaque.containers,
+                    ) else {
+                        break;
+                    };
+                    self.prefix_cursor = markdown::Cursor::default();
+                    if let Some(prefix) = prefix {
+                        let text = self.remaining()[..prefix.end].to_owned();
+                        self.consume(prefix.end);
+                        fragments.push(Fragment::Text {
+                            text,
+                            visible: true,
+                            literal: true,
+                        });
+                        self.line_prefix_done = true;
+                    } else {
+                        self.opaque = None;
+                        self.html.clear();
+                        continue;
+                    }
+                }
+                let terminator = self.opaque.as_ref().unwrap().terminator;
+                let line_end = self.remaining().find('\n').map(|at| at + 1);
+                let limit = line_end.unwrap_or(self.remaining().len());
+                let end = if let Some(at) = self.remaining()[..limit].find(terminator) {
+                    self.opaque = None;
+                    at + terminator.len()
+                } else if finish || line_end.is_some() {
+                    limit
+                } else {
+                    let mut end = limit.saturating_sub(terminator.len() - 1);
+                    while !self.remaining().is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    end
+                };
+                if end == 0 {
+                    break;
+                }
+                let text = self.remaining()[..end].to_owned();
+                self.consume(end);
+                fragments.push(Fragment::Text {
+                    text,
+                    visible: true,
+                    literal: true,
+                });
+                continue;
+            }
             if !self.line_prefix_done {
                 let inline = matches!(self.literal, Some((_, _, false)));
-                let escaped_scope = !self.open.is_empty() && self.open.visible();
+                let escaped_scope = self.open.literal();
                 let contextual = inline || escaped_scope || self.paragraph_open;
-                let classify = self.open.visible()
+                let classify = self.open.markdown_active()
+                    && !self.html.active()
                     && self.literal.is_none_or(|(_, _, fence)| !fence)
                     && markdown::may_interrupt(self.remaining());
-                let line_end = if classify {
-                    let tail = &self.remaining()[self.continuation_checked..];
-                    if let Some(end) = tail.find('\n') {
-                        self.continuation_checked + end + 1
-                    } else if finish {
-                        self.remaining().len()
-                    } else {
-                        self.continuation_checked = self.remaining().len();
-                        break;
+                if self.open.markdown_active() {
+                    let mut prefix = self.prepared_prefix.take();
+                    if prefix.is_none() && self.html.containers().is_some() {
+                        let Some(html_prefix) = self.prefix_cursor.fence(
+                            &self.pending[self.cursor..],
+                            finish,
+                            self.html.containers().unwrap(),
+                        ) else {
+                            break;
+                        };
+                        if html_prefix.is_none() {
+                            self.html.clear();
+                            self.prefix_cursor = markdown::Cursor::default();
+                        }
+                        prefix = html_prefix;
                     }
-                } else {
-                    0
-                };
-                if self.open.visible() {
-                    let prefix = if matches!(self.literal, Some((_, _, true))) {
-                        let Some(prefix) = self.prefix_cursor.fence(
+                    if prefix.is_none() && matches!(self.literal, Some((_, _, true))) {
+                        let Some(fence_prefix) = self.prefix_cursor.fence(
                             &self.pending[self.cursor..],
                             finish,
                             &self.fence_containers,
                         ) else {
                             break;
                         };
-                        if prefix.is_none() {
+                        if fence_prefix.is_none() {
                             self.literal = None;
                             self.prefix_cursor = markdown::Cursor::default();
                         }
-                        prefix
-                    } else {
-                        None
-                    };
+                        prefix = fence_prefix;
+                    }
                     let Some(mut prefix) = prefix.or_else(|| {
                         self.prefix_cursor.normal(
                             &self.pending[self.cursor..],
@@ -163,12 +263,26 @@ impl Lexer {
                         break;
                     };
                     self.prefix_cursor = markdown::Cursor::default();
-                    let boundary = classify.then(|| {
-                        markdown::inspect_line(
-                            &self.remaining()[prefix.continuation_end..line_end],
-                            contextual,
-                        )
-                    });
+                    let boundary = if classify {
+                        let start = self.continuation_checked.max(prefix.end);
+                        let end = markdown::classification_end(self.remaining(), start, finish);
+                        if let Some(end) = end {
+                            Some(markdown::inspect_line(
+                                &self.remaining()[prefix.continuation_end..end],
+                                contextual,
+                            ))
+                        } else if prefix.indented {
+                            // Indentation is already decidable; publish whitespace
+                            // while preserving a continuing paragraph until newline.
+                            None
+                        } else {
+                            self.continuation_checked = self.remaining().len();
+                            self.prepared_prefix = Some(prefix);
+                            break;
+                        }
+                    } else {
+                        None
+                    };
                     let interrupts = boundary
                         .as_ref()
                         .is_some_and(|boundary| boundary.interrupts);
@@ -183,7 +297,8 @@ impl Lexer {
                     self.line_paragraph = boundary
                         .as_ref()
                         .map(|boundary| boundary.paragraph)
-                        .unwrap_or(!prefix.indented || continuation || inline);
+                        .unwrap_or(!prefix.indented || continuation || inline)
+                        && self.html.containers().is_none();
                     if let Some(boundary) = &boundary {
                         prefix.validate_containers(boundary);
                     }
@@ -207,6 +322,7 @@ impl Lexer {
                         fragments.push(Fragment::Text {
                             text,
                             visible: true,
+                            literal: true,
                         });
                     }
                 }
@@ -233,6 +349,7 @@ impl Lexer {
                     fragments.push(Fragment::Text {
                         text,
                         visible: true,
+                        literal: true,
                     });
                     continue;
                 }
@@ -253,6 +370,7 @@ impl Lexer {
                             fragments.push(Fragment::Text {
                                 text,
                                 visible: true,
+                                literal: true,
                             });
                         } else {
                             self.consume(len);
@@ -260,36 +378,84 @@ impl Lexer {
                         }
                         continue;
                     }
-                    tag::Scan::Tag { end, kind, closing }
-                        if self.open.kind() != Some(Kind::Parameter)
-                            || (closing && kind == Kind::Parameter) =>
+                    tag::Scan::Opaque { end, terminator }
+                        if self.open.is_empty() && !self.escaped =>
+                    {
+                        let text = self.remaining()[..end].to_owned();
+                        if !self.line_has_text {
+                            self.line_paragraph = false;
+                            self.paragraph_open = false;
+                        }
+                        self.consume(end);
+                        self.opaque = Some(Opaque {
+                            terminator,
+                            containers: self.line_containers.clone(),
+                        });
+                        fragments.push(Fragment::Text {
+                            text,
+                            visible: true,
+                            literal: true,
+                        });
+                        continue;
+                    }
+                    tag::Scan::Html { end, name, closing } => {
+                        let text = self.remaining()[..end].to_owned();
+                        if self.open.is_empty() && !self.escaped {
+                            self.html.tag(
+                                &text,
+                                &name,
+                                closing,
+                                !self.line_has_text,
+                                self.line_containers.clone(),
+                            );
+                            if self.html.containers().is_some() {
+                                self.line_paragraph = false;
+                                self.paragraph_open = false;
+                            }
+                        }
+                        let visible = self.open.visible();
+                        self.consume(end);
+                        fragments.push(Fragment::Text {
+                            text,
+                            visible,
+                            literal: true,
+                        });
+                        continue;
+                    }
+                    tag::Scan::Tag {
+                        end,
+                        kind,
+                        family,
+                        closing,
+                    } if self.html.active()
+                        || !matches!(self.open.kind(), Some((_, Kind::Parameter)))
+                        || (closing && self.open.kind() == Some((family, kind))) =>
                     {
                         let raw = self.remaining()[..end].to_owned();
                         let span = self.offset..self.offset + end;
                         let escaped = self.escaped;
                         let literal_block = self.literal_block;
-                        let mut literal = if self.open.is_empty() {
-                            escaped
-                        } else {
-                            self.open.visible()
-                        };
-                        if closing {
-                            if !escaped {
-                                literal |= self.open.close(kind).unwrap_or(false);
-                            } else if !self.open.visible() {
-                                self.consume(end);
-                                fragments.push(Fragment::Text {
-                                    text: raw,
-                                    visible: false,
-                                });
-                                continue;
+                        let mut literal = self.html.active()
+                            || self.open.literal()
+                            || (self.open.is_empty() && escaped);
+                        let recoverable =
+                            !literal && !closing && self.open.allows_call(family, kind);
+                        let visible = literal || (family == Family::Bare && self.open.visible());
+                        if !self.html.active() {
+                            if closing && !escaped {
+                                literal |= self.open.close(family, kind).unwrap_or(false);
+                            } else if !closing
+                                && !raw.trim_end_matches('>').trim_end().ends_with('/')
+                            {
+                                self.open.push(family, kind, literal);
                             }
-                        } else if !raw.trim_end_matches('>').trim_end().ends_with('/') {
-                            self.open.push(kind, literal);
                         }
                         self.consume(end);
                         fragments.push(Fragment::Tag(Tag {
                             kind,
+                            family,
+                            recoverable,
+                            visible: visible || literal,
                             closing,
                             span,
                             raw,
@@ -298,10 +464,11 @@ impl Lexer {
                         }));
                         continue;
                     }
-                    tag::Scan::Ordinary | tag::Scan::Tag { .. } => {}
+                    tag::Scan::Ordinary | tag::Scan::Tag { .. } | tag::Scan::Opaque { .. } => {}
                 }
             }
             if self.open.is_empty()
+                && !self.html.active()
                 && !self.indented
                 && matches!(first, '`' | '~')
                 && (!self.escaped || self.literal.is_some())
@@ -343,6 +510,7 @@ impl Lexer {
                 fragments.push(Fragment::Text {
                     text,
                     visible: true,
+                    literal: true,
                 });
                 continue;
             }
@@ -360,10 +528,15 @@ impl Lexer {
                     .unwrap_or(self.remaining().len())
             };
             let text = self.remaining()[..end].to_owned();
+            let literal = self.literal.is_some()
+                || self.indented
+                || self.html.active()
+                || self.open.literal();
             self.consume(end);
             fragments.push(Fragment::Text {
                 text,
                 visible: self.open.visible(),
+                literal,
             });
         }
         self.pending.drain(..self.cursor);
@@ -375,11 +548,12 @@ impl Lexer {
         for ch in self.pending[self.cursor..self.cursor + end].chars() {
             if ch == '\n' {
                 let blank = !self.line_has_text;
-                if !self.line_paragraph {
+                self.html.newline(blank);
+                if blank || !self.line_paragraph {
                     if matches!(self.literal, Some((_, _, false))) {
                         self.literal = None;
                     }
-                    if !self.open.is_empty() && self.open.visible() {
+                    if self.open.literal() {
                         self.open.clear();
                         self.literal_block += 1;
                     }
@@ -400,6 +574,8 @@ impl Lexer {
                         && !self.indented
                         && self.literal.is_none()
                         && self.open.is_empty()
+                        && !self.html.active()
+                        && self.opaque.is_none()
                     {
                         self.paragraph_open = true;
                     }
@@ -427,28 +603,54 @@ impl DsmlToolCallStreamFilter {
     }
 
     fn project(&mut self, chunk: &str, finish: bool) -> String {
-        let mut visible = String::new();
-        for fragment in self.lexer.push(chunk, finish) {
-            match fragment {
-                Fragment::Text {
-                    text,
-                    visible: true,
-                } => visible.push_str(&text),
-                Fragment::Tag(tag) if tag.literal => visible.push_str(&tag.raw),
-                _ => {}
-            }
-        }
-        visible
+        project_fragments(self.lexer.push(chunk, finish)).text
     }
 }
 
-/// Explicit DSML calls carry protocol intent without the ambiguous bare-XML
-/// heuristic. An incomplete named invocation remains a failed input, not `{}`.
+pub(super) struct Projection {
+    pub text: String,
+    pub literal: Vec<Range<usize>>,
+}
+
+fn project_fragments(fragments: Vec<Fragment>) -> Projection {
+    let mut output = Projection {
+        text: String::new(),
+        literal: Vec::new(),
+    };
+    for fragment in fragments {
+        let (text, literal) = match fragment {
+            Fragment::Text {
+                text,
+                visible: true,
+                literal,
+            } => (text, literal),
+            Fragment::Tag(tag) if tag.visible => (tag.raw, tag.literal),
+            _ => continue,
+        };
+        let start = output.text.len();
+        output.text.push_str(&text);
+        if literal && start < output.text.len() {
+            if let Some(last) = output.literal.last_mut()
+                && last.end == start
+            {
+                last.end = output.text.len();
+            } else {
+                output.literal.push(start..output.text.len());
+            }
+        }
+    }
+    output
+}
+
+pub(super) fn project_complete(text: &str) -> Projection {
+    project_fragments(Lexer::default().push(text, true))
+}
+
+/// The same ordered token stream owns DSML, bare XML and tool_call nesting.
+/// Name/argument validity never releases an inner candidate from its owner.
 #[derive(Default)]
 pub(super) struct Decoded {
-    pub calls: Vec<(Range<usize>, Value)>,
-    /// Invalid unnamed invocations still own all nested syntax families.
-    pub owned: Vec<Range<usize>>,
+    pub calls: Vec<super::ParsedDegradedCall>,
 }
 
 pub(super) fn decode(text: &str) -> Decoded {
@@ -467,86 +669,98 @@ pub(super) fn decode(text: &str) -> Decoded {
     let mut index = 0;
     while index < tags.len() {
         let opener = &tags[index];
-        if opener.kind != Kind::Invoke || opener.closing {
+        if !opener.recoverable || !matches!(opener.kind, Kind::Invoke | Kind::ToolCall) {
             index += 1;
             continue;
         }
         let self_closed = opener.raw.trim_end_matches('>').trim_end().ends_with('/');
-        // Determine ownership before validating the name. Every opener owns its
-        // subtree, including unnamed/empty invocations and nested wrappers.
         let mut open = Scopes::default();
-        open.push(Kind::Invoke, opener.literal);
+        open.push(opener.family, opener.kind, false);
         let boundary = if self_closed {
             None
         } else {
             tags[index + 1..]
                 .iter()
                 .position(|tag| {
-                    if opener.literal && tag.literal_block != opener.literal_block {
+                    if tag.literal_block != opener.literal_block {
                         return true;
                     }
                     if tag.closing {
-                        if open.close(tag.kind).is_some() {
+                        if open.close(tag.family, tag.kind).is_some() {
                             return open.is_empty();
                         }
-                        // A wrapper not opened inside this invocation is its
-                        // containing envelope; it terminates an incomplete call.
                         return tag.kind == Kind::Calls;
                     }
                     if !tag.raw.trim_end_matches('>').trim_end().ends_with('/') {
-                        open.push(tag.kind, tag.literal);
+                        open.push(tag.family, tag.kind, tag.literal);
                     }
                     false
                 })
                 .map(|offset| index + 1 + offset)
         };
-        let closer = boundary.map(|index| &tags[index]).filter(|tag| {
-            tag.kind == Kind::Invoke
-                && tag.closing
-                && (!opener.literal || tag.literal_block == opener.literal_block)
-        });
-        let complete = self_closed || closer.is_some();
+        let closer = boundary
+            .map(|i| &tags[i])
+            .filter(|tag| tag.family == opener.family && tag.kind == opener.kind && tag.closing);
         let body_end = if self_closed {
             opener.span.end
         } else {
-            boundary
-                .map(|index| tags[index].span.start)
-                .unwrap_or(text.len())
+            boundary.map(|i| tags[i].span.start).unwrap_or(text.len())
         };
         let span_end = closer.map(|tag| tag.span.end).unwrap_or(body_end);
-        decoded.owned.push(opener.span.start..span_end);
-        if !opener.literal
-            && let Some(name) =
-                super::extract_attr(&opener.raw, "name").filter(|name| !name.is_empty())
-        {
-            let body = &text[opener.span.end..body_end];
-            let parameters = tags[index + 1..]
-                .iter()
-                .take_while(|tag| tag.span.start < body_end)
-                .collect::<Vec<_>>();
-            let arguments = if complete {
-                arguments(body, opener.span.end, &parameters)
+        let call = if opener.family == Family::Bare {
+            if opener.kind == Kind::ToolCall {
+                super::parse_single_tool_call_tag(
+                    text[opener.span.end..body_end].replace('\0', "").trim(),
+                )
+            } else if self_closed || closer.is_some() {
+                super::parse_single_invoke(&text[opener.span.start..span_end])
             } else {
                 None
-            };
-            // Retain the actual undecodable input so strict tool admission produces
-            // its existing ToolInvalidArgs result before any executor is called.
-            let arguments = arguments
-                .map(|args| args.to_string())
-                .unwrap_or_else(|| text[opener.span.start..span_end].to_owned());
-            decoded.calls.push((
-                opener.span.start..span_end,
-                json!({
-                    "id": format!("xmlfb_{}", Uuid::new_v4()), "type":"function",
-                    "function":{"name":name,"arguments":arguments},
-                }),
-            ));
+            }
+        } else {
+            super::extract_attr(&opener.raw, "name")
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    let parameters = tags[index + 1..]
+                        .iter()
+                        .take_while(|tag| tag.span.start < body_end)
+                        .collect::<Vec<_>>();
+                    let arguments = if self_closed || closer.is_some() {
+                        arguments(
+                            &text[opener.span.end..body_end],
+                            opener.span.end,
+                            &parameters,
+                        )
+                    } else {
+                        None
+                    };
+                    let arguments = arguments
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| text[opener.span.start..span_end].to_owned());
+                    json!({
+                        "id": format!("xmlfb_{}", Uuid::new_v4()),
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    })
+                })
+        };
+        if let Some(call) = call {
+            decoded.calls.push(super::ParsedDegradedCall {
+                span: opener.span.start..span_end,
+                call,
+                explicit_dsml: opener.family == Family::Dsml,
+                format: if opener.kind == Kind::ToolCall {
+                    super::DegradedCallFormat::ToolCallTag
+                } else {
+                    super::DegradedCallFormat::Invoke
+                },
+            });
         }
         index = if self_closed {
             index + 1
         } else {
             boundary
-                .map(|index| if closer.is_some() { index + 1 } else { index })
+                .map(|i| if closer.is_some() { i + 1 } else { i })
                 .unwrap_or(tags.len())
         };
     }

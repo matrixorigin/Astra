@@ -13372,6 +13372,46 @@ mod tests {
         let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
         for (content, expected, paths) in [
             (
+                format!("<pre>\n{call}\n</pre>\n{call}"),
+                format!("<pre>\n{call}\n</pre>\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<!--\n{call}\n-->\n{call}"),
+                format!("<!--\n{call}\n-->\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<div>\n{call}\n</div>\n\n{call}"),
+                format!("<div>\n{call}\n</div>\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<div>\n{call}\n</div>\n{call}"),
+                format!("<div>\n{call}\n</div>\n{call}"),
+                vec![],
+            ),
+            (
+                format!("Answer <code>{call}</code>. {call}"),
+                format!("Answer <code>{call}</code>. "),
+                vec!["README.md"],
+            ),
+            (
+                format!("Answer <br>{call}"),
+                "Answer <br>".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("> <pre>\n> example\n{call}"),
+                "> <pre>\n> example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("> <!--\n> example\n{call}"),
+                "> <!--\n> example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
                 format!("Use a ` character\n===\n`{call}`"),
                 format!("Use a ` character\n===\n`{call}`"),
                 vec![],
@@ -13514,6 +13554,156 @@ mod tests {
                     arguments
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_degraded_markup_respects_literal_and_outer_ownership() {
+        let call = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        let legacy = "<tool_call>bash)(pwd)</tool_call>";
+        for (content, literal) in [
+            ("<!--\n<invoke name=\"bash\">\n-->".to_owned(), true),
+            (
+                "Text <code><parameter=example> pwd</code>.".to_owned(),
+                true,
+            ),
+            (format!("<section>\n{call}\n</section>\n"), true),
+            (format!("<style>\n{call}\n</style>\n"), true),
+            (format!("<textarea>\n{call}\n</textarea>\n"), true),
+            (format!("<my-widget>\n{call}\n</my-widget>\n"), true),
+            (format!("<pre>\n{call}\n</pre>\n"), true),
+            (format!("<!--\n{call}\n-->\n"), true),
+            (format!("<pre>\nexample\n</pre>\n    {call}"), true),
+            (format!("<!--\nexample\n-->\n    {call}"), true),
+            (format!("Answer <code>{call}</code>."), true),
+            (format!("> <pre>\n> {call}\n> </pre>\n"), true),
+            (format!("<div class=\"example\">\n{call}\n</div>\n"), true),
+            (format!("<invoke name=\"\">{call}</invoke>"), false),
+            (
+                format!("<parameter name=\"example\">{call}</parameter>"),
+                false,
+            ),
+            (
+                format!("<|DSML|parameter name=\"example\">{legacy}</|DSML|parameter>"),
+                false,
+            ),
+            (format!("<|DSML|calls>{legacy}</|DSML|calls>"), false),
+        ] {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|c| c.to_string()).collect()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["bash".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result.tool_calls.is_empty(),
+                    "example escaped ownership: {content:?}"
+                );
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert!(
+                    nonstream.tool_calls.is_empty(),
+                    "nonstream example escaped ownership: {content:?}"
+                );
+                if literal {
+                    assert_eq!(result.full_text, content);
+                    assert_eq!(published, content);
+                    assert_eq!(nonstream.full_text, content);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_degraded_markup_delivers_prose_before_line_or_stream_end() {
+        for text in [
+            "1. This is an ordinary answer arriving incrementally.",
+            "- An ordinary bullet.",
+            "# An ordinary heading",
+            "(An ordinary opening parenthesis)",
+        ] {
+            let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+            let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                let input = stream::unfold(receiver, |mut receiver| async {
+                    receiver.recv().await.map(|bytes| (Ok(bytes), receiver))
+                });
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        let _ = updates.send(text);
+                    }
+                };
+                collect_llm_stream_for_wire(
+                    Box::pin(input),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::new(),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+            });
+            let event = json!({"choices":[{"delta":{"content":text}}]});
+            sender
+                .send(Bytes::from(format!("data: {event}\n\n")))
+                .await
+                .unwrap();
+            let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut published = String::new();
+                while published != text {
+                    published.push_str(
+                        &received
+                            .recv()
+                            .await
+                            .expect("text callback while stream stays open"),
+                    );
+                }
+                published
+            })
+            .await;
+            if delivered.is_err() {
+                task.abort();
+            }
+            assert_eq!(
+                delivered.expect("ordinary prose must be delivered before newline or EOF"),
+                text
+            );
+            sender.send(Bytes::from("data: [DONE]\n\n")).await.unwrap();
+            assert_eq!(task.await.unwrap().unwrap().full_text, text);
         }
     }
 
