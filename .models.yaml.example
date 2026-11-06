@@ -11,6 +11,9 @@
 # This file defines available LLM models. Each entry is loaded into the
 # `infra_llm_models` table in MatrixOne. Load checks new or updated models;
 # `astra admin model check <name>` can repeat the connectivity check later.
+# A failed model import or check does not stop the other entries. The command
+# reports failed names and exits nonzero. Invalid configuration is rejected
+# before changing any models.
 #
 # ─── Field Reference ──────────────────────────────────────────────────────────
 #

@@ -96,6 +96,10 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
                             hold.next.store(0, std::sync::atomic::Ordering::SeqCst);
                             return (StatusCode::OK, Json(json!({"status":"ok"})));
                         }
+                        if body[limit] == 32 && outcome == 7 {
+                            hold.next.store(0, std::sync::atomic::Ordering::SeqCst);
+                            return (StatusCode::OK, Json(json!({"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"length"}]})));
+                        }
                         let matches = (body[limit] == 32 && matches!(outcome, 1 | 2))
                             || (body[limit] == 1024 && outcome == 3);
                         if matches
@@ -266,6 +270,10 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
             .unwrap()
             .is_empty()
     );
+    // A reasoning-only truncated response is sufficient to save a working
+    // model and must not trigger another paid inference.
+    let before = requests.load(std::sync::atomic::Ordering::SeqCst);
+    hold.next.store(7, std::sync::atomic::Ordering::SeqCst);
     let created = service
         .create_user_model(
             owner.clone(),
@@ -273,6 +281,11 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
         )
         .await
         .unwrap();
+    assert!(created.is_active);
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst) - before,
+        1
+    );
     let duplicate = service
         .create_user_model(
             owner.clone(),

@@ -197,8 +197,10 @@ guessing ownership; done-only text is not recovered on that error path. It creat
 calls nor continuation metadata, including when individual function items look
 complete. The existing output-cap owner handles continuation or interruption;
 other incomplete reasons remain failures. Explicitly unfinished saved items
-cannot be replayed. Connectivity probes and summary acceptance reject truncated
-results even when their partial text is nonempty or structurally complete.
+cannot be replayed. Summary acceptance rejects truncated results even when
+partial text is present. A connectivity probe only checks that the configured
+route produced valid output; a typed output-limit response can establish that
+fact without authorizing a complete answer, tool call, or capability.
 When a completed subscription response has an empty output array, the shared
 codec uses its fully received `response.output_item.done` items. Text deltas
 alone cannot establish a replayable response or authorize tools.
