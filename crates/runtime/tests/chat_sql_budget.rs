@@ -1659,7 +1659,7 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
     );
     let (lease, pod) = owner.lease_identity();
     let stale = store
-        .next(lease, pod, Some((&b.ctx.user_id, &b.ctx.session_id)), None)
+        .next(lease, pod, &b.ctx.user_id, &b.ctx.session_id)
         .await
         .unwrap()
         .unwrap();
@@ -1940,15 +1940,20 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         )
         .await
         .unwrap();
+    owner.drive_one().await.unwrap();
     assert!(
-        !owner.drive_one().await.unwrap(),
+        worker.seen.lock().unwrap().is_empty(),
         "a cached expired owner must not dispatch"
     );
     worker.permits.add_permits(sessions.len());
-    for _ in &sessions {
-        assert!(restarted.drive_one().await.unwrap());
+    // Pages also contain retained heads without completed turns. A true
+    // result means a bounded scan step, not necessarily an observation.
+    for step in 0..=sessions.len() + 1 {
+        if !restarted.drive_one().await.unwrap() {
+            break;
+        }
+        assert!(step <= sessions.len(), "catalog traversal must terminate");
     }
-    assert!(!restarted.drive_one().await.unwrap());
     assert_eq!(
         worker.seen.lock().unwrap().len(),
         999,
@@ -1958,10 +1963,12 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     sqlx::query("UPDATE agent_session_memory_work SET state_json = JSON_SET(state_json, '$.observation.retry_at_ms', 0) WHERE user_id = ? AND session_id = ?")
         .bind(&b.ctx.user_id).bind(&failed).execute(&b.ctx.pool).await.unwrap();
     worker.permits.add_permits(1);
-    assert!(
-        restarted.drive_one().await.unwrap(),
-        "wrapping the scan must revisit deferred work"
-    );
+    for _ in 0..=sessions.len() + 1 {
+        restarted.drive_one().await.unwrap();
+        if worker.seen.lock().unwrap().len() == sessions.len() {
+            break;
+        }
+    }
     let seen = worker.seen.lock().unwrap().clone();
     assert_eq!(seen, sessions.iter().cloned().collect());
     let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_memory_work WHERE JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.observed_turn')) = '1'")

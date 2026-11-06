@@ -2533,18 +2533,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         head: &SessionContextHeadV1,
     ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
         validate_head(head)?;
-        let columns = qualified_manifest_content_columns("m");
-        let sql = format!(
-            "SELECT {columns}, f.manifest_json AS fork_manifest_json
-             FROM (SELECT ? AS isolation_domain, ? AS owner_user_id, ? AS session_id, ? AS branch_id) k
-             LEFT JOIN conversation_manifest_nodes m
-               ON m.isolation_domain = k.isolation_domain AND m.owner_user_id = k.owner_user_id
-              AND m.session_id = k.session_id AND m.branch_id = k.branch_id
-              AND m.compaction_generation = ? AND m.reachable = 1 AND m.conversation_seq <= ?
-             LEFT JOIN session_forks f
-               ON f.isolation_domain = k.isolation_domain AND f.owner_user_id = k.owner_user_id
-              AND f.child_session_id = k.session_id AND f.child_branch_id = k.branch_id AND f.state = 'active'"
-        );
+        let sql = canonical_materialization_sql();
         let query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&head.key.isolation_domain)
             .bind(&head.key.owner_user_id)
@@ -2557,7 +2546,11 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .bind(i64_from_u64(
                 "head conversation sequence",
                 head.cursor.conversation_seq,
-            )?);
+            )?)
+            .bind(&head.key.isolation_domain)
+            .bind(&head.key.owner_user_id)
+            .bind(&head.key.session_id)
+            .bind(&head.key.branch_id);
         let mut rows = query.fetch(self.pool.get());
         let mut loaded = LoadedCanonicalContext::default();
         while let Some(row) = rows
@@ -6445,6 +6438,26 @@ fn validate_stored_manifest(
         ));
     }
     Ok(())
+}
+
+/// Keep direct storage predicates: a derived key joined to the catalog does
+/// not receive selective predicate pushdown on MatrixOne.
+pub(crate) fn canonical_materialization_sql() -> String {
+    let columns = qualified_manifest_content_columns("m");
+    format!(
+        "SELECT {columns}, f.manifest_json AS fork_manifest_json
+             FROM (SELECT 1) seed
+             LEFT JOIN (
+               SELECT * FROM conversation_manifest_nodes
+               WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?
+                 AND compaction_generation = ? AND reachable = 1 AND conversation_seq <= ?
+             ) m ON TRUE
+             LEFT JOIN (
+               SELECT manifest_json FROM session_forks FORCE INDEX (uq_session_forks_child)
+               WHERE isolation_domain = ? AND owner_user_id = ? AND child_session_id = ?
+                 AND child_branch_id = ? AND state = 'active'
+             ) f ON TRUE"
+    )
 }
 
 pub(crate) fn qualified_manifest_content_columns(alias: &str) -> String {

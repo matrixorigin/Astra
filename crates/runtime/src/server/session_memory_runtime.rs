@@ -199,7 +199,13 @@ pub(crate) struct SessionObservationRecovery {
     store: astra_services::session_observation::SessionObservationStore,
     lease: super::sweeper_lease::SweeperLease,
     scope: Option<(String, String)>,
-    scan_cursor: tokio::sync::Mutex<Option<(String, String)>>,
+    scan: tokio::sync::Mutex<ObservationScan>,
+}
+
+#[derive(Default)]
+struct ObservationScan {
+    after: Option<(String, String)>,
+    keys: std::collections::VecDeque<(String, String)>,
 }
 
 impl SessionObservationRecovery {
@@ -211,7 +217,7 @@ impl SessionObservationRecovery {
         Some(Self {
             state,
             scope: None,
-            scan_cursor: Default::default(),
+            scan: Default::default(),
             store: astra_services::session_observation::SessionObservationStore::new(pool.clone()),
             lease: super::sweeper_lease::SweeperLease::new(
                 pool,
@@ -247,36 +253,54 @@ impl SessionObservationRecovery {
     }
 
     pub(crate) async fn drive_one(&self) -> Result<bool, String> {
-        let mut scan_cursor = self.scan_cursor.lock().await;
+        let mut scan = self.scan.lock().await;
         if !self.prepare().await {
             return Ok(false);
         }
+        let key = if let Some(scope) = &self.scope {
+            scope.clone()
+        } else {
+            if scan.keys.is_empty() {
+                let page = self
+                    .store
+                    .key_page(
+                        scan.after
+                            .as_ref()
+                            .map(|(user, session)| (user.as_str(), session.as_str())),
+                    )
+                    .await?;
+                if let Some(last) = page.last() {
+                    let pending = self.store.pending_keys(&page).await?;
+                    scan.after = Some(last.clone());
+                    scan.keys = pending.into();
+                    if scan.keys.is_empty() {
+                        // One page was examined, even though no work was due.
+                        return Ok(true);
+                    }
+                }
+            }
+            let Some(key) = scan.keys.front().cloned() else {
+                scan.after = None;
+                return Ok(false);
+            };
+            key
+        };
         let Some(mut candidate) = self
             .store
-            .next(
-                &self.lease.lease_name,
-                &self.lease.pod_id,
-                self.scope
-                    .as_ref()
-                    .map(|(user, session)| (user.as_str(), session.as_str())),
-                scan_cursor
-                    .as_ref()
-                    .map(|(user, session)| (user.as_str(), session.as_str())),
-            )
+            .next(&self.lease.lease_name, &self.lease.pod_id, &key.0, &key.1)
             .await?
         else {
-            *scan_cursor = None;
-            return Ok(false);
+            if self.scope.is_some() {
+                return Ok(false);
+            }
+            // An idle/backed-off/deleted Session still consumes one bounded
+            // scan step. Never reset to the start merely because it is idle.
+            scan.keys.pop_front();
+            return Ok(true);
         };
         // The cursor is only a scan optimization. Checkpoints and canonical
         // facts remain durable; restarting or wrapping can never lose work.
-        // Session-scoped Router fixtures have no catalog traversal to advance.
-        if self.scope.is_none() {
-            *scan_cursor = Some((
-                candidate.key.owner_user_id.clone(),
-                candidate.key.session_id.clone(),
-            ));
-        }
+        // Advance only after checkpointing; cancellation/errors replay this key.
         let result = async {
             let materialized = self.store.materialize(&mut candidate).await?;
             let messages =
@@ -308,6 +332,9 @@ impl SessionObservationRecovery {
                 result.is_ok(),
             )
             .await?;
+        if self.scope.is_none() {
+            scan.keys.pop_front();
+        }
         if let Err(error) = result {
             // The failed attempt has a durable retry clock. Continue the bounded
             // batch so a few failing Sessions cannot starve healthy Sessions.
