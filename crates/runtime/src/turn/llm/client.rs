@@ -1628,6 +1628,7 @@ pub(crate) async fn finish_observed_provider_error(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1642,6 +1643,7 @@ pub(crate) async fn finish_observed_provider_error_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -1657,6 +1659,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown(
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     finish_observed_provider_attempt(
         observer,
         attempt_index,
@@ -1671,6 +1674,7 @@ pub(crate) async fn finish_observed_provider_delivery_unknown_with_partial(
     error: &astra_core::ClassifiedError,
     partial: &LlmCallResult,
 ) -> Result<(), astra_core::ClassifiedError> {
+    crate::server::run_trace::note_attempt_code(error.kind.as_str());
     note_observed_provider_usage_presence(observer, attempt_index, partial.usage_presence);
     finish_observed_provider_attempt(
         observer,
@@ -5411,6 +5415,7 @@ struct LlmAttemptSpan {
 
 impl LlmAttemptSpan {
     fn start() -> Self {
+        crate::server::run_trace::clear_attempt_code();
         let span = tracing::info_span!(target: "astra.llm", "llm.call");
         crate::server::run_trace::parent_to_active_run(&span);
         let entered = span.clone();
@@ -5420,13 +5425,15 @@ impl LlmAttemptSpan {
 
     fn succeed(&mut self) {
         self.failed = false;
+        crate::server::run_trace::clear_attempt_code();
     }
 }
 
 impl Drop for LlmAttemptSpan {
     fn drop(&mut self) {
         if self.failed {
-            astra_logging::trace_context::mark_error(&self.span);
+            let code = crate::server::run_trace::attempt_code().unwrap_or("unknown");
+            astra_logging::trace_context::mark_error(&self.span, code);
         }
     }
 }

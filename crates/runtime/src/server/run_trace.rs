@@ -3,15 +3,15 @@
 //! `spawn_observed` does not inherit the request span. The HTTP handler reads
 //! the inbound carrier before spawn and binds `astra.run` inside that task.
 //! A user-input wait ends the span; the continuation starts a new trace.
+//! `tokio::spawn` does not inherit the run slot, so owned inference tasks use
+//! [`spawn_in_active_run`] and only observe the parent span.
 
-use std::cell::RefCell;
 use std::future::Future;
 
-use astra_logging::trace_context::{Carrier, RunSpan};
+use astra_logging::trace_context::Carrier;
 
 tokio::task_local! {
     static INBOUND: Carrier;
-    static ACTIVE_RUN: RefCell<RunSpan>;
 }
 
 pub(crate) async fn scope_inbound<F>(carrier: Carrier, future: F) -> F::Output
@@ -29,14 +29,12 @@ pub(crate) async fn bind<F>(carrier: Carrier, future: F) -> F::Output
 where
     F: Future,
 {
-    ACTIVE_RUN
-        .scope(RefCell::new(RunSpan::start(&carrier)), future)
-        .await
+    astra_logging::trace_context::bind_run(&carrier, future).await
 }
 
 /// Close `astra.run` before the task parks on user input.
 pub(crate) fn suspend_for_user_input() -> UserInputTraceGuard {
-    let _ = ACTIVE_RUN.try_with(|slot| slot.borrow_mut().end());
+    astra_logging::trace_context::end_active_run();
     UserInputTraceGuard
 }
 
@@ -44,23 +42,36 @@ pub(crate) struct UserInputTraceGuard;
 
 impl Drop for UserInputTraceGuard {
     fn drop(&mut self) {
-        let _ = ACTIVE_RUN.try_with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if !slot.is_open() {
-                *slot = RunSpan::start(&Carrier::default());
-            }
-        });
+        astra_logging::trace_context::reopen_active_run();
     }
 }
 
 pub(crate) fn parent_to_active_run(span: &tracing::Span) {
-    let link = ACTIVE_RUN
-        .try_with(|slot| slot.borrow().link())
-        .ok()
-        .flatten();
-    if let Some(link) = link {
-        astra_logging::trace_context::attach_link(span, &link);
-    }
+    astra_logging::trace_context::parent_to_active_run(span);
+}
+
+pub(crate) fn fail_active_run(code: &'static str) {
+    astra_logging::trace_context::fail_active_run(code);
+}
+
+pub(crate) fn note_attempt_code(code: &'static str) {
+    astra_logging::trace_context::note_attempt_code(code);
+}
+
+pub(crate) fn clear_attempt_code() {
+    astra_logging::trace_context::clear_attempt_code();
+}
+
+pub(crate) fn attempt_code() -> Option<&'static str> {
+    astra_logging::trace_context::attempt_code()
+}
+
+pub(crate) fn spawn_in_active_run<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    astra_logging::trace_context::spawn_in_active_run(future)
 }
 
 #[cfg(test)]

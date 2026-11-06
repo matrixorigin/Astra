@@ -255,6 +255,10 @@ jobs:
           -p astra-harness -p astra-test-harness
           -p astra-logging -p astra-sync-protocol
           --profile ci
+      - name: Test astra-logging otel
+        run: >-
+          cargo nextest run --manifest-path Cargo.toml -p astra-logging
+          --features otel --profile ci
       - name: Test server e2e-hooks (selective)
         env:
           RUST_MIN_STACK: "16777216"

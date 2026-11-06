@@ -3,6 +3,9 @@
 //! The process exports only after OTLP init succeeds. Until then these helpers
 //! carry nothing and outbound callers strip stale trace headers.
 
+use std::cell::RefCell;
+use std::future::Future;
+
 #[cfg(feature = "otel")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,15 +31,30 @@ pub struct Carrier {
 
 impl Carrier {
     pub fn from_header_values(traceparent: Option<&str>, tracestate: Option<&str>) -> Self {
+        Self::from_header_fields(traceparent, tracestate)
+    }
+
+    /// Combine repeated `tracestate` fields, then keep a valid W3C list.
+    /// An invalid list is dropped. A valid `traceparent` is kept.
+    pub fn from_header_fields<'a, I>(traceparent: Option<&str>, tracestate: I) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut combined = String::new();
+        for field in tracestate {
+            if !combined.is_empty() {
+                combined.push(',');
+            }
+            combined.push_str(field);
+        }
         Self {
             traceparent: traceparent
                 .map(str::trim)
                 .filter(|value| valid_traceparent(value))
                 .map(str::to_owned),
-            tracestate: tracestate
-                .map(str::trim)
-                .filter(|value| valid_tracestate(value))
-                .map(str::to_owned),
+            tracestate: (!combined.is_empty())
+                .then(|| normalize_tracestate(&combined))
+                .flatten(),
         }
     }
 }
@@ -69,12 +87,88 @@ pub(crate) fn valid_traceparent(value: &str) -> bool {
         && span_id.chars().any(|c| c != '0')
 }
 
-pub(crate) fn valid_tracestate(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 512
-        && value
-            .chars()
-            .all(|c| c.is_ascii() && !c.is_ascii_control() && c != ' ')
+/// W3C `tracestate`: comma-separated members, optional whitespace around
+/// commas, and spaces inside a value. The stored form drops that whitespace.
+fn normalize_tracestate(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 512 {
+        return None;
+    }
+    let mut members = Vec::new();
+    for raw in value.split(',') {
+        let member = trim_ows(raw);
+        if member.is_empty() {
+            continue;
+        }
+        let (key, raw_value) = member.split_once('=')?;
+        if !valid_tracestate_key(key) || !valid_tracestate_value(raw_value) {
+            return None;
+        }
+        members.push(format!("{key}={raw_value}"));
+        if members.len() > 32 {
+            return None;
+        }
+    }
+    if members.is_empty() {
+        return None;
+    }
+    Some(members.join(","))
+}
+
+fn trim_ows(value: &str) -> &str {
+    value.trim_matches(|c| c == ' ' || c == '\t')
+}
+
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '*' | '/')
+}
+
+fn valid_tracestate_key(key: &str) -> bool {
+    let mut parts = key.split('@');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    match parts.next() {
+        None => valid_simple_key(first),
+        Some(system) if parts.next().is_none() => valid_tenant_id(first) && valid_system_id(system),
+        Some(_) => false,
+    }
+}
+
+fn valid_simple_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && key.len() <= 256
+        && chars.all(is_key_char)
+}
+
+fn valid_tenant_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id.len() <= 241
+        && chars.all(is_key_char)
+}
+
+fn valid_system_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && id.len() <= 14
+        && chars.all(is_key_char)
+}
+
+fn valid_tracestate_value(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(last) = chars.next_back() else {
+        return false;
+    };
+    value.len() <= 256 && is_nblk(last) && chars.all(is_chr)
+}
+
+fn is_nblk(c: char) -> bool {
+    matches!(c, '\u{21}'..='\u{2b}' | '\u{2d}'..='\u{3c}' | '\u{3e}'..='\u{7e}')
+}
+
+fn is_chr(c: char) -> bool {
+    c == ' ' || is_nblk(c)
 }
 
 fn is_hex(value: &str) -> bool {
@@ -94,6 +188,8 @@ pub struct RunLink {
 pub struct RunSpan {
     #[cfg(feature = "otel")]
     span: Option<opentelemetry::global::BoxedSpan>,
+    #[cfg(feature = "otel")]
+    error_code: Option<&'static str>,
     link: Option<RunLink>,
 }
 
@@ -106,15 +202,42 @@ impl RunSpan {
         #[cfg(not(feature = "otel"))]
         {
             let _ = carrier;
-            Self { link: None }
+            Self::idle()
+        }
+    }
+
+    /// A child task's view of a run. Dropping it does not end the owning span.
+    pub fn observe(link: RunLink) -> Self {
+        Self {
+            #[cfg(feature = "otel")]
+            span: None,
+            #[cfg(feature = "otel")]
+            error_code: None,
+            link: Some(link),
+        }
+    }
+
+    /// Record a stable outcome. The description is the code, not the cause.
+    pub fn fail(&mut self, code: &'static str) {
+        #[cfg(feature = "otel")]
+        {
+            self.error_code = Some(code);
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            let _ = code;
         }
     }
 
     pub fn end(&mut self) {
         #[cfg(feature = "otel")]
         {
-            use opentelemetry::trace::Span;
+            use opentelemetry::trace::{Span, Status};
             if let Some(mut span) = self.span.take() {
+                if let Some(code) = self.error_code.take() {
+                    span.set_status(Status::error(code));
+                    span.set_attribute(opentelemetry::KeyValue::new("error.code", code));
+                }
                 span.end();
             }
         }
@@ -127,6 +250,16 @@ impl RunSpan {
 
     pub fn link(&self) -> Option<RunLink> {
         self.link.clone()
+    }
+
+    fn idle() -> Self {
+        Self {
+            #[cfg(feature = "otel")]
+            span: None,
+            #[cfg(feature = "otel")]
+            error_code: None,
+            link: None,
+        }
     }
 }
 
@@ -158,14 +291,97 @@ pub fn attach_link(span: &tracing::Span, link: &RunLink) {
     }
 }
 
-/// Stable exported status. The description is the code `error`, not the cause.
-pub fn mark_error(span: &tracing::Span) {
+/// Stable exported status. The description is `code`, not the cause text.
+pub fn mark_error(span: &tracing::Span, code: &'static str) {
     #[cfg(feature = "otel")]
-    mark_error_otel(span);
+    mark_error_otel(span, code);
     #[cfg(not(feature = "otel"))]
     {
-        let _ = span;
+        let _ = (span, code);
     }
+}
+
+tokio::task_local! {
+    static ACTIVE_RUN: RefCell<RunSpan>;
+    static ATTEMPT_CODE: RefCell<Option<&'static str>>;
+}
+
+/// Bind `astra.run` and a fresh attempt-code slot for this task.
+pub async fn bind_run<F>(carrier: &Carrier, future: F) -> F::Output
+where
+    F: Future,
+{
+    ATTEMPT_CODE
+        .scope(RefCell::new(None), async move {
+            ACTIVE_RUN
+                .scope(RefCell::new(RunSpan::start(carrier)), future)
+                .await
+        })
+        .await
+}
+
+/// Run `future` on a new task that can see the current run without owning it.
+pub fn spawn_in_active_run<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let link = ACTIVE_RUN
+        .try_with(|slot| slot.borrow().link())
+        .ok()
+        .flatten();
+    tokio::spawn(async move {
+        match link {
+            Some(link) => {
+                ACTIVE_RUN
+                    .scope(
+                        RefCell::new(RunSpan::observe(link)),
+                        ATTEMPT_CODE.scope(RefCell::new(None), future),
+                    )
+                    .await
+            }
+            None => ATTEMPT_CODE.scope(RefCell::new(None), future).await,
+        }
+    })
+}
+
+pub fn parent_to_active_run(span: &tracing::Span) {
+    let link = ACTIVE_RUN
+        .try_with(|slot| slot.borrow().link())
+        .ok()
+        .flatten();
+    if let Some(link) = link {
+        attach_link(span, &link);
+    }
+}
+
+pub fn end_active_run() {
+    let _ = ACTIVE_RUN.try_with(|slot| slot.borrow_mut().end());
+}
+
+pub fn reopen_active_run() {
+    let _ = ACTIVE_RUN.try_with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if !slot.is_open() {
+            *slot = RunSpan::start(&Carrier::default());
+        }
+    });
+}
+
+pub fn fail_active_run(code: &'static str) {
+    let _ = ACTIVE_RUN.try_with(|slot| slot.borrow_mut().fail(code));
+}
+
+pub fn note_attempt_code(code: &'static str) {
+    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = Some(code));
+}
+
+pub fn clear_attempt_code() {
+    let _ = ATTEMPT_CODE.try_with(|slot| *slot.borrow_mut() = None);
+}
+
+pub fn attempt_code() -> Option<&'static str> {
+    ATTEMPT_CODE.try_with(|slot| *slot.borrow()).ok().flatten()
 }
 
 #[cfg(feature = "otel")]
@@ -174,10 +390,7 @@ fn start_otel(carrier: &Carrier) -> RunSpan {
     use opentelemetry::trace::{Span, Tracer};
 
     if !export_ready() {
-        return RunSpan {
-            span: None,
-            link: None,
-        };
+        return RunSpan::idle();
     }
     let parent = match carrier.traceparent.as_deref() {
         Some(traceparent) => global::get_text_map_propagator(|prop| {
@@ -193,10 +406,7 @@ fn start_otel(carrier: &Carrier) -> RunSpan {
     let context = span.span_context();
     if !context.is_valid() {
         span.end();
-        return RunSpan {
-            span: None,
-            link: None,
-        };
+        return RunSpan::idle();
     }
     let link = RunLink {
         trace_id: context.trace_id().to_bytes(),
@@ -206,6 +416,7 @@ fn start_otel(carrier: &Carrier) -> RunSpan {
     };
     RunSpan {
         span: Some(span),
+        error_code: None,
         link: Some(link),
     }
 }
@@ -257,12 +468,12 @@ fn attach_link_otel(span: &tracing::Span, link: &RunLink) {
 }
 
 #[cfg(feature = "otel")]
-fn mark_error_otel(span: &tracing::Span) {
+fn mark_error_otel(span: &tracing::Span, code: &'static str) {
     use opentelemetry::trace::Status;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-    span.set_status(Status::error("error"));
-    span.set_attribute("error.code", "error");
+    span.set_status(Status::error(code));
+    span.set_attribute("error.code", code);
 }
 
 #[cfg(feature = "otel")]
@@ -319,6 +530,38 @@ mod carrier_tests {
             None,
         );
         assert!(carrier.traceparent.is_some());
+    }
+
+    #[test]
+    fn tracestate_keeps_optional_whitespace_and_repeated_fields() {
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        let carrier = Carrier::from_header_values(
+            Some(parent),
+            Some("rojo=00f067aa0ba902b7, congo=t61rcWkgMzE"),
+        );
+        assert!(carrier.traceparent.is_some());
+        assert_eq!(
+            carrier.tracestate.as_deref(),
+            Some("rojo=00f067aa0ba902b7,congo=t61rcWkgMzE")
+        );
+        let spaced = Carrier::from_header_values(Some(parent), Some("vendor=a b"));
+        assert_eq!(spaced.tracestate.as_deref(), Some("vendor=a b"));
+        let invalid_value = Carrier::from_header_values(Some(parent), Some("vendor=a=b"));
+        assert!(invalid_value.traceparent.is_some());
+        assert_eq!(invalid_value.tracestate, None);
+        let blank_value = Carrier::from_header_values(Some(parent), Some("vendor= "));
+        assert!(blank_value.traceparent.is_some());
+        assert_eq!(blank_value.tracestate, None);
+        let repeated = Carrier::from_header_fields(
+            Some(parent),
+            ["rojo=00f067aa0ba902b7", "congo=t61rcWkgMzE"],
+        );
+        assert_eq!(
+            repeated.tracestate.as_deref(),
+            Some("rojo=00f067aa0ba902b7,congo=t61rcWkgMzE")
+        );
+        let tenant = Carrier::from_header_values(Some(parent), Some("congo@rojo=t61rcWkgMzE"));
+        assert_eq!(tenant.tracestate.as_deref(), Some("congo@rojo=t61rcWkgMzE"));
     }
 }
 
@@ -382,7 +625,7 @@ mod tests {
                 error = %secret_error,
                 "LLM send failed"
             );
-            mark_error(&tracing::Span::current());
+            mark_error(&tracing::Span::current(), "network");
         }
         drop(span);
 
@@ -403,7 +646,14 @@ mod tests {
             "{:?}",
             call.events
         );
-        assert_eq!(call.status, opentelemetry::trace::Status::error("error"));
+        assert_eq!(call.status, opentelemetry::trace::Status::error("network"));
+        assert!(
+            call.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "error.code" && attribute.value.as_str() == "network"
+            }),
+            "{:?}",
+            call.attributes
+        );
     }
 
     #[test]
@@ -499,5 +749,95 @@ mod tests {
         });
         let state = values.get("tracestate").map(String::as_str).unwrap_or("");
         assert!(state.contains("vendor=value"), "{values:?}");
+    }
+
+    #[test]
+    fn spawned_calls_share_the_run_and_record_outcomes() {
+        use opentelemetry::trace::Status;
+
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (exporter, provider) = capture_provider();
+        global::set_tracer_provider(provider.clone());
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        mark_export_ready();
+        let tracer = provider.tracer("astra-test");
+        let filter = EnvFilter::new("astra.run=info,astra.llm=info,astra.tool=info");
+        let subscriber = tracing_subscriber::registry()
+            .with(OpenTelemetryLayer::new(tracer).with_filter(filter));
+        let _default = tracing::subscriber::set_default(subscriber);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        runtime.block_on(async {
+            bind_run(&Carrier::from_header_values(Some(parent), None), async {
+                let llm = spawn_in_active_run(async {
+                    let span = tracing::info_span!(target: "astra.llm", "llm.call");
+                    parent_to_active_run(&span);
+                    drop(span);
+                });
+                let denied = spawn_in_active_run(async {
+                    let span = tracing::info_span!(target: "astra.tool", "tool.exec");
+                    parent_to_active_run(&span);
+                    mark_error(&span, "policy_denied");
+                    drop(span);
+                });
+                let ok_tool = spawn_in_active_run(async {
+                    let span = tracing::info_span!(target: "astra.tool", "tool.exec");
+                    parent_to_active_run(&span);
+                    drop(span);
+                });
+                llm.await.expect("llm task");
+                denied.await.expect("denied tool task");
+                ok_tool.await.expect("tool task");
+            })
+            .await;
+            bind_run(&Carrier::default(), async {
+                fail_active_run("provider_deadline");
+            })
+            .await;
+        });
+
+        let finished = exporter.0.lock().expect("span capture").clone();
+        let success = finished
+            .iter()
+            .find(|span| span.name == "astra.run" && span.status == Status::Unset)
+            .expect("successful run");
+        let children: Vec<_> = finished
+            .iter()
+            .filter(|span| span.name == "llm.call" || span.name == "tool.exec")
+            .collect();
+        assert_eq!(children.len(), 3);
+        for child in &children {
+            assert_eq!(
+                child.span_context.trace_id(),
+                success.span_context.trace_id()
+            );
+            assert_eq!(child.parent_span_id, success.span_context.span_id());
+        }
+        assert!(
+            children
+                .iter()
+                .any(|span| span.name == "llm.call" && span.status == Status::Unset)
+        );
+        assert!(children.iter().any(|span| {
+            span.name == "tool.exec"
+                && span.status == Status::error("policy_denied")
+                && span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == "error.code"
+                        && attribute.value.as_str() == "policy_denied"
+                })
+        }));
+        let failed = finished
+            .iter()
+            .find(|span| {
+                span.name == "astra.run" && span.status == Status::error("provider_deadline")
+            })
+            .expect("failed run");
+        assert!(failed.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "error.code"
+                && attribute.value.as_str() == "provider_deadline"
+        }));
     }
 }

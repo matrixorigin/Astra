@@ -161,14 +161,7 @@ pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response 
     );
 
     let start = Instant::now();
-    let carrier = astra_logging::trace_context::Carrier::from_header_values(
-        req.headers()
-            .get("traceparent")
-            .and_then(|value| value.to_str().ok()),
-        req.headers()
-            .get("tracestate")
-            .and_then(|value| value.to_str().ok()),
-    );
+    let carrier = inbound_carrier(req.headers());
     let mut res = super::run_trace::scope_inbound(carrier, next.run(req).instrument(span)).await;
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -224,6 +217,23 @@ pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response 
     Response::from_parts(parts, Body::from(collected))
 }
 
+fn inbound_carrier(headers: &axum::http::HeaderMap) -> astra_logging::trace_context::Carrier {
+    use astra_logging::trace_context::Carrier;
+
+    let traceparent = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok());
+    match headers
+        .get_all("tracestate")
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(fields) => Carrier::from_header_fields(traceparent, fields),
+        Err(_) => Carrier::from_header_values(traceparent, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +255,25 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(request_trace_middleware))
+    }
+
+    #[test]
+    fn repeated_tracestate_headers_combine() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+                .parse()
+                .unwrap(),
+        );
+        headers.append("tracestate", "rojo=00f067aa0ba902b7".parse().unwrap());
+        headers.append("tracestate", "congo=t61rcWkgMzE".parse().unwrap());
+        let carrier = inbound_carrier(&headers);
+        assert!(carrier.traceparent.is_some());
+        assert_eq!(
+            carrier.tracestate.as_deref(),
+            Some("rojo=00f067aa0ba902b7,congo=t61rcWkgMzE")
+        );
     }
 
     #[test]

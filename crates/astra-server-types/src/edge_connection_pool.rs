@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::edge_ws_protocol::{
     EDGE_TOOL_RESULT_GRACE_SECS, EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage,
     MAX_EDGE_TOOL_TIMEOUT_SECS, RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
-    trace_carrier_for_connection,
+    supports_w3c_trace_context,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -1150,7 +1150,8 @@ impl EdgeConnectionPool {
         let result_deadline = execution_deadline
             .map(|deadline| deadline + Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS));
         let key = pool_key(connection_user_id, edge_agent_id);
-        let (pending_results, sender, connection_generation, materialization_id, capabilities) = {
+        let has_trace_carrier = traceparent.is_some() || tracestate.is_some();
+        let (pending_results, sender, connection_generation, materialization_id, trace_supported) = {
             let Some(entry) = self.connections.get(&key) else {
                 tracing::warn!(
                     target: "astra_runtime::edge_dispatch_diag",
@@ -1179,11 +1180,14 @@ impl EdgeConnectionPool {
                 conn.sender.clone(),
                 conn.generation,
                 conn.materialization_id.clone(),
-                conn.capabilities.clone(),
+                has_trace_carrier && supports_w3c_trace_context(conn.capabilities.as_ref()),
             )
         };
-        let (traceparent, tracestate) =
-            trace_carrier_for_connection(capabilities.as_ref(), traceparent, tracestate);
+        let (traceparent, tracestate) = if trace_supported {
+            (traceparent, tracestate)
+        } else {
+            (None, None)
+        };
 
         let request_id = identity.storage_key();
         let delivery_generation = self

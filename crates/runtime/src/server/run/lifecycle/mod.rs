@@ -8162,6 +8162,20 @@ impl AgenticRunLifecycleService {
             }
         };
 
+        match final_status {
+            RunStatus::Failed => crate::server::run_trace::fail_active_run(
+                error_kind
+                    .map(astra_core::ErrorKind::as_str)
+                    .unwrap_or("failed"),
+            ),
+            RunStatus::Cancelled => crate::server::run_trace::fail_active_run("cancelled"),
+            RunStatus::Running
+            | RunStatus::Paused
+            | RunStatus::Waiting
+            | RunStatus::Completed
+            | RunStatus::Delegated => {}
+        }
+
         (events, final_status, error_msg)
     }
 

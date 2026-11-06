@@ -692,7 +692,10 @@ impl ToolExecutionService {
             .instrument(span.clone())
             .await;
         if result.is_error {
-            astra_logging::trace_context::mark_error(&span);
+            astra_logging::trace_context::mark_error(
+                &span,
+                Self::exported_tool_error_code(&result),
+            );
         }
         result
     }
@@ -719,9 +722,23 @@ impl ToolExecutionService {
             .instrument(span.clone())
             .await;
         if result.result_mut().is_error {
-            astra_logging::trace_context::mark_error(&span);
+            astra_logging::trace_context::mark_error(
+                &span,
+                Self::exported_tool_error_code(result.result_mut()),
+            );
         }
         result
+    }
+
+    fn exported_tool_error_code(result: &astra_tools::ToolResult) -> &'static str {
+        result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("error_kind"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(astra_core::ErrorKind::parse_tag)
+            .map(astra_core::ErrorKind::as_str)
+            .unwrap_or("unknown")
     }
 
     async fn execute_with_route_and_cancel<L, R>(
