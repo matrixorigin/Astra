@@ -134,6 +134,146 @@ async fn admitted_attempt_with_lost_headers_then_rejection_retains_uncertainty()
     let _ = server.await;
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn refused_connection_then_rejection_restores_draft_with_login_guidance() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug)]
+    struct RestartingServer {
+        address: std::net::SocketAddr,
+        calls: AtomicUsize,
+        stopped: tokio::sync::Notify,
+        posts: Arc<AtomicUsize>,
+        task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    }
+
+    impl astra_thin_client::client::BearerProvider for RestartingServer {
+        fn token(
+            &self,
+        ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+        {
+            Box::pin(async move {
+                match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    // GET /models completes first. The first admission then
+                    // connects to a closed port, before any POST can be sent.
+                    1 => self.stopped.notified().await,
+                    2 => {
+                        let listener = tokio::net::TcpListener::bind(self.address).await.unwrap();
+                        let posts = self.posts.clone();
+                        let app = Router::new().route(
+                            "/chat/stream",
+                            post(move || {
+                                posts.fetch_add(1, Ordering::SeqCst);
+                                async {
+                                    (
+                                        TEST_SSE_HEADERS,
+                                        concat!(
+                                            "data: {\"type\":\"error\",\"error_kind\":\"invalid_request\",",
+                                            "\"message\":\"registration required\",",
+                                            "\"error_code\":\"execution_binding_provider_required\",",
+                                            "\"metadata\":{\"attempt_admission_state\":\"rejected\"}}\n\n",
+                                            "data: [DONE]\n\n"
+                                        ),
+                                    )
+                                }
+                            }),
+                        );
+                        *self.task.lock().unwrap() = Some(tokio::spawn(async move {
+                            axum::serve(listener, app).await.unwrap();
+                        }));
+                    }
+                    _ => {}
+                }
+                Ok("synthetic-token".into())
+            })
+        }
+    }
+
+    let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = crate::test_utils::isolate_credentials();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = Arc::new(RestartingServer {
+        address,
+        calls: AtomicUsize::new(0),
+        stopped: tokio::sync::Notify::new(),
+        posts: Arc::new(AtomicUsize::new(0)),
+        task: Mutex::new(None),
+    });
+    let first_peer = peer.clone();
+    let catalog = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut headers = Vec::new();
+        let mut buffer = [0; 4096];
+        while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            headers.extend_from_slice(&buffer[..count]);
+        }
+        assert!(headers.starts_with(b"GET /models"));
+        let body = crate::test_utils::mock_model_catalog_json(&["test-model"]).to_string();
+        socket.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        ).as_bytes()).await.unwrap();
+        socket.shutdown().await.unwrap();
+        drop(socket);
+        drop(listener);
+        first_peer.stopped.notify_one();
+    });
+    let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None)
+        .unwrap()
+        .with_bearer_provider(peer.clone());
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "unsent message");
+    let mut pm = PermissionManager::new(true);
+    let mut params = ChatTurnParams::basic_cli(
+        &context,
+        "synthetic-token",
+        Some("session-refused-admission"),
+        &mut pm,
+    );
+    params.session_state_journal = Some(Arc::new(Mutex::new(
+        crate::edge_tools::SessionStateRollbackJournal::default(),
+    )));
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(20), stream_chat_sse(params))
+        .await
+        .unwrap()
+        .expect_err("the only dispatched POST is rejected");
+    catalog.await.unwrap();
+    if let Some(task) = peer.task.lock().unwrap().take() {
+        task.abort();
+    }
+    assert_eq!(peer.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        failure.partial.error_code.as_deref(),
+        Some("execution_binding_provider_required")
+    );
+    assert!(!failure.partial.prior_admission_ambiguous);
+    assert!(failure.partial.admission_rejected);
+    assert!(failure.partial.run_id.is_none());
+    assert!(failure.partial.last_heavy_checkpoint.is_none());
+    let mut state = crate::cli::session::session_state::SessionState::default();
+    let mut ui = crate::tests::TestUi::default();
+    crate::cli::turn::turn_failure_reporting::report_admission_rejection(
+        &mut state,
+        "unsent message",
+        &failure,
+        &mut ui,
+    );
+    assert_eq!(ui.restored_inputs, vec!["unsent message"]);
+    let shown = ui.errors.join("\n");
+    assert!(shown.contains("/login") && shown.contains("No model or tool ran"));
+    assert!(!shown.contains("unknown") && !shown.contains("do not resend"));
+}
+
 fn basic_chat_context<'a>(
     api: &'a astra_thin_client::ThinClient,
     registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,

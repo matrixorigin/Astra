@@ -1804,7 +1804,12 @@ impl ThinClient {
                 }
                 Err(e) => {
                     if attempt + 1 < max_attempts && e.is_transport() {
-                        prior_dispatch_ambiguous |= dispatched;
+                        // Connector failures happen before the HTTP request can
+                        // reach the Server. Other transport failures may lose an
+                        // admitted response; never erase an earlier ambiguity.
+                        let failed_before_send =
+                            matches!(&e, ThinClientError::Http(error) if error.is_connect());
+                        prior_dispatch_ambiguous |= dispatched && !failed_before_send;
                         let delay_secs = 1u64 << attempt;
                         if !quiet {
                             tracing::warn!(
