@@ -81,6 +81,8 @@ starts stay in the foreground.
 The command prints `status`, `logs`, and `stop` with the installed executable
 path and shell quoting. Run those printed commands; a later shell does not need
 `astra-edge` on `PATH`. Running the connect command again with the same
-credential leaves the background runner in place. A refreshed credential
-restarts that runner, and the next connection and reconnect use the new token.
-The token is not written to the runner metadata.
+credential leaves the background runner in place. A refreshed credential is
+handed to that running runner for its next connection; work already admitted
+keeps running. If the new credential cannot authenticate, the runner continues
+with the credential that was already working. The token is not written to the
+runner metadata.
