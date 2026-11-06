@@ -222,18 +222,18 @@ impl SessionObservationRecovery {
         })
     }
 
-    #[cfg(feature = "e2e-hooks")]
+    #[cfg(any(test, feature = "e2e-hooks"))]
     pub(crate) fn scope_for_test(&mut self, user: &str, session: &str) {
         self.scope = Some((user.into(), session.into()));
         self.lease.lease_name = format!("session_observation_test_{session}");
     }
 
-    #[cfg(feature = "e2e-hooks")]
+    #[cfg(any(test, feature = "e2e-hooks"))]
     pub(crate) fn lease_identity_for_test(&self) -> (&str, &str) {
         (&self.lease.lease_name, &self.lease.pod_id)
     }
 
-    #[cfg(feature = "e2e-hooks")]
+    #[cfg(any(test, feature = "e2e-hooks"))]
     pub(crate) async fn expire_lease_for_test(&self) {
         sqlx::query("UPDATE sweeper_leases SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE sweeper_name = ? AND owner_pod_id = ?")
             .bind(&self.lease.lease_name).bind(&self.lease.pod_id).execute(self.lease.pool.get()).await.unwrap();
