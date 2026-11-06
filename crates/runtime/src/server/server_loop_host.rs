@@ -1429,6 +1429,8 @@ fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
     match error.kind {
         astra_core::ErrorKind::RateLimit => "error_rate_limit",
         astra_core::ErrorKind::PaymentRequired => "error_payment_required",
+        astra_core::ErrorKind::ProviderQuotaExhausted => "error_provider_quota_exhausted",
+        astra_core::ErrorKind::ProviderForbidden => "error_provider_forbidden",
         astra_core::ErrorKind::ServerError => "error_server_error",
         astra_core::ErrorKind::Auth => "error_auth",
         astra_core::ErrorKind::ContextWindow => "error_context_window",

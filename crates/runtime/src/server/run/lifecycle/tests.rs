@@ -14,6 +14,9 @@ mod trace_ingestion_tests;
 
 #[path = "skill_ledger_tests.rs"]
 mod skill_ledger_tests;
+
+#[path = "provider_rejection_tests.rs"]
+mod provider_rejection_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[tokio::test]
