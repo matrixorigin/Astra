@@ -5425,6 +5425,22 @@ mod tests {
                     .unwrap();
                 assert!(observed.execution_settled);
                 assert_eq!(observed.context_not_saved, Some(case.context_lost()));
+                let (_, conversation, _, _, _) =
+                    crate::server::session::conversation::read_conversation(
+                        &pool, &user, &session, 200, None, false,
+                    )
+                    .await
+                    .unwrap();
+                let conversation = serde_json::to_value(conversation).unwrap();
+                let context = conversation
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| {
+                        item["run_id"] == run_id && item.get("context_not_saved").is_some()
+                    })
+                    .expect("cold conversation retains the exact cancelled Run's Context fact");
+                assert_eq!(context["context_not_saved"], case.context_lost());
                 let next_run = Uuid::new_v4().to_string();
                 let next_request = super::super::tests::prepared_test_request("continue");
                 let mut next = RootTurnStartParticipant {

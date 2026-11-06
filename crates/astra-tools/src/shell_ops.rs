@@ -8088,7 +8088,9 @@ printf 'probe.txt:1:needle\n'
 
         assert!(!result.is_error, "{}", result.output);
         assert!(
-            result.output.contains("daemonize themselves"),
+            result
+                .output
+                .contains("Live processes observed in this Bash execution scope were terminated"),
             "{}",
             result.output
         );

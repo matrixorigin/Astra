@@ -297,7 +297,7 @@ async fn foreground_timeout_preserves_external_effect_and_typed_failure() {
     assert_eq!(fields["recovery_evidence"]["retryable"], false);
     assert_eq!(
         fields["recovery_evidence"]["recovery_actions"],
-        json!(["reconcile_outcome"])
+        json!(["inspect_structured_failure"])
     );
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     assert_eq!(

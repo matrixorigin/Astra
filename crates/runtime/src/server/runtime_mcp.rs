@@ -377,6 +377,10 @@ pub(crate) struct AgentBindingMcpRpcError {
 }
 
 impl AgentBindingMcpRpcError {
+    pub(crate) fn provider_acknowledged(&self) -> bool {
+        self.provider_acknowledged
+    }
+
     pub(crate) fn is_cancelled_before_dispatch(&self) -> bool {
         self.cancelled_before_dispatch
     }

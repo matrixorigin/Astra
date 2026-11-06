@@ -910,6 +910,18 @@ Interactive and one-shot clients warn about a lost or unconfirmed Context. An
 executor crash before settlement, or an owner that has already been fenced,
 cannot promise to save its in-memory history.
 
+Web projects the same Context observation separately from assistant text. It
+retains the exact-run cancellation response even after Stop closes the stream;
+an acknowledgement without execution settlement remains unconfirmed. Once the
+existing Stop reconciliation observes a terminal, the bounded conversation
+read projects its receipt within the original Stop response budget. A slow
+read leaves saving unconfirmed and does not retain a terminal active slot.
+Cold history attaches that observation to the
+recorded terminal assistant, or a display-only cancellation item in the same
+Run when no assistant is visible. Historical cancellations remain attached to
+their own Run after a successor starts. This extends the existing snapshot
+projection, without another ordinary execution query or persistence owner.
+
 The MOI receiving boundary is outside Astra. Matrixflow
 [PR #18920](https://github.com/matrixorigin/matrixflow/pull/18920) adds protocol-ID
 propagation and authenticated, process-local cooperative cancellation; it does

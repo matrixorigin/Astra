@@ -7095,7 +7095,7 @@ mod tests {
             cancellation["error_kind"],
             astra_tools::TOOL_ERROR_KIND_CANCELLED
         );
-        assert!(outcome.output.contains("cancelled before completion"));
+        assert!(!outcome.output.is_empty(), "retain cancellation context");
         assert!(!cancellation.contains_key(astra_tools::workspace_observation::RECEIPT_FIELD));
         #[cfg(all(unix, not(target_os = "linux")))]
         assert_settled_shell_without_receipt(dir.path(), &outcome).await;
@@ -7107,7 +7107,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn edge_bash_helper_crash_marks_terminal_ownership_unsettled() {
+    async fn edge_bash_helper_crash_reports_unknown_without_blocking_inspection() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
         let outcome = executor
@@ -7132,9 +7132,12 @@ mod tests {
         );
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
-            Some(true),
-            "unowned descendants must become a terminal completion barrier"
+            Some(false),
+            "an unknown outcome must not quarantine later inspection"
         );
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
     }
 
     #[tokio::test]
@@ -7340,8 +7343,12 @@ mod tests {
         ).await;
 
         assert!(
-            !outcome.is_error,
-            "business command still completed: {outcome:?}"
+            outcome.is_error,
+            "changed coordination cannot confirm the outcome: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.tool_result_fields.as_ref().unwrap()["execution_fact"],
+            "unknown"
         );
         assert!(dir.path().join("generated.txt").is_file());
         assert!(
@@ -7359,7 +7366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn started_shell_with_unsettled_ownership_still_fails_closed_without_a_delta() {
+    async fn started_shell_with_unsettled_ownership_reports_unknown_without_a_delta() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
         let outcome = executor
@@ -7376,8 +7383,11 @@ mod tests {
         assert!(outcome.is_error);
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
-            Some(true)
+            Some(false)
         );
+        let fields = outcome.tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
     }
 
     #[tokio::test]
@@ -7853,7 +7863,7 @@ mod tests {
         let start = std::time::Instant::now();
         // This command starts a long-running background process and exits immediately.
         // Without the fix, wait_with_output() would block until sleep finishes (60s).
-        let result = executor
+        let outcome = executor
             .execute_with_metadata(
                 "bash",
                 &serde_json::json!({
@@ -7861,8 +7871,8 @@ mod tests {
                     "timeout": 5.0
                 }),
             )
-            .await
-            .output;
+            .await;
+        let result = outcome.output;
         let elapsed = start.elapsed();
         // The real default pipe drain must return well before the 60s sleep completes.
         assert!(
@@ -7877,7 +7887,14 @@ mod tests {
             !result.contains("timed out"),
             "should not timeout: {result}"
         );
-        assert!(result.contains("not running now"), "{result}");
+        assert!(
+            result.contains("Processes that escaped the scope may still run"),
+            "{result}"
+        );
+        assert_eq!(
+            outcome.tool_result_fields.unwrap()["background_children_reaped"],
+            true
+        );
     }
 
     #[cfg(target_os = "linux")]

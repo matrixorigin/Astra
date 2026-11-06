@@ -31063,8 +31063,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn database_independent_admission_fences_competing_runs_live_leases_and_unknown_effects()
-    {
+    async fn database_independent_admission_fences_live_owners_but_allows_prior_unknown_effects() {
         use crate::tool_invocation_ledger::{
             DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission,
         };
@@ -31220,10 +31219,6 @@ mod tests {
             .await
             .unwrap();
         let final_run = record("after-effect");
-        assert!(
-            store.insert_run(final_run.clone()).await.is_err(),
-            "terminal Run and executor exit cannot discharge unknown effects"
-        );
         let key = astra_turn_types::SessionKeyV1::owner_session(
             "server",
             &user,
@@ -31244,8 +31239,33 @@ mod tests {
             Some(crate::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool)
         );
         tx.rollback().await.unwrap();
-        // A confirmed effect outcome, rather than a Run status or deleted
-        // pointer, is the existing custody owner's release boundary.
+        store
+            .insert_run(final_run.clone())
+            .await
+            .expect("a prior unknown invocation does not block an independent Run");
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().state,
+            ToolInvocationState::OutcomeUnknown
+        );
+        assert!(
+            ledger
+                .claim_dispatch(
+                    &identity,
+                    "another-worker",
+                    90_000,
+                    ToolInvocationDispatchAdmission {
+                        expected_control_epoch: -1,
+                        expected_owner_generation: next.run_generation,
+                        expected_owner_pod_id: store.owner_pod_id.clone(),
+                        expected_execution_binding_generation: None,
+                    },
+                )
+                .await
+                .is_err(),
+            "the original invocation must not be redelivered"
+        );
+        // Only a confirmed result settles the original invocation, independently
+        // of admitting a new Run. Controller changes retain their stricter gate.
         ledger
             .compare_and_complete(
                 &identity,
@@ -31262,10 +31282,6 @@ mod tests {
             )
             .await
             .unwrap();
-        store
-            .insert_run(final_run.clone())
-            .await
-            .expect("confirmed custody allows the next independent Run");
         cleanup_database_run_fixture(&pool, &other_user, &other_run.run_id).await;
         sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
             .bind(&other_user)

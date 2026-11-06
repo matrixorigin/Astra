@@ -396,14 +396,27 @@ describe("AstraClient — Runs", () => {
   });
 
   test("cancelRun", async () => {
-    globalThis.fetch = mockFetch(200);
-    await createClient().cancelRun("r1");
+    globalThis.fetch = mockFetch(200, { run_id: "r1", status: "cancelled", execution_settled: true, context_not_saved: true });
+    expect(await createClient().cancelRun("r1")).toEqual({ runId: "r1", status: "cancelled", executionSettled: true, contextNotSaved: true });
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
     ).toContain("/chat/runs/r1");
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].method,
     ).toBe("DELETE");
+  });
+
+  test.each([
+    [{ run_id: "other", status: "cancelled", execution_settled: true }, null],
+    [{ run_id: "r1", status: "cancelled", execution_settled: true, context_not_saved: "false" }, null],
+    ["invalid json", null],
+    [{ run_id: "r1", status: "cancelled", execution_settled: true, context_not_saved: false },
+      { runId: "r1", status: "cancelled", executionSettled: true, contextNotSaved: false }],
+    [{ run_id: "r1", status: "cancellation_requested", execution_settled: false },
+      { runId: "r1", status: "cancellation_requested", executionSettled: false }],
+  ])("cancelRun preserves receipt uncertainty (%j)", async (wire, expected) => {
+    globalThis.fetch = mockFetch(200, wire);
+    expect(await createClient().cancelRun("r1")).toEqual(expected);
   });
 
   test("pauseRun", async () => {

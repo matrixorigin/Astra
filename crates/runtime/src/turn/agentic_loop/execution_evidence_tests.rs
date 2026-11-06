@@ -1007,34 +1007,21 @@ fn mixed_request_retains_only_its_workspace_completion_owner() {
 async fn callback_outcome_facts_reach_the_model_before_recovery() {
     // Use the shared producer, not hand-written rejection metadata. This is
     // the same callback body/metadata the CLI sends after cancellation.
-    for (started, unknown) in [(false, false), (true, false), (false, true)] {
+    for (started, unknown) in [(false, false), (true, false), (true, true)] {
         let mut result =
             make_edge_tool_with_args("bash", json!({"command": "perform-external-operation"}), "");
         let cancelled = astra_tools::cancelled_tool_result("bash", started);
+        let cancelled = if unknown {
+            cancelled.with_execution_outcome_unknown()
+        } else {
+            cancelled
+        };
         result.output = cancelled.output;
         result
             .tool_result_fields
             .as_mut()
             .unwrap()
             .extend(cancelled.metadata.unwrap());
-        if unknown {
-            let fields = result.tool_result_fields.as_mut().unwrap();
-            // A lost worker/result cannot assert that dispatch never occurred.
-            for key in [
-                "status",
-                "cancelled",
-                "reason",
-                "execution_started",
-                "side_effects_maybe",
-            ] {
-                fields.remove(key);
-            }
-            fields.remove("disposition");
-            fields.insert("error_kind".into(), json!("tool_outcome_unknown"));
-            fields.insert("execution_fact".into(), json!("unknown"));
-            fields.insert("side_effects_maybe".into(), json!(true));
-            result.output = "Error: shell acknowledgement lost; reconcile outcome".into();
-        }
         result.status = "failed".into();
         let mut observed =
             make_edge_tool_with_args("bash", json!({"command": "pwd"}), "/workspace");
@@ -1042,7 +1029,7 @@ async fn callback_outcome_facts_reach_the_model_before_recovery() {
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![result], 10, 2, None),
             edge_tool_result(vec![observed], 10, 2, None),
-            text_result("The operation's outcome is unknown.", 10, 2, None),
+            text_result("The operation was cancelled.", 10, 2, None),
         ])
         .with_valid_tools(&["bash"]);
         if started || unknown {
@@ -1055,14 +1042,7 @@ async fn callback_outcome_facts_reach_the_model_before_recovery() {
             .await
             .unwrap();
         let record = &state.stall.tool_call_records[0];
-        assert_eq!(
-            record.error_kind,
-            Some(if unknown {
-                astra_core::ErrorKind::ToolOutcomeUnknown
-            } else {
-                astra_core::ErrorKind::Cancelled
-            })
-        );
+        assert_eq!(record.error_kind, Some(astra_core::ErrorKind::Cancelled));
         assert_eq!(record.was_executed(), started || unknown);
         assert!(
             !record.ok,
@@ -1078,14 +1058,20 @@ async fn callback_outcome_facts_reach_the_model_before_recovery() {
         assert!(state.interruption.is_none(), "{:?}", state.interruption);
         let model_context = serde_json::to_string(&host.executed_messages[1]).unwrap();
         assert!(
-            model_context.contains(if started || unknown {
+            model_context.contains(if unknown {
                 "Inspect the outcome before repeating it"
+            } else if started {
+                "failed"
             } else {
                 "not_executed"
             }),
             "{model_context}"
         );
-        assert_eq!(state.final_text, "The operation's outcome is unknown.");
+        assert_eq!(
+            model_context.contains("Inspect the outcome before repeating it"),
+            unknown
+        );
+        assert_eq!(state.final_text, "The operation was cancelled.");
         assert_eq!(host.final_output_ready, vec![state.final_text.clone()]);
 
         if started || unknown {
@@ -1115,10 +1101,11 @@ async fn callback_outcome_facts_reach_the_model_before_recovery() {
             assert_eq!(resumed.turn_count(), 1);
             assert!(resumed.admitted_tool_call_batches.is_empty());
             assert!(!restored.stall.tool_call_records[0].ok);
-            assert!(
+            assert_eq!(
                 serde_json::to_string(&resumed.executed_messages[0])
                     .unwrap()
-                    .contains("Inspect the outcome before repeating it")
+                    .contains("Inspect the outcome before repeating it"),
+                unknown
             );
         }
     }

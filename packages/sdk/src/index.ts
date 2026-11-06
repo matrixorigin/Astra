@@ -408,6 +408,8 @@ export {
   extractWaitingReason,
   extractBlockedReason,
   projectRunWaitingState,
+  cancelledContextObservation,
+  contextSaveWarning,
   type ToolTerminalStatusEvent,
   type RunWaitingProjection,
 } from "./lifecycle-utils";

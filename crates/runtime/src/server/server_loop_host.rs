@@ -50735,8 +50735,18 @@ mod tests {
             .collect();
         assert_eq!(results.len(), 1);
         let wire_rejection: Value =
-            serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
+            serde_json::Deserializer::from_str(results[0]["content"].as_str().unwrap())
+                .into_iter::<Value>()
+                .next()
+                .unwrap()
+                .unwrap();
         assert_eq!(wire_rejection["error_kind"], "tool_call_arguments_invalid");
+        assert!(
+            results[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("not_executed")
+        );
     }
 
     // ── inject_tool_schema tests ────────────────────────────────────────────
@@ -53321,8 +53331,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(details["partial_full_text"], "half answer");
-        assert_eq!(details["usage"]["input_tokens"], 17);
-        assert_eq!(details["usage"]["output_tokens"], 3);
+        // The provider measured total input, but omitted its cache split.
+        // Preserve the observation without inventing an uncached-input lane.
+        inference.wait_for_measured_input(17).await;
+        assert!(details["qualified_usage"]["input_tokens"].is_null());
+        assert_eq!(details["qualified_usage"]["output_tokens"], 3);
         gateway.assert_complete();
         inference.assert_quiescent();
         assert_eq!(inference.attempt_count(), 1);
