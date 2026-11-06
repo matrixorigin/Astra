@@ -516,10 +516,12 @@ or low task value. They must not create a separate risk score, retry-cautioned
 tool list, or extra correction pressure without independent outcome evidence.
 Read tools may report overlapping delivery for the same captured content, but
 must not infer current prompt coverage or require stopping from read counts.
-Policy feedback names these observations `read_coverage_overlap` and
-`round_activity`, with coverage/progress review recommendations rather than
-semantic judgments of redundancy or low value. Both observation stages remain
-advisory; persistence of a signal is not proof that the model ignored feedback.
+Requested file ranges do not prove delivered content. The argument-derived
+read-overlap metric and its configuration, harness verifier and policy signal
+are removed. The filesystem executor may report which numbered lines it
+previously produced for the same captured bytes, without claiming they remain
+in model context. Exact observable-result identity and `round_activity` remain
+advisory evidence; persistence of a signal does not prove ignored feedback.
 Policy feedback schema v4 includes current, bounded recovery evidence from
 TurnGuard alongside behavioral observations. One pre-provider policy projection
 owns model-facing signature/operation repetition feedback; post-tool evaluation retains health,

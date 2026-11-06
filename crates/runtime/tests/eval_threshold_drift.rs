@@ -8,24 +8,13 @@
 
 use astra_config::runtime_config::ToolPolicyConfig;
 use astra_turn_core::evaluation::{
-    REDUNDANT_OVERLAPPING_READS_THRESHOLD, REDUNDANT_VALIDATION_RETRIES_THRESHOLD,
-    SEARCH_FANOUT_THRESHOLD,
+    REDUNDANT_VALIDATION_RETRIES_THRESHOLD, SEARCH_FANOUT_THRESHOLD,
 };
 
 fn assert_default_matches(actual: u32, expected: usize, name: &str) {
     assert_eq!(
         actual as usize, expected,
         "{name}: astra-config default diverged from astra-turn-core calibration constant ({actual} != {expected})",
-    );
-}
-
-#[test]
-fn default_redundant_reads_matches_turn_core() {
-    let cfg = ToolPolicyConfig::default();
-    assert_default_matches(
-        cfg.effective_redundant_reads_eval_threshold(),
-        REDUNDANT_OVERLAPPING_READS_THRESHOLD,
-        "redundant_overlapping_reads",
     );
 }
 

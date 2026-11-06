@@ -2443,11 +2443,11 @@ mod tests {
                 expected_result: "One verified fact".to_string(),
             },
             entries: vec![RuntimePolicyFeedbackEntry {
-                signal: RuntimePolicySignal::ReadCoverageOverlap,
+                signal: RuntimePolicySignal::SearchFanout,
                 stage: RuntimePolicyStage::Converge,
                 observed_at_round: 8,
                 evidence_count: 9,
-                recommendation: RuntimePolicyRecommendation::ReviewReadCoverage,
+                recommendation: RuntimePolicyRecommendation::NarrowEvidenceSearch,
             }],
         };
 
@@ -2460,7 +2460,7 @@ mod tests {
             assert!(output.contains("server_only"), "{depth:?}: {output}");
             assert!(output.contains("work_item=item-2@3"), "{depth:?}: {output}");
             assert!(
-                output.contains("ReadCoverageOverlap/Converge"),
+                output.contains("SearchFanout/Converge"),
                 "{depth:?}: {output}"
             );
         }

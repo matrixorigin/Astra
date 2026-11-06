@@ -11342,7 +11342,6 @@ pub(crate) mod tests {
     fn original_execution_facts_keep_admitted_evaluation_thresholds() {
         use crate::turn::runtime_policy::evaluation_thresholds_from_policy;
         let mut policy = astra_config::runtime_config::ToolPolicyConfig {
-            redundant_reads_eval_threshold: 7,
             search_fanout_eval_threshold: 19,
             redundant_validation_retries_eval_threshold: 5,
             ..Default::default()
@@ -15266,7 +15265,6 @@ mod parallel_execution_tests {
                             r.snapshot.final_state.as_deref(),
                             Some("completed" | "interrupted")
                         ) && r.snapshot.read_only_round_streak >= 32
-                            && r.snapshot.redundant_read_count >= 6
                     })
                     .count()
                     >= 3,

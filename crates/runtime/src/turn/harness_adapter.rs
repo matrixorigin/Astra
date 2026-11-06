@@ -206,10 +206,6 @@ mod enabled {
             .rev()
             .find_map(|record| record.result_class.clone());
         let read_only_round_streak = input.read_only_round_streak.min(u32::MAX as usize) as u32;
-        let redundant_read_count =
-            astra_turn_core::evaluation::count_redundant_overlapping_reads(input.tool_records)
-                .min(u32::MAX as usize) as u32;
-
         let elapsed = now.saturating_sub(session_start_unix_millis);
 
         RuntimeSnapshot {
@@ -240,7 +236,6 @@ mod enabled {
             has_final_text,
             last_tool_result_class,
             read_only_round_streak,
-            redundant_read_count,
             recursion_depth: input.recursion_depth,
             consecutive_errors: input.consecutive_errors,
             captured_at_unix_millis: now,
