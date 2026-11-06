@@ -277,6 +277,7 @@ impl AgenticRunLifecycleService {
             authority: proof.receipt().authority.clone(),
             opening_hash: proof.run().opening_hash.clone(),
             prior_messages: Vec::new(),
+            authorized_session_ids: None,
             had_canonical_head: proof.receipt().authority.base_head.is_some(),
             _weighted_permit: weighted,
         };
@@ -309,12 +310,13 @@ impl AgenticRunLifecycleService {
                 token.clone(),
             );
             if let Some(head) = canonical.authority.base_head.as_ref() {
-                canonical.prior_messages = canonical
+                let materialized = canonical
                     .coordinator
                     .materialize(head)
                     .await
-                    .map_err(|error| invalid_resume(error.to_string()))?
-                    .messages;
+                    .map_err(|error| invalid_resume(error.to_string()))?;
+                canonical.prior_messages = materialized.messages;
+                canonical.authorized_session_ids = Some(materialized.authorized_session_ids);
             }
             self.prepare_resumed_execution(
                 &proof,
@@ -580,6 +582,9 @@ impl AgenticRunLifecycleService {
             &facts.hooks,
         );
         let mut state = Self::assemble_loop_state(environment, facts);
+        if let Some(origins) = canonical.authorized_session_ids.as_ref() {
+            host.set_private_reasoning_origins(origins.clone());
+        }
         state.skills.client_pipeline_skills = handoff.client_pipeline_skills.clone();
         bind_execution_owner_generation(&mut state, run.run_generation);
         if let Some(cursor) = canonical

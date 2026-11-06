@@ -61,7 +61,7 @@ pub fn filter_memory_operation_turns(messages: &[Value]) -> Vec<Value> {
             segment
                 .iter()
                 .filter(|message| !astra_turn_types::is_runtime_owned_message(message))
-                .cloned(),
+                .map(astra_core::model_wire::responses::without_continuation),
         );
     };
 
@@ -143,6 +143,25 @@ mod tests {
     fn observer_messages_empty_user_content() {
         let msgs = build_observer_messages(Some(""), "answer");
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn observer_excludes_private_provider_state_without_changing_history() {
+        let messages = vec![
+            serde_json::json!({"role":"user", "content":"inspect"}),
+            serde_json::json!({"role":"assistant", "content":"done", "_astra_responses":{
+                "items":[{"type":"reasoning", "content":[{"type":"reasoning_text", "text":"private"}]}]
+            }}),
+        ];
+        let filtered = filter_memory_operation_turns(&messages);
+        assert_eq!(
+            filtered,
+            vec![
+                messages[0].clone(),
+                serde_json::json!({"role":"assistant", "content":"done"})
+            ]
+        );
+        assert!(messages[1].get("_astra_responses").is_some());
     }
 
     #[test]

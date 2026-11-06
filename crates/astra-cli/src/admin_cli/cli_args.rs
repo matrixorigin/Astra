@@ -130,7 +130,7 @@ pub enum ModelCmd {
     Add(ModelAddArgs),
     Show(ModelShowArgs),
     Delete(ModelDeleteArgs),
-    /// Probe upstream LLM connectivity; on success sets `is_active=true`, on failure `false` (HTTP `POST /models/{name}/check`).
+    /// Probe upstream connectivity; activate on success and preserve the current state on failure.
     /// This is the supported way to "try activate" from credentials already stored on the server.
     #[command(alias = "probe", visible_alias = "verify")]
     Check(ModelShowArgs),
@@ -198,7 +198,7 @@ pub struct ModelLoadArgs {
     pub path: String,
     /// When the server already has this model name, `POST /models` is skipped. With this flag,
     /// push `api_key` and optional `base_url` from the YAML via `PUT /models/{name}` so the
-    /// server re-runs connectivity and refreshes `is_active`.
+    /// server re-runs connectivity and preserves the configured activation state on failure.
     #[arg(long)]
     pub update_existing: bool,
 }

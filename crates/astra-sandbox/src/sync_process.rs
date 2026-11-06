@@ -168,7 +168,9 @@ pub fn run_sync_process(
     output_limit: usize,
     configure: impl FnOnce(&mut Command) -> io::Result<()>,
 ) -> Result<SyncProcessOutput, SyncProcessError> {
-    run_sync_process_with_cancel(program, args, timeout, output_limit, None, configure)
+    run_sync_process_with_cancel(program, args, timeout, output_limit, None, |command, _| {
+        configure(command)
+    })
 }
 
 /// Cancellation uses the same termination and ownership settlement as timeout.
@@ -179,7 +181,7 @@ pub fn run_sync_process_with_cancel(
     timeout: Duration,
     output_limit: usize,
     cancel: Option<&tokio_util::sync::CancellationToken>,
-    configure: impl FnOnce(&mut Command) -> io::Result<()>,
+    configure: impl FnOnce(&mut Command, bool) -> io::Result<()>,
 ) -> Result<SyncProcessOutput, SyncProcessError> {
     let before = |phase, error: io::Error| SyncProcessError {
         phase,
@@ -209,7 +211,8 @@ pub fn run_sync_process_with_cancel(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    configure(&mut command).map_err(|e| before("command setup", e))?;
+    configure(&mut command, owner.can_authoritatively_observe())
+        .map_err(|e| before("command setup", e))?;
     owner
         .install(&mut command)
         .map_err(|e| before("owner setup", e))?;
@@ -303,7 +306,7 @@ mod tests {
                 Duration::from_secs(3),
                 1024,
                 Some(&worker_token),
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
         });
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -326,7 +329,7 @@ mod tests {
             Duration::from_secs(1),
             1024,
             Some(&token),
-            |_| panic!("pre-cancelled execution must not reach setup"),
+            |_, _| panic!("pre-cancelled execution must not reach setup"),
         )
         .unwrap_err();
         assert!(!failure.started);

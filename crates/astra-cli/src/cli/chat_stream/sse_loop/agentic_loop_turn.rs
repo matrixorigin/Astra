@@ -492,14 +492,7 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
     }
     .to_string();
     let mut context = serde_json::Map::new();
-    for field in [
-        "edge_tools",
-        "edge_profile",
-        "edge_skills",
-        "thinking",
-        "rollback_on_failure",
-        "rollback_boundary",
-    ] {
+    for field in ["edge_tools", "edge_profile", "edge_skills", "thinking"] {
         if let Some(value) = source.remove(field) {
             context.insert(field.to_string(), value);
         }
@@ -1243,8 +1236,6 @@ fn inject_runtime_turn_overrides(
 
     if is_plan_subtask {
         root.insert("is_plan_subtask".into(), json!(true));
-        root.insert("rollback_on_failure".into(), json!(true));
-        root.insert("rollback_boundary".into(), json!("turn"));
     }
     if let Some(id) = plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
         root.insert("plan_subtask_id".into(), json!(id));
@@ -1729,7 +1720,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         approval_request_tx,
         ask_user_request_tx,
         skill_resolver,
-        turn_rollback_on_failure: is_plan_subtask,
+        compensate_non_file_on_failure: is_plan_subtask,
         tool_cache,
         incremental_state: incremental_state.clone(),
         request_session_execution_lease,
@@ -2636,8 +2627,8 @@ mod tests {
 
         assert!(payload.get("skill_search").is_none());
         assert_eq!(payload["is_plan_subtask"], json!(true));
-        assert_eq!(payload["rollback_on_failure"], json!(true));
-        assert_eq!(payload["rollback_boundary"], json!("turn"));
+        assert!(payload.get("rollback_on_failure").is_none());
+        assert!(payload.get("rollback_boundary").is_none());
         assert_eq!(payload["plan_subtask_id"], json!("sub-1"));
     }
 

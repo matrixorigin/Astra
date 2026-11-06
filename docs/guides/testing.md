@@ -620,7 +620,6 @@ as a passing test. No production credentials are needed in fork CI.
 The key-free BYOK network smoke is also explicit:
 
 ```bash
-ASTRA_BYOK_DNS_SERVERS=tcp://223.5.5.5 \
 ASTRA_TEST_BYOK_MODELS_URL=https://api.moonshot.cn/v1/models \
 CARGO_INCREMENTAL=0 cargo test --locked -p astra-services \
   --features external-contract-tests --test byok_live_network -- --ignored
@@ -918,9 +917,9 @@ Repeat for `kimi-k3`. The first check verifies observable enabled/disabled
 behavior; the second uses the actual streaming summary transport and Work
 decision parser with a test persistence implementation, without starting an
 Astra Server. Its elapsed time is invocation duration, not user-visible TTFT.
-Neither replaces the MatrixOne-backed persistence fixture above. Configure
-`ASTRA_BYOK_DNS_SERVERS` only when required by the local network; do not disable
-the BYOK public-endpoint policy to run these checks.
+Neither replaces the MatrixOne-backed persistence fixture above. Configure the
+Server's system DNS if needed; do not disable the BYOK public-endpoint policy
+to run these checks.
 
 ```bash
 # 1. Smallest relevant target while iterating

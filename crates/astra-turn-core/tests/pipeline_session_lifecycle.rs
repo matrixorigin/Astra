@@ -243,6 +243,7 @@ fn full_lifecycle_with_feedback_and_latches() {
 
     let turn1 = make_turn_state(1, 2);
     let input1 = AdaptiveTurnInput {
+        planning_messages: None,
         statics: &statics,
         agent: &agent,
         session: &session,
@@ -261,6 +262,7 @@ fn full_lifecycle_with_feedback_and_latches() {
 
     let turn2 = make_turn_state(2, 4);
     let input2 = AdaptiveTurnInput {
+        planning_messages: None,
         statics: &statics,
         agent: &agent,
         session: &session,
@@ -283,6 +285,7 @@ fn full_lifecycle_with_feedback_and_latches() {
 
     let turn3 = make_turn_state(3, 6);
     let input3 = AdaptiveTurnInput {
+        planning_messages: None,
         statics: &statics,
         agent: &agent,
         session: &session,

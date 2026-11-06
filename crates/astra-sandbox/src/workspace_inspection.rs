@@ -299,14 +299,14 @@ mod unix {
             same(&current, &self.root)
         }
 
-        /// Restore uses the retained workspace authority and never an ambient
-        /// manifest pathname. Missing targets must be created exclusively.
-        pub fn open_for_restore(
+        /// Resolve the original parent through the retained workspace authority.
+        /// Returning the directory handle lets the caller stage restoration
+        /// without reopening an attacker-controlled parent path.
+        pub fn open_restore_parent(
             &self,
             relative: &Path,
-            create_new: bool,
             expected_parent: Option<&str>,
-        ) -> io::Result<File> {
+        ) -> io::Result<(File, OsString)> {
             if relative.is_absolute()
                 || relative
                     .components()
@@ -326,26 +326,7 @@ mod unix {
                 return Err(invalid("source parent changed since capture"));
             }
             let name = name.ok_or_else(|| invalid("restore target must be a regular file"))?;
-            let c_name =
-                CString::new(name.as_bytes()).map_err(|_| invalid("restore path contains NUL"))?;
-            let flags = libc::O_RDWR
-                | libc::O_CLOEXEC
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK
-                | if create_new {
-                    libc::O_CREAT | libc::O_EXCL
-                } else {
-                    0
-                };
-            let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags, 0o600) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let file = unsafe { File::from_raw_fd(fd) };
-            if !file.metadata()?.is_file() {
-                return Err(invalid("restore target must be a regular file"));
-            }
-            Ok(file)
+            Ok((parent, name))
         }
 
         pub fn regular_siblings(

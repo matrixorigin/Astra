@@ -144,10 +144,12 @@ fn bash_workdir_under_landlock() {
             )
             .is_ok()
     );
-    let restored = inspection
-        .open_for_restore(Path::new(".moi/restored"), true, None)
+    let (parent, name) = inspection
+        .open_restore_parent(Path::new(".moi/restored"), None)
         .unwrap();
-    drop(restored);
+    crate::fs_ops::restore_file_in_open_parent(&parent, Path::new(&name), None, Some(b"restored"))
+        .unwrap();
+    assert_eq!(fs::read(nested.join("restored")).unwrap(), b"restored");
     assert!(!inspection.target_is_inside(Path::new("../../private/secret")));
     assert!(!inspection.target_is_inside(Path::new("../escape/secret")));
     assert!(

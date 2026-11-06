@@ -325,6 +325,7 @@ impl DatabaseModelService {
             })?;
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
         Ok(AdmittedModelExecution {
+            responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,

@@ -1969,7 +1969,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial_test::serial]
-async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
+async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
     let temp = tempfile::tempdir().unwrap();
     let _guard = ProcessJournalDirGuard::new(temp.path());
     #[derive(Clone)]
@@ -2130,44 +2130,8 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let tool_results = state.tool_results.lock().await;
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0]["request_id"].as_str(), Some("tr-tx-1"));
+    assert_eq!(tool_results[0]["status"].as_str(), Some("failed"));
     drop(tool_results);
-
-    let boundary_events: Vec<_> = session_journal::read_journal("sess-tx-e2e")
-        .unwrap()
-        .into_iter()
-        .filter(|event| {
-            matches!(
-                event.event_type,
-                JournalEventType::ExecutionBoundaryOpened
-                    | JournalEventType::ExecutionBoundaryCommitted
-            )
-        })
-        .collect();
-    assert_eq!(boundary_events.len(), 2);
-    assert_eq!(
-        boundary_events[0].event_type,
-        JournalEventType::ExecutionBoundaryOpened
-    );
-    assert_eq!(
-        boundary_events[1].event_type,
-        JournalEventType::ExecutionBoundaryCommitted
-    );
-
-    let opened = boundary_events[0]
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("execution_boundary"))
-        .expect("opened boundary metadata");
-    assert_eq!(opened["kind"].as_str(), Some("tool_batch"));
-    assert_eq!(opened["transaction_id"].as_str(), Some("tx-e2e"));
-
-    let committed = boundary_events[1]
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("execution_boundary"))
-        .expect("committed boundary metadata");
-    assert_eq!(committed["kind"].as_str(), Some("tool_batch"));
-    assert_eq!(committed["transaction_id"].as_str(), Some("tx-e2e"));
 }
 
 #[tokio::test(flavor = "current_thread")]

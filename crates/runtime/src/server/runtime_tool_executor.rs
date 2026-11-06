@@ -5906,8 +5906,8 @@ impl ToolExecutor for RuntimeToolExecutor {
         &self.workspace_root
     }
 
-    fn workspace_root(&self) -> &Path {
-        &self.workspace_root
+    fn workspace_root(&self) -> PathBuf {
+        self.workspace_root.clone()
     }
 
     async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
@@ -14411,6 +14411,29 @@ pub(crate) mod tests {
         assert_eq!(rollback_json["path"].as_str(), Some("gone.txt"));
         assert_eq!(rollback_json["edit_type"].as_str(), Some("delete"));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "restore me");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_file_edits_restores_matching_child_file() {
+        let (exec, dir) = test_executor();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let target = child.join("file.txt");
+        std::fs::write(&target, "original").unwrap();
+        let edited = exec
+            .execute(
+                "write_file",
+                &json!({"path":"child/file.txt", "content":"edited"}),
+            )
+            .await;
+        assert!(edited.contains("Successfully wrote"), "{edited}");
+
+        let args = json!({"scope":"file", "path":"child/file.txt"});
+        let resumed = exec.execute("rollback_file_edits", &args).await;
+        let resumed: Value = serde_json::from_str(&resumed).unwrap();
+        assert_eq!(resumed["success"], true, "{resumed}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
     }
 
     #[tokio::test]
