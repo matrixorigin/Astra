@@ -47,25 +47,27 @@ impl SessionObservationStore {
         lease_name: &str,
         pod_id: &str,
         scope: Option<(&str, &str)>,
+        after: Option<(&str, &str)>,
     ) -> Result<Option<ObservationCandidate>, String> {
         let columns = qualified_manifest_content_columns("m");
         let sql = format!(
             "SELECT h.head_json, h.observation_json, h.isolation_domain, h.owner_user_id, h.session_id, h.branch_id, h.completed_turn AS head_completed_turn, {columns},
                     f.manifest_json AS fork_manifest_json
              FROM (
-               SELECT h.*, JSON_EXTRACT(w.state_json, '$.observation') AS observation_json
+               SELECT h.*, CAST(JSON_EXTRACT(w.state_json, '$.observation') AS CHAR) AS observation_json
                FROM session_context_heads h
                JOIN agent_sessions s ON s.user_id = h.owner_user_id AND s.session_id = h.session_id
                LEFT JOIN agent_session_memory_work w ON w.user_id = h.owner_user_id AND w.session_id = h.session_id
                WHERE s.delete_requested_at IS NULL AND h.head_json IS NOT NULL AND h.completed_turn > 0
                  AND h.isolation_domain = 'server' AND h.branch_id = ?
                  AND (? IS NULL OR h.owner_user_id = ?) AND (? IS NULL OR h.session_id = ?)
+                 AND (? IS NULL OR h.owner_user_id > ? OR (h.owner_user_id = ? AND h.session_id > ?))
                  AND h.completed_turn > COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(w.state_json, '$.observation.observed_turn')) AS SIGNED), 0)
                  AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(w.state_json, '$.observation.retry_at_ms')) AS SIGNED), 0)
                      <= CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
                  AND EXISTS (SELECT 1 FROM sweeper_leases l WHERE l.sweeper_name = ?
                              AND l.owner_pod_id = ? AND l.expires_at > NOW(6))
-               ORDER BY h.updated_at, h.owner_user_id, h.session_id, h.branch_id LIMIT 1
+               ORDER BY h.owner_user_id, h.session_id LIMIT 1
              ) h
              LEFT JOIN conversation_manifest_nodes m
                ON m.isolation_domain = h.isolation_domain AND m.owner_user_id = h.owner_user_id
@@ -82,6 +84,10 @@ impl SessionObservationStore {
             .bind(scope.map(|(user, _)| user))
             .bind(scope.map(|(_, session)| session))
             .bind(scope.map(|(_, session)| session))
+            .bind(after.map(|(user, _)| user))
+            .bind(after.map(|(user, _)| user))
+            .bind(after.map(|(user, _)| user))
+            .bind(after.map(|(_, session)| session))
             .bind(lease_name)
             .bind(pod_id);
         let mut rows = query.fetch(self.pool.get());
@@ -204,13 +210,13 @@ impl SessionObservationStore {
             serde_json::to_string(&checkpoint).map_err(|_| "invalid observation checkpoint")?;
         sqlx::query(
             "INSERT INTO agent_session_memory_work (user_id, session_id, state_json, complete)
-             SELECT s.user_id, s.session_id, JSON_OBJECT('observation', JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN ? THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END)), 1
+             SELECT s.user_id, s.session_id, JSON_OBJECT('observation', JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN CAST(? AS SIGNED) = 1 THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END)), 1
              FROM agent_sessions s WHERE s.user_id = ? AND s.session_id = ? AND s.delete_requested_at IS NULL
                AND EXISTS (SELECT 1 FROM sweeper_leases l WHERE l.sweeper_name = ?
                            AND l.owner_pod_id = ? AND l.expires_at > NOW(6))
              ON DUPLICATE KEY UPDATE state_json = CASE
                WHEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.revision')) AS UNSIGNED), 0) = ?
-               THEN JSON_SET(state_json, '$.observation', JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN ? THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END)) ELSE state_json END"
+               THEN JSON_SET(state_json, '$.observation', JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN CAST(? AS SIGNED) = 1 THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END)) ELSE state_json END"
         ).bind(&json).bind(success).bind(backoff_ms).bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id)
             .bind(lease_name).bind(pod_id).bind(candidate.checkpoint.revision).bind(json).bind(success).bind(backoff_ms)
             .execute(self.pool.get()).await.map_err(|_| "observation checkpoint failed")?;

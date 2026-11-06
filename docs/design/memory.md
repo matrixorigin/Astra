@@ -316,7 +316,9 @@ second transcript, or adds a failure dependency to canonical chat settlement.
 When configured, the existing managed recovery owner discovers the latest
 unobserved completed canonical head, reads its immutable nodes in the same
 query, and delegates content/fork validation to the canonical coordinator.
-An existing sweeper lease selects one cross-process observation owner; it drains
+An existing sweeper lease selects one cross-process observation owner; a local
+keyset cursor advances past deferred Sessions and wraps without replacing durable
+checkpoints. The owner drains
 at most sixteen Sessions per tick with one bounded attempt at a time. The
 ordinary non-fork path adds one discovery/materialization query, fresh authority,
 and one atomic progress checkpoint, without per-Session claim transactions.

@@ -11,6 +11,9 @@ pub(super) struct AutoRoutingContext {
     engine: RunEngine,
     supported_input: bool,
     decision: Option<ModelRoutingDecision>,
+    // Immutable-decision absence is reusable only within this exact owned Run.
+    // Publishing still checks the canonical owner fence before primary I/O.
+    missing_decision_for: Option<(String, u64)>,
     applied: bool,
 }
 
@@ -56,6 +59,7 @@ impl ServerAgenticLoopHost {
             engine,
             supported_input,
             decision: None,
+            missing_decision_for: None,
             applied: false,
         });
     }
@@ -75,14 +79,28 @@ impl ServerAgenticLoopHost {
             .current_run_id
             .as_deref()
             .ok_or_else(|| invalid("Auto routing requires a run identity"))?;
+        let restore_key = state
+            .current_run_owner_generation
+            .map(|generation| (run_id.to_owned(), generation));
+        if restore_key
+            .as_ref()
+            .is_some_and(|key| routing.missing_decision_for.as_ref() == Some(key))
+        {
+            // Consume this preflight result once. A retry after uncertain
+            // decision publication must re-read durable storage.
+            routing.missing_decision_for = None;
+            return Ok(false);
+        }
         let Some(event) = routing
             .engine
             .load_run_event_by_idempotency_key(&self.user_id, run_id, EVENT_TYPE, DECISION_KEY)
             .await
             .map_err(invalid)?
         else {
+            routing.missing_decision_for = restore_key;
             return Ok(false);
         };
+        routing.missing_decision_for = None;
         let decision: ModelRoutingDecision = serde_json::from_value(
             event
                 .get("data")
@@ -147,6 +165,12 @@ impl ServerAgenticLoopHost {
             return Ok(());
         }
         self.restore_model_routing(state).await?;
+        // Preparation can publish a decision, including an uncertain commit.
+        // Never carry an absence snapshot across that write boundary.
+        self.model_routing
+            .as_mut()
+            .expect("Auto context")
+            .missing_decision_for = None;
         let routing = self.model_routing.as_ref().expect("Auto context");
         let service = routing.service.clone();
         let engine = routing.engine.clone();
