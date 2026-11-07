@@ -720,7 +720,7 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
 
 #[serial_test::serial]
 #[tokio::test]
-async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
+async fn post_auth_sync_schedules_its_marker_without_waiting_for_delivery() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
@@ -734,7 +734,7 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
     Mock::given(method("GET"))
         .and(path("/preferences"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "preferences": [] })))
-        .expect(2)
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -763,14 +763,26 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
         .mount(&server)
         .await;
 
-    let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
-    assert_eq!(report.attempted, 2);
-    assert_eq!(report.acked, 2);
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let prepared = cloud_sync::prepare_post_auth_cloud_resync(&owner).await;
+    let report = cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared);
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.acked, 0);
     assert_eq!(report.failed, 0);
     assert_eq!(report.terminal, 0);
     assert_eq!(report.blocker, None);
     assert!(!report.is_incomplete());
 
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if SyncOutboxStore::local().status().unwrap().acked == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background marker delivery");
     let status = SyncOutboxStore::local().status().expect("status");
     assert_eq!(status.acked, 2);
     assert_eq!(status.pending, 0);
@@ -1405,7 +1417,9 @@ async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
         .await
         .unwrap();
 
-    let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
+    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let prepared = cloud_sync::prepare_post_auth_cloud_resync(&owner).await;
+    let report = cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared);
     assert!(report.cloud_configured);
     assert_eq!(report.attempted, 0);
     assert_eq!(report.acked, 0);

@@ -413,6 +413,7 @@ pub fn spawn_edge_heartbeat(
 
 /// Replace the login generation's heartbeat only after authentication commits.
 /// Registration must settle before this interactive login can report readiness.
+#[cfg(test)]
 pub(crate) async fn rebind_after_login(
     api: &ThinClient,
     token: &str,
@@ -431,6 +432,7 @@ pub(crate) async fn rebind_after_login(
     .await
 }
 
+#[cfg(test)]
 async fn rebind_after_login_with_timeout(
     api: &ThinClient,
     token: &str,

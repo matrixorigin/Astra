@@ -20,20 +20,20 @@ const TEST_SSE_HEADERS: [(&str, &str); 2] = [
 
 #[tokio::test]
 #[serial_test::serial]
-async fn admitted_attempt_with_lost_headers_then_rejection_retains_uncertainty() {
-    assert_lost_admission("rejected").await;
+async fn admitted_attempt_with_lost_headers_is_not_replayed_even_if_next_admission_would_succeed() {
+    assert_lost_admission("lost_headers").await;
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn admitted_attempt_with_lost_headers_then_retry_exhaustion_retains_uncertainty() {
-    assert_lost_admission("lost").await;
+async fn accepted_headers_without_run_identity_retain_unknown_outcome() {
+    assert_lost_admission("headers_only").await;
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn admitted_attempt_with_lost_headers_then_deadline_retains_uncertainty() {
-    assert_lost_admission("deadline").await;
+async fn accepted_headers_with_truncated_body_retain_unknown_outcome() {
+    assert_lost_admission("truncated_body").await;
 }
 
 async fn assert_lost_admission(terminal: &'static str) {
@@ -87,24 +87,31 @@ async fn assert_lost_admission(terminal: &'static str) {
                     crate::test_utils::mock_model_catalog_json(&["test-model"]).to_string(),
                 )
             } else if headers.starts_with("POST /chat/stream") {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    // The synthetic Server admits the first request, but its
-                    // proxy loses response headers before any run id is visible.
-                    committed.fetch_add(1, Ordering::SeqCst);
-                    socket.write_all(b"HTTP/1.1 200").await.unwrap();
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                committed.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    if terminal == "lost_headers" {
+                        socket.write_all(b"HTTP/1.1 200").await.unwrap();
+                    } else {
+                        let body_length = if terminal == "truncated_body" {
+                            "Content-Length: 1000\r\n"
+                        } else {
+                            ""
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n{body_length}{}: {}\r\n\r\n",
+                            astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                            astra_server_types::AGENT_INTERACTION_API_MAJOR
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                    }
                     socket.shutdown().await.unwrap();
                     continue;
                 }
-                if terminal == "lost" {
-                    socket.shutdown().await.unwrap();
-                    continue;
-                }
-                if terminal == "deadline" {
-                    std::future::pending::<()>().await;
-                }
-                ("text/event-stream",concat!(
-                    "data: {\"type\":\"error\",\"error_kind\":\"invalid_request\",\"message\":\"registration required\",",
-                    "\"error_code\":\"execution_binding_provider_required\",\"metadata\":{\"attempt_admission_state\":\"rejected\"}}\n\n",
+                // Deliberately allow a second start, as a real Server can once
+                // the first detached Run has released its Session slot.
+                ("text/event-stream", concat!(
+                    "data: {\"type\":\"session_info\",\"session_id\":\"session-ambiguous-admission\",\"run_id\":\"duplicate-run\"}\n\n",
                     "data: [DONE]\n\n"
                 ).to_string())
             } else {
@@ -134,26 +141,16 @@ async fn assert_lost_admission(terminal: &'static str) {
     params.session_state_journal = Some(Arc::new(std::sync::Mutex::new(
         crate::edge_tools::SessionStateRollbackJournal::default(),
     )));
-    if terminal == "deadline" {
-        params.execution_time_budget =
-            Some(crate::cli::chat_stream::ExecutionTimeBudgetClock::new(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-                std::time::Duration::ZERO,
-                std::time::Duration::ZERO,
-            ));
-    }
     let failure = tokio::time::timeout(std::time::Duration::from_secs(20), stream_chat_sse(params))
         .await
         .unwrap()
-        .expect_err("last physical request is rejected");
+        .expect_err("unidentified admission outcome must remain a failure");
     assert_eq!(admitted.load(Ordering::SeqCst), 1);
-    assert!(post_count.load(Ordering::SeqCst) >= 2);
-    if terminal == "rejected" {
-        assert_eq!(
-            failure.partial.error_code.as_deref(),
-            Some("execution_binding_provider_required")
-        );
-    }
+    assert_eq!(
+        post_count.load(Ordering::SeqCst),
+        1,
+        "never replay an uncertain non-idempotent start"
+    );
     assert!(failure.partial.prior_admission_ambiguous);
     assert!(
         !failure.partial.admission_rejected && !failure.partial.server_admission_not_dispatched
