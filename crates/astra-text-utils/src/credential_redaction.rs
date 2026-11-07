@@ -10,7 +10,7 @@ use regex::{Regex, bytes::Regex as BytesRegex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 use uuid::Uuid;
@@ -28,17 +28,6 @@ fn credential_patterns() -> &'static [CredentialPattern] {
 fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPattern] {
     static PATTERNS: OnceLock<Vec<CredentialPattern>> = OnceLock::new();
     static STREAMING_PATTERNS: OnceLock<Vec<CredentialPattern>> = OnceLock::new();
-
-    macro_rules! pat {
-        ($re:expr, $label:expr) => {{
-            static RE: OnceLock<Regex> = OnceLock::new();
-            CredentialPattern {
-                regex: RE.get_or_init(|| Regex::new($re).expect("credential pattern regex")),
-                label: $label,
-                secret_capture: None,
-            }
-        }};
-    }
 
     macro_rules! pat_min {
         ($re:expr, $minimum:expr, $label:expr, $capture:expr) => {{
@@ -59,6 +48,23 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
         }};
     }
 
+    macro_rules! pat_stream {
+        ($regular:expr, $live:expr, $label:expr) => {{
+            static REGULAR: OnceLock<Regex> = OnceLock::new();
+            static STREAMING: OnceLock<Regex> = OnceLock::new();
+            let (slot, pattern) = if streaming {
+                (&STREAMING, $live)
+            } else {
+                (&REGULAR, $regular)
+            };
+            CredentialPattern {
+                regex: slot.get_or_init(|| Regex::new(pattern).expect("credential pattern regex")),
+                label: $label,
+                secret_capture: None,
+            }
+        }};
+    }
+
     let patterns = if streaming {
         &STREAMING_PATTERNS
     } else {
@@ -66,7 +72,11 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
     };
     patterns.get_or_init(|| {
         vec![
-            pat!(r"AKIA[0-9A-Z]{16}", "AWS_ACCESS_KEY"),
+            pat_stream!(
+                r"AKIA[0-9A-Z]{16}",
+                r"AKIA[0-9A-Z]+",
+                "AWS_ACCESS_KEY"
+            ),
             pat_min!(
                 r#"(?i)(?:aws_secret_access_key|aws_secret_key|\[\s*['"]?(?:aws_secret_access_key|aws_secret_key)['"]?\s*\]|['"](?:aws_secret_access_key|aws_secret_key)['"])\s*[=:]\s*['"]?(?P<secret>[A-Za-z0-9/+=._-]{{{},}})"#,
                 30,
@@ -79,20 +89,32 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 "TOKEN_ARGUMENT",
                 Some("secret")
             ),
-            pat!(r"gh[pousr]_[A-Za-z0-9_]{36,255}", "GITHUB_TOKEN"),
+            pat_stream!(
+                r"gh[pousr]_[A-Za-z0-9_]{36,}",
+                r"gh[pousr]_[A-Za-z0-9_]+",
+                "GITHUB_TOKEN"
+            ),
             // Hugging Face user-access tokens are opaque bearer credentials.
             // The public `hf_` prefix is fixed while the body is
             // case-sensitive alphanumeric data; accept the documented
             // minimum body length so a direct tool output cannot expose one
             // merely because it lacks an assignment/CLI flag wrapper.
-            pat!(r"hf_[A-Za-z0-9]{34,255}", "HUGGINGFACE_TOKEN"),
+            pat_stream!(
+                r"hf_[A-Za-z0-9]{34,}",
+                r"hf_[A-Za-z0-9]+",
+                "HUGGINGFACE_TOKEN"
+            ),
             pat_min!(
                 r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{{{},}}",
                 40,
                 "BEARER_TOKEN",
                 None
             ),
-            pat!(r"://[^:@\s/]+:[^:@\s/]+@", "CONNECTION_CREDENTIAL"),
+            pat_stream!(
+                r"://[^:@\s/]+:[^:@\s/]+@",
+                r"://[^:@\s/]+:[^:@\s/]+@?",
+                "CONNECTION_CREDENTIAL"
+            ),
             pat_min!(
                 r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key|\[\s*['"]?(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"]?\s*\]|['"](?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"])\s*[=:]\s*['"]?(?P<secret>[^\s'"]{{{},}})"#,
                 12,
@@ -103,26 +125,51 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
     })
 }
 
-fn credential_secret_spans<'a>(
-    text: &'a str,
-    pattern: &CredentialPattern,
-) -> Vec<regex::Match<'a>> {
-    if let Some(secret_capture) = pattern.secret_capture {
-        pattern
-            .regex
-            .captures_iter(text)
-            .filter_map(|captures| captures.name(secret_capture))
-            .filter(|matched| !span_is_redaction_envelope(text, matched.start(), matched.end()))
-            .filter(|matched| !credential_match_is_explicit_placeholder(matched.as_str()))
-            .collect()
+fn credential_secret_matches<'text: 'pattern, 'pattern>(
+    text: &'text str,
+    pattern: &'pattern CredentialPattern,
+    envelopes: &'pattern RedactionEnvelopeIndex,
+    overlapping: bool,
+) -> impl Iterator<Item = regex::Match<'text>> + 'pattern {
+    let matches: Box<dyn Iterator<Item = regex::Match<'text>> + 'pattern> = if overlapping {
+        // A live match can consume the beginning of another context,
+        // e.g. `Bearer xBearer `, whose value arrives after the first
+        // match. Revisit possible starts near the end of each match.
+        // Context keywords are short, so this lookback remains bounded
+        // for long values. Bare token patterns consume their entire
+        // character run and do not need overlapping matching.
+        const LOOKBACK: usize = 320;
+        let mut next = 0;
+        Box::new(std::iter::from_fn(move || {
+            if next > text.len() {
+                return None;
+            }
+            let captures = pattern.regex.captures_at(text, next)?;
+            let whole = captures.get(0)?;
+            let matched = pattern
+                .secret_capture
+                .and_then(|name| captures.name(name))
+                .unwrap_or(whole);
+            next = whole.end().saturating_sub(LOOKBACK).max(whole.start() + 1);
+            while next < text.len() && !text.is_char_boundary(next) {
+                next += 1;
+            }
+            Some(matched)
+        }))
+    } else if let Some(secret_capture) = pattern.secret_capture {
+        Box::new(
+            pattern
+                .regex
+                .captures_iter(text)
+                .filter_map(move |captures| captures.name(secret_capture)),
+        )
     } else {
-        pattern
-            .regex
-            .find_iter(text)
-            .filter(|matched| !span_is_redaction_envelope(text, matched.start(), matched.end()))
-            .filter(|matched| !credential_match_is_explicit_placeholder(matched.as_str()))
-            .collect()
-    }
+        Box::new(pattern.regex.find_iter(text))
+    };
+    matches.filter(|matched| {
+        !envelopes.contains(matched.start(), matched.end())
+            && !credential_match_is_explicit_placeholder(matched.as_str())
+    })
 }
 
 /// Deliberate documentation/configuration placeholders are public contract
@@ -208,9 +255,6 @@ pub fn private_key_header_markers(text: &str) -> Vec<(usize, usize, String)> {
     pem_header_regex()
         .find_iter(text)
         .filter_map(|matched| {
-            if span_is_redaction_envelope(text, matched.start(), matched.end()) {
-                return None;
-            }
             pem_marker_kind(matched.as_str(), "-----BEGIN ")
                 .map(|kind| (matched.start(), matched.end(), kind.to_string()))
         })
@@ -222,9 +266,6 @@ pub fn private_key_end_markers(text: &str) -> Vec<(usize, usize, String)> {
     pem_end_regex()
         .find_iter(text)
         .filter_map(|matched| {
-            if span_is_redaction_envelope(text, matched.start(), matched.end()) {
-                return None;
-            }
             pem_marker_kind(matched.as_str(), "-----END ")
                 .map(|kind| (matched.start(), matched.end(), kind.to_string()))
         })
@@ -310,50 +351,265 @@ fn marker(label: &str, value: &str) -> String {
 /// editor can later resolve a redacted anchor against the raw file without
 /// exposing the value or providing an offline guess oracle.
 pub fn redact_credentials_in_text(text: &str) -> (String, usize) {
-    let patterns = credential_patterns();
-    let (mut result, mut total) = redact_pem_blocks(text, true, false);
+    render_redaction(text, true, false, false, usize::MAX).expect("unbounded edit projection")
+}
 
-    for pat in patterns {
-        let mut new_result = String::new();
-        let mut last_end = 0;
-        let mut found = false;
+/// Redact text at a presentation boundary without minting edit authority.
+pub fn redact_credentials_for_display(text: &str) -> (String, usize) {
+    render_redaction(text, false, false, false, usize::MAX).expect("unbounded display projection")
+}
 
-        // A generated marker may itself contain words such as `SECRET_KEY:`.
-        // Never redact inside an existing marker or the second pass would
-        // inflate counts and make the reference stale. Structured patterns
-        // may select only their secret-value capture so public syntax remains
-        // visible and exact edits cannot accidentally delete it.
-        for matched in credential_secret_spans(&result, pat) {
-            found = true;
-            total += 1;
-            new_result.push_str(&result[last_end..matched.start()]);
-            new_result.push_str(&marker(pat.label, matched.as_str()));
-            last_end = matched.end();
+/// Bound intermediate display projections as well as their final size.
+pub fn redact_credentials_for_display_bounded(
+    text: &str,
+    max_bytes: usize,
+) -> Result<(String, usize), &'static str> {
+    render_redaction(text, false, false, false, max_bytes)
+}
+
+/// Redact a growing preview conservatively before slicing it for display.
+pub fn redact_credentials_for_display_streaming(
+    text: &str,
+    max_bytes: usize,
+) -> Result<(String, usize), &'static str> {
+    render_redaction(text, false, true, false, max_bytes)
+}
+
+fn render_redaction(
+    text: &str,
+    edit_capable: bool,
+    streaming: bool,
+    partial: bool,
+    max_bytes: usize,
+) -> Result<(String, usize), &'static str> {
+    if text.len() > max_bytes {
+        return Err("Safe output projection exceeds the bounded display limit.");
+    }
+    let mut result = String::new();
+    let mut cursor = 0;
+    let mut total = 0;
+    for_each_redaction_span(text, streaming, partial, |span| {
+        append_safe_projection(&mut result, &text[cursor..span.start], max_bytes)?;
+        if edit_capable && span.editable {
+            append_safe_projection(
+                &mut result,
+                &marker(span.label, &text[span.start..span.end]),
+                max_bytes,
+            )?;
+        } else {
+            append_safe_projection(&mut result, MARKER_PREFIX, max_bytes)?;
+            append_safe_projection(&mut result, span.label, max_bytes)?;
+            append_safe_projection(&mut result, "]", max_bytes)?;
         }
+        cursor = span.end;
+        total += 1;
+        Ok(())
+    })?;
+    append_safe_projection(&mut result, &text[cursor..], max_bytes)?;
+    Ok((result, total))
+}
 
-        if found {
-            new_result.push_str(&result[last_end..]);
-            result = new_result;
+fn append_safe_projection(
+    output: &mut String,
+    text: &str,
+    limit: usize,
+) -> Result<(), &'static str> {
+    let needed = output
+        .len()
+        .checked_add(text.len())
+        .filter(|size| *size <= limit)
+        .ok_or("Safe output projection exceeds the bounded display limit.")?;
+    if needed > output.capacity() {
+        let capacity = output.capacity().saturating_mul(2).max(needed).min(limit);
+        output.reserve_exact(capacity - output.len());
+    }
+    output.push_str(text);
+    Ok(())
+}
+
+/// A complete BEGIN sentinel with an unfinished label is not yet classifiable.
+/// Once the full header is present, `pem_spans` owns the entire key body.
+fn pending_pem_header(text: &str) -> Option<usize> {
+    const BEGIN: &str = "-----BEGIN ";
+    if let Some(start) = text.rfind(BEGIN) {
+        let rest = &text[start + BEGIN.len()..];
+        let complete = pem_header_regex()
+            .find_at(text, start)
+            .is_some_and(|matched| matched.start() == start);
+        if !complete {
+            let letters = rest
+                .bytes()
+                .take_while(|b| b.is_ascii_uppercase() || *b == b' ')
+                .count();
+            let suffix = &rest[letters..];
+            if letters <= 75
+                && (suffix.is_empty()
+                    || (rest[..letters].ends_with("PRIVATE KEY")
+                        && suffix.len() < 5
+                        && suffix.bytes().all(|b| b == b'-')))
+            {
+                return Some(start);
+            }
         }
     }
-
-    (result, total)
+    None
 }
 
-/// Redact text at a non-owning presentation/persistence boundary.
-///
-/// Unlike [`redact_credentials_in_text`], this deliberately emits a
-/// display-only marker. A runtime/server that does not own the source file
-/// must never mint an edit capability that a different Edge process cannot
-/// verify. Executor-owned output should use the edit-capable function above.
-pub fn redact_credentials_for_display(text: &str) -> (String, usize) {
-    redact_credentials_for_display_with_boundary(text, false, false)
+fn pending_url_authority(text: &str) -> Option<usize> {
+    let start = text.rfind("://")?;
+    let authority = &text[start + 3..];
+    if authority
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '/' || ch == '@')
+    {
+        return None;
+    }
+    match authority.find(':') {
+        None => Some(start),
+        Some(index) if index > 0 && index + 1 == authority.len() => Some(start),
+        _ => None,
+    }
 }
 
-/// Redact a growing preview conservatively: explicit credential contexts are
-/// hidden even before their value is long enough for the settled-output rules.
-pub fn redact_credentials_for_display_streaming(text: &str) -> (String, usize) {
-    redact_credentials_for_display_with_boundary(text, false, true)
+#[derive(Clone, Copy)]
+struct RedactionSpan {
+    start: usize,
+    end: usize,
+    label: &'static str,
+    editable: bool,
+}
+
+/// Merge overlapping rules on the original text before replacing any bytes.
+/// The same groups are used by presentation, line windows and edit references.
+fn for_each_redaction_span(
+    text: &str,
+    streaming: bool,
+    partial: bool,
+    mut emit: impl FnMut(RedactionSpan) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let patterns = credential_patterns_for_stream(streaming);
+    let envelopes = redaction_envelope_index(text);
+    let mut streams: Vec<_> = patterns
+        .iter()
+        .map(|pattern| {
+            let overlapping = pattern.secret_capture.is_some()
+                || pattern.label == "BEARER_TOKEN"
+                || (!streaming && pattern.label == "AWS_ACCESS_KEY");
+            credential_secret_matches(text, pattern, &envelopes, overlapping).peekable()
+        })
+        .collect();
+    let mut pem = pem_spans(text).peekable();
+    let mut extra = Vec::new();
+    if partial {
+        let first_header = pem_header_regex().find(text).map(|m| m.start());
+        let mut search_from = 0;
+        let mut last_end = None;
+        while let Some(end) = pem_end_regex().find_at(text, search_from) {
+            if first_header.is_some_and(|header| header <= end.start()) {
+                break;
+            }
+            last_end = Some(first_header.map_or(end.end(), |header| end.end().min(header)));
+            search_from = end.end() - 5;
+        }
+        if let Some(end) = last_end {
+            extra.push(RedactionSpan {
+                start: 0,
+                end,
+                label: "PRIVATE_KEY",
+                editable: false,
+            });
+        }
+    }
+    if streaming {
+        if let Some(start) = pending_pem_header(text) {
+            extra.push(RedactionSpan {
+                start,
+                end: text.len(),
+                label: "PRIVATE_KEY",
+                editable: false,
+            });
+        }
+        if let Some(start) = pending_url_authority(text) {
+            extra.push(RedactionSpan {
+                start,
+                end: text.len(),
+                label: "CONNECTION_CREDENTIAL",
+                editable: false,
+            });
+        }
+    }
+    extra.sort_unstable_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
+    let mut extra = extra.into_iter().peekable();
+    let mut active: Option<RedactionSpan> = None;
+    loop {
+        let mut selected = streams
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, stream)| {
+                stream
+                    .peek()
+                    .map(|m| (m.start(), std::cmp::Reverse(m.end()), i))
+            })
+            .min();
+        if let Some(span) = pem.peek() {
+            let key = (span.start, std::cmp::Reverse(span.end), patterns.len());
+            if selected.is_none_or(|current| key < current) {
+                selected = Some(key);
+            }
+        }
+        if let Some(span) = extra.peek() {
+            let key = (span.start, std::cmp::Reverse(span.end), patterns.len() + 1);
+            if selected.is_none_or(|current| key < current) {
+                selected = Some(key);
+            }
+        }
+        let Some((_, _, source)) = selected else {
+            break;
+        };
+        let span = if source < patterns.len() {
+            let matched = streams[source].next().expect("peeked credential");
+            RedactionSpan {
+                start: matched.start(),
+                end: matched.end(),
+                label: patterns[source].label,
+                editable: true,
+            }
+        } else if source == patterns.len() {
+            let span = pem.next().expect("peeked PEM");
+            RedactionSpan {
+                start: span.start,
+                end: span.end,
+                label: "PRIVATE_KEY",
+                editable: span.complete,
+            }
+        } else {
+            extra.next().expect("peeked partial span")
+        };
+        if let Some(current) = active.as_mut()
+            && span.start < current.end
+        {
+            current.end = current.end.max(span.end);
+            current.editable &= span.editable;
+            if span.label == "PRIVATE_KEY" {
+                current.label = "PRIVATE_KEY";
+            }
+        } else {
+            if let Some(mut previous) = active.replace(span) {
+                if previous.label == "PRIVATE_KEY" && previous.end - previous.start > PEM_MAX_BYTES
+                {
+                    previous.editable = false;
+                }
+                emit(previous)?;
+            }
+        }
+    }
+    if let Some(mut last) = active {
+        if last.label == "PRIVATE_KEY" && last.end - last.start > PEM_MAX_BYTES {
+            last.editable = false;
+        }
+        emit(last)?;
+    }
+    Ok(())
 }
 
 /// Redact a bounded tail/head capture whose first byte may be in the middle
@@ -361,118 +617,55 @@ pub fn redact_credentials_for_display_streaming(text: &str) -> (String, usize) {
 /// this explicitly partial-input path; complete source/RPC views use the
 /// ordinary display function and preserve unrelated documentation footers.
 pub fn redact_credentials_for_display_partial(text: &str) -> (String, usize) {
-    redact_credentials_for_display_with_boundary(text, true, false)
+    render_redaction(text, false, false, true, usize::MAX).expect("unbounded display projection")
 }
 
-fn redact_credentials_for_display_with_boundary(
-    text: &str,
-    may_start_inside_pem: bool,
-    streaming: bool,
-) -> (String, usize) {
-    let patterns = credential_patterns_for_stream(streaming);
-    let (mut result, mut total) = redact_pem_blocks(text, false, may_start_inside_pem);
-
-    for pat in patterns {
-        let mut new_result = String::new();
-        let mut last_end = 0;
-        let mut found = false;
-        for matched in credential_secret_spans(&result, pat) {
-            found = true;
-            total += 1;
-            new_result.push_str(&result[last_end..matched.start()]);
-            new_result.push_str(&format!("{MARKER_PREFIX}{}]", pat.label));
-            last_end = matched.end();
-        }
-        if found {
-            new_result.push_str(&result[last_end..]);
-            result = new_result;
-        }
-    }
-    (result, total)
+struct PemSpan {
+    start: usize,
+    end: usize,
+    complete: bool,
 }
 
-/// Redact a complete PEM private-key block before the ordinary single-line
-/// patterns run. If a header is present without a bounded matching END line,
-/// conceal the remainder of the logical output rather than leaking the body.
-/// This is deliberately conservative: a malformed/oversized key is not a
-/// reason to expose bytes that are indistinguishable from key material.
-fn redact_pem_blocks(
-    text: &str,
-    edit_capable: bool,
-    may_start_inside_pem: bool,
-) -> (String, usize) {
-    // A bounded/tail view can begin inside a PEM block and therefore contain
-    // an END marker without its BEGIN.  The preceding bytes are then
-    // indistinguishable from key material; conceal through that END rather
-    // than returning an orphaned base64 body.
-    let first_header = pem_header_regex().find(text).map(|matched| matched.start());
-    if may_start_inside_pem
-        && let Some(end_marker) = pem_end_regex().find(text)
-        && first_header.is_none_or(|header_start| end_marker.start() < header_start)
-    {
-        let (suffix, suffix_count) = redact_pem_blocks(
-            &text[end_marker.end()..],
-            edit_capable,
-            may_start_inside_pem,
-        );
-        let mut result = String::from("[REDACTED:PRIVATE_KEY]");
-        result.push_str(&suffix);
-        return (result, suffix_count + 1);
-    }
-
-    let mut result = String::with_capacity(text.len());
-    let mut cursor = 0usize;
-    let mut total = 0usize;
-    let mut search_from = 0usize;
-
-    while let Some(header) = pem_header_regex().find_at(text, search_from) {
-        if span_is_redaction_envelope(text, header.start(), header.end()) {
-            search_from = header.end();
-            continue;
-        }
-        let max_end = header.start().saturating_add(PEM_MAX_BYTES);
-        let header_kind = pem_marker_kind(header.as_str(), "-----BEGIN ");
-        let mut end = None;
-        let mut mismatched_end = false;
-        if let Some(candidate) = pem_end_regex().find_iter(&text[header.end()..]).next() {
-            let absolute_end = header.end().saturating_add(candidate.end());
-            if absolute_end <= max_end {
-                let candidate_kind = pem_marker_kind(candidate.as_str(), "-----END ");
-                if candidate_kind == header_kind {
-                    end = Some(absolute_end);
-                } else {
-                    // A mismatched terminator makes the rest of the source
-                    // indistinguishable from key material.  Conceal to EOF
-                    // rather than trying to guess which block the model meant.
-                    mismatched_end = true;
-                }
+/// One source of truth for full reads, line windows and edit references.
+fn pem_spans(text: &str) -> impl Iterator<Item = PemSpan> + '_ {
+    let mut cursor = 0;
+    std::iter::from_fn(move || {
+        let header = pem_header_regex().find_at(text, cursor)?;
+        let (mut end, mut complete) = pem_block_end(text, header);
+        // END and a following BEGIN can share five dashes. Treat all
+        // overlapping blocks as one source span and one edit reference.
+        while complete && end < text.len() {
+            let Some(next) = pem_header_regex().find_at(text, end.saturating_sub(5)) else {
+                break;
+            };
+            if next.start() >= end {
+                break;
             }
+            (end, complete) = pem_block_end(text, next);
         }
-        let end = if mismatched_end {
-            text.len()
-        } else {
-            end.unwrap_or(text.len())
-        };
-        result.push_str(&text[cursor..header.start()]);
-        let value = &text[header.start()..end];
-        if edit_capable {
-            result.push_str(&marker("PRIVATE_KEY", value));
-        } else {
-            result.push_str("[REDACTED:PRIVATE_KEY]");
-        }
-        total += 1;
         cursor = end;
-        search_from = end;
-        if end == text.len() {
-            break;
-        }
-    }
+        Some(PemSpan {
+            start: header.start(),
+            end,
+            complete,
+        })
+    })
+}
 
-    if total == 0 {
-        return (text.to_string(), 0);
+fn pem_block_end(text: &str, header: regex::Match<'_>) -> (usize, bool) {
+    let max_end = header.start().saturating_add(PEM_MAX_BYTES);
+    if let Some(end) = pem_end_regex().find_at(text, header.end())
+        && end.end() <= max_end
+        && pem_marker_kind(end.as_str(), "-----END ")
+            == pem_marker_kind(header.as_str(), "-----BEGIN ")
+        && pem_header_regex()
+            .find_at(text, header.start() + 1)
+            .is_none_or(|nested| nested.start() >= end.start())
+    {
+        return (end.end(), true);
     }
-    result.push_str(&text[cursor..]);
-    (result, total)
+    // Missing, mismatched, nested or oversized blocks cannot delimit key data.
+    (text.len(), false)
 }
 
 const DISPLAY_SECRET_FIELD_MARKER: &str = "[REDACTED:SECRET_FIELD]";
@@ -669,82 +862,80 @@ fn credential_value_shape(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ".:/_+=-".contains(ch))
 }
 
-/// Redact a line window while retaining the caller's original line
-/// coordinates.  A range read cannot safely run the PEM matcher on the slice
-/// alone: the requested window may start in the middle of a private-key
-/// block.  We therefore scan the complete source for PEM line spans and use a
-/// display-only marker for every intersecting line.  Ordinary single-line
-/// credentials remain editable when their line is present.
+/// Redact a line window using the same source groups as a complete read.
+/// Complete single-line credentials retain edit references; a group crossing
+/// a line boundary or containing a PEM is represented by a display marker.
 pub fn redact_line_window(raw: &str, start_line: usize, end_line: usize) -> String {
-    let lines = raw.lines().collect::<Vec<_>>();
-    let start = start_line.saturating_sub(1).min(lines.len());
-    let end = end_line.min(lines.len()).max(start);
-    let pem_lines = pem_line_ranges(&lines);
-    lines[start..end]
-        .iter()
-        .enumerate()
-        .map(|(offset, line)| {
-            let line_number = start + offset + 1;
-            if pem_lines.iter().any(|(span_start, span_end)| {
-                *span_start <= line_number && line_number <= *span_end
-            }) {
-                "[REDACTED:PRIVATE_KEY]".to_string()
-            } else {
-                redact_credentials_in_text(line).0
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+    let start_line = start_line.max(1);
+    if end_line < start_line {
+        return String::new();
+    }
+    let mut selected_start = None;
+    let mut selected_end = 0;
+    let mut offset = 0;
+    for (index, segment) in raw.split_inclusive('\n').enumerate() {
+        let line = index + 1;
+        if line == start_line {
+            selected_start = Some(offset);
+        }
+        offset += segment.len();
+        if line >= start_line {
+            selected_end = offset;
+        }
+        if line >= end_line {
+            break;
+        }
+    }
+    let Some(selected_start) = selected_start else {
+        return String::new();
+    };
+    let mut groups = Vec::new();
+    for_each_redaction_span(raw, false, false, |span| {
+        if span.end > selected_start && span.start < selected_end {
+            groups.push(span);
+        }
+        Ok(())
+    })
+    .expect("unbounded redaction scan");
 
-fn pem_line_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut active_start: Option<(usize, Option<String>)> = None;
-    let mut bytes = 0usize;
-    for (index, line) in lines.iter().enumerate() {
-        let line_number = index + 1;
-        if active_start.is_none()
-            && let Some(header) = pem_header_regex().find(line)
-        {
-            active_start = Some((
-                line_number,
-                pem_marker_kind(header.as_str(), "-----BEGIN ").map(str::to_string),
-            ));
-            bytes = 0;
+    let mut output = Vec::new();
+    let mut group_index = 0;
+    let mut line_start = selected_start;
+    for segment in raw[selected_start..selected_end].split_inclusive('\n') {
+        let line = segment
+            .strip_suffix('\n')
+            .map_or(segment, |line| line.strip_suffix('\r').unwrap_or(line));
+        let line_end = line_start + line.len();
+        let segment_end = line_start + segment.len();
+        while group_index < groups.len() && groups[group_index].end <= line_start {
+            group_index += 1;
         }
-        if active_start.is_some() {
-            bytes = bytes.saturating_add(line.len().saturating_add(1));
-            let (start, kind) = active_start.as_ref().expect("active PEM span");
-            let mut ended = false;
-            let mut mismatched = false;
-            if let Some(end_marker) = pem_end_regex().find_iter(line).next() {
-                if pem_marker_kind(end_marker.as_str(), "-----END ") == kind.as_deref() {
-                    ended = true;
-                } else {
-                    mismatched = true;
-                }
-            }
-            // An unbounded/malformed block is concealed through EOF.  This
-            // keeps the range path fail-closed without retaining its bytes.
-            if mismatched {
-                ranges.push((*start, lines.len()));
-                active_start = None;
-                break;
-            } else if ended {
-                ranges.push((*start, line_number));
-                active_start = None;
-                bytes = 0;
-            } else if bytes > PEM_MAX_BYTES {
-                ranges.push((*start, lines.len()));
-                active_start = None;
-                break;
-            }
+        let mut last = group_index;
+        while last < groups.len() && groups[last].start < segment_end {
+            last += 1;
         }
+        let relevant = &groups[group_index..last];
+        if let Some(span) = relevant.iter().find(|span| {
+            span.label == "PRIVATE_KEY"
+                || !span.editable
+                || span.start < line_start
+                || span.end > line_end
+        }) {
+            output.push(format!("{MARKER_PREFIX}{}]", span.label));
+        } else {
+            let mut rendered = String::new();
+            let mut cursor = line_start;
+            for span in relevant {
+                rendered.push_str(&raw[cursor..span.start]);
+                rendered.push_str(&marker(span.label, &raw[span.start..span.end]));
+                cursor = span.end;
+            }
+            rendered.push_str(&raw[cursor..line_end]);
+            output.push(rendered);
+        }
+        line_start = segment_end;
     }
-    if let Some((start, _)) = active_start {
-        ranges.push((start, lines.len()));
-    }
-    ranges
+    output.join("\n")
 }
 
 /// Truncate already-redacted text without cutting through an executor marker.
@@ -907,13 +1098,22 @@ pub struct SafeOutputProjection {
 
 impl SafeOutputProjection {
     pub fn new(text: String) -> Self {
-        let marker_ranges = Arc::new(redaction_marker_ranges(&text));
+        Self::try_new_bounded(text, usize::MAX).expect("unbounded projection")
+    }
+
+    /// Bound both the safe text and its marker index before caching or paging.
+    pub fn try_new_bounded(text: String, max_heap_bytes: usize) -> Result<Self, &'static str> {
+        let max_markers = max_heap_bytes
+            .checked_sub(text.len())
+            .ok_or("Safe output projection exceeds the bounded display limit.")?
+            / std::mem::size_of::<(usize, usize)>();
+        let ranges = redaction_marker_ranges_bounded(&text, max_markers)?;
         let total_lines = text.lines().count();
-        Self {
+        Ok(Self {
             text: Arc::<str>::from(text),
-            marker_ranges,
+            marker_ranges: Arc::new(ranges),
             total_lines,
-        }
+        })
     }
 
     pub fn text(&self) -> &str {
@@ -922,6 +1122,14 @@ impl SafeOutputProjection {
 
     pub fn total_bytes(&self) -> usize {
         self.text.len()
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.text.len().saturating_add(
+            self.marker_ranges
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+        )
     }
 
     pub fn total_lines(&self) -> usize {
@@ -1014,40 +1222,66 @@ pub fn redacted_output_tail_chars(raw: &str, max_chars: usize) -> String {
 }
 
 fn redaction_marker_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = marker_regex()
-        .find_iter(text)
-        .map(|m| (m.start(), m.end()))
-        .collect::<Vec<_>>();
-    ranges.extend(
-        display_marker_regex()
-            .find_iter(text)
-            .map(|m| (m.start(), m.end())),
-    );
-    ranges.sort_unstable();
-    ranges.dedup();
-    let mut merged = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        if let Some((_, previous_end)) = merged.last_mut()
-            && start <= *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    merged
+    redaction_marker_ranges_bounded(text, usize::MAX).expect("unbounded marker index")
 }
 
-fn span_is_redaction_envelope(text: &str, start: usize, end: usize) -> bool {
-    marker_regex().find_iter(text).any(|marker| {
-        if !(marker.start() <= start && end <= marker.end()) {
-            return false;
+fn redaction_marker_ranges_bounded(
+    text: &str,
+    max_markers: usize,
+) -> Result<Vec<(usize, usize)>, &'static str> {
+    let mut ranges = Vec::<(usize, usize)>::new();
+    let mut opaque = marker_regex().find_iter(text).peekable();
+    let mut display = display_marker_regex().find_iter(text).peekable();
+    loop {
+        let marker = match (opaque.peek(), display.peek()) {
+            (Some(a), Some(b)) if a.start() <= b.start() => opaque.next(),
+            (Some(_), Some(_)) => display.next(),
+            (Some(_), None) => opaque.next(),
+            (None, Some(_)) => display.next(),
+            (None, None) => break,
         }
-        opaque_reference(marker.as_str())
-    }) || display_marker_regex().find_iter(text).any(|marker| {
-        marker.start() <= start
-            && end <= marker.end()
-            && marker
+        .expect("peeked marker");
+        if let Some((_, end)) = ranges.last_mut()
+            && marker.start() <= *end
+        {
+            *end = (*end).max(marker.end());
+            continue;
+        }
+        if ranges.len() == max_markers {
+            return Err("Safe output projection exceeds the bounded display limit.");
+        }
+        if ranges.len() == ranges.capacity() {
+            let desired = ranges.capacity().saturating_mul(2).max(1).min(max_markers);
+            ranges.reserve_exact(desired - ranges.len());
+            if ranges.capacity() > max_markers {
+                return Err("Safe output projection exceeds the bounded display limit.");
+            }
+        }
+        ranges.push((marker.start(), marker.end()));
+    }
+    Ok(ranges)
+}
+
+struct RedactionEnvelopeIndex(Vec<(usize, usize)>);
+
+impl RedactionEnvelopeIndex {
+    fn contains(&self, start: usize, end: usize) -> bool {
+        let index = self
+            .0
+            .partition_point(|(marker_start, _)| *marker_start <= start);
+        index > 0 && self.0[index - 1].1 >= end
+    }
+}
+
+fn redaction_envelope_index(text: &str) -> RedactionEnvelopeIndex {
+    if !text.contains(MARKER_PREFIX) {
+        return RedactionEnvelopeIndex(Vec::new());
+    }
+    let mut ranges: Vec<_> = marker_regex()
+        .find_iter(text)
+        .filter(|marker| opaque_reference(marker.as_str()))
+        .chain(display_marker_regex().find_iter(text).filter(|marker| {
+            marker
                 .as_str()
                 .strip_prefix(MARKER_PREFIX)
                 .and_then(|value| value.strip_suffix(']'))
@@ -1057,7 +1291,18 @@ fn span_is_redaction_envelope(text: &str, start: usize, end: usize) -> bool {
                             .iter()
                             .any(|pattern| pattern.label == label)
                 })
-    })
+        }))
+        .map(|marker| (marker.start(), marker.end()))
+        .collect();
+    ranges.sort_unstable_by_key(|&(start, _)| start);
+    // Keep the largest end of a single preceding envelope; merging adjacent
+    // ranges would incorrectly exempt a secret spanning two separate markers.
+    let mut max_end = 0;
+    for (_, end) in &mut ranges {
+        max_end = max_end.max(*end);
+        *end = max_end;
+    }
+    RedactionEnvelopeIndex(ranges)
 }
 
 // Transport preserves a constrained, non-secret envelope without asserting
@@ -1217,12 +1462,17 @@ pub fn resolve_redacted_anchor(
         return Err(REDACTION_REFERENCE_ERROR.to_string());
     }
 
-    let mut pattern = String::new();
+    struct ReferenceCandidates<'a> {
+        spans: Vec<(usize, usize)>,
+        values: Vec<&'a str>,
+    }
+
+    let mut resolved = String::new();
     let mut cursor = 0usize;
-    let mut saw_marker = false;
-    let mut marker_specs = Vec::new();
-    let mut source_matches = HashMap::new();
-    for (capture_group, matched) in (1usize..).zip(marker_regex().captures_iter(anchor)) {
+    let mut marker_ranges = Vec::new();
+    let mut source_matches: HashMap<&str, ReferenceCandidates<'_>> = HashMap::new();
+    let mut canonical_spans = None;
+    for matched in marker_regex().captures_iter(anchor) {
         let whole = matched
             .get(0)
             .expect("marker capture must contain whole match");
@@ -1238,8 +1488,7 @@ pub fn resolve_redacted_anchor(
             .get(3)
             .map(|value| value.as_str())
             .unwrap_or_default();
-        let issuer_mac = matched.get(4).map(|value| value.as_str().to_string());
-        let Some(issuer_mac) = issuer_mac.as_deref() else {
+        let Some(issuer_mac) = matched.get(4).map(|value| value.as_str()) else {
             // Three-field markers predate the issuer MAC and cannot prove
             // provenance at an edit/display boundary.  Keeping their legacy
             // value-MAC resolver alive would turn persisted or forged model
@@ -1249,91 +1498,70 @@ pub fn resolve_redacted_anchor(
         if !marker_issuer_matches(label, nonce, issuer_mac) {
             return Err(REDACTION_REFERENCE_ERROR.to_string());
         }
-        let label_pattern = if label == "K1" {
-            // Keep the existing bounded PEM check below the matcher; a large
-            // counted repetition exceeds regex's compiled-size limit.
-            r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----".to_string()
-        } else {
-            let Some(pat) = credential_patterns()
+        let groups = canonical_spans.get_or_insert_with(|| {
+            let mut groups = Vec::new();
+            for_each_redaction_span(content, false, false, |span| {
+                groups.push(span);
+                Ok(())
+            })
+            .expect("unbounded redaction scan");
+            groups
+        });
+        let candidates = source_matches.entry(label).or_insert_with(|| {
+            let spans: Vec<_> = groups
                 .iter()
-                .find(|pat| marker_label_code(pat.label) == Some(label))
-            else {
-                return Err(REDACTION_REFERENCE_ERROR.to_string());
-            };
-            let spans = source_matches
-                .entry(pat.label)
-                .or_insert_with(|| credential_secret_spans(content, pat));
-            let Some(value) = spans
+                .filter(|span| span.editable && marker_label_code(span.label) == Some(label))
+                .map(|span| (span.start, span.end))
+                .collect();
+            let mut seen = HashSet::new();
+            let values = spans
                 .iter()
-                .find(|span| marker_mac_matches(label, nonce, span.as_str(), mac))
-            else {
-                return Err(REDACTION_REFERENCE_ERROR.to_string());
-            };
-            // Authenticate value bytes, not an occurrence. The full-anchor
-            // matcher still rejects duplicates unless context selects one.
-            regex::escape(value.as_str())
+                .map(|&(start, end)| &content[start..end])
+                .filter(|value| seen.insert(*value))
+                .collect();
+            ReferenceCandidates { spans, values }
+        });
+        let Some(value) = candidates
+            .values
+            .iter()
+            .copied()
+            .find(|value| marker_mac_matches(label, nonce, value, mac))
+        else {
+            return Err(REDACTION_REFERENCE_ERROR.to_string());
         };
-        pattern.push_str(&regex::escape(&anchor[cursor..whole.start()]));
-        pattern.push('(');
-        pattern.push_str(&label_pattern);
-        pattern.push(')');
-        marker_specs.push((
-            capture_group,
-            label.to_string(),
-            nonce.to_string(),
-            mac.to_string(),
-            whole.as_str().to_string(),
-        ));
+        append_safe_projection(&mut resolved, &anchor[cursor..whole.start()], content.len())
+            .map_err(|_| REDACTION_REFERENCE_ERROR.to_string())?;
+        let start = resolved.len();
+        append_safe_projection(&mut resolved, value, content.len())
+            .map_err(|_| REDACTION_REFERENCE_ERROR.to_string())?;
+        marker_ranges.push((label, start, resolved.len()));
         cursor = whole.end();
-        saw_marker = true;
     }
 
-    if !saw_marker {
+    if marker_ranges.is_empty() {
         return Err(REDACTION_REFERENCE_ERROR.to_string());
     }
-    pattern.push_str(&regex::escape(&anchor[cursor..]));
-    let matcher = Regex::new(&pattern).map_err(|_| REDACTION_REFERENCE_ERROR.to_string())?;
-
-    let candidates = matcher
-        .captures_iter(content)
-        .filter_map(|captures| {
-            let whole = captures.get(0)?;
-            let candidate = whole.as_str();
-            for (group, label, nonce, mac, _) in &marker_specs {
-                let value = captures.get(*group)?.as_str();
-                // The owner-side PEM scanner uses the same bound.  Keep this
-                // check outside the regex: embedding a large counted
-                // repetition exceeds regex's compiled-size limit.
-                if label == "K1" && value.len() > PEM_MAX_BYTES {
-                    return None;
-                }
-                let valid = marker_mac_matches(label, nonce, value, mac);
-                if !valid {
-                    return None;
-                }
-            }
-            let mut redacted = String::with_capacity(candidate.len());
-            let mut candidate_cursor = 0usize;
-            for (group, _, _, _, marker) in &marker_specs {
-                let span = captures.get(*group)?;
-                let relative_start = span.start() - whole.start();
-                let relative_end = span.end() - whole.start();
-                redacted.push_str(&candidate[candidate_cursor..relative_start]);
-                redacted.push_str(marker);
-                candidate_cursor = relative_end;
-            }
-            redacted.push_str(&candidate[candidate_cursor..]);
-            (redacted == anchor).then_some(candidate.to_string())
-        })
-        .collect::<Vec<_>>();
-
-    if candidates.is_empty() {
+    append_safe_projection(&mut resolved, &anchor[cursor..], content.len())
+        .map_err(|_| REDACTION_REFERENCE_ERROR.to_string())?;
+    let Some(start) = content.find(resolved.as_str()) else {
+        return Err(REDACTION_REFERENCE_ERROR.to_string());
+    };
+    // The editor consumes the returned raw anchor using ordinary substring
+    // replacement. Reject any other raw occurrence, even a noncanonical or
+    // overlapping one that did not qualify as a redacted candidate.
+    if crate::first_two_match_positions(content, &resolved).is_some() {
         return Err(REDACTION_REFERENCE_ERROR.to_string());
     }
-    if candidates.len() > 1 {
-        return Err(REDACTION_REFERENCE_ERROR.to_string());
+    for (label, relative_start, relative_end) in marker_ranges {
+        let range = (start + relative_start, start + relative_end);
+        if !source_matches
+            .get(label)
+            .is_some_and(|candidates| candidates.spans.binary_search(&range).is_ok())
+        {
+            return Err(REDACTION_REFERENCE_ERROR.to_string());
+        }
     }
-    Ok(candidates.into_iter().next())
+    Ok(Some(resolved))
 }
 
 #[cfg(test)]
@@ -1348,13 +1576,504 @@ mod tests {
             "--token short ",
             "Bearer short ",
         ] {
-            let (live, count) = redact_credentials_for_display_streaming(raw);
+            let (live, count) = redact_credentials_for_display_streaming(raw, usize::MAX).unwrap();
             assert!(count > 0 && !live.contains("short"), "{raw:?}: {live}");
         }
         let raw = "password=short ";
         assert_eq!(redact_credentials_for_display(raw).0, raw);
-        for prompt in ["Confirm? ", "确认？ ", "Password: "] {
-            assert_eq!(redact_credentials_for_display_streaming(prompt).0, prompt);
+        for prompt in [
+            "Confirm? ",
+            "确认？ ",
+            "Password: ",
+            "Password:",
+            "继续？",
+            "running",
+        ] {
+            assert_eq!(
+                redact_credentials_for_display_streaming(prompt, usize::MAX)
+                    .unwrap()
+                    .0,
+                prompt
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_keeps_public_prefixes_visible_until_secret_bytes_arrive() {
+        for prefix in ["-", "A", "g", "h", "AKIA", "ghp_", "hf_", "-----BEGIN"] {
+            assert_eq!(
+                redact_credentials_for_display_streaming(prefix, usize::MAX)
+                    .unwrap()
+                    .0,
+                prefix
+            );
+        }
+        for prefix in ["AKIA", "ghp_", "hf_"] {
+            for end in 1..=prefix.len() {
+                assert_eq!(
+                    redact_credentials_for_display_streaming(&prefix[..end], usize::MAX)
+                        .unwrap()
+                        .0,
+                    &prefix[..end]
+                );
+            }
+            let secret = format!("{prefix}Z");
+            assert!(
+                !redact_credentials_for_display_streaming(&secret, usize::MAX)
+                    .unwrap()
+                    .0
+                    .contains(&secret)
+            );
+        }
+        let pem = "-----BEGIN PRIVATE KEY-----\nbody";
+        for end in 1..="-----BEGIN".len() {
+            assert_eq!(
+                redact_credentials_for_display_streaming(&pem[..end], usize::MAX)
+                    .unwrap()
+                    .0,
+                &pem[..end]
+            );
+        }
+        assert!(
+            !redact_credentials_for_display_streaming(pem, usize::MAX)
+                .unwrap()
+                .0
+                .contains("body")
+        );
+    }
+
+    #[test]
+    fn streaming_display_never_exposes_known_secret_prefixes() {
+        for (prefix, secret, suffix) in [
+            ("password=", "zzzzzzzzzzzz", "\n"),
+            ("Bearer ", "zzzzzzzzzzzz", "\n"),
+            ("AKIA", "ZZZZZZZZZZZZZZZZ", "\n"),
+            ("ghp_", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "\n"),
+            ("hf_", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "\n"),
+            ("https://user:", "zzzzzzzz", "@example.test\n"),
+            (
+                "-----BEGIN PRIVATE KEY-----\n",
+                "zzzzzzzz",
+                "\n-----END PRIVATE KEY-----",
+            ),
+        ] {
+            let text = format!("{prefix}{secret}{suffix}");
+            for end in prefix.len() + 1..=text.len() {
+                let preview = redact_credentials_for_display_streaming(&text[..end], usize::MAX)
+                    .unwrap()
+                    .0;
+                assert!(
+                    !preview.contains(&secret[..1]),
+                    "secret prefix leaked at byte {end}: {preview:?}"
+                );
+            }
+        }
+
+        let overlapping = format!("password=fooBearer {}", "z".repeat(40));
+        let preview = redact_credentials_for_display_streaming(&overlapping, usize::MAX)
+            .unwrap()
+            .0;
+        assert!(
+            !preview.contains("foo") && !preview.contains('z'),
+            "{preview}"
+        );
+        let complete_token = format!("ghp_{}h", "a".repeat(35));
+        let preview = redact_credentials_for_display_streaming(&complete_token, usize::MAX)
+            .unwrap()
+            .0;
+        assert!(!preview.contains(&complete_token), "{preview}");
+        for raw in ["prefixghp_z", "prefixAKIAZ", "prefixhf_z"] {
+            let preview = redact_credentials_for_display_streaming(raw, usize::MAX)
+                .unwrap()
+                .0;
+            assert!(
+                !preview.ends_with('z') && !preview.ends_with('Z'),
+                "{raw:?}: {preview:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_index_preserves_single_valid_marker_boundaries() {
+        let text = format!(
+            "[REDACTED:PRIVATE_KEY][REDACTED:GITHUB_TOKEN][REDACTED:UNKNOWN][REDACTED:C3:{0}:{0}:{0}][REDACTED:C3:{0}:{0}]",
+            "a".repeat(32)
+        );
+        let index = redaction_envelope_index(&text);
+        let markers: Vec<_> = display_marker_regex()
+            .find_iter(&text)
+            .chain(marker_regex().find_iter(&text))
+            .collect();
+        for marker in &markers {
+            let valid = marker.as_str().contains("PRIVATE_KEY")
+                || marker.as_str().contains("GITHUB_TOKEN")
+                || (marker.as_str().starts_with("[REDACTED:C3:")
+                    && marker.as_str().matches(':').count() == 4);
+            assert_eq!(
+                index.contains(marker.start(), marker.end()),
+                valid,
+                "{marker:?}"
+            );
+        }
+        let first = &markers[0];
+        let second = &markers[1];
+        assert!(
+            !index.contains(first.start(), second.end()),
+            "adjacent markers are not one envelope"
+        );
+    }
+
+    #[test]
+    fn streaming_projection_rejects_expansion_over_budget() {
+        let input = "password=z ".repeat(20);
+        assert!(redact_credentials_for_display_streaming(&input, input.len()).is_err());
+        let safe = "[REDACTED:GITHUB_TOKEN]".to_string();
+        assert!(SafeOutputProjection::try_new_bounded(safe.clone(), safe.len()).is_err());
+        let projection =
+            SafeOutputProjection::try_new_bounded(safe.clone(), safe.len() + 64).unwrap();
+        assert!(projection.heap_bytes() <= safe.len() + 64);
+        assert_eq!(projection.text(), safe);
+    }
+
+    #[test]
+    fn streaming_redacts_nested_contexts_at_every_chunk_boundary() {
+        for prefix in [
+            "Bearer xBearer ",
+            "--token --token ",
+            "password=password = ",
+            "aws_secret_key=aws_secret_key = ",
+        ] {
+            let text = format!("{prefix}{} ", "z".repeat(48));
+            for end in prefix.len() + 1..=text.len() {
+                let preview = redact_credentials_for_display_streaming(&text[..end], usize::MAX)
+                    .unwrap()
+                    .0;
+                assert!(!preview.contains('z'), "{prefix:?} byte {end}: {preview:?}");
+            }
+        }
+        let text = "password=foo-----BEGIN PRIVATE";
+        let preview = redact_credentials_for_display_streaming(text, usize::MAX)
+            .unwrap()
+            .0;
+        assert!(!preview.contains("foo"), "{preview:?}");
+    }
+
+    #[test]
+    fn streaming_nested_contexts_cover_long_values_and_whitespace() {
+        for size in [319, 320, 321, 4096] {
+            let value = "a".repeat(size);
+            let whitespace = " ".repeat(size);
+            for text in [
+                format!("Bearer {value}Bearer{whitespace}zzzz"),
+                format!("--token {value}--token{whitespace}zzzz"),
+                format!("password={value}password{whitespace}={whitespace}zzzz"),
+            ] {
+                let preview = redact_credentials_for_display_streaming(&text, usize::MAX)
+                    .unwrap()
+                    .0;
+                assert!(!preview.contains("zzzz"), "{size}: {preview:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_withholds_an_unfinished_url_authority() {
+        let text = "https://alice:zzzz@example.test/path";
+        for end in "https://a".len()..=text.len() {
+            let preview = redact_credentials_for_display_streaming(&text[..end], usize::MAX)
+                .unwrap()
+                .0;
+            assert!(!preview.contains("alice"), "byte {end}: {preview:?}");
+            assert!(!preview.contains('z'), "byte {end}: {preview:?}");
+        }
+        let ordinary = "https://alice/path ";
+        assert_eq!(
+            redact_credentials_for_display_streaming(ordinary, usize::MAX)
+                .unwrap()
+                .0,
+            ordinary
+        );
+    }
+
+    #[test]
+    fn bounded_settled_redaction_stops_before_projection_expansion() {
+        let input = "password=abcdefghijkl ".repeat(100);
+        assert!(redact_credentials_for_display_bounded(&input, input.len()).is_err());
+        assert_eq!(
+            redact_credentials_for_display_bounded(&input, input.len() * 3).unwrap(),
+            redact_credentials_for_display(&input)
+        );
+        let adjacent = "[REDACTED:PRIVATE_KEY][REDACTED:GITHUB_TOKEN]";
+        assert_eq!(
+            redaction_marker_ranges_bounded(adjacent, 1).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn partial_pem_redaction_handles_many_orphan_end_markers() {
+        let prefix = "partial-key-----END PRIVATE KEY-----".repeat(10_000);
+        let text = format!(
+            "{prefix}visible\n-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\nafter"
+        );
+        let (safe, count) = redact_credentials_for_display_partial(&text);
+        assert_eq!(count, 2);
+        assert_eq!(safe.matches("[REDACTED:PRIVATE_KEY]").count(), 2);
+        assert!(safe.contains("visible\n[REDACTED:PRIVATE_KEY]\nafter"));
+        assert!(!safe.contains("partial-key") && !safe.contains("secret"));
+    }
+
+    #[test]
+    fn partial_pem_redaction_preserves_an_overlapping_begin_marker() {
+        for suffix in ["", "\n-----END PRIVATE KEY-----\nafter"] {
+            let raw = format!(
+                "prefix-----END PRIVATE KEY-----BEGIN PRIVATE KEY-----\nprivate-body{suffix}"
+            );
+            let (safe, count) = redact_credentials_for_display_partial(&raw);
+            assert!(!safe.contains("private-body"), "{safe:?}");
+            assert_eq!(count, 2, "{safe:?}");
+            if !suffix.is_empty() {
+                assert!(safe.ends_with("\nafter"), "{safe:?}");
+            }
+        }
+        let adjacent = "prefix-----END PRIVATE KEY-----END PRIVATE KEY-----after";
+        let (safe, count) = redact_credentials_for_display_partial(adjacent);
+        assert_eq!(count, 1);
+        assert_eq!(safe, "[REDACTED:PRIVATE_KEY]after");
+    }
+
+    #[test]
+    fn overlapping_pem_blocks_share_one_safe_edit_reference() {
+        let raw = concat!(
+            "before\n-----BEGIN PRIVATE KEY-----\nFIRST_BODY\n",
+            "-----END PRIVATE KEY-----BEGIN PRIVATE KEY-----\nSECOND_BODY\n",
+            "-----END PRIVATE KEY-----\nafter"
+        );
+        let (editable, count) = redact_credentials_in_text(raw);
+        assert_eq!(count, 1);
+        for safe in [
+            editable.clone(),
+            redact_credentials_for_display(raw).0,
+            redact_credentials_for_display_streaming(raw, usize::MAX)
+                .unwrap()
+                .0,
+            redact_line_window(raw, 4, 4),
+        ] {
+            assert!(
+                !safe.contains("FIRST_BODY") && !safe.contains("SECOND_BODY"),
+                "{safe:?}"
+            );
+        }
+        assert_eq!(
+            resolve_redacted_anchor(raw, &editable, false).unwrap(),
+            Some(raw.into())
+        );
+        let marker = marker_regex().find(&editable).unwrap().as_str();
+        assert!(
+            resolve_redacted_anchor(raw, marker, false)
+                .unwrap()
+                .is_some()
+        );
+
+        let incomplete = raw.replace("-----END PRIVATE KEY-----\nafter", "unterminated");
+        let editable = redact_credentials_in_text(&incomplete).0;
+        assert!(!editable.contains("SECOND_BODY"));
+        assert!(resolve_redacted_anchor(&incomplete, &editable, false).is_err());
+    }
+
+    #[test]
+    fn pem_line_window_uses_all_blocks_on_the_same_line() {
+        let raw = concat!(
+            "before\n-----BEGIN PRIVATE KEY-----\nFIRST_BODY\n",
+            "-----END PRIVATE KEY----- -----BEGIN PRIVATE KEY-----\n",
+            "SECOND_BODY\n-----END PRIVATE KEY-----\nafter\n"
+        );
+        assert_eq!(redact_line_window(raw, 5, 5), "[REDACTED:PRIVATE_KEY]");
+        assert_eq!(redact_line_window(raw, 7, 7), "after");
+    }
+
+    #[test]
+    fn overlapping_pem_edit_reference_respects_size_limit() {
+        for (body_len, resolvable) in [(32_000, true), (33_000, false)] {
+            let body = "A".repeat(body_len);
+            let raw = format!(
+                "-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
+            );
+            let editable = redact_credentials_in_text(&raw).0;
+            let resolved = resolve_redacted_anchor(&raw, &editable, false);
+            assert_eq!(resolved.is_ok(), resolvable, "body length {body_len}");
+            if resolvable {
+                assert_eq!(resolved.unwrap(), Some(raw));
+            }
+        }
+    }
+
+    #[test]
+    fn pem_edit_anchors_resolve_chains_and_many_separate_blocks() {
+        let chain = concat!(
+            "-----BEGIN RSA PRIVATE KEY-----\nfirst\n-----END RSA PRIVATE KEY-----",
+            "BEGIN EC PRIVATE KEY-----\nsecond\n-----END EC PRIVATE KEY-----",
+            "BEGIN PRIVATE KEY-----\nthird\n-----END PRIVATE KEY-----"
+        );
+        let (safe, count) = redact_credentials_in_text(chain);
+        assert_eq!(count, 1);
+        assert_eq!(
+            resolve_redacted_anchor(chain, &safe, false).unwrap(),
+            Some(chain.into())
+        );
+
+        let many = (0..120)
+            .map(|i| format!("-----BEGIN PRIVATE KEY-----\nkey{i}\n-----END PRIVATE KEY-----"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (safe, count) = redact_credentials_in_text(&many);
+        assert_eq!(count, 120);
+        assert_eq!(
+            resolve_redacted_anchor(&many, &safe, false).unwrap(),
+            Some(many)
+        );
+
+        let mixed = concat!(
+            "-----BEGIN PRIVATE KEY-----\nfirst\n-----END PRIVATE KEY-----\n",
+            "password=abcdefghijklmnop\n",
+            "-----BEGIN PRIVATE KEY-----\nsecond\n-----END PRIVATE KEY-----"
+        );
+        let (safe, count) = redact_credentials_in_text(mixed);
+        assert_eq!(count, 3);
+        assert_eq!(
+            resolve_redacted_anchor(mixed, &safe, false).unwrap(),
+            Some(mixed.into())
+        );
+    }
+
+    #[test]
+    fn pem_anchor_search_checks_overlapping_candidate_locations() {
+        for duplicate in [false, true] {
+            let blocks = (0..3)
+                .map(|i| {
+                    format!(
+                        "-----BEGIN PRIVATE KEY-----\nkey{}\n-----END PRIVATE KEY-----",
+                        if duplicate { 0 } else { i }
+                    )
+                })
+                .collect::<Vec<_>>();
+            let raw = blocks.join("\n");
+            let safe = redact_credentials_in_text(&raw).0;
+            let markers = safe.lines().collect::<Vec<_>>();
+            let anchor = markers[1..].join("\n");
+            let resolved = resolve_redacted_anchor(&raw, &anchor, false);
+            if duplicate {
+                assert!(
+                    resolved.is_err(),
+                    "overlapping candidates must be ambiguous"
+                );
+            } else {
+                assert_eq!(resolved.unwrap(), Some(blocks[1..].join("\n")));
+            }
+        }
+    }
+
+    #[test]
+    fn pem_anchor_rejects_an_overlapping_noncanonical_raw_occurrence() {
+        let first = "-----BEGIN PRIVATE KEY-----\nfirst\n-----END PRIVATE KEY-----";
+        let second = "-----BEGIN PRIVATE KEY-----\nsecond\n-----END PRIVATE KEY-----";
+        let raw = format!("{first}{}{second}-", &second[5..]);
+        let (safe, count) = redact_credentials_in_text(&raw);
+        assert_eq!(count, 2);
+        let anchor = &safe[safe.rfind(MARKER_PREFIX).unwrap()..];
+        assert!(resolve_redacted_anchor(&raw, anchor, false).is_err());
+    }
+
+    #[test]
+    fn redaction_anchor_cannot_expand_past_the_source_size() {
+        let raw = "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----";
+        let marker = redact_credentials_in_text(raw).0;
+        assert!(resolve_redacted_anchor(raw, &marker.repeat(10_000), false).is_err());
+    }
+
+    #[test]
+    fn redaction_anchor_resolves_values_issued_by_overlapping_rules() {
+        let aws_key = ["AK", "IA", "ABCDEFGHIJKLMNOP"].concat();
+        let raw = format!("--token abcdefghijklmnopqrst{aws_key}\n--token abcdefghijklmnopqrst\n");
+        let (safe, count) = redact_credentials_in_text(&raw);
+        assert_eq!(count, 2);
+        assert_eq!(
+            resolve_redacted_anchor(&raw, &safe, false).unwrap(),
+            Some(raw)
+        );
+    }
+
+    #[test]
+    fn overlapping_rules_redact_and_resolve_the_original_secret_group() {
+        let aws_key = ["AK", "IA", "ABCDEFGHIJKLMNOP"].concat();
+        for raw in [
+            format!("--token {aws_key}suffixsuffixsuffix"),
+            format!("password=prefix{aws_key}"),
+            format!("--token abcdefghijklmnopqrst{aws_key}"),
+            "password=fooBearer zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+        ] {
+            let (editable, count) = redact_credentials_in_text(&raw);
+            let display = redact_credentials_for_display(&raw).0;
+            assert_eq!(count, 1, "{editable}");
+            assert!(!editable.contains(&aws_key) && !editable.contains("zzzz"));
+            assert!(!display.contains("suffixsuffixsuffix") && !display.contains("zzzz"));
+            assert_eq!(
+                resolve_redacted_anchor(&raw, &editable, false).unwrap(),
+                Some(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn line_window_uses_context_from_the_complete_source() {
+        let raw = format!("Bearer\n{}\nafter", "x".repeat(40));
+        let line = redact_line_window(&raw, 2, 2);
+        assert!(!line.contains(&"x".repeat(40)), "{line}");
+        assert_eq!(line, "[REDACTED:BEARER_TOKEN]");
+
+        let raw = format!("AWS_SECRET_KEY=\n{}\nafter", "x".repeat(30));
+        let line = redact_line_window(&raw, 2, 2);
+        assert!(!line.contains(&"x".repeat(30)), "{line}");
+        assert_eq!(
+            resolve_redacted_anchor(&raw, &line, false).unwrap(),
+            Some("x".repeat(30))
+        );
+
+        let crlf = format!(
+            "before\r\nAWS_SECRET_KEY=\r\n{}\r\nafter\r\n",
+            "x".repeat(30)
+        );
+        let line = redact_line_window(&crlf, 3, 3);
+        assert_eq!(
+            resolve_redacted_anchor(&crlf, &line, false).unwrap(),
+            Some("x".repeat(30))
+        );
+        assert_eq!(redact_line_window(&crlf, 0, 1), "before");
+        assert_eq!(redact_line_window(&crlf, 5, 9), "");
+        assert_eq!(redact_line_window(&crlf, 3, 2), "");
+    }
+
+    #[test]
+    fn nested_pem_headers_conceal_the_unbounded_remainder() {
+        for between in ["\nOUTER_BODY\n-----", ""] {
+            let raw = format!(
+                "-----BEGIN PRIVATE KEY-----{between}BEGIN PRIVATE KEY-----\nINNER_BODY\n-----END PRIVATE KEY-----\nOUTER_SECRET\n-----END PRIVATE KEY-----\nafter"
+            );
+            let editable = redact_credentials_in_text(&raw).0;
+            for safe in [
+                editable.clone(),
+                redact_credentials_for_display(&raw).0,
+                redact_credentials_for_display_streaming(&raw, usize::MAX)
+                    .unwrap()
+                    .0,
+                redact_line_window(&raw, 1, raw.lines().count()),
+            ] {
+                assert!(
+                    !safe.contains("INNER_BODY") && !safe.contains("OUTER_SECRET"),
+                    "{safe:?}"
+                );
+            }
+            assert!(resolve_redacted_anchor(&raw, &editable, false).is_err());
         }
     }
 
@@ -1409,12 +2128,12 @@ mod tests {
 
     #[test]
     fn indexed_secret_assignments_are_redacted_and_resolve_exactly() {
-        let raw =
-            r#"os.environ["AWS_SECRET_ACCESS_KEY"] = "D4w8z9wKN1aVeT3BpQj6kIuN7wH8X0M9KfV5OqzF""#;
-        let (redacted, count) = redact_credentials_in_text(raw);
+        let secret = ["D4w8z9wKN1aVeT3BpQj6", "kIuN7wH8X0M9KfV5OqzF"].concat();
+        let raw = format!(r#"os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}""#);
+        let (redacted, count) = redact_credentials_in_text(&raw);
         assert_eq!(count, 1);
-        assert!(!redacted.contains("D4w8z9wKN1aVeT3BpQj6kIuN7wH8X0M9KfV5OqzF"));
-        let resolved = resolve_redacted_anchor(raw, &redacted, false)
+        assert!(!redacted.contains(&secret));
+        let resolved = resolve_redacted_anchor(&raw, &redacted, false)
             .expect("indexed assignment reference should parse")
             .expect("indexed assignment marker should resolve");
         assert_eq!(resolved, raw);

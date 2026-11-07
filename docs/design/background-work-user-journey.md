@@ -40,13 +40,15 @@ command to finish; independently owned agent/fanout controls can remain availabl
 composer input still addresses the parent. Capability introspection reports
 `shell_task_controls` separately from agent and fanout task controls.
 
-`task_output` observes a bounded snapshot or waits for a terminal event. Output
-growth and prompts do not wake a blocking observation. A live shell snapshot
-can omit earlier output and has no stable pagination cursor: stdout and stderr
-may grow independently. After completion, the captured output can be paginated;
+`task_output` observes a bounded snapshot or waits for a terminal event. For
+interactive shells, `wake_on_output=true` also wakes the bounded wait for
+output; existing output returns immediately, so repeated waits may return the
+same snapshot. A live shell snapshot gives stdout and stderr separate bounded
+tails and has no stable pagination cursor; the tails do not imply ordering
+between streams. After completion, the captured output can be paginated;
 published workspace files may still be changed by users between reads.
-An unfinished output token is withheld from the live view until it can be
-redacted; this is indicated in the snapshot. A timed-out or cancelled observation
+An ambiguous credential or private-key prefix may be withheld from the live
+view; this is indicated in the snapshot. A timed-out or cancelled observation
 leaves the command running. `task_input` writes only to a task launched with
 `stdin=true`; default stdin is closed. Input writes, closing stdin and stop
 requests are acknowledged separately from observed terminal execution. The task

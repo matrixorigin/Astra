@@ -478,9 +478,15 @@ pub(crate) async fn background_task_output_snapshot(
             handle.output_reference(),
         )
     };
-    let (output, end_offset, total_bytes, total_lines) = background_registry
-        .get_combined_output_since_async(task_id, offset, max_bytes)
-        .await?;
+    let (output, end_offset, total_bytes, total_lines) = if status.is_terminal() {
+        background_registry
+            .get_combined_output_since_async(task_id, offset, max_bytes)
+            .await?
+    } else {
+        background_registry
+            .get_live_output_async(task_id, max_bytes)
+            .await?
+    };
 
     Ok(crate::edge_tools::BgTaskOutputSnapshot {
         kind: "shell".to_string(),
@@ -752,10 +758,6 @@ pub(crate) fn background_task_event_system_message(
                 background_shell_notification_label(id, title)
             ))
         }
-        // This is advisory activity evidence, not a lifecycle transition or
-        // a chat message. The workbench row projects it without interrupting
-        // the conversation.
-        crate::edge_tools::background_tasks::BgTaskEvent::NoRecentOutput { .. } => None,
         crate::edge_tools::background_tasks::BgTaskEvent::Killed { id, title } => Some(format!(
             "Background shell {} was stopped",
             background_shell_notification_label(id, title)

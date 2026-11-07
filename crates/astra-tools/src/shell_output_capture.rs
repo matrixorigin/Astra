@@ -22,13 +22,16 @@ const CAPTURE_IO: u8 = 2;
 pub(super) struct CaptureState {
     used: Arc<AtomicU64>,
     failure: Arc<AtomicU8>,
+    activity: tokio::sync::watch::Sender<u64>,
 }
 
 impl CaptureState {
     fn new() -> Self {
+        let (activity, _) = tokio::sync::watch::channel(0);
         Self {
             used: Arc::new(AtomicU64::new(0)),
             failure: Arc::new(AtomicU8::new(CAPTURE_OK)),
+            activity,
         }
     }
 
@@ -79,10 +82,24 @@ pub struct CaptureWriter {
 
 impl CaptureWriter {
     pub async fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
         self.state.reserve(bytes.len())?;
         self.file.write_all(bytes).await.map_err(|_| {
             self.state.mark_io_failure();
-        })
+        })?;
+        if self.state.activity.receiver_count() > 0 {
+            // Publish activity only after the captured bytes are readable.
+            self.file
+                .flush()
+                .await
+                .map_err(|_| self.state.mark_io_failure())?;
+            self.state
+                .activity
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+        Ok(())
     }
 
     pub async fn finish(mut self) -> Result<(), ()> {
@@ -113,6 +130,7 @@ pub struct BashOutputCapture {
 /// obtain this owner, and workspace receipts never share it.
 pub struct TaskCapture {
     bytes: Arc<AtomicU64>,
+    activity: tokio::sync::watch::Receiver<u64>,
     removed: Mutex<bool>,
     #[cfg(unix)]
     directory: Arc<TaskCaptureDirectory>,
@@ -143,6 +161,10 @@ impl TaskCaptureDirectory {
 }
 
 impl TaskCapture {
+    pub fn output_activity(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.activity.clone()
+    }
+
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Acquire)
     }
@@ -251,6 +273,7 @@ impl BashOutputCapture {
         let _ = directory;
         let owner = Arc::new(TaskCapture {
             bytes: self.state.used.clone(),
+            activity: self.state.activity.subscribe(),
             removed: Mutex::new(false),
             #[cfg(unix)]
             directory,
@@ -890,6 +913,36 @@ mod tests {
         stdout.finish().await.unwrap();
         stderr.finish().await.unwrap();
         assert!(capture.finish(true, true, false).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activity_observers_see_concurrent_stream_writes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut capture, mut stdout, mut stderr) =
+            BashOutputCapture::start(workspace.path(), 1024).unwrap();
+        let directory = capture.task_capture_directory().unwrap();
+        let (stdout_path, stderr_path, owner) = capture.task_output_files(directory).unwrap();
+        let mut first = owner.output_activity();
+        let mut second = owner.output_activity();
+        let out = tokio::spawn(async move { stdout.write(b"ready").await });
+        let err = tokio::spawn(async move { stderr.write(b"warning").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), first.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::fs::read(&stdout_path).unwrap() == b"ready"
+                || std::fs::read(&stderr_path).unwrap() == b"warning"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), second.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        out.await.unwrap().unwrap();
+        err.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(stdout_path).unwrap(), b"ready");
+        assert_eq!(std::fs::read(stderr_path).unwrap(), b"warning");
+        assert_eq!(owner.bytes(), 12);
     }
 
     #[tokio::test]

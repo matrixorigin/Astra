@@ -861,7 +861,10 @@ async fn background_task_output_view(
     let first =
         request_background_task_output_snapshot(bg_commands, task_id, first_offset, max_bytes)
             .await?;
-    if requested_offset.is_some() || first.kind != "shell" || first.total_bytes <= max_bytes as u64
+    if requested_offset.is_some()
+        || first.kind != "shell"
+        || !first.status.is_terminal()
+        || first.total_bytes <= max_bytes as u64
     {
         return Ok((first_offset, first));
     }
@@ -3208,13 +3211,14 @@ impl ToolExecutor {
     #[cfg(test)]
     async fn task_output(&self, args: &Value) -> String {
         let mut fields = None;
-        self.task_output_with_fields(args, &mut fields).await
+        self.task_output_with_fields(args, &mut fields, None).await
     }
 
     async fn task_output_with_fields(
         &self,
         args: &Value,
         tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
+        observation_deadline: Option<tokio::time::Instant>,
     ) -> String {
         let task_id = match background_task_id_arg(args) {
             Ok(Some(id)) => id,
@@ -3222,6 +3226,13 @@ impl ToolExecutor {
             Ok(None) => return format_background_task_argument_error("task_id is required"),
         };
         let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
+        let wake_on_output = args
+            .get("wake_on_output")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if wake_on_output && !block {
+            return format_background_task_argument_error("wake_on_output requires block=true");
+        }
         let requested_offset = args.get("offset").and_then(Value::as_u64);
         let pattern = match args.get("pattern") {
             None => None,
@@ -3282,8 +3293,23 @@ impl ToolExecutor {
                 )
                 .await
             {
+                if wake_on_output {
+                    *tool_result_fields = None;
+                    return format_background_task_argument_error(
+                        "wake_on_output is available only for shell tasks",
+                    );
+                }
                 return output;
             }
+        }
+
+        if wake_on_output && self.background_tasks.get(&task_id).is_none() {
+            return match request_background_task_output_snapshot(self, &task_id, 0, 1).await {
+                Ok(_) => format_background_task_argument_error(
+                    "wake_on_output is available only for shell tasks",
+                ),
+                Err(error) => error,
+            };
         }
 
         let bg_commands = self;
@@ -3343,14 +3369,66 @@ impl ToolExecutor {
         }
 
         let timeout = Duration::from_millis(timeout_ms);
+        let deadline =
+            observation_deadline.unwrap_or_else(|| tokio::time::Instant::now() + timeout);
         let mut interrupted = self.foreground_wait_control.begin_wait();
-        let released = if let Ok(mut task) = self.background_tasks.subscription(&task_id) {
+        let mut initial_snapshot = None;
+        let reason = if let Ok(mut task) = self.background_tasks.subscription(&task_id) {
+            let mut activity = wake_on_output
+                .then(|| self.background_tasks.output_activity(&task_id))
+                .flatten();
+            if let Some(activity) = activity.as_mut() {
+                activity.borrow_and_update();
+            }
+            // Subscribe before observing: a write racing with this snapshot
+            // remains visible to `changed`, without polling or a new task state.
+            if wake_on_output {
+                let initial =
+                    match background_task_output_view(self, &task_id, requested_offset, max_bytes)
+                        .await
+                    {
+                        Ok(initial) => initial,
+                        Err(error) => return error,
+                    };
+                if !initial.1.output.is_empty() || initial.1.status.is_terminal() {
+                    let reason = if initial.1.status.is_terminal() {
+                        "terminal"
+                    } else {
+                        "output"
+                    };
+                    *tool_result_fields = Some(background_task_output_result_fields(
+                        &task_id, &initial.1, read_mode, true,
+                    ));
+                    tool_result_fields
+                        .as_mut()
+                        .expect("output fields")
+                        .insert("wait_result".into(), json!(reason));
+                    return format_background_task_output(
+                        &task_id, initial.0, &initial.1, read_mode,
+                    );
+                }
+                initial_snapshot = Some(initial);
+            }
             tokio::select! {
-                result = tokio::time::timeout(timeout, task.wait()) => {
-                    if let Ok(Err(error)) = result { return format_background_task_error(&error); }
-                    false
+                biased;
+                result = task.wait() => {
+                    if let Err(error) = result { return format_background_task_error(&error); }
+                    "terminal"
                 },
-                _ = interrupted.released() => true,
+                _ = async {
+                    if let Some(activity) = activity.as_mut() {
+                        if activity.changed().await.is_ok() { return; }
+                    }
+                    std::future::pending::<()>().await
+                } => "output",
+                _ = interrupted.released() => "released",
+                _ = tokio::time::sleep_until(deadline) => "timeout",
+            }
+        } else if let Some(handle) = self.background_tasks.get(&task_id) {
+            if handle.status().is_terminal() {
+                "terminal"
+            } else {
+                return format_background_task_error(&BackgroundTaskError::StaleHandle { task_id });
             }
         } else if let Some(ctx) = &self.spawn_context
             && ctx
@@ -3361,13 +3439,37 @@ impl ToolExecutor {
                 .any(|state| state.agent_id == task_id)
         {
             tokio::select! {
-                _ = ctx.spawner.wait_for_agent_outcome(&task_id, timeout) => false,
-                _ = interrupted.released() => true,
+                outcome = ctx.spawner.wait_for_agent_outcome(
+                    &task_id,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                ) => match outcome {
+                    astra_runtime::orchestration::WaitForAgentOutcome::Status(_) => "terminal",
+                    astra_runtime::orchestration::WaitForAgentOutcome::TimedOut => "timeout",
+                    astra_runtime::orchestration::WaitForAgentOutcome::Unknown => {
+                        return format_background_task_error(&BackgroundTaskError::not_found(&task_id));
+                    }
+                },
+                _ = interrupted.released() => "released",
+                _ = tokio::time::sleep_until(deadline) => "timeout",
             }
         } else {
-            false
+            return format_background_task_error(&BackgroundTaskError::not_found(&task_id));
         };
-        match background_task_output_view(self, &task_id, requested_offset, max_bytes).await {
+        let observed = if reason == "timeout" {
+            if let Some(initial) = initial_snapshot {
+                Ok(initial)
+            } else {
+                tool_result_fields
+                    .get_or_insert_default()
+                    .insert("wait_result".into(), json!("timeout"));
+                return format!(
+                    "Wait timed out after {timeout_ms}ms. The task was not stopped; use task_output without block to inspect its current state."
+                );
+            }
+        } else {
+            background_task_output_view(self, &task_id, requested_offset, max_bytes).await
+        };
+        match observed {
             Ok((offset, snapshot)) => {
                 *tool_result_fields = Some(background_task_output_result_fields(
                     &task_id, &snapshot, read_mode, true,
@@ -3375,15 +3477,9 @@ impl ToolExecutor {
                 let terminal = snapshot.status.requires_attention_or_terminal_wake();
                 tool_result_fields.as_mut().expect("output fields").insert(
                     "wait_result".into(),
-                    json!(if terminal {
-                        "terminal"
-                    } else if released {
-                        "released"
-                    } else {
-                        "timeout"
-                    }),
+                    json!(if terminal { "terminal" } else { reason }),
                 );
-                if terminal || released {
+                if terminal || reason != "timeout" {
                     format_background_task_output(&task_id, offset, &snapshot, read_mode)
                 } else {
                     format_background_task_output_wait_timeout(
@@ -4675,17 +4771,18 @@ impl ToolExecutor {
             let mut fields = None;
             let output = match name {
                 "task_output" => {
-                    let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
                     let timeout = std::time::Duration::from_millis(
                         args.get("timeout_ms")
                             .and_then(Value::as_u64)
                             .unwrap_or(30_000)
                             .clamp(1, 300_000),
                     );
+                    let deadline = tokio::time::Instant::now() + timeout;
                     tokio::select! {
-                        result = self.task_output_with_fields(args, &mut fields) => result,
+                        biased;
+                        result = self.task_output_with_fields(args, &mut fields, Some(deadline)) => result,
                         _ = async { match cancel_token { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false)),
-                        _ = tokio::time::sleep(timeout), if !block => {
+                        _ = tokio::time::sleep_until(deadline) => {
                             let mut outcome = ToolExecutionOutcome::error_with_evidence(
                                 "Task observation timed out. The task was not stopped; check its status or retry the observation.".into(),
                                 astra_core::ToolFailureEvidence::from_error_kind(astra_core::ErrorKind::ToolTimeout),
@@ -8523,6 +8620,7 @@ pub(crate) mod tests {
                     "timeout_ms": 5
                 }),
                 &mut result_fields,
+                None,
             )
             .await;
 
@@ -8566,6 +8664,7 @@ pub(crate) mod tests {
             .task_output_with_fields(
                 &serde_json::json!({ "task_id": child_id }),
                 &mut alias_fields,
+                None,
             )
             .await;
         assert!(
@@ -8701,7 +8800,11 @@ pub(crate) mod tests {
         for _ in 0..2 {
             let mut fields = None;
             let output = executor
-                .task_output_with_fields(&serde_json::json!({"task_id": &child_id}), &mut fields)
+                .task_output_with_fields(
+                    &serde_json::json!({"task_id": &child_id}),
+                    &mut fields,
+                    None,
+                )
                 .await;
             assert!(
                 output.contains("Read agent fanout output live-review-fanout"),
@@ -8715,6 +8818,14 @@ pub(crate) mod tests {
             assert_eq!(observation.id, "live-review-fanout");
             assert_eq!(observation.status, WorkUnitStatus::Running);
         }
+
+        let unsupported = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id":"live-review-fanout","block":true,"wake_on_output":true}),
+            )
+            .await;
+        assert!(unsupported.contains("invalid_argument"), "{unsupported}");
 
         release.add_permits(3);
         let parent = spawner.fanout_parent("run-parent");
@@ -8779,6 +8890,60 @@ pub(crate) mod tests {
         assert!(
             matches!(status, astra_runtime::orchestration::AgentStatus::Completed { result, .. } if result == "child result")
         );
+    }
+
+    #[tokio::test]
+    async fn task_output_waits_for_the_actual_local_agent_outcome() {
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let spawner = gated_test_spawner(release.clone());
+        let executor =
+            Arc::new(test_executor().with_spawn_context(fanout_test_context(spawner.clone())));
+        let launched = executor
+            .execute(
+                "agent",
+                &serde_json::json!({"action":"spawn", "description":"Review", "prompt":"Review"}),
+            )
+            .await;
+        let launched: serde_json::Value = serde_json::from_str(&launched).unwrap();
+        let id = launched["agent_id"].as_str().unwrap();
+        let timed_out = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id":id,"block":true,"timeout_ms":10}),
+            )
+            .await;
+        assert!(timed_out.contains("Wait timed out"), "{timed_out}");
+
+        let waiting = executor.clone();
+        let task_id = id.to_string();
+        let wait = tokio::spawn(async move {
+            waiting
+                .execute(
+                    "task_output",
+                    &serde_json::json!({"task_id":task_id,"block":true,"timeout_ms":2000}),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+        let completed = wait.await.unwrap();
+        assert!(completed.contains("child result"), "{completed}");
+        assert!(!completed.contains("Wait timed out"), "{completed}");
+        let already_done = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id":id,"block":true,"timeout_ms":2000}),
+            )
+            .await;
+        assert!(already_done.contains("child result"), "{already_done}");
+
+        let unknown = executor
+            .execute(
+                "task_output",
+                &serde_json::json!({"task_id":"unknown-task","block":true,"timeout_ms":2000}),
+            )
+            .await;
+        assert!(unknown.contains("not_found"), "{unknown}");
     }
 
     #[tokio::test]
@@ -9142,7 +9307,7 @@ pub(crate) mod tests {
         assert!(output.contains("Output chunk:"), "{output}");
         assert!(output.contains("hello"), "{output}");
         assert!(output.contains("world"), "{output}");
-        assert!(output.contains("next_offset 12"), "{output}");
+        assert!(!output.contains("next_offset"), "{output}");
         assert!(
             output.contains("later_call task_output(task_id='bg-shell-1', block=false)"),
             "{output}"
@@ -9163,7 +9328,7 @@ pub(crate) mod tests {
         let historical = format_background_task_output(
             "bg-shell-1",
             800,
-            &snapshot,
+            &bg_snapshot(900, 1_000, 20, "completed", "latest bounded chunk"),
             BgTaskOutputReadMode::Historical,
         );
 

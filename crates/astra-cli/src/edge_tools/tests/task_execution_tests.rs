@@ -181,7 +181,11 @@ async fn interactive_shell_output_is_visible_and_live_offsets_are_rejected() {
         loop {
             let output = call(&executor, "task_output", json!({"task_id":id})).await;
             assert!(!output.is_error, "{output:?}");
-            if output.output.contains("Confirm?") && output.output.contains("warning") {
+            if output
+                .output
+                .split_once("Output chunk:\n")
+                .is_some_and(|(_, chunk)| chunk.contains("Confirm?") && chunk.contains("warning"))
+            {
                 assert!(!output.output.contains("next_offset"), "{output:?}");
                 break;
             }
@@ -197,7 +201,7 @@ async fn interactive_shell_output_is_visible_and_live_offsets_are_rejected() {
     )
     .await;
     assert!(
-        !tiny.is_error && tiny.output.contains("partial tokens may be withheld"),
+        tiny.is_error && tiny.output.contains("too small to show both streams"),
         "{tiny:?}"
     );
     let invalid = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
@@ -220,6 +224,281 @@ async fn interactive_shell_output_is_visible_and_live_offsets_are_rejected() {
         output.output.contains("answer=yes") && output.output.contains("warning"),
         "{output:?}"
     );
+}
+
+#[tokio::test]
+async fn interactive_wait_observes_unterminated_output_and_preserves_input() {
+    let (workspace, executor) = fixture();
+    let id = launch(
+        &executor,
+        "IFS= read -r gate; printf 'Password:'; IFS= read -r answer",
+        true,
+        10.0,
+    )
+    .await;
+    stdin_ready(&executor, &id).await;
+    let observer = Arc::new(
+        ToolExecutor::new(workspace.path())
+            .with_background_tasks(executor.background_tasks.clone()),
+    );
+    let waiter = {
+        let (executor, id) = (executor.clone(), id.clone());
+        tokio::spawn(async move {
+            call(
+                &executor,
+                "task_output",
+                json!({"task_id":id,"block":true,"wake_on_output":true,"timeout_ms":5000}),
+            )
+            .await
+        })
+    };
+    let second_waiter = {
+        let (observer, id) = (observer.clone(), id.clone());
+        tokio::spawn(async move {
+            call(
+                &observer,
+                "task_output",
+                json!({"task_id":id,"block":true,"wake_on_output":true,"timeout_ms":5000}),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !executor.foreground_wait_control.is_active()
+            || !observer.foreground_wait_control.is_active()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let input = call(
+        &executor,
+        "task_input",
+        json!({"task_id":id,"input":"go\n"}),
+    )
+    .await;
+    assert!(!input.is_error, "{input:?}");
+    let observed = tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !observed.is_error
+            && observed
+                .output
+                .split_once("Output chunk:\n")
+                .is_some_and(|(_, chunk)| chunk.contains("Password:")),
+        "{observed:?}"
+    );
+    assert_eq!(
+        observed.tool_result_fields.as_ref().unwrap()["wait_result"],
+        "output"
+    );
+    let second = tokio::time::timeout(Duration::from_secs(3), second_waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !second.is_error
+            && second
+                .output
+                .split_once("Output chunk:\n")
+                .is_some_and(|(_, chunk)| chunk.contains("Password:")),
+        "{second:?}"
+    );
+    let again = call(
+        &executor,
+        "task_output",
+        json!({"task_id":id,"block":true,"wake_on_output":true,"timeout_ms":1000}),
+    )
+    .await;
+    assert!(
+        !again.is_error
+            && again
+                .output
+                .split_once("Output chunk:\n")
+                .is_some_and(|(_, chunk)| chunk.contains("Password:")),
+        "{again:?}"
+    );
+    let input = call(
+        &executor,
+        "task_input",
+        json!({"task_id":id,"input":"ok\n"}),
+    )
+    .await;
+    assert!(!input.is_error, "{input:?}");
+    assert!(!terminal(&executor, &id).await.is_error);
+}
+
+#[tokio::test]
+async fn live_output_keeps_both_streams_visible_after_a_noisy_stream() {
+    let (_workspace, executor) = fixture();
+    for command in [
+        "yes warning | head -n 12000 >&2; printf 'READY:'; IFS= read -r answer",
+        "yes warning | head -n 12000; printf 'READY:' >&2; IFS= read -r answer",
+    ] {
+        let id = launch(&executor, command, true, 10.0).await;
+        stdin_ready(&executor, &id).await;
+        let handle = executor.background_tasks.get(&id).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let out = std::fs::read(&handle.stdout_path).unwrap_or_default();
+                let err = std::fs::read(&handle.stderr_path).unwrap_or_default();
+                if out.windows(6).any(|w| w == b"READY:") || err.windows(6).any(|w| w == b"READY:")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let output = call(
+            &executor,
+            "task_output",
+            json!({"task_id":id,"max_bytes":65536}),
+        )
+        .await;
+        assert!(!output.is_error && output.output.split_once("Output chunk:\n").is_some_and(|(_, chunk)| chunk.contains("READY:") && chunk.contains("warning")), "{output:?}");
+        let input = call(
+            &executor,
+            "task_input",
+            json!({"task_id":id,"input":"ok\n"}),
+        )
+        .await;
+        assert!(!input.is_error, "{input:?}");
+        assert!(!terminal(&executor, &id).await.is_error);
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_stream_does_not_hide_the_other_stream() {
+    let (_workspace, executor) = fixture();
+    for (command, broken_stdout) in [
+        ("printf 'READY:'; IFS= read -r answer", false),
+        ("printf 'READY:' >&2; IFS= read -r answer", true),
+    ] {
+        let id = launch(&executor, command, true, 10.0).await;
+        stdin_ready(&executor, &id).await;
+        let handle = executor.background_tasks.get(&id).unwrap();
+        let (working, broken) = if broken_stdout {
+            (handle.stderr_path, handle.stdout_path)
+        } else {
+            (handle.stdout_path, handle.stderr_path)
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !std::fs::read_to_string(&working).is_ok_and(|s| s.contains("READY:")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::remove_file(broken).unwrap();
+        let output = call(&executor, "task_output", json!({"task_id":id})).await;
+        let broken_label = if broken_stdout { "stdout" } else { "stderr" };
+        assert!(
+            !output.is_error
+                && output.output.contains("READY:")
+                && output
+                    .output
+                    .contains(&format!("{broken_label} unavailable")),
+            "{output:?}"
+        );
+        let search = call(
+            &executor,
+            "task_output",
+            json!({"task_id":id,"pattern":"READY:"}),
+        )
+        .await;
+        assert!(
+            !search.is_error
+                && search.output.contains("READY:")
+                && search.output.contains("search results are incomplete"),
+            "{search:?}"
+        );
+        let input = call(
+            &executor,
+            "task_input",
+            json!({"task_id":id,"input":"ok\n"}),
+        )
+        .await;
+        assert!(!input.is_error, "{input:?}");
+        let _ = terminal(&executor, &id).await;
+    }
+}
+
+#[tokio::test]
+async fn incomplete_terminal_capture_remains_observable_and_searchable() {
+    let (_workspace, executor) = fixture();
+    let id = launch(&executor, "printf 'failure-detail'; sleep 4", false, 1.0).await;
+    let done = terminal(&executor, &id).await;
+    assert!(done.is_error);
+    assert_eq!(
+        done.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["complete"],
+        false
+    );
+    let output = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
+    assert!(
+        !output.is_error
+            && output
+                .output
+                .split_once("Output chunk:\n")
+                .is_some_and(|(_, chunk)| chunk.contains("failure-detail")),
+        "{output:?}"
+    );
+    let search = call(
+        &executor,
+        "task_output",
+        json!({"task_id":id,"pattern":"failure-detail"}),
+    )
+    .await;
+    assert!(
+        !search.is_error
+            && search
+                .output
+                .split_once("Matched output:\n")
+                .is_some_and(|(_, chunk)| chunk.contains("failure-detail")),
+        "{search:?}"
+    );
+}
+
+#[tokio::test]
+async fn task_output_timeout_does_not_stop_an_interactive_process() {
+    let (_workspace, executor) = fixture();
+    let id = launch(&executor, "cat", true, 10.0).await;
+    stdin_ready(&executor, &id).await;
+    for wake_on_output in [false, true] {
+        let result = call(
+            &executor,
+            "task_output",
+            json!({
+                "task_id":id, "block":true, "wake_on_output":wake_on_output, "timeout_ms":100
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            result.tool_result_fields.as_ref().unwrap()["wait_result"],
+            "timeout"
+        );
+        assert!(
+            !executor
+                .background_tasks
+                .get(&id)
+                .unwrap()
+                .status()
+                .is_terminal()
+        );
+    }
+    let closed = call(
+        &executor,
+        "task_input",
+        json!({"task_id":id,"close_stdin":true}),
+    )
+    .await;
+    assert!(!closed.is_error, "{closed:?}");
+    assert!(!terminal(&executor, &id).await.is_error);
 }
 
 #[tokio::test]
@@ -350,6 +629,63 @@ async fn restored_background_results_remain_readable_across_repeated_restore() {
     );
     drop(again);
     assert!(std::path::Path::new(&published).exists());
+}
+
+#[tokio::test]
+async fn restored_task_wait_distinguishes_completion_from_lost_ownership() {
+    let workspace = tempfile::tempdir().unwrap();
+    let stdout = workspace.path().join("stdout");
+    let stderr = workspace.path().join("stderr");
+    std::fs::write(&stdout, "recorded output").unwrap();
+    std::fs::write(&stderr, "").unwrap();
+    let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+        workspace.path().join("restored"),
+    );
+    for (id, status) in [
+        ("restored-complete", "completed"),
+        ("restored-live", "running"),
+    ] {
+        registry
+            .restore_shell_task_projection(
+                astra_services::session_workspace::BackgroundShellTaskProjection {
+                    id: id.into(),
+                    status: status.into(),
+                    title: "restored shell".into(),
+                    started_at_ms: 1,
+                    ended_at_ms: (status == "completed").then_some(2),
+                    stdout_path: stdout.display().to_string(),
+                    stderr_path: stderr.display().to_string(),
+                    exit_code: (status == "completed").then_some(0),
+                    terminal_reason: None,
+                },
+            )
+            .unwrap();
+    }
+    let executor = ToolExecutor::new(workspace.path()).with_background_tasks(registry);
+    let done = call(
+        &executor,
+        "task_output",
+        json!({"task_id":"restored-complete","block":true}),
+    )
+    .await;
+    assert!(
+        !done.is_error && done.output.contains("recorded output"),
+        "{done:?}"
+    );
+    let stale = call(
+        &executor,
+        "task_output",
+        json!({"task_id":"restored-live","block":true}),
+    )
+    .await;
+    assert!(stale.output.contains("stale_handle"), "{stale:?}");
+    let unknown = call(
+        &executor,
+        "task_output",
+        json!({"task_id":"missing","block":true,"wake_on_output":true}),
+    )
+    .await;
+    assert!(unknown.output.contains("not_found"), "{unknown:?}");
 }
 
 #[cfg(unix)]

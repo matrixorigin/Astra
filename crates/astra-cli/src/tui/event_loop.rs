@@ -19418,6 +19418,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_row_keeps_available_output_when_one_stream_is_missing() {
+        let temp = crate::tests::test_temp_dir();
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-partial-output"),
+        );
+        let id = registry
+            .spawn_shell("printf kept-output; printf lost >&2", "partial output")
+            .await;
+        wait_for_background_shell_terminal(&mut registry, &id).await;
+        let stderr = registry.get(&id).unwrap().stderr_path;
+        std::fs::remove_file(stderr).unwrap();
+        wait_for_background_shell_preview(&mut registry, &id).await;
+        let rows = background_task_rows(&mut registry);
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        let tail = row.output_tail.as_deref().unwrap_or_default();
+        assert!(tail.contains("kept-output"), "{tail}");
+        assert!(tail.contains("stderr unavailable"), "{tail}");
+        assert!(row.total_bytes.is_none(), "{row:?}");
+    }
+
+    #[tokio::test]
     async fn background_task_rows_separate_restored_freshness_from_lifecycle() {
         let temp = crate::tests::test_temp_dir();
         let stdout = temp.path().join("restored.stdout");
@@ -23874,17 +23895,6 @@ mod tests {
         );
         assert!(!completed.contains("Background command"));
 
-        let stalled = background_task_event_system_message(&BgTaskEvent::NoRecentOutput {
-            id: "bg-shell-2".to_string(),
-            title: "python script.py".to_string(),
-            inactive_ms: 47_000,
-            last_output_tail: "still processing".to_string(),
-        });
-        assert!(
-            stalled.is_none(),
-            "quiet-work advisory must not pollute chat history"
-        );
-
         let killed = background_task_event_system_message(&BgTaskEvent::Killed {
             id: "bg-shell-3".to_string(),
             title: "deploy.sh".to_string(),
@@ -24034,12 +24044,6 @@ mod tests {
             BgTaskEvent::Killed {
                 id: "bg-shell-4".to_string(),
                 title: "deploy.sh".to_string(),
-            },
-            BgTaskEvent::NoRecentOutput {
-                id: "bg-shell-5".to_string(),
-                title: "python script.py".to_string(),
-                inactive_ms: 45_000,
-                last_output_tail: "still processing".to_string(),
             },
         ]);
 

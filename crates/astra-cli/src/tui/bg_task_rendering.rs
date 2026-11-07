@@ -65,8 +65,7 @@ pub(crate) fn background_task_rows(
                     .as_ref()
                     .map(format_background_task_output_read_error);
                 let total_bytes = output_error.is_none().then_some(total_bytes);
-                let output_tail =
-                    output_error.or_else(|| output_tail.filter(|tail| !tail.is_empty()));
+                let output_tail = output_tail.filter(|tail| !tail.is_empty()).or(output_error);
                 super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
                     id,
                     status,

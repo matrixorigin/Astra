@@ -2837,7 +2837,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "Wait for terminal status, release by parent input, or a bounded timeout. Timeout leaves the task running. Default false; output growth and prompts do not wake this wait."
+                            "description": "Wait for terminal status, release by parent input, or a bounded timeout. Set wake_on_output=true to observe interactive shell output instead. Timeout leaves the task running. Default false."
+                        },
+                        "wake_on_output": {
+                            "type": "boolean",
+                            "description": "With block=true, wake for shell output as well as terminal status. Existing output returns immediately; repeated waits can return the same snapshot. Default false."
                         },
                         "offset": {
                             "type": "integer",

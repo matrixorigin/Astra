@@ -5,10 +5,7 @@
 //! - Spawn / kill lifecycle with CancellationToken
 //! - File-backed output capture (stdout/stderr → disk)
 //! - Single-channel `pending_completions` queue drained by
-//!   `poll_completions`; the TUI tick consumes lifecycle and advisory events
-//!   (Started / Completed / Failed / Killed / NoRecentOutput) exactly once
-//!   per occurrence
-//! - Factual no-recent-output advisory without guessing process intent
+//!   `poll_completions`; the TUI tick consumes lifecycle events exactly once
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -162,12 +159,6 @@ pub(crate) enum BgTaskEvent {
         id: String,
         title: String,
     },
-    NoRecentOutput {
-        id: String,
-        title: String,
-        inactive_ms: u64,
-        last_output_tail: String,
-    },
 }
 
 impl BgTaskEvent {
@@ -176,8 +167,7 @@ impl BgTaskEvent {
             Self::Started { id, .. }
             | Self::Completed { id, .. }
             | Self::Failed { id, .. }
-            | Self::Killed { id, .. }
-            | Self::NoRecentOutput { id, .. } => id,
+            | Self::Killed { id, .. } => id,
         }
     }
 }
@@ -216,8 +206,6 @@ pub(crate) struct BackgroundTaskHandle {
     output_error: Option<BackgroundTaskError>,
     output_sampled_at: Option<Instant>,
     last_activity: Instant,
-    last_tail_probe_at: Option<Instant>,
-    no_recent_output_reported: bool,
     work_revision: u64,
     completion: Option<watch::Receiver<Option<Arc<TaskCompletion>>>>,
     input: Option<watch::Receiver<Option<astra_sandbox::ProcessInput>>>,
@@ -401,7 +389,6 @@ const MAX_RETAINED_FAILED_TASKS: usize = 128;
 #[cfg(test)]
 const MAX_RETAINED_FAILED_TASKS: usize = 3;
 const STALL_THRESHOLD: Duration = Duration::from_secs(45);
-const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
 const OUTPUT_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const OUTPUT_PREVIEW_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -615,7 +602,7 @@ impl BackgroundTaskRegistry {
                 live_control: BgTaskLiveControl::Available, cancel_token: cancel.clone(),
                 stdout_path, stderr_path, exit_code: None, terminal_reason: None,
                 last_output_size: 0, output_tail: None, output_error: None, output_sampled_at: None,
-                last_activity: Instant::now(), last_tail_probe_at: None, no_recent_output_reported: false, work_revision: 1,
+                last_activity: Instant::now(), work_revision: 1,
                 completion: Some(completion.clone()), input: input.clone(), capture, background,
             });
             if background {
@@ -696,6 +683,13 @@ impl BackgroundTaskRegistry {
             cancel: handle.cancel_token,
             completion,
         })
+    }
+
+    pub(crate) fn output_activity(&self, id: &str) -> Option<watch::Receiver<u64>> {
+        self.get(id)?
+            .capture
+            .as_ref()
+            .map(|capture| capture.output_activity())
     }
 
     /// Bounded model context projected from the same producer record used by
@@ -914,6 +908,32 @@ impl BackgroundTaskRegistry {
             .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
+    /// Live streams are independent: concatenating them and taking one tail
+    /// lets old stderr hide newer stdout (and vice versa).
+    pub async fn get_live_output_async(
+        &mut self,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<(String, u64, u64, u64), BackgroundTaskError> {
+        self.drain_join_set();
+        let handle = self
+            .get(id)
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
+        if handle.stdout_path.as_os_str().is_empty() || handle.stderr_path.as_os_str().is_empty() {
+            return Err(BackgroundTaskError::output_unavailable(
+                id,
+                "Private task output is unavailable after the session closes.",
+            ));
+        }
+        let settled = handle.output_settled();
+        let (stdout, stderr) = tokio::join!(
+            safe_projection_async(&handle.stdout_path, settled),
+            safe_projection_async(&handle.stderr_path, settled),
+        );
+        available_stream_tails(stdout, stderr, max_bytes)
+            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
+    }
+
     pub async fn search_combined_output_async(
         &mut self,
         id: &str,
@@ -944,20 +964,30 @@ impl BackgroundTaskRegistry {
             optional_safe_projection_async(&handle.stdout_path, settled),
             optional_safe_projection_async(&handle.stderr_path, settled)
         );
-        let stdout =
-            stdout.map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?;
-        let stderr =
-            stderr.map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?;
+        let (stdout, stderr, warning) = separate_stream_results(stdout, stderr)
+            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?;
+        let stdout = stdout.flatten();
+        let stderr = stderr.flatten();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            search_projections(
+            let warning = warning.map_or_else(String::new, |warning| {
+                format!("[{warning}; search results are incomplete]\n")
+            });
+            let budget = max_bytes.checked_sub(warning.len()).ok_or_else(|| {
+                BackgroundTaskError::output_unavailable(
+                    &task_id,
+                    "max_bytes is too small to report unavailable output; increase it and search again.",
+                )
+            })?;
+            let (output, matching, truncated) = search_projections(
                 stdout.as_deref(),
                 stderr.as_deref(),
                 &pattern,
                 context_lines,
-                max_bytes,
+                budget,
             )
-            .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))
+            .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))?;
+            Ok((format!("{warning}{output}"), matching, truncated))
         })
         .await
         .map_err(|error| BackgroundTaskError::output_unavailable(id, error.to_string()))?
@@ -1137,8 +1167,6 @@ impl TaskRegistryState {
             output_error: None,
             output_sampled_at: None,
             last_activity: Instant::now(),
-            last_tail_probe_at: None,
-            no_recent_output_reported: false,
             work_revision,
             completion: None,
             input: None,
@@ -1414,33 +1442,27 @@ impl TaskRegistryState {
         let now = Instant::now();
         let mut requests = Vec::new();
         for handle in self.tasks.values_mut() {
-            if let Some(capture) = &handle.capture {
-                let bytes = capture.bytes();
-                if bytes == handle.last_output_size && !handle.status().is_terminal() {
-                    continue;
-                }
-            }
             let status = handle.status();
             let monitors_lifecycle =
                 handle.live_control.is_available() && status == BgTaskStatus::Running;
+            let size_changed = handle
+                .capture
+                .as_ref()
+                .is_none_or(|capture| capture.bytes() != handle.last_output_size);
+            let preview_dirty = handle
+                .output_sampled_at
+                .is_none_or(|sampled| handle.last_activity > sampled)
+                || handle.output_error.is_some();
             let preview_due = if monitors_lifecycle {
-                !handle
-                    .output_sampled_at
-                    .is_some_and(|at| at.elapsed() < OUTPUT_PREVIEW_INTERVAL)
+                (size_changed || preview_dirty)
+                    && !handle
+                        .output_sampled_at
+                        .is_some_and(|at| at.elapsed() < OUTPUT_PREVIEW_INTERVAL)
             } else {
                 handle.output_sampled_at.is_none()
             };
-            if !monitors_lifecycle && !preview_due {
+            if !preview_due && (!monitors_lifecycle || !size_changed) {
                 continue;
-            }
-            let probe_stalled_tail = monitors_lifecycle
-                && handle.last_activity.elapsed() > STALL_THRESHOLD
-                && !handle.no_recent_output_reported
-                && !handle
-                    .last_tail_probe_at
-                    .is_some_and(|at| at.elapsed() < STALL_TAIL_RECHECK_COOLDOWN);
-            if probe_stalled_tail {
-                handle.last_tail_probe_at = Some(now);
             }
             if preview_due {
                 handle.output_sampled_at = Some(now);
@@ -1449,7 +1471,7 @@ impl TaskRegistryState {
                 id: handle.id.clone(),
                 stdout_path: handle.stdout_path.clone(),
                 stderr_path: handle.stderr_path.clone(),
-                tail_bytes: (preview_due || probe_stalled_tail).then_some(8192),
+                tail_bytes: preview_due.then_some(8192),
                 report_missing: !monitors_lifecycle,
                 settled: handle.output_settled(),
             });
@@ -1471,47 +1493,31 @@ impl TaskRegistryState {
     }
 
     fn apply_output_observations(&mut self, observations: Vec<ShellOutputObservation>) {
-        let mut events = Vec::new();
         for observation in observations {
             let Some(handle) = self.tasks.get_mut(&observation.id) else {
                 continue;
             };
+            // Completion clears this timestamp to request a final preview.
+            // A live probe already in flight must not satisfy that request.
+            if handle.ended_at_ms.is_some() && handle.output_sampled_at.is_none() {
+                continue;
+            }
             let size_changed = observation.total_bytes != handle.last_output_size;
             handle.last_output_size = observation.total_bytes;
+            let observed_at = Instant::now();
             if let Some(tail) = observation.tail.as_ref() {
                 handle.output_tail = Some(tail.trim_end().to_string());
+                handle.output_sampled_at = Some(observed_at);
+            } else if observation.output_error.is_some() {
+                // Do not let a previously successful preview hide a new error.
+                handle.output_tail = None;
             }
-            handle.output_error = observation.output_error;
-            if !handle.live_control.is_available() || handle.status().is_terminal() {
-                continue;
+            if observation.tail.is_some() || observation.output_error.is_some() {
+                handle.output_error = observation.output_error;
             }
             if size_changed {
-                handle.last_activity = Instant::now();
-                handle.last_tail_probe_at = None;
-                handle.no_recent_output_reported = false;
-                continue;
+                handle.last_activity = observed_at;
             }
-            let Some(tail) = observation.tail else {
-                continue;
-            };
-            if handle.last_activity.elapsed() > STALL_THRESHOLD && !handle.no_recent_output_reported
-            {
-                let inactive_ms = handle
-                    .last_activity
-                    .elapsed()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                handle.no_recent_output_reported = true;
-                events.push(BgTaskEvent::NoRecentOutput {
-                    id: handle.id.clone(),
-                    title: handle.description.clone(),
-                    inactive_ms,
-                    last_output_tail: tail.trim_end().to_string(),
-                });
-            }
-        }
-        for event in events {
-            self.push_event(event);
         }
     }
 
@@ -1591,7 +1597,7 @@ async fn collect_shell_output_observations(
             .as_ref()
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        let output_error = if request.report_missing
+        let mut output_error = if request.report_missing
             && (request.stdout_path.as_os_str().is_empty()
                 || request.stderr_path.as_os_str().is_empty())
         {
@@ -1613,14 +1619,22 @@ async fn collect_shell_output_observations(
             None
         };
         let tail = if let Some(max_bytes) = request.tail_bytes {
-            read_combined_tail_str_async(
+            match read_combined_tail_str_async(
                 &request.stdout_path,
                 &request.stderr_path,
                 max_bytes,
                 request.settled,
             )
             .await
-            .ok()
+            {
+                Ok(tail) => Some(tail),
+                Err(error) => {
+                    output_error.get_or_insert_with(|| {
+                        BackgroundTaskError::output_unavailable(&request.id, error)
+                    });
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1632,15 +1646,6 @@ async fn collect_shell_output_observations(
         }
     }))
     .await
-}
-
-async fn read_tail_str_async(
-    path: &Path,
-    max_bytes: usize,
-    settled: bool,
-) -> Result<(String, u64), String> {
-    let projection = safe_projection_async(path, settled).await?;
-    Ok(projection_tail(&projection, max_bytes))
 }
 
 async fn optional_safe_projection_async(
@@ -1773,18 +1778,69 @@ async fn read_combined_tail_str_async(
     settled: bool,
 ) -> Result<String, String> {
     let (stdout, stderr) = tokio::join!(
-        read_tail_str_async(stdout_path, max_bytes, settled),
-        read_tail_str_async(stderr_path, max_bytes, settled),
+        safe_projection_async(stdout_path, settled),
+        safe_projection_async(stderr_path, settled),
     );
-    let stdout = stdout.map(|(text, _)| text).unwrap_or_default();
-    let stderr = stderr.map(|(text, _)| text).unwrap_or_default();
-    if stderr.trim().is_empty() {
-        Ok(stdout)
-    } else if stdout.trim().is_empty() {
-        Ok(stderr)
-    } else {
-        Ok(format!("{stdout}\n{stderr}"))
+    available_stream_tails(stdout, stderr, max_bytes).map(|(output, _, _, _)| output)
+}
+
+type SeparatedStreamResults<T> = Result<(Option<T>, Option<T>, Option<String>), String>;
+
+fn separate_stream_results<T>(
+    stdout: Result<T, String>,
+    stderr: Result<T, String>,
+) -> SeparatedStreamResults<T> {
+    match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => Ok((Some(stdout), Some(stderr), None)),
+        (Ok(stdout), Err(error)) => Ok((
+            Some(stdout),
+            None,
+            Some(format!("stderr unavailable: {error}")),
+        )),
+        (Err(error), Ok(stderr)) => Ok((
+            None,
+            Some(stderr),
+            Some(format!("stdout unavailable: {error}")),
+        )),
+        (Err(out), Err(err)) => Err(format!(
+            "stdout unavailable: {out}; stderr unavailable: {err}"
+        )),
     }
+}
+
+fn available_stream_tails(
+    stdout: Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String>,
+    stderr: Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String>,
+    max_bytes: usize,
+) -> Result<(String, u64, u64, u64), String> {
+    let (stdout, stderr, warning) = separate_stream_results(stdout, stderr)?;
+    if let (Some(stdout), Some(stderr)) = (&stdout, &stderr) {
+        return bounded_stream_tails(stdout, stderr, max_bytes);
+    }
+    let warning = format!(
+        "[{}; output totals exclude this stream]\n",
+        warning.expect("one unavailable stream")
+    );
+    let (label, projection) = match (stdout, stderr) {
+        (Some(stdout), None) => ("<stdout tail>\n", stdout),
+        (None, Some(stderr)) => ("<stderr tail>\n", stderr),
+        _ => unreachable!("one stream is available"),
+    };
+    if projection.total_bytes() == 0 {
+        return Err(warning);
+    }
+    let budget = max_bytes.checked_sub(warning.len() + label.len()).ok_or(
+        "max_bytes is too small to report unavailable output; increase it and observe again.",
+    )?;
+    let (tail, _) = projection_tail(&projection, budget);
+    if projection.total_bytes() > 0 && tail.is_empty() {
+        return Err("max_bytes is too small to show available output safely; increase it and observe again.".into());
+    }
+    let total = warning.len() + label.len() + projection.total_bytes();
+    let lines = projection.total_lines() as u64;
+    let output = format!("{warning}{label}{tail}");
+    let end = output.len() as u64;
+    Ok((output, end, total as u64, lines))
 }
 
 fn unix_epoch_millis() -> u64 {
@@ -1810,6 +1866,67 @@ fn projection_tail(
     let start = projection.total_bytes().saturating_sub(max_bytes);
     let (chunk, _end, total, _) = projection.window(start, max_bytes);
     (chunk, total as u64)
+}
+
+fn bounded_stream_tails(
+    stdout: &astra_text_utils::credential_redaction::SafeOutputProjection,
+    stderr: &astra_text_utils::credential_redaction::SafeOutputProjection,
+    max_bytes: usize,
+) -> Result<(String, u64, u64, u64), String> {
+    let (out_len, err_len) = (stdout.total_bytes(), stderr.total_bytes());
+    let total_lines = (stdout.total_lines() + stderr.total_lines()) as u64;
+    if out_len == 0 || err_len == 0 {
+        let stream = if out_len == 0 { stderr } else { stdout };
+        let label = if out_len == 0 && err_len > 0 {
+            "<stderr tail>\n"
+        } else {
+            ""
+        };
+        let (tail, _) = projection_tail(stream, max_bytes.saturating_sub(label.len()));
+        if stream.total_bytes() > 0 && tail.is_empty() {
+            return Err(
+                "max_bytes is too small to show output safely; increase it and observe again."
+                    .into(),
+            );
+        }
+        let output = format!("{label}{tail}");
+        let end = output.len() as u64;
+        return Ok((
+            output,
+            end,
+            (out_len + err_len + label.len()) as u64,
+            total_lines,
+        ));
+    }
+    const OUT_LABEL: &str = "<stdout tail>\n";
+    const ERR_LABEL: &str = "\n<stderr tail>\n";
+    let labels = OUT_LABEL.len() + ERR_LABEL.len();
+    if max_bytes < labels + 2 {
+        return Err(
+            "max_bytes is too small to show both streams; increase it and observe again.".into(),
+        );
+    }
+    let budget = max_bytes - labels;
+    let mut out_budget = out_len.min(budget / 2);
+    let mut err_budget = err_len.min(budget - out_budget);
+    out_budget = out_len.min(budget - err_budget);
+    err_budget = err_len.min(budget - out_budget);
+    let (out, _) = projection_tail(stdout, out_budget);
+    let (err, _) = projection_tail(stderr, err_budget);
+    if out.is_empty() || err.is_empty() {
+        return Err(
+            "max_bytes is too small to show both streams safely; increase it and observe again."
+                .into(),
+        );
+    }
+    let output = format!("{OUT_LABEL}{out}{ERR_LABEL}{err}");
+    let end = output.len() as u64;
+    Ok((
+        output,
+        end,
+        (out_len + err_len + labels) as u64,
+        total_lines,
+    ))
 }
 
 /// Build the owner-side model view before any byte window is applied. A
@@ -1847,7 +1964,7 @@ fn remove_cached_output(stdout: &Path, stderr: &Path) {
         },
     ] {
         if let Some(entry) = cache.entries.remove(&key) {
-            cache.bytes = cache.bytes.saturating_sub(entry.projection.total_bytes());
+            cache.bytes = cache.bytes.saturating_sub(entry.projection.heap_bytes());
         }
     }
 }
@@ -1897,40 +2014,44 @@ fn read_safe_projection_limited(
             return Err("Task output changed while being read; observe it again.".into());
         }
     }
-    let raw = String::from_utf8_lossy(&bytes);
-    // A growing token can become a credential as more bytes arrive. Show only
-    // complete tokens until capture settles; prompts need not end in a newline.
-    let mut end = if settled {
-        raw.len()
+    // An interrupted capture can end partway through a UTF-8 character. Keep
+    // that fragment out of the display until the stream is complete.
+    let end = if settled {
+        bytes.len()
     } else {
-        raw.char_indices()
-            .rfind(|(_, ch)| ch.is_whitespace())
-            .map_or(0, |(index, ch)| index + ch.len_utf8())
+        complete_utf8_prefix(&bytes)
     };
-    if !settled && let Some(begin) = raw[..end].rfind("-----BEGIN ") {
-        let label = &raw[begin + "-----BEGIN ".len()..end];
-        if label.len() <= 75 && label.bytes().all(|b| b.is_ascii_uppercase() || b == b' ') {
-            // A future suffix can turn this into a PEM private-key header;
-            // do not expose a provisional label the redactor will later hide.
-            end = raw[..begin]
-                .char_indices()
-                .rfind(|(_, ch)| ch.is_whitespace())
-                .map_or(0, |(index, ch)| index + ch.len_utf8());
-        }
-    }
+    let raw = bounded_lossy_utf8(&bytes[..end], SAFE_OUTPUT_CACHE_MAX_BYTES)?;
     let mut safe = if settled {
-        astra_text_utils::credential_redaction::redact_credentials_for_display(&raw[..end]).0
+        astra_text_utils::credential_redaction::redact_credentials_for_display_bounded(
+            &raw,
+            SAFE_OUTPUT_CACHE_MAX_BYTES,
+        )
+        .map_err(str::to_owned)?
+        .0
     } else {
         astra_text_utils::credential_redaction::redact_credentials_for_display_streaming(
-            &raw[..end],
+            &raw,
+            SAFE_OUTPUT_CACHE_MAX_BYTES,
         )
+        .map_err(str::to_owned)?
         .0
     };
-    if end < raw.len() {
+    if end < bytes.len() {
+        if safe.len() + "\n[Partial output withheld until the token is complete.]".len()
+            > SAFE_OUTPUT_CACHE_MAX_BYTES
+        {
+            return Err("Safe output projection exceeds the bounded display limit.".into());
+        }
         safe.push_str("\n[Partial output withheld until the token is complete.]");
     }
-    let projection =
-        Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(safe));
+    let projection = Arc::new(
+        astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(
+            safe,
+            SAFE_OUTPUT_CACHE_MAX_BYTES,
+        )
+        .map_err(str::to_owned)?,
+    );
     safe_output_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1946,6 +2067,38 @@ fn read_safe_projection_limited(
             },
         );
     Ok(projection)
+}
+
+fn bounded_lossy_utf8(bytes: &[u8], max_bytes: usize) -> Result<std::borrow::Cow<'_, str>, String> {
+    if let Ok(valid) = std::str::from_utf8(bytes) {
+        return if valid.len() <= max_bytes {
+            Ok(std::borrow::Cow::Borrowed(valid))
+        } else {
+            Err("Safe output projection exceeds the bounded display limit.".into())
+        };
+    }
+    let mut projected = 0usize;
+    for chunk in bytes.utf8_chunks() {
+        projected = projected
+            .checked_add(chunk.valid().len())
+            .and_then(|size| size.checked_add(if chunk.invalid().is_empty() { 0 } else { 3 }))
+            .filter(|size| *size <= max_bytes)
+            .ok_or("Safe output projection exceeds the bounded display limit.")?;
+    }
+    Ok(String::from_utf8_lossy(bytes))
+}
+
+fn complete_utf8_prefix(bytes: &[u8]) -> usize {
+    let Some(mut start) = bytes.len().checked_sub(1) else {
+        return 0;
+    };
+    while start > 0 && bytes[start] & 0xc0 == 0x80 && bytes.len() - start < 4 {
+        start -= 1;
+    }
+    match std::str::from_utf8(&bytes[start..]) {
+        Err(error) if error.error_len().is_none() => start + error.valid_up_to(),
+        _ => bytes.len(),
+    }
 }
 
 #[cfg(test)]
@@ -1989,12 +2142,32 @@ fn combined_safe_projection_limited(
     let projection = if stderr.text().is_empty() {
         stdout
     } else {
+        let delimiters = if stdout.text().is_empty() {
+            "<stderr>\n\n</stderr>".len()
+        } else {
+            "\n<stderr>\n\n</stderr>".len()
+        };
+        if stdout
+            .text()
+            .len()
+            .checked_add(stderr.text().len())
+            .and_then(|size| size.checked_add(delimiters))
+            .is_none_or(|size| size > SAFE_OUTPUT_CACHE_MAX_BYTES)
+        {
+            return Err("Safe output projection exceeds the bounded display limit.".into());
+        }
         let text = if stdout.text().is_empty() {
             format!("<stderr>\n{}\n</stderr>", stderr.text())
         } else {
             format!("{}\n<stderr>\n{}\n</stderr>", stdout.text(), stderr.text())
         };
-        Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(text))
+        Arc::new(
+            astra_text_utils::credential_redaction::SafeOutputProjection::try_new_bounded(
+                text,
+                SAFE_OUTPUT_CACHE_MAX_BYTES,
+            )
+            .map_err(str::to_owned)?,
+        )
     };
     safe_output_cache()
         .lock()
@@ -2037,9 +2210,9 @@ impl SafeOutputCache {
 
     fn insert(&mut self, key: SafeOutputCacheKey, mut entry: SafeOutputCacheEntry) {
         if let Some(previous) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(previous.projection.total_bytes());
+            self.bytes = self.bytes.saturating_sub(previous.projection.heap_bytes());
         }
-        let size = entry.projection.total_bytes();
+        let size = entry.projection.heap_bytes();
         if size > SAFE_OUTPUT_CACHE_MAX_BYTES {
             return;
         }
@@ -2055,7 +2228,7 @@ impl SafeOutputCache {
                 break;
             };
             if let Some(evicted) = self.entries.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(evicted.projection.total_bytes());
+                self.bytes = self.bytes.saturating_sub(evicted.projection.heap_bytes());
             }
         }
         self.tick = self.tick.saturating_add(1);
@@ -2307,26 +2480,6 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
                 xml_escape(title),
             )
         }
-        BgTaskEvent::NoRecentOutput {
-            id,
-            title,
-            inactive_ms,
-            last_output_tail,
-        } => {
-            format!(
-                "<background_task_notification>\n\
-                 <task_id>{id}</task_id>\n\
-                 <title>{}</title>\n\
-                 <status>running</status>\n\
-                 <advisory>no_recent_output</advisory>\n\
-                 <inactive_ms>{inactive_ms}</inactive_ms>\n\
-                 <hint>No output was observed recently. The process may still be working; inspect its output before deciding whether to stop it.</hint>\n\
-                 <last_output>{}</last_output>\n\
-                 </background_task_notification>",
-                xml_escape(title),
-                xml_escape(last_output_tail),
-            )
-        }
         BgTaskEvent::Started { .. } => String::new(),
     }
 }
@@ -2368,8 +2521,6 @@ mod tests {
             output_error: None,
             output_sampled_at: None,
             last_activity: Instant::now(),
-            last_tail_probe_at: None,
-            no_recent_output_reported: false,
             work_revision: 1,
             completion: None,
             input: None,
@@ -2892,6 +3043,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn throttled_preview_catches_the_last_output_from_a_real_task() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let go = tmp.path().join("go");
+        let end = tmp.path().join("end");
+        let command = format!(
+            "printf 'first\\n'; while [ ! -e '{}' ]; do sleep 0.02; done; printf 'second\\n'; while [ ! -e '{}' ]; do sleep 0.02; done",
+            go.display(),
+            end.display()
+        );
+        let id = reg.spawn_shell(&command, "preview").await;
+        let stdout = reg.get(&id).unwrap().stdout_path;
+        wait_until(Duration::from_secs(3), Duration::from_millis(10), || {
+            reg.poll_completions();
+            reg.get(&id)
+                .and_then(|h| h.output_tail)
+                .is_some_and(|tail| tail.contains("first"))
+        })
+        .await
+        .expect("initial preview");
+
+        reg.with_state(|state| {
+            state.tasks.get_mut(&id).unwrap().output_sampled_at =
+                Some(Instant::now() + Duration::from_secs(60));
+            state.last_output_probe_started = None;
+        });
+        std::fs::write(&go, "").unwrap();
+        wait_until(Duration::from_secs(3), Duration::from_millis(10), || {
+            std::fs::read_to_string(&stdout).is_ok_and(|text| text.contains("second"))
+        })
+        .await
+        .expect("second output");
+        wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+            reg.poll_completions();
+            reg.get(&id).is_some_and(|h| h.last_output_size >= 13)
+        })
+        .await
+        .expect("output size updated while preview is throttled");
+        assert!(
+            !reg.get(&id)
+                .unwrap()
+                .output_tail
+                .unwrap()
+                .contains("second")
+        );
+
+        reg.with_state(|state| {
+            state.tasks.get_mut(&id).unwrap().output_sampled_at =
+                Some(Instant::now() - OUTPUT_PREVIEW_INTERVAL - Duration::from_millis(1));
+            state.last_output_probe_started = None;
+        });
+        wait_until(Duration::from_secs(3), Duration::from_millis(10), || {
+            reg.poll_completions();
+            reg.get(&id)
+                .and_then(|h| h.output_tail)
+                .is_some_and(|tail| tail.contains("second"))
+        })
+        .await
+        .expect("final preview after output becomes quiet");
+        std::fs::write(&end, "").unwrap();
+        wait_for_task_terminal(&mut reg, &id).await;
+    }
+
+    #[tokio::test]
+    async fn stale_live_probe_cannot_complete_a_terminal_refresh() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf final-output", "preview race").await;
+        wait_for_task_terminal(&mut reg, &id).await;
+        wait_until(Duration::from_secs(3), Duration::from_millis(10), || {
+            reg.poll_completions();
+            reg.with_state(|state| !state.output_probe_in_flight)
+        })
+        .await
+        .expect("prior probe completed");
+        reg.with_state(|state| {
+            let handle = state.tasks.get_mut(&id).unwrap();
+            handle.output_sampled_at = None;
+            state.apply_output_observations(vec![ShellOutputObservation {
+                id: id.clone(),
+                total_bytes: 3,
+                tail: Some("old".into()),
+                output_error: None,
+            }]);
+            assert!(state.tasks[&id].output_sampled_at.is_none());
+            state.last_output_probe_started = None;
+        });
+        wait_until(Duration::from_secs(3), Duration::from_millis(10), || {
+            reg.poll_completions();
+            reg.get(&id)
+                .and_then(|handle| handle.output_tail)
+                .is_some_and(|tail| tail.contains("final-output"))
+        })
+        .await
+        .expect("terminal preview refreshed from the real capture");
+    }
+
+    #[tokio::test]
     async fn background_output_window_redacts_before_offset() {
         let tmp = crate::tests::test_temp_dir();
         let path = tmp.path().join("stdout");
@@ -2947,7 +3196,7 @@ mod tests {
 
         let running = read_safe_projection(&path, false).unwrap();
         assert!(running.text().starts_with("prefix\n"));
-        assert!(running.text().contains("Partial output withheld"));
+        assert!(running.text().contains("[REDACTED:"));
         assert!(!running.text().contains("partial-secret"));
 
         std::fs::write(
@@ -2972,14 +3221,10 @@ mod tests {
             ("Confirm? ", "Confirm?", "not present"),
             (
                 "Bearer abcdefghijklmnopqrstuvwxyz0123456789ABC",
-                "Bearer",
+                "[REDACTED:",
                 "abcdefghijklmnopqrstuvwxyz",
             ),
-            (
-                "password=partial-secret",
-                "Partial output withheld",
-                "partial-secret",
-            ),
+            ("password=partial-secret", "[REDACTED:", "partial-secret"),
             (
                 "-----BEGIN PRIVATE KEY-----\nPRIVATE_BODY_SENTINEL\n",
                 "[REDACTED:",
@@ -2987,7 +3232,7 @@ mod tests {
             ),
             (
                 "prefix\n-----BEGIN TOP SECRET ",
-                "Partial output withheld",
+                "[REDACTED:PRIVATE_KEY]",
                 "TOP SECRET",
             ),
         ] {
@@ -3008,6 +3253,20 @@ mod tests {
                 .text()
                 .contains("你好")
         );
+    }
+
+    #[test]
+    fn invalid_utf8_projection_enforces_the_budget_before_lossy_allocation() {
+        let bytes = b"ok\xff\xe4\xbd\xffend";
+        let expected = String::from_utf8_lossy(bytes);
+        assert_eq!(bounded_lossy_utf8(bytes, expected.len()).unwrap(), expected);
+        assert!(bounded_lossy_utf8(bytes, expected.len() - 1).is_err());
+
+        let tmp = crate::tests::test_temp_dir();
+        let path = tmp.path().join("invalid-output");
+        std::fs::write(&path, vec![0xff; SAFE_OUTPUT_CACHE_MAX_BYTES / 3 + 1]).unwrap();
+        let error = read_safe_projection(&path, true).unwrap_err();
+        assert!(error.contains("bounded display limit"), "{error}");
     }
 
     #[test]
@@ -3693,26 +3952,6 @@ mod tests {
         assert!(xml.contains("&amp;"));
     }
 
-    #[test]
-    fn notification_xml_keeps_no_output_as_advisory_not_lifecycle_state() {
-        let event = BgTaskEvent::NoRecentOutput {
-            id: "bg-1".into(),
-            title: "npm run dev".into(),
-            inactive_ms: 47_000,
-            last_output_tail: "server started".into(),
-        };
-
-        let xml = format_notification_xml(&event);
-
-        assert!(xml.contains("<status>running</status>"), "{xml}");
-        assert!(
-            xml.contains("<advisory>no_recent_output</advisory>"),
-            "{xml}"
-        );
-        assert!(xml.contains("<inactive_ms>47000</inactive_ms>"), "{xml}");
-        assert!(!xml.contains("waiting_for_input"), "{xml}");
-    }
-
     #[tokio::test]
     async fn kill_terminal_task_returns_error() {
         let tmp = crate::tests::test_temp_dir();
@@ -3753,75 +3992,6 @@ mod tests {
                     if eid == &id && error.contains("output exceeded")
             )),
             "expected output cap failure event, got {events:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn output_probe_emits_one_factual_no_output_advisory_without_changing_status() {
-        let tmp = crate::tests::test_temp_dir();
-        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-        let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Running);
-        handle.id = "bg-throttle".into();
-        handle.stdout_path = tmp.path().join("stdout.log");
-        handle.stderr_path = tmp.path().join("stderr.log");
-        std::fs::write(&handle.stdout_path, "still working..\n").unwrap();
-        handle.last_output_size = 16;
-        handle.last_activity = Instant::now() - STALL_THRESHOLD - Duration::from_secs(1);
-        let stalled_since = handle.last_activity;
-        reg.with_state(|state| state.tasks.insert(handle.id.clone(), handle));
-
-        reg.with_state(TaskRegistryState::poll_output_observations);
-        assert!(reg.with_state(|state| state.output_probe_in_flight));
-        let first_probe_started = reg.with_state(|state| state.last_output_probe_started);
-        reg.with_state(TaskRegistryState::poll_output_observations);
-        assert_eq!(
-            reg.with_state(|state| state.last_output_probe_started),
-            first_probe_started,
-            "a second tick must not schedule another probe while one is in flight"
-        );
-        let mut first_events = Vec::new();
-        wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
-            first_events.extend(reg.poll_completions());
-            !reg.with_state(|state| state.output_probe_in_flight)
-        })
-        .await
-        .expect("first async output probe should finish");
-        let handle = reg.get("bg-throttle").unwrap();
-        assert_eq!(handle.last_activity, stalled_since);
-        assert_eq!(handle.status(), BgTaskStatus::Running);
-        assert!(handle.no_recent_output_reported);
-        assert!(matches!(
-            first_events.as_slice(),
-            [BgTaskEvent::NoRecentOutput {
-                id,
-                inactive_ms,
-                last_output_tail,
-                ..
-            }] if id == "bg-throttle"
-                && *inactive_ms >= STALL_THRESHOLD.as_millis() as u64
-                && last_output_tail == "still working.."
-        ));
-
-        reg.with_state(|state| {
-            state.last_output_probe_started = Some(Instant::now() - OUTPUT_PROBE_INTERVAL)
-        });
-        reg.with_state(|state| {
-            state
-                .tasks
-                .get_mut("bg-throttle")
-                .unwrap()
-                .last_tail_probe_at = Some(Instant::now() - STALL_TAIL_RECHECK_COOLDOWN)
-        });
-        let mut repeat_events = Vec::new();
-        wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
-            repeat_events.extend(reg.poll_completions());
-            !reg.with_state(|state| state.output_probe_in_flight)
-        })
-        .await
-        .expect("repeat output probe should finish");
-        assert!(
-            repeat_events.is_empty(),
-            "unchanged quiet output must not produce duplicate advisories"
         );
     }
 
