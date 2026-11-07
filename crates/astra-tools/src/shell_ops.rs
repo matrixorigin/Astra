@@ -1097,8 +1097,6 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     environment: &[(String, String)],
     workdir: &PreparedBashWorkdir,
 ) -> ToolResult {
-    let explicit_verification =
-        crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
     let needs_observation = args
         .get("command")
         .and_then(Value::as_str)
@@ -1148,35 +1146,8 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     {
         return crate::cancelled_tool_result("bash", false);
     }
-    let before = if explicit_verification && !nested_in_run_script {
-        let root = ctx.workspace_root.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
-    let verification_fingerprint_unavailable = explicit_verification && before.is_none();
-
-    if ctx
-        .cancel_token
-        .as_ref()
-        .is_some_and(|token| token.is_cancelled())
-    {
-        return crate::cancelled_tool_result("bash", false);
-    }
-
     let mut result = execute_bash_inner(ctx, args, environment, workdir).await;
     attach_bash_workdir_evidence(&mut result, &ctx.workspace_root, workdir, args);
-    let scope_settled = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get(INTERNAL_SCOPE_SETTLED_FIELD))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let scope_ownership = result
         .metadata
         .as_ref()
@@ -1201,114 +1172,11 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         fields.remove(INTERNAL_SCOPE_QUARANTINED_FIELD);
         fields.remove(INTERNAL_EXECUTION_STARTED_FIELD);
     }
-    let detached = result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get("background_task_id"))
-        .and_then(Value::as_str)
-        .is_some();
     let coordination_unsettled = _observation_lease
         .as_ref()
         .is_some_and(|lease| !lease.coordination_integrity_valid());
     if coordination_unsettled {
         crate::workspace_observation::mark_workspace_observation_unsettled(&ctx.workspace_root);
-    }
-    if let Some(before) = before.filter(|_| !detached) {
-        let root = ctx.workspace_root.clone();
-        let after = tokio::task::spawn_blocking(move || {
-            crate::workspace_observation::WorkspaceFingerprint::capture(&root)
-        })
-        .await
-        .ok()
-        .flatten();
-        let after_captured = after.is_some();
-        let comparison = before.compare_with(after.as_ref());
-        // The pre-execution check cannot authorize a receipt after a slow
-        // fingerprint capture: binding/lease integrity must still hold at the
-        // exact mint boundary.
-        let receipt_authority_valid_at_mint = !coordination_unsettled
-            && _observation_lease.as_ref().is_none_or(
-                crate::workspace_observation::WorkspaceObservationLease::receipt_authority_valid,
-            );
-        let verification_receipt_valid = explicit_verification
-            && !result.is_error
-            && result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("exit_code"))
-                .and_then(Value::as_i64)
-                == Some(0)
-            && receipt_authority_valid_at_mint
-            && scope_settled
-            && !scope_quarantined
-            && after_captured
-            && comparison
-                == crate::workspace_observation::WorkspaceFingerprintComparison::Unchanged
-            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative());
-        if verification_receipt_valid {
-            result
-                .metadata
-                .get_or_insert_with(serde_json::Map::new)
-                .extend(crate::workspace_observation::explicit_workspace_verification_receipt());
-        } else if explicit_verification {
-            if verification_fingerprint_unavailable || !after_captured {
-                result = result.with_failure_evidence(
-                    crate::workspace_observation::
-                        explicit_workspace_verification_unavailable_evidence(),
-                );
-                result
-                    .metadata
-                    .get_or_insert_with(serde_json::Map::new)
-                    .insert(
-                        "workspace_observation_retry_scope".to_string(),
-                        Value::String("workspace_generation".to_string()),
-                    );
-                result.output.push_str("\n\n");
-                result.output.push_str(
-                    crate::workspace_observation::EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE,
-                );
-            } else {
-                result.is_error = true;
-                result.output.push_str(
-                    "\n\nError: verify-mode command did not produce an authoritative unchanged-workspace observation receipt.",
-                );
-            }
-        }
-        // A pre/post difference can include another writer's changes; it
-        // cannot establish that this shell wrote the workspace.
-    }
-    if explicit_verification
-        && !result.is_error
-        && !result.metadata.as_ref().is_some_and(|fields| {
-            fields
-                .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
-        })
-    {
-        if verification_fingerprint_unavailable {
-            result = result.with_failure_evidence(
-                crate::workspace_observation::explicit_workspace_verification_unavailable_evidence(
-                ),
-            );
-            result
-                .metadata
-                .get_or_insert_with(serde_json::Map::new)
-                .insert(
-                    "workspace_observation_retry_scope".to_string(),
-                    Value::String("workspace_generation".to_string()),
-                );
-            result.output.push_str("\n\n");
-            result.output.push_str(
-                crate::workspace_observation::EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE,
-            );
-        } else {
-            result.is_error = true;
-            result.output.push_str(
-                "\n\nError: verify-mode command did not produce an authoritative unchanged-workspace observation receipt.",
-            );
-        }
     }
     if coordination_unsettled
         || scope_quarantined
@@ -1346,8 +1214,6 @@ async fn execute_bash_inner(
         }
     };
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
-    let explicit_verification =
-        crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
 
     if let Err(reason) = validate_prepared_bash_command(command, workdir) {
         return ToolResult::error(reason);
@@ -1407,23 +1273,6 @@ async fn execute_bash_inner(
                     ));
                 }
             };
-        if explicit_verification && !owner.can_authoritatively_observe() {
-            let mut rejected = ToolResult::error(
-                "Error: bash mode=verify is unavailable: this executor cannot prove that all child processes have settled. No command was run. Use a typed workspace observer for file state; it does not replace a required script or test result."
-                    .into(),
-            );
-            rejected.metadata = Some(serde_json::Map::from_iter([
-                ("disposition".into(), Value::String("rejected".into())),
-                ("execution_started".into(), Value::Bool(false)),
-                ("side_effects_maybe".into(), Value::Bool(false)),
-                (
-                    "error_kind".into(),
-                    Value::String("tool_unavailable".into()),
-                ),
-                ("retryable".into(), Value::Bool(false)),
-            ]));
-            return rejected;
-        }
         if let Err(error) = owner.install(&mut command) {
             return ToolResult::error(format!(
                 "Error: unable to install Bash invocation owner: {error}"
@@ -7359,102 +7208,61 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_verify_mode_requires_an_unchanged_authoritative_workspace() {
+    async fn bash_command_reports_result_without_a_workspace_scan() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
-
         let result = execute_bash(
             &ctx,
-            &serde_json::json!({"command": "printf verified", "mode": "verify"}),
+            &serde_json::json!({"command": "printf changed > changed.txt"}),
         )
         .await;
-        let receipt = result
-            .metadata
-            .as_ref()
-            .and_then(|fields| fields.get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD));
-        if !result.is_error {
-            assert!(receipt.is_some_and(
-                crate::workspace_observation::is_explicit_workspace_verification_receipt,
-            ));
-        } else {
-            assert!(result.output.contains("No command was run"));
-            assert_eq!(result.metadata.as_ref().unwrap()["disposition"], "rejected");
-            assert!(receipt.is_none());
-        }
-    }
-
-    #[tokio::test]
-    async fn bash_verify_mode_rejects_a_workspace_mutation() {
-        let dir = tempdir().unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "printf changed > changed.txt", "mode": "verify"}),
-        )
-        .await;
-
-        assert!(
-            result.is_error,
-            "a verify command may not mutate: {result:?}"
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("changed.txt")).unwrap(),
+            "changed"
         );
-        if result.output.contains("No command was run") {
-            assert!(!dir.path().join("changed.txt").exists());
-            assert_eq!(result.metadata.as_ref().unwrap()["disposition"], "rejected");
-        } else {
-            assert!(dir.path().join("changed.txt").is_file());
-        }
-        assert!(result.metadata.as_ref().is_none_or(|fields| {
-            !fields
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .unwrap()
                 .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
-        }));
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn bash_verify_mode_rejects_nonzero_exit() {
+    async fn bash_reports_nonzero_exit_without_observation() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "exit 7", "mode": "verify"}),
-        )
-        .await;
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "exit 7"})).await;
 
         assert!(result.is_error);
         assert!(result.metadata.as_ref().is_none_or(|fields| {
             !fields
                 .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
+                .is_some()
         }));
     }
 
     #[tokio::test]
-    async fn bash_verify_mode_rejects_domain_negative_exit_one() {
+    async fn bash_reports_domain_negative_exit_without_observation() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "false", "mode": "verify"}),
-        )
-        .await;
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "false"})).await;
 
-        assert!(
-            result.is_error,
-            "verify mode requires exit zero: {result:?}"
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 1);
+        assert_ne!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::Success)
         );
         assert!(result.metadata.as_ref().is_none_or(|fields| {
             !fields
                 .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
-                .is_some_and(
-                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
-                )
+                .is_some()
         }));
     }
 

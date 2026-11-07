@@ -169,7 +169,9 @@ impl InterruptionKind {
             Self::TokenBudgetExceeded => "The current request exceeded its input token budget.",
             Self::RateLimited => "The model provider is temporarily rate limited.",
             Self::CooldownRejected => "The model provider is still in its retry cooldown.",
-            Self::UserCancelled => "The run was cancelled.",
+            Self::UserCancelled => {
+                "The run was cancelled. Any interrupted tool may still be running or may have partially executed; inspect its effects before retrying."
+            }
             Self::ContextOverflow => "The conversation exceeded the model context window.",
             Self::AuthFailure => "The model provider rejected the current credentials.",
             Self::CriticalVerdict => "A runtime safety check stopped the run.",
@@ -838,6 +840,13 @@ mod tests {
     use super::*;
 
     // ── labels ──
+
+    #[test]
+    fn cancellation_warns_about_possible_partial_effects() {
+        let message = InterruptionKind::UserCancelled.user_description();
+        assert!(message.contains("may still be running"));
+        assert!(message.contains("inspect its effects before retrying"));
+    }
 
     #[test]
     fn interruption_kind_labels() {

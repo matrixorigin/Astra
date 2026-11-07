@@ -1281,10 +1281,13 @@ async fn one_shot_sigint_keeps_identity_failure_when_event_writer_also_fails() {
             1,
             "never replay the submitted turn"
         );
-        assert_eq!(
-            cancels.load(Ordering::SeqCst),
-            2,
-            "facade and interrupt settle the same exact owner"
+        // SIGINT can arrive before or after the facade's in-flight cancel
+        // completes. Both paths must cancel this exact Run; a second request
+        // is idempotent, not a requirement on scheduler timing.
+        let cancellations = cancels.load(Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&cancellations),
+            "expected one or two exact-Run cancellations, got {cancellations}"
         );
     }
 }

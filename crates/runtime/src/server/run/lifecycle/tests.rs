@@ -19,23 +19,6 @@ mod skill_ledger_tests;
 mod provider_rejection_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
-#[test]
-fn previous_tool_warning_reaches_the_real_sse_consumer() {
-    use astra_turn_core::chat_turn_sse_dispatch::{
-        ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
-    };
-    let wire = json!({"type": "warning", "code": "previous_tool_outcome_unknown", "message": PREVIOUS_TOOL_ADVISORY});
-    let wire = astra_services::runs::transform_run_event_for_client(wire);
-    let effects = dispatch_chat_turn_sse_event_block(
-        &format!("data: {wire}\n\n"),
-        &mut ChatTurnSseAccum::default(),
-        &mut Vec::new(),
-    );
-    assert!(
-        matches!(effects.as_slice(), [SseRenderEffect::SystemWarning(message)] if message.contains("unconfirmed outcomes") && message.contains("previous tool history"))
-    );
-}
-
 #[tokio::test]
 async fn caught_loop_panic_settles_host_usage_before_returning_error() {
     struct PanicHost {

@@ -1667,8 +1667,18 @@ mod tests {
         assert!(!state.final_text_streamed);
 
         // The same matched window can outlive a settled obligation.
-        state.stall.tool_call_records.clear();
-        state.task_profile = make_state().task_profile;
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                args_full: Some(serde_json::json!({"command":"cargo test"}).to_string()),
+                ok: true,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                result_class: Some("success".into()),
+                exit_semantics: Some("success".into()),
+                ..Default::default()
+            });
         state.hooks.completion_settlement.latest_provider_text =
             Some("The edit was made; the final summary is partial.".to_string());
         let pending = super::super::execution_phase::pending_completion_action(&state);

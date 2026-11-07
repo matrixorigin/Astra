@@ -117,7 +117,7 @@ fn execution_limits_survive_resident_and_deferred_projection() {
     let resident = ToolSurface::build(canonical.clone(), &ToolSurfaceConfig::default(), &[]);
     let resident_schemas = resident.always_load_schemas();
     for (name, paths) in [
-        ("bash", vec!["/properties/mode"]),
+        ("bash", vec!["/properties/timeout", "/properties/workdir"]),
         (
             "agent",
             vec!["/properties/max_output_tokens", "/properties/message_type"],
@@ -146,14 +146,19 @@ fn execution_limits_survive_resident_and_deferred_projection() {
             assert!(native.is_some(), "{name} must be resident");
         }
         for path in paths {
-            let expected = original["function"]["parameters"].pointer(path).unwrap()
-                ["x-astra-discovery-summary"].as_str().expect("producer-owned execution limit");
+            let property = original["function"]["parameters"].pointer(path).unwrap();
             for parameters in std::iter::once(&selected["matches"][0]["parameters"])
                 .chain(native.map(|s| &s["function"]["parameters"]))
             {
+                let projected = parameters.pointer(path).unwrap();
                 assert_eq!(
-                    parameters.pointer(path).unwrap()["description"].as_str(),
-                    Some(expected)
+                    without_descriptions(projected.clone()),
+                    without_descriptions(property.clone()),
+                    "{name} {path} must retain its execution constraints"
+                );
+                assert_eq!(
+                    projected["description"].as_str(),
+                    property["x-astra-discovery-summary"].as_str()
                 );
             }
         }
@@ -605,7 +610,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .keys()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>(),
-        ["command", "force", "mode", "timeout", "workdir"]
+        ["command", "force", "timeout", "workdir"]
             .into_iter()
             .collect(),
         "ordinary resident Bash must retain its exact foreground call shape"
@@ -862,7 +867,6 @@ fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
             "background_ttl",
             "command",
             "force",
-            "mode",
             "ready_check",
             "run_in_background",
             "timeout",

@@ -29,21 +29,6 @@ pub struct CompletionSettlementState {
     /// separate from observation: reading the changed workspace is not a
     /// passing verification receipt.
     pub verification_retries: u32,
-    /// A failed, runtime-recognized canonical Work validation earns one
-    /// narrowly-scoped repair-and-revalidation cycle.  This is intentionally
-    /// separate from ordinary budget renewal: the repair must be followed by
-    /// the same canonical validation and then a truthful Work settlement.
-    pub canonical_validation_recovery_retries: u32,
-    /// A matching repair tool can fail before it establishes a successful
-    /// correction. Permit one outcome-aware retry of that repair while
-    /// preserving the independent request-shape correction budget on the
-    /// completion-action window. This never grants another repair cycle.
-    pub canonical_validation_recovery_failed_action_retries: u32,
-    /// Normalized identity of the failed validation that authorized the
-    /// bounded repair. The following revalidation must match this operation;
-    /// an unrelated build/test cannot erase the original failure.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub canonical_validation_recovery_operation: Option<String>,
     /// A single typed completion action that was already justified by the
     /// user's structured intent and the executed-tool ledger.  This is not a
     /// general budget extension: it is consumed once and is followed by a
@@ -114,16 +99,6 @@ pub struct ForegroundFanoutPagination {
 pub enum CompletionAction {
     #[serde(rename = "explicit_verification")]
     ExplicitVerification { missing_labels: Vec<String> },
-    /// Re-run one canonical validator when the current durable Work attempt's
-    /// latest validation failed or was invalidated by a later mutation. This
-    /// is settlement authority, not a general execution-budget extension.
-    #[serde(rename = "canonical_work_validation")]
-    CanonicalWorkValidation,
-    /// Make one focused workspace change after a failed canonical Work
-    /// validation.  The next action is always canonical revalidation; this
-    /// never opens a general exploratory slice.
-    #[serde(rename = "canonical_work_repair")]
-    CanonicalWorkRepair,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -175,6 +150,8 @@ mod tests {
             "required_workspace_mutation",
             "completion_task_action",
             "post_mutation_observation",
+            "canonical_work_validation",
+            "canonical_work_repair",
             "post_mutation_repair",
         ] {
             assert!(serde_json::from_value::<CompletionAction>(serde_json::json!(action)).is_err());
@@ -185,6 +162,9 @@ mod tests {
             "post_mutation_observation_failed_action_retries",
             "post_mutation_repair_retries",
             "post_mutation_repair_validation_operation",
+            "canonical_validation_recovery_retries",
+            "canonical_validation_recovery_failed_action_retries",
+            "canonical_validation_recovery_operation",
         ] {
             let mut wire = serde_json::to_value(CompletionSettlementState::default()).unwrap();
             wire[field] = serde_json::json!(0);
@@ -203,9 +183,6 @@ mod tests {
             textless_response_retries: 1,
 
             verification_retries: 8,
-            canonical_validation_recovery_retries: 9,
-            canonical_validation_recovery_failed_action_retries: 10,
-            canonical_validation_recovery_operation: Some("validator-b".into()),
             deferred_success_completion: Some(RuntimeSuccessfulToolCompletion {
                 tool_name: "validator".into(),
                 final_text: Some("observed completion".into()),
