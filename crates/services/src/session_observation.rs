@@ -17,6 +17,8 @@ pub struct ObservationCheckpoint {
     pub attempts: u32,
     pub retry_at_ms: i64,
     pub revision: u64,
+    /// Exact write receipt; affected-row counts are not reliable on MatrixOne.
+    pub receipt_id: Option<String>,
 }
 
 pub struct ObservationCandidate {
@@ -36,21 +38,40 @@ impl SessionObservationStore {
         Self { pool }
     }
 
-    /// Discover only a bounded key page, before any checkpoint/Session joins or
-    /// JSON eligibility checks. MatrixOne may sort the remaining narrow keys;
-    /// this must never pull all retained heads, checkpoints or transcripts.
-    pub async fn key_page(
-        &self,
-        after: Option<(&str, &str)>,
-    ) -> Result<Vec<(String, String)>, String> {
+    /// Allocation metadata bounds a complete sweep, including deletion gaps.
+    /// This does not aggregate or scan retained Session heads. Concurrent inserts
+    /// and late commits are rediscovered on the next sweep.
+    pub async fn catalog_high_water(&self) -> Result<u64, String> {
+        let next: Option<u64> = sqlx::query_scalar(
+            "SELECT AUTO_INCREMENT FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'session_context_heads'",
+        )
+        .fetch_one(self.pool.get())
+        .await
+        .map_err(|_| "observation catalog bound failed")?;
+        next.map(|next| next.saturating_sub(1))
+            .ok_or("observation catalog sequence unavailable".into())
+    }
+
+    /// A primary-key interval contains at most 64 allocated identities. Both
+    /// bounds reach storage; LIMIT/ORDER BY alone cannot bound MatrixOne input.
+    pub async fn key_page(&self, after: u64) -> Result<Vec<(String, String)>, String> {
         sqlx::query_as(KEY_PAGE_SQL)
-            .bind(after.map(|(user, _)| user))
-            .bind(after.map(|(user, _)| user))
-            .bind(after.map(|(user, _)| user))
-            .bind(after.map(|(_, session)| session))
+            .bind(after)
+            .bind(after.saturating_add(64))
             .fetch_all(self.pool.get())
             .await
             .map_err(|_| "observation key page failed".into())
+    }
+
+    pub async fn release_lease(&self, lease_name: &str, pod_id: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ? AND owner_pod_id = ?")
+            .bind(lease_name)
+            .bind(pod_id)
+            .execute(self.pool.get())
+            .await
+            .map_err(|_| "observation lease release failed")?;
+        Ok(())
     }
 
     /// Read eligibility only for this page. Concrete predicates on *each*
@@ -58,6 +79,7 @@ impl SessionObservationStore {
     /// for MatrixOne to avoid scanning the entire checkpoint catalog.
     pub async fn pending_keys(
         &self,
+        after: u64,
         keys: &[(String, String)],
     ) -> Result<Vec<(String, String)>, String> {
         if keys.is_empty() {
@@ -66,7 +88,7 @@ impl SessionObservationStore {
         if keys.len() > 64 {
             return Err("observation page exceeds limit".into());
         }
-        eligibility_query(keys)
+        eligibility_query(after, keys)
             .build_query_as()
             .fetch_all(self.pool.get())
             .await
@@ -169,6 +191,8 @@ impl SessionObservationStore {
         success: bool,
     ) -> Result<(), String> {
         let mut checkpoint = candidate.checkpoint.clone();
+        let receipt_id = uuid::Uuid::new_v4().to_string();
+        checkpoint.receipt_id = Some(receipt_id.clone());
         checkpoint.revision = checkpoint
             .revision
             .checked_add(1)
@@ -184,6 +208,12 @@ impl SessionObservationStore {
         let backoff_ms = backoff_ms.min(960_000);
         let json =
             serde_json::to_string(&checkpoint).map_err(|_| "invalid observation checkpoint")?;
+        let mut connection = self
+            .pool
+            .get()
+            .acquire()
+            .await
+            .map_err(|_| "observation checkpoint connection failed")?;
         sqlx::query(
             "INSERT INTO agent_session_memory_work (user_id, session_id, state_json, complete)
              SELECT s.user_id, s.session_id, JSON_OBJECT('observation', JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN CAST(? AS SIGNED) = 1 THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END)), 1
@@ -195,23 +225,43 @@ impl SessionObservationStore {
                THEN JSON_SET(state_json, '$.observation', JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN CAST(? AS SIGNED) = 1 THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END)) ELSE state_json END"
         ).bind(&json).bind(success).bind(backoff_ms).bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id)
             .bind(lease_name).bind(pod_id).bind(candidate.checkpoint.revision).bind(json).bind(success).bind(backoff_ms)
-            .execute(self.pool.get()).await.map_err(|_| "observation checkpoint failed")?;
+            .execute(&mut *connection).await.map_err(|_| "observation checkpoint failed")?;
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.receipt_id'))
+             FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&candidate.key.owner_user_id)
+        .bind(&candidate.key.session_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|_| "observation checkpoint receipt unavailable")?
+        .flatten();
+        if stored.as_deref() != Some(receipt_id.as_str()) {
+            return Err("observation checkpoint fence rejected or receipt superseded".into());
+        }
         Ok(())
     }
 }
 
-// Only keys are read by this traversal. Keep completed/head/JSON predicates out
-// of it: eligibility must not cause an idle page to traverse the entire catalog.
+// Physical identity is stable and independent of user/Session spelling. The
+// owner-scoped logical identity remains unique and authoritative for all reads.
 const KEY_PAGE_SQL: &str = "SELECT owner_user_id, session_id FROM session_context_heads
-    WHERE isolation_domain = 'server' AND branch_id = 'main'
-      AND (? IS NULL OR owner_user_id > ? OR (owner_user_id = ? AND session_id > ?))
-    ORDER BY owner_user_id, session_id LIMIT 64";
+    WHERE catalog_seq > ? AND catalog_seq <= ?
+      AND isolation_domain = 'server' AND branch_id = 'main'
+    ORDER BY catalog_seq";
 
-fn eligibility_query(keys: &[(String, String)]) -> sqlx::QueryBuilder<sqlx::MySql> {
+fn eligibility_query(after: u64, keys: &[(String, String)]) -> sqlx::QueryBuilder<sqlx::MySql> {
     let mut query = sqlx::QueryBuilder::new(
         "SELECT h.owner_user_id, h.session_id FROM (
            SELECT owner_user_id, session_id, completed_turn FROM session_context_heads
-           WHERE isolation_domain = 'server' AND branch_id = 'main'
+           WHERE catalog_seq > ",
+    );
+    query
+        .push_bind(after)
+        .push(" AND catalog_seq <= ")
+        .push_bind(after.saturating_add(64));
+    query.push(
+        " AND isolation_domain = 'server' AND branch_id = 'main'
              AND head_json IS NOT NULL AND completed_turn > 0 AND ",
     );
     for (user_column, next) in [
@@ -375,6 +425,7 @@ mod tests {
         let store = SessionObservationStore::new(pool.clone());
         let mut cursor = None;
         let mut captured = None;
+        let mut catalog_bound = None;
         for turn in 1..=3 {
             let reservation = match coordinator
                 .acquire_writer_and_reserve_turn(
@@ -419,6 +470,14 @@ mod tests {
                 CoordinatorMutationV1::Applied { cursor } => cursor,
                 other => panic!("unexpected commit: {other:?}"),
             });
+            let bound = store.catalog_high_water().await.unwrap();
+            if let Some(previous) = catalog_bound {
+                assert_eq!(
+                    bound, previous,
+                    "re-admission/Append/Replace must not allocate new catalog identities"
+                );
+            }
+            catalog_bound = Some(bound);
             if let Some(candidate) = captured.take() {
                 let materialized = store.materialize(&candidate).await.unwrap();
                 assert_eq!(materialized.head, *candidate.head.as_ref().unwrap());
@@ -427,10 +486,29 @@ mod tests {
                     materialized.messages.last().unwrap()["content"],
                     format!("turn-{}", turn - 1)
                 );
+                // SQL execution success is not a durable acknowledgement.
+                sqlx::query("UPDATE sweeper_leases SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE sweeper_name = 'plan-test'")
+                    .execute(pool.get()).await.unwrap();
+                assert!(
+                    store
+                        .finish("plan-test", "plan-worker", &candidate, true)
+                        .await
+                        .is_err(),
+                    "an expired lease must not acknowledge an unstored checkpoint"
+                );
+                sqlx::query("UPDATE sweeper_leases SET expires_at = DATE_ADD(NOW(6), INTERVAL 1 HOUR) WHERE sweeper_name = 'plan-test'")
+                    .execute(pool.get()).await.unwrap();
                 store
                     .finish("plan-test", "plan-worker", &candidate, true)
                     .await
                     .unwrap();
+                assert!(
+                    store
+                        .finish("plan-test", "plan-worker", &candidate, false)
+                        .await
+                        .is_err(),
+                    "a stale revision must not acknowledge a rejected retry clock"
+                );
             }
             // Finishing a captured older turn must leave the new turn pending.
             let candidate = store
@@ -509,37 +587,45 @@ mod tests {
             "INSERT INTO sweeper_leases (sweeper_name,owner_pod_id,expires_at) VALUES ('plan-test','plan-worker',DATE_ADD(NOW(), INTERVAL 1 HOUR))",
         ] { sqlx::query(statement).execute(pool.get()).await.unwrap(); }
         let store = SessionObservationStore::new(pool.clone());
-        let page = store
-            .key_page(Some(("synthetic-owner", "00050000")))
-            .await
-            .unwrap();
+        let page = store.key_page(50000).await.unwrap();
         assert_eq!(page.len(), 64);
         assert_eq!(page.first().unwrap().1, "00050001");
         assert_eq!(page.last().unwrap().1, "00050064");
         // Empty eligibility must still yield a next page, rather than restarting
         // discovery at the beginning or loading any of the 100000 transcripts.
-        assert!(store.pending_keys(&page).await.unwrap().is_empty());
-        let next = store
-            .key_page(Some((&page[63].0, &page[63].1)))
-            .await
-            .unwrap();
+        assert!(store.pending_keys(50000, &page).await.unwrap().is_empty());
+        let next = store.key_page(50064).await.unwrap();
         assert_eq!(next.first().unwrap().1, "00050065");
         for sparse in [false, true] {
+            // Check the production discovery storage operator, not only the
+            // eligibility/payload queries. Cover first, middle and last pages.
+            for after in [0_u64, 50000, 99936] {
+                let plan = prepared_plan(
+                    &pool,
+                    KEY_PAGE_SQL,
+                    &[serde_json::json!(after), serde_json::json!(after + 64)],
+                )
+                .await;
+                assert_scans_bounded(&plan, 8192);
+                assert_eq!(store.key_page(after).await.unwrap().len(), 64);
+            }
+            assert!(store.catalog_high_water().await.unwrap() >= 100000);
             if sparse {
                 sqlx::query("UPDATE agent_session_memory_work SET state_json = '{}' WHERE user_id = 'synthetic-owner' AND session_id = '00050032'")
                     .execute(pool.get()).await.unwrap();
                 assert_eq!(
-                    store.pending_keys(&page).await.unwrap(),
+                    store.pending_keys(50000, &page).await.unwrap(),
                     vec![("synthetic-owner".into(), "00050032".into())]
                 );
             }
-            let builder = eligibility_query(&page);
-            let arguments: Vec<_> = (0..3)
-                .flat_map(|_| {
+            let builder = eligibility_query(50000, &page);
+            let arguments: Vec<_> = [serde_json::json!(50000), serde_json::json!(50064)]
+                .into_iter()
+                .chain((0..3).flat_map(|_| {
                     page.iter().flat_map(|(user, session)| {
                         [serde_json::json!(user), serde_json::json!(session)]
                     })
-                })
+                }))
                 .collect();
             let plan = prepared_plan(&pool, builder.sql().as_str(), &arguments).await;
             // MatrixOne reads storage blocks (8192 rows), even for a 64-key IN.

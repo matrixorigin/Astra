@@ -4888,7 +4888,9 @@ async fn ensure_database_state_admitted(
         "INSERT IGNORE INTO session_context_heads
          (isolation_domain, owner_user_id, session_id, branch_id,
           authorization_epoch, device_trust_epoch, permission_epoch)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
+            SELECT 1 FROM session_context_heads WHERE isolation_domain = ?
+              AND owner_user_id = ? AND session_id = ? AND branch_id = ?)",
     )
     .bind(&key.isolation_domain)
     .bind(&key.owner_user_id)
@@ -4903,6 +4905,10 @@ async fn ensure_database_state_admitted(
         epochs.device_trust_epoch,
     )?)
     .bind(i64_from_u64("permission epoch", epochs.permission_epoch)?)
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
     .execute(&mut **tx)
     .await
     .map_err(|source| database_error("ensure_context_head", source))?;

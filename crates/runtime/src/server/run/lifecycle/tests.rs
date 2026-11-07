@@ -33245,6 +33245,96 @@ async fn stream_chat_explain_mode_finishes_a_short_turn() {
 }
 
 #[tokio::test]
+#[serial_test::serial(history_work)]
+async fn ephemeral_observer_burst_delivers_terminal_and_releases_run_resources() {
+    use astra_turn_core::contracts::TurnObserverOutcome;
+    #[derive(Default)]
+    struct HeldObserver {
+        active: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+    }
+    struct Active(Arc<AtomicUsize>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl TurnObserverWorker for HeldObserver {
+        async fn run(&self, _: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _active = Active(self.active.clone());
+            std::future::pending().await
+        }
+    }
+    let (service, _llm) = terminal_test_service().await;
+    assert!(service.shared_pool.is_none());
+    let observer = Arc::new(HeldObserver::default());
+    let metrics = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+    let service = service
+        .with_observer_worker(observer.clone())
+        .with_metrics_registry(metrics.clone());
+    // Independent Sessions all finish while the first four observers remain
+    // blocked. Exercise production lifecycle and its terminal event stream.
+    for _ in 0..8 {
+        let mut request = test_request("hello");
+        request.interactive_client = true;
+        let mut stream = ok(service.stream_chat("user-1".into(), request).await);
+        let mut events = stream.event_rx.take().unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut terminal = false;
+            while let Some(event) = events.recv().await {
+                terminal |= (event["event_type"] == "run_finished"
+                    || event["type"] == "run_finished")
+                    && chat_stream_event_status(&event) == Some(STATUS_COMPLETED);
+            }
+            terminal
+        })
+        .await
+        .expect("terminal stream cannot await optional observation");
+        assert!(terminal);
+    }
+    assert!(
+        service.drain_background_tasks(Duration::from_secs(5)).await,
+        "run-owned terminal projections and cleanup must drain with held observers"
+    );
+    assert!(service.approval_channels.lock().await.is_empty());
+    assert!(service.user_prompt_channels.lock().await.is_empty());
+    assert!(service.progress_channels.lock().await.is_empty());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observer.active.load(Ordering::SeqCst) != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observer.calls.load(Ordering::SeqCst), 4);
+    assert!(
+        metrics
+            .render_prometheus()
+            .contains("outcome=\"capacity_exceeded\"} 4")
+    );
+    assert!(
+        service
+            .stop_background_tasks_for_shutdown_impl(Duration::from_secs(5))
+            .await
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observer.active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown must cancel process-owned observations");
+    assert!(
+        metrics
+            .render_prometheus()
+            .contains("outcome=\"cancelled\"} 4")
+    );
+}
+
+#[tokio::test]
 #[ignore] // runs full agentic loop; needs live infra
 async fn durable_pause_resume_round_trip() {
     let svc = test_service();

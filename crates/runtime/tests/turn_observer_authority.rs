@@ -429,3 +429,20 @@ async fn observer_retry_after_authority_timeout_resolves_current_grant() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn observer_rechecks_authority_after_transcript_admission() {
+    let (url, requests, server) = backend(StatusCode::NO_CONTENT).await;
+    let mut authority = port(url);
+    let grant = Arc::new(AtomicU8::new(2));
+    authority.changing_grant = Some(grant.clone());
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(authority)));
+    assert!(worker.admits_observation("astra-a").await.unwrap());
+    grant.store(1, Ordering::SeqCst);
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap(),
+        TurnObserverOutcome::AccessDisabled
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    server.abort();
+}

@@ -298,8 +298,10 @@ retains its existing user-token authentication contract. The MOI caller must
 invoke close/finalize to trigger session-end maintenance.
 The MOI callback must be deployed before enabling this path in Astra.
 Compare its effective issuer with Astra's configured issuer byte for byte before
-deployment, including any trailing slash. A normal observer authority resolution
-performs one MOI identity request and one UC account-status request; fetching an
+deployment, including any trailing slash. Each admitted authority resolution
+performs one MOI identity request and one UC account-status request. Recovery
+checks admission before loading and resolves fresh dispatch authority afterward:
+an allowed attempt normally makes two MOI and two UC requests. Fetching an
 uncached UC service token can add another request.
 The identity callback has a two-second request deadline, including response-body
 reads, and an 8 KiB response limit for both successful and error responses,
@@ -313,46 +315,68 @@ The observer has a ten-second budget for the entire fresh authority lookup,
 including MOI and UC dependencies, and a separate 30-second backend deadline.
 Observation is optional background work and never writes a job, serializes a
 second transcript, or adds a failure dependency to canonical chat settlement.
-When configured, the existing managed recovery owner traverses pages of 64
-canonical Session keys. Only those keys enter a separate eligibility query;
+When configured, the managed recovery owner traverses physical intervals of 64
+canonical Session identities. `session_context_heads.catalog_seq` is an immutable
+auto-increment primary key; the existing owner-scoped logical identity remains
+unique. Both interval bounds reach storage, including on idle pages. Allocation
+metadata bounds each sweep without aggregating retained heads; gaps and late
+commits are revisited on later sweeps. Only returned keys enter an eligibility query;
 each participating table has direct full-key predicates. Idle pages read no
 transcripts. Eligible Sessions are rechecked and their committed head is captured
-without payloads. The canonical coordinator then materializes that captured head
+without payloads. Current write admission is checked before loading any transcript;
+denial records `access_disabled` and checkpoints the captured turn without loading
+or encoding payloads. Admission errors retain retryable work. A positive admission
+is not a cached write grant. The canonical coordinator then materializes that captured head
 using direct key, compaction-generation and conversation-cursor predicates,
 avoiding a full scan of a live Session's retained generation history. These are
 separate reads over immutable nodes: a concurrent append/Replace cannot change the captured
 transcript or its checkpoint watermark. Content/fork validation stays with the
 canonical coordinator. Direct storage predicates also protect normal
 restore/resume/history materialization from unrelated manifest scans.
-An existing sweeper lease selects one cross-process observation owner; a local
-keyset cursor advances past deferred Sessions and wraps without replacing durable
-checkpoints. Each of at most sixteen steps per tick either advances an empty
-eligibility page or attempts one Session, with one observation in flight.
+Thirty-two fixed sweeper leases distribute independent windows across replicas.
+Each process runs eight concurrent window workers and admits at most eight
+transcript/HTTP attempts. Available capacity is refilled without a per-attempt
+timer; completed sweeps and errors wait two seconds. A slow Session occupies
+one slot rather than the deployment's only observation slot. Leases have a
+60-second TTL and are renewed during work, then released when a window finishes.
 Candidates are rechecked after paging, so cached keys are not authorization,
 head, or retry-state snapshots. Cancellation or a checkpoint error retains the
-current candidate; restart scans from the beginning. The ordinary non-fork
-attempt adds a metadata-only discovery query, one selective canonical materialization
-query, fresh authority, and one atomic progress checkpoint, without per-Session
+numeric window; restart scans from the beginning. The ordinary non-fork
+attempt adds metadata-only discovery, early admission, selective canonical materialization,
+fresh dispatch authority, an atomic progress checkpoint and a receipt read, without per-Session
 claim transactions. The extra selective read replaces the joined payload scan;
 SQL count alone does not measure storage work.
-Catalog traversal adds two queries per 64-key page, separately from attempts.
-MatrixOne can still scan/sort remaining narrow keys for an ordered page; this
-is not a constant-time catalog scan or a fixed recall-latency guarantee. The
-expensive Session/checkpoint eligibility and payload reads are limited to the
+Catalog traversal and shard acquisition/release are separate from attempt costs.
+An owned nonempty window uses three lease-acquisition statements, a key-page
+read, an eligibility read and a lease release; each sweep also reads allocation
+metadata. Long batches renew leases with the existing three-statement protocol.
+Physical intervals bound each page's storage input; a complete sweep is still
+linear in allocated identities, including allocation gaps. This is not a fixed
+recall-latency guarantee. Eligibility and payload reads are limited to the
 page/selected Session, including when all retained Sessions are already observed.
 Unconfigured deployments create no observation owner or observation journal.
 
-Only a completed-turn watermark, revision, and independent exponential retry
+This physical-key change requires core schema contract `2026-11-07-v122`.
+Bootstrap rejects older contracts and does not migrate an existing database.
+Deployment therefore requires a separately reviewed fresh-schema cutover or
+migration plan; replacing an image against a v121 database is unsupported.
+
+Only a completed-turn watermark, revision, exact write receipt and independent exponential retry
 clock (5–960 seconds) are stored in the existing session-memory journal.
 Checkpoint writes preserve extraction/governance fields and reject stale lease
-owners or revisions. A new terminal turn cannot reset the retry clock. After a
+owners or revisions. SQL execution success is not acknowledgement: the same
+connection must read back this attempt's receipt. Missing, superseded or uncertain
+receipts retain the window for rediscovery. A new terminal turn cannot reset the retry clock. After a
 failure or restart, retry coalesces to the newest canonical context and resolves
 current authority again. Revocation skips the write and advances the watermark;
 no retry reuses credentials. Delivery is at least once, not exactly once: a
 crash after backend success and before checkpoint may repeat observation.
 Session deletion removes the journal through existing lifecycle cleanup and
 excludes the Session from discovery. Ephemeral deployments have no durable
-recovery and await bounded observation after terminal delivery.
+recovery: a process-owned dispatcher admits four requests without waiting for
+backend completion or retaining loop/workspace state. It reserves capacity before
+copying transcripts, records overload explicitly, and cancels owned work on
+shutdown. This is best-effort delivery, with no queue or crash replay guarantee.
 MOI built-in read-only grants use product-neutral remediation, while scoped
 Memoria logins retain their Connected apps instructions. Authority failures expose
 only stable allowlisted categories (service credentials, timeout, transport,

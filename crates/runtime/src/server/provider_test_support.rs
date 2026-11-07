@@ -92,6 +92,9 @@ impl ObservationRecoveryForTest {
     pub async fn drive_one(&self) -> Result<bool, String> {
         self.0.drive_one().await
     }
+    pub async fn run(&self, cancel: tokio_util::sync::CancellationToken) {
+        self.0.run(cancel).await;
+    }
 }
 
 #[derive(Clone, Debug)]
