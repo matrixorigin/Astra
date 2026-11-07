@@ -289,6 +289,16 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         self.memoria_port.is_some()
     }
 
+    async fn admits_observation(&self, user_id: &str) -> Result<bool, String> {
+        let Some(template) = &self.memoria_port else {
+            return Ok(false);
+        };
+        let port = template.bind_owner(user_id)?;
+        tokio::time::timeout(OBSERVER_AUTHORITY_TIMEOUT, port.admits_operation(true))
+            .await
+            .map_err(|_| "memoria observer admission timed out".to_string())?
+    }
+
     async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {
         if request.messages.is_empty() {
             return Ok(TurnObserverOutcome::Empty);
@@ -304,13 +314,8 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string())?;
-        // Serialize exactly once, then retain and send that same byte buffer.
-        // Calling `.json(...)` here as well would hide the queue's actual byte
-        // weight behind a second serializer-owned allocation.
-        let payload = encode_memory_extraction_observe_payload(&request)?;
-        let queue_reservation = reserve_memory_extraction_payload(&payload);
-        // Resolve fresh write authority after preparation, just as memory tools
-        // do. A denied/revoked grant never falls back to deployment credentials.
+        // Resolve fresh write authority before serializing the optional body.
+        // A denied/revoked grant never falls back to deployment credentials.
         let transport = tokio::time::timeout(
             OBSERVER_AUTHORITY_TIMEOUT,
             port.resolve_observer_transport(),
@@ -320,6 +325,11 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         let Some(transport) = transport else {
             return Ok(TurnObserverOutcome::AccessDisabled);
         };
+        // Serialize exactly once, then retain and send that same byte buffer.
+        // Calling `.json(...)` here as well would hide the queue's actual byte
+        // weight behind a second serializer-owned allocation.
+        let payload = encode_memory_extraction_observe_payload(&request)?;
+        let queue_reservation = reserve_memory_extraction_payload(&payload);
         let response = client
             .post(format!(
                 "{}/v1/observe",

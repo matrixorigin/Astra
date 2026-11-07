@@ -79,7 +79,7 @@ fn record_turn_observer_dispatch_metrics(
     );
 }
 
-fn record_turn_observer_run_metrics(
+pub(crate) fn record_turn_observer_run_metrics(
     registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
     mode: &'static str,
     outcome: &'static str,
@@ -93,6 +93,44 @@ fn record_turn_observer_run_metrics(
         &[("mode", mode), ("outcome", outcome)],
         1,
     );
+}
+
+/// Process-owned, bounded optional work. Tasks retain requests, never loop state
+/// or workspace cleanup. Overload and cancellation are explicit metric outcomes.
+pub(crate) struct EphemeralObserverTasks {
+    slots: Arc<tokio::sync::Semaphore>,
+    tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+}
+
+impl Default for EphemeralObserverTasks {
+    fn default() -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            tasks: Default::default(),
+        }
+    }
+}
+
+impl EphemeralObserverTasks {
+    pub(crate) fn stop(&self) {
+        self.slots.close();
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .abort_all();
+    }
+}
+
+struct EphemeralCancellationMetric {
+    metrics: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    completed: bool,
+}
+impl Drop for EphemeralCancellationMetric {
+    fn drop(&mut self) {
+        if !self.completed {
+            record_turn_observer_run_metrics(self.metrics.as_ref(), "ephemeral", "cancelled");
+        }
+    }
 }
 
 /// Bundles all handles needed by post-loop best-effort persistence calls.
@@ -110,6 +148,7 @@ pub(crate) struct PostLoopPersistContext {
     pub(crate) owner_pod_id: Option<String>,
     pub(crate) user_message: String,
     pub(crate) observer_worker: Option<Arc<dyn TurnObserverWorker>>,
+    pub(crate) ephemeral_observers: Arc<EphemeralObserverTasks>,
     pub(crate) metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 }
 
@@ -179,6 +218,7 @@ impl PostLoopPersistContext {
                 return Ok(());
             }
             fire_server_loop_observer(
+                &self.ephemeral_observers,
                 worker,
                 &self.user_id,
                 &self.session_id,
@@ -2296,12 +2336,23 @@ async fn append_session_transcript_items_in_tx(
 /// This sends the conversation messages to the Memoria `/v1/observe` endpoint
 /// for cross-session knowledge extraction.
 async fn fire_server_loop_observer(
+    owner: &EphemeralObserverTasks,
     observer_worker: Arc<dyn TurnObserverWorker>,
     user_id: &str,
     session_id: &str,
     state: &AgenticLoopState,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
 ) -> Result<(), String> {
+    // Reserve capacity before copying any transcript. No queue of blocked runs
+    // or requests is retained outside the four process-owned slots.
+    let permit = owner.slots.clone().try_acquire_owned().map_err(|_| {
+        record_turn_observer_dispatch_metrics(
+            metrics_registry.as_ref(),
+            "ephemeral",
+            "capacity_exceeded",
+        );
+        "ephemeral observation was not queued: capacity exhausted or dispatcher stopped".to_owned()
+    })?;
     let Some(request) = build_server_loop_observer_request(user_id, session_id, state) else {
         record_turn_observer_dispatch_metrics(
             metrics_registry.as_ref(),
@@ -2310,16 +2361,38 @@ async fn fire_server_loop_observer(
         );
         return Ok(());
     };
-    // Ephemeral deployments explicitly have no crash-recovery capability.
-    // Await bounded work after terminal delivery instead of dropping at capacity.
-    run_server_loop_observer_request(
-        observer_worker.as_ref(),
-        session_id,
-        request,
-        "ephemeral",
-        metrics_registry.as_ref(),
-    )
-    .await
+    let mut tasks = owner
+        .tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A permit may have been obtained just before shutdown closed admission.
+    // Serialize this check/spawn with stop's abort_all so no task escapes it.
+    if owner.slots.is_closed() {
+        record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "ephemeral", "stopped");
+        return Err("ephemeral observation dispatcher stopped before enqueue".into());
+    }
+    while tasks.try_join_next().is_some() {}
+    let cancellation = EphemeralCancellationMetric {
+        metrics: metrics_registry.clone(),
+        completed: false,
+    };
+    record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "ephemeral", "queued");
+    tasks.spawn(async move {
+        let _permit = permit;
+        let mut cancellation = cancellation;
+        let session = request.session_id.clone();
+        let _result = run_server_loop_observer_request(
+            observer_worker.as_ref(),
+            &session,
+            request,
+            "ephemeral",
+            metrics_registry.as_ref(),
+        )
+        .await;
+        // run_server_loop_observer_request records success/denial/timeout/error.
+        cancellation.completed = true;
+    });
+    Ok(())
 }
 
 fn build_server_loop_observer_request(
@@ -2643,6 +2716,7 @@ mod tests {
 
             user_message: "work".to_string(),
             observer_worker: None,
+            ephemeral_observers: Default::default(),
             metrics_registry: None,
         }
     }
@@ -3011,6 +3085,60 @@ mod tests {
         assert!(
             writer.requests.lock().expect("capture lock").is_empty(),
             "a failed canonical transaction must not dispatch derived work"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(history_work)]
+    async fn ephemeral_burst_does_not_hold_cleanup_and_cancellation_releases_capacity() {
+        let worker = Arc::new(CaptureObserverWorker::new(true));
+        let dispatcher = Arc::new(EphemeralObserverTasks::default());
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        registry.register_counter("astra_turn_observer_runs_total", "test");
+        registry.register_counter("astra_turn_observer_dispatches_total", "test");
+        for index in 0..32 {
+            let mut persist = test_post_loop_persist_context(&format!("ephemeral-{index}"));
+            persist.observer_worker = Some(worker.clone());
+            persist.ephemeral_observers = dispatcher.clone();
+            persist.metrics_registry = Some(registry.clone());
+            let state = observer_test_state();
+            // This is the post-terminal boundary called before workspace/state
+            // cleanup. It must return while accepted observers remain held.
+            let dispatched = tokio::time::timeout(
+                Duration::from_secs(1),
+                persist.run_after_core(&state, true, Ok(())),
+            )
+            .await
+            .expect("optional memory must not hold run cleanup");
+            assert_eq!(dispatched.is_ok(), index < 4, "overload must be explicit");
+            drop(state);
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.calls.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(worker.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(dispatcher.slots.available_permits(), 0);
+        assert!(
+            registry
+                .render_prometheus()
+                .contains("outcome=\"capacity_exceeded\"} 28")
+        );
+        dispatcher.stop();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatcher.slots.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            registry
+                .render_prometheus()
+                .contains("outcome=\"cancelled\"} 4")
         );
     }
 
@@ -3729,6 +3857,7 @@ mod tests {
 
             user_message: "initial one".to_string(),
             observer_worker: None,
+            ephemeral_observers: Default::default(),
             metrics_registry: None,
         };
         let terminal_assistant_source_event_id = persist

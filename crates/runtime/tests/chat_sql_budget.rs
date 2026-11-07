@@ -993,11 +993,10 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         ));
     }
     for (scenario, rounds, warm_context, polls, statements) in &budgets {
-        // Original 20-statement allocation plus one selective canonical read.
-        // Splitting head capture from payload loading avoids scanning retained
-        // compaction generations. No observation/control SQL is excluded.
+        // Original 20 plus selective materialization, early admission and a
+        // checkpoint receipt read. No observation/control SQL is excluded.
         assert!(
-            statements.len() <= 21,
+            statements.len() <= 23,
             "{scenario} (warm={warm_context}, polls={polls}) used {} SQL statements including transactions and drained work:\n{}",
             statements.len(),
             statements.join("\n")
@@ -1526,17 +1525,18 @@ async fn configured_auto_finishes_without_authoring_or_rollout_queries() {
         .filter(|statement| statement.as_str() == CONTROL_OBSERVATION_SQL)
         .count();
     let authentication_reads = authentication_snapshot_count(&sql);
-    // Original Auto allocation plus one selective canonical materialization.
+    // Original Auto allocation plus selective materialization, early admission
+    // and checkpoint receipt verification.
     // Only exact authentication/control reads explain the two-statement envelope;
     // all observation discovery, materialization and checkpoint SQL is counted.
     assert!(
-        sql.len() <= 32,
+        sql.len() <= 34,
         "Auto raw SQL budget: {}\n{}",
         sql.len(),
         sql.join("\n")
     );
     assert!(
-        sql.len() - control_polls - authentication_reads <= 30,
+        sql.len() - control_polls - authentication_reads <= 32,
         "Auto nonperiodic SQL budget: {}\n{}",
         sql.len(),
         sql.join("\n")
@@ -1666,7 +1666,7 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
         .unwrap()
         .unwrap();
     assert!(owner.drive_one().await.unwrap());
-    store.finish(lease, pod, &stale, true).await.unwrap();
+    assert!(store.finish(lease, pod, &stale, true).await.is_err());
     let mut work: sqlx::types::Json<astra_services::session_memory_lifecycle::SessionMemoryWork> =
         sqlx::query_scalar(
             "SELECT state_json FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
@@ -1717,7 +1717,7 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
     // Simulate restart by constructing a new recovery owner, and expire only
     // this test's leader lease. Recovery derives the latest input from Context.
     owner.expire_lease().await;
-    store.finish(lease, pod, &stale, true).await.unwrap();
+    assert!(store.finish(lease, pod, &stale, true).await.is_err());
     let expired: String = sqlx::query_scalar("SELECT CAST(JSON_EXTRACT(state_json, '$.observation') AS CHAR) FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(after, expired, "expired lease owners cannot checkpoint");
@@ -1840,15 +1840,6 @@ impl astra_runtime::TurnObserverWorker for HeldCanonicalObserver {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; 1000 synthetic canonical Sessions"]
 async fn canonical_observation_burst_recovers_without_chat_job_writes() {
-    use astra_services::{
-        AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
-        SessionContextCoordinator,
-    };
-    use astra_turn_types::{
-        ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-        CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
-    };
-    use futures_util::{StreamExt, stream};
     require_system_e2e_env();
     use sqlx::Connection;
     let mut settings = astra_core::MatrixOneSettings::from_env();
@@ -1865,22 +1856,163 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         .await
         .unwrap();
     let b = bootstrap_isolated_execution_handoff(database.clone()).await;
+    // Leave full empty physical intervals before the real backlog. Discovery
+    // must advance across deletion/allocation gaps, not stop at an empty page.
+    sqlx::query("INSERT INTO session_context_heads (isolation_domain,owner_user_id,session_id,branch_id) SELECT 'server','catalog-gap-owner',CAST(result AS CHAR),'main' FROM generate_series(1,128) g")
+        .execute(&b.ctx.pool).await.unwrap();
+    sqlx::query("DELETE FROM session_context_heads WHERE owner_user_id='catalog-gap-owner'")
+        .execute(&b.ctx.pool)
+        .await
+        .unwrap();
     let sessions: Vec<_> = (0..1000)
         .map(|_| uuid::Uuid::new_v4().to_string())
         .collect();
-    let coordinator = DatabaseSessionContextCoordinator::new(b.ctx.shared_pool.clone());
+    seed_observation_sessions(&b.ctx, &sessions).await;
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_memory_work")
+        .fetch_one(&b.ctx.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "canonical completion must not require observation jobs"
+    );
+    let probe = Arc::new(SchedulerProbe {
+        slow: sessions[0].clone(),
+        slow_once: std::sync::atomic::AtomicBool::new(true),
+        slow_owner: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        entered: Default::default(),
+        permits: tokio::sync::Semaphore::new(0),
+        seen: Default::default(),
+        active: Default::default(),
+        peak: Default::default(),
+    });
+    let mut owners = Vec::new();
+    let mut cancels = Vec::new();
+    let mut handles = Vec::new();
+    for index in 0..2 {
+        let state =
+            b.ctx
+                .app_state
+                .clone()
+                .with_turn_observer_worker(Arc::new(SchedulerObserver {
+                    probe: probe.clone(),
+                    owner: index,
+                }));
+        let owner = Arc::new(
+            astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new_catalog(
+                &state,
+            )
+            .await
+            .unwrap(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let running = owner.clone();
+        let token = cancel.clone();
+        handles.push(Some(tokio::spawn(async move {
+            running.run(token).await;
+        })));
+        cancels.push(cancel);
+        owners.push(owner);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(15), probe.entered.notified())
+        .await
+        .unwrap();
+    wait_for_probe(&probe, |seen| seen.len() >= 64).await;
+    assert!(
+        !probe.seen.lock().unwrap().contains_key(&sessions[0]),
+        "slow Session must still be held"
+    );
+    let arrivals: Vec<_> = (0..16).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for batch in arrivals.chunks(2) {
+        seed_observation_sessions(&b.ctx, batch).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    wait_for_probe(&probe, |seen| {
+        arrivals.iter().all(|key| seen.contains_key(key)) && seen.len() == 1015
+    })
+    .await;
+    assert_eq!(
+        probe
+            .seen
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [0, 1].into_iter().collect(),
+        "both managed owners must serve independent Sessions"
+    );
+    for peak in &probe.peak {
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 8);
+    }
+    let held_owner = probe.slow_owner.load(std::sync::atomic::Ordering::SeqCst);
+    cancels[held_owner].cancel();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handles[held_owner].take().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        probe.active[held_owner].load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    owners[held_owner].expire_lease().await;
+    wait_for_probe(&probe, |seen| seen.len() == 1016).await;
+    // Backend completion precedes durable acknowledgement. Do not cancel the
+    // owner in that gap and mistake a deliberately replayable write for loss.
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_memory_work WHERE JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.observed_turn')) = '1'")
+                .fetch_one(&b.ctx.pool).await.unwrap();
+            if receipts == 1016 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("every observed Session must receive a durable checkpoint");
+    for (cancel, handle) in cancels.iter().zip(handles.iter_mut()) {
+        cancel.cancel();
+        if let Some(handle) = handle.take() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_memory_work WHERE JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.observed_turn')) = '1'")
+        .fetch_one(&b.ctx.pool).await.unwrap();
+    assert_eq!(receipts, 1016);
+    b.ctx.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+}
+
+async fn seed_observation_sessions(ctx: &MatrixE2eCtx, sessions: &[String]) {
+    use astra_services::{
+        AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
+        SessionContextCoordinator,
+    };
+    use astra_turn_types::{
+        ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
+    };
+    use futures_util::{StreamExt, stream};
+    let coordinator = DatabaseSessionContextCoordinator::new(ctx.shared_pool.clone());
     let actor = ActorContextV1::owner_user(
-        &b.ctx.user_id,
+        &ctx.user_id,
         "synthetic-observation",
         ActorKindV1::Server,
         SessionSurfaceV1::Server,
         None,
         AuthorityEpochsV1::default(),
     );
-    stream::iter(&sessions).for_each_concurrent(4, |session| {
+    stream::iter(sessions).for_each_concurrent(4, |session| {
         let coordinator = &coordinator;
         let actor = &actor;
-        let ctx = &b.ctx;
         async move {
             sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status) VALUES (?, ?, 'active')")
                 .bind(&ctx.user_id).bind(session).execute(&ctx.pool).await.unwrap();
@@ -1898,19 +2030,175 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             }, "commit").await.unwrap();
         }
     }).await;
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_memory_work")
-        .fetch_one(&b.ctx.pool)
-        .await
+}
+
+struct SchedulerProbe {
+    slow: String,
+    slow_once: std::sync::atomic::AtomicBool,
+    slow_owner: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    permits: tokio::sync::Semaphore,
+    seen: Mutex<std::collections::BTreeMap<String, usize>>,
+    active: [std::sync::atomic::AtomicUsize; 2],
+    peak: [std::sync::atomic::AtomicUsize; 2],
+}
+struct SchedulerObserver {
+    probe: Arc<SchedulerProbe>,
+    owner: usize,
+}
+struct ActiveProbeCall(Arc<SchedulerProbe>, usize);
+impl Drop for ActiveProbeCall {
+    fn drop(&mut self) {
+        self.0.active[self.1].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[async_trait::async_trait]
+impl astra_runtime::TurnObserverWorker for SchedulerObserver {
+    async fn run(
+        &self,
+        request: astra_runtime::TurnObserverRequest,
+    ) -> Result<astra_runtime::TurnObserverOutcome, String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let current = self.probe.active[self.owner].fetch_add(1, SeqCst) + 1;
+        self.probe.peak[self.owner].fetch_max(current, SeqCst);
+        let _active = ActiveProbeCall(self.probe.clone(), self.owner);
+        if request.session_id == self.probe.slow && self.probe.slow_once.swap(false, SeqCst) {
+            self.probe.slow_owner.store(self.owner, SeqCst);
+            self.probe.entered.notify_one();
+            self.probe.permits.acquire().await.unwrap().forget();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.probe
+            .seen
+            .lock()
+            .unwrap()
+            .insert(request.session_id, self.owner);
+        Ok(astra_runtime::TurnObserverOutcome::Observed)
+    }
+}
+async fn wait_for_probe(
+    probe: &SchedulerProbe,
+    ready: impl Fn(&std::collections::BTreeMap<String, usize>) -> bool,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        loop {
+            if ready(&probe.seen.lock().unwrap()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("managed scheduler must make independent progress while a Session is held");
+}
+
+#[derive(Clone)]
+struct DeniedObservationPort {
+    owner: String,
+    admissions: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl astra_memoria::MemoriaPort for DeniedObservationPort {
+    fn bind_owner(&self, owner: &str) -> Result<Arc<dyn astra_memoria::MemoriaPort>, String> {
+        assert_eq!(owner, self.owner);
+        Ok(Arc::new(self.clone()))
+    }
+    async fn admits_operation(&self, write: bool) -> Result<bool, String> {
+        assert!(write);
+        self.admissions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(false)
+    }
+    async fn retrieve_ext(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: usize,
+        _: bool,
+    ) -> Result<Vec<astra_memoria::MemoriaMemory>, astra_memoria::MemoriaOperationError> {
+        panic!("denied observation must not retrieve")
+    }
+    async fn store(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<String, String> {
+        panic!("denied observation must not write")
+    }
+    async fn purge_working(&self, _: &str) -> Result<u64, String> {
+        panic!("denied observation must not purge")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn denied_recovery_never_reads_manifest_payloads() {
+    require_system_e2e_env();
+    let capture = SqlCapture::default();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
         .unwrap();
-    assert_eq!(
-        rows, 0,
-        "canonical completion must not require observation jobs"
+    let b = bootstrap().await;
+    let session = uuid::Uuid::new_v4().to_string();
+    seed_observation_sessions(&b.ctx, std::slice::from_ref(&session)).await;
+    let admissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = b.ctx.app_state.clone().with_turn_observer_worker(Arc::new(
+        astra_runtime::DatabaseTurnObserverWorker::new(Some(Arc::new(DeniedObservationPort {
+            owner: b.ctx.user_id.clone(),
+            admissions: admissions.clone(),
+        }))),
+    ));
+    let owner = astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new(
+        &state,
+        &b.ctx.user_id,
+        &session,
+    )
+    .await
+    .unwrap();
+    *capture.0.lock().unwrap() = Some(Vec::new());
+    let history = astra_core::history_work::HistoryWorkScenario::begin("denied-recovery").unwrap();
+    assert!(owner.drive_one().await.unwrap());
+    let samples = capture.0.lock().unwrap().take().unwrap();
+    let report = history.finish().unwrap();
+    assert_eq!(admissions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        samples
+            .iter()
+            .all(|sample| !sample.sql.contains("conversation_manifest_nodes")
+                && !sample.sql.contains("session_forks")),
+        "denied/read-only recovery must stop before canonical payload loading"
     );
+    assert_eq!(
+        report
+            .scoped
+            .measurement(astra_core::history_work::HistoryWorkSite::MemoryExtractionQueue)
+            .events,
+        0
+    );
+    assert!(
+        state
+            .metrics_registry()
+            .render_prometheus()
+            .contains("outcome=\"access_disabled\"} 1")
+    );
+    assert!(!owner.drive_one().await.unwrap());
+    b.ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn observer_expiry_during_dispatch_does_not_acknowledge_progress() {
+    require_system_e2e_env();
+    let b = bootstrap().await;
+    let session = uuid::Uuid::new_v4().to_string();
+    seed_observation_sessions(&b.ctx, std::slice::from_ref(&session)).await;
     let worker = Arc::new(HeldCanonicalObserver {
-        entered: tokio::sync::Notify::new(),
+        entered: Default::default(),
         permits: tokio::sync::Semaphore::new(0),
         seen: Default::default(),
-        fail_once: std::sync::atomic::AtomicBool::new(true),
+        fail_once: std::sync::atomic::AtomicBool::new(false),
         failed_session: Default::default(),
     });
     let state = b
@@ -1919,66 +2207,50 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         .clone()
         .with_turn_observer_worker(worker.clone());
     let owner = Arc::new(
-        astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new_catalog(
+        astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new(
             &state,
+            &b.ctx.user_id,
+            &session,
         )
         .await
         .unwrap(),
     );
-    let held = owner.clone();
-    let attempt = tokio::spawn(async move { held.drive_one().await });
+    let active = owner.clone();
+    let attempt = tokio::spawn(async move { active.drive_one().await });
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         worker.entered.notified(),
     )
     .await
     .unwrap();
-    attempt.abort();
-    assert!(attempt.await.unwrap_err().is_cancelled());
     owner.expire_lease().await;
-    let restarted =
-        astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new_catalog(
-            &state,
-        )
-        .await
-        .unwrap();
-    owner.drive_one().await.unwrap();
-    assert!(
-        worker.seen.lock().unwrap().is_empty(),
-        "a cached expired owner must not dispatch"
-    );
-    worker.permits.add_permits(sessions.len());
-    // Pages also contain retained heads without completed turns. A true
-    // result means a bounded scan step, not necessarily an observation.
-    for step in 0..=sessions.len() + 1 {
-        if !restarted.drive_one().await.unwrap() {
-            break;
-        }
-        assert!(step <= sessions.len(), "catalog traversal must terminate");
-    }
-    assert_eq!(
-        worker.seen.lock().unwrap().len(),
-        999,
-        "a failing earlier Session must not starve the remaining catalog"
-    );
-    let failed = worker.failed_session.lock().unwrap().clone().unwrap();
-    sqlx::query("UPDATE agent_session_memory_work SET state_json = JSON_SET(state_json, '$.observation.retry_at_ms', 0) WHERE user_id = ? AND session_id = ?")
-        .bind(&b.ctx.user_id).bind(&failed).execute(&b.ctx.pool).await.unwrap();
     worker.permits.add_permits(1);
-    for _ in 0..=sessions.len() + 1 {
-        restarted.drive_one().await.unwrap();
-        if worker.seen.lock().unwrap().len() == sessions.len() {
-            break;
-        }
-    }
-    let seen = worker.seen.lock().unwrap().clone();
-    assert_eq!(seen, sessions.iter().cloned().collect());
-    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_memory_work WHERE JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.observed_turn')) = '1'")
-        .fetch_one(&b.ctx.pool).await.unwrap();
-    assert_eq!(receipts, 1000);
-    b.ctx.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
-        .execute(&mut admin)
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), attempt)
         .await
+        .unwrap()
         .unwrap();
+    assert!(result.unwrap_err().contains("checkpoint"));
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_memory_work WHERE user_id=? AND session_id=?",
+    )
+    .bind(&b.ctx.user_id)
+    .bind(&session)
+    .fetch_one(&b.ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows, 0,
+        "expired in-flight work has no acknowledged watermark"
+    );
+    let restarted = astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new(
+        &state,
+        &b.ctx.user_id,
+        &session,
+    )
+    .await
+    .unwrap();
+    worker.permits.add_permits(1);
+    assert!(restarted.drive_one().await.unwrap());
+    assert!(!restarted.drive_one().await.unwrap());
+    b.ctx.close().await;
 }

@@ -11,7 +11,10 @@ mod admission;
 mod cancellation;
 mod execution_resume;
 mod persistence;
-pub(crate) use persistence::{run_server_loop_observer_request, server_input_source_event_id};
+pub(crate) use persistence::{
+    EphemeralObserverTasks, record_turn_observer_run_metrics, run_server_loop_observer_request,
+    server_input_source_event_id,
+};
 mod projection;
 pub(crate) mod run_state;
 
@@ -5653,6 +5656,7 @@ pub struct AgenticRunLifecycleService {
     progress_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<ProgressEvent>>>>,
     /// Memoria observer worker for cross-session knowledge extraction.
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
+    ephemeral_observers: Arc<EphemeralObserverTasks>,
     /// Auxiliary event writer for ask_user lifecycle audit events.
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
@@ -5807,6 +5811,7 @@ impl AgenticRunLifecycleService {
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
             observer_worker: None,
+            ephemeral_observers: Default::default(),
             auxiliary_event_writer: None,
             trace_ingestion: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
@@ -6218,6 +6223,11 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::AgentBindingService>,
     ) -> Self {
         self.agent_binding_service = service;
+        self
+    }
+
+    pub(crate) fn with_ephemeral_observers(mut self, owner: Arc<EphemeralObserverTasks>) -> Self {
+        self.ephemeral_observers = owner;
         self
     }
 
@@ -7302,6 +7312,7 @@ impl AgenticRunLifecycleService {
     }
 
     async fn stop_background_tasks_for_shutdown_impl(&self, timeout: std::time::Duration) -> bool {
+        self.ephemeral_observers.stop();
         // The preceding passive drain already persisted a graceful-shutdown
         // checkpoint. Do not reuse the user-cancel flag/token here: doing so
         // would turn a recoverable server restart into a durable user-cancelled
@@ -13824,6 +13835,7 @@ impl AgenticRunLifecycleService {
             owner_pod_id: self.run_engine.execution_owner_pod_id().map(str::to_owned),
             user_message,
             observer_worker: self.observer_worker.clone(),
+            ephemeral_observers: self.ephemeral_observers.clone(),
             metrics_registry: self.metrics_registry.clone(),
         };
 

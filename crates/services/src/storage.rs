@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-05-v121";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-07-v122";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -3265,6 +3265,7 @@ async fn ensure_core_schema_while_leased(
         pool,
         "session_context_heads",
         "CREATE TABLE IF NOT EXISTS session_context_heads (
+            catalog_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             isolation_domain VARCHAR(128) NOT NULL,
             owner_user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
@@ -3290,7 +3291,8 @@ async fn ensure_core_schema_while_leased(
             last_commit_json LONGTEXT NULL,
             fork_base_json LONGTEXT NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id),
+            PRIMARY KEY (catalog_seq),
+            UNIQUE KEY uq_session_context_identity (isolation_domain, owner_user_id, session_id, branch_id),
             INDEX idx_session_context_heads_owner_session (owner_user_id, session_id, branch_id),
             INDEX idx_session_context_heads_writer_expiry (active_writer_expires_at_ms)
         )",
@@ -4912,7 +4914,10 @@ async fn verify_core_schema_shape(
                 "project_retention_policy",
             ][..],
         ),
-        ("session_context_heads", &["fork_base_json"][..]),
+        (
+            "session_context_heads",
+            &["fork_base_json", "catalog_seq"][..],
+        ),
         (
             "conversation_manifest_nodes",
             &[
