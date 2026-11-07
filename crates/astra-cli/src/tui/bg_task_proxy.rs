@@ -478,6 +478,15 @@ pub(crate) async fn background_task_output_snapshot(
             handle.output_reference(),
         )
     };
+    // Sample before reading either stream. A racing write can cause a later
+    // duplicate wake, but cannot be acknowledged before it was observable.
+    let output_revision = if status.is_terminal() {
+        None
+    } else {
+        background_registry
+            .output_activity(task_id)
+            .map(|activity| *activity.borrow())
+    };
     let (output, end_offset, total_bytes, total_lines) = if status.is_terminal() {
         background_registry
             .get_combined_output_since_async(task_id, offset, max_bytes)
@@ -497,6 +506,7 @@ pub(crate) async fn background_task_output_snapshot(
         total_lines,
         status,
         output_ref,
+        output_revision,
     })
 }
 
@@ -585,6 +595,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
         total_lines,
         status,
         output_ref: format!("agent_state: {}", agent.agent_id),
+        output_revision: None,
     }
 }
 
@@ -626,6 +637,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
         total_lines,
         status,
         output_ref: format!("workspace_projection: {}", projection.id),
+        output_revision: None,
     }
 }
 

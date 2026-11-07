@@ -772,6 +772,8 @@ pub struct BgTaskOutputSnapshot {
     pub total_lines: u64,
     pub status: BgTaskOutputStatus,
     pub output_ref: String,
+    /// Producer activity observed before reading the live capture, not a byte cursor.
+    pub output_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1036,6 +1038,9 @@ fn format_background_task_output(
         metadata_parts
             .push("current snapshot; earlier output may be outside this window".to_string());
         metadata_parts.push("partial tokens may be withheld for redaction".to_string());
+        if let Some(revision) = snapshot.output_revision {
+            metadata_parts.push(format!("output_revision {revision}"));
+        }
     } else {
         metadata_parts.push(format!("offset {offset} -> {}", snapshot.end_offset));
         metadata_parts.push(format!("next_offset {}", snapshot.end_offset));
@@ -1208,16 +1213,17 @@ fn background_task_output_result_fields(
             BgTaskOutputReadMode::Historical => "historical",
         }
     };
-    serde_json::Map::from_iter([(
-        "background_task_observation".to_string(),
-        serde_json::json!({
-            "task_id": task_id,
-            "task_kind": snapshot.kind,
-            "status": snapshot.status.as_str(),
-            "terminal": snapshot.status.is_terminal(),
-            "mode": observation_mode,
-        }),
-    )])
+    let mut observation = serde_json::json!({
+        "task_id": task_id,
+        "task_kind": snapshot.kind,
+        "status": snapshot.status.as_str(),
+        "terminal": snapshot.status.is_terminal(),
+        "mode": observation_mode,
+    });
+    if let Some(revision) = snapshot.output_revision {
+        observation["output_revision"] = json!(revision);
+    }
+    serde_json::Map::from_iter([("background_task_observation".to_string(), observation)])
 }
 
 fn background_task_output_search_result_fields(
@@ -3234,6 +3240,22 @@ impl ToolExecutor {
             return format_background_task_argument_error("wake_on_output requires block=true");
         }
         let requested_offset = args.get("offset").and_then(Value::as_u64);
+        let after_output_revision = match args.get("after_output_revision") {
+            Some(value) => match value.as_u64() {
+                Some(revision) => Some(revision),
+                None => {
+                    return format_background_task_argument_error(
+                        "after_output_revision must be a non-negative integer",
+                    );
+                }
+            },
+            None => None,
+        };
+        if after_output_revision.is_some() && (!wake_on_output || requested_offset.is_some()) {
+            return format_background_task_argument_error(
+                "after_output_revision requires block=true, wake_on_output=true and no offset",
+            );
+        }
         let pattern = match args.get("pattern") {
             None => None,
             Some(Value::String(pattern)) => {
@@ -3390,7 +3412,22 @@ impl ToolExecutor {
                         Ok(initial) => initial,
                         Err(error) => return error,
                     };
-                if !initial.1.output.is_empty() || initial.1.status.is_terminal() {
+                let newer_output = match (after_output_revision, initial.1.output_revision) {
+                    (_, _) if initial.1.status.is_terminal() => true,
+                    (Some(previous), Some(current)) if previous > current => {
+                        return format_background_task_argument_error(
+                            "after_output_revision is newer than this task's output",
+                        );
+                    }
+                    (Some(previous), Some(current)) => current > previous,
+                    (Some(_), None) => {
+                        return format_background_task_error(&BackgroundTaskError::StaleHandle {
+                            task_id,
+                        });
+                    }
+                    (None, _) => !initial.1.output.is_empty(),
+                };
+                if newer_output {
                     let reason = if initial.1.status.is_terminal() {
                         "terminal"
                     } else {
@@ -3650,6 +3687,7 @@ impl ToolExecutor {
                 total_lines: total_lines as u64,
                 status,
                 output_ref: format!("agent_fanout:{}", group.group_id),
+                output_revision: None,
             },
         })
     }
@@ -3775,6 +3813,7 @@ impl ToolExecutor {
                 total_lines: total_lines as u64,
                 status,
                 output_ref: format!("agent_fanout:{group_id}"),
+                output_revision: None,
             },
         })
     }
@@ -9110,6 +9149,7 @@ pub(crate) mod tests {
             status: BgTaskOutputStatus::parse(status).expect("test status must be known"),
             output_ref: "stdout: /tmp/bg-shell-1.stdout · stderr: /tmp/bg-shell-1.stderr"
                 .to_string(),
+            output_revision: None,
         }
     }
 
@@ -9166,6 +9206,7 @@ pub(crate) mod tests {
             total_lines: 1,
             status: BgTaskOutputStatus::Running,
             output_ref: "agent_state: agent-1".to_string(),
+            output_revision: None,
         };
 
         let output =
@@ -9193,6 +9234,7 @@ pub(crate) mod tests {
                 total_lines: 1,
                 status: BgTaskOutputStatus::Running,
                 output_ref: "producer-owned".to_string(),
+                output_revision: None,
             };
             let fields = background_task_output_result_fields(
                 "work-1",

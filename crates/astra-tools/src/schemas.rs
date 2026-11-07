@@ -2841,7 +2841,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "wake_on_output": {
                             "type": "boolean",
-                            "description": "With block=true, wake for shell output as well as terminal status. Existing output returns immediately; repeated waits can return the same snapshot. Default false."
+                            "description": "With block=true, wake for shell output as well as terminal status. Existing output returns immediately unless after_output_revision is supplied. Default false."
+                        },
+                        "after_output_revision": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "With block=true and wake_on_output=true, wait for activity after the output_revision returned by the last live shell snapshot. The revision is an activity signal, not a byte cursor; the bounded view can repeat or omit output. Omit offset and pattern."
                         },
                         "offset": {
                             "type": "integer",

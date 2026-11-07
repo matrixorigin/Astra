@@ -110,11 +110,17 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
                 "BEARER_TOKEN",
                 None
             ),
-            pat_stream!(
-                r"://[^:@\s/]+:[^:@\s/]+@",
-                r"://[^:@\s/]+:[^:@\s/]+@?",
-                "CONNECTION_CREDENTIAL"
-            ),
+            CredentialPattern {
+                // URI userinfo can be empty, contain multiple colons, or be
+                // a token without a password. A later @ can extend userinfo,
+                // so consume through the last @ before the authority ends.
+                regex: {
+                    static RE: OnceLock<Regex> = OnceLock::new();
+                    RE.get_or_init(|| Regex::new(r"://[^/?#\s]*@").expect("URL authority regex"))
+                },
+                label: "CONNECTION_CREDENTIAL",
+                secret_capture: None,
+            },
             pat_min!(
                 r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key|\[\s*['"]?(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"]?\s*\]|['"](?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"])\s*[=:]\s*['"]?(?P<secret>[^\s'"]{{{},}})"#,
                 12,
@@ -197,10 +203,16 @@ fn credential_match_is_explicit_placeholder(matched: &str) -> bool {
         .strip_prefix("://")
         .and_then(|value| value.strip_suffix('@'))
     {
-        let value = authority
-            .rsplit_once(':')
-            .map_or(authority, |(_, password)| password);
-        return is_explicit_placeholder_value(value);
+        if authority.contains('@') {
+            return false;
+        }
+        return match authority.split_once(':') {
+            Some((username, password)) => {
+                (username.is_empty() || is_explicit_placeholder_value(username))
+                    && is_explicit_placeholder_value(password)
+            }
+            None => is_explicit_placeholder_value(authority),
+        };
     }
     matched
         .rfind(['=', ':'])
@@ -460,15 +472,12 @@ fn pending_url_authority(text: &str) -> Option<usize> {
     let authority = &text[start + 3..];
     if authority
         .chars()
-        .any(|ch| ch.is_whitespace() || ch == '/' || ch == '@')
+        .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '?' | '#'))
     {
         return None;
     }
-    match authority.find(':') {
-        None => Some(start),
-        Some(index) if index > 0 && index + 1 == authority.len() => Some(start),
-        _ => None,
-    }
+    // Even a previous @ can still be part of userinfo if more bytes arrive.
+    Some(start)
 }
 
 #[derive(Clone, Copy)]
@@ -533,7 +542,7 @@ fn for_each_redaction_span(
             extra.push(RedactionSpan {
                 start,
                 end: text.len(),
-                label: "CONNECTION_CREDENTIAL",
+                label: "URL_AUTHORITY_PENDING",
                 editable: false,
             });
         }
@@ -1569,6 +1578,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn url_authorities_remain_private_until_complete_and_public_hosts_stay_visible() {
+        for authority in [
+            "alice:secretvalue@host",
+            ":secretvalue@host",
+            "alice:part:secretvalue@host",
+            "secretvalue@host",
+            "alice@secretvalue@host",
+            "alice:secret%40value@host",
+        ] {
+            let prefix = "https://";
+            let raw = format!("{prefix}{authority}/path\n");
+            for end in prefix.len() + 1..=raw.len() {
+                let safe = redact_credentials_for_display_streaming(&raw[..end], usize::MAX)
+                    .unwrap()
+                    .0;
+                assert!(
+                    safe.starts_with("https[REDACTED:"),
+                    "authority leaked at {end}: {safe:?}"
+                );
+            }
+            let settled = redact_credentials_for_display(&raw).0;
+            assert!(!settled.contains("secret"), "{settled}");
+            let (editable, _) = redact_credentials_in_text(&raw);
+            assert!(!editable.contains("secret"), "{editable}");
+            assert_eq!(
+                resolve_redacted_anchor(&raw, &editable, false).unwrap(),
+                Some(raw)
+            );
+        }
+
+        for url in [
+            "http://127.0.0.1:3000\n",
+            "https://example.test:8443/path@elsewhere",
+            "https://example.test:8443?email=a@b",
+            "https://example.test:8443#contact@host",
+            "http://[::1]:3000 ",
+        ] {
+            assert_eq!(
+                redact_credentials_for_display_streaming(url, usize::MAX)
+                    .unwrap()
+                    .0,
+                url
+            );
+            assert_eq!(redact_credentials_for_display(url).0, url);
+        }
+        let pending = redact_credentials_for_display_streaming("http://localhost:3000", usize::MAX)
+            .unwrap()
+            .0;
+        assert!(pending.contains("URL_AUTHORITY_PENDING"), "{pending}");
+    }
+
+    #[test]
+    fn url_placeholder_exemptions_do_not_hide_other_userinfo() {
+        for authority in [
+            "user:secretvalue:<your-token>@host",
+            "user@secretvalue:<your-token>@host",
+            "secretvalue:<your-token>@host",
+        ] {
+            let raw = format!("https://{authority}/");
+            let safe = redact_credentials_for_display(&raw).0;
+            assert!(!safe.contains("secretvalue"), "{safe}");
+            let safe_live = redact_credentials_for_display_streaming(&raw, usize::MAX)
+                .unwrap()
+                .0;
+            let safe_editable = redact_credentials_in_text(&raw).0;
+            assert!(!safe_live.contains("secretvalue"), "{safe_live}");
+            assert!(!safe_editable.contains("secretvalue"), "{safe_editable}");
+        }
+        for url in [
+            "https://<your-token>@host/",
+            "https://<your-user>:<your-token>@host/",
+            "https://:<your-token>@host/",
+        ] {
+            assert_eq!(redact_credentials_for_display(url).0, url);
+        }
+    }
+
+    #[test]
     fn streaming_display_conservatively_redacts_short_contextual_values() {
         for raw in [
             "password=short ",
@@ -2312,8 +2399,10 @@ mod tests {
         let (display, count) = redact_credentials_for_display(
             &raw.replace("ghp_abcdefghijklmnopqrstuvwxyz0123456789", &legacy),
         );
-        assert_eq!(count, 0);
-        assert!(display.contains(&legacy));
+        // The entire URI userinfo is now concealed, even if it happens to
+        // contain a legacy marker; that marker still grants no edit authority.
+        assert_eq!(count, 1);
+        assert!(!display.contains(&legacy));
     }
 
     #[test]

@@ -205,6 +205,7 @@ pub(crate) fn background_task_output_snapshot_for_rejected_fanout_slot(
                 group.group_id, slot.slot_index
             )
         }),
+        output_revision: None,
     })
 }
 

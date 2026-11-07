@@ -332,6 +332,165 @@ async fn interactive_wait_observes_unterminated_output_and_preserves_input() {
 }
 
 #[tokio::test]
+async fn interactive_wait_can_follow_new_activity_without_replaying_old_prompt() {
+    let (workspace, executor) = fixture();
+    let id = launch(
+        &executor,
+        "printf 'first> '; IFS= read -r answer; printf 'second> '; IFS= read -r answer",
+        true,
+        10.0,
+    )
+    .await;
+    stdin_ready(&executor, &id).await;
+    let first = call(
+        &executor,
+        "task_output",
+        json!({
+            "task_id":id, "block":true, "wake_on_output":true, "timeout_ms":4000
+        }),
+    )
+    .await;
+    assert!(first.output.contains("first>"), "{first:?}");
+    let revision = first.tool_result_fields.as_ref().unwrap()["background_task_observation"]
+        ["output_revision"].as_u64().unwrap();
+    assert!(
+        first
+            .output
+            .contains(&format!("output_revision {revision}")),
+        "{first:?}"
+    );
+
+    let no_change = call(
+        &executor,
+        "task_output",
+        json!({
+            "task_id":id, "block":true, "wake_on_output":true,
+            "after_output_revision":revision, "timeout_ms":100
+        }),
+    )
+    .await;
+    assert!(!no_change.is_error, "{no_change:?}");
+    assert_eq!(
+        no_change.tool_result_fields.as_ref().unwrap()["wait_result"],
+        "timeout"
+    );
+    assert!(
+        !executor
+            .background_tasks
+            .get(&id)
+            .unwrap()
+            .status()
+            .is_terminal()
+    );
+
+    let future = call(
+        &executor,
+        "task_output",
+        json!({
+            "task_id":id, "block":true, "wake_on_output":true,
+            "after_output_revision":u64::MAX, "timeout_ms":1000
+        }),
+    )
+    .await;
+    assert!(
+        future.is_error && future.output.contains("newer"),
+        "{future:?}"
+    );
+
+    let observer = Arc::new(
+        ToolExecutor::new(workspace.path())
+            .with_background_tasks(executor.background_tasks.clone()),
+    );
+    let mut waiters = Vec::new();
+    for owner in [executor.clone(), observer] {
+        let id = id.clone();
+        waiters.push(tokio::spawn(async move {
+            call(
+                &owner,
+                "task_output",
+                json!({
+                    "task_id":id, "block":true, "wake_on_output":true,
+                    "after_output_revision":revision, "timeout_ms":4000
+                }),
+            )
+            .await
+        }));
+    }
+    let input = call(
+        &executor,
+        "task_input",
+        json!({"task_id":id, "input":"go\n"}),
+    )
+    .await;
+    assert!(!input.is_error, "{input:?}");
+    for waiter in waiters {
+        let next = waiter.await.unwrap();
+        assert!(
+            !next.is_error && next.output.contains("second>"),
+            "{next:?}"
+        );
+        assert!(next.tool_result_fields.as_ref().unwrap()["background_task_observation"]
+            ["output_revision"].as_u64().unwrap() > revision, "{next:?}");
+    }
+    // Activity which arrives before a subsequent wait must also be observed.
+    let already_changed = call(
+        &executor,
+        "task_output",
+        json!({
+            "task_id":id, "block":true, "wake_on_output":true,
+            "after_output_revision":revision, "timeout_ms":1000
+        }),
+    )
+    .await;
+    assert!(
+        !already_changed.is_error && already_changed.output.contains("second>"),
+        "{already_changed:?}"
+    );
+    for args in [
+        json!({"task_id":id, "after_output_revision":revision}),
+        json!({"task_id":id, "block":true, "wake_on_output":true, "after_output_revision":revision, "offset":0}),
+        json!({"task_id":id, "block":true, "wake_on_output":true, "after_output_revision":revision, "pattern":"second"}),
+    ] {
+        let invalid = call(&executor, "task_output", args).await;
+        assert!(invalid.is_error, "{invalid:?}");
+    }
+    let closed = call(
+        &executor,
+        "task_input",
+        json!({"task_id":id, "input":"done\n"}),
+    )
+    .await;
+    assert!(!closed.is_error, "{closed:?}");
+    assert!(!terminal(&executor, &id).await.is_error);
+}
+
+#[tokio::test]
+async fn live_shell_output_keeps_listening_url_visible() {
+    let (_workspace, executor) = fixture();
+    let id = launch(
+        &executor,
+        "printf 'Listening on http://127.0.0.1:3000\\n'; sleep 5",
+        false,
+        10.0,
+    )
+    .await;
+    let observed = call(
+        &executor,
+        "task_output",
+        json!({
+            "task_id":id, "block":true, "wake_on_output":true, "timeout_ms":4000
+        }),
+    )
+    .await;
+    let _ = call(&executor, "task_stop", json!({"task_id":id})).await;
+    let _ = terminal(&executor, &id).await;
+    assert!(
+        observed.output.contains("http://127.0.0.1:3000"),
+        "{observed:?}"
+    );
+}
+
+#[tokio::test]
 async fn live_output_keeps_both_streams_visible_after_a_noisy_stream() {
     let (_workspace, executor) = fixture();
     for command in [
@@ -898,6 +1057,9 @@ async fn task_execution_cancelled_observer_leaves_the_process_controllable() {
     let (_root, executor) = fixture();
     let id = launch(&executor, "cat", true, 5.0).await;
     stdin_ready(&executor, &id).await;
+    let initial = call(&executor, "task_output", json!({"task_id":id})).await;
+    let revision = initial.tool_result_fields.as_ref().unwrap()["background_task_observation"]
+        ["output_revision"].as_u64().unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
     let watcher = {
         let (executor, id, token) = (executor.clone(), id.clone(), cancel.clone());
@@ -905,13 +1067,21 @@ async fn task_execution_cancelled_observer_leaves_the_process_controllable() {
             executor
                 .execute_with_invocation_metadata_cancelable(
                     "task_output",
-                    &json!({"task_id":id,"block":true,"timeout_ms":30000}),
+                    &json!({"task_id":id,"block":true,"wake_on_output":true,
+                        "after_output_revision":revision,"timeout_ms":30000}),
                     ToolInvocationMetadata::default(),
                     Some(&token),
                 )
                 .await
         })
     };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !executor.foreground_wait_control.is_active() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     cancel.cancel();
     assert!(watcher.await.unwrap().is_error);
     if executor

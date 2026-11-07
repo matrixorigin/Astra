@@ -593,15 +593,6 @@ impl ToolExecutor {
                 }
             }
         };
-        // This executor owns the workspace read, so it is the only boundary
-        // allowed to issue an edit-capable redaction reference.  Redact the
-        // full content before any output budget/window is applied; otherwise
-        // a credential split at the model limit becomes an unrecognisable
-        // partial secret.  Keep `raw_content` for AST parsing, line-range
-        // accounting, and the staleness cache.
-        let (safe_content, _) =
-            astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content);
-
         // Outline isolation: return only definition signatures with line numbers
         if has_outline {
             let total_lines = raw_content.lines().count();
@@ -646,6 +637,7 @@ impl ToolExecutor {
         // otherwise it would be compressed after we had incorrectly recorded
         // the file as fully delivered.
         const AUTO_EXPAND_MAX_BYTES: usize = 16_384;
+        let mut expanded_view = None;
         if is_ranged {
             if let Ok(meta) = fs::metadata(&path)
                 && (meta.len() as usize) <= AUTO_EXPAND_MAX_BYTES
@@ -679,10 +671,15 @@ impl ToolExecutor {
                     );
                     return Ok(expanded);
                 }
+                expanded_view = Some(expanded_content);
             }
         }
 
         if !is_ranged {
+            // Redact the complete source before applying the output budget so
+            // a truncated secret cannot escape detection.
+            let (safe_content, _) =
+                astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content);
             let lines: Vec<&str> = safe_content.split('\n').collect();
             let total_lines = raw_content.lines().count();
             let numbered = add_line_numbers(&safe_content, 1);
@@ -756,11 +753,19 @@ impl ToolExecutor {
             ));
         }
         let actual_start_line = s + 1; // 1-indexed
-        let safe_range = astra_text_utils::credential_redaction::redact_line_window(
-            &raw_content,
-            actual_start_line,
-            e,
-        );
+        let safe_range = match expanded_view {
+            Some(view) => view
+                .split('\n')
+                .skip(s)
+                .take(e - s)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => astra_text_utils::credential_redaction::redact_line_window(
+                &raw_content,
+                actual_start_line,
+                e,
+            ),
+        };
         let source_line_count = e.saturating_sub(s);
         let line_numbers_preserve_source = safe_range.lines().count() == source_line_count;
         let numbered = add_line_numbers(&safe_range, actual_start_line);
@@ -3016,6 +3021,25 @@ mod tests {
             r2.contains("delta") && r2.contains("epsilon"),
             "second read should return the requested content: {r2}"
         );
+    }
+
+    #[test]
+    fn ranged_read_reuses_safe_small_file_view_when_auto_expand_exceeds_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = (0..100)
+            .map(|i| format!("line {i}: {}\r\n", "x".repeat(48)))
+            .collect::<String>();
+        raw.push_str("-----BEGIN PRIVATE KEY-----\r\nprivatebody\r\n-----END PRIVATE KEY-----\r\nlast\r\n\r\n");
+        assert!(raw.len() < 16_384);
+        std::fs::write(dir.path().join("budgeted-small.txt"), raw).unwrap();
+        let executor = test_executor_in(dir.path());
+        let result = executor.read_file(&json!({
+            "path": "budgeted-small.txt", "start_line": 102, "end_line": 104
+        }));
+        assert!(!result.contains("Auto-expanded"), "{result}");
+        assert!(!result.contains("privatebody"), "{result}");
+        assert!(result.contains("[REDACTED:PRIVATE_KEY]"), "{result}");
+        assert!(result.contains("last"), "{result}");
     }
 
     // ── Read observations preserve legitimate repeated and ranged reads ─────

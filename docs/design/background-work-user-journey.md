@@ -42,8 +42,10 @@ composer input still addresses the parent. Capability introspection reports
 
 `task_output` observes a bounded snapshot or waits for a terminal event. For
 interactive shells, `wake_on_output=true` also wakes the bounded wait for
-output; existing output returns immediately, so repeated waits may return the
-same snapshot. A live shell snapshot gives stdout and stderr separate bounded
+output. Pass the last live snapshot's `output_revision` as
+`after_output_revision` to wait for subsequent activity; without it, existing
+output returns immediately. The revision is an activity signal, not a byte
+cursor, and a concurrent write can result in a repeated snapshot. A live shell snapshot gives stdout and stderr separate bounded
 tails and has no stable pagination cursor; the tails do not imply ordering
 between streams. After completion, the captured output can be paginated;
 published workspace files may still be changed by users between reads.
