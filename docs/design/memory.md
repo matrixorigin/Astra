@@ -316,9 +316,13 @@ second transcript, or adds a failure dependency to canonical chat settlement.
 When configured, the existing managed recovery owner traverses pages of 64
 canonical Session keys. Only those keys enter a separate eligibility query;
 each participating table has direct full-key predicates. Idle pages read no
-transcripts. Eligible Sessions are then rechecked and materialized selectively
-with their latest canonical head in one snapshot; content/fork validation stays
-with the canonical coordinator. Direct storage predicates also protect normal
+transcripts. Eligible Sessions are rechecked and their committed head is captured
+without payloads. The canonical coordinator then materializes that captured head
+using direct key, compaction-generation and conversation-cursor predicates,
+avoiding a full scan of a live Session's retained generation history. These are
+separate reads over immutable nodes: a concurrent append/Replace cannot change the captured
+transcript or its checkpoint watermark. Content/fork validation stays with the
+canonical coordinator. Direct storage predicates also protect normal
 restore/resume/history materialization from unrelated manifest scans.
 An existing sweeper lease selects one cross-process observation owner; a local
 keyset cursor advances past deferred Sessions and wraps without replacing durable
@@ -327,8 +331,10 @@ eligibility page or attempts one Session, with one observation in flight.
 Candidates are rechecked after paging, so cached keys are not authorization,
 head, or retry-state snapshots. Cancellation or a checkpoint error retains the
 current candidate; restart scans from the beginning. The ordinary non-fork
-attempt adds one selective discovery/materialization query, fresh authority,
-and one atomic progress checkpoint, without per-Session claim transactions.
+attempt adds a metadata-only discovery query, one selective canonical materialization
+query, fresh authority, and one atomic progress checkpoint, without per-Session
+claim transactions. The extra selective read replaces the joined payload scan;
+SQL count alone does not measure storage work.
 Catalog traversal adds two queries per 64-key page, separately from attempts.
 MatrixOne can still scan/sort remaining narrow keys for an ordered page; this
 is not a constant-time catalog scan or a fixed recall-latency guarantee. The

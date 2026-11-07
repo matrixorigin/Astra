@@ -993,10 +993,11 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         ));
     }
     for (scenario, rounds, warm_context, polls, statements) in &budgets {
-        // Preserve the original allocation, including canonical observation
-        // discovery/checkpoint work and every periodic control query.
+        // Original 20-statement allocation plus one selective canonical read.
+        // Splitting head capture from payload loading avoids scanning retained
+        // compaction generations. No observation/control SQL is excluded.
         assert!(
-            statements.len() <= 20,
+            statements.len() <= 21,
             "{scenario} (warm={warm_context}, polls={polls}) used {} SQL statements including transactions and drained work:\n{}",
             statements.len(),
             statements.join("\n")
@@ -1525,16 +1526,17 @@ async fn configured_auto_finishes_without_authoring_or_rollout_queries() {
         .filter(|statement| statement.as_str() == CONTROL_OBSERVATION_SQL)
         .count();
     let authentication_reads = authentication_snapshot_count(&sql);
-    // Keep Auto's existing allocation. Only the exact authentication/control reads explain
-    // the two-statement envelope; all checkpoint SQL remains in the raw total.
+    // Original Auto allocation plus one selective canonical materialization.
+    // Only exact authentication/control reads explain the two-statement envelope;
+    // all observation discovery, materialization and checkpoint SQL is counted.
     assert!(
-        sql.len() <= 31,
+        sql.len() <= 32,
         "Auto raw SQL budget: {}\n{}",
         sql.len(),
         sql.join("\n")
     );
     assert!(
-        sql.len() - control_polls - authentication_reads <= 29,
+        sql.len() - control_polls - authentication_reads <= 30,
         "Auto nonperiodic SQL budget: {}\n{}",
         sql.len(),
         sql.join("\n")

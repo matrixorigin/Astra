@@ -627,8 +627,11 @@ cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
   ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
 ```
 
-The raw limit remains 20 statements. Auto retains its existing 29 nonperiodic /
-31 raw allocation. Observation never inserts or locks a memory-job row during
+The raw limit is 21 statements: the original 20 plus one selective canonical
+materialization read per observation. Auto similarly allows 30 nonperiodic / 32
+raw (previously 29 / 31). This explicit extra read avoids scanning all retained
+compaction generations merely to save one statement; it is included in capture.
+Observation never inserts or locks a memory-job row during
 chat settlement. The managed background owner discovers committed canonical
 heads and coalesces each Session to its latest completed turn. It persists only
 a small checkpoint with an independent retry clock, not another transcript.
@@ -656,7 +659,12 @@ runs in the online services lane and seeds 100,000 synthetic retained Sessions
 using the real schema. Prepared `EXPLAIN ANALYZE` statements exercise the actual
 canonical materializer, 64-key eligibility query, and selected-Session query in
 both fully observed and sparse-work states. It checks storage `inputRows`, not
-just returned rows or SQL count; page eligibility must not read transcripts.
+just returned rows or SQL count; page eligibility and selected-head discovery
+must not read transcripts. A second fixture retains 100 generations of 1,000
+nodes in one live Session and checks the canonical current-generation scan.
+Synthetic plan bodies are never passed through the application decoder. A
+separate valid Session uses real Append/Replace commits between head capture and
+materialization to verify pinned transcripts and checkpoint watermarks.
 MatrixOne may read an 8,192-row storage block for a key set. Narrow key sorting
 is still catalog-dependent and is not claimed to scan only 64 physical rows.
 Run it directly with `ASTRA_TEST_DB_IT=1 cargo test -p astra-services --lib
@@ -665,7 +673,7 @@ session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
 
 The readonly-round comparison accounts for exact periodic control reads and
 at most one account/session authentication snapshot when its 30-second cache
-expires. Those statements still count toward the raw 20-statement limit;
+expires. Those statements still count toward the raw 21-statement limit;
 repeated authentication snapshots or any other extra readonly-round SQL fail.
 The HTTP fixture binds both the Memoria URL and its master credential to the
 strict local mock. Enabling self-hosted access exercises the authenticated
