@@ -285,7 +285,7 @@ impl SessionObservationRecovery {
             };
             key
         };
-        let Some(mut candidate) = self
+        let Some(candidate) = self
             .store
             .next(&self.lease.lease_name, &self.lease.pod_id, &key.0, &key.1)
             .await?
@@ -302,7 +302,7 @@ impl SessionObservationRecovery {
         // facts remain durable; restarting or wrapping can never lose work.
         // Advance only after checkpointing; cancellation/errors replay this key.
         let result = async {
-            let materialized = self.store.materialize(&mut candidate).await?;
+            let materialized = self.store.materialize(&candidate).await?;
             let messages =
                 astra_turn_core::observer::filter_memory_operation_turns(&materialized.messages)
                     .into_iter()

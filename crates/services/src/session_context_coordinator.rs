@@ -3937,9 +3937,9 @@ impl DatabaseSessionContextCoordinator {
             .transpose()
     }
 
-    /// Shared decoder for canonical materialization and background consumers
-    /// that select a bounded head and its immutable nodes in one snapshot.
-    pub(crate) async fn materialize_loaded(
+    /// Validate the immutable nodes selected for a captured canonical head.
+    /// Background consumers use the same public materialization entrypoint.
+    async fn materialize_loaded(
         &self,
         head: &SessionContextHeadV1,
         loaded: LoadedCanonicalContext,
@@ -6460,7 +6460,7 @@ pub(crate) fn canonical_materialization_sql() -> String {
     )
 }
 
-pub(crate) fn qualified_manifest_content_columns(alias: &str) -> String {
+fn qualified_manifest_content_columns(alias: &str) -> String {
     MANIFEST_CONTENT_COLUMNS
         .split(',')
         .map(|column| format!("{alias}.{}", column.trim()))
@@ -6490,13 +6490,13 @@ const MANIFEST_CONTENT_COLUMNS: &str = "manifest_root, parent_manifest_root, com
 
 /// Validated manifest content, without retaining another copy of SQL bodies.
 #[derive(Default)]
-pub(crate) struct LoadedCanonicalContext {
+struct LoadedCanonicalContext {
     nodes: std::collections::HashMap<String, StoredManifestContent>,
     prefix: Option<SharedManifestPrefixV1>,
     prefix_loaded: bool,
 }
 impl LoadedCanonicalContext {
-    pub(crate) fn push_row(
+    fn push_row(
         &mut self,
         head: &SessionContextHeadV1,
         row: &sqlx::mysql::MySqlRow,

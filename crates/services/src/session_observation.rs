@@ -3,12 +3,11 @@
 use crate::MaterializedConversationV1;
 use astra_core::SharedPool;
 use astra_turn_types::SessionContextHeadV1;
-use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::session_context_coordinator::{
-    DatabaseSessionContextCoordinator, LoadedCanonicalContext, qualified_manifest_content_columns,
+    DatabaseSessionContextCoordinator, SessionContextCoordinator,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,9 +24,6 @@ pub struct ObservationCandidate {
     pub turn: u32,
     head: Result<SessionContextHeadV1, String>,
     pub checkpoint: ObservationCheckpoint,
-    // Keep row decoding inside the canonical coordinator, including scope,
-    // content hashes, chain ordering and inherited fork authorization.
-    loaded: Result<LoadedCanonicalContext, String>,
 }
 
 #[derive(Clone)]
@@ -77,9 +73,9 @@ impl SessionObservationStore {
             .map_err(|_| "observation eligibility page failed".into())
     }
 
-    /// Every storage relation is constrained by a concrete owner/Session key.
-    /// Do not join the global catalog to manifests: MatrixOne does not push
-    /// those derived-row join keys down into storage scans.
+    /// Capture eligibility and the immutable context head, without payloads.
+    /// Materialization must bind that head's generation/cursor directly at the
+    /// storage access: MatrixOne does not push derived-row join bounds down.
     pub async fn next(
         &self,
         lease_name: &str,
@@ -96,14 +92,9 @@ impl SessionObservationStore {
             .bind(user)
             .bind(session)
             .bind(lease_name)
-            .bind(pod_id)
-            .bind(user)
-            .bind(session)
-            .bind(user)
-            .bind(session);
-        let mut rows = query.fetch(self.pool.get());
-        let Some(row) = rows
-            .try_next()
+            .bind(pod_id);
+        let Some(row) = query
+            .fetch_optional(self.pool.get())
             .await
             .map_err(|_| "observation discovery failed")?
         else {
@@ -148,47 +139,21 @@ impl SessionObservationStore {
             .transpose()
             .map_err(|_| "invalid observation checkpoint")?
             .unwrap_or_default();
-        let mut loaded = head
-            .as_ref()
-            .map(|_| LoadedCanonicalContext::default())
-            .map_err(Clone::clone);
-        if let (Ok(head), Ok(content)) = (&head, &mut loaded)
-            && content.push_row(head, &row).is_err()
-        {
-            loaded = Err("invalid observation context".into());
-        }
-        drop(row);
-        while let Some(row) = rows
-            .try_next()
-            .await
-            .map_err(|_| "observation discovery failed")?
-        {
-            if let (Ok(head), Ok(content)) = (&head, &mut loaded)
-                && content.push_row(head, &row).is_err()
-            {
-                loaded = Err("invalid observation context".into());
-            }
-        }
         Ok(Some(ObservationCandidate {
             key,
             turn,
             head,
             checkpoint,
-            loaded,
         }))
     }
 
     pub async fn materialize(
         &self,
-        candidate: &mut ObservationCandidate,
+        candidate: &ObservationCandidate,
     ) -> Result<MaterializedConversationV1, String> {
         let head = candidate.head.as_ref().map_err(Clone::clone)?;
-        let loaded = std::mem::replace(
-            &mut candidate.loaded,
-            Err("observation already materialized".into()),
-        )?;
         DatabaseSessionContextCoordinator::new(self.pool.clone())
-            .materialize_loaded(head, loaded)
+            .materialize(head)
             .await
             .map_err(|_| "observation canonical context could not be materialized".into())
     }
@@ -276,12 +241,9 @@ fn eligibility_query(keys: &[(String, String)]) -> sqlx::QueryBuilder<sqlx::MySq
     query
 }
 
-fn candidate_sql() -> String {
-    let columns = qualified_manifest_content_columns("m");
-    format!(
-        "SELECT h.head_json, h.observation_json, h.isolation_domain, h.owner_user_id, h.session_id,
-                h.branch_id, h.completed_turn AS head_completed_turn, {columns},
-                f.manifest_json AS fork_manifest_json
+fn candidate_sql() -> &'static str {
+    "SELECT h.head_json, h.observation_json, h.isolation_domain, h.owner_user_id, h.session_id,
+                h.branch_id, h.completed_turn AS head_completed_turn
          FROM (
            SELECT h.*, CAST(JSON_EXTRACT(w.state_json, '$.observation') AS CHAR) AS observation_json
            FROM (SELECT * FROM session_context_heads WHERE isolation_domain = 'server'
@@ -298,15 +260,7 @@ fn candidate_sql() -> String {
                  <= CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
              AND EXISTS (SELECT 1 FROM sweeper_leases l WHERE l.sweeper_name = ?
                          AND l.owner_pod_id = ? AND l.expires_at > NOW(6))
-         ) h
-         LEFT JOIN (SELECT * FROM conversation_manifest_nodes
-                    WHERE isolation_domain = 'server' AND branch_id = 'main'
-                      AND owner_user_id = ? AND session_id = ? AND reachable = 1) m
-           ON m.compaction_generation = h.compaction_generation AND m.conversation_seq <= h.conversation_seq
-         LEFT JOIN (SELECT manifest_json FROM session_forks FORCE INDEX (uq_session_forks_child)
-                    WHERE isolation_domain = 'server' AND child_branch_id = 'main'
-                      AND owner_user_id = ? AND child_session_id = ? AND state = 'active') f ON TRUE"
-    )
+         ) h"
 }
 
 #[cfg(test)]
@@ -391,6 +345,130 @@ mod tests {
         rows.iter().map(|row| row.get::<String, _>(0)).collect()
     }
 
+    // Exercise valid production commits separately from synthetic plan metadata.
+    // Reading a newer head between discovery and materialization would mix the
+    // observation watermark with a different transcript.
+    async fn assert_captured_head_is_materialized(pool: &SharedPool) {
+        use crate::AcquireWriterAndReserveTurnOutcome;
+        use astra_turn_types::{
+            ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            CanonicalDeltaModeV1, CanonicalTurnDeltaV1, CoordinatorMutationV1, SessionKeyV1,
+            SessionSurfaceV1,
+        };
+        use serde_json::json;
+        let key = SessionKeyV1::owner_session("server", "synthetic-owner", "captured-head", "main");
+        let actor = ActorContextV1::owner_user(
+            &key.owner_user_id,
+            "observation-test",
+            ActorKindV1::Server,
+            SessionSurfaceV1::Server,
+            None,
+            AuthorityEpochsV1::default(),
+        );
+        sqlx::query("INSERT INTO agent_sessions (user_id,session_id,status) VALUES (?,?,'active')")
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let store = SessionObservationStore::new(pool.clone());
+        let mut cursor = None;
+        let mut captured = None;
+        for turn in 1..=3 {
+            let reservation = match coordinator
+                .acquire_writer_and_reserve_turn(
+                    &key,
+                    cursor.as_ref(),
+                    &actor,
+                    std::time::Duration::from_secs(30),
+                    &format!("writer-{turn}"),
+                    &format!("turn-{turn}"),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } => reservation,
+                other => panic!("unexpected admission: {other:?}"),
+            };
+            let result = coordinator
+                .commit_turn_and_release_writer(
+                    &reservation,
+                    CanonicalTurnDeltaV1 {
+                        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                        completed_turn: turn,
+                        journal_event_seq: u64::from(turn),
+                        conversation_seq: u64::from(turn),
+                        compaction_generation: u64::from(turn == 3),
+                        config_version_id: None,
+                        mode: if turn == 3 {
+                            CanonicalDeltaModeV1::Replace
+                        } else {
+                            CanonicalDeltaModeV1::Append
+                        },
+                        logical_segments: vec![vec![
+                            json!({"role":"assistant", "content":format!("turn-{turn}")}),
+                        ]],
+                    },
+                    &format!("commit-{turn}"),
+                )
+                .await
+                .unwrap();
+            cursor = Some(match result {
+                CoordinatorMutationV1::Applied { cursor } => cursor,
+                other => panic!("unexpected commit: {other:?}"),
+            });
+            if let Some(candidate) = captured.take() {
+                let materialized = store.materialize(&candidate).await.unwrap();
+                assert_eq!(materialized.head, *candidate.head.as_ref().unwrap());
+                assert_eq!(materialized.messages.len(), (turn - 1) as usize);
+                assert_eq!(
+                    materialized.messages.last().unwrap()["content"],
+                    format!("turn-{}", turn - 1)
+                );
+                store
+                    .finish("plan-test", "plan-worker", &candidate, true)
+                    .await
+                    .unwrap();
+            }
+            // Finishing a captured older turn must leave the new turn pending.
+            let candidate = store
+                .next(
+                    "plan-test",
+                    "plan-worker",
+                    &key.owner_user_id,
+                    &key.session_id,
+                )
+                .await
+                .unwrap()
+                .expect("newer committed turn remains eligible");
+            assert_eq!(candidate.turn, turn);
+            captured = Some(candidate);
+        }
+        let candidate = captured.unwrap();
+        assert_eq!(
+            store.materialize(&candidate).await.unwrap().messages,
+            vec![json!({"role":"assistant", "content":"turn-3"})]
+        );
+        store
+            .finish("plan-test", "plan-worker", &candidate, true)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .next(
+                    "plan-test",
+                    "plan-worker",
+                    &key.owner_user_id,
+                    &key.session_id
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; 100000 synthetic retained Sessions"]
     async fn retained_catalog_plans_keep_payload_reads_selective() {
@@ -470,7 +548,7 @@ mod tests {
             assert!(!plan.join("\n").contains("conversation_manifest_nodes"));
             let candidate = prepared_plan(
                 &pool,
-                &candidate_sql(),
+                candidate_sql(),
                 serde_json::json!([
                     "synthetic-owner",
                     "00050032",
@@ -479,17 +557,14 @@ mod tests {
                     "synthetic-owner",
                     "00050032",
                     "plan-test",
-                    "plan-worker",
-                    "synthetic-owner",
-                    "00050032",
-                    "synthetic-owner",
-                    "00050032"
+                    "plan-worker"
                 ])
                 .as_array()
                 .unwrap(),
             )
             .await;
             assert_scans_bounded(&candidate, 8192);
+            assert!(!candidate.join("\n").contains("conversation_manifest_nodes"));
         }
         let plan = prepared_plan(
             &pool,
@@ -511,8 +586,57 @@ mod tests {
         )
         .await;
         assert_scans_bounded(&plan, 8192);
-        // The malformed synthetic bodies are intentional: this fixture tests
-        // storage plans. Canonical hash/lineage semantics have separate tests.
+        // A live Session retains immutable nodes from old compaction generations.
+        // Session-key selectivity alone must not read that entire version history.
+        for statement in [
+            "INSERT INTO session_context_heads (isolation_domain,owner_user_id,session_id,branch_id,head_json,completed_turn,conversation_seq,compaction_generation)
+             VALUES ('server','synthetic-owner','retained-generations','main','{}',100,100000,99)",
+            "INSERT INTO agent_sessions (user_id,session_id,status) VALUES ('synthetic-owner','retained-generations','active')",
+            "INSERT INTO conversation_manifest_nodes (isolation_domain,owner_user_id,session_id,branch_id,manifest_root,completed_turn,conversation_seq,compaction_generation,canonical_segment_bytes,total_canonical_bytes,total_message_count,manifest_json,content_json)
+             SELECT 'server','synthetic-owner','retained-generations','main',LPAD(CAST(result + 100000 AS CHAR),64,'0'),1,result,FLOOR((result - 1) / 1000),1,1,1,'{}','[]' FROM generate_series(1,100000) g",
+        ] { sqlx::query(statement).execute(pool.get()).await.unwrap(); }
+        let candidate = prepared_plan(
+            &pool,
+            candidate_sql(),
+            serde_json::json!([
+                "synthetic-owner",
+                "retained-generations",
+                "synthetic-owner",
+                "retained-generations",
+                "synthetic-owner",
+                "retained-generations",
+                "plan-test",
+                "plan-worker"
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .await;
+        assert_scans_bounded(&candidate, 8192);
+        assert!(!candidate.join("\n").contains("conversation_manifest_nodes"));
+        let materialization = prepared_plan(
+            &pool,
+            &crate::session_context_coordinator::canonical_materialization_sql(),
+            serde_json::json!([
+                "server",
+                "synthetic-owner",
+                "retained-generations",
+                "main",
+                99,
+                100000,
+                "server",
+                "synthetic-owner",
+                "retained-generations",
+                "main"
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .await;
+        assert_scans_bounded(&materialization, 8192);
+        // Never send the malformed synthetic plan bodies through the decoder.
+        // Use a distinct Session with valid canonical commits for the race check.
+        assert_captured_head_is_materialized(&pool).await;
         pool.get().close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE `{}`",
