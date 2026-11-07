@@ -627,7 +627,6 @@ impl BackgroundTaskRegistry {
                     "recovery_evidence",
                     "stage",
                     "cleanup_authoritative",
-                    "process_id",
                 ] {
                     if let Some(value) = fields.get(key) {
                         facts.insert(key.into(), value.clone());

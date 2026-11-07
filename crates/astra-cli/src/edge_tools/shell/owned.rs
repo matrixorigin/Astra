@@ -91,15 +91,31 @@ impl OwnedShellInvocation {
                 return bash_preparation_rejection(format!("Cannot start command: {error}"));
             }
         };
-        let pid = process.id();
-        if interactive {
-            let _ = input.set(process.input());
+        if let Some(process_input) = process.input() {
+            let _ = input.set(process_input);
         }
         let preview_limit = self.output_limit.saturating_mul(2).max(16_384);
         let (mut stdout_preview, mut stderr_preview) = (Vec::new(), Vec::new());
         let mut capture_failed = false;
         let mut streams_complete = false;
+        #[cfg(all(test, target_os = "linux"))]
+        let mut test_stdout = self
+            .config
+            .supervisor_test_helper
+            .as_ref()
+            .map(|_| Vec::new());
         while let Some(output) = process.recv_output().await {
+            #[cfg(all(test, target_os = "linux"))]
+            let mut output = output;
+            #[cfg(all(test, target_os = "linux"))]
+            if let (ProcessOutput::Stdout(bytes), Some(buffer)) = (&mut output, &mut test_stdout) {
+                buffer.append(bytes);
+                if !strip_supervisor_test_prelude(buffer, false) {
+                    continue;
+                }
+                *bytes = std::mem::take(buffer);
+                test_stdout = None;
+            }
             let (bytes, preview, writer) = match output {
                 ProcessOutput::Stdout(bytes) => (bytes, &mut stdout_preview, &mut self.stdout),
                 ProcessOutput::Stderr(bytes) => (bytes, &mut stderr_preview, &mut self.stderr),
@@ -110,6 +126,20 @@ impl OwnedShellInvocation {
             let keep = bytes.len().min(preview_limit.saturating_sub(preview.len()));
             preview.extend_from_slice(&bytes[..keep]);
             if !capture_failed && writer.write(&bytes).await.is_err() {
+                capture_failed = true;
+                process.cancel();
+            }
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(bytes) = test_stdout.filter(|bytes| !bytes.is_empty()) {
+            if let Some(sink) = &self.config.progress_sink {
+                sink.record_chunk(&bytes);
+            }
+            let keep = bytes
+                .len()
+                .min(preview_limit.saturating_sub(stdout_preview.len()));
+            stdout_preview.extend_from_slice(&bytes[..keep]);
+            if !capture_failed && self.stdout.write(&bytes).await.is_err() {
                 capture_failed = true;
                 process.cancel();
             }
@@ -280,12 +310,6 @@ impl OwnedShellInvocation {
                     .observation
                     .as_ref()
                     .is_some_and(|lease| !lease.coordination_integrity_valid()));
-        if unsettled {
-            self.scope.attribution.mark_unsettled();
-            if let Some(lease) = &self.scope.observation {
-                lease.mark_unsettled();
-            }
-        }
         outcome = finish_bash_ownership(
             &self.config.effective_project_root,
             outcome,
@@ -298,10 +322,6 @@ impl OwnedShellInvocation {
             &self.workdir,
             &self.args,
         );
-        outcome
-            .tool_result_fields
-            .get_or_insert_default()
-            .insert("process_id".into(), json!(pid));
         if capture_failed {
             mark_bash_capture_unavailable(&mut outcome);
         }

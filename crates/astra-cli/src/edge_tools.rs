@@ -2889,17 +2889,15 @@ impl ToolExecutor {
         .await
     }
 
-    /// `exit_plan_mode` here is a permission-state pivot driven by
-    /// the plan-review overlay. When the user approves, writes unlock
-    /// and the host advances to the chosen execution mode.
+    /// Finish local plan authoring under the current policy. When review is
+    /// required, only the trusted overlay can approve it or select a mode.
     async fn exit_plan_mode_local_path(
         &self,
         plan_markdown: Option<&str>,
         explicit_review: bool,
     ) -> String {
-        use crate::cli::permission_manager::PermissionMode;
         let mode = *astra_core::sync_poison::recover_rwlock_read(&self.permission_mode);
-        if mode == PermissionMode::Bypass && !explicit_review {
+        if mode.auto_resolves_approval_prompts() && !explicit_review {
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
             self.stage_pending_round_tool_boost(&[
@@ -2922,7 +2920,6 @@ impl ToolExecutor {
             };
 
         if approved {
-            let next_mode = follow_up_mode.unwrap_or_else(|| self.plan_execution_mode());
             // Local guard cache is informational only here — there
             // is no cloud guard to mirror. Setting it to `Some(false)`
             // keeps the cached flag consistent with "writes are
@@ -2930,7 +2927,7 @@ impl ToolExecutor {
             // outcome the cloud path would have set.
             self.set_plan_mode_authoring_cache_for_active_session(false)
                 .await;
-            self.stage_pending_permission_mode_change(next_mode);
+            let next_mode = self.stage_plan_review_mode(follow_up_mode);
             self.stage_pending_round_tool_boost(&[
                 "bash",
                 "read_file",
@@ -2941,7 +2938,9 @@ impl ToolExecutor {
                 .filter(|plan| !plan.is_empty())
                 .map(|plan| format!(" Plan recorded:\n{plan}"))
                 .unwrap_or_default();
-            let mode_suffix = format!(" Next turn will run in {next_mode} mode.");
+            let mode_suffix = next_mode
+                .map(|mode| format!(" Next turn will run in {mode} mode."))
+                .unwrap_or_else(|| " Existing execution permissions remain unchanged.".into());
             format!("Exited plan mode; user approved.{mode_suffix}{plan_suffix}")
         } else {
             // Keep planning: the local perm_manager mode is unchanged
@@ -2953,14 +2952,19 @@ impl ToolExecutor {
         }
     }
 
-    fn plan_execution_mode(&self) -> crate::cli::permission_manager::PermissionMode {
+    fn stage_plan_review_mode(
+        &self,
+        selected: Option<crate::cli::permission_manager::PermissionMode>,
+    ) -> Option<crate::cli::permission_manager::PermissionMode> {
         use crate::cli::permission_manager::PermissionMode;
-        match *astra_core::sync_poison::recover_rwlock_read(&self.permission_mode) {
-            // Explicit Plan is non-executing; approving it enters the most
-            // restrictive execution policy unless the user chooses another.
-            PermissionMode::Plan => PermissionMode::Prompt,
-            mode => mode,
+        let current = *astra_core::sync_poison::recover_rwlock_read(&self.permission_mode);
+        // An explicit Plan mode is non-executing. Otherwise keeping the
+        // current permissions must not enqueue a stale mode change.
+        let next = selected.or((current == PermissionMode::Plan).then_some(PermissionMode::Prompt));
+        if let Some(mode) = next {
+            self.stage_pending_permission_mode_change(mode);
         }
+        next
     }
 
     /// Surface the Approve / Keep-planning overlay through the
@@ -3024,8 +3028,7 @@ impl ToolExecutor {
         self.set_plan_mode_authoring_cache_for_active_session(!approved)
             .await;
         if approved {
-            let next_mode = follow_up_mode.unwrap_or_else(|| self.plan_execution_mode());
-            self.stage_pending_permission_mode_change(next_mode);
+            self.stage_plan_review_mode(follow_up_mode);
             self.stage_pending_round_tool_boost(&[
                 "bash",
                 "read_file",

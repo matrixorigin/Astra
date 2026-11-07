@@ -561,7 +561,10 @@ async fn verify_installed_protocol(
         .map_err(|_| NativeProbeFailure::SettlementUnconfirmed)?;
 
     let mut evidence = Evidence::default();
-    let input = process.input();
+    let Some(input) = process.input() else {
+        let _ = process.cancel_and_wait().await;
+        return Err(NativeProbeFailure::SettlementUnconfirmed);
+    };
     let probe = match tokio::time::timeout(timeout, async {
         initialize_protocol(
             &mut process,
@@ -2477,7 +2480,9 @@ async fn drive_with_cached_catalog(
     input_rx: Option<tokio::sync::mpsc::Receiver<EdgeInvocationInput>>,
     cached_catalog: Option<&astra_turn_types::ProviderModelCatalog>,
 ) -> Result<(), String> {
-    let input = process.input();
+    let input = process
+        .input()
+        .ok_or_else(|| "native process input is unavailable".to_string())?;
     // Negotiation is a bounded control exchange, not the task's lifetime.
     // Once turn/start is acknowledged, only the admitted work cutoff or
     // cancellation may stop the healthy active turn.
@@ -2803,12 +2808,12 @@ impl ToolExecutor {
         // paths await authoritative descendant settlement before returning.
         let mut interrupt_acknowledged = false;
         if driven.is_err()
-            && let (Some(thread), Some(turn)) = (&evidence.thread, &evidence.turn)
+            && let (Some(thread), Some(turn), Some(input)) =
+                (&evidence.thread, &evidence.turn, process.input())
         {
             // Best effort protocol interruption, fenced to the actual ACKs.
             // Its ACK is not terminal evidence and never replaces settlement.
             let request = json!({"id": INTERRUPT_REQUEST_ID, "method": "turn/interrupt", "params": {"threadId": thread, "turnId": turn}});
-            let input = process.input();
             interrupt_acknowledged = tokio::time::timeout(
                 Duration::from_secs(1),
                 rpc(

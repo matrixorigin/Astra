@@ -123,7 +123,7 @@ for line in sys.stdin: pass
         turn: Some("turn".into()),
         ..Evidence::default()
     };
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut input_rx = None;
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let result = submit_stage_input(
@@ -284,7 +284,7 @@ for line in sys.stdin:
             );
             let token = CancellationToken::new();
             let mut process = transport::process(&script, token.clone()).await;
-            let input = process.input();
+            let input = process.input().expect("framed process input");
             let mut evidence = Evidence {
                 thread: Some("thread".into()),
                 turn: Some("turn".into()),
@@ -456,7 +456,7 @@ for line in sys.stdin:
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -585,7 +585,7 @@ for line in sys.stdin:
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -628,7 +628,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     initialize_protocol(
         &mut process,
@@ -668,7 +668,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let error = initialize_protocol(
         &mut process,
@@ -703,7 +703,7 @@ for line in sys.stdin: pass
 "#;
     let token = CancellationToken::new();
     let mut process = transport::process(script, token.clone()).await;
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let error = initialize_protocol(
         &mut process,
@@ -1861,7 +1861,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
                 cancel.clone(),
             )
             .unwrap();
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut evidence = Evidence::default();
         let proof = async {
             initialize_protocol(
@@ -2129,7 +2129,7 @@ for line in sys.stdin:
                 cancel.child_token(),
             )
             .unwrap();
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut evidence = Evidence::default();
         let proof = async {
             initialize_protocol(
@@ -2328,7 +2328,7 @@ async fn live_native_permission_masks_enforce_read_write_and_network_boundaries(
             cancel.child_token(),
         )
         .unwrap();
-    let input = process.input();
+    let input = process.input().expect("framed process input");
     let mut evidence = Evidence::default();
     let probes = async {
         initialize_protocol(&mut process, &input, &mut evidence, OUTPUT_BYTES, None, &cancel).await?;
@@ -3740,7 +3740,7 @@ for line in sys.stdin: pass
             turn: Some("turn".into()),
             ..Evidence::default()
         };
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let mut input_rx = None;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let ack = submit_stage_input(
@@ -4107,7 +4107,7 @@ for line in sys.stdin: assert json.loads(line).get('method') != 'turn/steer'
             );
             let token = CancellationToken::new();
             let mut process = process(&script, token.clone()).await;
-            let input = process.input();
+            let input = process.input().expect("framed process input");
             let mut evidence = Evidence {
                 thread: Some("thread".into()),
                 turn: Some("turn".into()),
@@ -4279,7 +4279,7 @@ for line in sys.stdin: pass
             turn: Some("turn".into()),
             ..Evidence::default()
         };
-        let input = process.input();
+        let input = process.input().expect("framed process input");
         let (input_tx, input_receiver) = tokio::sync::mpsc::channel(1);
         let (queued_ack_tx, mut queued_ack_rx) = tokio::sync::oneshot::channel();
         input_tx

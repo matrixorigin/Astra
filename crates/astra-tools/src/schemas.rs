@@ -2933,7 +2933,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         }}),
         json!({"type":"function","function":{
             "name":"exit_plan_mode",
-            "description":"Finalize the concrete plan and leave authoring. Pass review=true when the user requested review or a decision is needed. Required review comes from user/policy authority and cannot be waived by arguments. Bypass work may continue under its existing authorization; this does not mean user approval. Human review keeps existing execution permissions unless the user explicitly selects another mode.",
+            "description":"Finalize the concrete plan and leave authoring. Pass review=true when the user requested review or a decision is needed. Required review comes from user/policy authority and cannot be waived by arguments. Auto and Bypass work may continue under existing authorization; this does not mean user approval. Human review keeps existing execution permissions unless the user explicitly selects another mode.",
             "parameters":{"type":"object","properties":{
                 "plan":{"type":"string","description":"Full concrete plan as markdown, including implementation and acceptance criteria."},
                 "review":{"type":"boolean","description":"Request trusted human review. Required user/policy review remains enforced when omitted or false."}

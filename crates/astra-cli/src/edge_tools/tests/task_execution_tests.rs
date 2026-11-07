@@ -199,7 +199,7 @@ async fn task_execution_cancelled_observer_leaves_the_process_controllable() {
 }
 
 #[tokio::test]
-async fn task_execution_release_keeps_one_task_pid_and_original_deadline() {
+async fn task_execution_release_keeps_one_task_and_original_deadline() {
     let (_root, executor) = fixture();
     let control = executor.foreground_wait_control.clone();
     let run = {
@@ -233,12 +233,72 @@ async fn task_execution_release_keeps_one_task_pid_and_original_deadline() {
         "tool_timeout"
     );
     assert_eq!(outcome.tool_result_fields.as_ref().unwrap()["task_id"], id);
-    let pid = outcome.tool_result_fields.as_ref().unwrap()["process_id"]
-        .as_u64()
-        .unwrap();
+    assert!(outcome.output.contains("same-pid:"), "{outcome:?}");
     assert!(
-        outcome.output.contains(&format!("same-pid:{pid}")),
-        "{outcome:?}"
+        outcome
+            .tool_result_fields
+            .as_ref()
+            .unwrap()
+            .get("process_id")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn task_execution_release_keeps_the_running_shell() {
+    let (root, executor) = fixture();
+    let control = executor.foreground_wait_control.clone();
+    let run = {
+        let executor = executor.clone();
+        tokio::spawn(async move {
+            call(&executor, "bash", json!({
+                "command": "printf '%s' $$ > before.pid; IFS= read -r input; printf '%s' $$ > after.pid",
+                "stdin": true, "timeout": 10, "yield_time_ms": 30000
+            })).await
+        })
+    };
+    let before = root.path().join("before.pid");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !control.is_active()
+            || !std::fs::read_to_string(&before).is_ok_and(|pid| !pid.is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("shell started while foreground wait was active");
+    let before_pid = std::fs::read_to_string(before).unwrap();
+    assert!(!before_pid.is_empty());
+    assert!(control.release());
+    let background = run.await.unwrap();
+    assert!(!background.is_error, "{background:?}");
+    let id = background.tool_result_fields.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    stdin_ready(&executor, &id).await;
+    assert!(
+        !call(
+            &executor,
+            "task_input",
+            json!({"task_id":id,"input":"continue\n"})
+        )
+        .await
+        .is_error
+    );
+    let outcome = terminal(&executor, &id).await;
+    assert!(!outcome.is_error, "{outcome:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("after.pid")).unwrap(),
+        before_pid
+    );
+    assert!(
+        outcome
+            .tool_result_fields
+            .as_ref()
+            .unwrap()
+            .get("process_id")
+            .is_none()
     );
 }
 

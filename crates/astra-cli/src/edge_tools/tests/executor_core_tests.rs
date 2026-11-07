@@ -513,6 +513,16 @@ async fn exit_plan_mode_overlay_paths() {
             expect_tool_boost: Some(&["bash", "read_file", "write_file", "str_replace"]),
         },
         Case {
+            label: "approve-keep",
+            install_overlay: true,
+            decision: Some(PlanReviewDecision::Approve { mode: None }),
+            expect_starts_with: "Exited plan mode",
+            expect_contains: &["permissions remain unchanged"],
+            expect_not_contains: &["Error", "Next turn will run"],
+            expect_pending_mode: None,
+            expect_tool_boost: Some(&["bash", "read_file", "write_file", "str_replace"]),
+        },
+        Case {
             label: "keep-planning",
             install_overlay: true,
             decision: Some(PlanReviewDecision::KeepPlanning),
@@ -1299,6 +1309,68 @@ async fn model_planning_preserves_bypass_and_explicit_review_still_needs_a_user(
     assert!(reviewed.contains("user approved"));
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(PermissionMode::Bypass)
+        None,
+        "keeping permissions must not stage a mode change"
+    );
+}
+
+#[tokio::test]
+async fn plan_review_keep_permissions_only_exits_an_explicit_plan_mode() {
+    use crate::cli::chat_stream::PlanReviewDecision;
+    use crate::cli::permission_manager::PermissionMode;
+    for (mode, expected) in [
+        (PermissionMode::Plan, Some(PermissionMode::Prompt)),
+        (PermissionMode::Bypass, None),
+        (PermissionMode::Deny, None),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(temp.path()).with_active_session_id("plan-review");
+        executor.apply_runtime_permission_sandbox(mode);
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<crate::cli::chat_stream::PlanReviewRequest>(1);
+        executor.set_plan_review_request_tx(Some(tx));
+        let reviewer = tokio::spawn(async move {
+            rx.recv()
+                .await
+                .unwrap()
+                .response_tx
+                .send(PlanReviewDecision::Approve { mode: None })
+                .unwrap();
+        });
+        assert!(
+            executor
+                .resolve_remote_plan_review(Some("plan"))
+                .await
+                .unwrap()
+        );
+        reviewer.await.unwrap();
+        assert_eq!(executor.take_pending_permission_mode_change(), expected);
+    }
+}
+
+#[tokio::test]
+async fn model_planning_in_auto_mode_requires_review_only_when_requested() {
+    use crate::cli::permission_manager::PermissionMode;
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path()).with_active_session_id("planning-auto");
+    executor.apply_runtime_permission_sandbox(PermissionMode::Auto);
+    executor
+        .execute("enter_plan_mode", &json!({"goal":"design"}))
+        .await;
+    let automatic = executor
+        .execute("exit_plan_mode", &json!({"plan":"implement"}))
+        .await;
+    assert!(automatic.contains("existing permissions"), "{automatic}");
+    assert!(!automatic.contains("user approved"));
+    assert!(executor.take_pending_permission_mode_change().is_none());
+    executor
+        .execute("enter_plan_mode", &json!({"goal":"review"}))
+        .await;
+    let reviewed = executor
+        .execute("exit_plan_mode", &json!({"plan":"review", "review":true}))
+        .await;
+    assert!(
+        reviewed.starts_with("Error:"),
+        "explicit review requires the user: {reviewed}"
     );
 }

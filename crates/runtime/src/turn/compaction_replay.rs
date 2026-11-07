@@ -20,8 +20,8 @@
 //!
 //! Design: tiered escalation (default → aggressive → emergency) gated by
 //! `consecutive_context_window_errors`. After MAX_COMPACT_RETRIES the error
-//! propagates as a structured `InterruptionRecord` with
-//! `ResumeAction::CompactAndRetry` (for cross-session resume).
+//! propagates as a structured `InterruptionRecord` requiring user intervention,
+//! while preserving progress for a future request.
 
 use super::{CompactionEngine, PipelineOutcome, TokenBudget};
 use astra_turn_core::compaction_types::CompactionKind;
@@ -200,7 +200,7 @@ pub(crate) fn try_compact_for_retry_tiered(
     // Using `prompts::estimate_tokens` (which walks content + tool_calls and
     // adds per-message + fixed overhead) keeps this in sync with the
     // pre-request pressure estimate in `agentic_loop::lifecycle` so a
-    // CompactAndRetry triggered precisely by large tool_calls is not
+    // recovery triggered precisely by large tool_calls is not
     // silently skipped.
     let measured = last_measured_tokens
         .unwrap_or_else(|| crate::prompts::estimate_tokens(messages, 0, 0) as u64);

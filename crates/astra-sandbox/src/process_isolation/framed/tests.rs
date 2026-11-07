@@ -99,16 +99,28 @@ fn spawn_bytes(script: &str, stdin: bool, budget: ProcessIoLimits) -> OwnedProce
 #[tokio::test]
 async fn byte_stream_keeps_process_identity_and_acknowledges_targeted_input() {
     let mut process = spawn_bytes(
-        "printf '%s\\n' $$; read -r line; printf 'out:%s' \"$line\"; printf 'err' >&2",
+        "printf '%s\\n' $$; read -r line; printf 'pid:%s out:%s' $$ \"$line\"; printf 'err' >&2",
         true,
         limits(),
     );
-    let pid = process.id().unwrap();
-    let first = process.recv_output().await.unwrap();
-    assert!(
-        matches!(first, ProcessOutput::Stdout(ref bytes) if bytes == format!("{pid}\n").as_bytes())
-    );
-    process.input().write_bytes(b"answer\n").await.unwrap();
+    let mut first = Vec::new();
+    while !first.contains(&b'\n') {
+        match process.recv_output().await.unwrap() {
+            ProcessOutput::Stdout(bytes) => first.extend(bytes),
+            other => panic!("unexpected initial output: {other:?}"),
+        }
+    }
+    let pid = std::str::from_utf8(&first)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    process
+        .input()
+        .unwrap()
+        .write_bytes(b"answer\n")
+        .await
+        .unwrap();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     while let Some(output) = process.recv_output().await {
@@ -120,7 +132,7 @@ async fn byte_stream_keeps_process_identity_and_acknowledges_targeted_input() {
     let outcome = process.wait().await.unwrap();
     assert!(matches!(outcome.end, ProcessEnd::Exited));
     assert!(outcome.status.unwrap().success());
-    assert_eq!(stdout, b"out:answer");
+    assert_eq!(stdout, format!("pid:{pid} out:answer").as_bytes());
     assert_eq!(stderr, b"err");
     assert!(
         outcome
@@ -138,7 +150,7 @@ async fn byte_stream_stdin_is_closed_unless_explicitly_requested() {
         false,
         limits(),
     );
-    assert!(process.input.is_none());
+    assert!(process.input().is_none());
     let mut output = Vec::new();
     while let Some(ProcessOutput::Stdout(bytes)) = process.recv_output().await {
         output.extend(bytes);
@@ -151,8 +163,13 @@ async fn byte_stream_stdin_is_closed_unless_explicitly_requested() {
 #[tokio::test]
 async fn byte_stream_eof_and_deadline_are_physical_process_facts() {
     let mut process = spawn_bytes("cat; printf eof", true, limits());
-    process.input().write_bytes(b"raw\0bytes\n").await.unwrap();
-    process.input().close().await.unwrap();
+    process
+        .input()
+        .unwrap()
+        .write_bytes(b"raw\0bytes\n")
+        .await
+        .unwrap();
+    process.input().unwrap().close().await.unwrap();
     let mut output = Vec::new();
     while let Some(ProcessOutput::Stdout(bytes)) = process.recv_output().await {
         output.extend(bytes);
@@ -168,7 +185,7 @@ async fn byte_stream_eof_and_deadline_are_physical_process_facts() {
             ..limits()
         },
     );
-    let _input = process.input();
+    let _input = process.input().unwrap();
     let outcome = process.wait().await.unwrap();
     assert!(matches!(outcome.end, ProcessEnd::TimedOut), "{outcome:?}");
     assert!(
@@ -311,7 +328,12 @@ mod linux {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(86_400)).await;
         tokio::time::resume();
-        process.input().send_frame(b"continue").await.unwrap();
+        process
+            .input()
+            .unwrap()
+            .send_frame(b"continue")
+            .await
+            .unwrap();
         assert_eq!(next_payload(&mut process).await, b"finished");
         let outcome = tokio::time::timeout(Duration::from_secs(5), process.wait())
             .await
@@ -419,7 +441,7 @@ mod linux {
         let directory = tempfile::tempdir().unwrap();
         let token = CancellationToken::new();
         let process = spawn("touch started", directory.path(), limits(), token.clone());
-        let input = process.input();
+        let input = process.input().unwrap();
         drop(process);
         tokio::time::timeout(Duration::from_secs(5), input.sender.closed())
             .await
@@ -446,7 +468,7 @@ mod linux {
             limits(),
             CancellationToken::new(),
         );
-        let input = process.input();
+        let input = process.input().unwrap();
         let first = vec![b'x'; 64];
         input.send_frame(&first).await.unwrap();
         assert_eq!(next_payload(&mut process).await, first);
@@ -470,7 +492,7 @@ mod linux {
             limits(),
             CancellationToken::new(),
         );
-        let input = process.input();
+        let input = process.input().unwrap();
         for invalid in [
             vec![b'x'; 65],
             b"{}\n{}".to_vec(),
@@ -542,7 +564,7 @@ mod linux {
             token.clone(),
         );
         wait_ready(directory.path()).await;
-        let input = process.input();
+        let input = process.input().unwrap();
         let frame = vec![b'x'; budget.max_frame_bytes];
         input.send_frame(&frame).await.unwrap();
         input.send_frame(&frame).await.unwrap();
@@ -656,7 +678,7 @@ async fn raw_closed_stdin_does_not_cancel_still_useful_work() {
         true,
         limits(),
     );
-    let input = process.input();
+    let input = process.input().unwrap();
     let first = process.recv_output().await.unwrap();
     assert!(
         matches!(first, ProcessOutput::Stdout(ref bytes) if bytes.starts_with(b"stdin-closed"))

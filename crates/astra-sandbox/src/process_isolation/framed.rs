@@ -220,12 +220,12 @@ pub struct OwnedProcess {
     output: mpsc::Receiver<ProcessOutput>,
     completion: Option<JoinHandle<ProcessOutcome>>,
     cancel: CancellationToken,
-    pid: Option<u32>,
 }
 
 impl OwnedProcess {
-    pub fn input(&self) -> ProcessInput {
-        self.input.as_ref().expect("live process input").clone()
+    /// Input is available for framed processes and shells launched with stdin.
+    pub fn input(&self) -> Option<ProcessInput> {
+        self.input.clone()
     }
 
     /// Complete LF-delimited stdout payloads only. EOF or a closed queue is not
@@ -241,10 +241,6 @@ impl OwnedProcess {
 
     pub async fn recv_output(&mut self) -> Option<ProcessOutput> {
         self.output.recv().await
-    }
-
-    pub fn id(&self) -> Option<u32> {
-        self.pid
     }
 
     /// Cancels this invocation, never the caller's parent cancellation token.
@@ -369,7 +365,6 @@ impl BashInvocationOwner {
         let mut command = tokio::process::Command::from(command);
         command.kill_on_drop(!supervised);
         let child = command.spawn()?;
-        let pid = child.id();
         let guard = IsolatedScopeAbortGuard::new(Some(self), None, child.id());
         let cancel = cancel.child_token();
         let (input_tx, input_rx) = mpsc::channel(limits.max_queued_frames);
@@ -396,7 +391,6 @@ impl BashInvocationOwner {
             output: output_rx,
             completion: Some(completion),
             cancel,
-            pid,
         })
     }
 }

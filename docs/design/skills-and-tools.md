@@ -221,8 +221,8 @@ authority changes and reports a bounded structured difference; historical
 selection does not grant current execution authority.
 
 Model-authored planning retains the user's execution policy. Finishing a plan
-under Bypass does not add a human approval step unless explicitly requested.
-Other policies keep their trusted review gate. The default approval choice
+under Auto or Bypass does not add a human approval step unless explicitly
+requested. Other policies keep their trusted review gate. The default approval choice
 retains current permissions; no countdown changes permission. Finalization
 checks the submitted revision and session binding atomically, so approval of an
 older draft cannot release a newer draft's authoring guard.

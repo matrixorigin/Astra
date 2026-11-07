@@ -29,8 +29,8 @@ pub(crate) fn plan_mode_blocked_tool_result(tool: &str) -> astra_tools::ToolResu
     let mut result = astra_tools::ToolResult::error(format!(
         "Tool '{tool}' is blocked while plan mode is active. \
          Use read-only tools to finish the plan, then call \
-         `exit_plan_mode(plan='...')` to submit it for trusted user \
-         approval before write tools can run."
+         `exit_plan_mode(plan='...')` when ready. Existing permissions and \
+         explicit review requests determine how authoring finishes."
     ));
     result.metadata = Some(Map::from_iter([
         (
@@ -450,6 +450,23 @@ mod tests {
     use astra_plan::PlanRepository;
     use astra_plan::{SubtaskPlan, TaskStatus};
     use serde_json::json;
+
+    #[test]
+    fn blocked_plan_write_points_to_the_current_review_policy() {
+        let result = plan_mode_blocked_tool_result("write_file");
+        assert!(result.is_error);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["error_kind"],
+            "policy_denied"
+        );
+        assert!(result.output.contains("exit_plan_mode"));
+        assert!(
+            result
+                .output
+                .contains("Existing permissions and explicit review")
+        );
+        assert!(!result.output.contains("approval before write tools"));
+    }
 
     struct ReviewGate {
         repo: Arc<dyn PlanRepository>,

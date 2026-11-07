@@ -3363,6 +3363,19 @@ struct ShellRunError {
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
 }
 
+// The Linux unit-test supervisor is a re-exec of libtest. Its harness writes
+// a banner before entering the real supervisor; that banner is not output from
+// the target process. Streams may split it across arbitrary reads.
+#[cfg(all(test, target_os = "linux"))]
+fn strip_supervisor_test_prelude(buffer: &mut Vec<u8>, complete: bool) -> bool {
+    const PRELUDES: [&[u8]; 2] = [b"\nrunning 1 test\n", b"running 1 test\n"];
+    if let Some(prelude) = PRELUDES.iter().find(|prelude| buffer.starts_with(prelude)) {
+        buffer.drain(..prelude.len());
+        return true;
+    }
+    complete || !PRELUDES.iter().any(|prelude| prelude.starts_with(buffer))
+}
+
 // Keep the selected workspace pinned until the process owner settles.
 struct ShellScopeLease {
     attribution: astra_tools::workspace_observation::WorkspaceAttributionState,
@@ -3655,15 +3668,7 @@ fn run_shell_output_with_config(
             // The libtest re-exec is only a fixture entrypoint for the real
             // invocation supervisor. Its own prelude is not target-command
             // stdout and must not change predicate or empty-output semantics.
-            for prelude in [
-                b"\nrunning 1 test\n".as_slice(),
-                b"running 1 test\n".as_slice(),
-            ] {
-                if stdout_buf.starts_with(prelude) {
-                    stdout_buf.drain(..prelude.len());
-                    break;
-                }
-            }
+            strip_supervisor_test_prelude(&mut stdout_buf, true);
         }
         stdout_buf
     };
@@ -5029,6 +5034,26 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervisor_fixture_prelude_filter_handles_split_and_matching_target_output() {
+        let prelude = b"\nrunning 1 test\n";
+        let target = b"running 1 test\nactual target output";
+        let bytes = [prelude.as_slice(), target.as_slice()].concat();
+        for split in 0..=bytes.len() {
+            let mut buffer = bytes[..split].to_vec();
+            let ready = super::strip_supervisor_test_prelude(&mut buffer, false);
+            buffer.extend_from_slice(&bytes[split..]);
+            if !ready {
+                assert!(super::strip_supervisor_test_prelude(&mut buffer, true));
+            }
+            assert_eq!(buffer, target, "split at {split}");
+        }
+        let mut no_prelude = b"actual target output".to_vec();
+        assert!(super::strip_supervisor_test_prelude(&mut no_prelude, true));
+        assert_eq!(no_prelude, b"actual target output");
+    }
+
     #[test]
     fn readiness_probe_discards_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -6254,6 +6279,19 @@ mod tests {
         let fields = outcome.tool_result_fields.as_ref().unwrap();
         assert_eq!(fields["execution_fact"], "unknown");
         assert_eq!(fields["retryable"], false);
+        let inspection = executor
+            .execute_with_invocation_metadata_cancelable(
+                "read_file",
+                &serde_json::json!({"path": "generated.txt"}),
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                None,
+            )
+            .await;
+        assert!(
+            !inspection.is_error,
+            "inspection must remain usable: {inspection:?}"
+        );
+        assert!(inspection.output.contains('x'), "{inspection:?}");
     }
 
     #[tokio::test]
