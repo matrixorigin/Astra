@@ -206,9 +206,76 @@ retain the previous identity-pinned Edge heartbeat. On completion, the workbench
 stops and joins it before rebinding local execution. Login completion registers
 the current checkout with the new identity before reporting chat readiness,
 then starts its heartbeat; registration failure is reported explicitly and does
-not initialize a ready runtime. Existing transports retain their old generation
+not complete runtime initialization. Existing transports retain their old generation
 binding; they cannot silently adopt another account. Authentication
 changes are refused while local background tasks are running.
+
+In-TUI password login and registration establish the same Edge registration
+and heartbeat boundary after saving credentials. Rejected authentication retains
+the previous heartbeat. An account change stops and joins it before registering
+the new account's checkout. Same-account login retains the working heartbeat
+until registration succeeds, then joins it and starts the replacement. The
+registration request has a 15-second deadline, including response-body reads.
+Password authentication and registration use the existing workbench login task
+queue, so network waiting does not block keyboard handling or redraw. Password
+authentication (including any environment-identity check) also has a 15-second
+deadline. Once exchange starts, Escape/Ctrl-C reports that completion is pending
+instead of claiming cancellation after credentials may have committed.
+If registration fails, the saved login and model preference remain available;
+queued messages return to the composer for manual review and are not sent
+automatically. Local-state failures ask users to check workspace/state write
+access; transport, timeout and server failures provide the relevant recovery.
+Diagnostics record only failure category and HTTP status, not private paths,
+URLs or response bodies. Retrying `/login` or restarting retries registration
+without repeating model-provider authorization.
+
+Registration rejects an active `ASTRA_ACCESS_TOKEN` before the non-idempotent
+account-creation POST. Users must unset it and restart before creating a new
+account; no later identity lookup can turn a remotely created account into an
+apparent registration failure. A registration timeout, lost/truncated response,
+invalid successful credential response, or server-side failure reports an unknown
+outcome and directs users to try `/login` before registering again. Known
+connector failures and authoritative client-error rejections remain failures.
+
+When a valid `ASTRA_ACCESS_TOKEN` controls turn authentication, password sign-in
+checks its authenticated account against the password response before saving
+credentials or changing the session. A conflicting or unverifiable identity is
+rejected with instructions to unset the environment override and restart.
+Same-account sign-in uses the environment bearer for registration and heartbeat,
+matching subsequent turn admission; the new profile credentials are still saved.
+With `ASTRA_NATIVE_COLLABORATORS` selected, the interactive lifecycle does not
+send generic HTTP advertisements during startup or re-login. Native
+delivery is the only capability publisher: a timed-out generic POST cannot be
+buffered and forwarded later to erase a newer native advertisement. Credential
+completion requests a refresh through the existing native-delivery handle;
+the first selected native turn establishes or refreshes that owner and waits for
+publication before admission. A local runtime projection is not capacity-ready
+proof. No second delivery owner or publication generation scheme is added. Direct
+registration callers such as app-server keep their existing noninteractive policy.
+
+Graceful shutdown drains an in-flight password exchange before retiring the
+previous identity's runtime. A successful delayed response is published through
+the same credential/session transition reducer used by ordinary completion;
+teardown does not discard newly issued tokens or start a new runtime/heartbeat.
+
+An absent agent projection is not a registration-readiness gate: the first turn
+can initialize it lazily. The Server remains the execution admission authority.
+When execution selection rejects a new turn with
+`execution_binding_provider_required` before durable run creation, it includes
+`metadata.attempt_admission_state: rejected`. The CLI preserves that code, restores the
+draft and suggests `/login` or restarting only when no earlier dispatched
+attempt remains ambiguous. The thin transport updates the admission owner's live
+dispatch evidence before sending and settles each attempt on a complete response
+or a proven connector failure. This preserves uncertainty on retry exhaustion,
+authentication errors, cancellation, and admission-deadline expiry as well as on
+successful response returns. Connector failures known to precede HTTP request
+dispatch (including a refused connection) do not create ambiguity; they also
+cannot clear ambiguity from an earlier attempt that may have reached the Server.
+Older clients ignore this new attempt-only field
+instead of interpreting it as the legacy `admission_state: rejected` guarantee. A lost response followed by a rejected retry keeps
+recovery evidence and reports unknown execution state without restoring a draft
+or claiming no model/tool ran. An admitted run or resume failure is never
+relabeled as an unexecuted turn.
 
 At browser re-login the CLI drains and retires its old session-memory service
 before credential publication. Successful completion rebuilds that service with

@@ -37,6 +37,7 @@ use crate::work::{WorkCatalogCursorV1, WorkCatalogPageV1, WorkTaskGraphPageV2};
 
 const HTTP_STREAM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const AUTHED_TEXT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 /// Edge callbacks are control-plane acknowledgements, not long-lived streams.
 /// A peer that accepts bytes but never returns response headers must not stop
 /// the SSE consumer indefinitely. The budget has to outlast one slow database
@@ -1704,9 +1705,9 @@ impl ThinClient {
 
     /// Retry Server-owned loop admission on 429 and transport errors.
     ///
-    /// A retry is safe only before response headers arrive. Once the response
-    /// is returned, durable run identity and stream reconciliation belong to
-    /// the Server lifecycle.
+    /// A lost response before headers can still belong to an admitted Run.
+    /// Callers that interpret admission proofs must use the payload variant's
+    /// attempt provenance; the final response alone cannot settle earlier I/O.
     pub async fn post_developer_loop_retry_429(
         &self,
         token: &str,
@@ -1714,9 +1715,13 @@ impl ThinClient {
         max_attempts: u32,
         quiet: bool,
     ) -> Result<Response, ThinClientError> {
-        self.post_developer_loop_retry_429_with_payload(token, max_attempts, quiet, || {
-            Ok(payload.clone())
-        })
+        self.post_developer_loop_retry_429_with_payload(
+            token,
+            max_attempts,
+            quiet,
+            &mut false,
+            || Ok(payload.clone()),
+        )
         .await
     }
 
@@ -1725,11 +1730,15 @@ impl ThinClient {
     /// The factory may reject admission and record sticky dispatch evidence.
     /// Callers with an absolute execution deadline use this to publish a
     /// monotonically shrinking budget after 429 or transport waits.
+    /// The caller owns live ambiguity evidence. Dispatch sets it before sending;
+    /// a complete response or proven connector failure settles only this attempt.
+    /// Errors and a dropped deadline future retain evidence from any unsettled send.
     pub async fn post_developer_loop_retry_429_with_payload<F>(
         &self,
         token: &str,
         max_attempts: u32,
         quiet: bool,
+        prior_dispatch_ambiguous: &mut bool,
         mut payload_for_attempt: F,
     ) -> Result<Response, ThinClientError>
     where
@@ -1737,11 +1746,17 @@ impl ThinClient {
     {
         let mut last_err: Option<ThinClientError> = None;
         for attempt in 0..max_attempts {
-            match self
-                .post_developer_loop_with_payload(token, &mut payload_for_attempt)
-                .await
-            {
+            let ambiguous_before_attempt = *prior_dispatch_ambiguous;
+            let result = self
+                .post_developer_loop_with_payload(token, &mut || {
+                    let payload = payload_for_attempt()?;
+                    *prior_dispatch_ambiguous = true;
+                    Ok(payload)
+                })
+                .await;
+            match result {
                 Ok(resp) => {
+                    *prior_dispatch_ambiguous = ambiguous_before_attempt;
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
                             parse_retry_after(resp.headers()).unwrap_or(2u64 << attempt);
@@ -1762,6 +1777,9 @@ impl ThinClient {
                     return Ok(resp);
                 }
                 Err(e) => {
+                    if matches!(&e, ThinClientError::Http(error) if error.is_connect()) {
+                        *prior_dispatch_ambiguous = ambiguous_before_attempt;
+                    }
                     if attempt + 1 < max_attempts && e.is_transport() {
                         let delay_secs = 1u64 << attempt;
                         if !quiet {
@@ -5594,6 +5612,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_admission_builds_a_fresh_payload_after_rate_limit() {
+        let mut ambiguous = false;
         let _guard = set_test_retry_sleep_ms(0);
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
@@ -5614,7 +5633,7 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let mut remaining = 60;
         let response = client
-            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+            .post_developer_loop_retry_429_with_payload("t", 3, true, &mut ambiguous, || {
                 let current = remaining;
                 remaining -= 20;
                 Ok(serde_json::json!({"execution_time_budget": {"remaining_seconds": current}}))
@@ -5622,6 +5641,10 @@ mod tests {
             .await
             .expect("second admission succeeds");
         assert_eq!(response.status().as_u16(), 200);
+        assert!(
+            !ambiguous,
+            "429 responses are known rejections, not lost responses"
+        );
         let requests = srv.received_requests().await.expect("request history");
         assert_eq!(requests.len(), 2);
         let budgets = requests
@@ -5639,10 +5662,11 @@ mod tests {
 
     #[tokio::test]
     async fn expired_admission_dispatches_no_request() {
+        let mut ambiguous = false;
         let srv = MockServer::start().await;
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let error = client
-            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+            .post_developer_loop_retry_429_with_payload("t", 3, true, &mut ambiguous, || {
                 Err(ThinClientError::AdmissionDeadlineExpired)
             })
             .await
@@ -5653,6 +5677,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_admission_after_rate_limit_dispatches_no_retry() {
+        let mut ambiguous = false;
         let _guard = set_test_retry_sleep_ms(0);
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
@@ -5663,7 +5688,7 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let mut attempts = 0;
         let error = client
-            .post_developer_loop_retry_429_with_payload("t", 3, true, || {
+            .post_developer_loop_retry_429_with_payload("t", 3, true, &mut ambiguous, || {
                 attempts += 1;
                 if attempts == 1 {
                     Ok(serde_json::json!({"msg": "first attempt"}))

@@ -18,6 +18,309 @@ const TEST_SSE_HEADERS: [(&str, &str); 2] = [
     ),
 ];
 
+#[tokio::test]
+#[serial_test::serial]
+async fn admitted_attempt_with_lost_headers_then_rejection_retains_uncertainty() {
+    assert_lost_admission("rejected").await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn admitted_attempt_with_lost_headers_then_retry_exhaustion_retains_uncertainty() {
+    assert_lost_admission("lost").await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn admitted_attempt_with_lost_headers_then_deadline_retains_uncertainty() {
+    assert_lost_admission("deadline").await;
+}
+
+async fn assert_lost_admission(terminal: &'static str) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = crate::test_utils::isolate_credentials();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let post_count = Arc::new(AtomicUsize::new(0));
+    let committed = admitted.clone();
+    let attempts = post_count.clone();
+    let server = tokio::spawn(async move {
+        'connections: loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 8192];
+            let headers_end = loop {
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    continue 'connections;
+                }
+                request.extend_from_slice(&buf[..read]);
+                assert!(request.len() < 1024 * 1024);
+                if let Some(end) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8(request[..headers_end].to_vec()).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < headers_end + length {
+                let read = socket.read(&mut buf).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buf[..read]);
+            }
+            let (content_type, body) = if headers.starts_with("GET /models") {
+                (
+                    "application/json",
+                    crate::test_utils::mock_model_catalog_json(&["test-model"]).to_string(),
+                )
+            } else if headers.starts_with("POST /chat/stream") {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // The synthetic Server admits the first request, but its
+                    // proxy loses response headers before any run id is visible.
+                    committed.fetch_add(1, Ordering::SeqCst);
+                    socket.write_all(b"HTTP/1.1 200").await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    continue;
+                }
+                if terminal == "lost" {
+                    socket.shutdown().await.unwrap();
+                    continue;
+                }
+                if terminal == "deadline" {
+                    std::future::pending::<()>().await;
+                }
+                ("text/event-stream",concat!(
+                    "data: {\"type\":\"error\",\"error_kind\":\"invalid_request\",\"message\":\"registration required\",",
+                    "\"error_code\":\"execution_binding_provider_required\",\"metadata\":{\"attempt_admission_state\":\"rejected\"}}\n\n",
+                    "data: [DONE]\n\n"
+                ).to_string())
+            } else {
+                panic!("unexpected mock HTTP route");
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{}: {}\r\n\r\n{body}",
+                body.len(),
+                astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                astra_server_types::AGENT_INTERACTION_API_MAJOR
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "possibly executed message");
+    let mut pm = PermissionManager::new(true);
+    let mut params = ChatTurnParams::basic_cli(
+        &context,
+        "synthetic-token",
+        Some("session-ambiguous-admission"),
+        &mut pm,
+    );
+    // Root interactive callers install a durable journal; utility callers do
+    // not publish continuity checkpoints even when they have a session id.
+    params.session_state_journal = Some(Arc::new(std::sync::Mutex::new(
+        crate::edge_tools::SessionStateRollbackJournal::default(),
+    )));
+    if terminal == "deadline" {
+        params.execution_time_budget =
+            Some(crate::cli::chat_stream::ExecutionTimeBudgetClock::new(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            ));
+    }
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(20), stream_chat_sse(params))
+        .await
+        .unwrap()
+        .expect_err("last physical request is rejected");
+    assert_eq!(admitted.load(Ordering::SeqCst), 1);
+    assert!(post_count.load(Ordering::SeqCst) >= 2);
+    if terminal == "rejected" {
+        assert_eq!(
+            failure.partial.error_code.as_deref(),
+            Some("execution_binding_provider_required")
+        );
+    }
+    assert!(failure.partial.prior_admission_ambiguous);
+    assert!(
+        !failure.partial.admission_rejected && !failure.partial.server_admission_not_dispatched
+    );
+    assert!(failure.partial.run_id.is_none());
+    assert!(
+        failure.partial.last_heavy_checkpoint.is_some(),
+        "do not discard recovery evidence because only the last attempt was rejected"
+    );
+    let mut state = crate::cli::session::session_state::SessionState::default();
+    let mut ui = crate::tests::TestUi::default();
+    crate::cli::turn::turn_failure_reporting::report_turn_failure(
+        &mut state,
+        None,
+        "possibly executed message",
+        &failure,
+        std::time::Instant::now(),
+        &mut ui,
+    );
+    assert!(ui.restored_inputs.is_empty());
+    let shown = ui.errors.join("\n");
+    assert!(shown.contains("unknown") && shown.contains("do not resend"));
+    assert!(!shown.contains("No model or tool ran"));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn refused_connection_then_rejection_restores_draft_with_login_guidance() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Debug)]
+    struct RestartingServer {
+        address: std::net::SocketAddr,
+        calls: AtomicUsize,
+        stopped: tokio::sync::Notify,
+        posts: Arc<AtomicUsize>,
+        task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    }
+
+    impl astra_thin_client::client::BearerProvider for RestartingServer {
+        fn token(
+            &self,
+        ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+        {
+            Box::pin(async move {
+                match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    // GET /models completes first. The first admission then
+                    // connects to a closed port, before any POST can be sent.
+                    1 => self.stopped.notified().await,
+                    2 => {
+                        let listener = tokio::net::TcpListener::bind(self.address).await.unwrap();
+                        let posts = self.posts.clone();
+                        let app = Router::new().route(
+                            "/chat/stream",
+                            post(move || {
+                                posts.fetch_add(1, Ordering::SeqCst);
+                                async {
+                                    (
+                                        TEST_SSE_HEADERS,
+                                        concat!(
+                                            "data: {\"type\":\"error\",\"error_kind\":\"invalid_request\",",
+                                            "\"message\":\"registration required\",",
+                                            "\"error_code\":\"execution_binding_provider_required\",",
+                                            "\"metadata\":{\"attempt_admission_state\":\"rejected\"}}\n\n",
+                                            "data: [DONE]\n\n"
+                                        ),
+                                    )
+                                }
+                            }),
+                        );
+                        *self.task.lock().unwrap() = Some(tokio::spawn(async move {
+                            axum::serve(listener, app).await.unwrap();
+                        }));
+                    }
+                    _ => {}
+                }
+                Ok("synthetic-token".into())
+            })
+        }
+    }
+
+    let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = crate::test_utils::isolate_credentials();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = Arc::new(RestartingServer {
+        address,
+        calls: AtomicUsize::new(0),
+        stopped: tokio::sync::Notify::new(),
+        posts: Arc::new(AtomicUsize::new(0)),
+        task: Mutex::new(None),
+    });
+    let first_peer = peer.clone();
+    let catalog = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut headers = Vec::new();
+        let mut buffer = [0; 4096];
+        while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            headers.extend_from_slice(&buffer[..count]);
+        }
+        assert!(headers.starts_with(b"GET /models"));
+        let body = crate::test_utils::mock_model_catalog_json(&["test-model"]).to_string();
+        socket.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        ).as_bytes()).await.unwrap();
+        socket.shutdown().await.unwrap();
+        drop(socket);
+        drop(listener);
+        first_peer.stopped.notify_one();
+    });
+    let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None)
+        .unwrap()
+        .with_bearer_provider(peer.clone());
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "unsent message");
+    let mut pm = PermissionManager::new(true);
+    let mut params = ChatTurnParams::basic_cli(
+        &context,
+        "synthetic-token",
+        Some("session-refused-admission"),
+        &mut pm,
+    );
+    params.session_state_journal = Some(Arc::new(Mutex::new(
+        crate::edge_tools::SessionStateRollbackJournal::default(),
+    )));
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(20), stream_chat_sse(params))
+        .await
+        .unwrap()
+        .expect_err("the only dispatched POST is rejected");
+    catalog.await.unwrap();
+    if let Some(task) = peer.task.lock().unwrap().take() {
+        task.abort();
+    }
+    assert_eq!(peer.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(peer.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        failure.partial.error_code.as_deref(),
+        Some("execution_binding_provider_required")
+    );
+    assert!(!failure.partial.prior_admission_ambiguous);
+    assert!(failure.partial.admission_rejected);
+    assert!(failure.partial.run_id.is_none());
+    assert!(failure.partial.last_heavy_checkpoint.is_none());
+    let mut state = crate::cli::session::session_state::SessionState::default();
+    let mut ui = crate::tests::TestUi::default();
+    crate::cli::turn::turn_failure_reporting::report_admission_rejection(
+        &mut state,
+        "unsent message",
+        &failure,
+        &mut ui,
+    );
+    assert_eq!(ui.restored_inputs, vec!["unsent message"]);
+    let shown = ui.errors.join("\n");
+    assert!(shown.contains("/login") && shown.contains("No model or tool ran"));
+    assert!(!shown.contains("unknown") && !shown.contains("do not resend"));
+}
+
 fn basic_chat_context<'a>(
     api: &'a astra_thin_client::ThinClient,
     registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,

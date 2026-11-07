@@ -129,6 +129,105 @@ enum LoginEffect {
     Completed {
         uc: bool,
     },
+    PasswordAuthenticated {
+        context: PasswordLoginContext,
+        result: Result<crate::cli::auth_flow::PasswordAuthentication, String>,
+    },
+    PasswordRegistered {
+        context: PasswordLoginContext,
+        prepared: crate::cli::auth_flow::PreparedPasswordLogin,
+        result: Result<(), String>,
+    },
+}
+
+struct PasswordLoginContext {
+    username: String,
+    register: bool,
+    session_id: Option<String>,
+    attachment_epoch: u64,
+}
+
+fn spawn_password_authentication(
+    tasks: &mut tokio::task::JoinSet<Result<LoginEffect, String>>,
+    api: astra_thin_client::ThinClient,
+    context: PasswordLoginContext,
+    password: String,
+    email: Option<String>,
+) {
+    tasks.spawn(async move {
+        let result = crate::cli::auth_flow::request_password_authentication(
+            &api,
+            &context.username,
+            &password,
+            email.as_deref(),
+        )
+        .await;
+        Ok(LoginEffect::PasswordAuthenticated { context, result })
+    });
+}
+
+fn spawn_password_registration(
+    tasks: &mut tokio::task::JoinSet<Result<LoginEffect, String>>,
+    api: astra_thin_client::ThinClient,
+    context: PasswordLoginContext,
+    prepared: crate::cli::auth_flow::PreparedPasswordLogin,
+) {
+    tasks.spawn(async move {
+        let result = crate::cli::edge_lifecycle::register_after_login(&api, &prepared.token).await;
+        Ok(LoginEffect::PasswordRegistered {
+            context,
+            prepared,
+            result,
+        })
+    });
+}
+
+async fn settle_password_authentication(
+    profile: Option<&str>,
+    context: &PasswordLoginContext,
+    result: Result<crate::cli::auth_flow::PasswordAuthentication, String>,
+    state: &mut crate::cli::session::session_state::SessionState,
+) -> Result<crate::cli::auth_flow::PreparedPasswordLogin, String> {
+    let authentication = result?;
+    crate::cli::auth_flow::prepare_password_session_login(profile, &context.username, authentication, state)
+        .await.map_err(|error| if context.register {
+            format!("Account created, but local sign-in could not be completed: {error}. Try /login with the chosen credentials before registering again.")
+        } else { format!("Login failed: {error}") })
+}
+
+/// Credential exchange owns a possible remote account creation. Drain its
+/// successful result through the same publication owner before runtime teardown;
+/// joining a task and dropping its tokens is not successful settlement.
+async fn settle_login_tasks_for_shutdown(
+    phase: &super::login_control::LoginControl,
+    tasks: &mut tokio::task::JoinSet<Result<LoginEffect, String>>,
+    profile: Option<&str>,
+    state: &mut crate::cli::session::session_state::SessionState,
+) -> Vec<String> {
+    phase.prepare_shutdown(tasks);
+    let mut notices = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(LoginEffect::PasswordAuthenticated { context, result })) => {
+                match settle_password_authentication(profile, &context, result, state).await {
+                    Ok(_) => notices.push("Sign-in saved. Start Astra again to continue.".into()),
+                    Err(error) => notices.push(error),
+                }
+            }
+            Ok(Ok(LoginEffect::PasswordRegistered { result, .. })) => {
+                notices.push(
+                    result
+                        .err()
+                        .unwrap_or_else(|| "Sign-in saved. Start Astra again to continue.".into()),
+                );
+            }
+            Ok(Err(error)) => notices.push(error),
+            Err(error) if !error.is_cancelled() => notices
+                .push("Sign-in task did not complete. Try /login before registering again.".into()),
+            _ => {}
+        }
+    }
+    notices
 }
 
 fn cancel_login_on_key(
@@ -3207,7 +3306,25 @@ fn followup_gate_after_auth(
     }
 }
 
-/// Authentication was refused before any login task or view existed.
+/// Only a successful authentication completion may release queued messages.
+/// Failure also disarms an already queued wake, which must not submit a draft.
+fn authentication_followup_handoff(
+    queue: &mut VecDeque<NextTurnSubmission>,
+    pane: &mut BottomPane,
+    chat: &mut chat_widget::ChatWidget,
+    armed: &mut bool,
+    successful_gate: Option<FollowupReleaseGate>,
+) -> QueuedFollowupHandoff {
+    if let Some(gate) = successful_gate {
+        handoff_queued_followups(queue, pane, chat, gate)
+    } else {
+        *armed = false;
+        recover_followups_after_rejected_authentication(queue, pane, chat);
+        QueuedFollowupHandoff::HeldWithDraft
+    }
+}
+
+/// Authentication was refused or completion failed.
 /// The remaining FIFO will not get a later completion, so put it back
 /// in the composer.
 fn recover_followups_after_rejected_authentication(
@@ -8452,14 +8569,63 @@ pub(crate) async fn run_tui_session(
                             Ok(LoginEffect::Completed { uc })
                         });
                     }
+                    Ok(LoginEffect::PasswordAuthenticated { context, result }) => {
+                        if result.is_ok() {
+                            // Retire reads that could otherwise apply old identity data.
+                            model_catalog_tasks.abort_all();
+                            while model_catalog_tasks.join_next().await.is_some() {}
+                            while model_catalog_rx.try_recv().is_ok() {}
+                            bottom_pane.clear_model_catalog();
+                            model_catalog_loading = false;
+                            slash_background_read_tasks.abort_all();
+                            slash_background_read_count = 0;
+                            slash_background_read_generation = slash_background_read_generation.wrapping_add(1);
+                        }
+                        let prepared = settle_password_authentication(profile, &context, result, &mut state).await;
+                        match prepared {
+                            Ok(prepared) => {
+                                crate::cli::edge_lifecycle::prepare_login_rebind(&mut edge_heartbeat_task, prepared.owner_changed).await;
+                                spawn_password_registration(&mut login_tasks, api.clone(), context, prepared);
+                                chat_widget.commit_system(history_cell::system::SystemCell::info("Completing sign-in; registering local execution…"));
+                            }
+                            Err(error) => {
+                                chat_widget.commit_system(history_cell::system::SystemCell::error(error));
+                                pending_deferred_slash_flush = false;
+                                authentication_followup_handoff(&mut queued_followup_submissions, &mut bottom_pane, &mut chat_widget, &mut followup_replay_armed, None);
+                            }
+                        }
+                    }
+                    Ok(LoginEffect::PasswordRegistered { context, prepared, result }) => {
+                        let result = auth_flow::finish_password_session_login(&prepared, result, &mut state);
+                        let authenticated = result.is_ok();
+                        match result {
+                            Ok(()) => {
+                                crate::cli::edge_lifecycle::complete_login_rebind(api, &prepared.token, profile, &mut edge_heartbeat_task).await;
+                                let action = if context.register { "Registered and logged in" } else { "Logged in" };
+                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("{action} as {}", context.username)));
+                                let report = crate::post_auth_cloud_resync(profile, &mut state).await;
+                                if let Some(notice) = report.user_notice() {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
+                                }
+                                if let Some(model) = sync_default_model_after_auth(api, &prepared.token, &mut state, &mut bottom_pane, &mut chat_widget).await {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Default model: {model}")));
+                                }
+                            }
+                            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(error)),
+                        }
+                        pending_deferred_slash_flush = false;
+                        let handoff = authentication_followup_handoff(
+                            &mut queued_followup_submissions, &mut bottom_pane, &mut chat_widget, &mut followup_replay_armed,
+                            authenticated.then(|| followup_gate_after_auth(context.session_id.as_deref(), context.attachment_epoch,
+                                state.session_id.as_deref(), state.session_attachment_epoch, model_catalog_loading, slash_background_read_count)),
+                        );
+                        schedule_queued_handoff(&handoff, &state, |event| event_stream.push_front(event), &mut followup_replay_armed);
+                    }
                     Ok(LoginEffect::Completed { uc }) => {
                         // Keep the old, identity-pinned heartbeat during browser
                         // waiting/cancellation, but join it before rebinding Edge.
-                        if let Some(task) = edge_heartbeat_task.take() {
-                            task.abort();
-                            let _ = task.await;
-                        }
-                        match auth_flow::finish_browser_session_login(api, profile, uc, &mut state).await {
+                        crate::cli::edge_lifecycle::stop_heartbeat(&mut edge_heartbeat_task).await;
+                        match auth_flow::finish_browser_session_login(api, profile, uc, &mut state, &mut edge_heartbeat_task).await {
                             Ok((replacement, token, modules)) => {
                                 pipeline_modules = modules;
                                 skill_registry = Arc::clone(&state.unified_skill_registry);
@@ -8473,11 +8639,6 @@ pub(crate) async fn run_tui_session(
                                 external_skill_discovery_pending = true;
                                 authenticated_api = replacement;
                                 api = &authenticated_api;
-                                if crate::cli::edge_lifecycle::edge_cloud_registry_enabled() {
-                                    edge_heartbeat_task = crate::cli::edge_lifecycle::spawn_edge_heartbeat(
-                                        api.clone(), token.clone(), profile.map(str::to_owned),
-                                    );
-                                }
                                 server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(api.clone(), profile, None);
                                 plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api.clone(), profile, None);
                                 server_agent_projection_sequence = None;
@@ -8831,7 +8992,8 @@ pub(crate) async fn run_tui_session(
                 let runtime_notification_event = matches!(ev, TuiEvent::RuntimeNotificationTurn);
                 if runtime_notification_event
                     && runtime_notification_turn_pending
-                    && (followup_replay_armed
+                    && (!login_tasks.is_empty()
+                        || followup_replay_armed
                         || !queued_followup_submissions.is_empty()
                         || bottom_pane.queued_next_turn_submission_count() > 0
                         || work_start_identity_pending(
@@ -11833,112 +11995,22 @@ pub(crate) async fn run_tui_session(
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
-                                    if let bottom_pane::view::ViewResult::Login { username, password } = &result {
-                                        let auth_session_id = state.session_id.clone();
-                                        let auth_epoch = state.session_attachment_epoch;
-                                        match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state).await {
-                                            Ok(token) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
-                                                let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.user_notice() {
-                                                    chat_widget.commit_system(
-                                                        history_cell::system::SystemCell::warning(notice),
-                                                    );
-                                                }
-                                                if let Some(model) = sync_default_model_after_auth(
-                                                    api,
-                                                    &token,
-                                                    &mut state,
-                                                    &mut bottom_pane,
-                                                    &mut chat_widget,
-                                                )
-                                                .await
-                                                {
-                                                    chat_widget.commit_system(
-                                                        history_cell::system::SystemCell::response(
-                                                            format!("Default model: {model}"),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {e}")));
-                                            }
-                                        }
-                                        pending_deferred_slash_flush = false;
-                                        resume_queued_followups_after_modal(
-                                            &mut queued_followup_submissions,
-                                            &mut bottom_pane,
-                                            &mut chat_widget,
-                                            &mut event_stream,
-                    &state,
-                    &mut followup_replay_armed,
-                                            followup_gate_after_auth(
-                                                auth_session_id.as_deref(),
-                                                auth_epoch,
-                                                state.session_id.as_deref(),
-                                                state.session_attachment_epoch,
-                                                model_catalog_loading,
-                                                slash_background_read_count,
-                                            ),
-                                        );
-                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                        bottom_pane.sync_popups();
-                                        frame_requester.schedule_frame();
-                                        continue;
-                                    }
-                                    if let bottom_pane::view::ViewResult::Register { username, email, password } = &result {
-                                        let auth_session_id = state.session_id.clone();
-                                        let auth_epoch = state.session_attachment_epoch;
-                                        match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state).await {
-                                            Ok(token) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
-                                                let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.user_notice() {
-                                                    chat_widget.commit_system(
-                                                        history_cell::system::SystemCell::warning(notice),
-                                                    );
-                                                }
-                                                if let Some(model) = sync_default_model_after_auth(
-                                                    api,
-                                                    &token,
-                                                    &mut state,
-                                                    &mut bottom_pane,
-                                                    &mut chat_widget,
-                                                )
-                                                .await
-                                                {
-                                                    chat_widget.commit_system(
-                                                        history_cell::system::SystemCell::response(
-                                                            format!("Default model: {model}"),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Register failed: {e}")));
-                                            }
-                                        }
-                                        pending_deferred_slash_flush = false;
-                                        resume_queued_followups_after_modal(
-                                            &mut queued_followup_submissions,
-                                            &mut bottom_pane,
-                                            &mut chat_widget,
-                                            &mut event_stream,
-                    &state,
-                    &mut followup_replay_armed,
-                                            followup_gate_after_auth(
-                                                auth_session_id.as_deref(),
-                                                auth_epoch,
-                                                state.session_id.as_deref(),
-                                                state.session_attachment_epoch,
-                                                model_catalog_loading,
-                                                slash_background_read_count,
-                                            ),
-                                        );
-                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                    let password_form = match &result {
+                                        bottom_pane::view::ViewResult::Login { username, password } => Some((username, password, None)),
+                                        bottom_pane::view::ViewResult::Register { username, email, password } => Some((username, password, Some(email.clone()))),
+                                        _ => None,
+                                    };
+                                    if let Some((username, password, email)) = password_form {
+                                        login_phase.reset();
+                                        loop_try!(login_phase.begin_exchange());
+                                        let context = PasswordLoginContext {
+                                            username: username.clone(), register: email.is_some(),
+                                            session_id: state.session_id.clone(), attachment_epoch: state.session_attachment_epoch,
+                                        };
+                                        spawn_password_authentication(&mut login_tasks, api.clone(), context, password.clone(), email);
+                                        chat_widget.commit_system(history_cell::system::SystemCell::info("Signing in…"));
+                                        let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, width);
                                         bottom_pane.sync_popups();
                                         frame_requester.schedule_frame();
                                         continue;
@@ -12902,6 +12974,7 @@ pub(crate) async fn run_tui_session(
                 }
                 if runtime_notification_wake_at
                     .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    && login_tasks.is_empty()
                     && !state.pending_bg_notifications.is_empty()
                     && bottom_pane.composer.is_empty()
                     && !bottom_pane.has_active_view()
@@ -13028,6 +13101,12 @@ pub(crate) async fn run_tui_session(
         );
     }
 
+    for notice in
+        settle_login_tasks_for_shutdown(&login_phase, &mut login_tasks, profile, &mut state).await
+    {
+        chat_widget.commit_system(history_cell::system::SystemCell::info(notice));
+    }
+
     // Stop read-side observers first so teardown does not race fresh remote
     // fetches into state that is already converging toward shutdown.
     drop(task_board);
@@ -13096,7 +13175,6 @@ pub(crate) async fn run_tui_session(
     model_setup_phase.cancel();
     model_setup_cancel.cancel();
     while model_setup_tasks.join_next().await.is_some() {}
-    login_phase.shutdown(&mut login_tasks).await;
     while model_catalog_tasks.join_next().await.is_some() {}
     for task in startup_observation_tasks {
         task.abort();
@@ -13795,6 +13873,218 @@ mod tests {
         .await
         .unwrap();
         assert!(phase.begin_exchange().is_err());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn sighup_during_committed_registration_settles_credentials_before_teardown() {
+        use crate::cli::session::session_guard::ShutdownSignal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let committed = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().route("/auth/register",axum::routing::post({
+            let committed = committed.clone();let started=started.clone();let release=release.clone();
+            move || {let committed=committed.clone();let started=started.clone();let release=release.clone();async move {
+                committed.store(true,Ordering::SeqCst);
+                started.notify_one();
+                release.notified().await;
+                axum::Json(serde_json::json!({"user_id":"new-account","access_token":"saved-access","refresh_token":"saved-refresh"}))
+            }}
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = astra_thin_client::ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let phase = super::super::login_control::LoginControl::default();
+        phase.begin_exchange().unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        spawn_password_authentication(
+            &mut tasks,
+            api,
+            PasswordLoginContext {
+                username: "new-user".into(),
+                register: true,
+                session_id: None,
+                attachment_epoch: state.session_attachment_epoch,
+            },
+            "password".into(),
+            Some("user@example.test".into()),
+        );
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+        let (signal_tx, signal_rx) = tokio::sync::watch::channel(None);
+        signal_tx.send_replace(Some(ShutdownSignal::Sighup));
+        let signal = tokio::select! {
+            biased;
+            signal=await_shutdown_signal(signal_rx)=>signal,
+            _=tasks.join_next()=>panic!("registration response is held until after SIGHUP"),
+        };
+        assert_eq!(signal, ShutdownSignal::Sighup);
+        let mut settlement = Box::pin(settle_login_tasks_for_shutdown(
+            &phase, &mut tasks, None, &mut state,
+        ));
+        tokio::select! {
+            _=&mut settlement=>panic!("shutdown must await the pending account result"),
+            _=tokio::task::yield_now()=>{},
+        }
+        release.notify_one();
+        let notices = settlement.await;
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("Sign-in saved"))
+        );
+        assert!(tasks.is_empty());
+        assert!(
+            state.agent_spawner.is_none(),
+            "shutdown must not start a fresh runtime"
+        );
+        let credentials = crate::cli::cli_config::cli_utils::load_credentials();
+        assert_eq!(
+            credentials.profiles["default"].account_id.as_deref(),
+            Some("new-account")
+        );
+        assert_eq!(
+            credentials.profiles["default"].access_token.as_deref(),
+            Some("saved-access")
+        );
+        assert_eq!(
+            credentials.profiles["default"].refresh_token.as_deref(),
+            Some("saved-refresh")
+        );
+        peer.abort();
+        let _ = peer.await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn password_forms_keep_polling_keys_while_registration_is_stalled() {
+        use crate::cli::auth_flow;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        for register in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path(if register {"/auth/register"} else {"/auth/login"}))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id":"account","access_token":"saved-access","refresh_token":"saved-refresh"
+                }))).expect(1).mount(&server).await;
+            let received = Arc::new(tokio::sync::Notify::new());
+            let notification = received.clone();
+            Mock::given(method("POST"))
+                .and(path("/agents/edge"))
+                .respond_with(move |_: &wiremock::Request| {
+                    notification.notify_one();
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok":true}))
+                        .set_delay(Duration::from_secs(60))
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
+            let phase = super::super::login_control::LoginControl::default();
+            phase.begin_exchange().unwrap();
+            let mut state = crate::cli::session::session_state::SessionState::default();
+            let context = PasswordLoginContext {
+                username: "user".into(),
+                register,
+                session_id: None,
+                attachment_epoch: state.session_attachment_epoch,
+            };
+            spawn_password_authentication(
+                &mut tasks,
+                api.clone(),
+                context,
+                "password".into(),
+                register.then(|| "user@example.test".into()),
+            );
+            let LoginEffect::PasswordAuthenticated { context, result } =
+                tasks.join_next().await.unwrap().unwrap().unwrap()
+            else {
+                panic!("expected password authentication")
+            };
+            let prepared = auth_flow::prepare_password_session_login(
+                None,
+                &context.username,
+                result.unwrap(),
+                &mut state,
+            )
+            .await
+            .unwrap();
+            let mut heartbeat = None;
+            crate::cli::edge_lifecycle::prepare_login_rebind(
+                &mut heartbeat,
+                prepared.owner_changed,
+            )
+            .await;
+            spawn_password_registration(&mut tasks, api, context, prepared);
+            tokio::time::timeout(Duration::from_secs(5), received.notified())
+                .await
+                .unwrap();
+            let (keys, mut events) = tokio::sync::mpsc::unbounded_channel();
+            for key in [
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ] {
+                keys.send(key).unwrap();
+                tokio::select! {
+                    Some(key) = events.recv() => assert_eq!(cancel_login_on_key(key,&phase,&mut tasks),Some(false)),
+                    _ = tasks.join_next() => panic!("registration should still be waiting"),
+                }
+            }
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(16)).await;
+            let LoginEffect::PasswordRegistered {
+                prepared, result, ..
+            } = tasks.join_next().await.unwrap().unwrap().unwrap()
+            else {
+                panic!("expected registration outcome")
+            };
+            tokio::time::resume();
+            let error = auth_flow::finish_password_session_login(&prepared, result, &mut state)
+                .unwrap_err();
+            assert!(error.contains("timed out") && error.contains("Your login is saved"));
+            assert_eq!(
+                crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
+                    .access_token
+                    .as_deref(),
+                Some("saved-access")
+            );
+            let mut queued = interactive_queue(["unsent message".into()]);
+            let mut pane = BottomPane::new();
+            let mut chat = chat_widget::ChatWidget::new("");
+            let mut armed = true;
+            authentication_followup_handoff(&mut queued, &mut pane, &mut chat, &mut armed, None);
+            assert!(queued.is_empty() && !armed);
+            assert_eq!(pane.composer.text(), "unsent message");
+            server.verify().await;
+        }
     }
 
     #[test]
@@ -17103,11 +17393,18 @@ mod tests {
             let mut queued = interactive_queue(["plain A".to_string()]);
             let mut pane = BottomPane::new();
             let mut chat = chat_widget::ChatWidget::new("");
-            assert!(recover_followups_after_rejected_authentication(
-                &mut queued,
-                &mut pane,
-                &mut chat,
-            ));
+            let mut armed = true;
+            assert_eq!(
+                authentication_followup_handoff(
+                    &mut queued,
+                    &mut pane,
+                    &mut chat,
+                    &mut armed,
+                    None,
+                ),
+                QueuedFollowupHandoff::HeldWithDraft
+            );
+            assert!(!armed, "an old queued wake must not submit restored input");
             assert!(queued.is_empty());
             assert_eq!(pane.composer.text(), "plain A");
         }
@@ -17151,7 +17448,13 @@ mod tests {
         let mut queued = interactive_queue(["plain B".to_string()]);
         let mut pane = BottomPane::new();
         assert_eq!(
-            handoff_queued_followups(&mut queued, &mut pane, &mut chat, same),
+            authentication_followup_handoff(
+                &mut queued,
+                &mut pane,
+                &mut chat,
+                &mut false,
+                Some(same)
+            ),
             QueuedFollowupHandoff::SubmitNext
         );
         assert!(pane.composer.is_empty());
@@ -24203,6 +24506,12 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
         // Password login preserves an old selected model as Requested. A
         // confirmed empty new account must still offer first-model setup.
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("signed-in-account"),
+        )
+        .unwrap();
         let server = MockServer::start().await;
         Mock::given(method("GET")).and(path("/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -24237,7 +24546,10 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(pane.has_active_view());
+        assert!(matches!(
+            pane.pending_model_setup_read,
+            Some(super::super::model_setup::Action::Sources)
+        ));
         assert_eq!(pane.composer.text(), "unsent conversation");
         assert!(
             matches!(state.model, Some(SessionModelChoice::Requested(ref name)) if name == "previous-owner-model")
