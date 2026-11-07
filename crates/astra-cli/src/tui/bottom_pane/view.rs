@@ -207,6 +207,14 @@ pub(crate) enum BottomPaneViewAction {
     StopBackgroundTask {
         task_id: String,
     },
+    BeginShellInput {
+        task_id: String,
+    },
+    SubmitShellInput {
+        task_id: String,
+        attachment_epoch: u64,
+        input: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -843,6 +843,12 @@ pub enum ApprovalDecision {
 /// execute immediately.
 #[async_trait]
 pub trait ToolApprovalGate: Send + Sync {
+    /// Whether authoring must wait for human review under the current user
+    /// policy. A model may request review, never waive a required review.
+    async fn plan_review_required(&self) -> bool {
+        true
+    }
+
     /// Request approval for a tool invocation. The implementation should send
     /// the request to the UI and block until the user responds or timeout.
     async fn request_approval(

@@ -31,7 +31,7 @@ async fn public_cli_bash_retains_byte_exact_large_output_and_terminal_facts() {
         .execute_with_metadata(
             "bash",
             &json!({
-                "command":"seq 1 20000; printf '\\000\\377stderr-tail\\n' >&2; exit 7"
+                "command":"seq 1 20000; printf '\\000\\377stderr-tail\\n' >&2; sleep 30 & exit 7"
             }),
         )
         .await;
@@ -41,7 +41,15 @@ async fn public_cli_bash_retains_byte_exact_large_output_and_terminal_facts() {
     assert_eq!(fields["exit_code"], 7);
     assert_eq!(fields["bash_output_capture"]["complete"], true);
     assert!(output.output.contains("complete=true"));
-    assert!(output.output.contains("exit_code=7"));
+    assert!(output.output.contains("[bash terminal facts:"));
+    assert!(output.output.contains("\"exit_code\":7"));
+    assert_eq!(fields["background_children_reaped"], true);
+    assert!(
+        output
+            .output
+            .contains("\"background_children_reaped\":true")
+    );
+    assert!(output.output.contains("\"cleanup_authoritative\":"));
     let stdout = (1..=20000)
         .map(|index| format!("{index}\n"))
         .collect::<String>()
@@ -67,12 +75,12 @@ async fn public_cli_bash_retains_byte_exact_large_output_and_terminal_facts() {
         .await;
     assert!(!next.is_error, "{next:?}");
     assert_eq!(next.output.trim(), "settled");
-    assert!(
-        next.tool_result_fields
-            .as_ref()
-            .unwrap()
-            .get("bash_output_capture")
-            .is_none()
+    let capture = &next.tool_result_fields.as_ref().unwrap()["bash_output_capture"];
+    assert_eq!(capture["complete"], true);
+    assert_eq!(capture["stdout"]["bytes"], 7);
+    assert_eq!(
+        std::fs::read(capture["stdout"]["path"].as_str().unwrap()).unwrap(),
+        b"settled"
     );
 }
 
@@ -118,11 +126,22 @@ async fn public_cli_cancelled_bash_keeps_an_explicit_partial_capture() {
 async fn public_cli_capture_failure_does_not_erase_the_observed_exit() {
     let workspace = tempfile::tempdir().unwrap();
     let executor = executor(workspace.path());
+    // Obtain the selected executor's actual capture namespace through the
+    // public result rather than assuming captures live in the workspace.
+    let bootstrap = executor
+        .execute_with_metadata("bash", &json!({"command":"printf bootstrap"}))
+        .await;
+    assert!(!bootstrap.is_error, "{bootstrap:?}");
+    let capture_path =
+        bootstrap.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["stdout"]["path"]
+            .as_str()
+            .unwrap();
+    let capture_directory = Path::new(capture_path).parent().unwrap();
     let output = executor
         .execute_with_metadata(
             "bash",
             &json!({
-                "command":"printf done > command-done; mv astra-bash-outputs captured-away"
+                "command":format!("printf done > command-done; mv '{}' captured-away", capture_directory.display())
             }),
         )
         .await;

@@ -2000,10 +2000,6 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     kind: CompactionKind,
     audit_label: &str,
 ) {
-    if state.compaction_effectiveness.is_circuit_open() {
-        return;
-    }
-
     let max_tokens = state.max_turn_input_tokens;
     let budget = TokenBudget {
         max_prompt_tokens: max_tokens,

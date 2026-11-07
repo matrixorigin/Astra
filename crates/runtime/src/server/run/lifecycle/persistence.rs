@@ -1141,7 +1141,9 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     loop_state.idempotency_cache = Default::default();
     // A prior Run's observation quarantine is not execution authority for a
     // new Run. Unresolved calls are surfaced separately from the journal.
-    loop_state.consecutive_context_window_errors = restored.consecutive_context_window_errors;
+    // Retry admission belongs to this request, not checkpoint history. The
+    // user may have changed the model capacity or request since the failure.
+    loop_state.consecutive_context_window_errors = 0;
     if let Some(compaction_state) = restored.compaction_state.as_ref() {
         loop_state.compaction_effectiveness =
             crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(
@@ -1156,6 +1158,9 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
                 current_date,
             ),
         );
+    }
+    if let Some(session) = loop_state.pipeline_session.as_mut() {
+        session.recovery.reset_on_success();
     }
     Ok(())
 }

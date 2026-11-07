@@ -147,6 +147,7 @@ pub(crate) struct BackgroundTaskRow {
     /// Foreground fan-in remains observable in this view without pretending
     /// that observation changed lifecycle ownership.
     pub run_in_background: bool,
+    pub input_available: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +217,7 @@ impl BackgroundTaskRow {
             terminal_reason: None,
             fanout: None,
             run_in_background: true,
+            input_available: false,
         }
     }
 
@@ -232,6 +234,11 @@ impl BackgroundTaskRow {
             BackgroundTaskRowInit::new(id, BackgroundTaskKind::Shell, status, elapsed_ms, title)
                 .with_output(output_ref, output_tail, total_bytes),
         )
+    }
+
+    pub(crate) fn with_input_available(mut self, available: bool) -> Self {
+        self.input_available = available;
+        self
     }
 
     pub(crate) fn with_live_control(mut self, live_control: LiveControlState) -> Self {

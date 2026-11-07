@@ -5,9 +5,7 @@
 
 use super::{ApprovedNativeRuntime, ToolExecutor};
 use astra_edge::EdgeInvocationInput;
-use astra_sandbox::{
-    BashInvocationOwner, FramedProcess, FramedProcessEnd, FramedProcessInput, FramedProcessLimits,
-};
+use astra_sandbox::{BashInvocationOwner, OwnedProcess, ProcessEnd, ProcessInput, ProcessIoLimits};
 use astra_tools::{ProviderInteractionDecision, ProviderInteractionGate, ToolResult};
 use astra_turn_types::{ProviderInteractionRequest, ProviderStageInput, ProviderStageInputAck};
 use serde::Deserialize;
@@ -550,7 +548,7 @@ async fn verify_installed_protocol(
     let mut process = owner
         .spawn_framed(
             command,
-            FramedProcessLimits {
+            ProcessIoLimits {
                 max_frame_bytes: FRAME_BYTES,
                 max_queued_frames: 1,
                 max_stderr_bytes: 4096,
@@ -614,7 +612,7 @@ async fn verify_installed_protocol(
     } else {
         None
     };
-    // `FramedProcess` owns the physical cleanup deadline and descendant
+    // `OwnedProcess` owns the physical cleanup deadline and descendant
     // settlement. Do not wrap this future in another timeout: dropping the
     // join future here would abandon the only owner that can prove cleanup,
     // allowing the next PATH candidate to be probed while the old process is
@@ -887,8 +885,8 @@ fn native_models_from_provider_catalog(
 }
 
 async fn fetch_model_catalog(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     evidence: &mut Evidence,
     output_limit: usize,
     cancel: &CancellationToken,
@@ -1507,7 +1505,7 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Value, &'static str> {
     Ok(value)
 }
 
-pub(crate) async fn send(input: &FramedProcessInput, value: Value) -> Result<(), &'static str> {
+pub(crate) async fn send(input: &ProcessInput, value: Value) -> Result<(), &'static str> {
     let frame = serde_json::to_vec(&value).map_err(|_| "native request serialization failed")?;
     input
         .send_frame(&frame)
@@ -1694,7 +1692,7 @@ impl PendingStageInputAck {
 }
 
 async fn start_stage_input(
-    input: &FramedProcessInput,
+    input: &ProcessInput,
     evidence: &mut Evidence,
     message: EdgeInvocationInput,
 ) -> Result<Option<PendingStageInputAck>, &'static str> {
@@ -1729,8 +1727,8 @@ async fn start_stage_input(
 /// guidance stops further input, not a still-healthy native task.
 #[allow(clippy::too_many_arguments)]
 async fn drive_active_turn(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     evidence: &mut Evidence,
     gate: Option<&dyn ProviderInteractionGate>,
     cancel: &CancellationToken,
@@ -1827,8 +1825,8 @@ async fn drive_active_turn(
 
 #[allow(clippy::too_many_arguments)]
 async fn rpc(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     request: Value,
     evidence: &mut Evidence,
     output_limit: usize,
@@ -1938,8 +1936,8 @@ async fn rpc(
 /// selecting a model or starting a turn.
 #[allow(clippy::too_many_arguments)]
 async fn initialize_protocol(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     evidence: &mut Evidence,
     output_limit: usize,
     gate: Option<&dyn ProviderInteractionGate>,
@@ -1980,8 +1978,8 @@ async fn initialize_protocol(
 /// catalog is empty or temporarily unavailable, while an explicitly requested
 /// model is resolved against the live catalog immediately before its turn.
 async fn verify_provider_authentication(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     evidence: &mut Evidence,
     cancel: &CancellationToken,
     output_limit: usize,
@@ -2017,8 +2015,8 @@ async fn verify_provider_authentication(
 }
 
 async fn resolve_requested_model(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     stage: &Stage,
     evidence: &mut Evidence,
     output_limit: usize,
@@ -2080,7 +2078,7 @@ async fn resolve_requested_model(
 }
 
 async fn next_envelope(
-    process: &mut FramedProcess,
+    process: &mut OwnedProcess,
     evidence: &mut Evidence,
 ) -> Result<Value, &'static str> {
     if !evidence.pre_ack.is_empty() {
@@ -2416,7 +2414,7 @@ fn validate_interaction_response(
 // Protocol transport, output budget and interaction authority have distinct owners.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
-    process: &mut FramedProcess,
+    process: &mut OwnedProcess,
     stage: &Stage,
     cwd: &str,
     sandbox: &Value,
@@ -2441,7 +2439,7 @@ async fn drive(
 
 #[allow(clippy::too_many_arguments)]
 async fn drive_with_input(
-    process: &mut FramedProcess,
+    process: &mut OwnedProcess,
     stage: &Stage,
     cwd: &str,
     sandbox: &Value,
@@ -2468,7 +2466,7 @@ async fn drive_with_input(
 
 #[allow(clippy::too_many_arguments)]
 async fn drive_with_cached_catalog(
-    process: &mut FramedProcess,
+    process: &mut OwnedProcess,
     stage: &Stage,
     cwd: &str,
     sandbox: &Value,
@@ -2783,7 +2781,7 @@ impl ToolExecutor {
             Ok(remaining) => remaining,
             Err(reason) => return failure(reason),
         };
-        let limits = FramedProcessLimits {
+        let limits = ProcessIoLimits {
             max_frame_bytes: FRAME_BYTES,
             max_queued_frames: 1,
             max_stderr_bytes: 4096,
@@ -2853,9 +2851,9 @@ impl ToolExecutor {
             unsettled_on_drop.0.take();
         }
         let transport_ok = outcome.as_ref().is_ok_and(|outcome| {
-            (matches!(outcome.end, FramedProcessEnd::Exited)
+            (matches!(outcome.end, ProcessEnd::Exited)
                 && outcome.status.is_some_and(|status| status.success()))
-                || (cleanup_cancelled && matches!(outcome.end, FramedProcessEnd::Cancelled))
+                || (cleanup_cancelled && matches!(outcome.end, ProcessEnd::Cancelled))
         });
         let target_released = outcome
             .as_ref()

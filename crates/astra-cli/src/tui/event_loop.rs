@@ -22,7 +22,6 @@ use std::{
     time::Duration,
 };
 
-use crate::lock_recovery::LockRecovery;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 use crossterm::style::Stylize;
 use tokio_stream::StreamExt;
@@ -2537,43 +2536,6 @@ async fn sync_default_model_after_auth(
     Some(model)
 }
 
-async fn install_bash_detach_listener(
-    slot: &astra_tools::detach::DetachShellSlot,
-    chat_widget: &mut chat_widget::ChatWidget,
-    status_indicator: &mut status_indicator::StatusIndicator,
-) -> astra_tools::detach::DetachShellListener {
-    let (handle, listener) = astra_tools::detach::new_detach_pair();
-    *slot.lock().await = Some(handle);
-    set_bash_background_hint_enabled(chat_widget, status_indicator, false);
-    listener
-}
-
-fn bash_detach_hint_enabled(listener: Option<&astra_tools::detach::DetachShellListener>) -> bool {
-    let Some(listener) = listener else {
-        return false;
-    };
-    should_show_ctrl_b_background_hint(listener.is_active())
-}
-
-type BashDetachHandoffResult = Result<astra_tools::detach::DetachedShellPayload, String>;
-
-async fn await_bash_detach_handoff_with_timeout(
-    listener: astra_tools::detach::DetachShellListener,
-    timeout: Duration,
-) -> BashDetachHandoffResult {
-    match tokio::time::timeout(timeout, listener.payload_rx).await {
-        Ok(Ok(payload)) => Ok(payload),
-        Ok(Err(_)) => Err("bash runner ended before handing off the process.".to_string()),
-        Err(_) => Err("bash runner did not hand off the process before timeout.".to_string()),
-    }
-}
-
-async fn await_bash_detach_handoff(
-    listener: astra_tools::detach::DetachShellListener,
-) -> BashDetachHandoffResult {
-    await_bash_detach_handoff_with_timeout(listener, BASH_DETACH_HANDOFF_WAIT).await
-}
-
 fn is_background_task_manage_key(key: &crossterm::event::KeyEvent) -> bool {
     key.code == crossterm::event::KeyCode::Down
         && key
@@ -2795,7 +2757,7 @@ fn restore_queued_input(entries: VecDeque<NextTurnSubmission>, bottom_pane: &mut
             NextTurnSubmission::Interactive(text) => interactive.push(text),
             NextTurnSubmission::Conversation { target, content } => {
                 bottom_pane.push_workbench_input(Box::new(
-                    bottom_pane::agent_guide_view::AgentGuideView::for_continuation(
+                    bottom_pane::task_input_view::TaskInputView::for_continuation(
                         target,
                         content,
                         Some("This instruction was not sent. Review it before continuing.".into()),
@@ -2809,24 +2771,17 @@ fn restore_queued_input(entries: VecDeque<NextTurnSubmission>, bottom_pane: &mut
     }
 }
 
-fn submission_belongs_to_next_turn(
-    output_has_settled: bool,
-    foreground_lifecycle_transferred: bool,
-) -> bool {
-    output_has_settled || foreground_lifecycle_transferred
+fn submission_belongs_to_next_turn(output_has_settled: bool) -> bool {
+    output_has_settled
 }
 
 /// Slash commands belong to the local command dispatcher, never to the
 /// model-facing active-run guidance channel.  Queue them until the current
 /// turn settles so the ordinary idle submission path can dispatch them with
 /// exactly the same semantics as a command entered between turns.
-fn active_submission_belongs_to_next_turn(
-    text: &str,
-    output_has_settled: bool,
-    foreground_lifecycle_transferred: bool,
-) -> bool {
+fn active_submission_belongs_to_next_turn(text: &str, output_has_settled: bool) -> bool {
     slash_dispatch::parse_submission(text).is_command()
-        || submission_belongs_to_next_turn(output_has_settled, foreground_lifecycle_transferred)
+        || submission_belongs_to_next_turn(output_has_settled)
 }
 
 /// Current-run guidance is closed once the server definitively fences it.
@@ -2835,17 +2790,12 @@ fn active_submission_belongs_to_next_turn(
 fn active_submission_routes_to_next_turn(
     text: &str,
     output_has_settled: bool,
-    foreground_lifecycle_transferred: bool,
     guidance_admission_closed: bool,
     follow_up_deferred_before_bind: bool,
 ) -> bool {
     guidance_admission_closed
         || follow_up_deferred_before_bind
-        || active_submission_belongs_to_next_turn(
-            text,
-            output_has_settled,
-            foreground_lifecycle_transferred,
-        )
+        || active_submission_belongs_to_next_turn(text, output_has_settled)
 }
 
 /// Current-run guidance needs the durable server run id from `RunBound`.
@@ -2889,7 +2839,7 @@ fn defer_follow_up_before_run_bind(
 async fn handle_active_run_background_tasks_command(
     queued_text: &str,
     chat_widget: &mut chat_widget::ChatWidget,
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     bottom_pane: &mut BottomPane,
@@ -2916,15 +2866,13 @@ async fn handle_active_run_background_tasks_command(
 fn should_start_queued_followups(
     turn_ok: bool,
     turn_interrupted: bool,
-    foreground_lifecycle_transferred: bool,
     exit_after_turn_settlement: bool,
     turn_not_started: bool,
 ) -> bool {
     if turn_not_started {
         return false;
     }
-    (turn_ok && !turn_interrupted || foreground_lifecycle_transferred)
-        && !exit_after_turn_settlement
+    turn_ok && !turn_interrupted && !exit_after_turn_settlement
 }
 
 fn model_facing_followup_backlog(queued: &VecDeque<NextTurnSubmission>) -> bool {
@@ -3644,13 +3592,12 @@ fn active_guidance_closure_pending(
     run_control: &crate::cli::turn::local_run_control::LocalRunControl,
     submission_in_flight: bool,
 ) -> bool {
-    let barriers = TurnClosureBarriers::capture(run_control, submission_in_flight, false, false);
+    let barriers = TurnClosureBarriers::capture(run_control, submission_in_flight, false);
     barriers.guidance_submission_pending || barriers.guidance_disposition_pending
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TurnClosureBarriers {
-    bash_detach_request_pending: bool,
     guidance_submission_pending: bool,
     guidance_disposition_pending: bool,
     turn_projection_drain_pending: bool,
@@ -3660,11 +3607,9 @@ impl TurnClosureBarriers {
     fn capture(
         run_control: &crate::cli::turn::local_run_control::LocalRunControl,
         guidance_submission_in_flight: bool,
-        bash_detach_request_pending: bool,
         turn_projection_drain_pending: bool,
     ) -> Self {
         Self {
-            bash_detach_request_pending,
             guidance_submission_pending: guidance_submission_in_flight
                 || !run_control.pending_remote_submission_ids().is_empty(),
             guidance_disposition_pending: !run_control.pending_remote_disposition_ids().is_empty(),
@@ -3677,9 +3622,7 @@ impl TurnClosureBarriers {
     }
 
     fn all_clear(self) -> bool {
-        !self.bash_detach_request_pending
-            && !self.guidance_pending()
-            && !self.turn_projection_drain_pending
+        !self.guidance_pending() && !self.turn_projection_drain_pending
     }
 }
 
@@ -3844,13 +3787,13 @@ async fn submit_active_runtime_notification(
 }
 
 fn background_task_event_requires_model_attention(
-    event: &super::background_tasks::BgTaskEvent,
+    event: &crate::edge_tools::background_tasks::BgTaskEvent,
 ) -> bool {
     matches!(
         event,
-        super::background_tasks::BgTaskEvent::Completed { .. }
-            | super::background_tasks::BgTaskEvent::Failed { .. }
-            | super::background_tasks::BgTaskEvent::Killed { .. }
+        crate::edge_tools::background_tasks::BgTaskEvent::Completed { .. }
+            | crate::edge_tools::background_tasks::BgTaskEvent::Failed { .. }
+            | crate::edge_tools::background_tasks::BgTaskEvent::Killed { .. }
     )
 }
 
@@ -3859,87 +3802,8 @@ fn background_task_event_requires_model_attention(
 /// backends are snapshotted before that borrow and drained from its 80ms tick.
 /// Without this, `task_output` waits for the event loop that is itself waiting
 /// for the active agent, producing a deterministic registry timeout.
-async fn drain_background_task_commands(
-    commands: &Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
-    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
-    list_cache: &Arc<tokio::sync::RwLock<String>>,
-) -> bool {
-    let commands: Vec<_> = commands.lock_recover().drain(..).collect();
-    let mut mutated = false;
-    for command in commands {
-        match command {
-            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
-                let result = stop_background_task_with_agents(
-                    background_registry,
-                    agent_spawner,
-                    restored_local_agents,
-                    &task_id,
-                )
-                .await
-                .map(|_| ());
-                mutated |= result.is_ok();
-                let _ = reply.send(result);
-            }
-            crate::edge_tools::BgTaskCommand::GetOutputSince {
-                task_id,
-                offset,
-                max_bytes,
-                reply,
-            } => {
-                let _ = reply.send(
-                    background_task_output_snapshot_with_agents(
-                        background_registry,
-                        agent_spawner,
-                        restored_local_agents,
-                        &task_id,
-                        offset,
-                        max_bytes,
-                    )
-                    .await,
-                );
-            }
-            crate::edge_tools::BgTaskCommand::SearchOutput {
-                task_id,
-                pattern,
-                context_lines,
-                max_bytes,
-                reply,
-            } => {
-                let _ = reply.send(
-                    background_task_output_search_snapshot(
-                        background_registry,
-                        &task_id,
-                        &pattern,
-                        context_lines,
-                        max_bytes,
-                    )
-                    .await,
-                );
-            }
-            crate::edge_tools::BgTaskCommand::List { reply } => {
-                let rendered = render_background_task_list_xml_with_agents(
-                    background_registry,
-                    agent_spawner,
-                    restored_local_agents,
-                )
-                .await;
-                *list_cache.write().await = rendered.clone();
-                let _ = reply.send(rendered);
-            }
-        }
-    }
-    mutated
-}
-
-/// Rebuild background-work presentation at the cadence its underlying output
-/// sampler can actually change. The 50 ms input loop must not serialize XML or
-/// contend on the model-facing cache when no background fact changed. An open
-/// task view still receives per-frame elapsed-time projection without forcing
-/// the shared cache and footer down that hot path.
 async fn refresh_background_task_surfaces(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     local_agent_snapshot: &super::local_agent_snapshot::LocalAgentSnapshot,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     list_cache: &tokio::sync::RwLock<String>,
@@ -4908,6 +4772,12 @@ fn sync_explain_presentation(
 
 #[derive(Debug)]
 enum AgentWorkbenchOutcome {
+    ShellInput {
+        task_id: String,
+        attachment_epoch: u64,
+        input: Option<String>,
+        outcome: crate::edge_tools::ToolExecutionOutcome,
+    },
     Clipboard {
         success_message: String,
         result: Result<(), String>,
@@ -5301,6 +5171,33 @@ fn drain_agent_workbench_outcomes(
             continue;
         }
         match outcome {
+            AgentWorkbenchOutcome::ShellInput {
+                task_id,
+                attachment_epoch: origin,
+                input,
+                outcome,
+            } => {
+                if origin != attachment_epoch {
+                    continue;
+                }
+                if outcome.is_error {
+                    chat_widget.commit_system(history_cell::system::SystemCell::error(
+                        outcome.output.clone(),
+                    ));
+                    bottom_pane.push_view(Box::new(
+                        bottom_pane::task_input_view::TaskInputView::for_shell(
+                            task_id,
+                            origin,
+                            input.unwrap_or_default(),
+                            Some(outcome.output),
+                        ),
+                    ));
+                } else {
+                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                        "Input sent to {task_id}"
+                    )));
+                }
+            }
             AgentWorkbenchOutcome::Clipboard {
                 success_message,
                 result,
@@ -5369,7 +5266,7 @@ fn drain_agent_workbench_outcomes(
                             "agent requires session continuation"
                         );
                         bottom_pane.push_workbench_input(Box::new(
-                            bottom_pane::agent_guide_view::AgentGuideView::for_continuation(
+                            bottom_pane::task_input_view::TaskInputView::for_continuation(
                                 SessionContinuationTarget(Arc::new(*context)),
                                 String::new(),
                                 None,
@@ -5431,7 +5328,7 @@ fn drain_agent_workbench_outcomes(
                 };
                 let agent_name = target.agent_name().to_owned();
                 bottom_pane.push_view(Box::new(
-                    bottom_pane::agent_guide_view::AgentGuideView::with_draft(
+                    bottom_pane::task_input_view::TaskInputView::with_draft(
                         target,
                         intent.text,
                         format!("Not sent: {reason}"),
@@ -5539,7 +5436,7 @@ struct ViewActionBackends {
 // may advance, avoiding an ambient bag that could be retained across awaits.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_projection_actions(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     server_agent_observer: &crate::tui::server_agent_observer::ServerAgentObserver,
     server_agent_projection_sequence: &mut Option<u64>,
     backends: ViewActionBackends,
@@ -6713,7 +6610,7 @@ fn dispatch_agent_guide(
             "Could not stage agent guidance. The draft was not sent.",
         ));
         bottom_pane.push_view(Box::new(
-            bottom_pane::agent_guide_view::AgentGuideView::with_draft(
+            bottom_pane::task_input_view::TaskInputView::with_draft(
                 receipt,
                 content,
                 "Not sent: local validation failed",
@@ -6958,7 +6855,7 @@ fn apply_live_session_binding(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_bottom_pane_view_action(
     action: BottomPaneViewAction,
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     server_agent_observer: &crate::tui::server_agent_observer::ServerAgentObserver,
     server_agent_projection_sequence: &mut Option<u64>,
     backends: ViewActionBackends,
@@ -6970,6 +6867,55 @@ async fn dispatch_bottom_pane_view_action(
     terminal_height: u16,
 ) {
     match action {
+        BottomPaneViewAction::BeginShellInput { task_id } => {
+            if background_registry.get(&task_id).is_some_and(|task| {
+                task.input
+                    .get()
+                    .is_some_and(astra_sandbox::ProcessInput::is_open)
+                    && !task.status().is_terminal()
+            }) {
+                bottom_pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::for_shell(
+                        task_id,
+                        backends.session_attachment_epoch,
+                        String::new(),
+                        None,
+                    ),
+                ));
+                frame_requester.schedule_frame();
+            }
+        }
+        BottomPaneViewAction::SubmitShellInput {
+            task_id,
+            attachment_epoch,
+            input,
+        } => {
+            if attachment_epoch != backends.session_attachment_epoch {
+                chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                    "Session changed; no input was sent.",
+                ));
+                return;
+            }
+            let tasks = background_registry.clone();
+            let tx = backends.agent_workbench_tx;
+            tokio::spawn(async move {
+                let args = match &input {
+                    Some(input) => {
+                        serde_json::json!({"task_id":task_id,"input":format!("{input}\n")})
+                    }
+                    None => serde_json::json!({"task_id":task_id,"close_stdin":true}),
+                };
+                let outcome = tasks.input(&args, None).await;
+                let _ = tx
+                    .send(AgentWorkbenchOutcome::ShellInput {
+                        task_id,
+                        attachment_epoch,
+                        input,
+                        outcome,
+                    })
+                    .await;
+            });
+        }
         BottomPaneViewAction::ReturnToConversationNavigator => {
             // A transcript tab remains alive when the user goes back to the
             // run tree, preserving its live suffix, scroll, search and
@@ -7113,16 +7059,16 @@ async fn dispatch_bottom_pane_view_action(
             run_id,
             target,
         } => {
-            bottom_pane.push_view(Box::new(
-                bottom_pane::agent_guide_view::AgentGuideView::new(AgentGuideTarget::capture(
+            bottom_pane.push_view(Box::new(bottom_pane::task_input_view::TaskInputView::new(
+                AgentGuideTarget::capture(
                     agent_name,
                     run_id,
                     target,
                     backends.api.clone(),
                     backends.session_id.clone(),
                     backends.session_attachment_epoch,
-                )),
-            ));
+                ),
+            )));
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::SubmitAgentGuide { target, content } => {
@@ -7153,7 +7099,7 @@ async fn dispatch_bottom_pane_view_action(
                 }
             } else {
                 bottom_pane.push_workbench_input(Box::new(
-                    bottom_pane::agent_guide_view::AgentGuideView::for_continuation(
+                    bottom_pane::task_input_view::TaskInputView::for_continuation(
                         target,
                         content,
                         Some(
@@ -7367,11 +7313,44 @@ fn classify_local_shell_submission(text: &str) -> LocalShellSubmission {
     }
 }
 
-fn start_local_background_shell(
-    registry: &mut super::background_tasks::BackgroundTaskRegistry,
+async fn start_local_background_shell(
+    registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
+    worktree_journal: Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
     command: &str,
 ) -> Result<String, String> {
-    registry.try_spawn_shell(command, command)
+    let root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let executor = crate::edge_tools::ToolExecutor::new(root)
+        .with_shared_git_worktree_journal(worktree_journal)
+        .with_background_tasks(registry.clone());
+    // The user explicitly selected this local command. Install only its
+    // canonical Bash surface instead of relying on a model request's surface.
+    let bash_surface: Vec<_> = crate::edge_tools::all_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            schema
+                .pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("bash")
+        })
+        .collect();
+    executor.set_current_visible_tool_schemas(&bash_surface);
+    let outcome = executor
+        .execute_with_invocation_metadata_cancelable(
+            "bash",
+            &serde_json::json!({
+                "command": command, "yield_time_ms": 0,
+            }),
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
+            None,
+        )
+        .await;
+    outcome
+        .tool_result_fields
+        .as_ref()
+        .and_then(|fields| fields.get("task_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or(outcome.output)
 }
 
 fn local_background_shell_started_message(task_id: &str, command: &str) -> String {
@@ -8131,10 +8110,13 @@ pub(crate) async fn run_tui_session(
         tokio::sync::mpsc::channel::<AgentWorkbenchOutcome>(64);
 
     // Background task registry — owns spawned shell/agent processes.
-    let mut background_registry = super::background_tasks::BackgroundTaskRegistry::new(
-        background_task_output_dir(state.session_id.as_deref()),
-    )
-    .with_active_work_registry(state.active_work_registry.clone());
+    let user_shell_worktree_journal = state.git_worktree_journal.clone();
+    let mut background_registry = state
+        .background_tasks
+        .clone()
+        .with_active_work_registry(state.active_work_registry.clone());
+    background_registry
+        .rebind_output_dir_for_new_tasks(background_task_output_dir(state.session_id.as_deref()));
     let mut restored_local_agent_task_projections =
         restore_background_task_projections(&mut background_registry, state.session_id.as_deref())
             .await;
@@ -9090,8 +9072,9 @@ pub(crate) async fn run_tui_session(
                                     LocalShellSubmission::Background(command) => {
                                         match start_local_background_shell(
                                             &mut background_registry,
+                                            user_shell_worktree_journal.clone(),
                                             &command,
-                                        ) {
+                                        ).await {
                                             Ok(task_id) => chat_widget.commit_system(
                                                 history_cell::system::SystemCell::info(
                                                     local_background_shell_started_message(
@@ -9662,37 +9645,6 @@ pub(crate) async fn run_tui_session(
                                     let mut output_settled_at: Option<std::time::Instant> = None;
                                     let mut turn_projection_drained = false;
                                     let mut exit_after_turn_settlement = false;
-                                    // Phase 3b.3c: prime the bash detach slot for this
-                                    // turn. The bash runner takes the handle on entry;
-                                    // we keep the listener so a Ctrl+B keypress can
-                                    // fire the signal and await the live child + streams
-                                    // payload back. Replaces any stale handle from a
-                                    // prior turn that was never consumed (e.g. the model
-                                    // didn't run bash last turn).
-                                    let mut bash_detach_listener = Some(
-                                        install_bash_detach_listener(
-                                            &state.bash_detach_slot,
-                                            &mut chat_widget,
-                                            &mut status_indicator,
-                                        )
-                                        .await,
-                                    );
-                                    let (
-                                        bash_detach_handoff_tx,
-                                        mut bash_detach_handoff_rx,
-                                    ) = tokio::sync::mpsc::unbounded_channel::<
-                                        BashDetachHandoffResult,
-                                    >();
-                                    let mut bash_detach_handoff_channel_open = true;
-                                    let mut bash_detach_request_pending = false;
-                                    let mut active_bash_tool_use_id: Option<String> = None;
-                                    let mut active_bash_description: Option<String> = None;
-                                    // Once Ctrl+B transfers lifecycle ownership away from
-                                    // the foreground parent, that parent is no longer a valid
-                                    // guidance target. Composer input after the handoff belongs
-                                    // to the next turn even while the cancelled parent future is
-                                    // still draining its final transport events.
-                                    let mut foreground_lifecycle_transferred = false;
                                     let mut deferred_active_bg_notifications = Vec::new();
                                     // The host normally reports Explain Analyze repair through
                                     // the ordered stream. Keep one outer-turn bit as a final
@@ -9755,13 +9707,11 @@ pub(crate) async fn run_tui_session(
                                         *astra_core::sync_poison::recover_mutex_lock(
                                             &active_turn_local_run_control,
                                         ) = Some(preinstalled_run_control.clone());
-                                        let bash_detach_slot_for_ctrl_b =
-                                            state.bash_detach_slot.clone();
+                                        let foreground_wait_control_for_ctrl_b =
+                                            state.foreground_wait_control.clone();
                                         let background_registry_turn_session_id =
                                             state.session_id.clone();
                                         let background_registry_turn_model = state.model.as_deref().map(str::to_string);
-                                        let bg_task_commands_for_turn =
-                                            state.bg_task_commands.clone();
                                         let bg_task_list_cache_for_turn =
                                             state.bg_task_list_cache.clone();
                                         let active_work_registry_for_turn =
@@ -9885,8 +9835,7 @@ pub(crate) async fn run_tui_session(
                                             let closure_barriers = TurnClosureBarriers::capture(
                                                 &preinstalled_run_control,
                                                 guidance_submission_in_flight,
-                                                bash_detach_request_pending,
-                                                turn_result_ready.is_some()
+                                                                                    turn_result_ready.is_some()
                                                     && !turn_projection_drained,
                                             );
                                             if turn_result_ready.is_some()
@@ -10109,42 +10058,11 @@ pub(crate) async fn run_tui_session(
                                                             // panel remains an explicit navigation action when there
                                                             // is no foreground work to promote.
                                                             if is_ctrl_b_background_key(&k) {
-                                                                let detach_fired = if !bash_detach_request_pending
-                                                                    && background_registry.can_spawn_shell_task()
-                                                                    && let Some(listener) = bash_detach_listener.take()
-                                                                {
-                                                                    if listener.is_active()
-                                                                        && listener.signal_tx.send(true).is_ok()
-                                                                    {
-                                                                        listener.retire();
-                                                                        bash_detach_request_pending = true;
-                                                                        set_bash_background_hint_enabled(
-                                                                            &mut chat_widget,
-                                                                            &mut status_indicator,
-                                                                            false,
-                                                                        );
-                                                                        let handoff_tx =
-                                                                            bash_detach_handoff_tx.clone();
-                                                                        tokio::spawn(async move {
-                                                                            let result = await_bash_detach_handoff(listener).await;
-                                                                            let _ = handoff_tx.send(result);
-                                                                        });
-                                                                        true
-                                                                    } else {
-                                                                        bash_detach_listener = Some(listener);
-                                                                        false
-                                                                    }
-                                                                } else {
-                                                                    false
-                                                                };
-
-                                                                if detach_fired {
-                                                                    let pending_title = active_bash_description
-                                                                        .as_deref()
-                                                                        .unwrap_or("Bash");
+                                                                let wait_released = foreground_wait_control_for_ctrl_b.release();
+                                                                if wait_released {
                                                                     chat_widget.commit_system(
                                                                         history_cell::system::SystemCell::background_task(
-                                                                            format!("Moving {pending_title} to the background…"),
+                                                                            "Continuing without waiting; the task remains available in the task panel.",
                                                                         ),
                                                                     );
                                                                 } else {
@@ -10298,8 +10216,9 @@ pub(crate) async fn run_tui_session(
                                                                             LocalShellSubmission::Background(command) => {
                                                                                 match start_local_background_shell(
                                                                                     &mut background_registry,
+                                                                                    user_shell_worktree_journal.clone(),
                                                                                     &command,
-                                                                                ) {
+                                                                                ).await {
                                                                                     Ok(task_id) => chat_widget.commit_system(
                                                                                         history_cell::system::SystemCell::info(
                                                                                             local_background_shell_started_message(
@@ -10391,12 +10310,10 @@ pub(crate) async fn run_tui_session(
                                                                         if active_submission_routes_to_next_turn(
                                                                             &queued_text,
                                                                             output_settled_at.is_some(),
-                                                                            foreground_lifecycle_transferred,
-                                                                            guidance_admission_closed,
+                                                                                                                                            guidance_admission_closed,
                                                                             follow_up_deferred_before_bind,
                                                                         ) {
-                                                                            // The response stream has ended, foreground
-                                                                            // ownership has moved, the server has
+                                                                            // The response stream has ended, the server has
                                                                             // fenced current-run guidance, or an
                                                                             // earlier follow-up is already waiting
                                                                             // for RunBound. Hold the text until this
@@ -10472,6 +10389,11 @@ pub(crate) async fn run_tui_session(
                                                                             );
                                                                             continue;
                                                                         }
+                                                                        // A parent instruction releases only its foreground
+                                                                        // waits. Task ownership and stdin stay unchanged.
+                                                                        preinstalled_run_control
+                                                                            .expect_remote_user_intent_submission(&intent_id);
+                                                                        foreground_wait_control_for_ctrl_b.release();
                                                                         // Project local custody before awaiting the network.
                                                                         // The user can now distinguish "sending" from a
                                                                         // server-owned intent, and an ambiguous response cannot
@@ -10491,8 +10413,6 @@ pub(crate) async fn run_tui_session(
                                                                         let submission_intent_id = intent_id.clone();
                                                                         let submission_text = queued_text.clone();
                                                                         let submission_tx = guidance_submission_tx.clone();
-                                                                        preinstalled_run_control
-                                                                            .expect_remote_user_intent_submission(&intent_id);
                                                                         in_flight_guidance_queue_index = Some(
                                                                             bottom_pane
                                                                                 .queued_next_turn_submission_count(),
@@ -10745,157 +10665,6 @@ pub(crate) async fn run_tui_session(
                                                         }
                                                     }
                                                 }
-                                                handoff = bash_detach_handoff_rx.recv(), if bash_detach_handoff_channel_open => {
-                                                    bash_detach_request_pending = false;
-                                                    let handoff = match handoff {
-                                                        Some(handoff) => handoff,
-                                                        None => {
-                                                            bash_detach_handoff_channel_open = false;
-                                                            tracing::warn!(
-                                                                "bash detach handoff channel closed without payload"
-                                                            );
-                                                            chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::error(
-                                                                    "⏎ Backgrounding failed: runner disconnected",
-                                                                ),
-                                                            );
-                                                            set_bash_background_hint_enabled(
-                                                                &mut chat_widget,
-                                                                &mut status_indicator,
-                                                                false,
-                                                            );
-                                                            frame_requester.schedule_frame();
-                                                            continue;
-                                                        }
-                                                    };
-
-                                                    match handoff {
-                                                        Ok(payload) => {
-                                                            if !background_registry.can_spawn_shell_task() {
-                                                                let error = format!(
-                                                                    "background shell task limit reached ({} running)",
-                                                                    background_registry.running_count()
-                                                                );
-                                                                let astra_tools::detach::DetachedShellPayload {
-                                                                    mut child,
-                                                                    adoption_tx,
-                                                                    ..
-                                                                } = payload;
-                                                                let _ = adoption_tx.send(Err(error));
-                                                                let _ = child.kill().await;
-                                                                let _ = child.wait().await;
-                                                                chat_widget.commit_system(
-                                                                    history_cell::system::SystemCell::error(
-                                                                        "⏎ Backgrounding failed: task limit reached",
-                                                                    ),
-                                                                );
-                                                                set_bash_background_hint_enabled(
-                                                                    &mut chat_widget,
-                                                                    &mut status_indicator,
-                                                                    false,
-                                                                );
-                                                                frame_requester.schedule_frame();
-                                                                continue;
-                                                            }
-
-                                                            let astra_tools::detach::DetachedShellPayload {
-                                                                child,
-                                                                stdout,
-                                                                stderr,
-                                                                command,
-                                                                partial_stdout,
-                                                                partial_stderr,
-                                                                adoption_tx,
-                                                            } = payload;
-                                                            let id = match background_registry.adopt_detached_shell(
-                                                                child,
-                                                                stdout,
-                                                                stderr,
-                                                                &command,
-                                                                partial_stdout,
-                                                                partial_stderr,
-                                                            ) {
-                                                                Ok(id) => {
-                                                                    let _ = adoption_tx.send(Ok(id.clone()));
-                                                                    foreground_lifecycle_transferred = true;
-                                                                    id
-                                                                }
-                                                                Err(error) => {
-                                                                    let _ = adoption_tx.send(Err(error.clone()));
-                                                                    chat_widget.commit_system(
-                                                                        history_cell::system::SystemCell::error(
-                                                                            format!("⏎ Backgrounding failed: {error}")
-                                                                        ),
-                                                                    );
-                                                                    set_bash_background_hint_enabled(
-                                                                        &mut chat_widget,
-                                                                        &mut status_indicator,
-                                                                        false,
-                                                                    );
-                                                                    let _ = reveal_background_task_view_with_extra_rows(
-                                                                        &mut background_registry,
-                                                                        agent_spawner_for_cancel.as_ref(),
-                                                                        &restored_local_agent_task_projections,
-                                                                        &mut bottom_pane,
-                                                                        &frame_requester,
-                                                                        Vec::new(),
-                                                                        None,
-                                                                    )
-                                                                    .await;
-                                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                                                    frame_requester.schedule_frame();
-                                                                    continue;
-                                                                }
-                                                            };
-
-                                                            chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::background_task(
-                                                                    format!("Running in background · {id} · open the task panel to inspect")
-                                                                ),
-                                                            );
-                                                            set_bash_background_hint_enabled(
-                                                                &mut chat_widget,
-                                                                &mut status_indicator,
-                                                                false,
-                                                            );
-                                                            persist_background_task_projections_if_changed(
-                                                                &mut background_registry,
-                                                                background_registry_turn_session_id.as_deref(),
-                                                                background_registry_turn_model.as_deref(),
-                                                                &mut background_task_projection_cache,
-                                                            ).await;
-                                                            frame_requester.schedule_frame();
-                                                        }
-                                                        Err(error) => {
-                                                            *bash_detach_slot_for_ctrl_b.lock().await = None;
-                                                            chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::error(
-                                                                    format!("⏎ Backgrounding failed: {error}")
-                                                                ),
-                                                            );
-                                                            set_bash_background_hint_enabled(
-                                                                &mut chat_widget,
-                                                                &mut status_indicator,
-                                                                false,
-                                                            );
-                                                            let _ = reveal_background_task_view_with_extra_rows(
-                                                                &mut background_registry,
-                                                                agent_spawner_for_cancel.as_ref(),
-                                                                &restored_local_agent_task_projections,
-                                                                &mut bottom_pane,
-                                                                &frame_requester,
-                                                                Vec::new(),
-                                                                None,
-                                                            )
-                                                            .await;
-                                                        }
-                                                    }
-                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                                    frame_requester.schedule_frame();
-                                                    continue;
-                                                }
                                                 Some(ae) = tui_rx.recv() => {
                                                     if let TuiAppEvent::RestoreInput(request) = &ae {
                                                         // A queue-full fallback may contain the
@@ -11059,57 +10828,10 @@ pub(crate) async fn run_tui_session(
                                                         &ae,
                                                         &plan_task_observer,
                                                     );
-                                                    let should_rearm_bash_detach =
-                                                        !bash_detach_request_pending
-                                                            && bash_detach_listener.is_none()
-                                                            && match &ae {
-                                                                TuiAppEvent::ToolStarted {
-                                                                    name,
-                                                                    description,
-                                                                    tool_use_id,
-                                                                    parent_tool_use_id,
-                                                                    ..
-                                                                } => {
-                                                                    if name == "bash"
-                                                                        && parent_tool_use_id.is_none()
-                                                                    {
-                                                                        active_bash_tool_use_id =
-                                                                            Some(tool_use_id.clone());
-                                                                        active_bash_description =
-                                                                            Some(description.clone());
-                                                                    }
-                                                                    name == "bash"
-                                                                }
-                                                                TuiAppEvent::ToolCompleted {
-                                                                    tool_use_id,
-                                                                    ..
-                                                                } => {
-                                                                    if active_bash_tool_use_id.as_deref()
-                                                                        == Some(tool_use_id.as_str())
-                                                                    {
-                                                                        active_bash_tool_use_id = None;
-                                                                        active_bash_description = None;
-                                                                    }
-                                                                    true
-                                                                }
-                                                                _ => false,
-                                                            };
-                                                    if should_rearm_bash_detach {
-                                                        bash_detach_listener = Some(
-                                                            install_bash_detach_listener(
-                                                                &bash_detach_slot_for_ctrl_b,
-                                                                &mut chat_widget,
-                                                                &mut status_indicator,
-                                                            )
-                                                            .await,
-                                                        );
-                                                    }
                                                     set_bash_background_hint_enabled(
                                                         &mut chat_widget,
                                                         &mut status_indicator,
-                                                        bash_detach_hint_enabled(
-                                                            bash_detach_listener.as_ref(),
-                                                        ),
+                                                        should_show_ctrl_b_background_hint(foreground_wait_control_for_ctrl_b.is_active()),
                                                     );
                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                     {
@@ -11215,14 +10937,7 @@ pub(crate) async fn run_tui_session(
                                                     frame_requester.schedule_frame();
                                                 }
                                                 _ = itick.tick() => {
-                                                    let background_commands_mutated = drain_background_task_commands(
-                                                        &bg_task_commands_for_turn,
-                                                        &mut background_registry,
-                                                        agent_spawner_for_cancel.as_ref(),
-                                                        &restored_local_agent_task_projections,
-                                                        &bg_task_list_cache_for_turn,
-                                                    )
-                                                    .await;
+                                                    let background_commands_mutated = false;
                                                     let workbench_session_id = chat_widget.session_id().to_string();
                                                     drain_agent_workbench_outcomes(
                                                         &mut agent_workbench_rx,
@@ -11342,7 +11057,7 @@ pub(crate) async fn run_tui_session(
                                                             continue;
                                                         }
                                                         let notification =
-                                                            super::background_tasks::format_notification_xml(event);
+                                                            crate::edge_tools::background_tasks::format_notification_xml(event);
                                                         if notification.is_empty() {
                                                             continue;
                                                         }
@@ -11506,8 +11221,7 @@ pub(crate) async fn run_tui_session(
                                     let should_start_followups = should_start_queued_followups(
                                         turn_succeeded,
                                         state.last_turn_interrupted,
-                                        foreground_lifecycle_transferred,
-                                        exit_after_turn_settlement,
+                                                                    exit_after_turn_settlement,
                                         turn_not_started,
                                     );
                                     let locally_owned_user_intents =
@@ -12702,10 +12416,8 @@ pub(crate) async fn run_tui_session(
                             &mut background_task_projection_cache,
                         )
                         .await;
-                        background_registry = super::background_tasks::BackgroundTaskRegistry::new(
-                            background_task_output_dir(state.session_id.as_deref()),
-                        )
-                        .with_active_work_registry(state.active_work_registry.clone());
+                        state.background_tasks = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(background_task_output_dir(state.session_id.as_deref()));
+                        background_registry = state.background_tasks.clone().with_active_work_registry(state.active_work_registry.clone());
                         restored_local_agent_task_projections = restore_background_task_projections(
                             &mut background_registry,
                             state.session_id.as_deref(),
@@ -12867,14 +12579,7 @@ pub(crate) async fn run_tui_session(
                         frame_requester.schedule_frame();
                     }
                 }
-                let background_commands_mutated = drain_background_task_commands(
-                    &state.bg_task_commands,
-                    &mut background_registry,
-                    state.agent_spawner.as_ref(),
-                    &restored_local_agent_task_projections,
-                    &state.bg_task_list_cache,
-                )
-                .await;
+                let background_commands_mutated = false;
 
                 // Poll background shell completions.
                 let bg_events = background_registry.poll_completions();
@@ -12882,7 +12587,7 @@ pub(crate) async fn run_tui_session(
                     if !background_task_event_requires_model_attention(ev) {
                         continue;
                     }
-                    let notification = super::background_tasks::format_notification_xml(ev);
+                    let notification = crate::edge_tools::background_tasks::format_notification_xml(ev);
                     if !notification.is_empty() {
                         state.pending_bg_notifications.push(notification);
                         schedule_runtime_notification_wake(
@@ -14744,82 +14449,6 @@ mod tests {
     }
 
     #[test]
-    fn every_bash_handoff_outcome_waits_for_each_guidance_closure_barrier() {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum HandoffOutcome {
-            Success,
-            ChannelClosed,
-            TaskLimit,
-            AdoptionFailed,
-        }
-
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum PendingGuidanceClosure {
-            Submission,
-            Disposition,
-        }
-
-        for outcome in [
-            HandoffOutcome::Success,
-            HandoffOutcome::ChannelClosed,
-            HandoffOutcome::TaskLimit,
-            HandoffOutcome::AdoptionFailed,
-        ] {
-            for pending in [
-                PendingGuidanceClosure::Submission,
-                PendingGuidanceClosure::Disposition,
-            ] {
-                let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
-                let mut ready = Some((outcome, pending));
-
-                assert!(
-                    take_ready_result_if_all_closure_barriers_clear(
-                        &mut ready,
-                        TurnClosureBarriers::capture(&run_control, false, true, false),
-                    )
-                    .is_none(),
-                    "{outcome:?} cannot finish before its Bash handoff closes"
-                );
-
-                match pending {
-                    PendingGuidanceClosure::Submission => {
-                        run_control.expect_remote_user_intent_submission("intent-matrix")
-                    }
-                    PendingGuidanceClosure::Disposition => {
-                        run_control.expect_remote_user_intent_disposition("intent-matrix", 41)
-                    }
-                }
-                assert!(
-                    take_ready_result_if_all_closure_barriers_clear(
-                        &mut ready,
-                        TurnClosureBarriers::capture(&run_control, false, false, false),
-                    )
-                    .is_none(),
-                    "{outcome:?} must not bypass {pending:?} closure after handoff"
-                );
-                assert!(ready.is_some(), "the ready turn result must remain owned");
-
-                match pending {
-                    PendingGuidanceClosure::Submission => {
-                        run_control.release_remote_user_intent_submission("intent-matrix")
-                    }
-                    PendingGuidanceClosure::Disposition => {
-                        run_control.abandon_remote_user_intent_disposition("intent-matrix")
-                    }
-                }
-                assert_eq!(
-                    take_ready_result_if_all_closure_barriers_clear(
-                        &mut ready,
-                        TurnClosureBarriers::capture(&run_control, false, false, false),
-                    ),
-                    Some((outcome, pending)),
-                    "{outcome:?} may finish only after every closure barrier clears"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn every_turn_waits_for_the_terminal_projection_drain() {
         let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         let mut ready = Some(Ok::<(), String>(()));
@@ -14827,7 +14456,7 @@ mod tests {
         assert!(
             take_ready_result_if_all_closure_barriers_clear(
                 &mut ready,
-                TurnClosureBarriers::capture(&run_control, false, false, true),
+                TurnClosureBarriers::capture(&run_control, false, true),
             )
             .is_none(),
             "visible output settlement cannot substitute for the terminal stream drain"
@@ -14836,7 +14465,7 @@ mod tests {
         assert_eq!(
             take_ready_result_if_all_closure_barriers_clear(
                 &mut ready,
-                TurnClosureBarriers::capture(&run_control, false, false, false),
+                TurnClosureBarriers::capture(&run_control, false, false),
             ),
             Some(Ok(()))
         );
@@ -14845,7 +14474,7 @@ mod tests {
         assert!(
             take_ready_result_if_all_closure_barriers_clear(
                 &mut failed,
-                TurnClosureBarriers::capture(&run_control, false, false, true),
+                TurnClosureBarriers::capture(&run_control, false, true),
             )
             .is_none(),
             "a failed turn cannot publish TurnError before accepted partial output is drained"
@@ -14854,7 +14483,7 @@ mod tests {
         assert!(
             take_ready_result_if_all_closure_barriers_clear(
                 &mut failed,
-                TurnClosureBarriers::capture(&run_control, false, false, false),
+                TurnClosureBarriers::capture(&run_control, false, false),
             )
             .is_some()
         );
@@ -14911,7 +14540,7 @@ mod tests {
         assert!(
             take_ready_result_if_all_closure_barriers_clear(
                 &mut ready,
-                TurnClosureBarriers::capture(&run_control, false, false, false),
+                TurnClosureBarriers::capture(&run_control, false, false),
             )
             .is_none()
         );
@@ -14926,7 +14555,7 @@ mod tests {
         assert_eq!(
             take_ready_result_if_all_closure_barriers_clear(
                 &mut ready,
-                TurnClosureBarriers::capture(&run_control, false, false, false),
+                TurnClosureBarriers::capture(&run_control, false, false),
             ),
             Some("settled-turn")
         );
@@ -15281,7 +14910,7 @@ mod tests {
     use crate::background_task_error::BackgroundTaskError;
 
     use crate::cli::turn::local_run_control::LocalRunControl;
-    use crate::tui::background_tasks::BgTaskEvent;
+    use crate::edge_tools::background_tasks::BgTaskEvent;
     use astra_runtime::turn::run_control::{RunControlStatus, RunStatusProvider};
     use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
     use astra_turn_core::orchestration_types::{
@@ -16160,9 +15789,8 @@ mod tests {
 
     #[test]
     fn detach_request_does_not_transfer_foreground_submission_authority() {
-        assert!(!submission_belongs_to_next_turn(false, false));
-        assert!(submission_belongs_to_next_turn(false, true));
-        assert!(submission_belongs_to_next_turn(true, false));
+        assert!(!submission_belongs_to_next_turn(false));
+        assert!(submission_belongs_to_next_turn(true));
     }
 
     #[test]
@@ -16177,19 +15805,17 @@ mod tests {
             "/instructions",
         ] {
             assert!(
-                active_submission_belongs_to_next_turn(command, false, false),
+                active_submission_belongs_to_next_turn(command, false),
                 "active slash command must be queued for local dispatch: {command:?}"
             );
         }
         assert!(!active_submission_belongs_to_next_turn(
             "please inspect the next file",
-            false,
-            false,
+            false
         ));
         assert!(active_submission_belongs_to_next_turn(
             "please continue",
-            true,
-            false,
+            true
         ));
     }
 
@@ -16199,29 +15825,25 @@ mod tests {
             "list my workspaces",
             false,
             false,
-            false,
-            false,
+            false
         ));
         assert!(active_submission_routes_to_next_turn(
             "list my workspaces",
             false,
-            false,
             true,
-            false,
+            false
         ));
         assert!(active_submission_routes_to_next_turn(
             "please continue",
             true,
             false,
-            false,
-            false,
+            false
         ));
         assert!(active_submission_routes_to_next_turn(
             "再加测试",
             false,
             false,
-            false,
-            true,
+            true
         ));
     }
 
@@ -16289,8 +15911,7 @@ mod tests {
             "use the existing helper",
             false,
             false,
-            false,
-            false,
+            false
         ));
         assert_eq!(pane.queued_next_turn_submission_count(), 3);
     }
@@ -16551,7 +16172,7 @@ mod tests {
                 &mut followups,
                 std::iter::empty(),
                 &mut post,
-                should_start_queued_followups(true, false, false, false, false),
+                should_start_queued_followups(true, false, false, false),
             )
             .is_none()
         );
@@ -16611,7 +16232,7 @@ mod tests {
                 &mut VecDeque::new(),
                 local.into_iter().map(|intent| intent.text),
                 &mut pane.take_queued_next_turn_submissions(),
-                should_start_queued_followups(ok, interrupted, false, exiting, not_started),
+                should_start_queued_followups(ok, interrupted, exiting, not_started),
             )
             .expect("client-owned follow-up must remain recoverable");
             restore_queued_input(restored, &mut pane);
@@ -16769,8 +16390,7 @@ mod tests {
             "再加测试",
             false,
             false,
-            false,
-            deferred,
+            deferred
         ));
         assert!(bottom_pane.queue_next_turn_submission("再加测试".to_string()));
         assert!(run_control.pending_remote_submission_ids().is_empty());
@@ -16819,8 +16439,7 @@ mod tests {
             "第三句",
             false,
             false,
-            false,
-            replay_latch,
+            replay_latch
         ));
         let mut replay_deferred = replay_latch;
         assert!(!defer_follow_up_before_run_bind(
@@ -16868,7 +16487,7 @@ mod tests {
             &mut auth_queue,
             std::iter::empty(),
             &mut auth_post,
-            should_start_queued_followups(true, false, false, false, true),
+            should_start_queued_followups(true, false, false, true),
         );
         assert_eq!(
             restored.as_ref().map(restored_interactive_text).as_deref(),
@@ -16882,7 +16501,7 @@ mod tests {
             &mut failed_queue,
             std::iter::empty(),
             &mut failed_post,
-            should_start_queued_followups(false, false, false, false, false),
+            should_start_queued_followups(false, false, false, false),
         );
         assert_eq!(
             restored.as_ref().map(restored_interactive_text).as_deref(),
@@ -17192,19 +16811,12 @@ mod tests {
     }
 
     #[test]
-    fn only_completed_ownership_transfer_can_replay_after_interrupted_parent() {
-        assert!(!should_start_queued_followups(
-            false, true, false, false, false
-        ));
-        assert!(should_start_queued_followups(
-            false, true, true, false, false
-        ));
-        assert!(!should_start_queued_followups(
-            false, true, true, true, false
-        ));
-        assert!(!should_start_queued_followups(
-            true, false, false, false, true
-        ));
+    fn interrupted_parent_does_not_start_queued_followups() {
+        assert!(!should_start_queued_followups(false, true, false, false));
+        assert!(!should_start_queued_followups(true, true, false, false));
+        assert!(should_start_queued_followups(true, false, false, false));
+        assert!(!should_start_queued_followups(true, false, true, false));
+        assert!(!should_start_queued_followups(true, false, false, true));
     }
 
     #[test]
@@ -18273,7 +17885,7 @@ mod tests {
     }
 
     async fn wait_for_background_shell_terminal(
-        registry: &mut crate::tui::background_tasks::BackgroundTaskRegistry,
+        registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
         id: &str,
     ) {
         crate::tests::wait_until(
@@ -18300,7 +17912,7 @@ mod tests {
     }
 
     async fn wait_for_background_shell_preview(
-        registry: &mut crate::tui::background_tasks::BackgroundTaskRegistry,
+        registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
         id: &str,
     ) {
         crate::tests::wait_until(
@@ -18678,8 +18290,9 @@ mod tests {
     #[tokio::test]
     async fn restored_local_agent_preserves_last_observed_state_and_marks_stale() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
         let restored = vec![restored_local_agent_projection("running")];
 
         let rows = background_task_rows_with_agents(&mut registry, None, &restored).await;
@@ -18715,8 +18328,9 @@ mod tests {
     #[tokio::test]
     async fn background_task_list_xml_includes_restored_local_agent_without_spawner() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
         let restored = vec![restored_local_agent_projection("running")];
 
         let xml = render_background_task_list_xml_with_agents(&mut registry, None, &restored).await;
@@ -18734,128 +18348,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_tick_services_background_output_commands() {
-        let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
-        let task_id = registry.spawn_shell("printf 'progress\\n'", "long test");
-        for _ in 0..100 {
-            registry.poll_completions();
-            if registry
-                .get(&task_id)
-                .is_some_and(|task| task.status().as_str() != "running")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let commands = Arc::new(std::sync::Mutex::new(vec![
-            crate::edge_tools::BgTaskCommand::GetOutputSince {
-                task_id: task_id.clone(),
-                offset: 0,
-                max_bytes: 8192,
-                reply: reply_tx,
-            },
-        ]));
-        let list_cache = Arc::new(tokio::sync::RwLock::new(String::new()));
-
-        assert!(
-            !drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await,
-            "read-only output commands must not trigger workspace persistence"
-        );
-
-        let snapshot = reply_rx
-            .await
-            .expect("foreground tick must answer command")
-            .expect("background output must be readable");
-        assert_eq!(snapshot.output, "progress\n");
-        assert!(snapshot.status.is_terminal());
-        assert!(commands.lock_recover().is_empty());
-    }
-
-    #[tokio::test]
-    async fn foreground_tick_services_background_output_search_commands() {
-        let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
-        let task_id = registry.spawn_shell(
-            "printf 'before\\nfailing_test_name\\npanic detail\\n'",
-            "failing test",
-        );
-        for _ in 0..100 {
-            registry.poll_completions();
-            if registry
-                .get(&task_id)
-                .is_some_and(|task| task.status().as_str() != "running")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let commands = Arc::new(std::sync::Mutex::new(vec![
-            crate::edge_tools::BgTaskCommand::SearchOutput {
-                task_id: task_id.clone(),
-                pattern: "failing_test_name".to_string(),
-                context_lines: 1,
-                max_bytes: 8192,
-                reply: reply_tx,
-            },
-        ]));
-        let list_cache = Arc::new(tokio::sync::RwLock::new(String::new()));
-
-        assert!(
-            !drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await,
-            "read-only search commands must not trigger workspace persistence"
-        );
-
-        let snapshot = reply_rx
-            .await
-            .expect("foreground tick must answer search command")
-            .expect("background output must be searchable");
-        assert_eq!(snapshot.matching_lines, 1);
-        assert!(
-            snapshot.output.contains("panic detail"),
-            "{}",
-            snapshot.output
-        );
-        assert!(snapshot.status.is_terminal());
-        assert!(commands.lock_recover().is_empty());
-    }
-
-    #[tokio::test]
-    async fn foreground_tick_reports_typed_background_mutation() {
-        let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
-        let task_id = registry.spawn_shell("sleep 10", "long test");
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let commands = Arc::new(std::sync::Mutex::new(vec![
-            crate::edge_tools::BgTaskCommand::Kill {
-                task_id,
-                reply: reply_tx,
-            },
-        ]));
-        let list_cache = Arc::new(tokio::sync::RwLock::new(String::new()));
-
-        assert!(
-            drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await,
-            "accepted lifecycle mutation must trigger immediate persistence"
-        );
-        reply_rx
-            .await
-            .expect("foreground tick must answer kill command")
-            .expect("live shell must accept cancellation");
-    }
-
-    #[tokio::test]
     async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_surface() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
         let restored = vec![restored_fanout_local_agent_projection("running")];
 
         let rows = background_task_rows_with_agents(&mut registry, None, &restored).await;
@@ -18883,8 +18380,9 @@ mod tests {
     #[tokio::test]
     async fn task_output_command_reads_restored_local_agent_projection() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
         let restored = vec![restored_local_agent_projection("running")];
 
         let snapshot = background_task_output_snapshot_with_agents(
@@ -18908,8 +18406,9 @@ mod tests {
     #[tokio::test]
     async fn task_stop_command_reports_stale_handle_for_restored_local_agent() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
         let restored = vec![restored_local_agent_projection("running")];
 
         let error =
@@ -18938,8 +18437,9 @@ mod tests {
         assert!(matches!(spawned, SpawnAgentOutput::Launched { .. }));
 
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
 
         let xml =
             render_background_task_list_xml_with_agents(&mut registry, Some(&spawner), &[]).await;
@@ -18970,8 +18470,9 @@ mod tests {
         };
 
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
 
         let target =
             stop_background_task_with_agents(&mut registry, Some(&spawner), &[], &agent_id)
@@ -19004,8 +18505,9 @@ mod tests {
         };
 
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
 
         let snapshot = background_task_output_snapshot_with_agents(
             &mut registry,
@@ -19042,8 +18544,9 @@ mod tests {
         };
 
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
         let mut chat_widget = chat_widget::ChatWidget::new("");
         let mut bottom_pane = BottomPane::new();
         dispatch_background_task_stop(
@@ -19080,8 +18583,9 @@ mod tests {
         assert!(matches!(spawned, SpawnAgentOutput::Launched { .. }));
 
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg"),
+        );
         let mut bottom_pane = BottomPane::new();
 
         assert!(
@@ -19151,7 +18655,7 @@ mod tests {
     #[tokio::test]
     async fn ctrl_t_task_surface_is_consistent_and_does_not_mutate_behind_a_modal() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("task-shortcut"),
         );
         let task_board = task_board_observer::TaskBoardObserver::new("session-a");
@@ -19163,7 +18667,9 @@ mod tests {
         let mut expanded = false;
         let mut pin = None;
         let mut bottom_pane = BottomPane::new();
-        let background_task_id = registry.spawn_shell("sleep 60", "unrelated background work");
+        let background_task_id = registry
+            .spawn_shell("sleep 60", "unrelated background work")
+            .await;
 
         assert!(handle_task_surface_shortcut(
             &key,
@@ -19576,25 +19082,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_detach_handoff_timeout_returns_error() {
-        let (handle, listener) = astra_tools::detach::new_detach_pair();
-        handle.mark_active(true);
-
-        let result =
-            await_bash_detach_handoff_with_timeout(listener, Duration::from_millis(1)).await;
-
-        let error = match result {
-            Ok(_) => panic!("missing payload should time out"),
-            Err(error) => error,
-        };
-        assert!(error.contains("before timeout"));
-        assert!(!handle.is_blocked());
-    }
-
-    #[tokio::test]
     async fn background_surfaces_skip_unchanged_input_ticks() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("surface-refresh"),
         );
         let snapshot = crate::tui::local_agent_snapshot::LocalAgentSnapshot::default();
@@ -19651,8 +19141,9 @@ mod tests {
     #[tokio::test]
     async fn force_open_background_task_view_opens_panel_on_empty_registry() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("empty"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("empty"),
+        );
         let mut bottom_pane = BottomPane::new();
 
         assert!(
@@ -19675,10 +19166,11 @@ mod tests {
     #[tokio::test]
     async fn active_run_tasks_panel_is_read_only_and_preserves_queue_and_selection() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("active"));
-        let first_id = registry.spawn_shell("sleep 60", "first active task");
-        let second_id = registry.spawn_shell("sleep 60", "second active task");
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("active"),
+        );
+        let first_id = registry.spawn_shell("sleep 60", "first active task").await;
+        let second_id = registry.spawn_shell("sleep 60", "second active task").await;
         let mut bottom_pane = BottomPane::new();
         bottom_pane.set_task_status(TaskStatus::TurnRunning {
             started_at: std::time::Instant::now(),
@@ -19787,8 +19279,9 @@ mod tests {
     #[tokio::test]
     async fn background_task_switcher_opens_for_pending_bash_handoff() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("pending"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("pending"),
+        );
         let mut bottom_pane = BottomPane::new();
 
         assert!(
@@ -19832,8 +19325,9 @@ mod tests {
     #[tokio::test]
     async fn force_open_background_task_view_preempts_existing_bottom_pane() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("overlay"));
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("overlay"),
+        );
         let mut bottom_pane = BottomPane::new();
         bottom_pane.push_view(Box::new(NonBackgroundPane));
 
@@ -19869,10 +19363,12 @@ mod tests {
     #[tokio::test]
     async fn background_task_rows_include_typed_status_and_combined_tail() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-row-projection"),
         );
-        let id = registry.spawn_shell("printf 'stdout-line'; printf 'stderr-line' >&2", "demo");
+        let id = registry
+            .spawn_shell("printf 'stdout-line'; printf 'stderr-line' >&2", "demo")
+            .await;
 
         wait_for_background_shell_terminal(&mut registry, &id).await;
         wait_for_background_shell_preview(&mut registry, &id).await;
@@ -19899,10 +19395,12 @@ mod tests {
     #[tokio::test]
     async fn background_task_rows_surface_missing_output_artifact() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-missing-output"),
         );
-        let id = registry.spawn_shell("printf 'done'", "missing output artifact");
+        let id = registry
+            .spawn_shell("printf 'done'", "missing output artifact")
+            .await;
 
         wait_for_background_shell_terminal(&mut registry, &id).await;
         let stdout_path = registry.get(&id).unwrap().stdout_path.clone();
@@ -19929,7 +19427,7 @@ mod tests {
         let stderr = temp.path().join("restored.stderr");
         std::fs::write(&stdout, "line from previous session\n").unwrap();
         std::fs::write(&stderr, "").unwrap();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-restored-row"),
         );
         registry
@@ -19986,7 +19484,7 @@ mod tests {
         let stderr = temp.path().join("restored.stderr");
         std::fs::write(&stdout, "persisted\n").unwrap();
         std::fs::write(&stderr, "").unwrap();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-persist"),
         );
         registry
@@ -20090,7 +19588,7 @@ mod tests {
         };
         let projections =
             export_background_local_agent_task_projections_from_snapshot(&snapshot, &[]);
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("shared-snapshot"),
         );
         let rows = background_task_rows_with_agent_snapshot(&mut registry, &snapshot, &[]);
@@ -20126,7 +19624,7 @@ mod tests {
         };
         let projections =
             export_background_local_agent_task_projections_from_snapshot(&snapshot, &[]);
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("terminal-time"),
         );
         let rows = background_task_rows_with_agent_snapshot(&mut registry, &snapshot, &[]);
@@ -20141,10 +19639,12 @@ mod tests {
     #[tokio::test]
     async fn background_task_output_snapshot_drains_completion_before_status() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-output-snapshot"),
         );
-        let id = registry.spawn_shell("printf 'done\\n'", "quick output");
+        let id = registry
+            .spawn_shell("printf 'done\\n'", "quick output")
+            .await;
 
         wait_for_background_shell_terminal(&mut registry, &id).await;
         let snapshot = background_task_output_snapshot(&mut registry, &id, 0, 1024)
@@ -20161,10 +19661,12 @@ mod tests {
     #[tokio::test]
     async fn background_task_output_snapshot_includes_stderr_only_shell_output() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-output-stderr"),
         );
-        let id = registry.spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr output");
+        let id = registry
+            .spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr output")
+            .await;
 
         wait_for_background_shell_terminal(&mut registry, &id).await;
         let snapshot = background_task_output_snapshot(&mut registry, &id, 0, 1024)
@@ -20186,7 +19688,7 @@ mod tests {
         let stderr = temp.path().join("restored.stderr");
         std::fs::write(&stdout, "old output\n").unwrap();
         std::fs::write(&stderr, "").unwrap();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("bg-task-output-restored"),
         );
         registry
@@ -20217,10 +19719,11 @@ mod tests {
     #[tokio::test]
     async fn background_task_switcher_opens_for_failed_but_not_completed_only() {
         let temp = crate::tests::test_temp_dir();
-        let mut completed_registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
-            temp.path().join("completed-only"),
-        );
-        let completed_id = completed_registry.spawn_shell("true", "completed");
+        let mut completed_registry =
+            crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                temp.path().join("completed-only"),
+            );
+        let completed_id = completed_registry.spawn_shell("true", "completed").await;
         for _ in 0..50 {
             completed_registry.poll_completions();
             if completed_registry
@@ -20245,9 +19748,12 @@ mod tests {
         );
         assert!(!bottom_pane.has_active_view());
 
-        let mut failed_registry =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("failed"));
-        let failed_id = failed_registry.spawn_shell("/definitely_missing_astra_binary", "failed");
+        let mut failed_registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("failed"),
+        );
+        let failed_id = failed_registry
+            .spawn_shell("/definitely_missing_astra_binary", "failed")
+            .await;
         for _ in 0..50 {
             failed_registry.poll_completions();
             if failed_registry
@@ -20430,12 +19936,8 @@ mod tests {
         // backlog and restore this text to the composer instead of sending
         // it. The notice must not promise a delivery that never happens.
         assert!(!RUN_TERMINAL_FOLLOW_UP_NOTICE.contains("will be sent"));
-        assert!(!should_start_queued_followups(
-            false, false, false, false, false
-        ));
-        assert!(!should_start_queued_followups(
-            true, true, false, false, false
-        ));
+        assert!(!should_start_queued_followups(false, false, false, false));
+        assert!(!should_start_queued_followups(true, true, false, false));
 
         // A conflict on the SAME run, but in a durable status this branch
         // does not special-case (e.g. a manual pause), must keep falling
@@ -20519,7 +20021,7 @@ mod tests {
 
             let mut queued = bottom_pane.take_queued_next_turn_submissions();
             let mut followups = std::collections::VecDeque::new();
-            let should_start = should_start_queued_followups(true, false, false, false, false);
+            let should_start = should_start_queued_followups(true, false, false, false);
             assert!(should_start, "a normally-settled turn must start followups");
             assert!(
                 settle_followup_submissions(
@@ -20567,7 +20069,7 @@ mod tests {
 
             let mut queued = bottom_pane.take_queued_next_turn_submissions();
             let mut followups = std::collections::VecDeque::new();
-            let should_start = should_start_queued_followups(true, true, false, false, false);
+            let should_start = should_start_queued_followups(true, true, false, false);
             assert!(
                 !should_start,
                 "an interrupted turn must not start followups"
@@ -20614,7 +20116,7 @@ mod tests {
 
             let mut queued = bottom_pane.take_queued_next_turn_submissions();
             let mut followups = std::collections::VecDeque::new();
-            let should_start = should_start_queued_followups(false, false, false, false, false);
+            let should_start = should_start_queued_followups(false, false, false, false);
             assert!(!should_start, "a failed turn must not start followups");
             let restored = settle_followup_submissions(
                 &mut followups,
@@ -21549,8 +21051,9 @@ mod tests {
             Some("session-control"),
         );
         let output = tempfile::tempdir().unwrap();
-        let mut background =
-            crate::tui::background_tasks::BackgroundTaskRegistry::new(output.path().to_path_buf());
+        let mut background = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            output.path().to_path_buf(),
+        );
         let (agent_workbench_tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut pane = BottomPane::new();
         dispatch_bottom_pane_view_action(
@@ -22163,9 +21666,7 @@ mod tests {
         ));
         assert!(matches!(
             response_rx.try_recv(),
-            Ok(crate::cli::chat_stream::PlanReviewDecision::Approve {
-                mode: crate::cli::permission_manager::PermissionMode::Auto
-            })
+            Ok(crate::cli::chat_stream::PlanReviewDecision::Approve { mode: None })
         ));
     }
 
@@ -22520,14 +22021,16 @@ mod tests {
     async fn local_shell_submission_returns_started_before_process_completion_and_captures_output()
     {
         let tmp = crate::tests::test_temp_dir();
-        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             tmp.path().join("local-shell"),
         );
 
         let id = start_local_background_shell(
             &mut registry,
+            std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
             "sleep 0.15; printf 'local shell ready\\n'",
         )
+        .await
         .expect("start local shell");
 
         let initial_events = registry.poll_completions();
@@ -23812,7 +23315,7 @@ mod tests {
             assert!(should_flush_submission_immediately(raw), "{raw}");
             assert!(slash_dispatch::immediate_control(raw).is_none(), "{raw}");
             assert!(!slash_dispatch::is_model_picker_request(raw), "{raw}");
-            assert!(!active_submission_belongs_to_next_turn(raw, false, false));
+            assert!(!active_submission_belongs_to_next_turn(raw, false));
             assert!(should_queue_work_start_submission(
                 raw,
                 false,

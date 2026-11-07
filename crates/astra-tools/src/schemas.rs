@@ -2016,6 +2016,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "additionalProperties": false,
                     "properties": {
                         "command": {"type": "string", "description": BASH_COMMAND_GUIDANCE},
+                        "description": {"type":"string","maxLength":512,"description":"Optional short task label for the user; execution still uses command exactly."},
+                        "yield_time_ms": {"type":"integer","minimum":0,"maximum":30000,"default":10000,"description":"How long to wait before returning the same running task's id. This is a presentation wait, not a process timeout. Use 0 for immediate background observation; task_output can wait again without restarting the command."},
+                        "stdin": {"type":"boolean","default":false,"description":"Keep an owned input pipe open for targeted task_input calls. Ordinary user messages still address the parent. Defaults to closed stdin; does not allocate a PTY."},
                         "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
@@ -2823,7 +2826,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Observe one specific typed background task and return its task kind/status. For an append-only shell task, omitting offset returns one bounded latest-tail status snapshot; do this at most once per task in a turn and do not chase live progress with a cursor. For a terminal shell task, especially a failure, set pattern to search the captured output with bounded context instead of reading its files through Bash; terminal diagnostics remain available after a status snapshot. Agent-result tasks may return a cursor when their semantic result is larger than one bounded response. Set block=true once when the user explicitly asks to wait: the runtime waits for terminal completion, required input, or timeout without spending additional model rounds. Supply an explicit offset only when the user asked to read historical shell output, then use next_offset for bounded pagination. Requires the exact task_id so the model and UI refer to the same task.",
+                "description": "Observe one exact task_id. Returns current status, advertised controls and a bounded output window. For live shell output, omit offset for the latest tail; use offset/next_offset for incremental or historical reads. Set block=true for an event-backed bounded wait; timeout returns the current state and cancelling the wait leaves the task running. For failures, pattern searches captured output with bounded context. Running, input delivery and stop requests are not terminal completion.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2834,12 +2837,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "Wait inside the runtime for terminal task status, required input, or timeout. Default false. Set true once only when the user explicitly asks to wait; ordinary output growth does not wake the model."
+                            "description": "Wait for terminal status, required input, new parent input, or a bounded timeout. Timeout leaves the task running. Default false; ordinary output growth does not wake the model."
                         },
                         "offset": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "Explicit output cursor. For shell tasks, omit it for one current latest-tail status snapshot and set it only when the user asked to page historical output. For bounded agent results, reuse the returned next_offset to continue the semantic result."
+                            "description": "Output cursor for incremental or historical reads. Omit for the latest bounded tail. Reuse next_offset to continue without replaying earlier output."
                         },
                         "pattern": {
                             "type": "string",
@@ -2867,6 +2870,22 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         }
                     },
                     "required": ["task_id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_input",
+                "description": "Write targeted input or close stdin for a running shell task that advertises stdin support. Written bytes are acknowledged, not task completion. Use agent.send_message for agent mailboxes and native steering; do not resend unconfirmed input automatically.",
+                "parameters": {
+                    "type":"object", "additionalProperties":false,
+                    "properties": {
+                        "task_id":{"type":"string","minLength":1},
+                        "input":{"type":"string","maxLength":32768,"description":"Exact bytes as UTF-8 text; include a newline when the child expects a line. Maximum 32768 UTF-8 bytes."},
+                        "close_stdin":{"type":"boolean","default":false,"description":"Close the input pipe instead of writing. Cannot be combined with input."}
+                    },
+                    "required":["task_id"]
                 }
             }
         }),
@@ -2905,89 +2924,21 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
-        // ── enter_plan_mode ─────────────────────────────────────────
-        // Top-level sentinel tool that flips the session into plan
-        // mode. Promoted from the buried `session.enter_plan` action
-        // in 2026-05 because the model rarely picked the sub-action
-        // — the reference agent's dedicated `EnterPlanMode` tool is the
-        // reference. While in plan mode, write tools (str_replace,
-        // write_file, bash, git commit, …) are denied at the
-        // permission gate; already-visible read tools stay available.
-        // Exit via `exit_plan_mode` — that's the only unlock path.
-        json!({
-            "type": "function",
-            "function": {
-                "name": "enter_plan_mode",
-                "description": "Enter plan mode for non-trivial work that needs design before code. While in plan mode, mutating tools are blocked at the permission gate and only already-visible read/control tools remain usable. Author the plan, then call `exit_plan_mode` with the markdown for user approval.\n\
-        \n\
-        ## When to Use This Tool\n\
-        Use plan mode when user alignment before edits materially reduces risk:\n\
-        - Multiple reasonable implementation approaches exist and the choice affects architecture, data flow, permissions, public API, or persistence.\n\
-        - Requirements are unclear enough that exploration should precede a concrete implementation proposal.\n\
-        - The work is high-impact or hard to unwind, such as schema changes, auth/security behavior, cross-cutting refactors, or large migrations.\n\
-        - The user explicitly wants a plan, design review, or approval before implementation.\n\
-        \n\
-        When you enter plan mode:\n\
-        1. Edits are blocked by design.\n\
-        2. Explore only with read tools that are already visible in the current turn, and identify existing patterns to follow.\n\
-        3. Produce executable leaf steps: each step should map to one concrete artifact, API surface, or validation target.\n\
-        4. Avoid umbrella steps like \"build the whole system\" when code, API, UI, and verification are separate outcomes.\n\
-        5. Call `exit_plan_mode(plan='<markdown>')` to submit the plan for user approval. Approval is produced by the UI/control plane, not by model-supplied tool arguments.\n\
-        \n\
-        ## When NOT to Use This Tool\n\
-        Do not enter plan mode when normal execution is clearer:\n\
-        - Single-line / few-line fixes (typos, obvious bugs).\n\
-        - User gave specific step-by-step instructions — just do them.\n\
-        - The required read tools are not visible; answer from conversation context or say the capability is unavailable instead.\n\
-        - Pure research / read-only exploration with no implementation step (use `agent` with explore type instead when that tool is visible).\n\
-        - The work is < 3 files and the approach is obvious.\n\
-        \n\
-        Important: `exit_plan_mode` is the ONLY way to leave plan mode. Do not use `ask_user` to ask \"is the plan ready?\" — `exit_plan_mode` itself surfaces the plan for approval.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "goal": {
-                            "type": "string",
-                            "description": "Optional one-line goal label that surfaces in the TUI plan-mode banner. Defaults to a placeholder if omitted."
-                        }
-                    },
-                    "required": []
-                }
-            }
-        }),
-        // ── exit_plan_mode ──────────────────────────────────────────
-        // Companion to enter_plan_mode. Surfaces the proposed plan to
-        // the user for approval, lifts the write-tool guard on
-        // success. The durable plan remains its own record; the task board
-        // is an explicit execution checklist, never a copied plan tree.
-        json!({
-            "type": "function",
-            "function": {
-                "name": "exit_plan_mode",
-                "description": "Submit the plan for user approval. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects in the trusted UI. The model cannot approve its own plan; approval unlocks writes only after the UI/control plane returns the user's decision. The approved plan remains a durable plan record; use the task board only when an execution checklist materially helps.\n\
-        \n\
-        ## Plan structure (what makes a good plan)\n\
-        - Numbered list of concrete, executable leaf steps — each step maps to ONE artifact, API surface, or validation target.\n\
-        - Each step includes: what files to touch, what to change, and the acceptance criteria.\n\
-        - Avoid umbrella phases like \"build the system\" — split into scaffold → implement → test → verify.\n\
-        - Prefer 3-7 steps for most work; >10 steps signals over-decomposition.\n\
-        \n\
-        ## Important\n\
-        - Do NOT call this tool to ask 'is the plan ready?' — that's exactly what THIS tool does. It inherently requests approval.\n\
-        - Pass the FULL plan as a single markdown string in `plan`. The user sees this verbatim.\n\
-        - Only call this when the plan is concrete and unambiguous. If you have unresolved decisions, use `ask_user` first.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "plan": {
-                            "type": "string",
-                            "description": "The plan markdown to present for approval. Numbered list of steps; nested bullets ok. The user reads this verbatim."
-                        }
-                    },
-                    "required": ["plan"]
-                }
-            }
-        }),
+        // Planning temporarily limits implementation while the model authors
+        // a proposal; it never rewrites the user's execution permission mode.
+        json!({"type":"function","function":{
+            "name":"enter_plan_mode",
+            "description":"Begin authoring a plan when design or user alignment is useful. Implementation writes pause while authoring; read/control tools remain available and the user's execution permission mode is preserved. Finish with exit_plan_mode. An explicit user request for review must be honored; do not create an approval requirement merely because you chose to plan.",
+            "parameters":{"type":"object","properties":{"goal":{"type":"string","description":"Optional short goal label."}},"required":[]}
+        }}),
+        json!({"type":"function","function":{
+            "name":"exit_plan_mode",
+            "description":"Finalize the concrete plan and leave authoring. Pass review=true when the user requested review or a decision is needed. Required review comes from user/policy authority and cannot be waived by arguments. Bypass work may continue under its existing authorization; this does not mean user approval. Human review keeps existing execution permissions unless the user explicitly selects another mode.",
+            "parameters":{"type":"object","properties":{
+                "plan":{"type":"string","description":"Full concrete plan as markdown, including implementation and acceptance criteria."},
+                "review":{"type":"boolean","description":"Request trusted human review. Required user/policy review remains enforced when omitted or false."}
+            },"required":["plan"]}
+        }}),
     ]
 }
 

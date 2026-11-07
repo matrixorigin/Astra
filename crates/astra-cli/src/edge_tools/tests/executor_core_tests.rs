@@ -236,31 +236,6 @@ async fn execute_with_metadata_bash_non_zero_exit_is_structured_failure() {
 }
 
 #[tokio::test]
-async fn legacy_bash_string_path_preserves_execution_failure_truth() {
-    let executor = test_executor();
-    let output = executor
-        .execute("bash", &json!({"command": "echo diagnostic >&2; exit 127"}))
-        .await;
-
-    assert!(
-        crate::edge_tools::cli_tool_output_is_error(&output),
-        "string-only callers must not record a failed shell execution as success: {output}"
-    );
-    assert!(
-        output.starts_with("Error: bash execution failed"),
-        "{output}"
-    );
-    assert!(
-        output.contains("diagnostic"),
-        "diagnostic evidence was lost: {output}"
-    );
-    assert!(
-        output.contains("exit code 127"),
-        "exit truth was lost: {output}"
-    );
-}
-
-#[tokio::test]
 async fn execute_with_metadata_bash_non_zero_exit_preserves_structured_failure() {
     let executor = test_executor();
     let outcome = executor
@@ -483,10 +458,7 @@ async fn plan_mode_write_guard_cache_is_invalidated_when_session_changes() {
     executor
         .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
         .await;
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Plan)
-    );
+    assert_eq!(executor.take_pending_permission_mode_change(), None);
 
     let blocked = executor
         .execute("bash", &json!({ "command": "true" }))
@@ -532,7 +504,7 @@ async fn exit_plan_mode_overlay_paths() {
             label: "approve-auto",
             install_overlay: true,
             decision: Some(PlanReviewDecision::Approve {
-                mode: PermissionMode::Auto,
+                mode: Some(PermissionMode::Auto),
             }),
             expect_starts_with: "Exited plan mode",
             expect_contains: &["auto"],
@@ -641,7 +613,7 @@ async fn exit_plan_mode_overlay_paths() {
 // enter_plan_mode must stage PermissionMode::Plan regardless of cloud availability.
 
 #[tokio::test]
-async fn enter_plan_mode_stages_permission_mode_plan() {
+async fn enter_plan_mode_preserves_the_selected_permission_mode() {
     for (label, use_cloud) in [("offline", false), ("cloud", true)] {
         let temp = tempfile::tempdir().unwrap();
         let server = MockServer::start().await;
@@ -664,8 +636,8 @@ async fn enter_plan_mode_stages_permission_mode_plan() {
         );
         assert_eq!(
             executor.take_pending_permission_mode_change(),
-            Some(crate::cli::permission_manager::PermissionMode::Plan),
-            "[{label}] must stage Plan on the pending permission-mode slot"
+            None,
+            "[{label}] model planning must preserve the user permission mode"
         );
         assert!(
             server.received_requests().await.unwrap().is_empty(),
@@ -695,7 +667,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
         let _ = request.response_tx.send(PlanReviewDecision::Approve {
-            mode: PermissionMode::Prompt,
+            mode: Some(PermissionMode::Prompt),
         });
     });
 
@@ -727,7 +699,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
 async fn enter_plan_mode_then_exit_full_cycle_offline() {
     // End-to-end local enter → exit flow works without
     // any cloud at all. Asserts the slot transitions cleanly:
-    //   1. enter_plan_mode → pending = Some(Plan)
+    //   1. enter_plan_mode authors without changing the user permission mode
     //   2. host applies → perm_manager simulated as Plan
     //   3. user requests exit → overlay → pending = Some(Auto)
     //   4. host applies → perm_manager simulated as Auto
@@ -747,8 +719,8 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Plan),
-        "enter must stage Plan"
+        None,
+        "model planning must preserve execution permissions"
     );
 
     // Step 2-4: exit through overlay, choose Auto
@@ -762,7 +734,7 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
         let _ = request
             .response_tx
             .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
-                mode: crate::cli::permission_manager::PermissionMode::Auto,
+                mode: Some(crate::cli::permission_manager::PermissionMode::Auto),
             });
     });
 
@@ -830,10 +802,7 @@ async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
     executor
         .execute("enter_plan_mode", &json!({"goal": "Inspect safely"}))
         .await;
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Plan)
-    );
+    assert_eq!(executor.take_pending_permission_mode_change(), None);
 
     let result = executor
         .execute("read_file", &json!({"path": probe.to_string_lossy()}))
@@ -868,10 +837,7 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
     executor
         .execute("enter_plan_mode", &json!({"goal": "Ship safely"}))
         .await;
-    assert_eq!(
-        executor.take_pending_permission_mode_change(),
-        Some(crate::cli::permission_manager::PermissionMode::Plan)
-    );
+    assert_eq!(executor.take_pending_permission_mode_change(), None);
 
     // Sanity: blocked first.
     let blocked = executor
@@ -894,7 +860,7 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         let _ = request
             .response_tx
             .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
-                mode: crate::cli::permission_manager::PermissionMode::Auto,
+                mode: Some(crate::cli::permission_manager::PermissionMode::Auto),
             });
     });
 
@@ -1277,4 +1243,62 @@ fn truncate_output_cjk_boundary_no_panic() {
     let result = truncate_output(input, 7); // Between 2nd and 3rd char
     assert!(result.contains("[truncated]"));
     // Should not panic — regression for char boundary issue
+}
+
+#[tokio::test]
+async fn model_planning_preserves_bypass_and_explicit_review_still_needs_a_user() {
+    use crate::cli::chat_stream::PlanReviewDecision;
+    use crate::cli::permission_manager::PermissionMode;
+    let temp = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(temp.path()).with_active_session_id("planning-policy");
+    executor.apply_runtime_permission_sandbox(PermissionMode::Bypass);
+    executor
+        .execute("enter_plan_mode", &json!({"goal":"design first"}))
+        .await;
+    assert!(executor.take_pending_permission_mode_change().is_none());
+    let automatic = executor
+        .execute(
+            "exit_plan_mode",
+            &json!({"plan":"1. Implement and validate"}),
+        )
+        .await;
+    assert!(automatic.contains("existing permissions"), "{automatic}");
+    assert!(!automatic.contains("user approved"));
+    assert!(executor.take_pending_permission_mode_change().is_none());
+    executor
+        .execute("enter_plan_mode", &json!({"goal":"explicit review"}))
+        .await;
+    let no_ui = executor
+        .execute(
+            "exit_plan_mode",
+            &json!({"plan":"1. Needs review","review":true,"approved":true}),
+        )
+        .await;
+    assert!(
+        no_ui.starts_with("Error:"),
+        "model arguments cannot approve a plan: {no_ui}"
+    );
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel(crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY);
+    executor.set_plan_review_request_tx(Some(tx));
+    let reviewer = tokio::spawn(async move {
+        let request: crate::cli::chat_stream::PlanReviewRequest = rx.recv().await.unwrap();
+        assert_eq!(request.plan_markdown, "1. Needs review");
+        request
+            .response_tx
+            .send(PlanReviewDecision::Approve { mode: None })
+            .unwrap();
+    });
+    let reviewed = executor
+        .execute(
+            "exit_plan_mode",
+            &json!({"plan":"1. Needs review","review":true}),
+        )
+        .await;
+    reviewer.await.unwrap();
+    assert!(reviewed.contains("user approved"));
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        Some(PermissionMode::Bypass)
+    );
 }

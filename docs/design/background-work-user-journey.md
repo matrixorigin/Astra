@@ -28,6 +28,42 @@ restart recovery, or cross-surface delivery. Those behaviors require the
 runtime and end-to-end evidence described under Verification gates before
 they can be claimed as supported.
 
+## Current local shell execution contract
+
+The selected CLI/User Runner executor owns a shell invocation from launch to
+settlement. Foreground and background waits share its task id, process, original
+deadline, cancellation endpoint, capture and workspace custody. Ctrl+B, an
+accepted parent instruction, or Bash's bounded `yield_time_ms` releases a
+foreground wait. No process/pipes are adopted by the TUI and no new invocation
+is launched. Ordinary composer input still addresses the parent.
+
+`task_output` observes or waits on producer events; it does not acquire the
+running command's workspace lease. A timed-out or cancelled observation leaves
+the command running. `task_input` writes only to a task launched with
+`stdin=true`; default stdin is closed. Input writes, closing stdin and stop
+requests are acknowledged separately from observed terminal execution. The task
+panel offers input only when the actual task supports it. Agent mailboxes and
+native collaborator steering keep their existing protocols and identities.
+
+Capture and queues are bounded. Each executor admits at most 32 simultaneous
+shell tasks, with a 50 MiB capture limit per task and 256 MiB retained terminal
+capture budget; terminal handle retention is separately bounded. Restored private
+captures in the selected output namespace retain quota accounting; other saved
+references remain read-only and cannot authorize deleting user files. Slow consumers
+retain terminal notifications under bounded launch backpressure. The existing
+64 MiB safe-output cache coalesces cold generations, with at most two queued
+blocking projection workers; bounded reads do not allocate one full capture per
+observer. Output chunks
+do not trigger model calls, and local waits perform no periodic SQL. A restored
+plain-shell projection can expose saved output but cannot recreate a lost
+process handle. Weak process-group cleanup never certifies authoritative
+workspace settlement. These limits are not a claim that one workspace or one
+executor can run 1,000 physical commands concurrently.
+
+Repeated observations remain legal within ordinary run budgets. An unchanged
+status is a fact for the model, not permission for the application to synthesize
+a final answer or declare the user's objective complete.
+
 ## Default journey: parent-owned concurrent child
 
 `agent.spawn` accepts one child and promptly returns a `launched` receipt with
@@ -108,7 +144,9 @@ UI or serializing the children.
 
 ## Explicit background handoff
 
-The user may move foreground work to the background. In the terminal this is
+For shell commands, the supported control releases the foreground wait as
+described above. The following fanout handoff remains a target journey. The
+user may move foreground work to the background. In the terminal this is
 an explicit control such as Ctrl+B; other clients may expose the same typed
 control. This changes ownership for a foreground fanout or other work that is
 still awaiting a joined result; ordinary single-child concurrency needs no

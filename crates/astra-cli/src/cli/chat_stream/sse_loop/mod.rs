@@ -328,18 +328,13 @@ async fn stream_chat_sse_inner(
         } else {
             ex
         };
-        let ex = if let Some(ref cmds) = p.bg_task_commands {
-            ex.with_bg_task_commands(cmds.clone())
+        let ex = if let Some(ref cmds) = p.background_tasks {
+            ex.with_background_tasks(cmds.clone())
         } else {
             ex
         };
-        let ex = if let Some(ref cache) = p.bg_task_list_cache {
-            ex.with_bg_task_list_cache(cache.clone())
-        } else {
-            ex
-        };
-        let ex = if let Some(ref slot) = p.bash_detach_slot {
-            ex.with_bash_detach_slot(slot.clone())
+        let ex = if let Some(ref slot) = p.foreground_wait_control {
+            ex.with_foreground_wait_control(slot.clone())
         } else {
             ex
         };
@@ -460,10 +455,7 @@ async fn stream_chat_sse_inner(
     } else {
         Vec::new()
     };
-    let cli_capabilities = edge_tools::cli_default_capabilities(
-        p.agent_spawner.is_some(),
-        p.bg_task_commands.is_some(),
-    );
+    let cli_capabilities = edge_tools::cli_default_capabilities(p.agent_spawner.is_some(), true);
     let all_schemas: (Vec<Value>, Vec<Value>) = (
         astra_runtime::capabilities::cli_local_tool_schemas(
             edge_tools::local_tool_schemas(),

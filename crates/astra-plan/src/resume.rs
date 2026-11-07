@@ -52,7 +52,7 @@ pub fn plan_resume_digest(state: &PlanModeState) -> Option<String> {
 
 pub fn plan_resume_prompt_hint(state: &PlanModeState) -> Option<String> {
     let digest = plan_resume_digest(state)?;
-    let guidance = "A plan draft is awaiting trusted user review for this session. \
+    let guidance = "A plan draft is active for this session. \
         Stay in read-only planning mode, refine the proposal, and call \
         `exit_plan_mode(plan='...')` to submit the current draft. Do not treat \
         task or Work execution progress as approval.";
@@ -61,7 +61,7 @@ pub fn plan_resume_prompt_hint(state: &PlanModeState) -> Option<String> {
 
 /// A loaded plan reached through the session's `active_plan_id` is authoring.
 ///
-/// Approval is an explicit control-plane transition that clears the active
+/// Finishing authoring is an explicit policy-admitted transition that clears the active
 /// binding. Inferring approval from embedded task/subtask progress creates a
 /// second authority and can silently release the write guard.
 pub fn plan_mode_authoring_active(_state: &PlanModeState) -> bool {
@@ -168,7 +168,7 @@ mod tests {
         let state = PlanModeState::new("Design slash commands".into());
         let hint = plan_resume_prompt_hint(&state).expect("hint");
         assert!(hint.contains("goal=\"Design slash commands\""), "{hint}");
-        assert!(hint.contains("awaiting trusted user review"), "{hint}");
+        assert!(hint.contains("A plan draft is active"), "{hint}");
     }
 
     #[test]

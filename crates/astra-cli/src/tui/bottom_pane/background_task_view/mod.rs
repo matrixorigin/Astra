@@ -181,6 +181,20 @@ impl BackgroundTaskView {
             });
         }
     }
+
+    fn request_input(&mut self) {
+        if let Some(row) = self.selected_row()
+            && row.input_available
+            && row.live_control.can_stop()
+        {
+            self.pending_action = Some(ViewActionRequest {
+                action: BottomPaneViewAction::BeginShellInput {
+                    task_id: row.id.clone(),
+                },
+                disposition: ViewActionDisposition::KeepOpen,
+            });
+        }
+    }
 }
 
 fn work_unit_key(row: &BackgroundTaskRow) -> String {
@@ -268,6 +282,7 @@ impl BottomPaneView for BackgroundTaskView {
     fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
             Mode::List => match key.code {
+                KeyCode::Char('i') => self.request_input(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_up(),
                 KeyCode::Down | KeyCode::Char('j') => self.move_down(),
                 KeyCode::PageUp => self.move_page_up(),
@@ -290,6 +305,7 @@ impl BottomPaneView for BackgroundTaskView {
                 _ => {}
             },
             Mode::Detail => match key.code {
+                KeyCode::Char('i') => self.request_input(),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.detail_scroll
                         .set(self.detail_scroll.get().saturating_sub(1));
@@ -354,10 +370,17 @@ impl BottomPaneView for BackgroundTaskView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        match self.mode {
-            Mode::List => Some("↑↓ move · Enter details · S stop · Esc close".into()),
-            Mode::Detail => Some("↑↓ scroll · PgUp/PgDn page · S stop · Esc list · Q close".into()),
-        }
+        let input = if self.selected_row().is_some_and(|row| row.input_available) {
+            " · I input"
+        } else {
+            ""
+        };
+        Some(match self.mode {
+            Mode::List => format!("↑↓ move · Enter details{input} · S stop · Esc close"),
+            Mode::Detail => {
+                format!("↑↓ scroll · PgUp/PgDn page{input} · S stop · Esc list · Q close")
+            }
+        })
     }
 
     fn reserve_status_footer(&self) -> bool {

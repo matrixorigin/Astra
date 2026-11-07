@@ -1,8 +1,8 @@
 use super::*;
 use crate::CgroupGuard;
 
-fn limits() -> FramedProcessLimits {
-    FramedProcessLimits {
+fn limits() -> ProcessIoLimits {
+    ProcessIoLimits {
         max_frame_bytes: 64,
         max_queued_frames: 1,
         max_stderr_bytes: 16,
@@ -51,23 +51,23 @@ async fn weak_ownership_and_cancelled_admission_never_spawn() {
 #[test]
 fn invalid_and_overflowing_budgets_are_rejected() {
     for budget in [
-        FramedProcessLimits {
+        ProcessIoLimits {
             max_frame_bytes: 0,
             ..limits()
         },
-        FramedProcessLimits {
+        ProcessIoLimits {
             max_queued_frames: 0,
             ..limits()
         },
-        FramedProcessLimits {
+        ProcessIoLimits {
             max_queued_frames: usize::MAX,
             ..limits()
         },
-        FramedProcessLimits {
+        ProcessIoLimits {
             max_stderr_bytes: usize::MAX,
             ..limits()
         },
-        FramedProcessLimits {
+        ProcessIoLimits {
             timeout: Some(Duration::ZERO),
             ..limits()
         },
@@ -79,6 +79,135 @@ fn invalid_and_overflowing_budgets_are_rejected() {
     }
 }
 
+#[cfg(unix)]
+fn spawn_bytes(script: &str, stdin: bool, budget: ProcessIoLimits) -> OwnedProcess {
+    let owner = BashInvocationOwner {
+        process_scope: CgroupGuard {
+            cg_path: None,
+            procs_path: None,
+        },
+        supervisor: None,
+    };
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", script]);
+    owner
+        .spawn_streamed(command, budget, CancellationToken::new(), stdin, ())
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn byte_stream_keeps_process_identity_and_acknowledges_targeted_input() {
+    let mut process = spawn_bytes(
+        "printf '%s\\n' $$; read -r line; printf 'out:%s' \"$line\"; printf 'err' >&2",
+        true,
+        limits(),
+    );
+    let pid = process.id().unwrap();
+    let first = process.recv_output().await.unwrap();
+    assert!(
+        matches!(first, ProcessOutput::Stdout(ref bytes) if bytes == format!("{pid}\n").as_bytes())
+    );
+    process.input().write_bytes(b"answer\n").await.unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    while let Some(output) = process.recv_output().await {
+        match output {
+            ProcessOutput::Stdout(bytes) => stdout.extend(bytes),
+            ProcessOutput::Stderr(bytes) => stderr.extend(bytes),
+        }
+    }
+    let outcome = process.wait().await.unwrap();
+    assert!(matches!(outcome.end, ProcessEnd::Exited));
+    assert!(outcome.status.unwrap().success());
+    assert_eq!(stdout, b"out:answer");
+    assert_eq!(stderr, b"err");
+    assert!(
+        outcome
+            .settlement
+            .is_none_or(|settlement| !settlement.ownership.is_authoritative()),
+        "a process group is not descendant proof"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn byte_stream_stdin_is_closed_unless_explicitly_requested() {
+    let mut process = spawn_bytes(
+        "if read line; then printf stolen; else printf closed; fi",
+        false,
+        limits(),
+    );
+    assert!(process.input.is_none());
+    let mut output = Vec::new();
+    while let Some(ProcessOutput::Stdout(bytes)) = process.recv_output().await {
+        output.extend(bytes);
+    }
+    assert_eq!(output, b"closed");
+    assert!(process.wait().await.unwrap().status.unwrap().success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn byte_stream_eof_and_deadline_are_physical_process_facts() {
+    let mut process = spawn_bytes("cat; printf eof", true, limits());
+    process.input().write_bytes(b"raw\0bytes\n").await.unwrap();
+    process.input().close().await.unwrap();
+    let mut output = Vec::new();
+    while let Some(ProcessOutput::Stdout(bytes)) = process.recv_output().await {
+        output.extend(bytes);
+    }
+    assert_eq!(output, b"raw\0bytes\neof");
+    assert!(process.wait().await.unwrap().status.unwrap().success());
+
+    let process = spawn_bytes(
+        "read line",
+        true,
+        ProcessIoLimits {
+            timeout: Some(Duration::from_millis(100)),
+            ..limits()
+        },
+    );
+    let _input = process.input();
+    let outcome = process.wait().await.unwrap();
+    assert!(matches!(outcome.end, ProcessEnd::TimedOut), "{outcome:?}");
+    assert!(
+        outcome.status.is_some(),
+        "timeout waits for the observed process exit"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_unblocks_full_byte_stream_queues() {
+    let process = spawn_bytes("while :; do printf flood; done", false, limits());
+    let outcome = tokio::time::timeout(Duration::from_secs(5), process.cancel_and_wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome.end, ProcessEnd::Cancelled));
+    assert!(outcome.status.is_some());
+}
+
+#[tokio::test]
+async fn cancelled_queued_input_is_not_delivered() {
+    let (tx, rx) = mpsc::channel(1);
+    let (ack, acknowledgement) = oneshot::channel();
+    tx.send(InputWrite {
+        bytes: Some(b"must not run".to_vec()),
+        written: Some(ack),
+    })
+    .await
+    .unwrap();
+    drop(acknowledgement);
+    drop(tx);
+    let (writer, mut reader) = tokio::io::duplex(64);
+    write_frames(writer, rx, false).await.unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert!(bytes.is_empty());
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -86,9 +215,9 @@ mod linux {
     fn spawn(
         script: &str,
         directory: &std::path::Path,
-        budget: FramedProcessLimits,
+        budget: ProcessIoLimits,
         cancel: CancellationToken,
-    ) -> FramedProcess {
+    ) -> OwnedProcess {
         spawn_with_helper(
             script,
             directory,
@@ -101,10 +230,10 @@ mod linux {
     fn spawn_with_helper(
         script: &str,
         directory: &std::path::Path,
-        budget: FramedProcessLimits,
+        budget: ProcessIoLimits,
         cancel: CancellationToken,
         helper: &str,
-    ) -> FramedProcess {
+    ) -> OwnedProcess {
         let (mut command, owner) = BashInvocationOwner::prepare_with_supervisor_helper(
             std::env::current_exe().unwrap(),
             [
@@ -127,7 +256,7 @@ mod linux {
     // The re-exec test harness prints a prelude before entering the existing
     // supervisor helper. Only tests skip that exact prelude; production never
     // interprets payload text or strips non-JSON output from a native process.
-    async fn next_payload(process: &mut FramedProcess) -> Vec<u8> {
+    async fn next_payload(process: &mut OwnedProcess) -> Vec<u8> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let frame = process
@@ -144,7 +273,7 @@ mod linux {
         .unwrap()
     }
 
-    fn assert_authority(outcome: &FramedProcessOutcome) {
+    fn assert_authority(outcome: &ProcessOutcome) {
         assert_eq!(outcome.target_released, Some(true));
         assert_eq!(
             outcome.settlement.unwrap().ownership,
@@ -171,7 +300,7 @@ mod linux {
         let mut process = spawn(
             "touch ready; read line; printf 'finished\\n'",
             directory.path(),
-            FramedProcessLimits {
+            ProcessIoLimits {
                 timeout: None,
                 ..limits()
             },
@@ -188,10 +317,7 @@ mod linux {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::Exited),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::Exited), "{outcome:?}");
         assert_authority(&outcome);
     }
 
@@ -225,10 +351,7 @@ mod linux {
         let process = spawn("touch started", directory.path(), limits(), token.clone());
         token.cancel();
         let outcome = process.wait().await.unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::Cancelled),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::Cancelled), "{outcome:?}");
         assert_eq!(outcome.target_released, Some(false));
         assert!(
             outcome.settlement.is_none(),
@@ -256,10 +379,7 @@ mod linux {
         )
         .unwrap();
         let outcome = process.wait().await.unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::Cancelled),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::Cancelled), "{outcome:?}");
         assert_eq!(outcome.target_released, Some(false));
         assert!(outcome.settlement.is_none());
         assert!(!directory.path().join("started").exists());
@@ -268,7 +388,7 @@ mod linux {
     #[tokio::test]
     async fn startup_deadline_waits_for_owned_cleanup_without_releasing_target() {
         let directory = tempfile::tempdir().unwrap();
-        let budget = FramedProcessLimits {
+        let budget = ProcessIoLimits {
             timeout: Some(Duration::from_millis(50)),
             ..limits()
         };
@@ -287,10 +407,7 @@ mod linux {
         )
         .unwrap();
         let outcome = process.wait().await.unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::TimedOut),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::TimedOut), "{outcome:?}");
         assert_eq!(outcome.target_released, Some(false));
         assert!(outcome.settlement.is_none());
         assert!(outcome.status.is_some(), "cleanup must await the helper");
@@ -337,10 +454,7 @@ mod linux {
         assert_eq!(next_payload(&mut process).await, br#"{"second":true}"#);
         drop(input);
         let outcome = process.wait().await.unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::Exited),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::Exited), "{outcome:?}");
         assert_eq!(outcome.status.unwrap().code(), Some(7));
         assert_eq!(outcome.stderr, vec![b'0'; 16]);
         assert!(outcome.stderr_capped);
@@ -372,10 +486,7 @@ mod linux {
         assert_eq!(next_payload(&mut process).await, br#"{"valid":true}"#);
         drop(input);
         let outcome = process.wait().await.unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::Exited),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::Exited), "{outcome:?}");
         assert_authority(&outcome);
     }
 
@@ -390,7 +501,7 @@ mod linux {
         );
         let outcome = process.wait().await.unwrap();
         assert!(
-            matches!(&outcome.end, FramedProcessEnd::OutputFailed(error) if error.kind() == io::ErrorKind::InvalidData),
+            matches!(&outcome.end, ProcessEnd::OutputFailed(error) if error.kind() == io::ErrorKind::InvalidData),
             "{outcome:?}"
         );
         assert_authority(&outcome);
@@ -410,7 +521,7 @@ mod linux {
         );
         let outcome = process.wait().await.unwrap();
         assert!(
-            matches!(&outcome.end, FramedProcessEnd::OutputFailed(error) if error.kind() == io::ErrorKind::UnexpectedEof),
+            matches!(&outcome.end, ProcessEnd::OutputFailed(error) if error.kind() == io::ErrorKind::UnexpectedEof),
             "{outcome:?}"
         );
         assert_authority(&outcome);
@@ -420,7 +531,7 @@ mod linux {
     async fn blocked_stdin_and_full_input_queue_are_cancelled_and_settled() {
         let directory = tempfile::tempdir().unwrap();
         let token = CancellationToken::new();
-        let budget = FramedProcessLimits {
+        let budget = ProcessIoLimits {
             max_frame_bytes: 1024 * 1024,
             ..limits()
         };
@@ -448,10 +559,7 @@ mod linux {
             io::ErrorKind::Interrupted
         );
         let outcome = process.wait().await.unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::Cancelled),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::Cancelled), "{outcome:?}");
         assert_authority(&outcome);
     }
 
@@ -469,10 +577,7 @@ mod linux {
         // Leave stdout unread: the helper prelude already fills the one-slot queue.
         token.cancel();
         let outcome = process.wait().await.unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::Cancelled),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::Cancelled), "{outcome:?}");
         assert_authority(&outcome);
         assert!(!escaped_pid_path(directory.path()).exists());
         assert!(!directory.path().join("late").exists());
@@ -481,7 +586,7 @@ mod linux {
     #[tokio::test]
     async fn deadline_terminates_a_process_with_blocked_output() {
         let directory = tempfile::tempdir().unwrap();
-        let budget = FramedProcessLimits {
+        let budget = ProcessIoLimits {
             timeout: Some(Duration::from_secs(3)),
             ..limits()
         };
@@ -496,10 +601,7 @@ mod linux {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            matches!(outcome.end, FramedProcessEnd::TimedOut),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome.end, ProcessEnd::TimedOut), "{outcome:?}");
         assert_authority(&outcome);
     }
 
@@ -544,4 +646,31 @@ mod linux {
         assert!(outcome.settlement.is_none(), "{outcome:?}");
         assert!(!outcome.status.unwrap().success());
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn raw_closed_stdin_does_not_cancel_still_useful_work() {
+    let mut process = spawn_bytes(
+        "exec 0<&-; printf 'stdin-closed\\n'; sleep 0.05; printf 'finished\\n'",
+        true,
+        limits(),
+    );
+    let input = process.input();
+    let first = process.recv_output().await.unwrap();
+    assert!(
+        matches!(first, ProcessOutput::Stdout(ref bytes) if bytes.starts_with(b"stdin-closed"))
+    );
+    assert!(input.write_bytes(b"not delivered").await.is_err());
+    let mut output = Vec::new();
+    while let Some(part) = process.recv_output().await {
+        if let ProcessOutput::Stdout(bytes) = part {
+            output.extend(bytes);
+        }
+    }
+    let terminal = process.wait().await.unwrap();
+    assert!(matches!(terminal.end, ProcessEnd::Exited));
+    assert!(terminal.status.unwrap().success());
+    assert!(String::from_utf8(output).unwrap().contains("finished"));
+    assert!(!input.is_open());
 }

@@ -1,4 +1,3 @@
-pub(crate) mod agent_guide_view;
 pub(crate) mod agent_transcript_view;
 pub(crate) mod ask_user_view;
 pub(crate) mod background_task_view;
@@ -17,6 +16,7 @@ pub(crate) mod plan_review_view;
 pub(crate) mod root_transcript_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
+pub(crate) mod task_input_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;

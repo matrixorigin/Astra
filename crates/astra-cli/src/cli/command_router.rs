@@ -1833,9 +1833,9 @@ async fn execute_cli_command_impl(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 agent_spawner: None,
                 root_agent_id: None,
-                bg_task_commands: None,
+                background_tasks: None,
                 bg_task_list_cache: None,
-                bash_detach_slot: None,
+                foreground_wait_control: None,
                 stream_event_tx: None,
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
@@ -2545,9 +2545,9 @@ async fn execute_cli_command_impl(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 agent_spawner: None,
                 root_agent_id: None,
-                bg_task_commands: None,
+                background_tasks: None,
                 bg_task_list_cache: None,
-                bash_detach_slot: None,
+                foreground_wait_control: None,
                 stream_event_tx,
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
@@ -3897,8 +3897,8 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
 
 /// Classify the user-visible terminal contract without turning advisory
 /// evidence into another execution/retry authority. A natural-language stop
-/// can still be useful output, but an active exact-argument failure or
-/// rejection means Astra cannot honestly label the result verified.
+/// can still be useful output. Historical tool failures remain diagnostics;
+/// lifecycle and explicit verification own the terminal disposition.
 fn completion_disposition(sr: &StreamResult, exit_code: ExitCode) -> &'static str {
     if exit_code != ExitCode::Success {
         return if sr.final_state == "interrupted" {
@@ -3913,17 +3913,7 @@ fn completion_disposition(sr: &StreamResult, exit_code: ExitCode) -> &'static st
     if sr.server_terminal_authoritative {
         return "completed";
     }
-    let unresolved = !astra_turn_core::evaluation::active_terminal_execution_failure_operation_keys(
-        &sr.tool_call_records,
-    )
-    .is_empty()
-        || !astra_turn_core::evaluation::active_rejected_operation_keys(&sr.tool_call_records)
-            .is_empty();
-    if unresolved {
-        "responded_unverified"
-    } else {
-        "completed"
-    }
+    "completed"
 }
 
 fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
@@ -4295,9 +4285,9 @@ pub(crate) async fn run_print_mode(
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         stream_event_tx: None,
         stream_json_emitter: stream_json_emitter.clone(),
         #[cfg(feature = "harness")]
@@ -6277,7 +6267,7 @@ mod final_json_output_tests {
     }
 
     #[test]
-    fn final_json_output_marks_active_exact_failure_as_unverified() {
+    fn final_json_output_keeps_historical_failure_separate_from_completion() {
         let mut sr = stream_result_for_json();
         sr.tool_call_records
             .push(astra_services::session_journal::ToolCallRecord {
@@ -6290,9 +6280,13 @@ mod final_json_output_tests {
             });
         let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
 
-        assert_eq!(output["completion_disposition"], "responded_unverified");
-        assert_eq!(output["success"], false);
+        assert_eq!(output["completion_disposition"], "completed");
+        assert_eq!(output["success"], true);
         assert_eq!(output["exit_code"], 0);
+        assert!(
+            !sr.tool_call_records[0].ok,
+            "failure remains diagnostic evidence"
+        );
     }
 
     #[test]

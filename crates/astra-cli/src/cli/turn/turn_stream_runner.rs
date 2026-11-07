@@ -238,9 +238,9 @@ fn build_turn_stream_params<'a>(
 
         git_worktree_journal: Some(state.git_worktree_journal.clone()),
         session_state_journal: Some(state.session_state_journal.clone()),
-        bg_task_commands: Some(state.bg_task_commands.clone()),
+        background_tasks: Some(state.background_tasks.clone()),
         bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
-        bash_detach_slot: Some(state.bash_detach_slot.clone()),
+        foreground_wait_control: Some(state.foreground_wait_control.clone()),
         // This clock scopes every local tool mutation, checkpoint and journal
         // event. Server admission allocates its own turn independently.
         turn_index: state.turn.saturating_add(1),

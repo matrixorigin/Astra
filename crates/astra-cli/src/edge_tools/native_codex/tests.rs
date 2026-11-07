@@ -4,8 +4,8 @@ use astra_tools::tool_engine::{ToolInvocationAdmissionSource, ToolInvocationMeta
 /// Feed a fixture input through the same active dispatcher used by production.
 #[allow(clippy::too_many_arguments)]
 async fn submit_stage_input(
-    process: &mut FramedProcess,
-    input: &FramedProcessInput,
+    process: &mut OwnedProcess,
+    input: &ProcessInput,
     evidence: &mut Evidence,
     gate: Option<&dyn ProviderInteractionGate>,
     cancel: &CancellationToken,
@@ -1852,7 +1852,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     timeout: Some(Duration::from_secs(15)),
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
@@ -2005,7 +2005,7 @@ SessionStart = [{{ hooks = [{{ type = "command", command = {}, timeout = 2 }}] }
                 )
             })
             .unwrap();
-        assert!(matches!(outcome.end, FramedProcessEnd::Exited));
+        assert!(matches!(outcome.end, ProcessEnd::Exited));
         assert!(outcome.status.unwrap().success());
         assert!(
             !outcome.stderr_capped,
@@ -2120,7 +2120,7 @@ for line in sys.stdin:
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
                     max_stderr_bytes: 4096,
@@ -2319,7 +2319,7 @@ async fn live_native_permission_masks_enforce_read_write_and_network_boundaries(
     let mut process = owner
         .spawn_framed(
             command,
-            FramedProcessLimits {
+            ProcessIoLimits {
                 max_frame_bytes: FRAME_BYTES,
                 max_queued_frames: 1,
                 max_stderr_bytes: 4096,
@@ -3005,7 +3005,7 @@ mod transport {
         }
     }
 
-    pub(super) async fn process(script: &str, token: CancellationToken) -> FramedProcess {
+    pub(super) async fn process(script: &str, token: CancellationToken) -> OwnedProcess {
         let (command, owner) = BashInvocationOwner::prepare_with_supervisor_helper(
             std::env::current_exe().unwrap(),
             [
@@ -3021,7 +3021,7 @@ mod transport {
         let mut process = owner
             .spawn_framed(
                 command,
-                FramedProcessLimits {
+                ProcessIoLimits {
                     max_frame_bytes: FRAME_BYTES,
                     max_queued_frames: 1,
                     max_stderr_bytes: 128,

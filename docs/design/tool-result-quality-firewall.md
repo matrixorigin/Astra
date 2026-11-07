@@ -102,3 +102,9 @@ Only full authoritative arguments establish matching operations. Restored
 redacted arguments or display previews cannot merge failures or prove recovery.
 Recovery evidence advises the model without authorizing hidden retries,
 automatic path substitution, tool suppression, or a separate recovery lifecycle.
+
+Historical failure counts and exact-command matching do not determine whether
+a user's objective is complete. Failed attempts remain diagnostic evidence for
+the model. Run lifecycle, explicit caller verification, canonical Work
+settlement and genuinely unknown effects retain their own authority; the
+evaluator emits no blanket incomplete-answer notice from error history.

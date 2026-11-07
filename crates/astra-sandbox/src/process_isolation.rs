@@ -32,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 
 mod framed;
 pub use framed::{
-    FramedProcess, FramedProcessEnd, FramedProcessInput, FramedProcessLimits, FramedProcessOutcome,
+    OwnedProcess, ProcessEnd, ProcessInput, ProcessInputError, ProcessIoLimits, ProcessOutcome,
+    ProcessOutput,
 };
 
 const MAX_CAPTURED_STDOUT_BYTES: usize = 64 * 1024;
@@ -2593,6 +2594,7 @@ async fn execute_isolated_with_cancel_impl(
     std_cmd.current_dir(&config.working_dir);
     std_cmd
         .env_clear()
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]

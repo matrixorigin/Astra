@@ -2309,36 +2309,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 .completion_settlement
                 .deferred_success_completion = None;
         }
-        let unchanged_work_ids = state
-            .stall
-            .work_unit_observations
-            .repeatedly_unchanged_ids(2);
-        if !settled_round_has_failure && !unchanged_work_ids.is_empty() {
-            let work_ids = unchanged_work_ids.join(", ");
-            let caller_owned_ids = state
-                .stall
-                .work_unit_observations
-                .repeatedly_unchanged_without_wake(2);
-            state.final_text_model_item_id = None;
-            state.final_text = if caller_owned_ids.is_empty() {
-                format!(
-                    "Work {work_ids} has not materially changed. No further live-status reads will run in this turn; the runtime owns its next meaningful update."
-                )
-            } else {
-                format!(
-                    "Work {work_ids} has not materially changed. No further live-status reads will run in this turn. No automatic update is promised for {}; inspect it or request a fresh observation later.",
-                    caller_owned_ids.join(", ")
-                )
-            };
-            tracing::info!(
-                target: "astra::loop_guard",
-                work_ids,
-                "closing repeated unchanged work-unit observations with a runtime acknowledgement"
-            );
-            state.step_recorder.end_turn(false);
-            return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
-        }
-
         if super::execution_phase::reject_unsettled_execution_completion(state) {
             state.step_recorder.end_turn(false);
             try_write_heavy_checkpoint(state);

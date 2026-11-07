@@ -190,16 +190,14 @@ async fn cli_bash_workdir_is_honored_by_the_detachable_launcher() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     std::fs::create_dir(root.join("nested")).unwrap();
-    let (slot, _listener) = astra_tools::detach::new_slot_with_handle();
-    let executor = workdir_executor(&root).with_bash_detach_slot(slot);
+    let executor = workdir_executor(&root);
     let outcome = executor
-        .bash_detachable_with_metadata(
+        .bash_outcome_with_cancel_async(
             &serde_json::json!({"command":"pwd", "workdir":"nested"}),
             astra_tools::tool_engine::ToolInvocationMetadata::default(),
             None,
         )
-        .await
-        .expect("pwd enters detachable launch mode");
+        .await;
     assert!(!outcome.is_error, "{outcome:?}");
     assert_eq!(outcome.output.trim(), root.join("nested").to_str().unwrap());
     assert_eq!(

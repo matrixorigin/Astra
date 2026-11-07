@@ -767,6 +767,7 @@ impl AgenticRunLifecycleService {
             state.session_turn,
             token.clone(),
             interactive,
+            interaction_mode,
             None,
         )
         .await;

@@ -10,15 +10,16 @@ use astra_core::work_unit::{
     WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
 };
 use astra_runtime::tool_sandbox::{IsolationLevel, SandboxPolicy, filter_environment};
-use astra_tools::detach::{
-    AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
-    restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
-};
+use astra_tools::detach::render_bash_detached_marker;
 use astra_tools::exit_semantics::{self, ExitSemantics};
 use astra_tools::shell_output_capture::{BashOutputCapture, BlockingCaptureWriter};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
+
+#[path = "shell/owned.rs"]
+mod owned;
+use owned::OwnedShellInvocation;
 
 pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -3323,20 +3324,14 @@ impl std::io::Write for ShellOutputBuffer {
 
 /// A blocking shell worker outlives a dropped async join handle. Cancel its
 /// invocation-local token before releasing the caller's ownership.
-struct CancelShellOnDrop(tokio_util::sync::CancellationToken);
+struct CancelShellOnDrop(Option<tokio_util::sync::CancellationToken>);
 
 impl Drop for CancelShellOnDrop {
     fn drop(&mut self) {
-        self.0.cancel();
+        if let Some(cancel) = &self.0 {
+            cancel.cancel();
+        }
     }
-}
-
-enum DetachableShellOutput {
-    Completed(std::process::Output),
-    Detached {
-        payload: Box<astra_tools::detach::DetachedShellPayload>,
-        adoption_rx: tokio::sync::oneshot::Receiver<Result<String, String>>,
-    },
 }
 
 fn effective_shell_command(config: &ShellRunConfig) -> String {
@@ -3368,7 +3363,7 @@ struct ShellRunError {
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
 }
 
-// Keep the workspace lease until the blocking shell worker returns.
+// Keep the selected workspace pinned until the process owner settles.
 struct ShellScopeLease {
     attribution: astra_tools::workspace_observation::WorkspaceAttributionState,
     observation: Option<astra_tools::workspace_observation::WorkspaceObservationLease>,
@@ -3416,12 +3411,10 @@ impl ShellRunError {
     }
 }
 
-fn run_shell_output_with_config(
-    config: ShellRunConfig,
-) -> Result<ScopedShellOutput, ShellRunError> {
+fn prepare_shell_process(
+    config: &ShellRunConfig,
+) -> Result<(Command, astra_sandbox::BashInvocationOwner), ShellRunError> {
     let effective_command = effective_shell_command(&config);
-    #[cfg(all(test, target_os = "linux"))]
-    let uses_supervisor_test_helper = config.supervisor_test_helper.is_some();
 
     let mut target_args = Vec::new();
     if config.program == "bash" && astra_tools::shell_ops::should_enable_pipefail(&config.command) {
@@ -3444,12 +3437,16 @@ fn run_shell_output_with_config(
     };
     #[cfg(not(all(test, target_os = "linux")))]
     let prepared = astra_sandbox::BashInvocationOwner::prepare(&config.program, &target_args);
-    let (mut child_cmd, mut invocation_owner) = prepared.map_err(|error| {
+    let (mut child_cmd, invocation_owner) = prepared.map_err(|error| {
         ShellRunError::new(format!(
             "Error: unable to establish Bash invocation owner: {error}"
         ))
     })?;
-    child_cmd.current_dir(&config.effective_project_root);
+    // Stdin belongs to the process owner; only explicit interactive launch
+    // replaces this closed input with its owned pipe.
+    child_cmd
+        .current_dir(&config.effective_project_root)
+        .stdin(Stdio::null());
     if config.discard_output {
         child_cmd.stdout(Stdio::null()).stderr(Stdio::null());
     } else {
@@ -3493,6 +3490,15 @@ fn run_shell_output_with_config(
         ));
     }
 
+    Ok((child_cmd, invocation_owner))
+}
+
+fn run_shell_output_with_config(
+    config: ShellRunConfig,
+) -> Result<ScopedShellOutput, ShellRunError> {
+    #[cfg(all(test, target_os = "linux"))]
+    let uses_supervisor_test_helper = config.supervisor_test_helper.is_some();
+    let (mut child_cmd, mut invocation_owner) = prepare_shell_process(&config)?;
     if let Err(error) = invocation_owner.install(&mut child_cmd) {
         return Err(ShellRunError::new(format!(
             "Error: unable to install Bash invocation owner: {error}"
@@ -3717,329 +3723,9 @@ fn apply_overlay_to_tokio_command(cmd: &mut TokioCommand) {
     }
 }
 
-fn configure_detachable_tokio_command(config: &ShellRunConfig) -> Result<TokioCommand, String> {
-    let effective_command = effective_shell_command(config);
-    let mut child_cmd = TokioCommand::new(&config.program);
-    if config.program == "bash" && astra_tools::shell_ops::should_enable_pipefail(&config.command) {
-        child_cmd.arg("-o").arg("pipefail");
-    }
-    child_cmd
-        .arg(&config.shell_flag)
-        .arg(&effective_command)
-        .current_dir(&config.effective_project_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    apply_overlay_to_tokio_command(&mut child_cmd);
-
-    #[cfg(unix)]
-    child_cmd.process_group(0);
-
-    if let Some(ref policy) = config.sandbox_policy {
-        child_cmd.current_dir(&policy.project_root);
-        child_cmd.env_clear();
-        for (key, value) in filter_environment(policy) {
-            child_cmd.env(key, value);
-        }
-    }
-
-    // This function is reachable only after the detached-shape gate. Keep
-    // that proof meaningful at the process boundary: no BASH_ENV, exported
-    // function, dynamic-loader override, or user PATH may turn a literal
-    // builtin/sleep command into a writer after the gate ran.
-    if astra_tools::workspace_observation::bash_command_is_detachable_safe(&config.command) {
-        child_cmd
-            .env_clear()
-            .env("PATH", astra_tools::workspace_observation::DETACHABLE_PATH)
-            .env("LC_ALL", "C");
-    }
-
-    if let Some(workdir) = &config.workdir {
-        workdir.install_on_std_command(child_cmd.as_std_mut())?;
-    }
-    Ok(child_cmd)
-}
-
-fn record_async_bash_chunk(
-    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
-    bytes: &[u8],
-) {
-    if let Some(sink) = sink {
-        sink.record_chunk(bytes);
-    }
-}
-
-async fn drain_tokio_stdout(
-    stdout: &mut tokio::process::ChildStdout,
-    output: &mut Vec<u8>,
-    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
-    timeout: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut buf = [0u8; 8192];
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break,
-            read = stdout.read(&mut buf) => {
-                match read {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        record_async_bash_chunk(sink, &buf[..n]);
-                        output.extend_from_slice(&buf[..n]);
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-}
-
-async fn drain_tokio_stderr(
-    stderr: &mut tokio::process::ChildStderr,
-    output: &mut Vec<u8>,
-    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
-    timeout: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut buf = [0u8; 8192];
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break,
-            read = stderr.read(&mut buf) => {
-                match read {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        record_async_bash_chunk(sink, &buf[..n]);
-                        output.extend_from_slice(&buf[..n]);
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-}
-
-async fn run_shell_output_with_detach_config(
-    config: ShellRunConfig,
-    detach: &astra_tools::detach::DetachShellHandle,
-    command_label: &str,
-) -> Result<DetachableShellOutput, String> {
-    let mut child_cmd = configure_detachable_tokio_command(&config)?;
-    let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Error: failed to capture stdout".to_string())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Error: failed to capture stderr".to_string())?;
-
-    let mut signal_rx = detach.signal_rx.lock().await.take();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(config.timeout_secs);
-    let mut stdout_buf: Vec<u8> = Vec::new();
-    let mut stderr_buf: Vec<u8> = Vec::new();
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut stdout_read_buf = [0u8; 8192];
-    let mut stderr_read_buf = [0u8; 8192];
-    let mut exit_status = None;
-    let mut detached = false;
-
-    loop {
-        if detach_signal_observed(&mut signal_rx) {
-            detached = true;
-            break;
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                exit_status = Some(status);
-                break;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                sigkill_process_group(&mut child).await;
-                restore_detach_signal_receiver(detach, signal_rx).await;
-                return Err(format!("Error: {e}"));
-            }
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            sigkill_process_group(&mut child).await;
-            restore_detach_signal_receiver(detach, signal_rx).await;
-            return Err(format!(
-                "Error: command timed out after {}s",
-                config.timeout_secs
-            ));
-        }
-
-        if let Some(rx) = signal_rx.as_mut() {
-            tokio::select! {
-                biased;
-                res = rx.changed() => {
-                    match res {
-                        Ok(()) if *rx.borrow_and_update() => {
-                            detached = true;
-                            break;
-                        }
-                        Ok(()) => {}
-                        Err(_) => signal_rx = None,
-                    }
-                }
-                _ = async {
-                    if let Some(token) = config.cancel_token.as_ref() {
-                        token.cancelled().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    sigkill_process_group(&mut child).await;
-                    restore_detach_signal_receiver(detach, signal_rx).await;
-                    return Err("Error: command cancelled by user".to_string());
-                }
-                read = stdout.read(&mut stdout_read_buf), if stdout_open => {
-                    match read {
-                        Ok(0) => stdout_open = false,
-                        Ok(n) => {
-                            record_async_bash_chunk(&config.progress_sink, &stdout_read_buf[..n]);
-                            stdout_buf.extend_from_slice(&stdout_read_buf[..n]);
-                        }
-                        Err(_) => stdout_open = false,
-                    }
-                }
-                read = stderr.read(&mut stderr_read_buf), if stderr_open => {
-                    match read {
-                        Ok(0) => stderr_open = false,
-                        Ok(n) => {
-                            record_async_bash_chunk(&config.progress_sink, &stderr_read_buf[..n]);
-                            stderr_buf.extend_from_slice(&stderr_read_buf[..n]);
-                        }
-                        Err(_) => stderr_open = false,
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-            }
-        } else {
-            tokio::select! {
-                biased;
-                _ = async {
-                    if let Some(token) = config.cancel_token.as_ref() {
-                        token.cancelled().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    sigkill_process_group(&mut child).await;
-                    restore_detach_signal_receiver(detach, signal_rx).await;
-                    return Err("Error: command cancelled by user".to_string());
-                }
-                read = stdout.read(&mut stdout_read_buf), if stdout_open => {
-                    match read {
-                        Ok(0) => stdout_open = false,
-                        Ok(n) => {
-                            record_async_bash_chunk(&config.progress_sink, &stdout_read_buf[..n]);
-                            stdout_buf.extend_from_slice(&stdout_read_buf[..n]);
-                        }
-                        Err(_) => stdout_open = false,
-                    }
-                }
-                read = stderr.read(&mut stderr_read_buf), if stderr_open => {
-                    match read {
-                        Ok(0) => stderr_open = false,
-                        Ok(n) => {
-                            record_async_bash_chunk(&config.progress_sink, &stderr_read_buf[..n]);
-                            stderr_buf.extend_from_slice(&stderr_read_buf[..n]);
-                        }
-                        Err(_) => stderr_open = false,
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-            }
-        }
-    }
-
-    if detached {
-        let (adoption_tx, adoption_rx) = tokio::sync::oneshot::channel();
-        let payload = Box::new(astra_tools::detach::DetachedShellPayload {
-            child,
-            stdout,
-            stderr,
-            command: command_label.to_string(),
-            partial_stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
-            partial_stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
-            adoption_tx,
-        });
-        return Ok(DetachableShellOutput::Detached {
-            payload,
-            adoption_rx,
-        });
-    }
-
-    let read_timeout = BASH_PIPE_READ_TIMEOUT;
-    drain_tokio_stdout(
-        &mut stdout,
-        &mut stdout_buf,
-        &config.progress_sink,
-        read_timeout,
-    )
-    .await;
-    drain_tokio_stderr(
-        &mut stderr,
-        &mut stderr_buf,
-        &config.progress_sink,
-        read_timeout,
-    )
-    .await;
-
-    restore_detach_signal_receiver(detach, signal_rx).await;
-    Ok(DetachableShellOutput::Completed(std::process::Output {
-        status: exit_status.unwrap_or_else(|| {
-            child
-                .try_wait()
-                .ok()
-                .flatten()
-                .expect("bash child should have exited before normal completion")
-        }),
-        stdout: stdout_buf,
-        stderr: stderr_buf,
-    }))
-}
-
-/// Adaptive default bash timeout by command kind. Used when the caller
-/// omits the `timeout` field. Session 0e37eb46 regression: cargo builds
-/// on this workspace routinely take 40-90s and the previous
-/// "everything else = 30s" catch-all guaranteed a first-call timeout
-/// that burned one LLM round per cargo/make/pytest invocation.
-///
-/// Tier ladder (matches the operator intuition "the longer a tool
-/// takes to produce useful output, the more patience we should give
-/// it before assuming it's stuck"):
-///
-///   * **5s**   — instant: `echo`, `pwd`, `whoami`, `date`, …
-///   * **10s**  — fast reads: `cat`, `head`, `tail`, `ls`, `stat`, …
-///   * **15s**  — search/traversal: `grep`, `find`, `rg`, `sed`, …
-///   * **120s** — build / test / compile / package-install commands
-///     (tier 5, added 2026-05-09). `cargo`, `make`, `go`, `mvn`,
-///     `gradle`, `pytest`, `pnpm`, `yarn`, `npm`, `pip`, `uv`, `cmake`,
-///     `tox`. Defaults high enough that typical clean builds on
-///     medium-sized workspaces complete; callers that KNOW a build
-///     will be longer pass an explicit `timeout`.
-///   * **30s**  — default for anything else (network, shell scripts
-///     the tiers don't recognize).
-pub(crate) fn default_bash_timeout_secs(command: &str) -> f64 {
+fn default_bash_timeout_secs(command: &str) -> f64 {
     astra_tools::shell_ops::workspace_edge_bash_timeout_secs(command)
 }
-
-// ── Non-blocking pipe drain helpers ──────────────────────────────
-//
-// These are split by pipe type (`ChildStdout` vs `ChildStderr`)
-// because `std::process::ChildStd{out,err}` are distinct types —
-// using a generic-over-`Read` form would force us to own the pipe,
-// and we want to *borrow* it across loop iterations so the wait
-// loop can progressively drain bytes instead of reading only once
-// at the very end.
 
 fn set_pipe_nonblocking_stdout(pipe: Option<&mut std::process::ChildStdout>) {
     #[cfg(unix)]
@@ -4484,123 +4170,14 @@ impl ToolExecutor {
         Ok((command, timeout_secs, workdir))
     }
 
-    fn render_bash_output(
-        &self,
-        command: &str,
-        out: std::process::Output,
-        workdir: &astra_tools::shell_ops::PreparedBashWorkdir,
-    ) -> String {
-        // Register any files read by this bash invocation so the
-        // read-before-edit gate accepts subsequent writes. Without
-        // this, `bash cat path` inspection creates a deadlock:
-        // model reads via bash, tries to edit, gate rejects with
-        // "has not been read yet", model reads again via bash, …
-        if out.status.success() {
-            self.register_bash_read_targets(command, workdir);
+    fn shell_output_renderer(&self) -> BashOutputRenderer {
+        BashOutputRenderer {
+            project_root: self.effective_project_root(),
+            output_limit: self.scaled_output_limit(),
+            tracker: self.build_test_tracker.clone(),
+            observability_session: self.observability_session.clone(),
+            read_only_execution: self.read_only_execution,
         }
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let mut result = String::new();
-
-        // Prepend destructive command warning if applicable
-        if let Some(warning) = destructive_command_warning(command) {
-            result.push_str(warning);
-            result.push('\n');
-        }
-
-        let exit_code = out.status.code().unwrap_or(-1);
-        let exit_semantics = exit_semantics::classify_exit(command, exit_code);
-        let result_class =
-            exit_semantics::classify_command_result(command, &stdout, &stderr, Some(exit_code));
-        let execution_failed = exit_semantics.is_tool_error() || result_class.is_tool_error();
-
-        // `execute()` is a legacy string-only boundary. It cannot carry the
-        // structured `is_error` bit returned by `render_bash_outcome`, so an
-        // execution failure must have a stable textual failure envelope as
-        // well. Otherwise a useful stderr line such as "command not found"
-        // was recorded as a successful tool call by string consumers.
-        if execution_failed {
-            result.push_str(&format!(
-                "Error: bash execution failed (exit code {exit_code})"
-            ));
-        }
-        if !stdout.is_empty() {
-            if !result.is_empty() {
-                result.push_str("\nstdout:\n");
-            }
-            result.push_str(&stdout);
-        }
-        if !stderr.is_empty() {
-            if !result.is_empty() {
-                result.push_str("\nstderr:\n");
-            }
-            result.push_str(&stderr);
-        }
-
-        if result.is_empty() || (result.trim().is_empty() && !result.contains("⚠️")) {
-            return if out.status.success() {
-                "(no output)".to_string()
-            } else {
-                empty_nonzero_exit_output(command, exit_code)
-            };
-        }
-
-        result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
-
-        // Budget-pressure-aware truncation (was hardcoded 20KB)
-        let limit = self.scaled_output_limit();
-        if result.len() > limit {
-            result =
-                astra_text_utils::credential_redaction::truncate_redacted_output(result, limit);
-        }
-
-        // For build/test commands, provide structured output with iteration tracking
-        if build_test::is_build_test_command(command) || build_test::go_test_no_match(&result) {
-            let mut parsed = build_test::parse_build_test_output(&result, out.status.code());
-            if !parsed.error_locations.is_empty() {
-                parsed.enrich_with_scope(&self.effective_project_root());
-            }
-            // Gap 2 + Tier 1 expiry: apply the parsed build/test
-            // outcome to the observability session so the
-            // SelfModel surface stays current on the next turn.
-            // See `apply_build_test_outcome_to_session` for the
-            // full publish/expire semantics and the f85a02bb
-            // regression context.
-            if let Some(session_lock) = &self.observability_session
-                && let Ok(mut session) = session_lock.write()
-            {
-                apply_build_test_outcome_to_session(&mut session, &parsed);
-            }
-            let delta = {
-                let mut tracker = self
-                    .build_test_tracker
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if tracker.command_changed(command) {
-                    tracker.reset();
-                }
-                tracker.record(&parsed, command)
-            };
-            let delta_summary = delta.to_summary();
-            if delta_summary.is_empty() {
-                return parsed.to_enhanced_output(&result);
-            }
-            return format!(
-                "{}\n\n{}",
-                delta_summary,
-                parsed.to_enhanced_output(&result)
-            );
-        }
-
-        // Append exit code context for non-zero, non-build commands
-        if !out.status.success() {
-            if should_append_exit_code(command, exit_code) {
-                result.push_str(&format!("\n(exit code {exit_code})"));
-            }
-        }
-
-        result
     }
 
     fn render_bash_outcome(
@@ -4610,96 +4187,11 @@ impl ToolExecutor {
         descendants_terminated: bool,
         workdir: &astra_tools::shell_ops::PreparedBashWorkdir,
     ) -> super::ToolExecutionOutcome {
-        let exit_code = out.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        let exit_semantics = astra_tools::exit_semantics::classify_exit(command, exit_code);
-        let result_class = astra_tools::exit_semantics::classify_command_result(
-            command,
-            &stdout,
-            &stderr,
-            Some(exit_code),
-        );
-        let output = self.render_bash_output(command, out, workdir);
-        let mut outcome = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
-            super::ToolExecutionOutcome::error(output)
-        } else {
-            super::ToolExecutionOutcome::ok(output)
-        };
-        if descendants_terminated {
-            outcome.output.push_str(
-                "\n\nLive processes observed in this Bash execution scope were terminated when the call ended. Processes that escaped the scope may still run.",
-            );
-            if environment_background_authorized() && !self.read_only_execution {
-                outcome.output.push_str(
-                    " For a service needed by later calls, use run_in_background=true with an independent ready_check.",
-                );
-            } else {
-                outcome.output.push_str(
-                    " Managed background services are unavailable. Keep bounded work and its dependent checks in the same foreground call.",
-                );
-            }
+        if out.status.success() {
+            self.register_bash_read_targets(command, workdir);
         }
-        let fields = outcome
-            .tool_result_fields
-            .get_or_insert_with(serde_json::Map::new);
-        astra_tools::execution_outcome::insert_started_execution_fact(fields);
-        fields.insert(
-            "exit_code".to_string(),
-            Value::Number(serde_json::Number::from(exit_code)),
-        );
-        fields.insert(
-            "exit_semantics".to_string(),
-            serde_json::to_value(exit_semantics).unwrap_or_else(|_| {
-                Value::String(format!("{exit_semantics:?}").to_ascii_lowercase())
-            }),
-        );
-        fields.insert(
-            "result_class".to_string(),
-            Value::String(result_class.as_str().to_string()),
-        );
-        if descendants_terminated {
-            fields.insert("background_children_reaped".to_string(), Value::Bool(true));
-        }
-        if outcome.is_error {
-            let evidence = astra_tools::exit_semantics::command_failed_evidence();
-            fields.insert(
-                "error_kind".to_string(),
-                Value::String(evidence.kind.as_str().to_string()),
-            );
-            fields.insert("retryable".to_string(), Value::Bool(evidence.retryable));
-            fields.insert(
-                "recovery_evidence".to_string(),
-                serde_json::to_value(evidence).expect("command failure evidence must serialize"),
-            );
-        }
-        outcome
-    }
-
-    fn finish_bash_ownership(
-        &self,
-        mut outcome: super::ToolExecutionOutcome,
-        ownership_unsettled: bool,
-        lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
-    ) -> super::ToolExecutionOutcome {
-        let coordination_unsettled =
-            lease.is_some_and(|lease| !lease.coordination_integrity_valid());
-        if coordination_unsettled {
-            astra_tools::workspace_observation::mark_workspace_observation_unsettled(
-                &self.effective_project_root(),
-            );
-        }
-        if ownership_unsettled || coordination_unsettled {
-            outcome.is_error = true;
-            outcome.output.push_str("\n\nThe command's final outcome could not be confirmed; a child process may still be running. Inspect the current state before retrying.");
-            let fields = outcome
-                .tool_result_fields
-                .get_or_insert_with(Default::default);
-            fields.insert("execution_fact".into(), json!("unknown"));
-            fields.insert("side_effects_maybe".into(), json!(true));
-            fields.insert("retryable".into(), json!(false));
-        }
-        outcome
+        self.shell_output_renderer()
+            .render_bash_outcome(command, out, descendants_terminated)
     }
 
     #[cfg(unix)]
@@ -5120,360 +4612,76 @@ impl ToolExecutor {
                     return bash_preparation_rejection(format!("Error: {message}"));
                 }
             };
-        let tool_cancel = cancel_token
-            .map(tokio_util::sync::CancellationToken::child_token)
-            .unwrap_or_default();
-        let _cancel_on_drop = CancelShellOnDrop(tool_cancel.clone());
-        let mut config = self.shell_run_config(
-            "bash",
-            "-c",
-            &command,
-            timeout_secs,
-            true,
-            Some(&tool_cancel),
-        );
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return super::cancelled_tool_execution_outcome("bash", false);
+        }
+        let mut config = self.shell_run_config("bash", "-c", &command, timeout_secs, true, None);
         config.workdir = Some(workdir.clone());
         let output_limit = self.scaled_output_limit_for("bash");
-        let capture_limit =
-            output_limit.min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS);
-        let (capture, stdout, stderr) = match BashOutputCapture::start_blocking(
-            &self.effective_project_root(),
-            capture_limit,
-            output_limit.saturating_mul(2).max(16_384),
-        ) {
+        // Captured streams belong to the executor, not the user's source tree.
+        // They remain stable across presentation/workspace changes and can be
+        // reclaimed by the existing task retention owner after terminal exit.
+        let output_root = self.background_tasks.output_directory();
+        if let Err(error) = std::fs::create_dir_all(&output_root) {
+            return bash_preparation_rejection(format!("Cannot prepare command output: {error}"));
+        }
+        let (capture, stdout, stderr) = match BashOutputCapture::start(&output_root, output_limit) {
             Ok(capture) => capture,
             Err(message) => return bash_preparation_rejection(message),
         };
-        config.output_capture = Some((stdout, stderr));
-        let quarantine_root = self.effective_project_root();
+        let (stdout_path, stderr_path, captured_bytes) = capture.task_output_files();
         let Some(attribution) =
             astra_tools::workspace_observation::WorkspaceAttributionState::capture(
-                &quarantine_root,
+                &self.effective_project_root(),
             )
         else {
-            return bash_preparation_rejection("Error: workspace is unavailable".to_string());
+            return bash_preparation_rejection("Error: workspace is unavailable".into());
         };
-        if _observation_lease
+        let scope = std::sync::Arc::new(ShellScopeLease {
+            attribution,
+            observation: _observation_lease,
+            _workspace: workspace_guard,
+        });
+        let owned = OwnedShellInvocation {
+            config,
+            scope,
+            capture,
+            stdout,
+            stderr,
+            renderer: self.shell_output_renderer(),
+            args: args.clone(),
+            source_preimages,
+            workdir: workdir.clone(),
+            output_limit,
+        };
+        let background =
+            args.get("yield_time_ms").and_then(Value::as_u64) == Some(0) && !nested_in_run_script;
+        let task = match self.background_tasks.start_shell(
+            args.get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(&command),
+            (stdout_path, stderr_path),
+            captured_bytes,
+            background,
+            cancel_token,
+            move |cancel, input| owned.run(cancel, input),
+        ) {
+            Ok(task) => task,
+            Err(message) => return bash_preparation_rejection(message),
+        };
+        let outcome = self
+            .wait_for_shell_task(task, args, cancel_token, nested_in_run_script)
+            .await;
+        if outcome
+            .tool_result_fields
             .as_ref()
-            .is_some_and(|lease| !lease.coordination_integrity_valid())
+            .and_then(|fields| fields.get("exit_code"))
+            .and_then(Value::as_i64)
+            == Some(0)
         {
-            return bash_preparation_rejection(
-                "Error: workspace changed before execution".to_string(),
-            );
-        }
-        // The worker owns observation leases until its process group settles,
-        // including when the caller is cancelled while awaiting the join.
-        let shell_result = tokio::task::spawn_blocking(move || {
-            let scope = ShellScopeLease {
-                attribution,
-                observation: _observation_lease,
-                _workspace: workspace_guard,
-            };
-            let config = config;
-            let result = if scope
-                .observation
-                .as_ref()
-                .is_some_and(|lease| !lease.coordination_integrity_valid())
-            {
-                Err(ShellRunError::new(
-                    "Error: workspace changed before the command started. No command was run.",
-                ))
-            } else {
-                run_shell_output_with_config(config)
-            };
-            (result, scope)
-        })
-        .await;
-        let (shell_result, scope) = match shell_result {
-            Ok((result, scope)) => (Ok(result), Some(scope)),
-            Err(error) => (Err(error), None),
-        };
-        let observation_lease = scope.as_ref().and_then(|scope| scope.observation.as_ref());
-        let coordination_unsettled = observation_lease
-            .as_ref()
-            .is_some_and(|lease| !lease.coordination_integrity_valid());
-        let command_complete = matches!(&shell_result, Ok(Ok(_)));
-        let outcome = match shell_result {
-            Ok(Ok(output)) => {
-                let scope_ownership = output.scope_ownership;
-                let ownership_unsettled = coordination_unsettled
-                    || (scope_ownership.is_none()
-                        && !astra_tools::workspace_observation::bash_command_is_detachable_safe(
-                            &command,
-                        ));
-                self.finish_bash_ownership(
-                    self.render_bash_outcome(
-                        &command,
-                        output.output,
-                        output.descendants_terminated,
-                        &workdir,
-                    ),
-                    ownership_unsettled,
-                    observation_lease,
-                )
-            }
-            Ok(Err(error)) => {
-                if !error.execution_started {
-                    return bash_preparation_rejection(error.message);
-                }
-                let outcome_unknown = error.kind == astra_core::ErrorKind::ToolOutcomeUnknown
-                    || error.ownership_unsettled
-                    || coordination_unsettled;
-                // Preserve the worker's cause; a cancellation arriving after
-                // settlement must not relabel a timeout or lost process result.
-                let mut outcome = if error.kind == astra_core::ErrorKind::Cancelled {
-                    let mut cancelled = super::cancelled_tool_execution_outcome("bash", true);
-                    cancelled.output = error.message;
-                    cancelled
-                } else {
-                    super::ToolExecutionOutcome::error_with_evidence(
-                        error.message,
-                        astra_core::ToolFailureEvidence::new(
-                            error.kind,
-                            if outcome_unknown {
-                                astra_core::ToolFailureCause::OutcomeUnknown
-                            } else {
-                                astra_core::ToolFailureCause::CommandFailed
-                            },
-                            false,
-                            vec![if outcome_unknown {
-                                astra_core::ToolRecoveryAction::ReconcileOutcome
-                            } else {
-                                astra_core::ToolRecoveryAction::InspectStructuredFailure
-                            }],
-                        ),
-                    )
-                };
-                let fields = outcome.tool_result_fields.get_or_insert_default();
-                fields.insert("retryable".into(), Value::Bool(false));
-                astra_tools::execution_outcome::insert_started_execution_fact(fields);
-                if outcome_unknown {
-                    fields.insert("execution_fact".into(), json!("unknown"));
-                }
-                self.finish_bash_ownership(
-                    outcome,
-                    coordination_unsettled || error.ownership_unsettled,
-                    observation_lease,
-                )
-            }
-            Err(error) => {
-                let mut outcome = super::ToolExecutionOutcome::error(format!(
-                    "Error: bash worker failed: {error}"
-                ));
-                let fields = outcome.tool_result_fields.get_or_insert_default();
-                let evidence = astra_core::ToolFailureEvidence::from_error_kind(
-                    astra_core::ErrorKind::ToolOutcomeUnknown,
-                );
-                fields.insert(
-                    "error_kind".into(),
-                    Value::String(evidence.kind.as_str().into()),
-                );
-                fields.insert(
-                    "recovery_evidence".into(),
-                    serde_json::to_value(evidence).expect("tool outcome evidence must serialize"),
-                );
-                fields.insert("execution_fact".into(), Value::String("unknown".into()));
-                fields.insert("side_effects_maybe".into(), Value::Bool(true));
-                fields.insert("retryable".into(), Value::Bool(false));
-                self.finish_bash_ownership(
-                    outcome,
-                    coordination_unsettled
-                        || !astra_tools::workspace_observation::bash_command_is_detachable_safe(
-                            &command,
-                        ),
-                    observation_lease,
-                )
-            }
-        };
-        let mut outcome = attach_bash_workdir_outcome(
-            attach_source_preimage_outcome(outcome, source_preimages),
-            &self.effective_project_root(),
-            &workdir,
-            args,
-        );
-        // The blocking worker has settled before the capture is finalized.
-        // Its streams were tapped before the bounded renderer saw them.
-        let retain_for_preview = outcome.output.len() > capture_limit;
-        match capture
-            .finish(command_complete, command_complete, retain_for_preview)
-            .await
-        {
-            Ok(Some(receipt)) => {
-                if !receipt.complete {
-                    mark_bash_capture_unavailable(&mut outcome);
-                }
-                let fields = outcome.tool_result_fields.get_or_insert_default();
-                let terminal = format!(
-                    "[bash outcome: exit_code={}; exit_semantics={}; error_kind={}; background_children_reaped={}]",
-                    fields.get("exit_code").unwrap_or(&Value::Null),
-                    fields.get("exit_semantics").unwrap_or(&Value::Null),
-                    fields.get("error_kind").unwrap_or(&Value::Null),
-                    fields
-                        .get("background_children_reaped")
-                        .unwrap_or(&Value::Bool(false))
-                );
-                outcome.output = receipt.present(&outcome.output, &terminal, output_limit);
-                fields.extend(receipt.result_fields());
-            }
-            Ok(None) => {}
-            Err(failure) => {
-                outcome.output = format!(
-                    "[bash output capture failed: {failure}; no complete output file]\n{}",
-                    outcome.output
-                );
-                mark_bash_capture_unavailable(&mut outcome);
-                outcome.tool_result_fields.get_or_insert_default().insert(
-                    "bash_output_capture".into(),
-                    serde_json::json!({"complete":false,"failure":failure}),
-                );
-            }
+            self.register_bash_read_targets(&command, &workdir);
         }
         outcome
-    }
-
-    async fn restore_bash_detach_handle(
-        &self,
-        slot: astra_tools::detach::DetachShellSlot,
-        handle: astra_tools::detach::DetachShellHandle,
-    ) {
-        handle.mark_active(false);
-        if !handle.is_blocked() {
-            *slot.lock().await = Some(handle);
-        }
-    }
-
-    pub(crate) async fn bash_detachable_with_metadata(
-        &self,
-        args: &Value,
-        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
-        cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Option<super::ToolExecutionOutcome> {
-        if self.read_only_execution {
-            return Some(read_only_shell_rejection());
-        }
-        let slot = self.bash_detach_slot.as_ref()?.clone();
-        let handle = slot.lock().await.take()?;
-
-        let (command, timeout_secs, workdir) =
-            match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
-                Ok(invocation) => invocation,
-                Err(message) => {
-                    self.restore_bash_detach_handle(slot, handle).await;
-                    return Some(bash_preparation_rejection(message));
-                }
-            };
-        let outcome = async {
-            // A detached child has no foreground post-execution observation
-            // window yet. Refuse to detach commands that are not proven
-            // cache-safe, so a background writer cannot mutate the workspace after
-            // this call returns and pollute a later caller's receipt. Returning
-            // `None` hands the invocation to the normal foreground path, which
-            // owns the shared lease and finalizes the receipt.
-            if !astra_tools::workspace_observation::bash_command_is_detachable_safe(&command) {
-                self.restore_bash_detach_handle(slot, handle).await;
-                return None;
-            }
-            let source_preimages =
-                match prepare_source_preimages(self, args, invocation, false, &workdir) {
-                    Ok(plan) => plan,
-                    Err(message) => {
-                        self.restore_bash_detach_handle(slot, handle).await;
-                        return Some(bash_preparation_rejection(format!("Error: {message}")));
-                    }
-                };
-            if source_preimages.is_some() {
-                self.restore_bash_detach_handle(slot, handle).await;
-                return Some(bash_preparation_rejection(
-                    "Error: source_artifacts cannot be combined with detached bash until terminal receipt tracking is available".to_string(),
-                ));
-            }
-            let mut config =
-                self.shell_run_config("bash", "-c", &command, timeout_secs, true, cancel_token);
-            config.workdir = Some(workdir.clone());
-
-            handle.mark_active(true);
-            let outcome = run_shell_output_with_detach_config(config, &handle, &command).await;
-            match outcome {
-                Ok(DetachableShellOutput::Completed(out)) => {
-                    self.restore_bash_detach_handle(slot, handle).await;
-                    let mut outcome = self.render_bash_outcome(&command, out, false, &workdir);
-                    outcome.output = self.finalize_tool_output(outcome.output, "bash");
-                    self.record_output_size(outcome.output.len());
-                    Some(outcome)
-                }
-                Ok(DetachableShellOutput::Detached {
-                    payload,
-                    adoption_rx,
-                }) => {
-                    handle.mark_active(false);
-                    let Some(sender) = handle.payload_tx.lock().await.take() else {
-                        terminate_detached_payload(payload).await;
-                        return Some(super::ToolExecutionOutcome::error(
-                            "Error: bash detach failed: host payload channel was not available"
-                                .to_string(),
-                        ));
-                    };
-                    if let Err(payload) = sender.send(*payload) {
-                        terminate_detached_payload(Box::new(payload)).await;
-                        return Some(super::ToolExecutionOutcome::error(
-                            "Error: bash detach failed: host listener dropped before payload arrived"
-                                .to_string(),
-                        ));
-                    }
-
-                    let task_id = match await_adoption_ack(adoption_rx).await {
-                        AdoptionAckOutcome::Adopted { task_id, .. } => task_id,
-                        AdoptionAckOutcome::Refused(error) => {
-                            return Some(super::ToolExecutionOutcome::error(format!(
-                                "Error: bash detach failed: host could not adopt process: {error}"
-                            )));
-                        }
-                        AdoptionAckOutcome::SenderDropped => {
-                            return Some(super::ToolExecutionOutcome::error(
-                                "Error: bash detach failed: host dropped adoption acknowledgement"
-                                    .to_string(),
-                            ));
-                        }
-                        AdoptionAckOutcome::TimedOut => {
-                            return Some(super::ToolExecutionOutcome::error(
-                                "Error: bash detach failed: host did not acknowledge adoption in time"
-                                    .to_string(),
-                            ));
-                        }
-                    };
-
-                    let output = render_bash_detached_marker(&task_id);
-                    let mut tool_result_fields = serde_json::Map::new();
-                    tool_result_fields.insert("bash_detached".to_string(), Value::Bool(true));
-                    tool_result_fields.insert(
-                        "background_task_id".to_string(),
-                        Value::String(task_id.clone()),
-                    );
-                    WorkUnitObservation::new(
-                        task_id,
-                        "shell",
-                        WorkUnitStatus::Running,
-                        1,
-                        WorkUnitObservationMode::Transition,
-                    )
-                    .expect("detached shell task ids are non-empty")
-                    .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
-                    .insert_into(&mut tool_result_fields);
-                    Some(super::ToolExecutionOutcome {
-                        output,
-                        tool_result_fields: Some(tool_result_fields),
-                        is_error: false,
-                    })
-                }
-                Err(error) => {
-                    self.restore_bash_detach_handle(slot, handle).await;
-                    Some(super::ToolExecutionOutcome::error(error))
-                }
-            }
-        }.await;
-        outcome.map(|outcome| {
-            attach_bash_workdir_outcome(outcome, &self.effective_project_root(), &workdir, args)
-        })
     }
 
     pub(crate) fn powershell(&self, args: &Value) -> String {
@@ -5587,6 +4795,215 @@ impl ToolExecutor {
     }
 }
 
+fn finish_bash_ownership(
+    root: &std::path::Path,
+    mut outcome: super::ToolExecutionOutcome,
+    ownership_unsettled: bool,
+    lease: Option<&astra_tools::workspace_observation::WorkspaceObservationLease>,
+) -> super::ToolExecutionOutcome {
+    let coordination_unsettled = lease.is_some_and(|lease| !lease.coordination_integrity_valid());
+    if coordination_unsettled {
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(root);
+    }
+    if ownership_unsettled || coordination_unsettled {
+        outcome.is_error = true;
+        outcome.output.push_str("\n\nThe command's final outcome could not be confirmed; a child process may still be running. Inspect the current state before retrying.");
+        let fields = outcome
+            .tool_result_fields
+            .get_or_insert_with(Default::default);
+        fields.insert("execution_fact".into(), json!("unknown"));
+        fields.insert("side_effects_maybe".into(), json!(true));
+        fields.insert("retryable".into(), json!(false));
+    }
+    outcome
+}
+
+struct BashOutputRenderer {
+    project_root: PathBuf,
+    output_limit: usize,
+    tracker: std::sync::Arc<std::sync::Mutex<build_test::BuildTestTracker>>,
+    observability_session: Option<
+        std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
+    >,
+    read_only_execution: bool,
+}
+
+impl BashOutputRenderer {
+    fn render_output(&self, command: &str, out: std::process::Output) -> String {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut result = String::new();
+
+        // Prepend destructive command warning if applicable
+        if let Some(warning) = destructive_command_warning(command) {
+            result.push_str(warning);
+            result.push('\n');
+        }
+
+        let exit_code = out.status.code().unwrap_or(-1);
+        let exit_semantics = exit_semantics::classify_exit(command, exit_code);
+        let result_class =
+            exit_semantics::classify_command_result(command, &stdout, &stderr, Some(exit_code));
+        let execution_failed = exit_semantics.is_tool_error() || result_class.is_tool_error();
+
+        // `execute()` is a legacy string-only boundary. It cannot carry the
+        // structured `is_error` bit returned by `render_bash_outcome`, so an
+        // execution failure must have a stable textual failure envelope as
+        // well. Otherwise a useful stderr line such as "command not found"
+        // was recorded as a successful tool call by string consumers.
+        if execution_failed {
+            result.push_str(&format!(
+                "Error: bash execution failed (exit code {exit_code})"
+            ));
+        }
+        if !stdout.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\nstdout:\n");
+            }
+            result.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\nstderr:\n");
+            }
+            result.push_str(&stderr);
+        }
+
+        if result.is_empty() || (result.trim().is_empty() && !result.contains("⚠️")) {
+            return if out.status.success() {
+                "(no output)".to_string()
+            } else {
+                empty_nonzero_exit_output(command, exit_code)
+            };
+        }
+
+        result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
+
+        // Budget-pressure-aware truncation (was hardcoded 20KB)
+        let limit = self.output_limit;
+        if result.len() > limit {
+            result =
+                astra_text_utils::credential_redaction::truncate_redacted_output(result, limit);
+        }
+
+        // For build/test commands, provide structured output with iteration tracking
+        if build_test::is_build_test_command(command) || build_test::go_test_no_match(&result) {
+            let mut parsed = build_test::parse_build_test_output(&result, out.status.code());
+            if !parsed.error_locations.is_empty() {
+                parsed.enrich_with_scope(&self.project_root.clone());
+            }
+            // Gap 2 + Tier 1 expiry: apply the parsed build/test
+            // outcome to the observability session so the
+            // SelfModel surface stays current on the next turn.
+            // See `apply_build_test_outcome_to_session` for the
+            // full publish/expire semantics and the f85a02bb
+            // regression context.
+            if let Some(session_lock) = &self.observability_session
+                && let Ok(mut session) = session_lock.write()
+            {
+                apply_build_test_outcome_to_session(&mut session, &parsed);
+            }
+            let delta = {
+                let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                if tracker.command_changed(command) {
+                    tracker.reset();
+                }
+                tracker.record(&parsed, command)
+            };
+            let delta_summary = delta.to_summary();
+            if delta_summary.is_empty() {
+                return parsed.to_enhanced_output(&result);
+            }
+            return format!(
+                "{}\n\n{}",
+                delta_summary,
+                parsed.to_enhanced_output(&result)
+            );
+        }
+
+        // Append exit code context for non-zero, non-build commands
+        if !out.status.success() {
+            if should_append_exit_code(command, exit_code) {
+                result.push_str(&format!("\n(exit code {exit_code})"));
+            }
+        }
+
+        result
+    }
+
+    fn render_bash_outcome(
+        &self,
+        command: &str,
+        out: std::process::Output,
+        descendants_terminated: bool,
+    ) -> super::ToolExecutionOutcome {
+        let exit_code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let exit_semantics = astra_tools::exit_semantics::classify_exit(command, exit_code);
+        let result_class = astra_tools::exit_semantics::classify_command_result(
+            command,
+            &stdout,
+            &stderr,
+            Some(exit_code),
+        );
+        let output = self.render_output(command, out);
+        let mut outcome = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
+            super::ToolExecutionOutcome::error(output)
+        } else {
+            super::ToolExecutionOutcome::ok(output)
+        };
+        if descendants_terminated {
+            outcome.output.push_str(
+                "\n\nLive processes observed in this Bash execution scope were terminated when the call ended. Processes that escaped the scope may still run.",
+            );
+            if environment_background_authorized() && !self.read_only_execution {
+                outcome.output.push_str(
+                    " For a service needed by later calls, use run_in_background=true with an independent ready_check.",
+                );
+            } else {
+                outcome.output.push_str(
+                    " Managed background services are unavailable. Keep bounded work and its dependent checks in the same foreground call.",
+                );
+            }
+        }
+        let fields = outcome
+            .tool_result_fields
+            .get_or_insert_with(serde_json::Map::new);
+        astra_tools::execution_outcome::insert_started_execution_fact(fields);
+        fields.insert(
+            "exit_code".to_string(),
+            Value::Number(serde_json::Number::from(exit_code)),
+        );
+        fields.insert(
+            "exit_semantics".to_string(),
+            serde_json::to_value(exit_semantics).unwrap_or_else(|_| {
+                Value::String(format!("{exit_semantics:?}").to_ascii_lowercase())
+            }),
+        );
+        fields.insert(
+            "result_class".to_string(),
+            Value::String(result_class.as_str().to_string()),
+        );
+        if descendants_terminated {
+            fields.insert("background_children_reaped".to_string(), Value::Bool(true));
+        }
+        if outcome.is_error {
+            let evidence = astra_tools::exit_semantics::command_failed_evidence();
+            fields.insert(
+                "error_kind".to_string(),
+                Value::String(evidence.kind.as_str().to_string()),
+            );
+            fields.insert("retryable".to_string(), Value::Bool(evidence.retryable));
+            fields.insert(
+                "recovery_evidence".to_string(),
+                serde_json::to_value(evidence).expect("command failure evidence must serialize"),
+            );
+        }
+        outcome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ToolExecutor;
@@ -5673,10 +5090,12 @@ mod tests {
                 !interrupted.output.contains("ghp_"),
                 "incomplete sensitive lines must be omitted"
             );
-            assert!(
-                interrupted.output.contains("effects may remain"),
-                "{}",
-                interrupted.output
+            let facts = interrupted.tool_result_fields.as_ref().unwrap();
+            assert_eq!(facts["side_effects_maybe"], true);
+            assert_eq!(facts["retryable"], false);
+            assert_eq!(
+                facts["error_kind"],
+                if cancel { "cancelled" } else { "tool_timeout" }
             );
             let next = executor
                 .execute_with_metadata("bash", &serde_json::json!({"command":"printf next > next"}))
@@ -6841,7 +6260,8 @@ mod tests {
     async fn unstarted_shell_failure_does_not_quarantine_the_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let outcome = executor.finish_bash_ownership(
+        let outcome = super::finish_bash_ownership(
+            &executor.effective_project_root(),
             super::super::ToolExecutionOutcome::error("spawn failed".to_string()),
             false,
             None,
@@ -6905,16 +6325,14 @@ mod tests {
     #[tokio::test]
     async fn completed_mutation_free_detach_candidate_does_not_quarantine_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        let (slot, _listener) = astra_tools::detach::new_slot_with_handle();
-        let executor = test_executor_in(dir.path()).with_bash_detach_slot(slot);
+        let executor = test_executor_in(dir.path());
         let outcome = executor
-            .bash_detachable_with_metadata(
+            .bash_outcome_with_cancel_async(
                 &serde_json::json!({"command": "true"}),
                 astra_tools::tool_engine::ToolInvocationMetadata::default(),
                 None,
             )
-            .await
-            .expect("safe command enters detachable lane");
+            .await;
 
         assert!(!outcome.is_error, "{outcome:?}");
         assert_eq!(
@@ -7030,7 +6448,8 @@ mod tests {
     async fn started_shell_with_unsettled_ownership_reports_unknown_without_a_delta() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let outcome = executor.finish_bash_ownership(
+        let outcome = super::finish_bash_ownership(
+            &executor.effective_project_root(),
             super::super::ToolExecutionOutcome::error("ownership lost".to_string()),
             true,
             None,
@@ -7084,35 +6503,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_missing_command_returns_error() {
+    async fn bash_invalid_command_is_typed_and_never_executes() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let result = executor
-            .execute_with_metadata("bash", &serde_json::json!({}))
-            .await
-            .output;
-        assert!(result.contains("Error"), "got: {result}");
-        assert!(
-            result.contains("Origin: model_argument_error"),
-            "got: {result}"
-        );
-        assert!(result.contains("no command was run"), "got: {result}");
-    }
-
-    #[tokio::test]
-    async fn bash_blank_command_returns_model_argument_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let executor = test_executor_in(dir.path());
-        let result = executor
-            .execute_with_metadata("bash", &serde_json::json!({"command": " \n\t "}))
-            .await
-            .output;
-        assert!(result.contains("Error"), "got: {result}");
-        assert!(
-            result.contains("Origin: model_argument_error"),
-            "got: {result}"
-        );
-        assert!(result.contains("no command was run"), "got: {result}");
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"command":" \n\t "}),
+        ] {
+            let outcome = executor.execute_with_metadata("bash", &args).await;
+            let fields = outcome.tool_result_fields.unwrap();
+            assert!(outcome.is_error);
+            assert_eq!(fields["error_kind"], "tool_invalid_args");
+            assert_eq!(fields["execution_started"], false);
+            assert_eq!(fields["side_effects_maybe"], false);
+        }
     }
 
     #[tokio::test]
@@ -7154,37 +6558,20 @@ mod tests {
     /// is the canonical 12-LLM-round trace this contract was designed
     /// to defeat.
     #[tokio::test]
-    async fn bash_rejects_background_task_output_dir_disk_read() {
+    async fn bash_can_read_authorized_saved_task_output() {
         let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("astra/bg_tasks/task.stdout");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(&output, "saved evidence\n").unwrap();
         let executor = test_executor_in(dir.path());
-        for command in [
-            "tail -20 /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
-            "cat /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
-            "tail -f /var/folders/abc/T/astra/bg_tasks/sess/bg-shell-2.stdout",
-            "grep error /tmp/astra/bg_tasks/sess/bg-shell-3.stderr",
-        ] {
-            let result = executor
-                .execute_with_metadata("bash", &serde_json::json!({"command": command}))
-                .await
-                .output;
-            assert!(
-                result.contains("background task output files"),
-                "{command} -> {result}"
-            );
-            assert!(result.contains("task_output"), "{command} -> {result}");
-            assert!(result.contains("pattern"), "{command} -> {result}");
-        }
-        assert!(
-            executor
-                .execute_with_metadata(
-                    "bash",
-                    &serde_json::json!({"command": "echo bg_tasks is unrelated here"})
-                )
-                .await
-                .output
-                .contains("bg_tasks is unrelated here"),
-            "literal word 'bg_tasks' without the astra path prefix must not trigger"
-        );
+        let result = executor
+            .execute_with_metadata(
+                "bash",
+                &serde_json::json!({"command":"tail -1 astra/bg_tasks/task.stdout"}),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("saved evidence"));
     }
 
     /// Regression for the c49bc4a3 inspection-loop deadlock: a model that
@@ -7442,7 +6829,8 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let executor = test_executor_in(dir.path());
         let outcome = executor.execute_with_metadata("bash", &serde_json::json!({
-            "command": format!("cd {} && ./custom-command", super::shell_escape(dir.path().to_str().unwrap()))
+            "command": format!("cd {} && ./custom-command", super::shell_escape(dir.path().to_str().unwrap())),
+            "yield_time_ms":30000
         })).await;
         assert!(!outcome.is_error, "{}", outcome.output);
         assert!(outcome.output.contains("custom command finished"));
@@ -7523,7 +6911,7 @@ mod tests {
             .execute_with_metadata(
                 "bash",
                 &serde_json::json!({
-                    "command": "echo started && sleep 60 &",
+                    "command": "echo started; sleep 60 &",
                     "timeout": 5.0
                 }),
             )

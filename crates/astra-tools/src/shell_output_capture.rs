@@ -72,26 +72,26 @@ impl CaptureState {
     }
 }
 
-pub(super) struct CaptureWriter {
+pub struct CaptureWriter {
     file: File,
     state: CaptureState,
 }
 
 impl CaptureWriter {
-    pub(super) async fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<(), ()> {
         self.state.reserve(bytes.len())?;
         self.file.write_all(bytes).await.map_err(|_| {
             self.state.mark_io_failure();
         })
     }
 
-    pub(super) async fn finish(mut self) -> Result<(), ()> {
+    pub async fn finish(mut self) -> Result<(), ()> {
         self.file.flush().await.map_err(|_| {
             self.state.mark_io_failure();
         })
     }
 
-    pub(super) fn read_failed(&self) {
+    pub fn read_failed(&self) {
         self.state.mark_io_failure();
     }
 }
@@ -124,7 +124,17 @@ pub struct CaptureReceipt {
 }
 
 impl BashOutputCapture {
-    pub(super) fn start(
+    /// The task registry observes these same files and counter from launch;
+    /// changing foreground presentation never reopens or reseeds a stream.
+    pub fn task_output_files(&self) -> (PathBuf, PathBuf, Arc<AtomicU64>) {
+        (
+            self.stdout.clone(),
+            self.stderr.clone(),
+            self.state.used.clone(),
+        )
+    }
+
+    pub fn start(
         workspace: &Path,
         inline_limit: usize,
     ) -> Result<(Self, CaptureWriter, CaptureWriter), String> {
@@ -141,6 +151,53 @@ impl BashOutputCapture {
                 state,
             },
         ))
+    }
+
+    /// Recover quota ownership only for private files in Astra's capture
+    /// namespace. A saved path alone never authorizes deleting user files.
+    pub fn retained_task_bytes(output_root: &Path, stdout: &Path, stderr: &Path) -> Option<u64> {
+        let directory = stdout.parent()?;
+        if stderr.parent()? != directory || directory.file_name()? != CAPTURE_DIRECTORY_NAME {
+            return None;
+        }
+        let stem = stdout.file_stem()?.to_str()?;
+        if stem.len() != 16
+            || !stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || stdout.extension()? != "stdout"
+            || stderr.file_stem()? != stem
+            || stderr.extension()? != "stderr"
+        {
+            return None;
+        }
+        let root = directory.parent()?.canonicalize().ok()?;
+        let expected = output_root.canonicalize().ok()?;
+        if root != expected {
+            return None;
+        }
+        if !std::fs::symlink_metadata(directory)
+            .ok()?
+            .file_type()
+            .is_dir()
+        {
+            return None;
+        }
+        let mut bytes = 0_u64;
+        for path in [stdout, stderr] {
+            let metadata = std::fs::symlink_metadata(path).ok()?;
+            if !metadata.file_type().is_file() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // SAFETY: geteuid has no preconditions or borrowed resources.
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                    return None;
+                }
+            }
+            bytes = bytes.saturating_add(metadata.len());
+        }
+        Some(bytes)
     }
 
     /// Tap a blocking process runner without replacing its process owner.

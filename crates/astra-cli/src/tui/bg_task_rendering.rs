@@ -15,7 +15,7 @@ use super::frame_requester::FrameRequester;
 use crate::background_task_error::BackgroundTaskError;
 
 pub(crate) fn background_task_rows(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
 ) -> Vec<super::bottom_pane::background_task_view::BackgroundTaskRow> {
     background_registry.drain_join_set();
     let snapshots: Vec<_> = background_registry
@@ -35,6 +35,11 @@ pub(crate) fn background_task_rows(
                 handle.output_tail().map(str::to_string),
                 handle.output_error().cloned(),
                 handle.observed_output_bytes(),
+                handle
+                    .input
+                    .get()
+                    .is_some_and(astra_sandbox::ProcessInput::is_open)
+                    && !handle.status().is_terminal(),
                 format!(
                     "stdout: {} · stderr: {}",
                     handle.stdout_path.display(),
@@ -61,6 +66,7 @@ pub(crate) fn background_task_rows(
                 output_tail,
                 output_error,
                 total_bytes,
+                input_available,
                 output_ref,
             )| {
                 let output_error = output_error
@@ -83,6 +89,7 @@ pub(crate) fn background_task_rows(
                 .with_output_stats(None, None)
                 .with_terminal(exit_code, terminal_reason)
                 .with_timing(Some(started_at_ms), ended_at_ms)
+                .with_input_available(input_available)
             },
         )
         .collect()
@@ -381,7 +388,7 @@ pub(crate) fn background_task_row_for_local_agent_projection(
 }
 
 pub(crate) async fn background_task_rows_with_agents(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
 ) -> Vec<super::bottom_pane::background_task_view::BackgroundTaskRow> {
@@ -390,7 +397,7 @@ pub(crate) async fn background_task_rows_with_agents(
 }
 
 pub(crate) fn background_task_rows_with_agent_snapshot(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     snapshot: &super::local_agent_snapshot::LocalAgentSnapshot,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
 ) -> Vec<super::bottom_pane::background_task_view::BackgroundTaskRow> {
@@ -429,7 +436,7 @@ pub(crate) fn background_task_rows_with_agent_snapshot(
 }
 
 pub(crate) async fn render_background_task_list_xml_with_agents(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
 ) -> String {
@@ -440,13 +447,13 @@ pub(crate) async fn render_background_task_list_xml_with_agents(
 }
 
 pub(crate) fn background_task_live_control_state(
-    live_control: super::background_tasks::BgTaskLiveControl,
+    live_control: crate::edge_tools::background_tasks::BgTaskLiveControl,
 ) -> super::bottom_pane::background_task_view::LiveControlState {
     match live_control {
-        super::background_tasks::BgTaskLiveControl::Available => {
+        crate::edge_tools::background_tasks::BgTaskLiveControl::Available => {
             super::bottom_pane::background_task_view::LiveControlState::Available
         }
-        super::background_tasks::BgTaskLiveControl::StaleHandle => {
+        crate::edge_tools::background_tasks::BgTaskLiveControl::StaleHandle => {
             super::bottom_pane::background_task_view::LiveControlState::StaleHandle
         }
     }
@@ -490,7 +497,7 @@ pub(crate) fn sync_background_task_footer_from_rows(
 }
 
 pub(crate) async fn open_background_task_view(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     bottom_pane: &mut BottomPane,
@@ -508,7 +515,7 @@ pub(crate) async fn open_background_task_view(
 }
 
 pub(crate) async fn reveal_background_task_view(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     bottom_pane: &mut BottomPane,
@@ -529,7 +536,7 @@ pub(crate) async fn reveal_background_task_view(
 }
 
 pub(crate) async fn reveal_background_task_view_with_extra_rows(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     bottom_pane: &mut BottomPane,
@@ -554,7 +561,7 @@ pub(crate) async fn reveal_background_task_view_with_extra_rows(
 /// Used by Ctrl+B/Shift+Down so the user always lands in a panel they can navigate or
 /// dismiss. Empty-state rendering lives in `BackgroundTaskView`.
 pub(crate) async fn force_open_background_task_view(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     bottom_pane: &mut BottomPane,
@@ -575,7 +582,7 @@ pub(crate) async fn force_open_background_task_view(
 
 #[allow(clippy::too_many_arguments)]
 async fn reveal_background_task_view_rows_inner(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     bottom_pane: &mut BottomPane,
@@ -615,7 +622,7 @@ async fn reveal_background_task_view_rows_inner(
 
 pub(crate) async fn dispatch_background_task_stop(
     task_id: &str,
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     chat_widget: &mut super::chat_widget::ChatWidget,
@@ -675,7 +682,7 @@ pub(crate) enum BackgroundTaskStopTarget {
 }
 
 pub(crate) async fn stop_background_task_with_agents(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     task_id: &str,
@@ -743,7 +750,7 @@ pub(crate) async fn stop_background_task_with_agents(
 }
 
 pub(crate) async fn background_task_output_snapshot_with_agents(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     task_id: &str,
@@ -867,6 +874,7 @@ pub(crate) fn render_background_task_rows_xml(
             ),
             ("elapsed_ms", row.elapsed_ms.to_string()),
             ("title", xml_escape_attr(&row.title)),
+            ("stdin", row.input_available.to_string()),
         ];
         match row.kind {
             BackgroundTaskKind::Shell => attrs.push(("command", xml_escape_attr(&row.title))),
