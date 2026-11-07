@@ -26,6 +26,7 @@ const READY_FD_ENV: &str = "ASTRA_EDGE_READY_FD";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+const LOG_ROTATE_INTERVAL: Duration = Duration::from_secs(30);
 const LOG_TAIL_LINES: usize = 200;
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 
@@ -33,10 +34,15 @@ static INSTANCE_LOCK: Mutex<Option<File>> = Mutex::new(None);
 static SHUTDOWN: OnceLock<CancellationToken> = OnceLock::new();
 static STARTUP_CANCELLED: AtomicBool = AtomicBool::new(false);
 static PARENT_RELEASED: AtomicBool = AtomicBool::new(false);
-static PHASE_STATE: Mutex<PhaseState> = Mutex::new(PhaseState { epoch: 0 });
+static PHASE_STATE: Mutex<PhaseState> = Mutex::new(PhaseState {
+    epoch: 0,
+    connected: None,
+});
 
 struct PhaseState {
     epoch: u64,
+    /// `connected.lock`, held exactly while the runner is connected.
+    connected: Option<File>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,12 +161,21 @@ fn phase_epoch(state: &Mutex<PhaseState>) -> u64 {
     lock_phase(state).epoch
 }
 
+/// `connected` is published only by holding `connected.lock`; the phase file
+/// describes a runner that is not connected. Leaving `connected` releases
+/// the lock, which needs no filesystem write, so a failed phase write cannot
+/// leave the runner reported as connected.
 fn note_phase_with(state: &Mutex<PhaseState>, dir: &Path, phase: &str) {
     let mut gate = lock_phase(state);
+    if let Err(error) = write_private(&dir.join("phase"), phase.as_bytes()) {
+        tracing::warn!(target: "astra.edge", phase, error = %error, "cannot record the runner phase");
+    }
     if phase != "connected" {
         gate.epoch = gate.epoch.wrapping_add(1);
+        if let Some(connected) = gate.connected.as_ref() {
+            let _ = connected.unlock();
+        }
     }
-    let _ = write_private(&dir.join("phase"), phase.as_bytes());
 }
 
 fn signal_ready_for_epoch_with(
@@ -169,8 +184,14 @@ fn signal_ready_for_epoch_with(
     dir: Option<&Path>,
     ready_fd: Option<i32>,
 ) {
-    let _gate = lock_phase(state);
-    if _gate.epoch != epoch {
+    let gate = lock_phase(state);
+    if gate.epoch != epoch {
+        return;
+    }
+    if let Some(connected) = gate.connected.as_ref()
+        && let Err(error) = connected.lock_exclusive()
+    {
+        tracing::warn!(target: "astra.edge", error = %error, "cannot publish the connected state");
         return;
     }
     signal_ready_in(dir, ready_fd);
@@ -212,16 +233,14 @@ pub fn prepare_child() -> io::Result<()> {
     })?);
     detach_session()?;
     let lock = acquire_instance_lock(&dir)?;
-    write_private(&dir.join("pid"), std::process::id().to_string().as_bytes())?;
+    lock_phase(&PHASE_STATE).connected = Some(open_lock_file(&dir.join("connected.lock"))?);
     note_phase("starting");
     *INSTANCE_LOCK
         .lock()
         .map_err(|_| io::Error::other("runner instance lock poisoned"))? = Some(lock);
     let log = dir.join("edge.log");
     rotate_log(&log)?;
-    redirect_stdio(&log)?;
-    spawn_log_rotator();
-    Ok(())
+    redirect_stdio(&log)
 }
 
 pub fn management_exit_code(args: &[String], root: &Path) -> Option<i32> {
@@ -255,22 +274,19 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
     };
     let _start_guard = Unlock(&start);
     let token = option_value(args, "--token").unwrap_or("");
-    let fingerprint = credential_fingerprint(token);
     match instance_is_locked(&dir) {
-        Ok(true) => match reconcile_running(&dir, &identity, &fingerprint) {
-            Running::Same => return existing_instance(&dir, &identity, executable),
-            Running::Conflict | Running::Unreadable => {
-                return existing_instance(&dir, &identity, executable);
-            }
-            Running::Replace => {
-                return hand_off_credential(&dir, &identity, token, &fingerprint, executable);
-            }
-        },
+        Ok(true) => return running_instance(&dir, &identity, token, executable),
         Ok(false) => {}
         Err(error) => {
             eprintln!("Error: cannot inspect the existing runner: {error}");
             return 1;
         }
+    }
+    // A credential handed to a runner that has exited must not override the
+    // credential this command starts with.
+    if let Err(error) = discard_handoff(&dir) {
+        eprintln!("Error: cannot clear the previous runner's credential: {error}");
+        return 1;
     }
     if let Err(error) = write_metadata(&dir, &identity) {
         eprintln!("Error: cannot record runner state: {error}");
@@ -278,10 +294,6 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
     }
     match spawn_and_wait(executable, args, &dir, &identity.workspace) {
         Ok(()) => {
-            if let Err(error) = write_private(&fingerprint_path(&dir), fingerprint.as_bytes()) {
-                eprintln!("Error: cannot record the runner credential generation: {error}");
-                return 1;
-            }
             print_connected(executable, &identity.edge_id, &identity.server_url);
             0
         }
@@ -293,37 +305,56 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
     }
 }
 
-enum Running {
-    Same,
-    Replace,
-    Conflict,
-    Unreadable,
-}
-
-fn reconcile_running(dir: &Path, identity: &Identity, fingerprint: &str) -> Running {
+/// Called with `start.lock` held, so a handoff is ordered against the
+/// runner's final authentication decision (`lock_credential_handoff`).
+/// Every connect command hands its credential over; the runner's
+/// `TokenManager` alone decides whether it differs from the one in use.
+fn running_instance(dir: &Path, identity: &Identity, token: &str, executable: &Path) -> i32 {
     let record = match read_metadata(dir) {
         Ok(record) => record,
-        Err(_) => return Running::Unreadable,
+        Err(error) => {
+            eprintln!("Error: cannot read runner state: {error}");
+            return 1;
+        }
     };
     if record.workspace != identity.workspace.display().to_string() {
-        return Running::Conflict;
+        eprintln!(
+            "Error: runner {} is already connected to another workspace ({})",
+            record.edge_id, record.workspace
+        );
+        eprintln!(
+            "Stop it with: {}",
+            management_command(executable, "stop", &record.edge_id, &record.server_url)
+        );
+        return 1;
     }
-    match read_fingerprint(dir) {
-        Some(stored) if stored == fingerprint => Running::Same,
-        _ => Running::Replace,
+    let phase = match phase_label(dir) {
+        Ok(phase) => phase,
+        Err(error) => {
+            eprintln!("Error: cannot inspect the runner lock: {error}");
+            return 1;
+        }
+    };
+    if phase == "stopping" {
+        eprintln!("Error: the runner is stopping. Run the command again after it stops.");
+        return 1;
     }
-}
-
-fn credential_fingerprint(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-/// Fingerprint of the last credential a connect command gave this runner,
-/// either at startup or through a handoff.
-fn fingerprint_path(dir: &Path) -> PathBuf {
-    dir.join("credential.fingerprint")
+    if let Err(error) = queue_pending_credential(dir, token) {
+        eprintln!("Error: cannot hand the credential to the running runner: {error}");
+        return 1;
+    }
+    let code = if phase == "connected" {
+        eprintln!("Runner is already connected in the background.");
+        0
+    } else {
+        eprintln!("Runner is already running in phase {phase}.");
+        1
+    };
+    eprintln!(
+        "It uses this command's credential from its next connection attempt; running work is not interrupted."
+    );
+    print_actions(executable, &record.edge_id, &record.server_url);
+    code
 }
 
 fn pending_credential_path(dir: &Path) -> PathBuf {
@@ -334,43 +365,19 @@ fn claimed_credential_path(dir: &Path) -> PathBuf {
     dir.join("credential.claimed")
 }
 
-/// Called with `start.lock` held, so it is ordered against the runner's
-/// final authentication decision (`lock_credential_handoff`).
-fn hand_off_credential(
-    dir: &Path,
-    identity: &Identity,
-    token: &str,
-    fingerprint: &str,
-    executable: &Path,
-) -> i32 {
-    match phase_label(dir) {
-        Ok(phase) if phase == "stopping" => {
-            eprintln!("Error: the runner is stopping. Run the command again after it stops.");
-            return 1;
-        }
-        Ok(_) => {}
-        Err(error) => {
-            eprintln!("Error: cannot inspect the runner lock: {error}");
-            return 1;
-        }
-    }
-    if let Err(error) = queue_pending_credential(dir, token) {
-        eprintln!("Error: cannot hand the credential to the running runner: {error}");
-        return 1;
-    }
-    if let Err(error) = write_private(&fingerprint_path(dir), fingerprint.as_bytes()) {
-        eprintln!("Error: cannot record the runner credential generation: {error}");
-        return 1;
-    }
-    eprintln!(
-        "The running runner uses the new credential from its next connection attempt. Running work is not interrupted."
-    );
-    print_actions(executable, &identity.edge_id, &identity.server_url);
-    0
-}
-
 pub fn queue_pending_credential(dir: &Path, token: &str) -> io::Result<()> {
     write_private(&pending_credential_path(dir), token.as_bytes())
+}
+
+fn discard_handoff(dir: &Path) -> io::Result<()> {
+    for path in [pending_credential_path(dir), claimed_credential_path(dir)] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// State directory through which connect commands hand credentials to this
@@ -385,28 +392,30 @@ pub fn credential_handoff_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Take the queued credential, if any. The rename claims exactly the value
-/// that is queued now; a newer handoff published afterwards stays queued.
+/// Read the credential handed to this runner. A newer handoff replaces an
+/// unfinished claim by rename, so acknowledging one value never removes its
+/// successor. The claimed file stays until `finish_claim`, so a failed read
+/// or an interrupted consumer retries it on the next call.
 pub fn claim_pending_credential(dir: &Path) -> io::Result<Option<String>> {
-    if !move_pending_to_claimed(dir)? {
-        return Ok(None);
-    }
-    take_claimed_credential(dir)
-}
-
-fn move_pending_to_claimed(dir: &Path) -> io::Result<bool> {
     match std::fs::rename(pending_credential_path(dir), claimed_credential_path(dir)) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match std::fs::read_to_string(claimed_credential_path(dir)) {
+        Ok(token) if token.trim().is_empty() => {
+            finish_claim(dir);
+            Ok(None)
+        }
+        Ok(token) => Ok(Some(token.trim().to_string())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-fn take_claimed_credential(dir: &Path) -> io::Result<Option<String>> {
-    let path = claimed_credential_path(dir);
-    let token = std::fs::read_to_string(&path);
-    let _ = std::fs::remove_file(&path);
-    Ok(Some(token?.trim().to_string()).filter(|token| !token.is_empty()))
+/// Call after the claimed credential is staged in the `TokenManager`.
+pub fn finish_claim(dir: &Path) {
+    let _ = std::fs::remove_file(claimed_credential_path(dir));
 }
 
 pub struct HandoffLock {
@@ -445,62 +454,22 @@ fn lock_credential_handoff_with(dir: Option<&Path>, parent_released: bool) -> Op
     }
 }
 
+/// Serializes starting, stopping and handing a credential to one runner.
 fn lock_start(dir: &Path) -> io::Result<File> {
-    let path = dir.join("start.lock");
+    let file = open_lock_file(&dir.join("start.lock"))?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)?;
-    set_mode(&path, 0o600);
-    file.lock_exclusive()?;
+        .open(path)?;
+    set_mode(path, 0o600);
     Ok(file)
-}
-
-fn read_fingerprint(dir: &Path) -> Option<String> {
-    std::fs::read_to_string(fingerprint_path(dir))
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn existing_instance(dir: &Path, identity: &Identity, executable: &Path) -> i32 {
-    let record = match read_metadata(dir) {
-        Ok(record) => record,
-        Err(error) => {
-            eprintln!("Error: cannot read runner state: {error}");
-            return 1;
-        }
-    };
-    if record.workspace != identity.workspace.display().to_string() {
-        eprintln!(
-            "Error: runner {} is already connected to another workspace ({})",
-            record.edge_id, record.workspace
-        );
-        eprintln!(
-            "Stop it with: {} stop --edge-id {} --server-url {}",
-            shell_quote(&executable.display().to_string()),
-            shell_quote(&record.edge_id),
-            shell_quote(&record.server_url)
-        );
-        return 1;
-    }
-    let phase = match phase_label(dir) {
-        Ok(phase) => phase,
-        Err(error) => {
-            eprintln!("Error: cannot inspect the runner lock: {error}");
-            return 1;
-        }
-    };
-    if phase == "connected" {
-        eprintln!("Runner is already connected in the background.");
-        print_actions(executable, &record.edge_id, &record.server_url);
-        return 0;
-    }
-    eprintln!("Runner is already running in phase {phase}.");
-    print_actions(executable, &record.edge_id, &record.server_url);
-    1
 }
 
 fn spawn_and_wait(
@@ -717,25 +686,36 @@ fn run_management(root: &Path, request: Management) -> i32 {
     if request.edge_id.as_deref() == Some("") || request.server_url.as_deref() == Some("") {
         return 2;
     }
-    let records = match list_instances(root) {
-        Ok(records) => records,
+    let instances = match list_instances(root) {
+        Ok(instances) => instances,
         Err(error) => {
             eprintln!("Error: cannot read runner state: {error}");
             return 1;
         }
     };
+    let uninspectable = report_uninspectable(
+        &instances.unreadable,
+        request.edge_id.as_deref(),
+        request.server_url.as_deref(),
+    );
+    // An unreadable live runner may be the one this request means, so it is
+    // never stopped or reported absent by elimination.
+    if uninspectable && !matches!(request.action, Action::Status) {
+        return 1;
+    }
     let selected = match select_instances(
-        &records,
+        &instances.records,
         request.edge_id.as_deref(),
         request.server_url.as_deref(),
         request.action,
+        uninspectable,
     ) {
         Ok(selected) => selected,
         Err(code) => return code,
     };
     match request.action {
         Action::Status => {
-            let mut code = 0;
+            let mut code = i32::from(uninspectable);
             for record in selected {
                 if print_status(record) != 0 {
                     code = 1;
@@ -760,6 +740,7 @@ fn select_instances<'a>(
     edge_id: Option<&str>,
     server_url: Option<&str>,
     action: Action,
+    uninspectable: bool,
 ) -> Result<Vec<&'a Record>, i32> {
     let matched: Vec<&Record> = records
         .iter()
@@ -767,6 +748,9 @@ fn select_instances<'a>(
         .filter(|record| server_url.is_none_or(|url| same_destination(&record.server_url, url)))
         .collect();
     if matched.is_empty() {
+        if uninspectable {
+            return Err(1);
+        }
         match action {
             Action::Status | Action::Stop => {
                 eprintln!("No managed runner.");
@@ -795,17 +779,28 @@ fn select_instances<'a>(
 }
 
 fn phase_label(dir: &Path) -> io::Result<String> {
-    let recorded = std::fs::read_to_string(dir.join("phase"))
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if instance_is_locked(dir)? {
-        Ok(recorded.unwrap_or_else(|| "starting".to_string()))
-    } else if recorded.as_deref() == Some("authentication-failure") {
-        Ok("authentication-failure".to_string())
-    } else {
-        Ok("stopped".to_string())
+    let recorded = match std::fs::read_to_string(dir.join("phase")) {
+        Ok(value) => Some(value.trim().to_string()).filter(|value| !value.is_empty()),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(_) => Some("unknown".to_string()),
+    };
+    if !instance_is_locked(dir)? {
+        return Ok(if recorded.as_deref() == Some("authentication-failure") {
+            "authentication-failure".to_string()
+        } else {
+            "stopped".to_string()
+        });
     }
+    if connected_lock_is_held(dir)? {
+        return Ok("connected".to_string());
+    }
+    Ok(match recorded.as_deref() {
+        None => "starting",
+        // The runner left `connected` but could not record its next phase.
+        Some("connected") => "unknown",
+        Some(phase) => phase,
+    }
+    .to_string())
 }
 
 fn print_status(record: &Record) -> i32 {
@@ -813,7 +808,7 @@ fn print_status(record: &Record) -> i32 {
     let code = match phase_label(&record.dir) {
         Ok(phase) => {
             eprintln!("phase: {phase}");
-            0
+            i32::from(phase == "unknown")
         }
         Err(error) => {
             eprintln!("phase: unknown");
@@ -832,34 +827,41 @@ fn stop_instance(record: &Record) -> i32 {
 }
 
 fn stop_instance_with(record: &Record, announce: bool) -> i32 {
-    match instance_is_locked(&record.dir) {
-        Ok(false) => {
+    // A start in progress holds `start.lock` until its runner owns the
+    // instance lock, so it either finishes first and is stopped here, or
+    // begins after this stop.
+    let start = match lock_start(&record.dir) {
+        Ok(start) => start,
+        Err(error) => {
+            eprintln!("Error: cannot lock runner startup: {error}");
+            return 1;
+        }
+    };
+    let pid = match instance_owner(&record.dir) {
+        Ok(None) => {
             if announce {
                 eprintln!("Runner is already stopped.");
             }
             return 0;
         }
-        Ok(true) => {}
+        Ok(Some(pid)) => pid,
         Err(error) => {
             eprintln!("Error: cannot inspect the runner lock: {error}");
             return 1;
         }
-    }
-    let Some(pid) = read_pid(&record.dir) else {
-        eprintln!("Error: runner state has no process id");
-        return 1;
     };
-    if !is_stoppable_pid(record, pid) {
-        eprintln!("Error: refusing to signal process {pid}; it is not astra-edge");
-        return 1;
-    }
-    if let Err(error) = nix::sys::signal::kill(
+    match nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid as i32),
         nix::sys::signal::Signal::SIGTERM,
     ) {
-        eprintln!("Error: cannot stop the runner: {error}");
-        return 1;
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => {
+            eprintln!("Error: cannot stop the runner: {error}");
+            return 1;
+        }
     }
+    // The runner may need the lock to finish its final decision.
+    drop(start);
     let started = Instant::now();
     while started.elapsed() < STOP_TIMEOUT {
         match instance_is_locked(&record.dir) {
@@ -924,25 +926,79 @@ fn read_log_tail(path: &Path, max_lines: usize, max_bytes: u64) -> io::Result<Ve
     Ok(lines[start_line..].to_vec())
 }
 
-fn list_instances(root: &Path) -> io::Result<Vec<Record>> {
+struct Instances {
+    records: Vec<Record>,
+    /// State directories whose metadata could not be read.
+    unreadable: Vec<(PathBuf, io::Error)>,
+}
+
+fn list_instances(root: &Path) -> io::Result<Instances> {
     let dir = root.join("edge-runners");
+    let mut instances = Instances {
+        records: Vec::new(),
+        unreadable: Vec::new(),
+    };
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(instances),
         Err(error) => return Err(error),
     };
-    let mut records = Vec::new();
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        if let Ok(record) = read_metadata(&entry.path()) {
-            records.push(record);
+        match read_metadata(&entry.path()) {
+            Ok(record) => instances.records.push(record),
+            Err(error) => instances.unreadable.push((entry.path(), error)),
         }
     }
-    records.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
-    Ok(records)
+    instances
+        .records
+        .sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+    Ok(instances)
+}
+
+/// Report unreadable state directories that may belong to a live runner the
+/// request selects. Only a positively unheld instance lock, or a directory
+/// that cannot match the requested identity, proves it irrelevant.
+fn report_uninspectable(
+    unreadable: &[(PathBuf, io::Error)],
+    edge_id: Option<&str>,
+    server_url: Option<&str>,
+) -> bool {
+    let requested = edge_id.zip(server_url).and_then(|(edge_id, server_url)| {
+        let server_url = astra_edge::edge_ws_url(server_url).ok()?;
+        Some(identity_key(&Identity {
+            edge_id: edge_id.to_string(),
+            server_url,
+            workspace: PathBuf::new(),
+        }))
+    });
+    let mut found = false;
+    for (dir, error) in unreadable {
+        if let Some(requested) = &requested
+            && dir.file_name() != Some(std::ffi::OsStr::new(requested))
+        {
+            continue;
+        }
+        match instance_is_locked(dir) {
+            Ok(false) => continue,
+            Ok(true) => eprintln!(
+                "Error: cannot read the state of a running runner in {}: {error}",
+                dir.display()
+            ),
+            Err(lock_error) => eprintln!(
+                "Error: cannot inspect runner state in {}: {error}; lock: {lock_error}",
+                dir.display()
+            ),
+        }
+        found = true;
+    }
+    if found && requested.is_none() {
+        eprintln!("Pass --edge-id and --server-url to select a runner whose state is readable.");
+    }
+    found
 }
 
 fn read_metadata(dir: &Path) -> io::Result<Record> {
@@ -976,12 +1032,6 @@ fn read_metadata(dir: &Path) -> io::Result<Record> {
         server_url,
         workspace,
     })
-}
-
-fn read_pid(dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(dir.join("pid"))
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
 }
 
 fn user_runner_identity(args: &[String]) -> io::Result<Option<Identity>> {
@@ -1156,22 +1206,69 @@ fn same_destination(left: &str, right: &str) -> bool {
     }
 }
 
+/// The instance lock is a POSIX record lock, so the kernel reports the
+/// process that owns it. The runner must not open `instance.lock` again:
+/// closing any descriptor for the file releases a record lock.
 fn acquire_instance_lock(dir: &Path) -> io::Result<File> {
-    let path = dir.join("instance.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)?;
-    set_mode(&path, 0o600);
-    file.try_lock_exclusive()?;
-    Ok(file)
+    let file = open_lock_file(&dir.join("instance.lock"))?;
+    let lock = write_record_lock();
+    match nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_SETLK(&lock)) {
+        Ok(_) => Ok(file),
+        Err(nix::errno::Errno::EAGAIN | nix::errno::Errno::EACCES) => Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "the runner is already running",
+        )),
+        Err(error) => Err(io_error(error)),
+    }
+}
+
+fn write_record_lock() -> nix::libc::flock {
+    // SAFETY: `flock` is a plain C struct; all-zero is a valid whole-file range.
+    let mut lock: nix::libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = nix::libc::F_WRLCK as _;
+    lock.l_whence = nix::libc::SEEK_SET as _;
+    lock
+}
+
+/// The process that currently owns this runner's instance lock.
+fn instance_owner(dir: &Path) -> io::Result<Option<u32>> {
+    let Some(file) = open_existing_lock(&dir.join("instance.lock"))? else {
+        return Ok(None);
+    };
+    let mut lock = write_record_lock();
+    nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETLK(&mut lock)).map_err(io_error)?;
+    let mut unlocked = write_record_lock();
+    unlocked.l_type = nix::libc::F_UNLCK as _;
+    if lock.l_type == unlocked.l_type {
+        return Ok(None);
+    }
+    u32::try_from(lock.l_pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "runner lock has no owner"))
 }
 
 fn instance_is_locked(dir: &Path) -> io::Result<bool> {
-    let path = dir.join("instance.lock");
-    match std::fs::symlink_metadata(&path) {
+    Ok(instance_owner(dir)?.is_some())
+}
+
+fn connected_lock_is_held(dir: &Path) -> io::Result<bool> {
+    let Some(file) = open_existing_lock(&dir.join("connected.lock"))? else {
+        return Ok(false);
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn open_existing_lock(path: &Path) -> io::Result<Option<File>> {
+    match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => {
             return Err(io::Error::new(
@@ -1179,18 +1276,14 @@ fn instance_is_locked(dir: &Path) -> io::Result<bool> {
                 "runner lock is not a regular file",
             ));
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     }
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = file.unlock();
-            Ok(false)
-        }
-        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(true),
-        Err(error) => Err(error),
-    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map(Some)
 }
 
 fn write_metadata(dir: &Path, identity: &Identity) -> io::Result<()> {
@@ -1252,18 +1345,17 @@ fn rotate_log_file(path: &Path, limit: u64) -> io::Result<Option<File>> {
     Ok(Some(file))
 }
 
-fn spawn_log_rotator() {
-    let Ok(dir) = std::env::var(STATE_DIR_ENV) else {
+/// Runs on the runner's tokio runtime; no dedicated thread.
+pub fn spawn_log_rotator() {
+    let Some(dir) = credential_handoff_dir() else {
         return;
     };
-    if dir.is_empty() {
-        return;
-    }
-    let token = shutdown_token();
-    std::thread::spawn(move || {
-        let log = PathBuf::from(dir).join("edge.log");
-        while !token.is_cancelled() {
-            std::thread::sleep(Duration::from_secs(1));
+    let log = dir.join("edge.log");
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LOG_ROTATE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
             if let Ok(Some(file)) = rotate_log_file(&log, LOG_ROTATE_BYTES) {
                 let _ = redirect_log_fd(&file);
             }
@@ -1315,55 +1407,6 @@ fn as_fd_raw(fd: &impl std::os::fd::AsFd) -> i32 {
 
 fn io_error(error: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
-}
-
-fn is_stoppable_pid(record: &Record, pid: u32) -> bool {
-    if is_astra_edge_pid(pid) {
-        return true;
-    }
-    // Unit tests hold the instance lock with a short-lived helper process.
-    // Release builds do not contain this branch.
-    #[cfg(test)]
-    {
-        record.dir.join("test-allow-stop").is_file()
-    }
-    #[cfg(not(test))]
-    {
-        let _ = record;
-        false
-    }
-}
-
-fn is_astra_edge_pid(pid: u32) -> bool {
-    process_exe(pid)
-        .and_then(|path| path.file_name().map(|name| name == "astra-edge"))
-        .unwrap_or(false)
-}
-
-fn process_exe(pid: u32) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn proc_pidpath(pid: i32, buffer: *mut i8, buffersize: u32) -> i32;
-        }
-        let mut buffer = vec![0i8; 4096];
-        let length = unsafe { proc_pidpath(pid as i32, buffer.as_mut_ptr(), buffer.len() as u32) };
-        if length <= 0 {
-            return None;
-        }
-        let bytes = &buffer[..length as usize];
-        let bytes = bytes.iter().map(|byte| *byte as u8).collect::<Vec<_>>();
-        Some(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
 }
 
 fn set_mode(path: &Path, mode: u32) {
@@ -1494,38 +1537,6 @@ mod tests {
     }
 
     #[test]
-    fn stopped_runner_keeps_an_authentication_failure() {
-        let root = tempfile::tempdir().unwrap();
-        assert_eq!(phase_label(root.path()).unwrap(), "stopped");
-        write_private(&root.path().join("phase"), b"authentication-failure").unwrap();
-        assert_eq!(phase_label(root.path()).unwrap(), "authentication-failure");
-        {
-            let _lock = acquire_instance_lock(root.path()).unwrap();
-            assert_eq!(phase_label(root.path()).unwrap(), "authentication-failure");
-        }
-        assert_eq!(phase_label(root.path()).unwrap(), "authentication-failure");
-    }
-
-    #[test]
-    fn held_instance_lock_is_visible_and_released_with_the_file() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path();
-        assert!(!instance_is_locked(dir).unwrap());
-        let lock = acquire_instance_lock(dir).unwrap();
-        assert!(instance_is_locked(dir).unwrap());
-        drop(lock);
-        let mut released = false;
-        for _ in 0..50 {
-            if !instance_is_locked(dir).unwrap() {
-                released = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(released, "instance lock was not released with the file");
-    }
-
-    #[test]
     fn status_stop_and_logs_are_separate_from_the_connect_command() {
         assert!(parse_management(&moi_args()).is_none());
         let status = parse_management(&args(&["status", "--edge-id", "runner-abc"])).unwrap();
@@ -1581,32 +1592,6 @@ mod tests {
     }
 
     #[test]
-    fn running_phase_is_not_reported_as_connected() {
-        let root = tempfile::tempdir().unwrap();
-        let identity = Identity {
-            edge_id: "runner-abc".to_string(),
-            server_url: "wss://astra.example".to_string(),
-            workspace: std::fs::canonicalize(".").unwrap(),
-        };
-        assert_eq!(
-            existing_instance(root.path(), &identity, Path::new("astra-edge")),
-            1
-        );
-        write_metadata(root.path(), &identity).unwrap();
-        write_private(&root.path().join("phase"), b"reconnecting").unwrap();
-        let _lock = acquire_instance_lock(root.path()).unwrap();
-        assert_eq!(
-            existing_instance(root.path(), &identity, Path::new("astra-edge")),
-            1
-        );
-        write_private(&root.path().join("phase"), b"connected").unwrap();
-        assert_eq!(
-            existing_instance(root.path(), &identity, Path::new("astra-edge")),
-            0
-        );
-    }
-
-    #[test]
     fn same_edge_id_on_two_servers_is_selected_by_server_url() {
         let root = tempfile::tempdir().unwrap();
         let records = [
@@ -1624,7 +1609,7 @@ mod tests {
             },
         ];
         assert!(matches!(
-            select_instances(&records, Some("runner-abc"), None, Action::Stop),
+            select_instances(&records, Some("runner-abc"), None, Action::Stop, false),
             Err(2)
         ));
         let selected = select_instances(
@@ -1632,6 +1617,7 @@ mod tests {
             Some("runner-abc"),
             Some("https://b.example/"),
             Action::Logs,
+            false,
         )
         .unwrap();
         assert_eq!(selected.len(), 1);
@@ -1678,7 +1664,10 @@ mod tests {
 
     #[test]
     fn current_readiness_updates_phase_and_stale_readiness_does_not() {
-        let state = Mutex::new(PhaseState { epoch: 0 });
+        let state = Mutex::new(PhaseState {
+            epoch: 0,
+            connected: None,
+        });
         let root = tempfile::tempdir().unwrap();
         let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
         let raw = as_fd_raw(&write_fd);
@@ -1705,7 +1694,10 @@ mod tests {
 
     #[tokio::test]
     async fn delayed_readiness_cannot_overwrite_a_newer_phase() {
-        let state = std::sync::Arc::new(Mutex::new(PhaseState { epoch: 0 }));
+        let state = std::sync::Arc::new(Mutex::new(PhaseState {
+            epoch: 0,
+            connected: None,
+        }));
         let root = tempfile::tempdir().unwrap();
         note_phase_with(&state, root.path(), "starting");
         let epoch = phase_epoch(&state);
@@ -1848,104 +1840,6 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_token_stays_with_the_running_runner() {
-        let python = Command::new("python3")
-            .arg("--version")
-            .output()
-            .expect("python3 is required to hold the test runner lock");
-        assert!(python.status.success(), "python3 --version failed");
-        let root = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let workspace = workspace.path().canonicalize().unwrap();
-        let argv_log = root.path().join("argv.txt");
-        let holder_py = root.path().join("holder.py");
-        let holder = root.path().join("holder.sh");
-        std::fs::write(
-            &holder_py,
-            r#"import fcntl, os, time
-state = os.environ["ASTRA_EDGE_STATE_DIR"]
-lock = open(os.path.join(state, "instance.lock"), "a")
-fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-with open(os.path.join(state, "pid"), "w") as pid:
-    pid.write(str(os.getpid()))
-os.write(int(os.environ["ASTRA_EDGE_READY_FD"]), b"1")
-time.sleep(30)
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            &holder,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexec python3 '{}'\n",
-                argv_log.display(),
-                holder_py.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let old = connect_args("https://example.test", "old-token", &workspace);
-        let identity = user_runner_identity_with(&old, None).unwrap().unwrap();
-        let dir = state_dir(root.path(), &identity);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("test-allow-stop"), b"1").unwrap();
-        let _stop = StopHolder(dir.clone());
-        assert_eq!(supervise(&holder, &old, root.path()), 0);
-        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
-        let fresh = connect_args("https://example.test/", "fresh-token", &workspace);
-        assert_eq!(supervise(&holder, &fresh, root.path()), 0);
-        assert_eq!(std::fs::read_to_string(dir.join("pid")).unwrap(), pid);
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid.trim().parse().unwrap()),
-            None,
-        )
-        .expect("the original runner was stopped");
-        assert!(instance_is_locked(&dir).unwrap());
-        let argv = std::fs::read_to_string(&argv_log).unwrap();
-        assert!(argv.contains("old-token"), "first runner did not start");
-        assert!(
-            !argv.contains("fresh-token"),
-            "refresh started a second process"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("credential.next"))
-                .unwrap()
-                .trim(),
-            "fresh-token"
-        );
-        let metadata = std::fs::read_to_string(dir.join("metadata.json")).unwrap();
-        assert!(!metadata.contains("old-token"));
-        assert!(!metadata.contains("fresh-token"));
-        let fingerprint = std::fs::read_to_string(dir.join("credential.fingerprint")).unwrap();
-        assert!(!fingerprint.contains("fresh-token"));
-        assert_eq!(fingerprint.trim(), credential_fingerprint("fresh-token"));
-
-        std::fs::write(dir.join("phase"), "stopping").unwrap();
-        let late = connect_args("https://example.test", "late-token", &workspace);
-        assert_eq!(supervise(&holder, &late, root.path()), 1);
-        assert_eq!(
-            claim_pending_credential(&dir).unwrap().as_deref(),
-            Some("fresh-token")
-        );
-    }
-
-    #[test]
-    fn claiming_a_credential_never_removes_a_newer_handoff() {
-        let dir = tempfile::tempdir().unwrap();
-        queue_pending_credential(dir.path(), "generation-one").unwrap();
-        assert!(move_pending_to_claimed(dir.path()).unwrap());
-        queue_pending_credential(dir.path(), "generation-two").unwrap();
-        assert_eq!(
-            take_claimed_credential(dir.path()).unwrap().as_deref(),
-            Some("generation-one")
-        );
-        assert_eq!(
-            claim_pending_credential(dir.path()).unwrap().as_deref(),
-            Some("generation-two")
-        );
-        assert_eq!(claim_pending_credential(dir.path()).unwrap(), None);
-    }
-
-    #[test]
     fn final_authentication_decision_excludes_a_concurrent_handoff() {
         let dir = tempfile::tempdir().unwrap();
         assert!(lock_credential_handoff_with(Some(dir.path()), false).is_none());
@@ -1966,54 +1860,6 @@ time.sleep(30)
         command.join().unwrap();
     }
 
-    #[test]
-    fn unreadable_lock_is_not_reported_as_stopped() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let workspace = workspace.path().canonicalize().unwrap();
-        let command = connect_args("https://example.test", "secret-token", &workspace);
-        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
-        let dir = state_dir(root.path(), &identity);
-        ensure_private_dir(&dir).unwrap();
-        write_metadata(&dir, &identity).unwrap();
-        write_private(&dir.join("phase"), b"connected").unwrap();
-        write_private(&dir.join("pid"), b"1").unwrap();
-        let lock = acquire_instance_lock(&dir).unwrap();
-        let lock_path = dir.join("instance.lock");
-        set_mode(&lock_path, 0o000);
-        let _restore = RestoreMode(lock_path.clone());
-        let error = instance_is_locked(&dir).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
-        assert_eq!(
-            management_exit_code(
-                &args(&[
-                    "status",
-                    "--edge-id",
-                    "runner-abc",
-                    "--server-url",
-                    "https://example.test",
-                ]),
-                root.path(),
-            ),
-            Some(1)
-        );
-        assert_eq!(
-            management_exit_code(
-                &args(&[
-                    "stop",
-                    "--edge-id",
-                    "runner-abc",
-                    "--server-url",
-                    "https://example.test",
-                ]),
-                root.path(),
-            ),
-            Some(1)
-        );
-        drop(_restore);
-        drop(lock);
-    }
-
     fn connect_args(server_url: &str, token: &str, workspace: &Path) -> Vec<String> {
         args(&[
             "--edge-id",
@@ -2029,28 +1875,473 @@ time.sleep(30)
         ])
     }
 
-    struct StopHolder(PathBuf);
-
-    impl Drop for StopHolder {
-        fn drop(&mut self) {
-            let Ok(pid) = std::fs::read_to_string(self.0.join("pid")) else {
-                return;
-            };
-            let Ok(pid) = pid.trim().parse::<i32>() else {
-                return;
-            };
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-    }
-
-    struct RestoreMode(PathBuf);
+    struct RestoreMode(PathBuf, u32);
 
     impl Drop for RestoreMode {
         fn drop(&mut self) {
-            set_mode(&self.0, 0o600);
+            set_mode(&self.0, self.1);
+        }
+    }
+
+    const HOLD_DIR_ENV: &str = "ASTRA_EDGE_TEST_HOLD_DIR";
+    const HOLD_CONNECTED_ENV: &str = "ASTRA_EDGE_TEST_HOLD_CONNECTED";
+    const HOLD_DELAY_ENV: &str = "ASTRA_EDGE_TEST_HOLD_DELAY_MS";
+    const HOLDER_TEST: &str = "managed_background::tests::runner_lock_holder";
+    const HOLDER_READY: &str = "astra-edge-test-holder-ready";
+
+    /// Does nothing in a normal run. Other tests start this binary with only
+    /// this test selected so that a separate process owns a runner's locks,
+    /// as a real runner does; a process never sees its own record lock.
+    #[test]
+    fn runner_lock_holder() {
+        let Some(dir) = std::env::var_os(HOLD_DIR_ENV).map(PathBuf::from) else {
+            return;
+        };
+        if let Some(delay) = std::env::var(HOLD_DELAY_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        let _instance = acquire_instance_lock(&dir).unwrap();
+        let connected = open_lock_file(&dir.join("connected.lock")).unwrap();
+        if std::env::var(HOLD_CONNECTED_ENV).as_deref() != Ok("0") {
+            connected.lock_exclusive().unwrap();
+        }
+        if let Some(fd) = std::env::var(READY_FD_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            notify_parent_ready_fd(fd);
+        }
+        println!("{HOLDER_READY}");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    struct Holder(Child);
+
+    impl Holder {
+        fn spawn(dir: &Path, connected: bool) -> Self {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([HOLDER_TEST, "--exact", "--nocapture", "--test-threads=1"])
+                .env(HOLD_DIR_ENV, dir)
+                .env(HOLD_CONNECTED_ENV, if connected { "1" } else { "0" })
+                .env_remove(READY_FD_ENV)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut lines = std::io::BufRead::lines(std::io::BufReader::new(stdout));
+            loop {
+                let line = lines
+                    .next()
+                    .expect("holder exited before it held the lock")
+                    .unwrap();
+                if line.trim_end().ends_with(HOLDER_READY) {
+                    break;
+                }
+            }
+            Self(child)
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        fn is_alive(&mut self) -> bool {
+            self.0.try_wait().unwrap().is_none()
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Kills whatever process owns the runner's instance lock when dropped.
+    struct KillOwner(PathBuf);
+
+    impl Drop for KillOwner {
+        fn drop(&mut self) {
+            if let Ok(Some(pid)) = instance_owner(&self.0) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+
+    /// A stand-in runner executable for `supervise`: it records its argv and
+    /// then owns the runner's locks, connected, and reports readiness.
+    fn holder_executable(root: &Path, name: &str, delay_ms: u64) -> (PathBuf, PathBuf) {
+        let argv_log = root.join(format!("{name}.argv"));
+        let script = root.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {argv}\n{HOLD_DIR_ENV}=\"$ASTRA_EDGE_STATE_DIR\" {HOLD_DELAY_ENV}={delay_ms} exec {exe} {HOLDER_TEST} --exact --nocapture --test-threads=1\n",
+                argv = shell_quote(&argv_log.display().to_string()),
+                exe = shell_quote(&std::env::current_exe().unwrap().display().to_string()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, argv_log)
+    }
+
+    fn wait_until_unlocked(dir: &Path) {
+        for _ in 0..200 {
+            if !instance_is_locked(dir).unwrap() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("instance lock was not released");
+    }
+
+    fn management(root: &Path, parts: &[&str]) -> i32 {
+        management_exit_code(&args(parts), root).unwrap()
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { nix::libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn instance_lock_reports_its_owner_and_is_released_with_the_process() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(instance_owner(root.path()).unwrap(), None);
+        let holder = Holder::spawn(root.path(), false);
+        assert_eq!(instance_owner(root.path()).unwrap(), Some(holder.pid()));
+        assert!(
+            acquire_instance_lock(root.path()).is_err(),
+            "a second runner took the instance lock"
+        );
+        drop(holder);
+        wait_until_unlocked(root.path());
+    }
+
+    #[test]
+    fn stopped_runner_keeps_an_authentication_failure() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(phase_label(root.path()).unwrap(), "stopped");
+        write_private(&root.path().join("phase"), b"authentication-failure").unwrap();
+        assert_eq!(phase_label(root.path()).unwrap(), "authentication-failure");
+        let holder = Holder::spawn(root.path(), false);
+        assert_eq!(phase_label(root.path()).unwrap(), "authentication-failure");
+        drop(holder);
+        wait_until_unlocked(root.path());
+        assert_eq!(phase_label(root.path()).unwrap(), "authentication-failure");
+    }
+
+    #[test]
+    fn connected_is_reported_only_while_the_runner_holds_its_connected_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = Identity {
+            edge_id: "runner-abc".to_string(),
+            server_url: "wss://astra.example".to_string(),
+            workspace: std::fs::canonicalize(".").unwrap(),
+        };
+        let exe = Path::new("astra-edge");
+        assert_eq!(running_instance(root.path(), &identity, "token", exe), 1);
+        write_metadata(root.path(), &identity).unwrap();
+
+        let disconnected = Holder::spawn(root.path(), false);
+        write_private(&root.path().join("phase"), b"reconnecting").unwrap();
+        assert_eq!(phase_label(root.path()).unwrap(), "reconnecting");
+        assert_eq!(running_instance(root.path(), &identity, "token", exe), 1);
+        // A phase file that still says connected is not proof of a connection.
+        write_private(&root.path().join("phase"), b"connected").unwrap();
+        assert_eq!(phase_label(root.path()).unwrap(), "unknown");
+        assert_eq!(running_instance(root.path(), &identity, "token", exe), 1);
+        drop(disconnected);
+        wait_until_unlocked(root.path());
+
+        let _connected = Holder::spawn(root.path(), true);
+        assert_eq!(phase_label(root.path()).unwrap(), "connected");
+        assert_eq!(running_instance(root.path(), &identity, "token", exe), 0);
+    }
+
+    #[test]
+    fn a_failed_phase_write_does_not_leave_the_runner_reported_connected() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let _instance = Holder::spawn(dir, false);
+        let state = Mutex::new(PhaseState {
+            epoch: 0,
+            connected: Some(open_lock_file(&dir.join("connected.lock")).unwrap()),
+        });
+        let epoch = phase_epoch(&state);
+        signal_ready_for_epoch_with(&state, epoch, Some(dir), None);
+        assert_eq!(phase_label(dir).unwrap(), "connected");
+        set_mode(dir, 0o500);
+        let restore = RestoreMode(dir.to_path_buf(), 0o700);
+        note_phase_with(&state, dir, "reconnecting");
+        let phase = phase_label(dir).unwrap();
+        drop(restore);
+        assert_ne!(phase, "connected");
+        if !is_root() {
+            assert_eq!(phase, "unknown");
+        }
+    }
+
+    #[test]
+    fn every_connect_command_hands_its_credential_to_the_running_runner() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let (holder, argv_log) = holder_executable(root.path(), "holder.sh", 0);
+        let old = connect_args("https://example.test", "old-token", &workspace);
+        let identity = user_runner_identity_with(&old, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        // Left behind by a runner that exited: it must not reach a new runner.
+        queue_pending_credential(&dir, "stale-token").unwrap();
+        let _cleanup = KillOwner(dir.clone());
+        assert_eq!(supervise(&holder, &old, root.path()), 0);
+        assert_eq!(claim_pending_credential(&dir).unwrap(), None);
+        let owner = instance_owner(&dir).unwrap().unwrap();
+
+        let fresh = connect_args("https://example.test/", "fresh-token", &workspace);
+        assert_eq!(supervise(&holder, &fresh, root.path()), 0);
+        assert_eq!(
+            claim_pending_credential(&dir).unwrap().as_deref(),
+            Some("fresh-token")
+        );
+        // The runner tried the credential and it was rejected.
+        finish_claim(&dir);
+        assert_eq!(supervise(&holder, &fresh, root.path()), 0);
+        assert_eq!(
+            claim_pending_credential(&dir).unwrap().as_deref(),
+            Some("fresh-token"),
+            "a rejected credential could not be submitted again"
+        );
+        finish_claim(&dir);
+
+        assert_eq!(instance_owner(&dir).unwrap(), Some(owner));
+        let argv = std::fs::read_to_string(&argv_log).unwrap();
+        assert!(argv.contains("old-token"), "first runner did not start");
+        assert!(
+            !argv.contains("fresh-token"),
+            "a handoff started a second process"
+        );
+        let metadata = std::fs::read_to_string(dir.join("metadata.json")).unwrap();
+        assert!(!metadata.contains("old-token"));
+        assert!(!metadata.contains("fresh-token"));
+
+        write_private(&dir.join("phase"), b"stopping").unwrap();
+        // A stopping runner holds no connected lock and takes no credential.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(owner as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        wait_until_unlocked(&dir);
+        let _stopping = Holder::spawn(&dir, false);
+        let late = connect_args("https://example.test", "late-token", &workspace);
+        assert_eq!(supervise(&holder, &late, root.path()), 1);
+        assert_eq!(claim_pending_credential(&dir).unwrap(), None);
+    }
+
+    #[test]
+    fn claims_survive_read_failures_and_interrupted_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        queue_pending_credential(dir, "generation-one").unwrap();
+        assert_eq!(
+            claim_pending_credential(dir).unwrap().as_deref(),
+            Some("generation-one")
+        );
+        // The consumer stopped before finishing: the claim is retried.
+        assert_eq!(
+            claim_pending_credential(dir).unwrap().as_deref(),
+            Some("generation-one")
+        );
+        // A newer handoff supersedes the unfinished claim; finishing one
+        // claim never removes a later handoff.
+        queue_pending_credential(dir, "generation-two").unwrap();
+        assert_eq!(
+            claim_pending_credential(dir).unwrap().as_deref(),
+            Some("generation-two")
+        );
+        queue_pending_credential(dir, "generation-three").unwrap();
+        finish_claim(dir);
+        assert_eq!(
+            claim_pending_credential(dir).unwrap().as_deref(),
+            Some("generation-three")
+        );
+        finish_claim(dir);
+        assert_eq!(claim_pending_credential(dir).unwrap(), None);
+
+        if is_root() {
+            return;
+        }
+        queue_pending_credential(dir, "generation-four").unwrap();
+        std::fs::rename(pending_credential_path(dir), claimed_credential_path(dir)).unwrap();
+        set_mode(&claimed_credential_path(dir), 0o000);
+        let restore = RestoreMode(claimed_credential_path(dir), 0o600);
+        assert!(claim_pending_credential(dir).is_err());
+        assert!(
+            claimed_credential_path(dir).exists(),
+            "a failed read lost the credential"
+        );
+        drop(restore);
+        assert_eq!(
+            claim_pending_credential(dir).unwrap().as_deref(),
+            Some("generation-four")
+        );
+    }
+
+    #[test]
+    fn stop_waits_for_a_start_in_progress_and_stops_its_runner() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let (slow, _) = holder_executable(root.path(), "slow-holder.sh", 700);
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        let _cleanup = KillOwner(dir.clone());
+        let start_root = root.path().to_path_buf();
+        let start = std::thread::spawn(move || supervise(&slow, &command, &start_root));
+        while !dir.join("metadata.json").exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(instance_owner(&dir).unwrap(), None);
+        let stopped = management(
+            root.path(),
+            &[
+                "stop",
+                "--edge-id",
+                "runner-abc",
+                "--server-url",
+                "https://example.test",
+            ],
+        );
+        assert_eq!(start.join().unwrap(), 0);
+        assert_eq!(stopped, 0);
+        assert_eq!(
+            instance_owner(&dir).unwrap(),
+            None,
+            "a runner started during stop remained running"
+        );
+    }
+
+    #[test]
+    fn stop_signals_only_the_process_that_owns_the_instance_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(".").unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        write_metadata(&dir, &identity).unwrap();
+        let mut decoy = Command::new("sleep").arg("30").spawn().unwrap();
+        // A stale process id from an earlier runner is never trusted.
+        write_private(&dir.join("pid"), decoy.id().to_string().as_bytes()).unwrap();
+        let mut runner = Holder::spawn(&dir, true);
+        let stop = [
+            "stop",
+            "--edge-id",
+            "runner-abc",
+            "--server-url",
+            "https://example.test",
+        ];
+        assert_eq!(management(root.path(), &stop), 0);
+        assert!(!runner.is_alive());
+        assert!(
+            decoy.try_wait().unwrap().is_none(),
+            "stop signalled another process"
+        );
+        let _ = decoy.kill();
+        let _ = decoy.wait();
+        assert_eq!(management(root.path(), &stop), 0);
+    }
+
+    #[test]
+    fn live_runner_with_unreadable_metadata_is_never_reported_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(".").unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        std::fs::write(dir.join("metadata.json"), b"not json").unwrap();
+        let full = [
+            "--edge-id",
+            "runner-abc",
+            "--server-url",
+            "https://example.test",
+        ];
+        let mut runner = Holder::spawn(&dir, true);
+        for action in ["status", "stop", "logs"] {
+            let mut request = vec![action];
+            request.extend(full);
+            assert_eq!(management(root.path(), &request), 1, "{action}");
+        }
+        assert_eq!(
+            management(root.path(), &["status", "--edge-id", "runner-abc"]),
+            1
+        );
+        assert_eq!(management(root.path(), &["stop"]), 1);
+        assert!(runner.is_alive(), "stop acted on an uninspected runner");
+        // Another runner's directory cannot match a fully specified request.
+        let other = [
+            "status",
+            "--edge-id",
+            "runner-other",
+            "--server-url",
+            "https://example.test",
+        ];
+        assert_eq!(management(root.path(), &other), 0);
+        drop(runner);
+        wait_until_unlocked(&dir);
+        // Without a live owner, unreadable state is not a runner.
+        assert_eq!(management(root.path(), &["status"]), 0);
+    }
+
+    #[test]
+    fn unreadable_lock_is_not_reported_as_stopped() {
+        if is_root() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        write_metadata(&dir, &identity).unwrap();
+        let _runner = Holder::spawn(&dir, true);
+        let lock_path = dir.join("instance.lock");
+        set_mode(&lock_path, 0o000);
+        let _restore = RestoreMode(lock_path, 0o600);
+        assert_eq!(
+            instance_is_locked(&dir).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+        for action in ["status", "stop"] {
+            assert_eq!(
+                management(
+                    root.path(),
+                    &[
+                        action,
+                        "--edge-id",
+                        "runner-abc",
+                        "--server-url",
+                        "https://example.test",
+                    ],
+                ),
+                1,
+                "{action}"
+            );
         }
     }
 }

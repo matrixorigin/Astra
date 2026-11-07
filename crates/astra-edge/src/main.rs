@@ -977,6 +977,7 @@ async fn runtime() {
     let executable = std::env::current_exe().expect("current executable");
     if managed_background::is_managed_child() {
         managed_background::install_shutdown_listener();
+        managed_background::spawn_log_rotator();
     }
     let _installation_lease = match astra_core::client_installation::acquire(&executable) {
         Ok(lease) => lease,
@@ -1040,22 +1041,38 @@ async fn runtime() {
 /// The open connection and its admitted work are untouched; the credential is
 /// used by the next attempt. One that cannot authenticate falls back to the
 /// working credential through the token manager's one-shot swap.
-async fn adopt_handed_off_credential(config: &EdgeConfig, handoff: Option<&Path>) -> bool {
+async fn adopt_handed_off_credential(config: &EdgeConfig, handoff: Option<&Path>) -> Handoff {
     let Some(dir) = handoff else {
-        return false;
+        return Handoff::None;
     };
     match managed_background::claim_pending_credential(dir) {
-        Ok(Some(token)) => config.token_manager.stage_unproven_candidate(token).await,
-        Ok(None) => false,
+        Ok(Some(token)) => {
+            let changed = config.token_manager.stage_unproven_candidate(token).await;
+            managed_background::finish_claim(dir);
+            if changed {
+                Handoff::Adopted
+            } else {
+                Handoff::None
+            }
+        }
+        Ok(None) => Handoff::None,
         Err(error) => {
             tracing::warn!(
                 target: "astra.edge",
                 error = %error,
-                "cannot read the credential handed to this runner"
+                "cannot read the credential handed to this runner; it is kept for the next attempt"
             );
-            false
+            Handoff::Unreadable
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum Handoff {
+    None,
+    Adopted,
+    /// A credential was handed over but could not be read yet.
+    Unreadable,
 }
 
 /// Returns true when the runner must exit with an error.
@@ -1093,41 +1110,58 @@ async fn run_connection_loop(config: &EdgeConfig, handoff: Option<&Path>) -> boo
                     // before this decision or, once the lock is released by
                     // exit, starts a new runner itself.
                     let handoff_lock = managed_background::lock_credential_handoff(handoff);
-                    if adopt_handed_off_credential(config, handoff).await {
-                        tracing::warn!(
-                            error = %e,
-                            "Authentication failed — retrying with the credential handed to this runner"
-                        );
-                        reconnect_delay_secs = 1;
-                        continue;
+                    match adopt_handed_off_credential(config, handoff).await {
+                        Handoff::Adopted => {
+                            tracing::warn!(
+                                error = %e,
+                                "Authentication failed — retrying with the credential handed to this runner"
+                            );
+                            reconnect_delay_secs = 1;
+                            continue;
+                        }
+                        // Never exit while an accepted handoff is untried.
+                        Handoff::Unreadable => {
+                            drop(handoff_lock);
+                            tracing::warn!(
+                                error = %e,
+                                delay = reconnect_delay_secs,
+                                "Authentication failed — retrying once the handed-off credential is readable"
+                            );
+                            managed_background::note_phase("reconnecting");
+                        }
+                        Handoff::None => {
+                            // The previous credential may be revoked (e.g. a
+                            // renewal rotated it away but the persist was
+                            // lost, or a handed-off candidate was rejected).
+                            // Before giving up, try the credential that last
+                            // authenticated, or the other startup candidate.
+                            if config.token_manager.swap_to_fallback().await {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Authentication failed — retrying with the fallback credential"
+                                );
+                                reconnect_delay_secs = 1;
+                                continue;
+                            }
+                            tracing::error!(
+                                error = %e,
+                                "Permanent authentication failure — not retrying"
+                            );
+                            managed_background::note_phase("authentication-failure");
+                            if let Some(lock) = handoff_lock {
+                                lock.keep_until_exit();
+                            }
+                            return true;
+                        }
                     }
-                    // The chosen startup token may be revoked (e.g. a renewal
-                    // rotated it away but the persist was lost). Before giving
-                    // up, try the other startup candidate once.
-                    if config.token_manager.swap_to_fallback().await {
-                        tracing::warn!(
-                            error = %e,
-                            "Authentication failed with the selected token — retrying with the alternate startup token"
-                        );
-                        reconnect_delay_secs = 1;
-                        continue;
+                } else {
+                    tracing::error!(error = %e, "Connection error");
+                    if !config.reconnect {
+                        return true;
                     }
-                    tracing::error!(
-                        error = %e,
-                        "Permanent authentication failure — not retrying"
-                    );
-                    managed_background::note_phase("authentication-failure");
-                    if let Some(lock) = handoff_lock {
-                        lock.keep_until_exit();
-                    }
-                    return true;
+                    managed_background::note_phase("reconnecting");
+                    tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
                 }
-                tracing::error!(error = %e, "Connection error");
-                if !config.reconnect {
-                    return true;
-                }
-                managed_background::note_phase("reconnecting");
-                tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
             }
         }
         // Exponential backoff with jitter
@@ -1954,6 +1988,68 @@ mod tests {
         assert_eq!(
             managed_background::claim_pending_credential(handoff.path()).unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_handoffs_still_fall_back_to_the_proven_credential() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let handoff = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = handoff_config(&listener, state.path(), workspace.path(), true);
+        let rejected = EdgeServerMessage::AuthError {
+            message: "rejected".into(),
+        };
+        let server = async {
+            let mut seen = Vec::new();
+            let (mut ws, bearer) = accept_edge(&listener).await;
+            seen.push(bearer);
+            send_server(&mut ws, &auth_ok()).await;
+            managed_background::queue_pending_credential(handoff.path(), "bad-one").unwrap();
+            send_server(
+                &mut ws,
+                &EdgeServerMessage::Closing {
+                    reason: "server restart".into(),
+                },
+            )
+            .await;
+            while ws.next().await.is_some_and(|message| message.is_ok()) {}
+
+            let (mut ws, bearer) = accept_edge(&listener).await;
+            seen.push(bearer);
+            // A second handoff arrives while the first is authenticating.
+            managed_background::queue_pending_credential(handoff.path(), "bad-two").unwrap();
+            send_server(&mut ws, &rejected).await;
+            drop(ws);
+
+            let (mut ws, bearer) = accept_edge(&listener).await;
+            seen.push(bearer);
+            send_server(&mut ws, &rejected).await;
+            drop(ws);
+
+            let (_ws, bearer) = accept_edge(&listener).await;
+            seen.push(bearer);
+            seen
+        };
+        let seen = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::select! {
+                exit_with_error = run_connection_loop(&config, Some(handoff.path())) => {
+                    panic!("runner exited before trying the proven credential (error: {exit_with_error})")
+                }
+                seen = server => seen,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                "Bearer old-token",
+                "Bearer bad-one",
+                "Bearer bad-two",
+                "Bearer old-token"
+            ]
         );
     }
 
