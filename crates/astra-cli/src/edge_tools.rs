@@ -1213,6 +1213,8 @@ pub(crate) struct PermissionSandboxBasis {
 
 pub struct ToolExecutor {
     pub(crate) background_tasks: background_tasks::BackgroundTaskRegistry,
+    // A task may outlive a turn only when a session owner holds this registry.
+    background_tasks_shared: bool,
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
     /// so the server can add user_id for proper multi-user isolation.
@@ -1442,6 +1444,7 @@ impl ToolExecutor {
                     .join("bg_tasks")
                     .join(uuid::Uuid::new_v4().to_string()),
             ),
+            background_tasks_shared: false,
             project_root: root.clone(),
             cloud_base: None,
             cloud_token: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -2305,7 +2308,10 @@ impl ToolExecutor {
         match capability {
             Capability::AgentSpawner => self.spawn_context.is_some(),
 
-            Capability::LocalBackgroundTasks => !self.read_only_execution,
+            Capability::LocalBackgroundTasks => {
+                !self.read_only_execution
+                    && (self.background_tasks_shared || self.spawn_context.is_some())
+            }
             // Fail-closed: unknown executor-gated capabilities are denied.
             // If a new executor-gated variant is added here, it MUST get an
             // explicit match arm — the wildcard is a safety net, not a policy.
@@ -2766,6 +2772,7 @@ impl ToolExecutor {
         tasks: background_tasks::BackgroundTaskRegistry,
     ) -> Self {
         self.background_tasks = tasks;
+        self.background_tasks_shared = true;
         self
     }
 
@@ -4609,13 +4616,33 @@ impl ToolExecutor {
             let mut fields = None;
             let output = match name {
                 "task_output" => {
-                    if let Some(cancel) = cancel_token {
-                        tokio::select! {
-                            result = self.task_output_with_fields(args, &mut fields) => result,
-                            _ = cancel.cancelled() => return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false)),
+                    let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
+                    let timeout = std::time::Duration::from_millis(
+                        args.get("timeout_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(30_000)
+                            .clamp(1, 300_000),
+                    );
+                    tokio::select! {
+                        result = self.task_output_with_fields(args, &mut fields) => result,
+                        _ = async { match cancel_token { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false)),
+                        _ = tokio::time::sleep(timeout), if !block => {
+                            let mut outcome = ToolExecutionOutcome::error_with_evidence(
+                                "Task observation timed out. The task was not stopped; check its status or retry the observation.".into(),
+                                astra_core::ToolFailureEvidence::from_error_kind(astra_core::ErrorKind::ToolTimeout),
+                            );
+                            let fields = outcome.tool_result_fields.get_or_insert_default();
+                            fields.insert("stage".into(), json!("observation"));
+                            fields.insert("side_effects_maybe".into(), json!(false));
+                            fields.insert("retryable".into(), json!(true));
+                            if let Some(id) = args.get("task_id").and_then(Value::as_str) {
+                                fields.insert("task_id".into(), json!(id));
+                                if let Some(context) = self.background_tasks.model_context(id) {
+                                    fields.insert("task".into(), context);
+                                }
+                            }
+                            return EdgeToolRun::from_tool_result(tool_result_from_cli_outcome(outcome));
                         }
-                    } else {
-                        self.task_output_with_fields(args, &mut fields).await
                     }
                 }
                 "task_stop" => self.task_kill_bg(args).await,
@@ -6117,6 +6144,7 @@ impl ToolExecutor {
                 "current_model": current_model,
                 "capabilities_active": caps.active_names,
                 "capabilities_inactive": caps.inactive_names,
+                "shell_task_controls": self.background_tasks_shared && !self.read_only_execution,
                 "tools_visible": model.capabilities.tool_names,
                 "tools_dropped_by_capability": caps.dropped_by_capability,
                 "tools_dropped_by_surface": caps.dropped_by_surface,
@@ -6141,6 +6169,7 @@ impl ToolExecutor {
                 "current_model": current_model,
                 "capabilities_active": caps.active_names,
                 "capabilities_inactive": caps.inactive_names,
+                "shell_task_controls": self.background_tasks_shared && !self.read_only_execution,
                 "tools_visible": caps.visible_names,
                 "tools_dropped_by_capability": caps.dropped_by_capability,
                 "tools_dropped_by_surface": caps.dropped_by_surface,
@@ -6154,8 +6183,11 @@ impl ToolExecutor {
     fn cli_capability_view(&self) -> CliCapabilityView {
         use astra_turn_core::capability::Capability;
 
-        let caps =
-            cli_default_capabilities(self.spawn_context.is_some(), !self.read_only_execution);
+        let caps = cli_default_capabilities(
+            self.spawn_context.is_some(),
+            !self.read_only_execution
+                && (self.background_tasks_shared || self.spawn_context.is_some()),
+        );
         let mut active_names = Vec::new();
         let mut inactive_names = Vec::new();
         for capability in [
@@ -6281,7 +6313,9 @@ impl ToolExecutor {
         if self.spawn_context.is_some() {
             extra.push(astra_runtime_env::CAP_MULTI_AGENT);
         }
-        if !self.read_only_execution {
+        if self.capability_has_runtime_binding(
+            astra_turn_core::capability::Capability::LocalBackgroundTasks,
+        ) {
             extra.push(astra_runtime_env::CAP_LOCAL_BACKGROUND_TASKS);
         }
         astra_runtime_env::CapacityProviderCoverageEntry::ready(
@@ -6649,13 +6683,54 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn local_background_tools_are_available_without_a_tui() {
+    fn local_background_tools_require_a_retained_session_owner() {
         use astra_turn_core::capability::Capability;
         let dir = tempfile::tempdir().unwrap();
-        let mut executor = ToolExecutor::new(dir.path());
+        let executor = ToolExecutor::new(dir.path());
+        assert!(!executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
+        let mut executor = executor.with_background_tasks(
+            super::background_tasks::BackgroundTaskRegistry::new(dir.path().join("tasks")),
+        );
         assert!(executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
+        assert_eq!(executor.capability_info_json()["shell_task_controls"], true);
         executor.set_read_only_execution();
         assert!(!executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
+    }
+
+    #[tokio::test]
+    async fn agent_controls_do_not_imply_detachable_shell_controls() {
+        use astra_turn_core::capability::Capability;
+        let dir = tempfile::tempdir().unwrap();
+        let executor =
+            ToolExecutor::new(dir.path()).with_spawn_context(fanout_test_context(test_spawner()));
+        assert!(executor.capability_has_runtime_binding(Capability::LocalBackgroundTasks));
+        assert_eq!(
+            executor.capability_info_json()["shell_task_controls"],
+            false
+        );
+        let outcome = executor
+            .execute_with_metadata(
+                "bash",
+                &json!({"command":"printf finished","yield_time_ms":0}),
+            )
+            .await;
+        assert!(
+            !outcome.is_error && outcome.output.contains("finished"),
+            "{outcome:?}"
+        );
+        assert!(
+            outcome
+                .tool_result_fields
+                .as_ref()
+                .unwrap()
+                .get("bash_detached")
+                .is_none()
+        );
+        let rejected = executor
+            .execute_with_metadata("bash", &json!({"command":"touch unintended","stdin":true}))
+            .await;
+        assert!(rejected.is_error);
+        assert!(!dir.path().join("unintended").exists());
     }
 
     #[test]
@@ -9434,6 +9509,7 @@ pub(crate) mod tests {
             .await;
         let parsed: serde_json::Value =
             serde_json::from_str(&out).expect("introspect must return JSON");
+        assert_eq!(parsed["shell_task_controls"], false);
 
         let inactive: Vec<&str> = parsed["capabilities_inactive"]
             .as_array()
@@ -9444,8 +9520,8 @@ pub(crate) mod tests {
             "bare executor must report AgentSpawner inactive; got {out}"
         );
         assert!(
-            !inactive.contains(&"LocalBackgroundTasks"),
-            "the headless executor owns its task registry; got {out}"
+            inactive.contains(&"LocalBackgroundTasks"),
+            "a headless executor without a session owner must report task controls inactive; got {out}"
         );
         assert!(
             !inactive.contains(&"PlanLifecycle"),
@@ -9467,13 +9543,24 @@ pub(crate) mod tests {
         assert!(missing.contains(&"AgentSpawner"));
 
         assert!(
-            dropped.iter().all(|entry| entry["name"] != "task_output"),
-            "headless task output remains available: {out}"
+            dropped.iter().any(|entry| entry["name"] == "task_output"),
+            "headless task output must not be advertised without an owner: {out}"
         );
 
         let providers = parsed["capacity_provider_coverage"]
             .as_array()
             .expect("capacity_provider_coverage");
+        let control = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "control_plane")
+            .unwrap();
+        assert!(
+            !control["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cap| cap == "local_background_tasks")
+        );
         let cli_local = providers
             .iter()
             .find(|provider| provider["provider_type"] == "cli_local")

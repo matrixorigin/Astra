@@ -10470,6 +10470,11 @@ mod tests {
         let control = astra_tools::detach::ForegroundWaitControl::default();
         let executor = std::sync::Arc::new(
             crate::edge_tools::ToolExecutor::new(dir.path())
+                .with_background_tasks(
+                    crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                        dir.path().join("tasks"),
+                    ),
+                )
                 .with_foreground_wait_control(control.clone()),
         );
         let tasks = executor.background_tasks.clone();

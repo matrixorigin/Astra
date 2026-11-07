@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -42,9 +42,21 @@ static NEXT_BG_ID: AtomicU32 = AtomicU32::new(1);
 // every 8 KiB request.  Only the safe projection is cached; raw output never
 // enters this process-wide cache.
 const SAFE_OUTPUT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-// Bound work before entering Tokio's blocking pool. The existing cache lock
-// coalesces cold generations; waiting callers do not each allocate a capture.
-static OUTPUT_READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+const SAFE_OUTPUT_CACHE_MAX_ENTRIES: usize = 2048;
+// Bound cold reads before entering Tokio's blocking pool. Small outputs have
+// their own capacity, so large scans do not block unrelated interactive reads.
+const SMALL_OUTPUT_SCAN_BYTES: u64 = 512 * 1024;
+static SMALL_OUTPUT_READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+static LARGE_OUTPUT_READ_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+static OUTPUT_SEARCH_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+fn output_read_slots(bytes: u64) -> &'static tokio::sync::Semaphore {
+    if bytes <= SMALL_OUTPUT_SCAN_BYTES {
+        &SMALL_OUTPUT_READ_SLOTS
+    } else {
+        &LARGE_OUTPUT_READ_SLOTS
+    }
+}
 
 #[derive(Default)]
 struct SafeOutputCache {
@@ -208,8 +220,8 @@ pub(crate) struct BackgroundTaskHandle {
     no_recent_output_reported: bool,
     work_revision: u64,
     completion: Option<watch::Receiver<Option<Arc<TaskCompletion>>>>,
-    pub(crate) input: Arc<OnceLock<astra_sandbox::ProcessInput>>,
-    captured_bytes: Option<Arc<AtomicU64>>,
+    input: Option<watch::Receiver<Option<astra_sandbox::ProcessInput>>>,
+    capture: Option<Arc<astra_tools::shell_output_capture::TaskCapture>>,
     background: bool,
 }
 
@@ -236,6 +248,46 @@ impl ShellTaskSubscription {
 }
 
 impl BackgroundTaskHandle {
+    fn published_output_paths(&self) -> Option<(String, String)> {
+        let Some(completion) = &self.completion else {
+            return (!self.stdout_path.as_os_str().is_empty()
+                && !self.stderr_path.as_os_str().is_empty())
+            .then(|| {
+                (
+                    self.stdout_path.display().to_string(),
+                    self.stderr_path.display().to_string(),
+                )
+            });
+        };
+        let completion = completion.borrow().clone()?;
+        let capture = completion
+            .outcome
+            .tool_result_fields
+            .as_ref()?
+            .get("bash_output_capture")?;
+        Some((
+            capture.get("stdout")?.get("path")?.as_str()?.to_owned(),
+            capture.get("stderr")?.get("path")?.as_str()?.to_owned(),
+        ))
+    }
+
+    pub(crate) fn output_reference(&self) -> String {
+        self.published_output_paths().map_or_else(
+            || format!("task: {}", self.id),
+            |(stdout, stderr)| format!("stdout: {stdout} · stderr: {stderr}"),
+        )
+    }
+
+    pub(crate) fn stdin_available(&self) -> bool {
+        !self.status().is_terminal()
+            && self.input.as_ref().is_some_and(|input| {
+                input.borrow().as_ref().map_or_else(
+                    || input.has_changed().is_ok(),
+                    astra_sandbox::ProcessInput::is_open,
+                )
+            })
+    }
+
     fn output_settled(&self) -> bool {
         if let Some(terminal) = self.completion.as_ref().and_then(|rx| rx.borrow().clone()) {
             return terminal
@@ -245,7 +297,8 @@ impl BackgroundTaskHandle {
                 .and_then(|fields| fields.get("bash_output_capture"))
                 .and_then(|capture| capture.get("complete"))
                 .and_then(Value::as_bool)
-                .unwrap_or(terminal.status == BgTaskStatus::Completed);
+                // A receipt is omitted only for a completely drained stream.
+                .unwrap_or(true);
         }
         // A restored interrupted task cannot prove that its last line is whole.
         self.status() == BgTaskStatus::Completed
@@ -267,7 +320,24 @@ impl BackgroundTaskHandle {
     }
 
     pub fn projected_status(&self) -> &'static str {
-        self.status().as_str()
+        if self.live_control == BgTaskLiveControl::StaleHandle && !self.status().is_terminal() {
+            "unavailable"
+        } else {
+            self.status().as_str()
+        }
+    }
+
+    pub(crate) fn work_unit_status(&self) -> WorkUnitStatus {
+        if self.live_control == BgTaskLiveControl::StaleHandle && !self.status().is_terminal() {
+            return WorkUnitStatus::Unavailable;
+        }
+        match self.status() {
+            BgTaskStatus::Running => WorkUnitStatus::Running,
+            BgTaskStatus::Stopping => WorkUnitStatus::Stopping,
+            BgTaskStatus::Completed => WorkUnitStatus::Completed,
+            BgTaskStatus::Failed => WorkUnitStatus::Failed,
+            BgTaskStatus::Killed => WorkUnitStatus::Cancelled,
+        }
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -428,7 +498,7 @@ impl BackgroundTaskRegistry {
                 format!("Task {id} has ended or is stopping; no input was sent."),
             );
         }
-        let Some(input) = handle.input.get() else {
+        let Some(mut input) = handle.input.clone() else {
             return rejected(
                 astra_core::ErrorKind::ToolUnavailable,
                 format!(
@@ -436,25 +506,35 @@ impl BackgroundTaskRegistry {
                 ),
             );
         };
-        let write = async {
-            if close {
-                input.close().await
-            } else {
-                input
-                    .write_bytes(bytes.expect("validated input").as_bytes())
-                    .await
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let input = loop {
+            if let Some(input) = input.borrow_and_update().clone() {
+                break input;
+            }
+            tokio::select! {
+                changed = input.changed() => if changed.is_err() {
+                    return rejected(astra_core::ErrorKind::ToolUnavailable, format!("Task {id} could not open stdin; no input was sent."));
+                },
+                _ = tokio::time::sleep_until(deadline) => return rejected(astra_core::ErrorKind::ToolTimeout, format!("Timed out waiting for stdin on {id}; no input was sent.")),
+                _ = async { match cancel { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => return rejected(astra_core::ErrorKind::Cancelled, format!("Input to {id} was cancelled before it was sent.")),
             }
         };
-        let result = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(5), write) => match result {
-                Ok(result) => result,
-                Err(_) => Err(astra_sandbox::ProcessInputError::Unconfirmed(std::io::Error::new(std::io::ErrorKind::TimedOut, "write acknowledgement deadline elapsed"))),
-            },
-            _ = async { match cancel { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => Err(astra_sandbox::ProcessInputError::Unconfirmed(std::io::Error::new(std::io::ErrorKind::Interrupted, "input wait cancelled"))),
+        let result = if close {
+            input.close(deadline, cancel).await
+        } else {
+            input
+                .write_bytes(bytes.expect("validated input").as_bytes(), deadline, cancel)
+                .await
         };
         if let Err(astra_sandbox::ProcessInputError::NotSent(error)) = &result {
             return rejected(
-                astra_core::ErrorKind::ToolUnavailable,
+                if cancel.is_some_and(CancellationToken::is_cancelled) {
+                    astra_core::ErrorKind::Cancelled
+                } else if error.kind() == std::io::ErrorKind::TimedOut {
+                    astra_core::ErrorKind::ToolTimeout
+                } else {
+                    astra_core::ErrorKind::ToolUnavailable
+                },
                 format!("Input to {id} was not sent: {error}"),
             );
         }
@@ -491,20 +571,32 @@ impl BackgroundTaskRegistry {
     pub(crate) fn start_shell<F, R>(
         &self,
         command: &str,
-        (stdout_path, stderr_path): (PathBuf, PathBuf),
-        captured_bytes: Arc<AtomicU64>,
+        (stdout_path, stderr_path, capture): (
+            PathBuf,
+            PathBuf,
+            Option<Arc<astra_tools::shell_output_capture::TaskCapture>>,
+        ),
         background: bool,
+        stdin: bool,
         parent_cancel: Option<&CancellationToken>,
         run: F,
     ) -> Result<ShellTaskSubscription, String>
     where
-        F: FnOnce(CancellationToken, Arc<OnceLock<astra_sandbox::ProcessInput>>) -> R,
+        F: FnOnce(
+            CancellationToken,
+            Option<watch::Sender<Option<astra_sandbox::ProcessInput>>>,
+        ) -> R,
         R: Future<Output = astra_tools::execution_outcome::ToolExecutionOutcome> + Send + 'static,
     {
         self.with_state(|state| {
-            state.drain_join_set();
-            state.prune_retained_terminal_tasks();
+            if !state.drain_join_set() {
+                state.prune_retained_terminal_tasks();
+            }
             if state.running_count() >= MAX_CONCURRENT_TASKS { return Err(format!("task limit reached ({MAX_CONCURRENT_TASKS} running)")); }
+            if state.tasks.values().filter(|task| task.capture.is_some()).count()
+                >= MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS {
+                return Err("Task retention capacity is full; wait for tasks to settle or resolve output cleanup errors before starting more tasks.".into());
+            }
             if state.pending_completions.len() >= 2 * (MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS) {
                 return Err("Task notifications are awaiting delivery; inspect existing tasks before launching more.".into());
             }
@@ -512,7 +604,10 @@ impl BackgroundTaskRegistry {
             // Launch cancellation remains bound through terminal settlement.
             // Observation tools get their own token and never become owners.
             let cancel = parent_cancel.map(CancellationToken::child_token).unwrap_or_default();
-            let input = Arc::new(OnceLock::new());
+            let (input_tx, input) = if stdin {
+                let (tx, rx) = watch::channel(None);
+                (Some(tx), Some(rx))
+            } else { (None, None) };
             let (terminal, completion) = watch::channel(None);
             let status = Arc::new(AtomicU8::new(BgTaskStatus::Running as u8));
             state.tasks.insert(id.clone(), BackgroundTaskHandle {
@@ -522,13 +617,13 @@ impl BackgroundTaskRegistry {
                 stdout_path, stderr_path, exit_code: None, terminal_reason: None,
                 last_output_size: 0, output_tail: None, output_error: None, output_sampled_at: None,
                 last_activity: Instant::now(), last_tail_probe_at: None, no_recent_output_reported: false, work_revision: 1,
-                completion: Some(completion.clone()), input: input.clone(), captured_bytes: Some(captured_bytes), background,
+                completion: Some(completion.clone()), input: input.clone(), capture, background,
             });
             if background {
                 state.push_event(BgTaskEvent::Started { id: id.clone(), description: command.into() });
                 state.publish_task(&id);
             }
-            let future = run(cancel.clone(), input.clone());
+            let future = run(cancel.clone(), input_tx);
             let task_id = id.clone();
             state.join_set.spawn(async move {
                 let mut outcome = match AssertUnwindSafe(future).catch_unwind().await {
@@ -627,6 +722,7 @@ impl BackgroundTaskRegistry {
                     "recovery_evidence",
                     "stage",
                     "cleanup_authoritative",
+                    "bash_output_capture",
                 ] {
                     if let Some(value) = fields.get(key) {
                         facts.insert(key.into(), value.clone());
@@ -635,10 +731,14 @@ impl BackgroundTaskRegistry {
             }
             facts.insert("error".into(), json!(terminal.error));
             facts
-        });
+        }).or_else(|| (handle.live_control == BgTaskLiveControl::StaleHandle && !handle.status().is_terminal()).then(|| {
+            json!({"execution_fact":"unknown", "side_effects_maybe":true, "cleanup_authoritative":false, "retryable":false,
+                "error":"The prior process is no longer observable; its effects and cleanup are unknown."})
+                .as_object().expect("object literal").clone()
+        }));
         Some(
             json!({"task_id":id,"kind":"shell","status":handle.projected_status(),
-            "controls":{"observe":true,"wait":handle.completion.is_some(),"stdin":handle.input.get().is_some_and(astra_sandbox::ProcessInput::is_open),
+            "controls":{"observe":true,"wait":handle.completion.is_some(),"stdin":handle.stdin_available(),
                 "stop":handle.live_control.is_available() && !handle.status().is_terminal(),"resume":false},"execution":execution}),
         )
     }
@@ -686,6 +786,27 @@ impl BackgroundTaskRegistry {
 
     pub fn output_directory(&self) -> PathBuf {
         self.with_state(|state| state.output_dir.clone())
+    }
+
+    pub(crate) fn intern_capture_directory(
+        &self,
+        output_root: &Path,
+        candidate: Arc<astra_tools::shell_output_capture::TaskCaptureDirectory>,
+    ) -> Arc<astra_tools::shell_output_capture::TaskCaptureDirectory> {
+        self.with_state(|state| {
+            // A task admitted before a session rebind must not replace the
+            // current namespace with its old directory.
+            if state.output_dir != output_root {
+                return candidate;
+            }
+            if let Some(existing) = &state.capture_directory
+                && existing.same_directory(&candidate)
+            {
+                return existing.clone();
+            }
+            state.capture_directory = Some(candidate.clone());
+            candidate
+        })
     }
 
     pub fn restore_shell_task_projection(
@@ -766,6 +887,7 @@ impl BackgroundTaskRegistry {
         }
         // A wait deadline is not process exit. Cleanup stays owned in the
         // registry; a cancelled waiter cannot manufacture a killed result.
+        self.with_state(TaskRegistryState::prune_retained_terminal_tasks);
         requested
     }
 
@@ -779,32 +901,18 @@ impl BackgroundTaskRegistry {
         let handle = self
             .get(id)
             .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        let terminal = handle.status().is_terminal();
+        if handle.stdout_path.as_os_str().is_empty() || handle.stderr_path.as_os_str().is_empty() {
+            return Err(BackgroundTaskError::output_unavailable(
+                id,
+                "Private task output is unavailable after the session closes.",
+            ));
+        }
         let settled = handle.output_settled();
-        let task_id = id.to_owned();
-        let permit = OUTPUT_READ_SLOTS
-            .acquire()
-            .await
-            .expect("output slots remain open");
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            if terminal && !handle.stdout_path.exists() && file_len(&handle.stderr_path) == 0 {
-                return Err(BackgroundTaskError::output_artifact_missing(
-                    &task_id,
-                    &handle.stdout_path,
-                ));
-            }
-            read_combined_from_str(
-                &handle.stdout_path,
-                &handle.stderr_path,
-                offset,
-                max_bytes,
-                settled,
-            )
-            .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))
-        })
-        .await
-        .map_err(|error| BackgroundTaskError::output_unavailable(id, error.to_string()))?
+        let projection =
+            combined_projection_async(id, &handle.stdout_path, &handle.stderr_path, settled)
+                .await?;
+        projection_window(&projection, offset, max_bytes)
+            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
     pub async fn search_combined_output_async(
@@ -818,22 +926,37 @@ impl BackgroundTaskRegistry {
         let handle = self
             .get(id)
             .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        let terminal = handle.output_settled();
+        if handle.stdout_path.as_os_str().is_empty() || handle.stderr_path.as_os_str().is_empty() {
+            return Err(BackgroundTaskError::output_unavailable(
+                id,
+                "Private task output is unavailable after the session closes.",
+            ));
+        }
+        let settled = handle.output_settled();
         let task_id = id.to_owned();
         let pattern = pattern.to_owned();
-        let permit = OUTPUT_READ_SLOTS
+        // Bound projection lifetimes as well as the search itself: waiters
+        // must not each pin a large cache entry while queued for search.
+        let permit = OUTPUT_SEARCH_SLOTS
             .acquire()
             .await
-            .expect("output slots remain open");
+            .expect("output search slots remain open");
+        let (stdout, stderr) = tokio::join!(
+            optional_safe_projection_async(&handle.stdout_path, settled),
+            optional_safe_projection_async(&handle.stderr_path, settled)
+        );
+        let stdout =
+            stdout.map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?;
+        let stderr =
+            stderr.map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            search_combined_output(
-                &handle.stdout_path,
-                &handle.stderr_path,
+            search_projections(
+                stdout.as_deref(),
+                stderr.as_deref(),
                 &pattern,
                 context_lines,
                 max_bytes,
-                terminal,
             )
             .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))
         })
@@ -846,12 +969,29 @@ struct TaskRegistryState {
     tasks: HashMap<String, BackgroundTaskHandle>,
     join_set: JoinSet<Arc<TaskCompletion>>,
     output_dir: PathBuf,
+    capture_directory: Option<Arc<astra_tools::shell_output_capture::TaskCaptureDirectory>>,
     pending_completions: Vec<BgTaskEvent>,
     output_probe_tx: mpsc::UnboundedSender<Vec<ShellOutputObservation>>,
     output_probe_rx: mpsc::UnboundedReceiver<Vec<ShellOutputObservation>>,
     output_probe_in_flight: bool,
     last_output_probe_started: Option<Instant>,
     active_work_registry: Option<Arc<ActiveWorkRegistry>>,
+}
+
+impl Drop for TaskRegistryState {
+    fn drop(&mut self) {
+        // No registry remains to own these private captures. Abort running
+        // owners before unlinking; published workspace files are independent.
+        self.join_set.abort_all();
+        for task in self.tasks.values().filter(|task| task.capture.is_some()) {
+            remove_cached_output(&task.stdout_path, &task.stderr_path);
+            if let Some(owner) = &task.capture
+                && let Err(error) = owner.remove_files()
+            {
+                tracing::warn!(task_id = %task.id, %error, "could not remove private command output");
+            }
+        }
+    }
 }
 
 impl TaskRegistryState {
@@ -861,6 +1001,7 @@ impl TaskRegistryState {
             tasks: HashMap::new(),
             join_set: JoinSet::new(),
             output_dir,
+            capture_directory: None,
             pending_completions: Vec::new(),
             output_probe_tx,
             output_probe_rx,
@@ -888,13 +1029,7 @@ impl TaskRegistryState {
         if !handle.background {
             return;
         }
-        let status = match handle.status() {
-            BgTaskStatus::Running => WorkUnitStatus::Running,
-            BgTaskStatus::Stopping => WorkUnitStatus::Stopping,
-            BgTaskStatus::Completed => WorkUnitStatus::Completed,
-            BgTaskStatus::Failed => WorkUnitStatus::Failed,
-            BgTaskStatus::Killed => WorkUnitStatus::Cancelled,
-        };
+        let status = handle.work_unit_status();
         let observation = WorkUnitObservation::new(
             &handle.id,
             "shell",
@@ -915,6 +1050,9 @@ impl TaskRegistryState {
     /// session binding is identity discovery for the current conversation,
     /// not a user-requested session switch, so running work must survive it.
     pub fn rebind_output_dir_for_new_tasks(&mut self, output_dir: PathBuf) {
+        if self.output_dir != output_dir {
+            self.capture_directory = None;
+        }
         self.output_dir = output_dir;
     }
 
@@ -933,34 +1071,68 @@ impl TaskRegistryState {
         {
             NEXT_BG_ID.fetch_max(sequence, Ordering::Relaxed);
         }
-        let status = BgTaskStatus::from_str(projection.status.as_str()).ok_or_else(|| {
-            format!(
-                "invalid background shell status '{}' for {}",
-                projection.status, projection.id
+        let projected_status =
+            BgTaskStatus::from_str(projection.status.as_str()).ok_or_else(|| {
+                format!(
+                    "invalid background shell status '{}' for {}",
+                    projection.status, projection.id
+                )
+            })?;
+        let prior = self
+            .active_work_registry
+            .as_ref()
+            .and_then(|registry| registry.canonical_observation(id, "shell"));
+        // An older persisted running row must not overwrite a terminal event
+        // the current tracker has already observed.
+        let prior_terminal = prior.as_ref().filter(|observation| {
+            observation.status.is_terminal()
+                && (observation.status != WorkUnitStatus::Unavailable
+                    || !projected_status.is_terminal())
+        });
+        let status = match prior_terminal.map(|observation| observation.status) {
+            Some(WorkUnitStatus::Completed) => BgTaskStatus::Completed,
+            Some(WorkUnitStatus::Failed) => BgTaskStatus::Failed,
+            Some(WorkUnitStatus::Cancelled) => BgTaskStatus::Killed,
+            _ => projected_status,
+        };
+        let work_revision = prior.as_ref().map_or(2, |observation| {
+            if prior_terminal.is_some() {
+                observation.revision
+            } else {
+                observation.revision.saturating_add(1)
+            }
+        });
+        // The tracker confirms status and revision only; it cannot validate
+        // exit details from an older persisted projection.
+        let trust_projection_details = prior_terminal.is_none();
+        let (stdout_path, stderr_path) = if prior_terminal.is_some() && status != projected_status {
+            // These paths describe the conflicting old observation as well.
+            (PathBuf::new(), PathBuf::new())
+        } else {
+            (
+                PathBuf::from(projection.stdout_path),
+                PathBuf::from(projection.stderr_path),
             )
-        })?;
-        let stdout_path = PathBuf::from(projection.stdout_path);
-        let stderr_path = PathBuf::from(projection.stderr_path);
-        let captured_bytes =
-            astra_tools::shell_output_capture::BashOutputCapture::retained_task_bytes(
-                &self.output_dir,
-                &stdout_path,
-                &stderr_path,
-            )
-            .map(|bytes| Arc::new(AtomicU64::new(bytes)));
+        };
         let handle = BackgroundTaskHandle {
             id: id.to_string(),
             description: projection.title,
             status: Arc::new(AtomicU8::new(status as u8)),
             started_at: instant_from_unix_epoch_millis(projection.started_at_ms),
             started_at_ms: projection.started_at_ms,
-            ended_at_ms: projection.ended_at_ms,
+            ended_at_ms: trust_projection_details
+                .then_some(projection.ended_at_ms)
+                .flatten(),
             live_control: BgTaskLiveControl::StaleHandle,
             cancel_token: CancellationToken::new(),
             stdout_path,
             stderr_path,
-            exit_code: projection.exit_code,
-            terminal_reason: projection.terminal_reason,
+            exit_code: trust_projection_details
+                .then_some(projection.exit_code)
+                .flatten(),
+            terminal_reason: trust_projection_details
+                .then_some(projection.terminal_reason)
+                .flatten(),
             last_output_size: 0,
             output_tail: None,
             output_error: None,
@@ -968,10 +1140,12 @@ impl TaskRegistryState {
             last_activity: Instant::now(),
             last_tail_probe_at: None,
             no_recent_output_reported: false,
-            work_revision: if status.is_terminal() { 2 } else { 1 },
+            work_revision,
             completion: None,
-            input: Arc::new(OnceLock::new()),
-            captured_bytes,
+            input: None,
+            // A persisted path is a read-only reference, never authority to
+            // delete a file after the original owner has gone away.
+            capture: None,
             background: true,
         };
         self.tasks.insert(id.to_string(), handle);
@@ -986,6 +1160,7 @@ impl TaskRegistryState {
         for projection in projections {
             self.restore_shell_task_projection(projection)?;
         }
+        self.prune_retained_terminal_tasks();
         Ok(())
     }
 
@@ -1040,10 +1215,16 @@ impl TaskRegistryState {
     ///
     /// Idempotent: safe to call multiple times per tick; only new
     /// completions are collected.
-    pub fn drain_join_set(&mut self) {
+    pub fn drain_join_set(&mut self) -> bool {
+        let mut completed = false;
         while let Some(result) = self.join_set.try_join_next() {
             self.record_join_result(result);
+            completed = true;
         }
+        if completed {
+            self.prune_retained_terminal_tasks();
+        }
+        completed
     }
 
     fn record_join_result(&mut self, result: Result<Arc<TaskCompletion>, tokio::task::JoinError>) {
@@ -1116,8 +1297,7 @@ impl TaskRegistryState {
     /// and task_output can inspect them. Failed tasks get a separate retention
     /// cap because they drive footer attention and usually need diagnosis.
     /// Executor-created terminal captures also share a 256 MiB disk budget;
-    /// unowned artifact references are never removed here. Restored private
-    /// captures retain their quota ownership after namespace validation.
+    /// unowned artifact references are never removed here.
     pub fn prune_retained_terminal_tasks(&mut self) {
         let keep_completed = self.retained_terminal_task_ids(
             |status| matches!(status, BgTaskStatus::Completed | BgTaskStatus::Killed),
@@ -1131,8 +1311,8 @@ impl TaskRegistryState {
             .tasks
             .values()
             .filter(|handle| handle.status().is_terminal())
-            .filter_map(|handle| handle.captured_bytes.as_ref())
-            .map(|bytes| bytes.load(Ordering::Acquire))
+            .filter_map(|handle| handle.capture.as_ref())
+            .map(|capture| capture.bytes())
             .sum::<u64>();
         let mut candidates = self
             .tasks
@@ -1149,18 +1329,17 @@ impl TaskRegistryState {
             let Some(handle) = self.tasks.remove(&id) else {
                 continue;
             };
-            if let Some(bytes) = handle.captured_bytes {
-                retained_bytes = retained_bytes.saturating_sub(bytes.load(Ordering::Acquire));
-                // Only executor captures from the selected private namespace
-                // carry quota ownership, including validated restored files.
-                // Other saved references and source preimages are not removed.
-                for path in [&handle.stdout_path, &handle.stderr_path] {
-                    if let Err(error) = std::fs::remove_file(path)
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        tracing::warn!(task_id = %id, error = %error, "could not evict retained command output");
-                    }
+            if let Some(owner) = &handle.capture {
+                // Only captures created by this owner carry deletion authority.
+                if let Err(error) = owner.remove_files() {
+                    tracing::warn!(task_id = %id, error = %error, "could not evict retained command output");
+                    // Retain the same owner for a later retry; never discard
+                    // cleanup authority after an unsuccessful deletion.
+                    self.tasks.insert(id, handle);
+                    continue;
                 }
+                retained_bytes = retained_bytes.saturating_sub(owner.bytes());
+                remove_cached_output(&handle.stdout_path, &handle.stderr_path);
                 tracing::debug!(task_id = %id, "terminal command output evicted by retention budget");
             }
         }
@@ -1212,7 +1391,6 @@ impl TaskRegistryState {
     pub fn poll_completions(&mut self) -> Vec<BgTaskEvent> {
         self.poll_output_observations();
         self.drain_join_set();
-        self.prune_retained_terminal_tasks();
         std::mem::take(&mut self.pending_completions)
     }
 
@@ -1237,8 +1415,8 @@ impl TaskRegistryState {
         let now = Instant::now();
         let mut requests = Vec::new();
         for handle in self.tasks.values_mut() {
-            if let Some(bytes) = &handle.captured_bytes {
-                let bytes = bytes.load(Ordering::Acquire);
+            if let Some(capture) = &handle.capture {
+                let bytes = capture.bytes();
                 if bytes == handle.last_output_size && !handle.status().is_terminal() {
                     continue;
                 }
@@ -1375,16 +1553,22 @@ impl TaskRegistryState {
         let mut projections: Vec<_> = self
             .tasks
             .values()
-            .map(|handle| BackgroundShellTaskProjection {
-                id: handle.id.clone(),
-                status: handle.status().as_str().to_string(),
-                title: handle.description.clone(),
-                started_at_ms: handle.started_at_ms,
-                ended_at_ms: handle.ended_at_ms,
-                stdout_path: handle.stdout_path.display().to_string(),
-                stderr_path: handle.stderr_path.display().to_string(),
-                exit_code: handle.exit_code,
-                terminal_reason: handle.terminal_reason.clone(),
+            .filter(|handle| handle.background)
+            .map(|handle| {
+                // Persist only workspace results, never private session files.
+                let (stdout_path, stderr_path) =
+                    handle.published_output_paths().unwrap_or_default();
+                BackgroundShellTaskProjection {
+                    id: handle.id.clone(),
+                    status: handle.status().as_str().to_string(),
+                    title: handle.description.clone(),
+                    started_at_ms: handle.started_at_ms,
+                    ended_at_ms: handle.ended_at_ms,
+                    stdout_path,
+                    stderr_path,
+                    exit_code: handle.exit_code,
+                    terminal_reason: handle.terminal_reason.clone(),
+                }
             })
             .collect();
         projections.sort_by(|a, b| a.started_at_ms.cmp(&b.started_at_ms).then(a.id.cmp(&b.id)));
@@ -1408,10 +1592,27 @@ async fn collect_shell_output_observations(
             .as_ref()
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        let output_error =
-            (request.report_missing && stdout_metadata.is_err() && stderr_bytes == 0).then(|| {
-                BackgroundTaskError::output_artifact_missing(&request.id, &request.stdout_path)
-            });
+        let output_error = if request.report_missing
+            && (request.stdout_path.as_os_str().is_empty()
+                || request.stderr_path.as_os_str().is_empty())
+        {
+            Some(BackgroundTaskError::output_unavailable(
+                &request.id,
+                "Private task output is unavailable after the session closes.",
+            ))
+        } else if request.report_missing && stdout_metadata.is_err() {
+            Some(BackgroundTaskError::output_artifact_missing(
+                &request.id,
+                &request.stdout_path,
+            ))
+        } else if request.report_missing && stderr_metadata.is_err() {
+            Some(BackgroundTaskError::output_artifact_missing(
+                &request.id,
+                &request.stderr_path,
+            ))
+        } else {
+            None
+        };
         let tail = if let Some(max_bytes) = request.tail_bytes {
             read_combined_tail_str_async(
                 &request.stdout_path,
@@ -1439,17 +1640,131 @@ async fn read_tail_str_async(
     max_bytes: usize,
     settled: bool,
 ) -> Result<(String, u64), String> {
-    let path = path.to_path_buf();
-    let permit = OUTPUT_READ_SLOTS
-        .acquire()
+    let projection = safe_projection_async(path, settled).await?;
+    Ok(projection_tail(&projection, max_bytes))
+}
+
+async fn optional_safe_projection_async(
+    path: &Path,
+    settled: bool,
+) -> Result<Option<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>>, String> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.len() > 0 => safe_projection_async(path, settled).await.map(Some),
+        Ok(_) => Ok(None),
+        Err(error) => Err(format!("cannot stat {}: {error}", path.display())),
+    }
+}
+
+async fn safe_projection_async(
+    path: &Path,
+    settled: bool,
+) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
+    loop {
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|error| format!("cannot stat {}: {error}", path.display()))?;
+        let key = SafeOutputCacheKey::File(path.to_path_buf());
+        if let Some(projection) =
+            cache_lookup(&key, file_generation(Some(&metadata)), None, settled)
+        {
+            return Ok(projection);
+        }
+        let small = metadata.len() <= SMALL_OUTPUT_SCAN_BYTES;
+        let limit = if small {
+            SMALL_OUTPUT_SCAN_BYTES
+        } else {
+            SAFE_OUTPUT_CACHE_MAX_BYTES as u64
+        };
+        let permit = output_read_slots(metadata.len())
+            .acquire()
+            .await
+            .expect("output slots remain open");
+        let path_owned = path.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            read_safe_projection_limited(&path_owned, settled, limit)
+        })
         .await
-        .expect("output slots remain open");
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        read_tail_str(&path, max_bytes, settled)
-    })
-    .await
-    .map_err(|error| format!("background output read task failed: {error}"))?
+        .map_err(|error| format!("background output read task failed: {error}"))?;
+        if result.is_err()
+            && small
+            && tokio::fs::metadata(path)
+                .await
+                .is_ok_and(|m| m.len() > SMALL_OUTPUT_SCAN_BYTES)
+        {
+            continue;
+        }
+        return result;
+    }
+}
+
+async fn combined_projection_async(
+    task_id: &str,
+    stdout: &Path,
+    stderr: &Path,
+    settled: bool,
+) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, BackgroundTaskError>
+{
+    loop {
+        let (stdout_meta, stderr_meta) =
+            tokio::join!(tokio::fs::metadata(stdout), tokio::fs::metadata(stderr));
+        let stat_error = |path: &Path, error: std::io::Error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                BackgroundTaskError::output_artifact_missing(task_id, path)
+            } else {
+                BackgroundTaskError::output_unavailable(
+                    task_id,
+                    format!("cannot stat {}: {error}", path.display()),
+                )
+            }
+        };
+        let stdout_meta = stdout_meta.map_err(|error| stat_error(stdout, error))?;
+        let stderr_meta = stderr_meta.map_err(|error| stat_error(stderr, error))?;
+        let key = SafeOutputCacheKey::Combined {
+            stdout: stdout.to_path_buf(),
+            stderr: stderr.to_path_buf(),
+        };
+        if let Some(projection) = cache_lookup(
+            &key,
+            file_generation(Some(&stdout_meta)),
+            Some(file_generation(Some(&stderr_meta))),
+            settled,
+        ) {
+            return Ok(projection);
+        }
+        let max_stream = stdout_meta.len().max(stderr_meta.len());
+        let small = max_stream <= SMALL_OUTPUT_SCAN_BYTES;
+        let limit = if small {
+            SMALL_OUTPUT_SCAN_BYTES
+        } else {
+            SAFE_OUTPUT_CACHE_MAX_BYTES as u64
+        };
+        let permit = output_read_slots(max_stream)
+            .acquire()
+            .await
+            .expect("output slots remain open");
+        let (stdout_owned, stderr_owned) = (stdout.to_path_buf(), stderr.to_path_buf());
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            combined_safe_projection_limited(&stdout_owned, &stderr_owned, settled, limit)
+        })
+        .await
+        .map_err(|error| {
+            BackgroundTaskError::output_unavailable(
+                task_id,
+                format!("background output read task failed: {error}"),
+            )
+        })?;
+        if result.is_err() && small {
+            let (a, b) = tokio::join!(tokio::fs::metadata(stdout), tokio::fs::metadata(stderr));
+            if a.is_ok_and(|m| m.len() > SMALL_OUTPUT_SCAN_BYTES)
+                || b.is_ok_and(|m| m.len() > SMALL_OUTPUT_SCAN_BYTES)
+            {
+                continue;
+            }
+        }
+        return result.map_err(|detail| BackgroundTaskError::output_unavailable(task_id, detail));
+    }
 }
 
 async fn read_combined_tail_str_async(
@@ -1489,11 +1804,13 @@ fn instant_from_unix_epoch_millis(started_at_ms: u64) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-fn read_tail_str(path: &Path, max_bytes: usize, settled: bool) -> Result<(String, u64), String> {
-    let projection = read_safe_projection(path, settled)?;
+fn projection_tail(
+    projection: &astra_text_utils::credential_redaction::SafeOutputProjection,
+    max_bytes: usize,
+) -> (String, u64) {
     let start = projection.total_bytes().saturating_sub(max_bytes);
     let (chunk, _end, total, _) = projection.window(start, max_bytes);
-    Ok((chunk, total as u64))
+    (chunk, total as u64)
 }
 
 /// Build the owner-side model view before any byte window is applied. A
@@ -1501,29 +1818,176 @@ fn read_tail_str(path: &Path, max_bytes: usize, settled: bool) -> Result<(String
 /// first is not safe. Background output is bounded by the shared capture owner; the
 /// bounded full read keeps offset/end_offset semantics stable in this safe
 /// view while preventing cross-page secret fragments.
+#[cfg(test)]
 fn read_redacted_file(path: &Path) -> Result<String, String> {
     Ok(read_safe_projection(path, true)?.text().to_string())
 }
 
+fn cache_lookup(
+    key: &SafeOutputCacheKey,
+    primary: (u64, Option<std::time::SystemTime>),
+    secondary: Option<(u64, Option<std::time::SystemTime>)>,
+    settled: bool,
+) -> Option<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>> {
+    safe_output_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lookup(key, primary.0, primary.1, secondary, settled)
+}
+
+fn remove_cached_output(stdout: &Path, stderr: &Path) {
+    let mut cache = safe_output_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for key in [
+        SafeOutputCacheKey::File(stdout.to_path_buf()),
+        SafeOutputCacheKey::File(stderr.to_path_buf()),
+        SafeOutputCacheKey::Combined {
+            stdout: stdout.to_path_buf(),
+            stderr: stderr.to_path_buf(),
+        },
+    ] {
+        if let Some(entry) = cache.entries.remove(&key) {
+            cache.bytes = cache.bytes.saturating_sub(entry.projection.total_bytes());
+        }
+    }
+}
+
+fn file_generation(metadata: Option<&std::fs::Metadata>) -> (u64, Option<std::time::SystemTime>) {
+    (
+        metadata.map_or(0, std::fs::Metadata::len),
+        metadata.and_then(|m| m.modified().ok()),
+    )
+}
+
+#[cfg(test)]
 fn read_safe_projection(
     path: &Path,
     settled: bool,
 ) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
+    read_safe_projection_limited(path, settled, SAFE_OUTPUT_CACHE_MAX_BYTES as u64)
+}
+
+fn read_safe_projection_limited(
+    path: &Path,
+    settled: bool,
+    scan_limit: u64,
+) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+    if metadata.len() > scan_limit {
+        return Err("Task output exceeds the bounded projection limit; inspect a bounded source artifact instead.".into());
+    }
+    let key = SafeOutputCacheKey::File(path.to_path_buf());
+    if let Some(projection) = cache_lookup(&key, file_generation(Some(&metadata)), None, settled) {
+        return Ok(projection);
+    }
+    let (len, modified) = file_generation(Some(&metadata));
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(len).read_to_end(&mut bytes))
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() as u64 != len {
+        return Err("Task output changed while being read; observe it again.".into());
+    }
+    if settled {
+        let after =
+            std::fs::metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        if file_generation(Some(&after)) != (len, modified) {
+            return Err("Task output changed while being read; observe it again.".into());
+        }
+    }
+    let raw = String::from_utf8_lossy(&bytes);
+    // An incomplete last line may contain a fragment of a credential.
+    let raw = if !settled && !raw.ends_with('\n') {
+        raw.rfind('\n').map(|i| &raw[..=i]).unwrap_or("")
+    } else {
+        raw.as_ref()
+    };
+    let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(raw).0;
+    let projection =
+        Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(safe));
     safe_output_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .file_projection(path, settled)
+        .insert(
+            key,
+            SafeOutputCacheEntry {
+                len,
+                modified,
+                secondary: None,
+                settled,
+                projection: projection.clone(),
+                last_used: 0,
+            },
+        );
+    Ok(projection)
 }
 
+#[cfg(test)]
 fn combined_safe_projection(
     stdout_path: &Path,
     stderr_path: &Path,
     settled: bool,
 ) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
+    combined_safe_projection_limited(
+        stdout_path,
+        stderr_path,
+        settled,
+        SAFE_OUTPUT_CACHE_MAX_BYTES as u64,
+    )
+}
+
+fn combined_safe_projection_limited(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    settled: bool,
+    scan_limit: u64,
+) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
+    let stdout_metadata = std::fs::metadata(stdout_path)
+        .map_err(|e| format!("cannot stat {}: {e}", stdout_path.display()))?;
+    let stderr_metadata = std::fs::metadata(stderr_path)
+        .map_err(|e| format!("cannot stat {}: {e}", stderr_path.display()))?;
+    if stdout_metadata.len() > scan_limit || stderr_metadata.len() > scan_limit {
+        return Err("Task output exceeds the bounded projection limit; inspect a bounded source artifact instead.".into());
+    }
+    let primary = file_generation(Some(&stdout_metadata));
+    let secondary = Some(file_generation(Some(&stderr_metadata)));
+    let key = SafeOutputCacheKey::Combined {
+        stdout: stdout_path.to_path_buf(),
+        stderr: stderr_path.to_path_buf(),
+    };
+    if let Some(projection) = cache_lookup(&key, primary, secondary, settled) {
+        return Ok(projection);
+    }
+    let stdout = read_safe_projection_limited(stdout_path, settled, scan_limit)?;
+    let stderr = read_safe_projection_limited(stderr_path, settled, scan_limit)?;
+    let projection = if stderr.text().is_empty() {
+        stdout
+    } else {
+        let text = if stdout.text().is_empty() {
+            format!("<stderr>\n{}\n</stderr>", stderr.text())
+        } else {
+            format!("{}\n<stderr>\n{}\n</stderr>", stdout.text(), stderr.text())
+        };
+        Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(text))
+    };
     safe_output_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .combined_projection(stdout_path, stderr_path, settled)
+        .insert(
+            key,
+            SafeOutputCacheEntry {
+                len: primary.0,
+                modified: primary.1,
+                secondary,
+                settled,
+                projection: projection.clone(),
+                last_used: 0,
+            },
+        );
+    Ok(projection)
 }
 
 impl SafeOutputCache {
@@ -1556,7 +2020,9 @@ impl SafeOutputCache {
         if size > SAFE_OUTPUT_CACHE_MAX_BYTES {
             return;
         }
-        while self.bytes.saturating_add(size) > SAFE_OUTPUT_CACHE_MAX_BYTES {
+        while self.bytes.saturating_add(size) > SAFE_OUTPUT_CACHE_MAX_BYTES
+            || self.entries.len() >= SAFE_OUTPUT_CACHE_MAX_ENTRIES
+        {
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -1574,143 +2040,18 @@ impl SafeOutputCache {
         self.bytes = self.bytes.saturating_add(size);
         self.entries.insert(key, entry);
     }
-
-    fn file_projection(
-        &mut self,
-        path: &Path,
-        settled: bool,
-    ) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
-        let metadata =
-            std::fs::metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-        let (len, modified) = (metadata.len(), metadata.modified().ok());
-        if len > SAFE_OUTPUT_CACHE_MAX_BYTES as u64 {
-            return Err("Task output exceeds the bounded projection limit; inspect a bounded source artifact instead.".into());
-        }
-        let key = SafeOutputCacheKey::File(path.to_path_buf());
-        if let Some(projection) = self.lookup(&key, len, modified, None, settled) {
-            return Ok(projection);
-        }
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)
-            .and_then(|file| {
-                file.take(SAFE_OUTPUT_CACHE_MAX_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)
-            })
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        if bytes.len() > SAFE_OUTPUT_CACHE_MAX_BYTES {
-            return Err("Task output exceeds the bounded projection limit; inspect a bounded source artifact instead.".into());
-        }
-        let raw = String::from_utf8_lossy(&bytes);
-        // Interrupted output can end in a credential fragment even after the
-        // process has stopped. Only proven complete streams publish that line.
-        let raw = if !settled && !raw.ends_with('\n') {
-            raw.rfind('\n').map(|i| &raw[..=i]).unwrap_or("")
-        } else {
-            raw.as_ref()
-        };
-        let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(raw).0;
-        let projection =
-            Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(safe));
-        self.insert(
-            key,
-            SafeOutputCacheEntry {
-                len,
-                modified,
-                secondary: None,
-                settled,
-                projection: projection.clone(),
-                last_used: 0,
-            },
-        );
-        Ok(projection)
-    }
-
-    fn combined_projection(
-        &mut self,
-        stdout_path: &Path,
-        stderr_path: &Path,
-        settled: bool,
-    ) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
-        let stdout_metadata = std::fs::metadata(stdout_path).ok();
-        let stderr_metadata = std::fs::metadata(stderr_path).ok();
-        let generation = |metadata: &Option<std::fs::Metadata>| {
-            (
-                metadata.as_ref().map_or(0, std::fs::Metadata::len),
-                metadata.as_ref().and_then(|m| m.modified().ok()),
-            )
-        };
-        let (len, modified) = generation(&stdout_metadata);
-        let secondary = Some(generation(&stderr_metadata));
-        let key = SafeOutputCacheKey::Combined {
-            stdout: stdout_path.to_path_buf(),
-            stderr: stderr_path.to_path_buf(),
-        };
-        if let Some(projection) = self.lookup(&key, len, modified, secondary, settled) {
-            return Ok(projection);
-        }
-        let stdout = stdout_metadata
-            .map(|_| self.file_projection(stdout_path, settled))
-            .transpose()?;
-        let stderr = stderr_metadata
-            .map(|_| self.file_projection(stderr_path, settled))
-            .transpose()?;
-        // A single stream can share its projection; do not copy a full capture
-        // just to serve another bounded window.
-        let projection = match (stdout, stderr.filter(|p| !p.text().is_empty())) {
-            (Some(stdout), None) => stdout,
-            (stdout, stderr) => {
-                let stdout = stdout.as_ref().map_or("", |p| p.text());
-                let text = stderr.map_or_else(
-                    || stdout.to_string(),
-                    |p| {
-                        if stdout.is_empty() {
-                            format!("<stderr>\n{}\n</stderr>", p.text())
-                        } else {
-                            format!("{stdout}\n<stderr>\n{}\n</stderr>", p.text())
-                        }
-                    },
-                );
-                Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(text))
-            }
-        };
-        self.insert(
-            key,
-            SafeOutputCacheEntry {
-                len,
-                modified,
-                secondary,
-                settled,
-                projection: projection.clone(),
-                last_used: 0,
-            },
-        );
-        Ok(projection)
-    }
 }
 
-fn combined_redacted_text(
-    stdout_path: &Path,
-    stderr_path: &Path,
-    settled: bool,
-) -> Result<String, String> {
-    Ok(combined_safe_projection(stdout_path, stderr_path, settled)?
-        .text()
-        .to_string())
-}
-
+#[cfg(test)]
 fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-fn read_combined_from_str(
-    stdout_path: &Path,
-    stderr_path: &Path,
+fn projection_window(
+    projection: &astra_text_utils::credential_redaction::SafeOutputProjection,
     offset: u64,
     max_bytes: usize,
-    settled: bool,
 ) -> Result<(String, u64, u64, u64), String> {
-    let projection = combined_safe_projection(stdout_path, stderr_path, settled)?;
     let total_bytes = projection.total_bytes() as u64;
     if offset > total_bytes {
         return Err(format!(
@@ -1721,6 +2062,7 @@ fn read_combined_from_str(
     Ok((output, end as u64, total as u64, lines as u64))
 }
 
+#[cfg(test)]
 fn search_combined_output(
     stdout_path: &Path,
     stderr_path: &Path,
@@ -1729,21 +2071,42 @@ fn search_combined_output(
     max_bytes: usize,
     settled: bool,
 ) -> Result<(String, u64, bool), String> {
+    let stdout = (file_len(stdout_path) > 0)
+        .then(|| read_safe_projection(stdout_path, settled))
+        .transpose()?;
+    let stderr = (file_len(stderr_path) > 0)
+        .then(|| read_safe_projection(stderr_path, settled))
+        .transpose()?;
+    search_projections(
+        stdout.as_deref(),
+        stderr.as_deref(),
+        pattern,
+        context_lines,
+        max_bytes,
+    )
+}
+
+fn search_projections(
+    stdout: Option<&astra_text_utils::credential_redaction::SafeOutputProjection>,
+    stderr: Option<&astra_text_utils::credential_redaction::SafeOutputProjection>,
+    pattern: &str,
+    context_lines: usize,
+    max_bytes: usize,
+) -> Result<(String, u64, bool), String> {
     let mut output = String::new();
     let mut matching_lines = 0_u64;
     let mut truncated = false;
 
-    for (label, path) in [("stdout", stdout_path), ("stderr", stderr_path)] {
-        if !path.exists() || file_len(path) == 0 {
+    for (label, projection) in [("stdout", stdout), ("stderr", stderr)] {
+        let Some(projection) = projection else {
             continue;
-        }
+        };
         search_output_source(
             label,
-            path,
+            projection.text(),
             pattern,
             context_lines,
             max_bytes,
-            settled,
             &mut output,
             &mut matching_lines,
             &mut truncated,
@@ -1756,11 +2119,10 @@ fn search_combined_output(
 #[allow(clippy::too_many_arguments)]
 fn search_output_source(
     label: &str,
-    path: &Path,
+    safe_text: &str,
     pattern: &str,
     context_lines: usize,
     max_bytes: usize,
-    settled: bool,
     output: &mut String,
     matching_lines: &mut u64,
     truncated: &mut bool,
@@ -1770,8 +2132,6 @@ fn search_output_source(
     // Search the owner-side redacted view, not raw output. In particular, a
     // PEM block or assignment can span lines and would leak if each line were
     // sanitized only after a raw window had already been selected.
-    let safe_text = read_safe_projection(path, settled)?;
-    let safe_text = safe_text.text();
     let mut reader = std::io::BufReader::new(safe_text.as_bytes());
     let mut bytes = Vec::new();
     let mut prior_lines = VecDeque::<(u64, String)>::with_capacity(context_lines);
@@ -1782,7 +2142,7 @@ fn search_output_source(
         bytes.clear();
         let read = reader
             .read_until(b'\n', &mut bytes)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            .map_err(|error| format!("cannot read {label} output: {error}"))?;
         if read == 0 {
             break;
         }
@@ -1965,7 +2325,7 @@ mod tests {
     /// keep the dir alive for the duration of the test — Drop reclaims
     /// it. The earlier shape used `TempDir::keep()` which leaked
     /// `/tmp/<dir>` once per test invocation.
-    fn test_handle_with_status(status: BgTaskStatus) -> (BackgroundTaskHandle, TempDir) {
+    pub(super) fn test_handle_with_status(status: BgTaskStatus) -> (BackgroundTaskHandle, TempDir) {
         let dir = crate::tests::test_temp_dir();
         let handle = BackgroundTaskHandle {
             id: "bg-1".into(),
@@ -1989,8 +2349,8 @@ mod tests {
             no_recent_output_reported: false,
             work_revision: 1,
             completion: None,
-            input: Arc::new(OnceLock::new()),
-            captured_bytes: None,
+            input: None,
+            capture: None,
             background: true,
         };
         (handle, dir)
@@ -2039,22 +2399,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_private_captures_keep_quota_ownership_without_deleting_foreign_files() {
+    async fn restored_output_references_never_grant_deletion_authority() {
         let root = tempfile::tempdir().unwrap();
         let mut registry = BackgroundTaskRegistry::new(root.path().to_path_buf());
-        let foreign_stdout = root.path().join("user.stdout");
-        let foreign_stderr = root.path().join("user.stderr");
-        std::fs::write(&foreign_stdout, "user data").unwrap();
-        std::fs::write(&foreign_stderr, "").unwrap();
-        assert!(
-            astra_tools::shell_output_capture::BashOutputCapture::retained_task_bytes(
-                root.path(),
-                &foreign_stdout,
-                &foreign_stderr
-            )
-            .is_none()
-        );
-        let mut first = None;
+        let mut saved = Vec::new();
         for index in 0..4 {
             let (capture, mut stdout, stderr) =
                 astra_tools::shell_output_capture::BashOutputCapture::start(root.path(), 4096)
@@ -2063,13 +2411,10 @@ mod tests {
             stdout.finish().await.unwrap();
             stderr.finish().await.unwrap();
             let receipt = capture.finish(true, true, true).await.unwrap().unwrap();
-            if first.is_none() {
-                first = Some(receipt.stdout.path.clone());
-            }
-            let id = format!("restored-{index}");
+            saved.push(receipt.stdout.path.clone());
             registry
                 .restore_shell_task_projection(BackgroundShellTaskProjection {
-                    id: id.clone(),
+                    id: format!("restored-{index}"),
                     status: "completed".into(),
                     title: "restored output".into(),
                     started_at_ms: index,
@@ -2080,26 +2425,12 @@ mod tests {
                     terminal_reason: None,
                 })
                 .unwrap();
-            assert_eq!(
-                registry
-                    .get(&id)
-                    .unwrap()
-                    .captured_bytes
-                    .as_ref()
-                    .unwrap()
-                    .load(Ordering::Acquire),
-                13
-            );
         }
         registry.with_state(TaskRegistryState::prune_retained_terminal_tasks);
-        assert!(
-            !first.unwrap().exists(),
-            "evicted executor capture is reclaimed after restore"
-        );
-        assert_eq!(
-            std::fs::read_to_string(foreign_stdout).unwrap(),
-            "user data"
-        );
+        drop(registry);
+        for path in saved {
+            assert_eq!(std::fs::read(path).unwrap(), b"saved output\n");
+        }
     }
 
     #[tokio::test]
@@ -2109,9 +2440,9 @@ mod tests {
         let task = registry
             .start_shell(
                 "panicking task",
-                (tmp.path().join("stdout"), tmp.path().join("stderr")),
-                Arc::new(AtomicU64::new(0)),
+                (tmp.path().join("stdout"), tmp.path().join("stderr"), None),
                 true,
+                false,
                 None,
                 |_, _| async { panic!("injected runner panic") },
             )
@@ -2151,9 +2482,9 @@ mod tests {
         let error = reg
             .start_shell(
                 "true",
-                (tmp.path().join("stdout"), tmp.path().join("stderr")),
-                Arc::new(AtomicU64::new(0)),
+                (tmp.path().join("stdout"), tmp.path().join("stderr"), None),
                 true,
+                false,
                 None,
                 |_, _| async { ToolExecutionOutcome::ok("unexpected launch".into()) },
             )
@@ -2323,7 +2654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn combined_tail_preserves_stderr_when_stdout_artifact_is_missing() {
+    async fn combined_output_reports_missing_stdout() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg
@@ -2334,15 +2665,14 @@ mod tests {
         let stdout_path = reg.get(&id).unwrap().stdout_path.clone();
         std::fs::remove_file(stdout_path).unwrap();
 
-        let expected = "<stderr>\nstderr-line\n\n</stderr>";
-        let (output, end, total, lines) = reg
+        let error = reg
             .get_combined_output_since_async(&id, 0, 4096)
             .await
-            .expect("observation preserves stderr when stdout is missing");
-        assert_eq!(output, expected);
-        assert_eq!(end, expected.len() as u64);
-        assert_eq!(total, expected.len() as u64);
-        assert_eq!(lines, expected.lines().count() as u64);
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BackgroundTaskError::OutputArtifactMissing { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2640,6 +2970,45 @@ mod tests {
         assert!(changed.text().contains("stderr changed"));
     }
 
+    #[test]
+    fn safe_output_cache_bounds_empty_entries() {
+        let mut cache = SafeOutputCache::default();
+        for index in 0..=SAFE_OUTPUT_CACHE_MAX_ENTRIES {
+            cache.insert(
+                SafeOutputCacheKey::File(PathBuf::from(format!("empty-{index}"))),
+                SafeOutputCacheEntry {
+                    len: 0,
+                    modified: None,
+                    secondary: None,
+                    settled: true,
+                    projection: Arc::new(
+                        astra_text_utils::credential_redaction::SafeOutputProjection::new(
+                            String::new(),
+                        ),
+                    ),
+                    last_used: 0,
+                },
+            );
+        }
+        assert_eq!(cache.entries.len(), SAFE_OUTPUT_CACHE_MAX_ENTRIES);
+        assert!(
+            !cache
+                .entries
+                .contains_key(&SafeOutputCacheKey::File("empty-0".into()))
+        );
+    }
+
+    #[test]
+    fn small_scan_limit_rejects_a_grown_file_before_reading_it() {
+        let dir = crate::tests::test_temp_dir();
+        let path = dir.path().join("growing");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(SMALL_OUTPUT_SCAN_BYTES + 1)
+            .unwrap();
+        assert!(read_safe_projection_limited(&path, false, SMALL_OUTPUT_SCAN_BYTES).is_err());
+    }
+
     #[tokio::test]
     async fn render_background_task_list_xml_reports_typed_rows() {
         let tmp = crate::tests::test_temp_dir();
@@ -2683,7 +3052,11 @@ mod tests {
             "completion must capture ended_at_ms"
         );
         assert!(xml.contains("ended_at_ms=\""), "{xml}");
-        assert!(xml.contains("output_ref=\"stdout:"), "{xml}");
+        assert!(xml.contains(&format!("output_ref=\"task: {id}\"")), "{xml}");
+        assert!(
+            !xml.contains(&handle.stdout_path.display().to_string()),
+            "{xml}"
+        );
         assert!(xml.contains("total_output_bytes=\"11\""), "{xml}");
         assert!(xml.contains("preview=\"last\""), "{xml}");
         assert!(
@@ -2722,7 +3095,19 @@ mod tests {
         let stderr = tmp.path().join("restored.stderr");
         std::fs::write(&stdout, "still building\n").unwrap();
         std::fs::write(&stderr, "").unwrap();
-        let mut reg = BackgroundTaskRegistry::new(tmp.path().join("registry"));
+        let active = Arc::new(ActiveWorkRegistry::default());
+        active.observe(
+            &WorkUnitObservation::new(
+                "bg-shell-restored",
+                "shell",
+                WorkUnitStatus::Running,
+                7,
+                WorkUnitObservationMode::Current,
+            )
+            .unwrap(),
+        );
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().join("registry"))
+            .with_active_work_registry(active.clone());
         reg.restore_shell_task_projection(BackgroundShellTaskProjection {
             id: "bg-shell-restored".into(),
             status: "running".into(),
@@ -2737,6 +3122,27 @@ mod tests {
         .expect("restore projection");
 
         assert_eq!(reg.running_count(), 0);
+        assert!(active.active_work_observations().is_empty());
+        assert_eq!(
+            active
+                .terminal_observation("bg-shell-restored", "shell")
+                .unwrap()
+                .status,
+            WorkUnitStatus::Unavailable
+        );
+        assert_eq!(
+            active
+                .terminal_observation("bg-shell-restored", "shell")
+                .unwrap()
+                .revision,
+            8
+        );
+        let context = reg.model_context("bg-shell-restored").unwrap();
+        assert_eq!(context["status"], "unavailable");
+        assert_eq!(context["execution"]["execution_fact"], "unknown");
+        assert_eq!(context["execution"]["side_effects_maybe"], true);
+        assert_eq!(context["execution"]["cleanup_authoritative"], false);
+        assert_eq!(context["execution"]["retryable"], false);
         assert_eq!(
             reg.kill("bg-shell-restored").unwrap_err(),
             BackgroundTaskError::StaleHandle {
@@ -2754,7 +3160,7 @@ mod tests {
         wait_for_output_preview(&mut reg, "bg-shell-restored").await;
         let xml = reg.render_background_task_list_xml();
         assert!(xml.contains("id=\"bg-shell-restored\""), "{xml}");
-        assert!(xml.contains("status=\"running\""), "{xml}");
+        assert!(xml.contains("status=\"unavailable\""), "{xml}");
         assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
         assert!(xml.contains("preview=\"still building\""), "{xml}");
 
@@ -2791,6 +3197,79 @@ mod tests {
         assert!(xml.contains("ended_at_ms=\"1766000005000\""), "{xml}");
         let exported = reg.export_shell_task_projections();
         assert_eq!(exported[0].ended_at_ms, Some(1_766_000_005_000));
+    }
+
+    #[test]
+    fn stale_restored_running_row_cannot_overwrite_known_terminal() {
+        let tmp = crate::tests::test_temp_dir();
+        let active = Arc::new(ActiveWorkRegistry::default());
+        active.observe(
+            &WorkUnitObservation::new(
+                "bg-shell-known",
+                "shell",
+                WorkUnitStatus::Completed,
+                7,
+                WorkUnitObservationMode::Current,
+            )
+            .unwrap(),
+        );
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf())
+            .with_active_work_registry(active.clone());
+        registry
+            .restore_shell_task_projection(BackgroundShellTaskProjection {
+                id: "bg-shell-known".into(),
+                status: "running".into(),
+                title: "old snapshot".into(),
+                started_at_ms: 1,
+                ended_at_ms: None,
+                stdout_path: "old.stdout".into(),
+                stderr_path: "old.stderr".into(),
+                exit_code: None,
+                terminal_reason: None,
+            })
+            .unwrap();
+        let known = active
+            .terminal_observation("bg-shell-known", "shell")
+            .unwrap();
+        assert_eq!(
+            (known.status, known.revision),
+            (WorkUnitStatus::Completed, 7)
+        );
+        assert_eq!(
+            registry.model_context("bg-shell-known").unwrap()["status"],
+            "completed"
+        );
+
+        active.observe(
+            &WorkUnitObservation::new(
+                "bg-shell-conflict",
+                "shell",
+                WorkUnitStatus::Completed,
+                7,
+                WorkUnitObservationMode::Current,
+            )
+            .unwrap(),
+        );
+        registry
+            .restore_shell_task_projection(BackgroundShellTaskProjection {
+                id: "bg-shell-conflict".into(),
+                status: "failed".into(),
+                title: "old snapshot".into(),
+                started_at_ms: 1,
+                ended_at_ms: Some(2),
+                stdout_path: "old.stdout".into(),
+                stderr_path: "old.stderr".into(),
+                exit_code: Some(42),
+                terminal_reason: Some("old failure".into()),
+            })
+            .unwrap();
+        let handle = registry.get("bg-shell-conflict").unwrap();
+        assert_eq!(handle.projected_status(), "completed");
+        assert_eq!(handle.exit_code, None);
+        assert_eq!(handle.terminal_reason, None);
+        assert_eq!(handle.ended_at_ms, None);
+        assert!(handle.stdout_path.as_os_str().is_empty());
+        assert!(handle.stderr_path.as_os_str().is_empty());
     }
 
     #[tokio::test]
@@ -3017,7 +3496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn combined_output_preserves_stdout_when_stderr_missing() {
+    async fn combined_output_reports_missing_stderr() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo stdout-only", "stdout fallback").await;
@@ -3026,14 +3505,14 @@ mod tests {
         let stderr_path = reg.get(&id).unwrap().stderr_path.clone();
         std::fs::remove_file(stderr_path).unwrap();
 
-        let (output, _, _, _) = reg
+        let error = reg
             .get_combined_output_since_async(&id, 0, 4096)
             .await
-            .unwrap();
-        assert!(
-            output.contains("stdout-only"),
-            "missing stderr must not hide stdout: {output}"
-        );
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BackgroundTaskError::OutputArtifactMissing { .. }
+        ));
     }
 
     #[tokio::test]
@@ -3530,6 +4009,226 @@ mod concurrency_tests {
     use super::*;
 
     #[tokio::test]
+    async fn restored_read_only_tasks_do_not_consume_capture_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = BackgroundTaskRegistry::new(temp.path().to_path_buf());
+        for index in
+            0..(MAX_CONCURRENT_TASKS + MAX_RETAINED_COMPLETED_TASKS + MAX_RETAINED_FAILED_TASKS)
+        {
+            registry
+                .restore_shell_task_projection(BackgroundShellTaskProjection {
+                    id: format!("restored-{index}"),
+                    status: "running".into(),
+                    title: "old".into(),
+                    started_at_ms: index as u64,
+                    ended_at_ms: None,
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    exit_code: None,
+                    terminal_reason: None,
+                })
+                .unwrap();
+        }
+        let mut task = registry
+            .start_shell(
+                "new",
+                (temp.path().join("stdout"), temp.path().join("stderr"), None),
+                false,
+                false,
+                None,
+                |_, _| async { ToolExecutionOutcome::ok("done".into()) },
+            )
+            .unwrap();
+        assert!(!task.wait().await.unwrap().is_error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_directory_interning_is_shared_and_respects_rebind() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("old");
+        std::fs::create_dir(&root).unwrap();
+        let mut registry = BackgroundTaskRegistry::new(root.clone());
+        let mut captures = Vec::new();
+        let mut joins = JoinSet::new();
+        for _ in 0..8 {
+            let (capture, stdout, stderr) =
+                astra_tools::shell_output_capture::BashOutputCapture::start(&root, 4096).unwrap();
+            let candidate = capture.task_capture_directory().unwrap();
+            drop(stdout);
+            drop(stderr);
+            captures.push(capture);
+            let (registry, root) = (registry.clone(), root.clone());
+            joins.spawn(async move { registry.intern_capture_directory(&root, candidate) });
+        }
+        let first = joins.join_next().await.unwrap().unwrap();
+        while let Some(result) = joins.join_next().await {
+            assert!(Arc::ptr_eq(&first, &result.unwrap()));
+        }
+        std::fs::rename(root.join("astra-bash-outputs"), root.join("old-captures")).unwrap();
+        let (replacement, stdout, stderr) =
+            astra_tools::shell_output_capture::BashOutputCapture::start(&root, 4096).unwrap();
+        drop(stdout);
+        drop(stderr);
+        let replacement_directory =
+            registry.intern_capture_directory(&root, replacement.task_capture_directory().unwrap());
+        assert!(!Arc::ptr_eq(&first, &replacement_directory));
+        captures.push(replacement);
+        let late = captures[0].task_capture_directory().unwrap();
+        registry.rebind_output_dir_for_new_tasks(temp.path().join("new"));
+        registry.intern_capture_directory(&root, late);
+        assert!(registry.with_state(|state| state.capture_directory.is_none()));
+    }
+
+    #[tokio::test]
+    async fn input_cancelled_while_starting_was_never_sent() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = BackgroundTaskRegistry::new(temp.path().to_path_buf());
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let mut task = registry
+            .start_shell(
+                "starting",
+                (temp.path().join("stdout"), temp.path().join("stderr"), None),
+                true,
+                true,
+                None,
+                |_, input| async move {
+                    let _input = input;
+                    let _ = wait.await;
+                    ToolExecutionOutcome::ok("done".into())
+                },
+            )
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let args = json!({"task_id": task.id, "input": "not sent"});
+        let input = registry.input(&args, Some(&cancel));
+        tokio::pin!(input);
+        assert!(futures_util::poll!(&mut input).is_pending());
+        cancel.cancel();
+        let result = input.await;
+        assert_eq!(
+            result.tool_result_fields.unwrap()["input_delivery"],
+            "not_sent"
+        );
+        release.send(()).unwrap();
+        task.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_output_does_not_wait_for_cold_read_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut handle, _fixture) = super::tests::test_handle_with_status(BgTaskStatus::Completed);
+        handle.stdout_path = temp.path().join("stdout");
+        handle.stderr_path = temp.path().join("stderr");
+        std::fs::write(&handle.stdout_path, "short output\n").unwrap();
+        std::fs::write(&handle.stderr_path, "").unwrap();
+        let id = handle.id.clone();
+        let mut registry = BackgroundTaskRegistry::new(temp.path().to_path_buf());
+        registry.with_state(|state| state.tasks.insert(id.clone(), handle));
+        registry
+            .get_combined_output_since_async(&id, 0, 1024)
+            .await
+            .unwrap();
+        let _all_cold_slots = LARGE_OUTPUT_READ_SLOTS.acquire_many(2).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.get_combined_output_since_async(&id, 0, 1024),
+        )
+        .await;
+        assert_eq!(
+            result
+                .expect("cached read must not queue behind cold scans")
+                .unwrap()
+                .0,
+            "short output\n"
+        );
+        let search = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.search_combined_output_async(&id, "short", 0, 1024),
+        )
+        .await
+        .expect("cached search must not queue behind cold scans")
+        .unwrap();
+        assert_eq!(search.1, 1);
+
+        let (mut cold, _fixture) = super::tests::test_handle_with_status(BgTaskStatus::Completed);
+        cold.id = "cold-small".into();
+        cold.stdout_path = temp.path().join("cold-stdout");
+        cold.stderr_path = temp.path().join("cold-stderr");
+        std::fs::write(&cold.stdout_path, "fresh\n").unwrap();
+        std::fs::write(&cold.stderr_path, "").unwrap();
+        registry.with_state(|state| state.tasks.insert(cold.id.clone(), cold));
+        let cold_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.get_combined_output_since_async("cold-small", 0, 1024),
+        )
+        .await
+        .expect("small cold output must not wait for large scans")
+        .unwrap();
+        assert_eq!(cold_result.0, "fresh\n");
+    }
+
+    #[tokio::test]
+    async fn output_removed_while_waiting_is_not_reported_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut handle, _fixture) = super::tests::test_handle_with_status(BgTaskStatus::Completed);
+        handle.stdout_path = temp.path().join("stdout");
+        handle.stderr_path = temp.path().join("stderr");
+        std::fs::File::create(&handle.stdout_path)
+            .unwrap()
+            .set_len(SMALL_OUTPUT_SCAN_BYTES + 1)
+            .unwrap();
+        std::fs::write(&handle.stderr_path, "").unwrap();
+        let (id, stdout, stderr) = (
+            handle.id.clone(),
+            handle.stdout_path.clone(),
+            handle.stderr_path.clone(),
+        );
+        let mut registry = BackgroundTaskRegistry::new(temp.path().to_path_buf());
+        registry.with_state(|state| state.tasks.insert(id.clone(), handle));
+        let permits = LARGE_OUTPUT_READ_SLOTS.acquire_many(2).await.unwrap();
+        let read = registry.get_combined_output_since_async(&id, 0, 1024);
+        tokio::pin!(read);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut read)
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(stdout).unwrap();
+        std::fs::remove_file(stderr).unwrap();
+        drop(permits);
+        assert!(
+            read.await.is_err(),
+            "missing output must not become a successful empty result"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonblocking_observation_deadline_does_not_stop_the_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut handle, _fixture) = super::tests::test_handle_with_status(BgTaskStatus::Running);
+        handle.stdout_path = temp.path().join("stdout");
+        handle.stderr_path = temp.path().join("stderr");
+        std::fs::write(&handle.stdout_path, "pending\n").unwrap();
+        std::fs::write(&handle.stderr_path, "").unwrap();
+        let id = handle.id.clone();
+        let registry = BackgroundTaskRegistry::new(temp.path().to_path_buf());
+        registry.with_state(|state| state.tasks.insert(id.clone(), handle));
+        let executor =
+            super::super::ToolExecutor::new(temp.path()).with_background_tasks(registry.clone());
+        let permits = SMALL_OUTPUT_READ_SLOTS.acquire_many(2).await.unwrap();
+        let result = executor
+            .execute_with_metadata("task_output", &json!({"task_id":id,"timeout_ms":25}))
+            .await;
+        assert!(result.is_error, "{result:?}");
+        let fields = result.tool_result_fields.unwrap();
+        assert_eq!(fields["stage"], "observation");
+        assert_eq!(fields["error_kind"], "tool_timeout");
+        assert_eq!(fields["side_effects_maybe"], false);
+        assert_eq!(registry.get(&id).unwrap().status(), BgTaskStatus::Running);
+        drop(permits);
+    }
+
+    #[tokio::test]
     async fn task_registry_thousand_waiters_share_terminal_events_without_polling() {
         let temp = tempfile::tempdir().unwrap();
         let mut registry = BackgroundTaskRegistry::new(temp.path().to_path_buf());
@@ -3540,8 +4239,8 @@ mod concurrency_tests {
             let task = registry
                 .start_shell(
                     "event fixture",
-                    (temp.path().join("stdout"), temp.path().join("stderr")),
-                    Arc::new(AtomicU64::new(0)),
+                    (temp.path().join("stdout"), temp.path().join("stderr"), None),
+                    false,
                     false,
                     None,
                     |_, _| async move {
@@ -3554,8 +4253,8 @@ mod concurrency_tests {
         }
         let overflow = registry.start_shell(
             "not launched",
-            (temp.path().join("stdout"), temp.path().join("stderr")),
-            Arc::new(AtomicU64::new(0)),
+            (temp.path().join("stdout"), temp.path().join("stderr"), None),
+            false,
             false,
             None,
             |_, _| async { panic!("capacity must reject before polling") },
@@ -3603,9 +4302,10 @@ mod concurrency_tests {
                     (
                         temp.path().join(format!("stdout-{index}")),
                         temp.path().join(format!("stderr-{index}")),
+                        None,
                     ),
-                    Arc::new(AtomicU64::new(0)),
                     true,
+                    false,
                     None,
                     |_, _| async { ToolExecutionOutcome::ok("done".into()) },
                 )

@@ -51,11 +51,7 @@ async fn stdin_ready(executor: &ToolExecutor, id: &str) {
                 !task.status().is_terminal(),
                 "task ended before stdin opened"
             );
-            if task
-                .input
-                .get()
-                .is_some_and(astra_sandbox::ProcessInput::is_open)
-            {
+            if task.stdin_available() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -78,11 +74,286 @@ async fn terminal(
     .unwrap()
 }
 
+async fn recorded(executor: &ToolExecutor, id: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if executor
+                .background_tasks
+                .get(id)
+                .is_some_and(|task| task.ended_at_ms.is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal completion recorded");
+}
+
+#[tokio::test]
+async fn published_command_output_survives_task_retention() {
+    let (workspace, executor) = fixture();
+    let result = call(&executor, "bash", json!({"command":"seq 1 20000"})).await;
+    assert!(!result.is_error, "{result:?}");
+    let path = result.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["stdout"]["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(std::path::Path::new(&path).starts_with(workspace.path().join("astra-bash-outputs")));
+    for _ in 0..8 {
+        let next = call(&executor, "bash", json!({"command":"printf ok"})).await;
+        assert!(!next.is_error, "{next:?}");
+    }
+    let bytes = std::fs::read(&path).expect("published workspace output must not be evicted");
+    assert!(bytes.starts_with(b"1\n2\n"));
+    assert!(bytes.ends_with(b"20000\n"));
+    let reread = call(
+        &executor,
+        "read_file",
+        json!({"path":path,"start_line":19999,"end_line":20000}),
+    )
+    .await;
+    assert!(
+        !reread.is_error && reread.output.contains("20000"),
+        "{reread:?}"
+    );
+    let id = launch(&executor, "printf background", false, 5.0).await;
+    terminal(&executor, &id).await;
+    let private = executor.background_tasks.get(&id).unwrap().stdout_path;
+    assert!(private.exists());
+    drop(executor);
+    assert!(
+        !private.exists(),
+        "session close must reclaim its private capture"
+    );
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "session close must retain published workspace output"
+    );
+}
+
+#[tokio::test]
+async fn restored_background_results_remain_readable_across_repeated_restore() {
+    let (workspace, executor) = fixture();
+    let large_id = launch(&executor, "seq 1 20000", false, 5.0).await;
+    let large = terminal(&executor, &large_id).await;
+    let published =
+        large.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["stdout"]["path"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let short_id = launch(&executor, "printf short", false, 5.0).await;
+    terminal(&executor, &short_id).await;
+    let mut registry = executor.background_tasks.clone();
+    let projections = registry.export_shell_task_projections();
+    drop(registry);
+    drop(executor);
+
+    let mut restored = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+        workspace.path().join("restored"),
+    );
+    restored
+        .restore_shell_task_projections(projections)
+        .unwrap();
+    assert!(
+        restored
+            .get(&large_id)
+            .unwrap()
+            .output_reference()
+            .contains(&published)
+    );
+    assert!(
+        restored
+            .get_combined_output_since_async(&large_id, 0, 64)
+            .await
+            .unwrap()
+            .0
+            .contains("1\n2\n")
+    );
+    assert!(
+        restored
+            .get_combined_output_since_async(&short_id, 0, 64)
+            .await
+            .is_err()
+    );
+    assert!(
+        restored
+            .search_combined_output_async(&short_id, "short", 0, 64)
+            .await
+            .is_err()
+    );
+    let projections = restored.export_shell_task_projections();
+    drop(restored);
+    let mut again = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+        workspace.path().join("again"),
+    );
+    again.restore_shell_task_projections(projections).unwrap();
+    assert!(
+        again
+            .get(&large_id)
+            .unwrap()
+            .output_reference()
+            .contains(&published)
+    );
+    assert!(
+        again
+            .get_combined_output_since_async(&large_id, 0, 64)
+            .await
+            .unwrap()
+            .0
+            .contains("1\n2\n")
+    );
+    drop(again);
+    assert!(std::path::Path::new(&published).exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn task_cleanup_uses_original_directory_after_path_replacement() {
+    use std::os::unix::fs::symlink;
+    for prune in [false, true] {
+        let (workspace, executor) = fixture();
+        let mut ids = Vec::new();
+        let mut first_paths = None;
+        for _ in 0..if prune { 3 } else { 1 } {
+            let id = launch(&executor, "printf task", false, 5.0).await;
+            terminal(&executor, &id).await;
+            if first_paths.is_none() {
+                let task = executor.background_tasks.get(&id).unwrap();
+                first_paths = Some((task.stdout_path, task.stderr_path));
+            }
+            ids.push(id);
+        }
+        let last = if prune {
+            Some(
+                launch(
+                    &executor,
+                    "while [ ! -f release ]; do sleep 0.01; done; printf task",
+                    false,
+                    5.0,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let (stdout, stderr) = first_paths.unwrap();
+        let original_dir = stdout.parent().unwrap().to_path_buf();
+        let moved = original_dir.with_file_name("moved-captures");
+        std::fs::rename(&original_dir, &moved).unwrap();
+        let victim = workspace.path().join("user-files");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join(stdout.file_name().unwrap()), b"user stdout").unwrap();
+        std::fs::write(victim.join(stderr.file_name().unwrap()), b"user stderr").unwrap();
+        symlink(&victim, &original_dir).unwrap();
+        let registry = executor.background_tasks.clone();
+        if let Some(last) = last {
+            std::fs::write(workspace.path().join("release"), b"").unwrap();
+            terminal(&executor, &last).await;
+            recorded(&executor, &last).await;
+            assert!(registry.get(&ids[0]).is_none());
+        }
+        drop(registry);
+        drop(executor);
+        assert_eq!(
+            std::fs::read(victim.join(stdout.file_name().unwrap())).unwrap(),
+            b"user stdout"
+        );
+        assert_eq!(
+            std::fs::read(victim.join(stderr.file_name().unwrap())).unwrap(),
+            b"user stderr"
+        );
+        assert!(!moved.join(stdout.file_name().unwrap()).exists());
+        assert!(!moved.join(stderr.file_name().unwrap()).exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn retained_tasks_share_directory_descriptor_and_survive_rebind() {
+    fn directory_fd_count(path: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| target == path)
+            .count()
+    }
+    let (workspace, executor) = fixture();
+    let mut paths = Vec::new();
+    for _ in 0..4 {
+        let id = launch(&executor, "printf task", false, 5.0).await;
+        terminal(&executor, &id).await;
+        paths.push(executor.background_tasks.get(&id).unwrap().stdout_path);
+    }
+    let old_directory = paths[0].parent().unwrap().to_path_buf();
+    assert_eq!(
+        directory_fd_count(&old_directory),
+        1,
+        "one pinned directory fd per namespace"
+    );
+    let mut registry = executor.background_tasks.clone();
+    registry.rebind_output_dir_for_new_tasks(workspace.path().join("new-captures"));
+    let id = launch(&executor, "printf new", false, 5.0).await;
+    terminal(&executor, &id).await;
+    paths.push(registry.get(&id).unwrap().stdout_path);
+    assert_ne!(
+        paths.last().unwrap().parent(),
+        Some(old_directory.as_path())
+    );
+    drop(registry);
+    drop(executor);
+    assert!(
+        paths.iter().all(|path| !path.exists()),
+        "both namespaces must be reclaimed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_eviction_retains_cleanup_owner_for_retry() {
+    let (_workspace, executor) = fixture();
+    let first = launch(&executor, "printf task", false, 5.0).await;
+    terminal(&executor, &first).await;
+    let stdout = executor.background_tasks.get(&first).unwrap().stdout_path;
+    let moved = stdout.with_extension("moved");
+    std::fs::rename(&stdout, &moved).unwrap();
+    std::fs::write(&stdout, b"user file").unwrap();
+    let mut last = String::new();
+    for _ in 0..3 {
+        let id = launch(&executor, "printf task", false, 5.0).await;
+        terminal(&executor, &id).await;
+        last = id;
+    }
+    recorded(&executor, &last).await;
+    let mut registry = executor.background_tasks.clone();
+    assert!(
+        registry.get(&first).is_some(),
+        "failed cleanup must retain its owner"
+    );
+    assert_eq!(std::fs::read(&stdout).unwrap(), b"user file");
+    std::fs::remove_file(&stdout).unwrap();
+    std::fs::rename(moved, &stdout).unwrap();
+    for _ in 0..10 {
+        registry.poll_completions();
+    }
+    assert!(
+        registry.get(&first).is_some(),
+        "idle UI polls must not retry cleanup"
+    );
+    registry.prune_retained_terminal_tasks();
+    assert!(
+        registry.get(&first).is_none(),
+        "cleanup should succeed on retry"
+    );
+    assert!(!stdout.exists());
+}
+
 #[tokio::test]
 async fn task_execution_headless_input_preserves_bytes_and_does_not_claim_completion() {
     let (_root, executor) = fixture();
     let id = launch(&executor, "printf 'pid:%s\\n' $$; IFS= read -r value; printf '<%s>\\n' \"$value\"; cat; printf 'finished\\n'", true, 5.0).await;
-    stdin_ready(&executor, &id).await;
     let input = call(
         &executor,
         "task_input",

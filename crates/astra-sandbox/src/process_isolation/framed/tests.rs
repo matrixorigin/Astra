@@ -11,6 +11,53 @@ fn limits() -> ProcessIoLimits {
 }
 
 #[tokio::test]
+async fn input_cancellation_distinguishes_before_and_after_submission() {
+    let (sender, mut receiver) = mpsc::channel(1);
+    let input = ProcessInput {
+        sender: sender.clone(),
+        cancel: CancellationToken::new(),
+        max_frame_bytes: 64,
+        framed: false,
+    };
+    sender
+        .send(InputWrite {
+            bytes: None,
+            written: None,
+        })
+        .await
+        .unwrap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(matches!(
+        input
+            .write_bytes(b"before", deadline, Some(&cancelled))
+            .await,
+        Err(ProcessInputError::NotSent(_))
+    ));
+    receiver.recv().await.unwrap();
+
+    let cancelled = CancellationToken::new();
+    let writer = {
+        let (input, cancelled) = (input.clone(), cancelled.clone());
+        tokio::spawn(async move {
+            input
+                .write_bytes(b"after", deadline, Some(&cancelled))
+                .await
+        })
+    };
+    // Receiving the queued frame proves submission happened; retain its ack
+    // sender so cancellation happens before an acknowledgement is possible.
+    let submitted = receiver.recv().await.unwrap();
+    cancelled.cancel();
+    assert!(matches!(
+        writer.await.unwrap(),
+        Err(ProcessInputError::Unconfirmed(_))
+    ));
+    drop(submitted);
+}
+
+#[tokio::test]
 async fn weak_ownership_and_cancelled_admission_never_spawn() {
     let directory = tempfile::tempdir().unwrap();
     let command = || {
@@ -118,7 +165,11 @@ async fn byte_stream_keeps_process_identity_and_acknowledges_targeted_input() {
     process
         .input()
         .unwrap()
-        .write_bytes(b"answer\n")
+        .write_bytes(
+            b"answer\n",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            None,
+        )
         .await
         .unwrap();
     let mut stdout = Vec::new();
@@ -166,10 +217,19 @@ async fn byte_stream_eof_and_deadline_are_physical_process_facts() {
     process
         .input()
         .unwrap()
-        .write_bytes(b"raw\0bytes\n")
+        .write_bytes(
+            b"raw\0bytes\n",
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            None,
+        )
         .await
         .unwrap();
-    process.input().unwrap().close().await.unwrap();
+    process
+        .input()
+        .unwrap()
+        .close(tokio::time::Instant::now() + Duration::from_secs(5), None)
+        .await
+        .unwrap();
     let mut output = Vec::new();
     while let Some(ProcessOutput::Stdout(bytes)) = process.recv_output().await {
         output.extend(bytes);
@@ -683,7 +743,16 @@ async fn raw_closed_stdin_does_not_cancel_still_useful_work() {
     assert!(
         matches!(first, ProcessOutput::Stdout(ref bytes) if bytes.starts_with(b"stdin-closed"))
     );
-    assert!(input.write_bytes(b"not delivered").await.is_err());
+    assert!(
+        input
+            .write_bytes(
+                b"not delivered",
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                None
+            )
+            .await
+            .is_err()
+    );
     let mut output = Vec::new();
     while let Some(part) = process.recv_output().await {
         if let ProcessOutput::Stdout(bytes) = part {

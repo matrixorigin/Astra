@@ -3527,7 +3527,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filter_preserves_headless_executor_controls() {
+    fn runtime_filter_requires_a_session_owner_for_shell_controls() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut schemas = vec![
             schema("bash"),
@@ -3542,6 +3542,29 @@ mod tests {
             &executor,
             &mut schemas,
             &mut report,
+        ));
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),
+            std::collections::HashSet::from(["bash".to_string()])
+        );
+        assert_eq!(report.visible_count, 1);
+
+        let mut schemas = vec![
+            schema("bash"),
+            schema("task_output"),
+            schema("task_list"),
+            schema("task_stop"),
+        ];
+        let mut report = surface_report_from_visible_schemas(&schemas, 4, 4);
+        let executor = crate::edge_tools::ToolExecutor::new(temp_dir.path()).with_background_tasks(
+            crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                temp_dir.path().join("tasks"),
+            ),
+        );
+        assert!(runtime_filter_turn_schemas_and_report(
+            &executor,
+            &mut schemas,
+            &mut report
         ));
         assert_eq!(
             astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),

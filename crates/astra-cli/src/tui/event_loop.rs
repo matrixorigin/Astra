@@ -6868,12 +6868,10 @@ async fn dispatch_bottom_pane_view_action(
 ) {
     match action {
         BottomPaneViewAction::BeginShellInput { task_id } => {
-            if background_registry.get(&task_id).is_some_and(|task| {
-                task.input
-                    .get()
-                    .is_some_and(astra_sandbox::ProcessInput::is_open)
-                    && !task.status().is_terminal()
-            }) {
+            if background_registry
+                .get(&task_id)
+                .is_some_and(|task| task.stdin_available())
+            {
                 bottom_pane.push_view(Box::new(
                     bottom_pane::task_input_view::TaskInputView::for_shell(
                         task_id,
@@ -19381,8 +19379,7 @@ mod tests {
         assert_eq!(row.kind.as_str(), "shell");
         assert_eq!(row.status.as_str(), "completed");
         let output_ref = row.output_ref.as_deref().unwrap_or_default();
-        assert!(output_ref.contains("stdout:"), "{output_ref:?}");
-        assert!(output_ref.contains("stderr:"), "{output_ref:?}");
+        assert_eq!(output_ref, format!("task: {id}"));
         let tail = row.output_tail.as_deref().unwrap_or_default();
         assert!(tail.contains("stdout-line"), "{tail:?}");
         assert!(tail.contains("stderr-line"), "{tail:?}");
@@ -19453,7 +19450,7 @@ mod tests {
             .find(|row| row.id == "bg-shell-restored")
             .expect("restored row");
 
-        assert_eq!(row.status.as_str(), "running");
+        assert_eq!(row.status.as_str(), "unavailable");
         assert_eq!(row.started_at_ms, Some(1));
         assert_eq!(row.ended_at_ms, None);
         assert_eq!(
@@ -19654,8 +19651,7 @@ mod tests {
         assert_eq!(snapshot.status.as_str(), "completed");
         assert!(snapshot.status.is_terminal(), "{snapshot:?}");
         assert!(snapshot.output.contains("done"), "{snapshot:?}");
-        assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
-        assert!(snapshot.output_ref.contains("stderr:"), "{snapshot:?}");
+        assert_eq!(snapshot.output_ref, format!("task: {id}"));
     }
 
     #[tokio::test]
@@ -19677,8 +19673,7 @@ mod tests {
         assert!(snapshot.status.is_terminal(), "{snapshot:?}");
         assert!(snapshot.output.contains("<stderr>"), "{snapshot:?}");
         assert!(snapshot.output.contains("stderr-line"), "{snapshot:?}");
-        assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
-        assert!(snapshot.output_ref.contains("stderr:"), "{snapshot:?}");
+        assert_eq!(snapshot.output_ref, format!("task: {id}"));
     }
 
     #[tokio::test]
@@ -19711,8 +19706,8 @@ mod tests {
             .await
             .expect("snapshot");
 
-        assert_eq!(snapshot.status.as_str(), "running");
-        assert!(!snapshot.status.is_terminal(), "{snapshot:?}");
+        assert_eq!(snapshot.status.as_str(), "unavailable");
+        assert!(snapshot.status.is_terminal(), "{snapshot:?}");
         assert_eq!(snapshot.output, "old output\n");
     }
 

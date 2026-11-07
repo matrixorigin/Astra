@@ -1,7 +1,7 @@
 //! One shell invocation, independent of the foreground presentation lifetime.
 use super::*;
 use astra_sandbox::{ProcessEnd, ProcessIoLimits, ProcessOutput};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 // Keep this presentation projection bounded and derived from canonical facts;
 // output truncation and capture failure must not erase execution acknowledgements.
@@ -38,13 +38,14 @@ pub(super) struct OwnedShellInvocation {
     pub(super) source_preimages: Option<astra_tools::source_preimage::PreparedSourcePreimages>,
     pub(super) workdir: astra_tools::shell_ops::PreparedBashWorkdir,
     pub(super) output_limit: usize,
+    pub(super) retain_for_task: bool,
 }
 
 impl OwnedShellInvocation {
     pub(super) async fn run(
         mut self,
         cancel: tokio_util::sync::CancellationToken,
-        input: Arc<OnceLock<astra_sandbox::ProcessInput>>,
+        input: Option<tokio::sync::watch::Sender<Option<astra_sandbox::ProcessInput>>>,
     ) -> super::super::ToolExecutionOutcome {
         self.config.cancel_token = Some(cancel.clone());
         if cancel.is_cancelled() {
@@ -91,8 +92,8 @@ impl OwnedShellInvocation {
                 return bash_preparation_rejection(format!("Cannot start command: {error}"));
             }
         };
-        if let Some(process_input) = process.input() {
-            let _ = input.set(process_input);
+        if let (Some(input), Some(process_input)) = (input, process.input()) {
+            input.send_replace(Some(process_input));
         }
         let preview_limit = self.output_limit.saturating_mul(2).max(16_384);
         let (mut stdout_preview, mut stderr_preview) = (Vec::new(), Vec::new());
@@ -161,7 +162,14 @@ impl OwnedShellInvocation {
                 preview.truncate(end);
             }
         }
-        let (mut outcome, ownership, execution_started) = match terminal {
+        // A text result cannot represent arbitrary bytes faithfully, even
+        // when the stream is small enough to fit inline.
+        let non_utf8_output = std::str::from_utf8(&stdout_preview).is_err()
+            || std::str::from_utf8(&stderr_preview).is_err();
+        let whitespace_only_output = (!stdout_preview.is_empty() || !stderr_preview.is_empty())
+            && String::from_utf8_lossy(&stdout_preview).trim().is_empty()
+            && String::from_utf8_lossy(&stderr_preview).trim().is_empty();
+        let (mut outcome, ownership, execution_started, rendered_truncated) = match terminal {
             Ok(terminal) => {
                 // The driver proves full pipe drain only on natural exit.
                 // Cancellation/timeout retains partial bytes without claiming
@@ -178,7 +186,7 @@ impl OwnedShellInvocation {
                 let exit_code = terminal.status.and_then(|status| status.code());
                 let cancelled = matches!(terminal.end, ProcessEnd::Cancelled);
                 let timed_out = matches!(terminal.end, ProcessEnd::TimedOut);
-                let mut outcome = if let (ProcessEnd::Exited, Some(status)) =
+                let (mut outcome, truncated) = if let (ProcessEnd::Exited, Some(status)) =
                     (&terminal.end, terminal.status)
                 {
                     self.renderer.render_bash_outcome(
@@ -274,7 +282,7 @@ impl OwnedShellInvocation {
                         fields.insert("side_effects_maybe".into(), json!(true));
                     }
                     fields.insert("retryable".into(), json!(false));
-                    outcome
+                    (outcome, false)
                 };
                 let fields = outcome.tool_result_fields.get_or_insert_default();
                 if cancelled {
@@ -290,7 +298,7 @@ impl OwnedShellInvocation {
                     "cleanup_authoritative".into(),
                     json!(ownership.is_some_and(|owner| owner.is_authoritative())),
                 );
-                (outcome, ownership, started)
+                (outcome, ownership, started, truncated)
             }
             Err(error) => (
                 super::super::ToolExecutionOutcome::error_with_evidence(
@@ -301,6 +309,7 @@ impl OwnedShellInvocation {
                 ),
                 None,
                 true,
+                false,
             ),
         };
         let unsettled = execution_started
@@ -325,49 +334,56 @@ impl OwnedShellInvocation {
         if capture_failed {
             mark_bash_capture_unavailable(&mut outcome);
         }
-        match self
-            .capture
-            .finish(streams_complete && !capture_failed, true, true)
-            .await
-        {
-            Ok(Some(receipt)) => {
-                if !receipt.complete {
-                    mark_bash_capture_unavailable(&mut outcome);
-                }
-                // Keep ordinary short command results small. The retained
-                // task and structured capture metadata still expose the same
-                // files; a verbose recovery header is useful only if output
-                // is incomplete or the full bytes do not fit inline.
-                if !receipt.complete
-                    || receipt.stdout.bytes.saturating_add(receipt.stderr.bytes)
-                        > self.output_limit as u64
-                {
-                    // Terminal facts are independent of disposable output:
-                    // truncation must not hide an exit or cleanup uncertainty.
+        let publish = !streams_complete
+            || capture_failed
+            || rendered_truncated
+            || non_utf8_output
+            || whitespace_only_output
+            || self.capture.captured_bytes()
+                > self
+                    .output_limit
+                    .min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS)
+                    as u64
+            || outcome.output.len() > astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS;
+        if publish {
+            match self
+                .capture
+                .publish_to_workspace(
+                    &self.config.effective_project_root,
+                    streams_complete && !capture_failed,
+                )
+                .await
+            {
+                Ok(receipt) => {
+                    if !receipt.complete {
+                        mark_bash_capture_unavailable(&mut outcome);
+                    }
                     outcome.output = receipt.present(
                         &outcome.output,
                         &terminal_facts(&outcome),
                         self.output_limit,
                     );
+                    outcome
+                        .tool_result_fields
+                        .get_or_insert_default()
+                        .extend(receipt.result_fields());
                 }
-                outcome
-                    .tool_result_fields
-                    .get_or_insert_default()
-                    .extend(receipt.result_fields());
+                Err(error) => {
+                    mark_bash_capture_unavailable(&mut outcome);
+                    outcome.tool_result_fields.get_or_insert_default().insert(
+                        "bash_output_capture".into(),
+                        json!({"complete":false,"failure":error}),
+                    );
+                    outcome.output = format!(
+                        "[bash output capture failed: {error}; no complete output file]\n{}\n\n{}",
+                        terminal_facts(&outcome),
+                        outcome.output,
+                    );
+                }
             }
-            Ok(None) => {}
-            Err(error) => {
-                mark_bash_capture_unavailable(&mut outcome);
-                outcome.tool_result_fields.get_or_insert_default().insert(
-                    "bash_output_capture".into(),
-                    json!({"complete":false,"failure":error}),
-                );
-                outcome.output = format!(
-                    "[bash output capture failed: {error}; no complete output file]\n{}\n\n{}",
-                    terminal_facts(&outcome),
-                    outcome.output,
-                );
-            }
+        }
+        if self.retain_for_task {
+            self.capture.retain_for_task();
         }
         outcome
     }
@@ -382,14 +398,15 @@ impl ToolExecutor {
         nested: bool,
     ) -> super::super::ToolExecutionOutcome {
         let mut cancel_on_drop = CancelShellOnDrop(Some(task.cancel.clone()));
-        let mut foreground = (!nested).then(|| self.foreground_wait_control.begin_wait());
+        let can_release = self.background_tasks_shared && !nested;
+        let mut foreground = can_release.then(|| self.foreground_wait_control.begin_wait());
         let wait_ms = args
             .get("yield_time_ms")
             .and_then(Value::as_u64)
             .unwrap_or(10_000)
             .min(30_000);
         let deadline =
-            (!nested).then(|| tokio::time::Instant::now() + Duration::from_millis(wait_ms));
+            can_release.then(|| tokio::time::Instant::now() + Duration::from_millis(wait_ms));
         let result = tokio::select! {
             biased;
             outcome = task.wait() => Some(outcome),

@@ -4,8 +4,8 @@
 use std::fs::OpenOptions;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
@@ -100,12 +100,81 @@ pub struct BashOutputCapture {
     stdout: PathBuf,
     stderr: PathBuf,
     state: CaptureState,
-    published: bool,
+    retained: bool,
     inline_limit: usize,
     stdout_reader: std::fs::File,
     stderr_reader: std::fs::File,
+    task_capture: Option<Arc<TaskCapture>>,
     #[cfg(unix)]
     directory_fd: std::fs::File,
+}
+
+/// Deletion authority for a live private task capture. Restored paths do not
+/// obtain this owner, and workspace receipts never share it.
+pub struct TaskCapture {
+    bytes: Arc<AtomicU64>,
+    removed: Mutex<bool>,
+    #[cfg(unix)]
+    directory: Arc<TaskCaptureDirectory>,
+    #[cfg(unix)]
+    files: [(PathBuf, (u64, u64)); 2],
+}
+
+/// One pinned directory can be shared by all tasks in the same namespace.
+pub struct TaskCaptureDirectory {
+    #[cfg(unix)]
+    directory: std::fs::File,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl TaskCaptureDirectory {
+    pub fn same_directory(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.identity == other.identity
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            true
+        }
+    }
+}
+
+impl TaskCapture {
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    pub fn remove_files(&self) -> std::io::Result<()> {
+        let mut removed = self
+            .removed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *removed {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            let mut first_error = None;
+            for (path, identity) in &self.files {
+                if let Err(error) = unlink_owned_at(&self.directory.directory, path, *identity)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+        // On platforms without a pinned-directory unlink, do not follow a
+        // mutable path when relinquishing private deletion authority.
+        *removed = true;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -126,12 +195,133 @@ pub struct CaptureReceipt {
 impl BashOutputCapture {
     /// The task registry observes these same files and counter from launch;
     /// changing foreground presentation never reopens or reseeds a stream.
-    pub fn task_output_files(&self) -> (PathBuf, PathBuf, Arc<AtomicU64>) {
-        (
-            self.stdout.clone(),
-            self.stderr.clone(),
-            self.state.used.clone(),
-        )
+    pub fn task_capture_directory(&self) -> Result<Arc<TaskCaptureDirectory>, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let directory = self
+                .directory_fd
+                .try_clone()
+                .map_err(|_| "Error: unable to retain Bash capture directory")?;
+            let metadata = directory
+                .metadata()
+                .map_err(|_| "Error: unable to inspect Bash capture directory")?;
+            Ok(Arc::new(TaskCaptureDirectory {
+                directory,
+                identity: (metadata.dev(), metadata.ino()),
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Arc::new(TaskCaptureDirectory {}))
+        }
+    }
+
+    pub fn task_output_files(
+        &mut self,
+        directory: Arc<TaskCaptureDirectory>,
+    ) -> Result<(PathBuf, PathBuf, Arc<TaskCapture>), String> {
+        if let Some(owner) = &self.task_capture {
+            return Ok((self.stdout.clone(), self.stderr.clone(), owner.clone()));
+        }
+        #[cfg(unix)]
+        let files = {
+            use std::os::unix::fs::MetadataExt;
+            let current = self
+                .directory_fd
+                .metadata()
+                .map_err(|_| "Error: unable to inspect Bash capture directory")?;
+            if (current.dev(), current.ino()) != directory.identity {
+                return Err("Error: Bash capture directory identity changed".into());
+            }
+            let stdout = self
+                .stdout_reader
+                .metadata()
+                .map_err(|_| "Error: unable to inspect Bash capture")?;
+            let stderr = self
+                .stderr_reader
+                .metadata()
+                .map_err(|_| "Error: unable to inspect Bash capture")?;
+            [
+                (self.stdout.clone(), (stdout.dev(), stdout.ino())),
+                (self.stderr.clone(), (stderr.dev(), stderr.ino())),
+            ]
+        };
+        #[cfg(not(unix))]
+        let _ = directory;
+        let owner = Arc::new(TaskCapture {
+            bytes: self.state.used.clone(),
+            removed: Mutex::new(false),
+            #[cfg(unix)]
+            directory,
+            #[cfg(unix)]
+            files,
+        });
+        self.task_capture = Some(owner.clone());
+        Ok((self.stdout.clone(), self.stderr.clone(), owner))
+    }
+
+    /// Keep private capture files for the task registry to observe and evict.
+    pub fn retain_for_task(mut self) {
+        self.retained = true;
+    }
+
+    pub fn captured_bytes(&self) -> u64 {
+        self.state.used.load(Ordering::Acquire)
+    }
+
+    /// Publish a user-visible copy under the selected workspace. The private
+    /// task capture remains separately owned by the registry.
+    pub async fn publish_to_workspace(
+        &self,
+        workspace: &Path,
+        streams_complete: bool,
+    ) -> Result<CaptureReceipt, String> {
+        let (destination, mut stdout, mut stderr) = Self::start(workspace, self.inline_limit)?;
+        for (source, writer) in [
+            (&self.stdout_reader, &mut stdout),
+            (&self.stderr_reader, &mut stderr),
+        ] {
+            let source = source
+                .try_clone()
+                .map_err(|_| "Error: unable to read Bash capture")?;
+            let mut source = File::from_std(source);
+            source
+                .seek(SeekFrom::Start(0))
+                .await
+                .map_err(|_| "Error: unable to read Bash capture")?;
+            let mut buffer = vec![0; 8192];
+            loop {
+                let count = source
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|_| "Error: unable to read Bash capture")?;
+                if count == 0 {
+                    break;
+                }
+                writer
+                    .write(&buffer[..count])
+                    .await
+                    .map_err(|_| "Error: unable to publish Bash output")?;
+            }
+        }
+        stdout
+            .finish()
+            .await
+            .map_err(|_| "Error: unable to publish Bash output")?;
+        stderr
+            .finish()
+            .await
+            .map_err(|_| "Error: unable to publish Bash output")?;
+        let mut receipt = destination
+            .finish(streams_complete, true, true)
+            .await?
+            .expect("published capture is retained");
+        if let Some(failure) = self.state.failure_reason() {
+            receipt.complete = false;
+            receipt.failure = Some(failure);
+        }
+        Ok(receipt)
     }
 
     pub fn start(
@@ -151,53 +341,6 @@ impl BashOutputCapture {
                 state,
             },
         ))
-    }
-
-    /// Recover quota ownership only for private files in Astra's capture
-    /// namespace. A saved path alone never authorizes deleting user files.
-    pub fn retained_task_bytes(output_root: &Path, stdout: &Path, stderr: &Path) -> Option<u64> {
-        let directory = stdout.parent()?;
-        if stderr.parent()? != directory || directory.file_name()? != CAPTURE_DIRECTORY_NAME {
-            return None;
-        }
-        let stem = stdout.file_stem()?.to_str()?;
-        if stem.len() != 16
-            || !stem.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || stdout.extension()? != "stdout"
-            || stderr.file_stem()? != stem
-            || stderr.extension()? != "stderr"
-        {
-            return None;
-        }
-        let root = directory.parent()?.canonicalize().ok()?;
-        let expected = output_root.canonicalize().ok()?;
-        if root != expected {
-            return None;
-        }
-        if !std::fs::symlink_metadata(directory)
-            .ok()?
-            .file_type()
-            .is_dir()
-        {
-            return None;
-        }
-        let mut bytes = 0_u64;
-        for path in [stdout, stderr] {
-            let metadata = std::fs::symlink_metadata(path).ok()?;
-            if !metadata.file_type().is_file() {
-                return None;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                // SAFETY: geteuid has no preconditions or borrowed resources.
-                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
-                    return None;
-                }
-            }
-            bytes = bytes.saturating_add(metadata.len());
-        }
-        Some(bytes)
     }
 
     /// Tap a blocking process runner without replacing its process owner.
@@ -272,10 +415,11 @@ impl BashOutputCapture {
                 stdout,
                 stderr,
                 state: state.clone(),
-                published: false,
+                retained: false,
                 inline_limit,
                 stdout_reader,
                 stderr_reader,
+                task_capture: None,
                 #[cfg(unix)]
                 directory_fd,
             },
@@ -314,13 +458,19 @@ impl BashOutputCapture {
             && !retain_for_preview
             && stdout.bytes.saturating_add(stderr.bytes) <= self.inline_limit as u64
         {
-            self.remove_file(&self.stdout)
-                .map_err(|_| "Error: unable to remove small Bash capture".to_string())?;
-            self.remove_file(&self.stderr)
-                .map_err(|_| "Error: unable to remove small Bash capture".to_string())?;
+            if let Some(owner) = &self.task_capture {
+                owner
+                    .remove_files()
+                    .map_err(|_| "Error: unable to remove small Bash capture".to_string())?;
+            } else {
+                self.remove_file(&self.stdout)
+                    .map_err(|_| "Error: unable to remove small Bash capture".to_string())?;
+                self.remove_file(&self.stderr)
+                    .map_err(|_| "Error: unable to remove small Bash capture".to_string())?;
+            }
             return Ok(None);
         }
-        self.published = true;
+        self.retained = true;
         Ok(Some(CaptureReceipt {
             stdout,
             stderr,
@@ -473,9 +623,13 @@ impl CaptureReceipt {
 
 impl Drop for BashOutputCapture {
     fn drop(&mut self) {
-        if !self.published {
-            let _ = self.remove_file(&self.stdout);
-            let _ = self.remove_file(&self.stderr);
+        if !self.retained {
+            if let Some(owner) = &self.task_capture {
+                let _ = owner.remove_files();
+            } else {
+                let _ = self.remove_file(&self.stdout);
+                let _ = self.remove_file(&self.stderr);
+            }
         }
     }
 }
@@ -540,6 +694,37 @@ fn unlink_at(directory: &std::fs::File, path: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn unlink_owned_at(
+    directory: &std::fs::File,
+    path: &Path,
+    identity: (u64, u64),
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = capture_file_name(path)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstatat initializes stat on success and never follows the leaf.
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    // dev_t differs across Unix targets, although both fields are u64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let actual = (stat.st_dev as u64, stat.st_ino as u64);
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || actual != identity {
+        return Err(std::io::Error::other("private Bash capture was replaced"));
+    }
+    unlink_at(directory, path)
 }
 
 #[cfg(not(unix))]
@@ -622,6 +807,43 @@ async fn stream_receipt(path: PathBuf, pinned: std::fs::File) -> Result<StreamRe
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_cleanup_never_unlinks_a_replaced_file() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut capture, mut stdout, stderr) =
+            BashOutputCapture::start(root.path(), 4096).unwrap();
+        let directory = capture.task_capture_directory().unwrap();
+        let (stdout_path, stderr_path, owner) = capture.task_output_files(directory).unwrap();
+        stdout.write(b"original").await.unwrap();
+        stdout.finish().await.unwrap();
+        stderr.finish().await.unwrap();
+        let moved = stdout_path.with_extension("moved");
+        std::fs::rename(&stdout_path, &moved).unwrap();
+        std::fs::write(&stdout_path, b"replacement").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let (owner, barrier) = (owner.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    owner.remove_files()
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            assert!(worker.join().unwrap().is_err());
+        }
+        assert_eq!(std::fs::read(&stdout_path).unwrap(), b"replacement");
+        assert!(!stderr_path.exists());
+        std::fs::remove_file(&stdout_path).unwrap();
+        std::fs::rename(moved, &stdout_path).unwrap();
+        owner.remove_files().unwrap();
+        drop(capture);
+        assert!(!stdout_path.exists());
+    }
 
     #[tokio::test]
     async fn byte_exact_capture_and_small_cleanup() {

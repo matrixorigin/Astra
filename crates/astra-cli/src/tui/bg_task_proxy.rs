@@ -461,28 +461,6 @@ pub(crate) fn format_background_task_stop_error_system_message(
     }
 }
 
-fn shell_output_status(
-    status: crate::edge_tools::background_tasks::BgTaskStatus,
-) -> crate::edge_tools::BgTaskOutputStatus {
-    match status {
-        crate::edge_tools::background_tasks::BgTaskStatus::Running => {
-            crate::edge_tools::BgTaskOutputStatus::Running
-        }
-        crate::edge_tools::background_tasks::BgTaskStatus::Stopping => {
-            crate::edge_tools::BgTaskOutputStatus::Stopping
-        }
-        crate::edge_tools::background_tasks::BgTaskStatus::Completed => {
-            crate::edge_tools::BgTaskOutputStatus::Completed
-        }
-        crate::edge_tools::background_tasks::BgTaskStatus::Failed => {
-            crate::edge_tools::BgTaskOutputStatus::Failed
-        }
-        crate::edge_tools::background_tasks::BgTaskStatus::Killed => {
-            crate::edge_tools::BgTaskOutputStatus::Cancelled
-        }
-    }
-}
-
 pub(crate) async fn background_task_output_snapshot(
     background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     task_id: &str,
@@ -495,13 +473,9 @@ pub(crate) async fn background_task_output_snapshot(
             .get(task_id)
             .ok_or_else(|| BackgroundTaskError::not_found(task_id))?;
         (
-            shell_output_status(handle.status()),
+            handle.work_unit_status(),
             handle.description.clone(),
-            format!(
-                "stdout: {} · stderr: {}",
-                handle.stdout_path.display(),
-                handle.stderr_path.display()
-            ),
+            handle.output_reference(),
         )
     };
     let (output, end_offset, total_bytes, total_lines) = background_registry
@@ -533,13 +507,9 @@ pub(crate) async fn background_task_output_search_snapshot(
             .get(task_id)
             .ok_or_else(|| BackgroundTaskError::not_found(task_id))?;
         (
-            shell_output_status(handle.status()),
+            handle.work_unit_status(),
             handle.description.clone(),
-            format!(
-                "stdout: {} · stderr: {}",
-                handle.stdout_path.display(),
-                handle.stderr_path.display()
-            ),
+            handle.output_reference(),
         )
     };
     let (output, matching_lines, truncated) = background_registry

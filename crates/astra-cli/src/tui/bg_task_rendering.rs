@@ -35,16 +35,8 @@ pub(crate) fn background_task_rows(
                 handle.output_tail().map(str::to_string),
                 handle.output_error().cloned(),
                 handle.observed_output_bytes(),
-                handle
-                    .input
-                    .get()
-                    .is_some_and(astra_sandbox::ProcessInput::is_open)
-                    && !handle.status().is_terminal(),
-                format!(
-                    "stdout: {} · stderr: {}",
-                    handle.stdout_path.display(),
-                    handle.stderr_path.display()
-                ),
+                handle.stdin_available(),
+                handle.output_reference(),
             )
         })
         .collect();

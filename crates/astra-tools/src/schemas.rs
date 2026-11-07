@@ -2017,8 +2017,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "command": {"type": "string", "description": BASH_COMMAND_GUIDANCE},
                         "description": {"type":"string","maxLength":512,"description":"Optional short task label for the user; execution still uses command exactly."},
-                        "yield_time_ms": {"type":"integer","minimum":0,"maximum":30000,"default":10000,"description":"How long to wait before returning the same running task's id. This is a presentation wait, not a process timeout. Use 0 for immediate background observation; task_output can wait again without restarting the command."},
-                        "stdin": {"type":"boolean","default":false,"description":"Keep an owned input pipe open for targeted task_input calls. Ordinary user messages still address the parent. Defaults to closed stdin; does not allocate a PTY."},
+                        "yield_time_ms": {"type":"integer","minimum":0,"maximum":30000,"default":10000,"description":"When a retained shell task owner is available, wait this long before returning the running task's id; 0 yields immediately. Otherwise wait for command completion. This is not a process timeout."},
+                        "stdin": {"type":"boolean","default":false,"description":"Keep an input pipe open for targeted task_input calls. Requires a retained shell task owner; otherwise the command is rejected before starting. Defaults to closed stdin; does not allocate a PTY."},
                         "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
@@ -2866,7 +2866,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 300000,
-                            "description": "Max ms to wait when block=true, and max registry response wait when block=false. Default 30000, max 300000."
+                            "description": "Max ms to wait for a task event when block=true, or for the observation response when block=false. A timed-out observation does not stop the task. Default 30000, max 300000."
                         }
                     },
                     "required": ["task_id"]

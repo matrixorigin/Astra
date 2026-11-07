@@ -4197,6 +4197,7 @@ impl ToolExecutor {
         }
         self.shell_output_renderer()
             .render_bash_outcome(command, out, descendants_terminated)
+            .0
     }
 
     #[cfg(unix)]
@@ -4564,6 +4565,20 @@ impl ToolExecutor {
                 .start_environment_background_task(args, invocation, cancel_token, workspace_guard)
                 .await;
         }
+        if (nested_in_run_script || !self.background_tasks_shared)
+            && args.get("stdin").and_then(Value::as_bool) == Some(true)
+        {
+            let mut outcome = super::ToolExecutionOutcome::error_with_evidence(
+                "Interactive stdin requires a session that can retain the task; no command was started.".into(),
+                astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolUnavailable,
+                ),
+            );
+            let fields = outcome.tool_result_fields.get_or_insert_default();
+            astra_tools::execution_outcome::insert_not_executed_fact(fields);
+            fields.insert("side_effects_maybe".into(), json!(false));
+            return outcome;
+        }
         let (command, timeout_secs, workdir) =
             match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
                 Ok(invocation) => invocation,
@@ -4630,11 +4645,21 @@ impl ToolExecutor {
         if let Err(error) = std::fs::create_dir_all(&output_root) {
             return bash_preparation_rejection(format!("Cannot prepare command output: {error}"));
         }
-        let (capture, stdout, stderr) = match BashOutputCapture::start(&output_root, output_limit) {
-            Ok(capture) => capture,
+        let (mut capture, stdout, stderr) =
+            match BashOutputCapture::start(&output_root, output_limit) {
+                Ok(capture) => capture,
+                Err(message) => return bash_preparation_rejection(message),
+            };
+        let directory = match capture.task_capture_directory() {
+            Ok(directory) => self
+                .background_tasks
+                .intern_capture_directory(&output_root, directory),
             Err(message) => return bash_preparation_rejection(message),
         };
-        let (stdout_path, stderr_path, captured_bytes) = capture.task_output_files();
+        let (stdout_path, stderr_path, task_capture) = match capture.task_output_files(directory) {
+            Ok(files) => files,
+            Err(message) => return bash_preparation_rejection(message),
+        };
         let Some(attribution) =
             astra_tools::workspace_observation::WorkspaceAttributionState::capture(
                 &self.effective_project_root(),
@@ -4658,16 +4683,18 @@ impl ToolExecutor {
             source_preimages,
             workdir: workdir.clone(),
             output_limit,
+            retain_for_task: self.background_tasks_shared,
         };
-        let background =
-            args.get("yield_time_ms").and_then(Value::as_u64) == Some(0) && !nested_in_run_script;
+        let background = self.background_tasks_shared
+            && !nested_in_run_script
+            && args.get("yield_time_ms").and_then(Value::as_u64) == Some(0);
         let task = match self.background_tasks.start_shell(
             args.get("description")
                 .and_then(Value::as_str)
                 .unwrap_or(&command),
-            (stdout_path, stderr_path),
-            captured_bytes,
+            (stdout_path, stderr_path, Some(task_capture)),
             background,
+            args.get("stdin").and_then(Value::as_bool).unwrap_or(false),
             cancel_token,
             move |cancel, input| owned.run(cancel, input),
         ) {
@@ -4834,7 +4861,7 @@ struct BashOutputRenderer {
 }
 
 impl BashOutputRenderer {
-    fn render_output(&self, command: &str, out: std::process::Output) -> String {
+    fn render_output(&self, command: &str, out: std::process::Output) -> (String, bool) {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let mut result = String::new();
@@ -4844,6 +4871,7 @@ impl BashOutputRenderer {
             result.push_str(warning);
             result.push('\n');
         }
+        let has_warning = !result.is_empty();
 
         let exit_code = out.status.code().unwrap_or(-1);
         let exit_semantics = exit_semantics::classify_exit(command, exit_code);
@@ -4874,19 +4902,31 @@ impl BashOutputRenderer {
             result.push_str(&stderr);
         }
 
-        if result.is_empty() || (result.trim().is_empty() && !result.contains("⚠️")) {
-            return if out.status.success() {
-                "(no output)".to_string()
-            } else {
-                empty_nonzero_exit_output(command, exit_code)
-            };
+        if (!stdout.is_empty() || !stderr.is_empty())
+            && stdout.trim().is_empty()
+            && stderr.trim().is_empty()
+            && !execution_failed
+            && !has_warning
+        {
+            return ("(output contains only whitespace)".to_string(), false);
+        }
+        if result.is_empty() {
+            return (
+                if out.status.success() {
+                    "(no output)".to_string()
+                } else {
+                    empty_nonzero_exit_output(command, exit_code)
+                },
+                false,
+            );
         }
 
         result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
 
         // Budget-pressure-aware truncation (was hardcoded 20KB)
         let limit = self.output_limit;
-        if result.len() > limit {
+        let truncated = result.len() > limit;
+        if truncated {
             result =
                 astra_text_utils::credential_redaction::truncate_redacted_output(result, limit);
         }
@@ -4917,12 +4957,15 @@ impl BashOutputRenderer {
             };
             let delta_summary = delta.to_summary();
             if delta_summary.is_empty() {
-                return parsed.to_enhanced_output(&result);
+                return (parsed.to_enhanced_output(&result), truncated);
             }
-            return format!(
-                "{}\n\n{}",
-                delta_summary,
-                parsed.to_enhanced_output(&result)
+            return (
+                format!(
+                    "{}\n\n{}",
+                    delta_summary,
+                    parsed.to_enhanced_output(&result)
+                ),
+                truncated,
             );
         }
 
@@ -4933,7 +4976,7 @@ impl BashOutputRenderer {
             }
         }
 
-        result
+        (result, truncated)
     }
 
     fn render_bash_outcome(
@@ -4941,7 +4984,7 @@ impl BashOutputRenderer {
         command: &str,
         out: std::process::Output,
         descendants_terminated: bool,
-    ) -> super::ToolExecutionOutcome {
+    ) -> (super::ToolExecutionOutcome, bool) {
         let exit_code = out.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -4952,7 +4995,7 @@ impl BashOutputRenderer {
             &stderr,
             Some(exit_code),
         );
-        let output = self.render_output(command, out);
+        let (output, truncated) = self.render_output(command, out);
         let mut outcome = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
             super::ToolExecutionOutcome::error(output)
         } else {
@@ -5005,7 +5048,7 @@ impl BashOutputRenderer {
                 serde_json::to_value(evidence).expect("command failure evidence must serialize"),
             );
         }
-        outcome
+        (outcome, truncated)
     }
 }
 

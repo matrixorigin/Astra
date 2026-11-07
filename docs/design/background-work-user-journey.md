@@ -35,25 +35,41 @@ settlement. Foreground and background waits share its task id, process, original
 deadline, cancellation endpoint, capture and workspace custody. Ctrl+B, an
 accepted parent instruction, or Bash's bounded `yield_time_ms` releases a
 foreground wait. No process/pipes are adopted by the TUI and no new invocation
-is launched. Ordinary composer input still addresses the parent.
+is launched. A surface without a retained shell task owner waits for the
+command to finish; independently owned agent/fanout controls can remain available. Ordinary
+composer input still addresses the parent. Capability introspection reports
+`shell_task_controls` separately from agent and fanout task controls.
 
 `task_output` observes or waits on producer events; it does not acquire the
 running command's workspace lease. A timed-out or cancelled observation leaves
 the command running. `task_input` writes only to a task launched with
 `stdin=true`; default stdin is closed. Input writes, closing stdin and stop
 requests are acknowledged separately from observed terminal execution. The task
-panel offers input only when the actual task supports it. Agent mailboxes and
-native collaborator steering keep their existing protocols and identities.
+panel offers input only when the task supports it. Input arriving during process
+startup waits for stdin within the same deadline. A timeout or cancellation
+before submission is reported as not sent; after submission, missing
+acknowledgement is unconfirmed and is not automatically retried. Agent mailboxes
+and native collaborator steering keep their existing protocols and identities.
 
 Capture and queues are bounded. Each executor admits at most 32 simultaneous
 shell tasks, with a 50 MiB capture limit per task and 256 MiB retained terminal
-capture budget; terminal handle retention is separately bounded. Restored private
-captures in the selected output namespace retain quota accounting; other saved
+capture budget; terminal handle retention is separately bounded. Restored
 references remain read-only and cannot authorize deleting user files. Slow consumers
 retain terminal notifications under bounded launch backpressure. The existing
-64 MiB safe-output cache coalesces cold generations, with at most two queued
-blocking projection workers; bounded reads do not allocate one full capture per
-observer. Output chunks
+safe-output cache has a 64 MiB text budget and a bounded entry count. Cached
+reads bypass cold scan admission; small and large cold scans have separate
+bounded capacity. Growing output
+still requires a new safe projection when its generation changes. Complete or
+partial output published under the workspace belongs to the workspace and is
+not evicted with private task captures. Private captures are removed when their
+session owner closes; a restored task can report a saved terminal status but not
+reconstruct its private output. A task whose previous owner was lost is
+unavailable to this executor; this does not prove its process stopped or its
+effects were rolled back. Published workspace files remain available.
+Private cleanup uses the original directory handle; tasks in one namespace
+share that handle. A failed eviction keeps its owner for retry, and a full
+retention budget applies backpressure rather than dropping cleanup ownership.
+Output chunks
 do not trigger model calls, and local waits perform no periodic SQL. A restored
 plain-shell projection can expose saved output but cannot recreate a lost
 process handle. Weak process-group cleanup never certifies authoritative

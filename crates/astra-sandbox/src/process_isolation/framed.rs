@@ -135,24 +135,40 @@ impl ProcessInput {
 
     /// Acknowledges bytes written to the pipe, not processing by the child.
     /// Cancellation or a lost acknowledgement never authorizes replay.
-    pub async fn write_bytes(&self, bytes: &[u8]) -> Result<(), ProcessInputError> {
+    pub async fn write_bytes(
+        &self,
+        bytes: &[u8],
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), ProcessInputError> {
         if self.framed || bytes.len() > self.max_frame_bytes {
             return Err(ProcessInputError::NotSent(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid process input",
             )));
         }
-        self.write(Some(bytes)).await
+        self.write(Some(bytes), deadline, cancel).await
     }
 
-    pub async fn close(&self) -> Result<(), ProcessInputError> {
-        self.write(None).await
+    pub async fn close(
+        &self,
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), ProcessInputError> {
+        self.write(None, deadline, cancel).await
     }
 
-    async fn write(&self, bytes: Option<&[u8]>) -> Result<(), ProcessInputError> {
+    async fn write(
+        &self,
+        bytes: Option<&[u8]>,
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), ProcessInputError> {
         let permit = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => return Err(ProcessInputError::NotSent(io::Error::new(io::ErrorKind::Interrupted, "process cancelled"))),
+            _ = async { match cancel { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => return Err(ProcessInputError::NotSent(io::Error::new(io::ErrorKind::Interrupted, "input cancelled"))),
+            _ = tokio::time::sleep_until(deadline) => return Err(ProcessInputError::NotSent(io::Error::new(io::ErrorKind::TimedOut, "input deadline elapsed before submission"))),
             permit = self.sender.reserve() => permit.map_err(|_| ProcessInputError::NotSent(io::Error::new(io::ErrorKind::BrokenPipe, "process input closed")))?,
         };
         let (written, acknowledgement) = oneshot::channel();
@@ -160,12 +176,14 @@ impl ProcessInput {
             bytes: bytes.map(<[u8]>::to_vec),
             written: Some(written),
         });
-        acknowledgement
-            .await
-            .map_err(|_| {
-                ProcessInputError::Unconfirmed(io::Error::other("write acknowledgement was lost"))
-            })?
-            .map_err(ProcessInputError::Unconfirmed)
+        tokio::select! {
+            biased;
+            result = acknowledgement => result
+                .map_err(|_| ProcessInputError::Unconfirmed(io::Error::other("write acknowledgement was lost")))?
+                .map_err(ProcessInputError::Unconfirmed),
+            _ = async { match cancel { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => Err(ProcessInputError::Unconfirmed(io::Error::new(io::ErrorKind::Interrupted, "input acknowledgement wait cancelled"))),
+            _ = tokio::time::sleep_until(deadline) => Err(ProcessInputError::Unconfirmed(io::Error::new(io::ErrorKind::TimedOut, "input acknowledgement deadline elapsed"))),
+        }
     }
 }
 
