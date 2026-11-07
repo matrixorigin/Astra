@@ -255,3 +255,134 @@ that prohibits tools must not create Work through automatic admission. Ordinary
 conversation-only acknowledgment needs no lookup or storage caveat. The compact
 resident memory surface supports remember/recall; select the full memory contract
 and use its invocation carrier for operations such as forget or update.
+
+## MOI request identity bridge
+
+With UC built-in memory explicitly enabled, MOI HMAC and MOI edge-token
+principals resolve their IAM subject through the configured `moi` external
+provider callback using action `resolve_memory_identity`. The pinned service
+credential is required. Its response binds `external_subject`, `issuer`,
+`uc_subject` and a required `memory_access` decision (`none`, `read_only` or
+`read_write`); the issuer must exactly equal the configured UC issuer. An
+identity-only response or unknown access value is an authority error, never an
+implicit read/write grant. `none` denies access without contacting UC or Memoria;
+`read_only` preserves recall but denies observation and other writes through the
+existing canonical policy. MOI must obtain this decision from its memory
+authorization policy; an active identity or permission to chat is insufficient.
+This change does not establish an all-or-nothing MOI product policy. Each
+operation resolves identity/access anew; an allowed grant also requires the
+existing live UC account-status check. The existing UC built-in policy,
+bounded owner derivation and owner-scoped
+Memoria transport apply; a provider request signature is not itself the grant.
+This is account-scoped personal memory and grants no workspace resource access.
+The same UC account uses the same personal-memory owner across MOI workspaces
+and native UC login; this bridge does not provide workspace-isolated memory.
+
+The bridge does not provision local password users, rename run/session owners,
+copy historical memories or alter native UC, local-account and scoped-key login
+paths. A missing mapping, unavailable callback, mismatched identity or revoked UC
+account never falls back to the deployment master under the request owner.
+The existing observer, explicit memory tools and session-end maintenance use
+this same resolver. Observer acceptance proves that an observation was accepted,
+not that memory was recalled or injected into a subsequent conversation.
+This change does not wire automatic prompt recall: the retained memory-prefetch
+helpers have no production caller. Verify cross-session recall with an explicit
+memory-tool invocation and verify account isolation separately.
+Close, memory-status and finalize accept request-bound HMAC authentication using
+exact method/path/body verification and the retained provider Session scope proof,
+just like conversation admission. The caller must sign a fresh request for each
+lifecycle operation; pre-upgrade HMAC Sessions without retained scope evidence
+are rejected rather than assigned a guessed workspace. Edge tokens retain their
+own owner namespace and cannot control an HMAC-created Session, even with the same IAM subject. The memory proxy
+retains its existing user-token authentication contract. The MOI caller must
+invoke close/finalize to trigger session-end maintenance.
+The MOI callback must be deployed before enabling this path in Astra.
+Compare its effective issuer with Astra's configured issuer byte for byte before
+deployment, including any trailing slash. Each admitted authority resolution
+performs one MOI identity request and one UC account-status request. Recovery
+checks admission before loading and resolves fresh dispatch authority afterward:
+an allowed attempt normally makes two MOI and two UC requests. Fetching an
+uncached UC service token can add another request.
+The identity callback has a two-second request deadline, including response-body
+reads, and an 8 KiB response limit for both successful and error responses,
+including chunked bodies. External-provider clients are reused per configured
+endpoint, preserving target-specific proxy and no-redirect policies; service
+credentials are attached per request, and identity/access decisions are not
+cached. Other provider actions retain their 30-second deadline with an 8 MiB
+response limit.
+
+The observer has a ten-second budget for the entire fresh authority lookup,
+including MOI and UC dependencies, and a separate 30-second backend deadline.
+Observation is optional background work and never writes a job, serializes a
+second transcript, or adds a failure dependency to canonical chat settlement.
+When configured, the managed recovery owner traverses physical intervals of 64
+canonical Session identities. `session_context_heads.catalog_seq` is an immutable
+auto-increment primary key; the existing owner-scoped logical identity remains
+unique. Both interval bounds reach storage, including on idle pages. Allocation
+metadata bounds each sweep without aggregating retained heads; gaps and late
+commits are revisited on later sweeps. Only returned keys enter an eligibility query;
+each participating table has direct full-key predicates. Idle pages read no
+transcripts. Eligible Sessions are rechecked and their committed head is captured
+without payloads. Current write admission is checked before loading any transcript;
+denial records `access_disabled` and checkpoints the captured turn without loading
+or encoding payloads. Admission errors retain retryable work. A positive admission
+is not a cached write grant. The canonical coordinator then materializes that captured head
+using direct key, compaction-generation and conversation-cursor predicates,
+avoiding a full scan of a live Session's retained generation history. These are
+separate reads over immutable nodes: a concurrent append/Replace cannot change the captured
+transcript or its checkpoint watermark. Content/fork validation stays with the
+canonical coordinator. Direct storage predicates also protect normal
+restore/resume/history materialization from unrelated manifest scans.
+Thirty-two fixed sweeper leases distribute independent windows across replicas.
+Each process runs eight concurrent window workers and admits at most eight
+transcript/HTTP attempts. Available capacity is refilled without a per-attempt
+timer; completed sweeps and errors wait two seconds. A slow Session occupies
+one slot rather than the deployment's only observation slot. Leases have a
+60-second TTL and are renewed during work, then released when a window finishes.
+Candidates are rechecked after paging, so cached keys are not authorization,
+head, or retry-state snapshots. Cancellation or a checkpoint error retains the
+numeric window; restart scans from the beginning. The ordinary non-fork
+attempt adds metadata-only discovery, early admission, selective canonical materialization,
+fresh dispatch authority, an atomic progress checkpoint and a receipt read, without per-Session
+claim transactions. The extra selective read replaces the joined payload scan;
+SQL count alone does not measure storage work.
+Catalog traversal and shard acquisition/release are separate from attempt costs.
+An owned nonempty window uses three lease-acquisition statements, a key-page
+read, an eligibility read and a lease release; each sweep also reads allocation
+metadata. Long batches renew leases with the existing three-statement protocol.
+Physical intervals bound each page's storage input; a complete sweep is still
+linear in allocated identities, including allocation gaps. This is not a fixed
+recall-latency guarantee. Eligibility and payload reads are limited to the
+page/selected Session, including when all retained Sessions are already observed.
+Unconfigured deployments create no observation owner or observation journal.
+
+This physical-key change requires core schema contract `2026-11-07-v122`.
+Bootstrap rejects older contracts and does not migrate an existing database.
+Deployment therefore requires a separately reviewed fresh-schema cutover or
+migration plan; replacing an image against a v121 database is unsupported.
+
+Only a completed-turn watermark, revision, exact write receipt and independent exponential retry
+clock (5–960 seconds) are stored in the existing session-memory journal.
+Checkpoint writes preserve extraction/governance fields and reject stale lease
+owners or revisions. SQL execution success is not acknowledgement: the same
+connection must read back this attempt's receipt. Missing, superseded or uncertain
+receipts retain the window for rediscovery. A new terminal turn cannot reset the retry clock. After a
+failure or restart, retry coalesces to the newest canonical context and resolves
+current authority again. Revocation skips the write and advances the watermark;
+no retry reuses credentials. Delivery is at least once, not exactly once: a
+crash after backend success and before checkpoint may repeat observation.
+Session deletion removes the journal through existing lifecycle cleanup and
+excludes the Session from discovery. Ephemeral deployments have no durable
+recovery: a process-owned dispatcher admits four requests without waiting for
+backend completion or retaining loop/workspace state. It reserves capacity before
+copying transcripts, records overload explicitly, and cancels owned work on
+shutdown. This is best-effort delivery, with no queue or crash replay guarantee.
+MOI built-in read-only grants use product-neutral remediation, while scoped
+Memoria logins retain their Connected apps instructions. Authority failures expose
+only stable allowlisted categories (service credentials, timeout, transport,
+unavailable, invalid response, upstream rejection), never provider body text.
+The callback's explicit identity denial is HTTP 403 with error code
+`moi_memory_identity_denied`; the resolver returns `Denied` for that exact pair.
+Service-authentication failures, unclassified 403 responses, dependency failures
+and malformed payloads remain authority errors. A denied account must not be
+reported as a backend outage, nor may an outage be converted into consent denial.

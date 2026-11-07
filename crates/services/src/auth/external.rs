@@ -1,7 +1,13 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use astra_core::{ErrorResponse, error_response_coded};
+
+const EXTERNAL_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
+const EXTERNAL_PROVIDER_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+const MEMORY_IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
+const MEMORY_IDENTITY_RESPONSE_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ExternalAuthProviderConfig {
@@ -448,6 +454,20 @@ pub struct ExternalRuntimeScopeResponse {
 
 #[async_trait]
 pub trait ExternalProviderClient: Send + Sync {
+    /// Resolve identity and an explicit personal-memory access decision. An
+    /// identity mapping or chat authorization alone is never a memory grant.
+    async fn resolve_memory_identity(
+        &self,
+        _provider: &ExternalAuthProviderConfig,
+        _external_subject: &str,
+    ) -> Result<ExternalMemoryIdentity, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "External provider memory authority is not configured",
+            "external_provider_memory_unavailable",
+        ))
+    }
+
     async fn authorize_request(
         &self,
         provider: &ExternalAuthProviderConfig,
@@ -552,15 +572,44 @@ pub async fn check_edge_token_revocation(
     }
 }
 
-// No shared client: the proxy decision is per-target (loopback bypasses the
-// env proxy, remote honours it), so the client is built per external-provider
-// endpoint via astra_core::net::client_builder_for_target in post_action.
-#[derive(Clone)]
-pub struct HttpExternalProviderClient;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalMemoryIdentity {
+    pub external_subject: String,
+    pub issuer: String,
+    pub uc_subject: String,
+    // Required: old identity-only responses must not silently grant read/write.
+    pub memory_access: super::memoria::MemoryAccess,
+}
+
+// Share pools only for the same configured endpoint. In particular, building a
+// loopback client must not change proxy policy for a remote provider. Credentials
+// remain request-local and authority decisions are never cached.
+#[derive(Clone, Default)]
+pub struct HttpExternalProviderClient {
+    clients: Arc<Mutex<HashMap<String, reqwest::Client>>>,
+}
 
 impl HttpExternalProviderClient {
     pub fn shared() -> Arc<dyn ExternalProviderClient> {
-        Arc::new(Self)
+        Arc::new(Self::default())
+    }
+
+    fn client_for_endpoint(&self, endpoint: &str) -> Result<reqwest::Client, String> {
+        let mut clients = self
+            .clients
+            .lock()
+            .map_err(|_| "provider client unavailable")?;
+        if let Some(client) = clients.get(endpoint) {
+            return Ok(client.clone());
+        }
+        let client = astra_core::net::client_builder_for_target(endpoint)
+            .timeout(EXTERNAL_PROVIDER_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "provider client unavailable")?;
+        clients.insert(endpoint.to_owned(), client.clone());
+        Ok(client)
     }
 
     async fn post_action<T, R>(
@@ -573,20 +622,35 @@ impl HttpExternalProviderClient {
         T: Serialize + Send,
         R: for<'de> Deserialize<'de>,
     {
+        self.post_action_with_limits(
+            provider,
+            action,
+            payload,
+            EXTERNAL_PROVIDER_TIMEOUT,
+            EXTERNAL_PROVIDER_RESPONSE_LIMIT,
+        )
+        .await
+    }
+
+    async fn post_action_with_limits<T, R>(
+        &self,
+        provider: &ExternalAuthProviderConfig,
+        action: &'static str,
+        payload: T,
+        timeout: Duration,
+        response_limit: usize,
+    ) -> Result<R, (StatusCode, Json<ErrorResponse>)>
+    where
+        T: Serialize + Send,
+        R: for<'de> Deserialize<'de>,
+    {
         let request = ExternalProviderActionRequest {
             action,
             provider_id: &provider.id,
             payload,
         };
-        // Build a target-aware client per endpoint: loopback callbacks bypass
-        // the env proxy, remote catalog/runtime-context endpoints honour it.
-        // (A shared client cannot make this per-target decision.)
-        let client = astra_core::net::client_builder_for_target(&provider.external_auth_endpoint)
-            .timeout(Duration::from_secs(30))
-            // Never let a 307/308 forward this POST (provider payload + Bearer
-            // auth key) to a different origin.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
+        let client = self
+            .client_for_endpoint(&provider.external_auth_endpoint)
             .map_err(|error| {
                 error_response_coded(
                     StatusCode::BAD_GATEWAY,
@@ -597,49 +661,86 @@ impl HttpExternalProviderClient {
                     "external_provider_request_failed",
                 )
             })?;
-        let mut http_request = client.post(&provider.external_auth_endpoint).json(&request);
+        let mut http_request = client
+            .post(&provider.external_auth_endpoint)
+            .timeout(timeout)
+            .json(&request);
         if !provider.auth_key.is_empty() {
             http_request = http_request.bearer_auth(&provider.auth_key);
         }
-        let response = http_request.send().await.map_err(|error| {
+        let mut response = http_request.send().await.map_err(|error| {
             error_response_coded(
                 StatusCode::BAD_GATEWAY,
                 format!(
                     "external provider '{}' action '{}' request failed: {error}",
                     provider.id, action
                 ),
-                "external_provider_request_failed",
+                if action == "resolve_memory_identity" && error.is_timeout() {
+                    "external_provider_request_timeout"
+                } else {
+                    "external_provider_request_failed"
+                },
             )
         })?;
         let status = response.status();
-        let body = response.text().await.map_err(|error| {
+        let invalid_body = || {
             error_response_coded(
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "external provider '{}' action '{}' response read failed: {error}",
+                    "external provider '{}' action '{}' response invalid or exceeds limit",
                     provider.id, action
                 ),
                 "external_provider_response_invalid",
             )
-        })?;
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > response_limit as u64)
+        {
+            return Err(invalid_body());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            if action == "resolve_memory_identity" && error.is_timeout() {
+                error_response_coded(
+                    StatusCode::BAD_GATEWAY,
+                    "external provider response timed out",
+                    "external_provider_request_timeout",
+                )
+            } else {
+                invalid_body()
+            }
+        })? {
+            if chunk.len() > response_limit.saturating_sub(body.len()) {
+                return Err(invalid_body());
+            }
+            body.extend_from_slice(&chunk);
+        }
         if !status.is_success() {
-            return Err(map_provider_error_status(
+            let mut error = map_provider_error_status(
                 &provider.id,
                 action,
                 status,
-                &body,
-            ));
+                &String::from_utf8_lossy(&body),
+            );
+            if action == "resolve_memory_identity" {
+                // The memory authority layer classifies safe diagnostics from
+                // the actual upstream status, not the generic gateway mapping.
+                error.0 = status;
+            }
+            return Err(error);
         }
-        let envelope = serde_json::from_str::<ProviderSuccessEnvelope>(&body).map_err(|error| {
-            error_response_coded(
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "external provider '{}' action '{}' response envelope is invalid: {error}",
-                    provider.id, action
-                ),
-                "external_provider_response_invalid",
-            )
-        })?;
+        let envelope =
+            serde_json::from_slice::<ProviderSuccessEnvelope>(&body).map_err(|error| {
+                error_response_coded(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "external provider '{}' action '{}' response envelope is invalid: {error}",
+                        provider.id, action
+                    ),
+                    "external_provider_response_invalid",
+                )
+            })?;
         if envelope.code != 0 {
             return Err(error_response_coded(
                 StatusCode::BAD_GATEWAY,
@@ -669,6 +770,21 @@ impl HttpExternalProviderClient {
 
 #[async_trait]
 impl ExternalProviderClient for HttpExternalProviderClient {
+    async fn resolve_memory_identity(
+        &self,
+        provider: &ExternalAuthProviderConfig,
+        external_subject: &str,
+    ) -> Result<ExternalMemoryIdentity, (StatusCode, Json<ErrorResponse>)> {
+        self.post_action_with_limits(
+            provider,
+            "resolve_memory_identity",
+            serde_json::json!({"external_subject": external_subject}),
+            MEMORY_IDENTITY_TIMEOUT,
+            MEMORY_IDENTITY_RESPONSE_LIMIT,
+        )
+        .await
+    }
+
     async fn authorize_request(
         &self,
         provider: &ExternalAuthProviderConfig,
@@ -1050,6 +1166,172 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn memory_identity_reuses_endpoint_pool_without_caching_credentials_or_grants() {
+        use axum::extract::ConnectInfo;
+        use std::net::SocketAddr;
+
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let captured = peers.clone();
+        let app = Router::new().route(
+            "/identity",
+            post(
+                move |ConnectInfo(peer): ConnectInfo<SocketAddr>,
+                      headers: axum::http::HeaderMap,
+                      Json(body): Json<Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        let mut peers = captured.lock().await;
+                        let access = if peers.is_empty() {
+                            "read_write"
+                        } else {
+                            "read_only"
+                        };
+                        let expected_key = if peers.is_empty() {
+                            "Bearer first-test-key"
+                        } else {
+                            "Bearer second-test-key"
+                        };
+                        assert_eq!(headers["authorization"], expected_key);
+                        peers.push(peer);
+                        Json(json!({"code":0,"data":{
+                            "external_subject":body["external_subject"],
+                            "issuer":"https://uc.example.test/realm",
+                            "uc_subject":"uc-1", "memory_access":access
+                        }}))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut provider = provider(format!(
+            "http://{}/identity",
+            listener.local_addr().unwrap()
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = HttpExternalProviderClient::default();
+        for (key, subject, expected) in [
+            (
+                "first-test-key",
+                "iam-1",
+                super::super::memoria::MemoryAccess::ReadWrite,
+            ),
+            (
+                "second-test-key",
+                "iam-2",
+                super::super::memoria::MemoryAccess::ReadOnly,
+            ),
+        ] {
+            provider.auth_key = key.into();
+            let identity = client
+                .resolve_memory_identity(&provider, subject)
+                .await
+                .unwrap();
+            assert_eq!(identity.external_subject, subject);
+            assert_eq!(identity.memory_access, expected);
+        }
+        let peers = peers.lock().await;
+        assert_eq!(peers.len(), 2);
+        assert_eq!(
+            peers[0], peers[1],
+            "sequential operations must reuse the HTTP connection"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn memory_identity_bounds_success_error_and_chunked_response_bodies() {
+        use axum::{body::Body, response::IntoResponse};
+
+        let app = Router::new().route(
+            "/{kind}",
+            post(
+                |axum::extract::Path(kind): axum::extract::Path<String>| async move {
+                    let bytes = vec![b'x'; MEMORY_IDENTITY_RESPONSE_LIMIT + 1];
+                    match kind.as_str() {
+                        "chunked" => Body::from_stream(futures_util::stream::iter([
+                            Ok::<_, std::io::Error>(bytes[..4096].to_vec()),
+                            Ok(bytes[4096..].to_vec()),
+                        ]))
+                        .into_response(),
+                        "error" => (StatusCode::FORBIDDEN, bytes).into_response(),
+                        _ => bytes.into_response(),
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpExternalProviderClient::default();
+        for kind in ["success", "error", "chunked"] {
+            let error = client
+                .resolve_memory_identity(&provider(format!("{origin}/{kind}")), "iam-1")
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                error.1.error_code.as_deref(),
+                Some("external_provider_response_invalid")
+            );
+            assert!(!error.1.detail.contains(&origin));
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_slow_memory_identity_callbacks_time_out_without_granting_access() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let captured = started.clone();
+        let app = Router::new().route(
+            "/identity",
+            post(move || {
+                captured.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<StatusCode>()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = provider(format!(
+            "http://{}/identity",
+            listener.local_addr().unwrap()
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = HttpExternalProviderClient::default();
+        let calls = (0..4).map(|_| client.resolve_memory_identity(&provider, "iam-1"));
+        let results = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(calls),
+        )
+        .await
+        .expect("slow identity callbacks must have bounded lifetimes");
+        assert_eq!(started.load(Ordering::SeqCst), 4);
+        for result in results {
+            let error = result
+                .err()
+                .expect("timeouts must not become grants or consent denials");
+            assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                error.1.error_code.as_deref(),
+                Some("external_provider_request_timeout")
+            );
+        }
+        server.abort();
+    }
+
     fn external_catalog_model(provider_ref: Option<&str>) -> ModelListItem {
         ExternalCatalogModel {
             id: "edge-offering".to_string(),
@@ -1138,7 +1420,7 @@ mod tests {
                 .expect("serve test provider");
         });
 
-        let client = HttpExternalProviderClient;
+        let client = HttpExternalProviderClient::default();
         let authorized = client
             .authorize_request(
                 &provider(endpoint.clone()),
@@ -1258,7 +1540,7 @@ mod tests {
                 .expect("serve test provider");
         });
 
-        let client = HttpExternalProviderClient;
+        let client = HttpExternalProviderClient::default();
         let err = client
             .list_catalog_by_scope(
                 &provider(endpoint),

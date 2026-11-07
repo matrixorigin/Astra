@@ -67,8 +67,9 @@ use encryption::sha256_hex;
 use external::validate_provider_runtime_context;
 pub use external::{
     ExternalAuthProviderConfig, ExternalAuthorizeRequestData, ExternalAuthorizedRequest,
-    ExternalCatalogResponse, ExternalProviderClient, ExternalRequestDescriptor,
-    ExternalRuntimeContextRequestData, ExternalRuntimeContextResponse, HttpExternalProviderClient,
+    ExternalCatalogResponse, ExternalMemoryIdentity, ExternalProviderClient,
+    ExternalRequestDescriptor, ExternalRuntimeContextRequestData, ExternalRuntimeContextResponse,
+    HttpExternalProviderClient,
 };
 use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims_with_detail};
 pub use provider_request::{ProviderAuthorizedRequest, ProviderRequestDescriptor};

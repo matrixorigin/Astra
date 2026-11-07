@@ -2533,42 +2533,35 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         head: &SessionContextHeadV1,
     ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
         validate_head(head)?;
-        let mut nodes = std::collections::HashMap::new();
-        self.load_manifest_contents_through(
-            &head.key,
-            head.cursor.compaction_generation,
-            head.cursor.conversation_seq,
-            &mut nodes,
-        )
-        .await?;
-        let mut scope = head.key.clone();
-        let mut through = head.cursor.conversation_seq;
-        let mut visited = HashSet::from([scope.clone()]);
-        while let Some(prefix) = self.load_fork_prefix(&scope).await? {
-            if prefix.parent_cursor.compaction_generation != head.cursor.compaction_generation {
-                break;
-            }
-            if !visited.insert(prefix.parent_key.clone()) {
-                return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "cyclic fork lineage".into(),
-                ));
-            }
-            through = through.min(prefix.parent_cursor.conversation_seq);
-            self.load_manifest_contents_through(
-                &prefix.parent_key,
-                prefix.parent_cursor.compaction_generation,
-                through,
-                &mut nodes,
-            )
-            .await?;
-            scope = prefix.parent_key;
+        let sql = canonical_materialization_sql();
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&head.key.isolation_domain)
+            .bind(&head.key.owner_user_id)
+            .bind(&head.key.session_id)
+            .bind(&head.key.branch_id)
+            .bind(i64_from_u64(
+                "head compaction generation",
+                head.cursor.compaction_generation,
+            )?)
+            .bind(i64_from_u64(
+                "head conversation sequence",
+                head.cursor.conversation_seq,
+            )?)
+            .bind(&head.key.isolation_domain)
+            .bind(&head.key.owner_user_id)
+            .bind(&head.key.session_id)
+            .bind(&head.key.branch_id);
+        let mut rows = query.fetch(self.pool.get());
+        let mut loaded = LoadedCanonicalContext::default();
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|source| database_error("load_manifest_contents", source))?
+        {
+            loaded.push_row(head, &row)?;
         }
-        let authorized_session_ids = visited.into_iter().map(|key| key.session_id).collect();
-        materialize_nodes(
-            head,
-            order_manifest_chain(head, nodes)?,
-            authorized_session_ids,
-        )
+        drop(rows);
+        self.materialize_loaded(head, loaded).await
     }
 
     async fn load_manifest_delta(
@@ -2867,16 +2860,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             let json: String = row
                 .try_get("manifest_json")
                 .map_err(|source| database_error("decode_fork_prefix", source))?;
-            let manifest: SessionForkManifestV1 = database_json("fork_prefix", &json)?;
-            manifest
-                .validate()
-                .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-            if manifest.child_key != *key || manifest.state != SessionForkStateV1::Active {
-                return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "fork lineage identity or state mismatch".into(),
-                ));
-            }
-            Ok(manifest.shared_prefix())
+            decode_fork_prefix(key, &json)
         })
         .transpose()
     }
@@ -3953,6 +3937,47 @@ impl DatabaseSessionContextCoordinator {
             .transpose()
     }
 
+    /// Validate the immutable nodes selected for a captured canonical head.
+    /// Background consumers use the same public materialization entrypoint.
+    async fn materialize_loaded(
+        &self,
+        head: &SessionContextHeadV1,
+        loaded: LoadedCanonicalContext,
+    ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
+        validate_head(head)?;
+        let LoadedCanonicalContext {
+            mut nodes,
+            mut prefix,
+            ..
+        } = loaded;
+        let mut through = head.cursor.conversation_seq;
+        let mut visited = HashSet::from([head.key.clone()]);
+        while let Some(current) = prefix {
+            if current.parent_cursor.compaction_generation != head.cursor.compaction_generation {
+                break;
+            }
+            if !visited.insert(current.parent_key.clone()) {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "cyclic fork lineage".into(),
+                ));
+            }
+            through = through.min(current.parent_cursor.conversation_seq);
+            self.load_manifest_contents_through(
+                &current.parent_key,
+                current.parent_cursor.compaction_generation,
+                through,
+                &mut nodes,
+            )
+            .await?;
+            prefix = self.load_fork_prefix(&current.parent_key).await?;
+        }
+        materialize_nodes(
+            head,
+            order_manifest_chain(head, nodes)?,
+            visited.into_iter().map(|key| key.session_id).collect(),
+        )
+    }
+
     async fn load_manifest_contents_through(
         &self,
         key: &SessionKeyV1,
@@ -4863,7 +4888,9 @@ async fn ensure_database_state_admitted(
         "INSERT IGNORE INTO session_context_heads
          (isolation_domain, owner_user_id, session_id, branch_id,
           authorization_epoch, device_trust_epoch, permission_epoch)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
+            SELECT 1 FROM session_context_heads WHERE isolation_domain = ?
+              AND owner_user_id = ? AND session_id = ? AND branch_id = ?)",
     )
     .bind(&key.isolation_domain)
     .bind(&key.owner_user_id)
@@ -4878,6 +4905,10 @@ async fn ensure_database_state_admitted(
         epochs.device_trust_epoch,
     )?)
     .bind(i64_from_u64("permission epoch", epochs.permission_epoch)?)
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
     .execute(&mut **tx)
     .await
     .map_err(|source| database_error("ensure_context_head", source))?;
@@ -6415,9 +6446,95 @@ fn validate_stored_manifest(
     Ok(())
 }
 
+/// Keep direct storage predicates: a derived key joined to the catalog does
+/// not receive selective predicate pushdown on MatrixOne.
+pub(crate) fn canonical_materialization_sql() -> String {
+    let columns = qualified_manifest_content_columns("m");
+    format!(
+        "SELECT {columns}, f.manifest_json AS fork_manifest_json
+             FROM (SELECT 1) seed
+             LEFT JOIN (
+               SELECT * FROM conversation_manifest_nodes
+               WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?
+                 AND compaction_generation = ? AND reachable = 1 AND conversation_seq <= ?
+             ) m ON TRUE
+             LEFT JOIN (
+               SELECT manifest_json FROM session_forks FORCE INDEX (uq_session_forks_child)
+               WHERE isolation_domain = ? AND owner_user_id = ? AND child_session_id = ?
+                 AND child_branch_id = ? AND state = 'active'
+             ) f ON TRUE"
+    )
+}
+
+fn qualified_manifest_content_columns(alias: &str) -> String {
+    MANIFEST_CONTENT_COLUMNS
+        .split(',')
+        .map(|column| format!("{alias}.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn decode_fork_prefix(
+    key: &SessionKeyV1,
+    json: &str,
+) -> Result<SharedManifestPrefixV1, SessionContextCoordinatorError> {
+    let manifest: SessionForkManifestV1 = database_json("fork_prefix", json)?;
+    manifest
+        .validate()
+        .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
+    if manifest.child_key != *key || manifest.state != SessionForkStateV1::Active {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "fork lineage identity or state mismatch".into(),
+        ));
+    }
+    Ok(manifest.shared_prefix())
+}
+
 const MANIFEST_CONTENT_COLUMNS: &str = "manifest_root, parent_manifest_root, completed_turn,
     conversation_seq, compaction_generation, canonical_segment_bytes,
     total_canonical_bytes, total_message_count, manifest_json, content_json, reachable";
+
+/// Validated manifest content, without retaining another copy of SQL bodies.
+#[derive(Default)]
+struct LoadedCanonicalContext {
+    nodes: std::collections::HashMap<String, StoredManifestContent>,
+    prefix: Option<SharedManifestPrefixV1>,
+    prefix_loaded: bool,
+}
+impl LoadedCanonicalContext {
+    fn push_row(
+        &mut self,
+        head: &SessionContextHeadV1,
+        row: &sqlx::mysql::MySqlRow,
+    ) -> Result<(), SessionContextCoordinatorError> {
+        if !self.prefix_loaded {
+            validate_head(head)?;
+            self.prefix = row
+                .try_get::<Option<String>, _>("fork_manifest_json")
+                .map_err(|source| database_error("decode_fork_prefix", source))?
+                .map(|json| decode_fork_prefix(&head.key, &json))
+                .transpose()?;
+            self.prefix_loaded = true;
+        }
+        if row
+            .try_get::<Option<String>, _>("manifest_root")
+            .map_err(|source| database_error("decode_manifest_root", source))?
+            .is_some()
+        {
+            let content = decode_stored_manifest_content(row, &head.key)?;
+            if self
+                .nodes
+                .insert(content.node.manifest_root.clone(), content)
+                .is_some()
+            {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "duplicate manifest identity".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 struct StoredManifestContent {
     node: ContextManifestNodeV1,

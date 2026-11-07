@@ -61,6 +61,42 @@ pub async fn ephemeral_provider_chat_stream(
     }
 }
 
+/// Production canonical observation owner for Router fixtures, which do not
+/// start managed timers. Prepare it with other server startup before capture;
+/// drive_one includes discovery, authority, HTTP and checkpoint SQL.
+pub struct ObservationRecoveryForTest(super::session_memory_runtime::SessionObservationRecovery);
+impl ObservationRecoveryForTest {
+    pub async fn new(state: &super::AppState, user: &str, session: &str) -> Option<Self> {
+        let mut owner =
+            super::session_memory_runtime::SessionObservationRecovery::new(state.clone())?;
+        owner.scope_for_test(user, session);
+        assert!(
+            owner.prepare().await,
+            "test observation owner must acquire its isolated lease"
+        );
+        Some(Self(owner))
+    }
+    /// Use only with a dedicated synthetic test database: exercises the full
+    /// production catalog scan without the Router fixture's Session filter.
+    pub async fn new_catalog(state: &super::AppState) -> Option<Self> {
+        let owner = super::session_memory_runtime::SessionObservationRecovery::new(state.clone())?;
+        assert!(owner.prepare().await);
+        Some(Self(owner))
+    }
+    pub fn lease_identity(&self) -> (&str, &str) {
+        self.0.lease_identity_for_test()
+    }
+    pub async fn expire_lease(&self) {
+        self.0.expire_lease_for_test().await;
+    }
+    pub async fn drive_one(&self) -> Result<bool, String> {
+        self.0.drive_one().await
+    }
+    pub async fn run(&self, cancel: tokio_util::sync::CancellationToken) {
+        self.0.run(cancel).await;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
     pub method: Method,

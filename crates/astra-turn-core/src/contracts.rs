@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TurnObserverRequest {
     pub user_id: String,
     pub session_id: String,
@@ -20,6 +20,17 @@ pub enum TurnObserverOutcome {
 
 #[async_trait]
 pub trait TurnObserverWorker: Send + Sync {
+    /// Deployment configuration only; user authority is resolved afresh by run.
+    fn is_configured(&self) -> bool {
+        true
+    }
+
+    /// Gate optional transcript loading. A positive result is not a reusable
+    /// write grant: run must resolve current authority again before dispatch.
+    async fn admits_observation(&self, _user_id: &str) -> Result<bool, String> {
+        Ok(self.is_configured())
+    }
+
     async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String>;
 }
 
