@@ -92,6 +92,150 @@ async fn recorded(executor: &ToolExecutor, id: &str) {
 }
 
 #[tokio::test]
+async fn independent_sessions_can_use_the_same_workspace_while_shell_runs() {
+    let (workspace, executor) = fixture();
+    let id = launch(
+        &executor,
+        "touch started; while [ ! -f release ]; do sleep 0.1; done",
+        false,
+        30.0,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !workspace.path().join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut commands = tokio::task::JoinSet::new();
+    for index in 0..8 {
+        let root = workspace.path().to_path_buf();
+        commands.spawn(async move {
+            let other = ToolExecutor::new(&root);
+            let command = format!("touch ready-{index}; while [ ! -f release-peers ]; do sleep 0.1; done; printf independent");
+            call(
+                &other,
+                "bash",
+                json!({"command":command, "timeout":25}),
+            )
+            .await
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while (0..8).any(|index| !workspace.path().join(format!("ready-{index}")).exists()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all independent shells should run concurrently");
+    let other = ToolExecutor::new(workspace.path());
+    let write = tokio::time::timeout(
+        Duration::from_secs(3),
+        call(
+            &other,
+            "write_file",
+            json!({"path":"unrelated", "content":"written"}),
+        ),
+    )
+    .await
+    .expect("a file edit should not wait for an unrelated shell");
+    assert!(!write.is_error, "{write:?}");
+    std::fs::write(workspace.path().join("release-peers"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while let Some(command) = commands.join_next().await {
+            let command = command.unwrap();
+            assert!(
+                !command.is_error && command.output.contains("independent"),
+                "{command:?}"
+            );
+        }
+    })
+    .await
+    .expect("independent shells should finish after release");
+    assert!(
+        !executor
+            .background_tasks
+            .get(&id)
+            .unwrap()
+            .status()
+            .is_terminal()
+    );
+    std::fs::write(workspace.path().join("release"), "").unwrap();
+    assert!(!terminal(&executor, &id).await.is_error);
+}
+
+#[tokio::test]
+async fn interactive_shell_output_is_visible_and_live_offsets_are_rejected() {
+    let (_workspace, executor) = fixture();
+    let id = launch(
+        &executor,
+        "printf 'Confirm? '; printf 'warning\\n' >&2; read answer; printf 'answer=%s\\n' \"$answer\"",
+        true,
+        10.0,
+    )
+    .await;
+    stdin_ready(&executor, &id).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let output = call(&executor, "task_output", json!({"task_id":id})).await;
+            assert!(!output.is_error, "{output:?}");
+            if output.output.contains("Confirm?") && output.output.contains("warning") {
+                assert!(!output.output.contains("next_offset"), "{output:?}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("an unfinished-line prompt should be visible before input");
+    let tiny = call(
+        &executor,
+        "task_output",
+        json!({"task_id":id,"max_bytes":1}),
+    )
+    .await;
+    assert!(
+        !tiny.is_error && tiny.output.contains("partial tokens may be withheld"),
+        "{tiny:?}"
+    );
+    let invalid = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
+    assert!(invalid.is_error, "{invalid:?}");
+    assert!(
+        invalid.output.contains("after the task ends"),
+        "{invalid:?}"
+    );
+    let input = call(
+        &executor,
+        "task_input",
+        json!({"task_id":id,"input":"yes\n"}),
+    )
+    .await;
+    assert!(!input.is_error, "{input:?}");
+    assert!(!terminal(&executor, &id).await.is_error);
+    let output = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
+    assert!(!output.is_error, "{output:?}");
+    assert!(
+        output.output.contains("answer=yes") && output.output.contains("warning"),
+        "{output:?}"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_source_capture_does_not_start_local_command() {
+    let (workspace, executor) = fixture();
+    let output = call(
+        &executor,
+        "bash",
+        json!({"command":"touch marker", "source_artifacts":["input.txt"]}),
+    )
+    .await;
+    assert!(output.is_error, "{output:?}");
+    assert!(!workspace.path().join("marker").exists());
+}
+
+#[tokio::test]
 async fn published_command_output_survives_task_retention() {
     let (workspace, executor) = fixture();
     let result = call(&executor, "bash", json!({"command":"seq 1 20000"})).await;

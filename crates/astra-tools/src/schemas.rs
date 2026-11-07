@@ -2826,7 +2826,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Observe one exact task_id. Returns current status, advertised controls and a bounded output window. For live shell output, omit offset for the latest tail; use offset/next_offset for incremental or historical reads. Set block=true for an event-backed bounded wait; timeout returns the current state and cancelling the wait leaves the task running. For failures, pattern searches captured output with bounded context. Running, input delivery and stop requests are not terminal completion.",
+                "description": "Observe one exact task_id. Returns current status, advertised controls and a bounded output window. Live shell output is a latest snapshot, which can omit earlier output; use offset/next_offset after the shell ends to paginate its capture. Set block=true for a bounded wait; timeout returns the current state and cancelling the wait leaves the task running. For failures, pattern searches captured output with bounded context. Running, input delivery and stop requests are not terminal completion.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2837,12 +2837,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "Wait for terminal status, required input, new parent input, or a bounded timeout. Timeout leaves the task running. Default false; ordinary output growth does not wake the model."
+                            "description": "Wait for terminal status, release by parent input, or a bounded timeout. Timeout leaves the task running. Default false; output growth and prompts do not wake this wait."
                         },
                         "offset": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "Output cursor for incremental or historical reads. Omit for the latest bounded tail. Reuse next_offset to continue without replaying earlier output."
+                            "description": "Output cursor for historical reads. Omit for the latest bounded snapshot; for shell tasks use a cursor only after completion."
                         },
                         "pattern": {
                             "type": "string",

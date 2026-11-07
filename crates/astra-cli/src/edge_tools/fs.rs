@@ -1366,51 +1366,6 @@ impl ToolExecutor {
         }
 
         match scope {
-            "source_receipt" => {
-                let receipt_id = match args.get("receipt_id").and_then(Value::as_str) {
-                    Some(receipt_id) if !receipt_id.trim().is_empty() => receipt_id,
-                    _ => {
-                        return json!({
-                            "success": false,
-                            "scope": "source_receipt",
-                            "error": "missing 'receipt_id' for scope=source_receipt",
-                        })
-                        .to_string();
-                    }
-                };
-                let Some(session_id) = self
-                    .active_session_id()
-                    .filter(|id| !id.trim().is_empty())
-                else {
-                    return json!({
-                        "success": false,
-                        "scope": "source_receipt",
-                        "error": "source receipt restore requires an active CLI session",
-                    })
-                    .to_string();
-                };
-                let owner_scope = format!("cli:{session_id}");
-                match astra_tools::source_preimage::prepare_receipt_restore(
-                    &self.effective_project_root(),
-                    &owner_scope,
-                    receipt_id,
-                ).and_then(|receipt| receipt.restore()) {
-                    Ok(()) => json!({
-                        "success": true,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "summary": "Restored the retained source preimage.",
-                    })
-                    .to_string(),
-                    Err(error) => json!({
-                        "success": false,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "error": error,
-                    })
-                    .to_string(),
-                }
-            }
             "list" => {
                 let summary = match self.file_journal.lock() {
                     Ok(journal) => journal.summary(),
@@ -1461,7 +1416,11 @@ impl ToolExecutor {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut undo_result = Ok(None);
                 for candidate in &candidates {
-                    if let Some(entry) = journal.entries().filter(|entry| entry.path == *candidate).last() {
+                    if let Some(entry) = journal
+                        .entries()
+                        .filter(|entry| entry.path == *candidate)
+                        .last()
+                    {
                         if !entry.belongs_to_workspace(&root) {
                             undo_result = Err(std::io::Error::other(
                                 "This edit belongs to another workspace; no file was rolled back",
@@ -1579,7 +1538,7 @@ impl ToolExecutor {
             other => json!({
                 "success": false,
                 "error": format!(
-                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list, source_receipt)"
+                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list)"
                 ),
             })
             .to_string(),

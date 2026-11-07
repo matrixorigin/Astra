@@ -40,9 +40,14 @@ command to finish; independently owned agent/fanout controls can remain availabl
 composer input still addresses the parent. Capability introspection reports
 `shell_task_controls` separately from agent and fanout task controls.
 
-`task_output` observes or waits on producer events; it does not acquire the
-running command's workspace lease. A timed-out or cancelled observation leaves
-the command running. `task_input` writes only to a task launched with
+`task_output` observes a bounded snapshot or waits for a terminal event. Output
+growth and prompts do not wake a blocking observation. A live shell snapshot
+can omit earlier output and has no stable pagination cursor: stdout and stderr
+may grow independently. After completion, the captured output can be paginated;
+published workspace files may still be changed by users between reads.
+An unfinished output token is withheld from the live view until it can be
+redacted; this is indicated in the snapshot. A timed-out or cancelled observation
+leaves the command running. `task_input` writes only to a task launched with
 `stdin=true`; default stdin is closed. Input writes, closing stdin and stop
 requests are acknowledged separately from observed terminal execution. The task
 panel offers input only when the task supports it. Input arriving during process
@@ -50,6 +55,11 @@ startup waits for stdin within the same deadline. A timeout or cancellation
 before submission is reported as not sent; after submission, missing
 acknowledgement is unconfirmed and is not automatically retried. Agent mailboxes
 and native collaborator steering keep their existing protocols and identities.
+
+Ordinary local shell tasks do not hold a workspace-wide exclusive lock for
+their lifetime. Independent sessions can therefore use the same workspace;
+as with external editors, users must coordinate overlapping writes and worktree
+removal. No automatic shell-effect attribution or source rollback is promised.
 
 Capture and queues are bounded. Each executor admits at most 32 simultaneous
 shell tasks, with a 50 MiB capture limit per task and 256 MiB retained terminal

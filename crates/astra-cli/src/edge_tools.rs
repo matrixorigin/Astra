@@ -110,6 +110,46 @@ fn tool_schemas_with_background(authorized: bool) -> Vec<Value> {
     if authorized {
         astra_tools::schemas::enable_managed_background_bash_schema(&mut schemas);
     }
+    if let Some(bash) = schemas
+        .iter_mut()
+        .find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some("bash"))
+    {
+        if let Some(properties) = bash
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.remove("source_artifacts");
+        }
+        if let Some(description) = bash.pointer_mut("/function/description") {
+            *description = Value::String(if authorized
+                && astra_tools::schemas::managed_background_bash_supported()
+            {
+                "Execute a command and report its output and exit status. workdir is call-local. Environment-lifetime services use run_in_background and ready_check."
+            } else {
+                "Execute a command and report its output and exit status. workdir is call-local."
+            }.into());
+        }
+    }
+    if let Some(rollback) = schemas.iter_mut().find(|schema| {
+        schema.pointer("/function/name").and_then(Value::as_str) == Some("rollback_file_edits")
+    }) {
+        if let Some(properties) = rollback
+            .pointer_mut("/function/parameters/properties")
+            .and_then(Value::as_object_mut)
+        {
+            properties.remove("receipt_id");
+            if let Some(scopes) = properties
+                .get_mut("scope")
+                .and_then(|scope| scope.get_mut("enum"))
+                .and_then(Value::as_array_mut)
+            {
+                scopes.retain(|scope| scope.as_str() != Some("source_receipt"));
+            }
+        }
+        if let Some(description) = rollback.pointer_mut("/function/description") {
+            *description = Value::String("List or restore file edits recorded by write_file and str_replace. Use scope=current_turn, file, turn, or list.".into());
+        }
+    }
     schemas
 }
 
@@ -976,9 +1016,8 @@ fn format_background_task_output(
         BgTaskOutputStatus::Cancelled => "stopped",
         BgTaskOutputStatus::Unavailable => "unavailable",
     };
+    let live_shell = kind == "shell" && !snapshot.status.is_terminal();
     let mut metadata_parts = vec![
-        format!("offset {offset} -> {}", snapshot.end_offset),
-        format!("next_offset {}", snapshot.end_offset),
         format!("total {} bytes", snapshot.total_bytes),
         format!("{} total lines", snapshot.total_lines),
         format!(
@@ -990,7 +1029,16 @@ fn format_background_task_output(
             }
         ),
     ];
-    if (read_mode == BgTaskOutputReadMode::Historical || kind != "shell")
+    if live_shell {
+        metadata_parts
+            .push("current snapshot; earlier output may be outside this window".to_string());
+        metadata_parts.push("partial tokens may be withheld for redaction".to_string());
+    } else {
+        metadata_parts.push(format!("offset {offset} -> {}", snapshot.end_offset));
+        metadata_parts.push(format!("next_offset {}", snapshot.end_offset));
+    }
+    if !live_shell
+        && (read_mode == BgTaskOutputReadMode::Historical || kind != "shell")
         && snapshot.end_offset < snapshot.total_bytes
     {
         metadata_parts.push(format!(
@@ -3239,6 +3287,17 @@ impl ToolExecutor {
         }
 
         let bg_commands = self;
+
+        if requested_offset.is_some()
+            && self
+                .background_tasks
+                .get(&task_id)
+                .is_some_and(|task| !task.status().is_terminal())
+        {
+            return format_background_task_argument_error(
+                "Live shell output is a current snapshot; use offset after the task ends.",
+            );
+        }
 
         if let Some(pattern) = pattern.as_deref() {
             return match request_background_task_output_search(

@@ -424,8 +424,7 @@ struct ShellOutputObservation {
 }
 
 /// The selected executor owns this registry. Views and tools clone its handle;
-/// observing a task never depends on an interactive event loop or takes the
-/// task's workspace lease.
+/// observing a task never depends on an interactive event loop.
 #[derive(Clone)]
 pub(crate) struct BackgroundTaskRegistry {
     state: Arc<Mutex<TaskRegistryState>>,
@@ -1899,13 +1898,37 @@ fn read_safe_projection_limited(
         }
     }
     let raw = String::from_utf8_lossy(&bytes);
-    // An incomplete last line may contain a fragment of a credential.
-    let raw = if !settled && !raw.ends_with('\n') {
-        raw.rfind('\n').map(|i| &raw[..=i]).unwrap_or("")
+    // A growing token can become a credential as more bytes arrive. Show only
+    // complete tokens until capture settles; prompts need not end in a newline.
+    let mut end = if settled {
+        raw.len()
     } else {
-        raw.as_ref()
+        raw.char_indices()
+            .rfind(|(_, ch)| ch.is_whitespace())
+            .map_or(0, |(index, ch)| index + ch.len_utf8())
     };
-    let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(raw).0;
+    if !settled && let Some(begin) = raw[..end].rfind("-----BEGIN ") {
+        let label = &raw[begin + "-----BEGIN ".len()..end];
+        if label.len() <= 75 && label.bytes().all(|b| b.is_ascii_uppercase() || b == b' ') {
+            // A future suffix can turn this into a PEM private-key header;
+            // do not expose a provisional label the redactor will later hide.
+            end = raw[..begin]
+                .char_indices()
+                .rfind(|(_, ch)| ch.is_whitespace())
+                .map_or(0, |(index, ch)| index + ch.len_utf8());
+        }
+    }
+    let mut safe = if settled {
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&raw[..end]).0
+    } else {
+        astra_text_utils::credential_redaction::redact_credentials_for_display_streaming(
+            &raw[..end],
+        )
+        .0
+    };
+    if end < raw.len() {
+        safe.push_str("\n[Partial output withheld until the token is complete.]");
+    }
     let projection =
         Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(safe));
     safe_output_cache()
@@ -2923,7 +2946,8 @@ mod tests {
         std::fs::write(&path, "prefix\nAWS_SECRET_KEY=partial-secret").unwrap();
 
         let running = read_safe_projection(&path, false).unwrap();
-        assert_eq!(running.text(), "prefix\n");
+        assert!(running.text().starts_with("prefix\n"));
+        assert!(running.text().contains("Partial output withheld"));
         assert!(!running.text().contains("partial-secret"));
 
         std::fs::write(
@@ -2938,6 +2962,90 @@ mod tests {
                 .contains("abcdefghijklmnopqrstuvwxyz0123456789")
         );
         assert!(settled.text().contains("[REDACTED:"));
+    }
+
+    #[test]
+    fn live_output_shows_complete_prompt_tokens_without_exposing_credentials() {
+        let tmp = crate::tests::test_temp_dir();
+        let path = tmp.path().join("stdout");
+        for (raw, visible, hidden) in [
+            ("Confirm? ", "Confirm?", "not present"),
+            (
+                "Bearer abcdefghijklmnopqrstuvwxyz0123456789ABC",
+                "Bearer",
+                "abcdefghijklmnopqrstuvwxyz",
+            ),
+            (
+                "password=partial-secret",
+                "Partial output withheld",
+                "partial-secret",
+            ),
+            (
+                "-----BEGIN PRIVATE KEY-----\nPRIVATE_BODY_SENTINEL\n",
+                "[REDACTED:",
+                "PRIVATE_BODY_SENTINEL",
+            ),
+            (
+                "prefix\n-----BEGIN TOP SECRET ",
+                "Partial output withheld",
+                "TOP SECRET",
+            ),
+        ] {
+            std::fs::write(&path, raw).unwrap();
+            let view = read_safe_projection(&path, false).unwrap();
+            assert!(view.text().contains(visible), "{raw:?}: {}", view.text());
+            assert!(!view.text().contains(hidden), "{raw:?}: {}", view.text());
+        }
+        std::fs::write(&path, b"hello \xe4\xbd").unwrap();
+        let partial = read_safe_projection(&path, false).unwrap();
+        assert!(partial.text().contains("hello "));
+        assert!(partial.text().contains("Partial output withheld"));
+        assert!(!partial.text().contains('\u{fffd}'));
+        std::fs::write(&path, "hello 你好 ").unwrap();
+        assert!(
+            read_safe_projection(&path, false)
+                .unwrap()
+                .text()
+                .contains("你好")
+        );
+    }
+
+    #[test]
+    fn live_output_does_not_expose_credential_prefixes_across_appends() {
+        let tmp = crate::tests::test_temp_dir();
+        let path = tmp.path().join("stdout");
+        for (prefix, suffix, secret) in [
+            (
+                "password=fooBearer ",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+                "fooBearer",
+            ),
+            (
+                "password=short-----BEGIN ",
+                "PRIVATE KEY-----\nPRIVATE_BODY\n",
+                "short",
+            ),
+            ("AWS_SECRET_KEY=short ", "more\n", "short"),
+            ("--token short ", "more\n", "short"),
+            ("Bearer short ", "more\n", "short"),
+        ] {
+            std::fs::write(&path, prefix).unwrap();
+            let preview = read_safe_projection(&path, false).unwrap();
+            assert!(
+                !preview.text().contains(secret),
+                "{prefix:?}: {}",
+                preview.text()
+            );
+            std::fs::write(&path, format!("{prefix}{suffix}")).unwrap();
+            let complete = read_safe_projection(&path, true).unwrap();
+            if prefix.starts_with("password=") {
+                assert!(
+                    !complete.text().contains(secret),
+                    "{prefix:?}: {}",
+                    complete.text()
+                );
+            }
+        }
     }
 
     #[test]

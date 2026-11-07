@@ -29,16 +29,16 @@ fn terminal_facts(outcome: &super::super::ToolExecutionOutcome) -> String {
 
 pub(super) struct OwnedShellInvocation {
     pub(super) config: ShellRunConfig,
-    pub(super) scope: Arc<ShellScopeLease>,
+    pub(super) workspace: Arc<Option<tokio::sync::OwnedRwLockReadGuard<()>>>,
     pub(super) capture: BashOutputCapture,
     pub(super) stdout: astra_tools::shell_output_capture::CaptureWriter,
     pub(super) stderr: astra_tools::shell_output_capture::CaptureWriter,
     pub(super) renderer: BashOutputRenderer,
     pub(super) args: Value,
-    pub(super) source_preimages: Option<astra_tools::source_preimage::PreparedSourcePreimages>,
     pub(super) workdir: astra_tools::shell_ops::PreparedBashWorkdir,
     pub(super) output_limit: usize,
     pub(super) retain_for_task: bool,
+    pub(super) admission_deadline: Option<std::time::Instant>,
 }
 
 impl OwnedShellInvocation {
@@ -51,15 +51,8 @@ impl OwnedShellInvocation {
         if cancel.is_cancelled() {
             return super::super::cancelled_tool_execution_outcome("bash", false);
         }
-        if self
-            .scope
-            .observation
-            .as_ref()
-            .is_some_and(|lease| !lease.coordination_integrity_valid())
-        {
-            return bash_preparation_rejection(
-                "Workspace changed before execution; no command was run.".into(),
-            );
+        if let Some(outcome) = bash_admission_deadline_outcome(self.admission_deadline) {
+            return outcome;
         }
         let (command, owner) = match prepare_shell_process(&self.config) {
             Ok(prepared) => prepared,
@@ -75,6 +68,24 @@ impl OwnedShellInvocation {
             .get("stdin")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        #[cfg(unix)]
+        {
+            let inspection = self.workdir.inspection();
+            let root_matches = self
+                .config
+                .effective_project_root
+                .canonicalize()
+                .ok()
+                .is_some_and(|root| inspection.matches_root_path(&root).unwrap_or(false));
+            if !root_matches || inspection.working_directory_relative().is_err() {
+                return bash_preparation_rejection(
+                    "Error: the selected workspace or working directory changed before execution; no command was run".into(),
+                );
+            }
+        }
+        if let Some(outcome) = bash_admission_deadline_outcome(self.admission_deadline) {
+            return outcome;
+        }
         let mut process = match owner.spawn_streamed(
             command,
             ProcessIoLimits {
@@ -83,12 +94,15 @@ impl OwnedShellInvocation {
                 max_stderr_bytes: 0,
                 timeout: Some(Duration::from_secs_f64(self.config.timeout_secs)),
             },
-            cancel,
+            cancel.clone(),
             interactive,
-            self.scope.clone(),
+            self.workspace.clone(),
         ) {
             Ok(process) => process,
             Err(error) => {
+                if cancel.is_cancelled() {
+                    return super::super::cancelled_tool_execution_outcome("bash", false);
+                }
                 return bash_preparation_rejection(format!("Cannot start command: {error}"));
             }
         };
@@ -312,21 +326,10 @@ impl OwnedShellInvocation {
                 false,
             ),
         };
-        let unsettled = execution_started
-            && (ownership.is_none()
-                || self
-                    .scope
-                    .observation
-                    .as_ref()
-                    .is_some_and(|lease| !lease.coordination_integrity_valid()));
-        outcome = finish_bash_ownership(
-            &self.config.effective_project_root,
-            outcome,
-            unsettled,
-            self.scope.observation.as_ref(),
-        );
+        let unsettled = execution_started && ownership.is_none();
+        outcome = finish_bash_ownership(outcome, unsettled);
         outcome = attach_bash_workdir_outcome(
-            attach_source_preimage_outcome(outcome, self.source_preimages),
+            outcome,
             &self.config.effective_project_root,
             &self.workdir,
             &self.args,

@@ -22,7 +22,12 @@ struct CredentialPattern {
 }
 
 fn credential_patterns() -> &'static [CredentialPattern] {
+    credential_patterns_for_stream(false)
+}
+
+fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPattern] {
     static PATTERNS: OnceLock<Vec<CredentialPattern>> = OnceLock::new();
+    static STREAMING_PATTERNS: OnceLock<Vec<CredentialPattern>> = OnceLock::new();
 
     macro_rules! pat {
         ($re:expr, $label:expr) => {{
@@ -33,28 +38,46 @@ fn credential_patterns() -> &'static [CredentialPattern] {
                 secret_capture: None,
             }
         }};
-        ($re:expr, $label:expr, $secret_capture:expr) => {{
-            static RE: OnceLock<Regex> = OnceLock::new();
+    }
+
+    macro_rules! pat_min {
+        ($re:expr, $minimum:expr, $label:expr, $capture:expr) => {{
+            static REGULAR: OnceLock<Regex> = OnceLock::new();
+            static STREAMING: OnceLock<Regex> = OnceLock::new();
+            let (slot, minimum) = if streaming {
+                (&STREAMING, 1)
+            } else {
+                (&REGULAR, $minimum)
+            };
             CredentialPattern {
-                regex: RE.get_or_init(|| Regex::new($re).expect("credential pattern regex")),
+                regex: slot.get_or_init(|| {
+                    Regex::new(&format!($re, minimum)).expect("credential pattern regex")
+                }),
                 label: $label,
-                secret_capture: Some($secret_capture),
+                secret_capture: $capture,
             }
         }};
     }
 
-    PATTERNS.get_or_init(|| {
+    let patterns = if streaming {
+        &STREAMING_PATTERNS
+    } else {
+        &PATTERNS
+    };
+    patterns.get_or_init(|| {
         vec![
             pat!(r"AKIA[0-9A-Z]{16}", "AWS_ACCESS_KEY"),
-            pat!(
-                r#"(?i)(?:aws_secret_access_key|aws_secret_key|\[\s*['"]?(?:aws_secret_access_key|aws_secret_key)['"]?\s*\]|['"](?:aws_secret_access_key|aws_secret_key)['"])\s*[=:]\s*['"]?(?P<secret>[A-Za-z0-9/+=._-]{30,})"#,
+            pat_min!(
+                r#"(?i)(?:aws_secret_access_key|aws_secret_key|\[\s*['"]?(?:aws_secret_access_key|aws_secret_key)['"]?\s*\]|['"](?:aws_secret_access_key|aws_secret_key)['"])\s*[=:]\s*['"]?(?P<secret>[A-Za-z0-9/+=._-]{{{},}})"#,
+                30,
                 "AWS_SECRET_KEY",
-                "secret"
+                Some("secret")
             ),
-            pat!(
-                r#"(?i)(?:--?(?:token|api[-_]?key|access[-_]?token|auth[-_]?token))(?:\s+|=)\s*['"]?(?P<secret>[A-Za-z0-9._\-/+=]{20,})"#,
+            pat_min!(
+                r#"(?i)(?:--?(?:token|api[-_]?key|access[-_]?token|auth[-_]?token))(?:\s+|=)\s*['"]?(?P<secret>[A-Za-z0-9._\-/+=]{{{},}})"#,
+                20,
                 "TOKEN_ARGUMENT",
-                "secret"
+                Some("secret")
             ),
             pat!(r"gh[pousr]_[A-Za-z0-9_]{36,255}", "GITHUB_TOKEN"),
             // Hugging Face user-access tokens are opaque bearer credentials.
@@ -63,15 +86,18 @@ fn credential_patterns() -> &'static [CredentialPattern] {
             // minimum body length so a direct tool output cannot expose one
             // merely because it lacks an assignment/CLI flag wrapper.
             pat!(r"hf_[A-Za-z0-9]{34,255}", "HUGGINGFACE_TOKEN"),
-            pat!(
-                r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{40,}",
-                "BEARER_TOKEN"
+            pat_min!(
+                r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{{{},}}",
+                40,
+                "BEARER_TOKEN",
+                None
             ),
             pat!(r"://[^:@\s/]+:[^:@\s/]+@", "CONNECTION_CREDENTIAL"),
-            pat!(
-                r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key|\[\s*['"]?(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"]?\s*\]|['"](?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"])\s*[=:]\s*['"]?(?P<secret>[^\s'"]{12,})"#,
+            pat_min!(
+                r#"(?i)(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key|\[\s*['"]?(?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"]?\s*\]|['"](?:password|passwd|secret_key|api_key|apikey|access_token|auth_token|secret_access_key)['"])\s*[=:]\s*['"]?(?P<secret>[^\s'"]{{{},}})"#,
+                12,
                 "SECRET_ASSIGNMENT",
-                "secret"
+                Some("secret")
             ),
         ]
     })
@@ -321,7 +347,13 @@ pub fn redact_credentials_in_text(text: &str) -> (String, usize) {
 /// must never mint an edit capability that a different Edge process cannot
 /// verify. Executor-owned output should use the edit-capable function above.
 pub fn redact_credentials_for_display(text: &str) -> (String, usize) {
-    redact_credentials_for_display_with_boundary(text, false)
+    redact_credentials_for_display_with_boundary(text, false, false)
+}
+
+/// Redact a growing preview conservatively: explicit credential contexts are
+/// hidden even before their value is long enough for the settled-output rules.
+pub fn redact_credentials_for_display_streaming(text: &str) -> (String, usize) {
+    redact_credentials_for_display_with_boundary(text, false, true)
 }
 
 /// Redact a bounded tail/head capture whose first byte may be in the middle
@@ -329,14 +361,15 @@ pub fn redact_credentials_for_display(text: &str) -> (String, usize) {
 /// this explicitly partial-input path; complete source/RPC views use the
 /// ordinary display function and preserve unrelated documentation footers.
 pub fn redact_credentials_for_display_partial(text: &str) -> (String, usize) {
-    redact_credentials_for_display_with_boundary(text, true)
+    redact_credentials_for_display_with_boundary(text, true, false)
 }
 
 fn redact_credentials_for_display_with_boundary(
     text: &str,
     may_start_inside_pem: bool,
+    streaming: bool,
 ) -> (String, usize) {
-    let patterns = credential_patterns();
+    let patterns = credential_patterns_for_stream(streaming);
     let (mut result, mut total) = redact_pem_blocks(text, false, may_start_inside_pem);
 
     for pat in patterns {
@@ -1306,6 +1339,24 @@ pub fn resolve_redacted_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_display_conservatively_redacts_short_contextual_values() {
+        for raw in [
+            "password=short ",
+            "AWS_SECRET_KEY=short ",
+            "--token short ",
+            "Bearer short ",
+        ] {
+            let (live, count) = redact_credentials_for_display_streaming(raw);
+            assert!(count > 0 && !live.contains("short"), "{raw:?}: {live}");
+        }
+        let raw = "password=short ";
+        assert_eq!(redact_credentials_for_display(raw).0, raw);
+        for prompt in ["Confirm? ", "确认？ ", "Password: "] {
+            assert_eq!(redact_credentials_for_display_streaming(prompt).0, prompt);
+        }
+    }
 
     #[test]
     fn byte_pem_scanner_handles_chunk_boundary_and_bounded_labels() {
