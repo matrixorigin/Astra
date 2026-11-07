@@ -2085,6 +2085,8 @@ mod tests {
                     execution_timeout_ms: None,
                     command_timeout_cap_ms: None,
                     execution_ceiling: None,
+                    traceparent: None,
+                    tracestate: None,
                 },
             )
             .await;
