@@ -19,15 +19,15 @@ fn complete_marker_len(text: &str, at: usize) -> Option<usize> {
         return None;
     }
     let mut i = at + MARKER_PREFIX.len();
-    if !bytes.get(i).copied().map_or(false, |b| b.is_ascii_uppercase()) {
+    if !bytes
+        .get(i)
+        .copied()
+        .is_some_and(|b| b.is_ascii_uppercase())
+    {
         return None;
     }
     i += 1;
-    while bytes
-        .get(i)
-        .copied()
-        .map_or(false, |b| is_marker_label_byte(b))
-    {
+    while bytes.get(i).copied().is_some_and(is_marker_label_byte) {
         i += 1;
     }
     if bytes.get(i) == Some(&b']') {
@@ -81,12 +81,8 @@ fn every_marker_is_complete(text: &str) -> bool {
 }
 
 fn hex32_field(bytes: &[u8], i: usize) -> Option<usize> {
-    let Some(limit) = i.checked_add(32) else {
-        return None;
-    };
-    let Some(field) = bytes.get(i..limit) else {
-        return None;
-    };
+    let limit = i.checked_add(32)?;
+    let field = bytes.get(i..limit)?;
     for &b in field {
         if !is_lower_hex(b) {
             return None;
@@ -96,7 +92,7 @@ fn hex32_field(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 fn is_lower_hex(b: u8) -> bool {
-    b.is_ascii_digit() || (b >= b'a' && b <= b'f')
+    b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
 }
 
 fn is_marker_label_byte(b: u8) -> bool {
@@ -261,7 +257,10 @@ fn marker_oracle_rejects_clipped_marker_fragments() {
     // Intact marker forms and marker-free notices must pass the scan.
     for (case, text) in [
         ("display marker", "[REDACTED:SECRET_ASSIGNMENT]"),
-        ("executor marker", "[REDACTED:C6:8124567890abcdef8124567890abcdef:8124567890abcdef8124567890abcdef]"),
+        (
+            "executor marker",
+            "[REDACTED:C6:8124567890abcdef8124567890abcdef:8124567890abcdef8124567890abcdef]",
+        ),
         ("marker amid text", "x [REDACTED:SECRET_ASSIGNMENT] y"),
         ("notice only", "\n[truncated]"),
         ("empty window", ""),
@@ -273,19 +272,38 @@ fn marker_oracle_rejects_clipped_marker_fragments() {
     // in the truncation notice closed the fragment.
     for (case, text) in [
         ("cut mid nonce", "password=[REDACTED:C6:8124\n[truncated]"),
-        ("cut mid hex field", "password=[REDACTED:C6:8124567890abcdef8124567890abcdef\n[truncated]"),
-        ("executor missing close", "[REDACTED:C6:8124567890abcdef8124567890abcdef:8124567890abcdef8124567890abcdef\n[truncated]"),
-        ("display label cut deep", "[REDACTED:SECRET_ASSIG\n[truncated]"),
+        (
+            "cut mid hex field",
+            "password=[REDACTED:C6:8124567890abcdef8124567890abcdef\n[truncated]",
+        ),
+        (
+            "executor missing close",
+            "[REDACTED:C6:8124567890abcdef8124567890abcdef:8124567890abcdef8124567890abcdef\n[truncated]",
+        ),
+        (
+            "display label cut deep",
+            "[REDACTED:SECRET_ASSIG\n[truncated]",
+        ),
         ("bare prefix at tail", "password=[REDACTED:"),
         ("prefix fragment mid text", "password=[R\n[truncated]"),
         ("prefix fragment deeper", "x=[RED\n[truncated]"),
-        ("second marker clipped", "a [REDACTED:SECRET_ASSIGNMENT] b [REDACTED:PRIVATE_KE\n[truncated]"),
+        (
+            "second marker clipped",
+            "a [REDACTED:SECRET_ASSIGNMENT] b [REDACTED:PRIVATE_KE\n[truncated]",
+        ),
     ] {
-        assert!(!every_marker_is_complete(text), "must reject clipped: {case}");
+        assert!(
+            !every_marker_is_complete(text),
+            "must reject clipped: {case}"
+        );
     }
     // Pin the replaced oracle's blind spot: it accepted the clipped nonce.
     fn weak_every_marker_is_complete(text: &str) -> bool {
-        text.split("[REDACTED:").skip(1).all(|rest| rest.contains(']'))
+        text.split("[REDACTED:")
+            .skip(1)
+            .all(|rest| rest.contains(']'))
     }
-    assert!(weak_every_marker_is_complete("password=[REDACTED:C6:8124\n[truncated]"));
+    assert!(weak_every_marker_is_complete(
+        "password=[REDACTED:C6:8124\n[truncated]"
+    ));
 }
