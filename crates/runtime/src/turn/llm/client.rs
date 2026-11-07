@@ -12958,6 +12958,917 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_dsml_orphan_closers_preserve_answer() {
+        let answer = "Mailbox permission is required.";
+        let content =
+            format!("{answer}</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>");
+        let mut frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .collect::<Vec<_>>();
+        frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let result = collect_llm_stream(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect orphan protocol suffix");
+        assert_eq!(result.full_text, answer);
+        assert!(
+            result.tool_calls.is_empty(),
+            "closing tags do not identify a call"
+        );
+        let visible = updates
+            .into_iter()
+            .filter_map(|update| match update {
+                LlmStreamUpdate::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(visible, answer);
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(nonstream.full_text, answer);
+        assert!(nonstream.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_calls_use_the_existing_wire_authority() {
+        let markup = concat!(
+            " Starting.\n<｜DSML｜ calls><｜DSML｜ invoke name=\"search\">",
+            "<｜DSML｜ parameter name=\"query\" string=\"true\">123</｜DSML｜ parameter>",
+            "<｜DSML｜ parameter name=\"count\" string=\"false\">5</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke><｜DSML｜ invoke name=\"undeclared\">{}",
+            "</｜DSML｜ invoke></｜DSML｜ calls>Ready. ",
+        );
+        let allowed = HashSet::from(["search".to_owned()]);
+        for native in [false, true] {
+            let mut delta = json!({"content":markup});
+            if native {
+                delta["tool_calls"] = json!([{
+                    "index":0,"id":"native-search","type":"function",
+                    "function":{"name":"search","arguments":"{\"query\":\"native\",\"count\":1}"},
+                }]);
+            }
+            let event = json!({"choices":[{"delta":delta,"finish_reason":"stop"}]});
+            let mut updates = Vec::new();
+            let mut callback = |update| updates.push(update);
+            let result = collect_llm_stream_for_wire(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {event}\n\ndata: [DONE]\n\n"
+                )))]),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &allowed,
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .expect("collect native or recovered DSML call");
+            assert_eq!(result.full_text, " Starting.\nReady. ");
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":delta,"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("search")]
+            );
+            let arguments: Value = serde_json::from_str(
+                result.tool_calls[0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                arguments,
+                if native {
+                    json!({"query":"native","count":1})
+                } else {
+                    json!({"query":"123","count":5})
+                }
+            );
+            if native {
+                assert_eq!(result.tool_calls[0]["id"], "native-search");
+            }
+            let visible = updates
+                .into_iter()
+                .filter_map(|update| match update {
+                    LlmStreamUpdate::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(visible, result.full_text);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_invalid_input_reaches_strict_admission() {
+        let markup = "<｜DSML｜ calls><｜DSML｜ invoke name=\"search\"><｜DSML｜ parameter name=\"count\" string=\"false\">invalid</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        let event = json!({"choices":[{"delta":{"content":markup},"finish_reason":"stop"}]});
+        let allowed = HashSet::from(["search".to_owned()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(vec![Ok(Bytes::from(format!(
+                "data: {event}\n\ndata: [DONE]\n\n"
+            )))]),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            None,
+            None,
+        )
+        .await
+        .expect("retain failed named tool input");
+        assert_eq!(result.full_text, "");
+        let call = &result.tool_calls[0];
+        assert_eq!(call["function"]["name"], "search");
+        assert_eq!(
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+            Err("arguments contain incomplete or invalid JSON")
+        );
+        let edge =
+            astra_turn_core::stream_events::build_edge_tool_call_event(call.as_object().unwrap());
+        assert_eq!(edge["arguments"]["_parse_error"]["executed"], false);
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_malformed_outer_owns_nested_calls() {
+        for (content, outer_name) in [
+            (
+                r#"<||DSML||tool_calls><||DSML||invoke name=""><||DSML||invoke name="bash"><||DSML||parameter name="command">pwd</||DSML||parameter></||DSML||invoke></||DSML||invoke></||DSML||tool_calls>"#,
+                None,
+            ),
+            (
+                r#"<||DSML||tool_calls><||DSML||invoke><||DSML||invoke name="bash">{"command":"pwd"}</||DSML||invoke></||DSML||invoke></||DSML||tool_calls>"#,
+                None,
+            ),
+            (
+                r#"<｜DSML｜ calls><｜DSML｜ invoke name="write_file"><｜DSML｜ calls></｜DSML｜ calls><｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke></｜DSML｜ invoke></｜DSML｜ calls>"#,
+                Some("write_file"),
+            ),
+        ] {
+            let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+            let event = json!({"choices":[{"delta":{"content":content},"finish_reason":"stop"}]});
+            let result = collect_llm_stream_for_wire(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {event}\n\ndata: [DONE]\n\n"
+                )))]),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &allowed,
+                None,
+                None,
+            )
+            .await
+            .expect("collect malformed outer invocation");
+            assert_eq!(result.full_text, "");
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                outer_name.into_iter().map(Some).collect::<Vec<_>>()
+            );
+            for call in &result.tool_calls {
+                assert_eq!(
+                    astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+                    Err("arguments contain incomplete or invalid JSON")
+                );
+                let edge = astra_turn_core::stream_events::build_edge_tool_call_event(
+                    call.as_object().unwrap(),
+                );
+                assert_eq!(edge["arguments"]["_parse_error"]["executed"], false);
+            }
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(
+                nonstream
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                outer_name.into_iter().map(Some).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_markdown_examples_remain_data() {
+        let call = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
+        for content in [
+            format!("- ~~~xml\n\n  {call}\n  ~~~\n"),
+            format!("1. ~~~xml\n\n   {call}\n   ~~~\n"),
+            format!("> ~~~text\n> {call}\n> ~~~"),
+            format!("    {call}\n"),
+            format!("- ~~~text\n  {call}\n  ~~~"),
+            format!("1. ~~~text\n   {call}\n   ~~~"),
+            format!("> - ~~~text\n>   {call}\n>   ~~~"),
+            format!("100. ~~~text\n     {call}\n     ~~~"),
+            format!("```text\n> ```\n{call}\n```"),
+            format!("> - ~~~xml\n>\n>   {call}\n>   ~~~\n"),
+            format!(">\t~~~xml\n> {call}\n> ~~~\n"),
+            format!("\t{call}\n"),
+        ]
+        .into_iter()
+        .flat_map(|text| [text.clone(), text.replace("~~~", "```")])
+        .flat_map(|text| ["\n", "\r\n"].map(|ending| text.replace('\n', ending)))
+        {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["bash".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .expect("collect Markdown example");
+                assert!(
+                    result.tool_calls.is_empty(),
+                    "Markdown is data: {content:?}"
+                );
+                assert_eq!(result.full_text, content);
+                assert_eq!(published, content);
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(nonstream.full_text, content);
+                assert!(nonstream.tool_calls.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_non_protocol_names_remain_literal() {
+        let content =
+            r#"<|DSML|invoke-example name="bash">{"command":"pwd"}</|DSML|invoke-example>"#;
+        for character_chunks in [false, true] {
+            let chunks = if character_chunks {
+                content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![content.to_owned()]
+            };
+            let mut frames = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                    Ok(Bytes::from(format!("data: {event}\n\n")))
+                })
+                .collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(result.tool_calls.is_empty());
+            assert_eq!(result.full_text, content);
+            assert_eq!(published, content);
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, content);
+            assert!(nonstream.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_inline_code_continuation_resumes_call_recovery() {
+        let content = "Before `foo\n    bar`\n<|DSML|invoke name=\"bash\">{\"command\":\"pwd\"}</|DSML|invoke>";
+        for character_chunks in [false, true] {
+            let chunks = if character_chunks {
+                content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+            } else {
+                vec![content.to_owned()]
+            };
+            let mut frames = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                    Ok(Bytes::from(format!("data: {event}\n\n")))
+                })
+                .collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "Before `foo\n    bar`\n");
+            assert_eq!(published, result.full_text);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("bash")]
+            );
+            assert_eq!(
+                astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                    &result.tool_calls[0]
+                )
+                .unwrap(),
+                json!({"command":"pwd"})
+            );
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, result.full_text);
+            assert_eq!(nonstream.tool_calls[0]["function"]["name"], "bash");
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_fragmented_long_prefixes_are_preserved_or_hidden() {
+        let fence_info = format!(
+            "~~~{}\n<|DSML|invoke name=\"bash\">{{\"command\":\"pwd\"}}</|DSML|invoke>\n~~~\n",
+            "x`".repeat(32_000)
+        );
+        for (content, expected) in [
+            (fence_info.clone(), fence_info),
+            (" ".repeat(512 * 1024), " ".repeat(512 * 1024)),
+            (
+                format!("<|DSML|invoke name=\"{}", "a".repeat(512 * 1024)),
+                String::new(),
+            ),
+        ] {
+            let mut frames=content.as_bytes().chunks(16).map(|chunk| {
+                let event=json!({"choices":[{"delta":{"content":std::str::from_utf8(chunk).unwrap()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            }).collect::<Vec<_>>();
+            frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+            let mut published = String::new();
+            let mut callback = |update| {
+                if let LlmStreamUpdate::Text(text) = update {
+                    published.push_str(&text);
+                }
+            };
+            let result = collect_llm_stream_for_wire(
+                stream::iter(frames),
+                "deepseek-test",
+                Instant::now(),
+                None,
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                &HashSet::from(["bash".to_owned()]),
+                Some(&mut callback),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, expected);
+            assert_eq!(published, expected);
+            assert!(result.tool_calls.is_empty());
+            let nonstream = parse_openai_compatible_nonstream_response(
+                &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                "deepseek-test",
+            );
+            assert_eq!(nonstream.full_text, expected);
+            assert!(nonstream.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_markdown_blocks_and_physical_lines() {
+        let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        let first = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"a.txt"}</||DSML||invoke></||DSML||
+ tool_calls>"#;
+        let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
+        for (content, expected, paths) in [
+            (
+                "<|DSML|invoke name=\"read_file\"><|DSML|parameter name=\"path\" string=\"true\">line1\rline2\nline3</|DSML|parameter></|DSML|invoke>".to_owned(),
+                String::new(),
+                vec!["line1\rline2\nline3"],
+            ),
+            (
+                format!("```example```\n{call}"),
+                "```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("``example``\n{call}"),
+                "``example``\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Text ```example```\n{call}"),
+                "Text ```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("```text\n{call}\n```\n{call}"),
+                format!("```text\n{call}\n```\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<pre>\n{call}\n</pre>\n{call}"),
+                format!("<pre>\n{call}\n</pre>\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<!--\n{call}\n-->\n{call}"),
+                format!("<!--\n{call}\n-->\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<div>\n{call}\n</div>\n\n{call}"),
+                format!("<div>\n{call}\n</div>\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("<div>\n{call}\n</div>\n{call}"),
+                format!("<div>\n{call}\n</div>\n{call}"),
+                vec![],
+            ),
+            (
+                format!("Answer <code>{call}</code>. {call}"),
+                format!("Answer <code>{call}</code>. "),
+                vec!["README.md"],
+            ),
+            (
+                format!("Answer <br>{call}"),
+                "Answer <br>".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("> <pre>\n> example\n{call}"),
+                "> <pre>\n> example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("> <!--\n> example\n{call}"),
+                "> <!--\n> example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Use a ` character\n===\n`{call}`"),
+                format!("Use a ` character\n===\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character\n===\n{call}"),
+                "Use a ` character\n===\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Text\n    `example\n{call}`"),
+                format!("Text\n    `example\n{call}`"),
+                vec![],
+            ),
+            (
+                format!("Text\n\n    `example\n    {call}`\n"),
+                format!("Text\n\n    `example\n    {call}`\n"),
+                vec![],
+            ),
+            (
+                format!("Example opener: \\<|DSML|calls>\n\n<|DSML|calls>{call}</|DSML|calls>"),
+                "Example opener: \\<|DSML|calls>\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!(
+                    "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n<|DSML|calls>{call}</|DSML|calls>"
+                ),
+                "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("# Example opener: \\<|DSML|calls>\n<|DSML|calls>{call}</|DSML|calls>"),
+                "# Example opener: \\<|DSML|calls>\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("The literal is: \\{call}"),
+                format!("The literal is: \\{call}"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character.\n\n`{call}`"),
+                format!("Use a ` character.\n\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Use a ` character.\n\n{call}"),
+                "Use a ` character.\n\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                format!("- Example\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
+                vec![],
+            ),
+            (
+                format!("- Example\n  ~~~text\n  example\n{call}"),
+                "- Example\n  ~~~text\n  example\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                "one</|DSML|\ncalls>    two</|DSML|calls>three".to_owned(),
+                "one    twothree".to_owned(),
+                vec![],
+            ),
+            (
+                format!("{first}    {second}"),
+                "    ".to_owned(),
+                vec!["a.txt", "b.txt"],
+            ),
+        ].into_iter().flat_map(|(content, expected, paths)| ["\n", "\r\n"].map(|ending| (
+            content.replace('\n', ending), expected.replace('\n', ending),
+            paths.iter().map(|path| path.replace('\n', ending)).collect::<Vec<_>>()
+        ))) {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["read_file".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.full_text, expected, "{content:?}");
+                assert_eq!(published, expected);
+                let arguments = result
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        assert_eq!(call["function"]["name"], "read_file");
+                        astra_turn_core::tool::args::shape::parse_tool_call_arguments(call).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    arguments,
+                    paths
+                        .iter()
+                        .map(|path| json!({"path":path}))
+                        .collect::<Vec<_>>()
+                );
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(nonstream.full_text, expected);
+                assert_eq!(
+                    nonstream
+                        .tool_calls
+                        .iter()
+                        .map(
+                            |call| astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                                call
+                            )
+                            .unwrap()
+                        )
+                        .collect::<Vec<_>>(),
+                    arguments
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_degraded_markup_respects_literal_and_outer_ownership() {
+        let call = r#"<|DSML|invoke name="bash">{"command":"pwd"}</|DSML|invoke>"#;
+        let nested =
+            r#"<|DSML|invoke name="bash"><parameter name="command">pwd</parameter></|DSML|invoke>"#;
+        let legacy = "<tool_call>bash)(pwd)</tool_call>";
+        for (content, literal, expected) in [
+            (format!("<Invoke>{nested}</Invoke>"), false),
+            (format!("< invoke>{nested}</invoke>"), false),
+            (format!("<invoke>{nested}</invoke>"), false),
+            (format!("<Invoke name=\"\">{nested}</Invoke>"), false),
+            (
+                format!("<invoke label='name=\"bash\"'>{nested}</invoke>"),
+                false,
+            ),
+            (
+                format!("<invoke tool_name=\"bash\">{nested}</invoke>"),
+                false,
+            ),
+            ("<!--\n<invoke name=\"bash\">\n-->".to_owned(), true),
+            (
+                "Text <code><parameter=example> pwd</code>.".to_owned(),
+                true,
+            ),
+            (format!("<section>\n{call}\n</section>\n"), true),
+            (format!("<style>\n{call}\n</style>\n"), true),
+            (format!("<textarea>\n{call}\n</textarea>\n"), true),
+            (format!("<my-widget>\n{call}\n</my-widget>\n"), true),
+            (format!("<pre>\n{call}\n</pre>\n"), true),
+            (format!("<!--\n{call}\n-->\n"), true),
+            (format!("<pre>\nexample\n</pre>\n    {call}"), true),
+            (format!("<!--\nexample\n-->\n    {call}"), true),
+            (format!("Answer <code>{call}</code>."), true),
+            (format!("> <pre>\n> {call}\n> </pre>\n"), true),
+            (format!("<div class=\"example\">\n{call}\n</div>\n"), true),
+            (format!("<invoke name=\"\">{call}</invoke>"), false),
+            (
+                format!("<parameter name=\"example\">{call}</parameter>"),
+                false,
+            ),
+            (
+                format!("<|DSML|parameter name=\"example\">{legacy}</|DSML|parameter>"),
+                false,
+            ),
+            (format!("<|DSML|calls>{legacy}</|DSML|calls>"), false),
+        ]
+        .into_iter()
+        .map(|(content, literal)| (content, literal, None))
+        .chain(
+            [
+                r#"<Invoke name="bash"><parameter name="command">pwd</parameter></Invoke>"#,
+                r#"< invoke name="bash"><parameter name="command">pwd</parameter></invoke>"#,
+                r#"<invoke name="bash"><parameter name="command">pwd</parameter></invoke>"#,
+                r#"<invoke name='bash'><parameter name='command'>pwd</parameter></invoke>"#,
+            ]
+            .map(|content| (content.to_owned(), false, Some(json!({"command":"pwd"})))),
+        ) {
+            for character_chunks in [false, true] {
+                let chunks = if character_chunks {
+                    content.chars().map(|c| c.to_string()).collect()
+                } else {
+                    vec![content.clone()]
+                };
+                let mut frames = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let event = json!({"choices":[{"delta":{"content":chunk}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .collect::<Vec<_>>();
+                frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let result = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::from(["bash".to_owned()]),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                for calls in [&result.tool_calls, &nonstream.tool_calls] {
+                    let actual = calls
+                        .iter()
+                        .map(|call| {
+                            assert_eq!(call["function"]["name"], "bash");
+                            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual,
+                        expected.iter().cloned().collect::<Vec<_>>(),
+                        "{content:?}"
+                    );
+                }
+                if literal {
+                    assert_eq!(result.full_text, content);
+                    assert_eq!(published, content);
+                    assert_eq!(nonstream.full_text, content);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_degraded_markup_delivers_prose_before_line_or_stream_end() {
+        for text in [
+            "1. This is an ordinary answer arriving incrementally.",
+            "- An ordinary bullet.",
+            "# An ordinary heading",
+            "(An ordinary opening parenthesis)",
+        ] {
+            let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+            let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                let input = stream::unfold(receiver, |mut receiver| async {
+                    receiver.recv().await.map(|bytes| (Ok(bytes), receiver))
+                });
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        let _ = updates.send(text);
+                    }
+                };
+                collect_llm_stream_for_wire(
+                    Box::pin(input),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &HashSet::new(),
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+            });
+            let event = json!({"choices":[{"delta":{"content":text}}]});
+            sender
+                .send(Bytes::from(format!("data: {event}\n\n")))
+                .await
+                .unwrap();
+            let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut published = String::new();
+                while published != text {
+                    published.push_str(
+                        &received
+                            .recv()
+                            .await
+                            .expect("text callback while stream stays open"),
+                    );
+                }
+                published
+            })
+            .await;
+            if delivered.is_err() {
+                task.abort();
+            }
+            assert_eq!(
+                delivered.expect("ordinary prose must be delivered before newline or EOF"),
+                text
+            );
+            sender.send(Bytes::from("data: [DONE]\n\n")).await.unwrap();
+            assert_eq!(task.await.unwrap().unwrap().full_text, text);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_dsml_parameter_markup_preserves_answer_suffix() {
+        let content = r#"Before.<||DSML||tool_calls><||DSML||invoke name="write_file"><||DSML||parameter name="path">example.txt</||DSML||parameter><||DSML||parameter name="content"><parameter=x>hello</||DSML||parameter></||DSML||invoke></||DSML||tool_calls>After."#;
+        let mut frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .collect::<Vec<_>>();
+        frames.push(Ok(Bytes::from("data: [DONE]\n\n")));
+        let mut published = String::new();
+        let mut callback = |update| {
+            if let LlmStreamUpdate::Text(text) = update {
+                published.push_str(&text);
+            }
+        };
+        let result = collect_llm_stream_for_wire(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &HashSet::from(["write_file".to_owned()]),
+            Some(&mut callback),
+            None,
+        )
+        .await
+        .expect("collect markup inside a string parameter");
+        assert_eq!(published, "Before.After.");
+        assert_eq!(result.full_text, published);
+        assert_eq!(
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(&result.tool_calls[0])
+                .unwrap(),
+            json!({"path":"example.txt","content":"<parameter=x>hello"})
+        );
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(nonstream.full_text, published);
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_never_publishes_degraded_dsml_markup() {
         let d1 = json!({"choices":[{"delta":{"content":"visible before\n<｜｜DS"}}]});
         let d2 = json!({"choices":[{"delta":{"content":"ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});

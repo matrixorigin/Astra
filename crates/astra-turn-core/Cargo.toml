@@ -26,6 +26,7 @@ dirs = "6.0.0"
 fastrand = "2"
 fnv = "1.0"
 futures-util = { workspace = true }
+pulldown-cmark = "0.12"
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

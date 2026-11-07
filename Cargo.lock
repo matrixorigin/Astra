@@ -839,6 +839,7 @@ dependencies = [
  "fnv",
  "futures-util",
  "proptest",
+ "pulldown-cmark",
  "regex",
  "reqwest 0.12.28",
  "serde",
