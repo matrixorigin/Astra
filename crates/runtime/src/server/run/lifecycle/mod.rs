@@ -2262,6 +2262,7 @@ async fn load_exact_indexed_interaction_event(
 /// durable run is still active when a decision arrives.
 struct DurableRunApprovalGate {
     user_id: String,
+    initial_interaction_mode: RequestedTurnInteractionMode,
     context: astra_turn_core::ws_approval_gate::ApprovalJournalContext,
     run_engine: RunEngine,
     runs: Arc<RwLock<HashMap<String, RunState>>>,
@@ -2330,6 +2331,7 @@ impl DurableRunApprovalGate {
         stream_event_tx: Option<mpsc::Sender<Value>>,
     ) -> Self {
         Self {
+            initial_interaction_mode: RequestedTurnInteractionMode::Prompt,
             user_id,
             context: astra_turn_core::ws_approval_gate::ApprovalJournalContext::new(
                 session_id, run_id, turn,
@@ -2343,6 +2345,11 @@ impl DurableRunApprovalGate {
             #[cfg(test)]
             wait_started_tx: std::sync::Mutex::new(None),
         }
+    }
+
+    fn with_interaction_mode(mut self, mode: RequestedTurnInteractionMode) -> Self {
+        self.initial_interaction_mode = mode;
+        self
     }
 
     fn with_cancel_token(mut self, cancel_token: Arc<CancellationToken>) -> Self {
@@ -2638,6 +2645,29 @@ impl DurableRunApprovalGate {
 
 #[async_trait]
 impl astra_tools::ToolApprovalGate for DurableRunApprovalGate {
+    async fn plan_review_required(&self) -> bool {
+        match self
+            .run_engine
+            .permission_mode_snapshot(
+                &self.user_id,
+                &self.context.session_id,
+                &self.context.run_id,
+            )
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot.applied.as_ref().map_or(
+                self.initial_interaction_mode != RequestedTurnInteractionMode::Auto,
+                |applied| {
+                    !matches!(
+                        applied.selection.mode,
+                        PermissionMode::Auto | PermissionMode::Bypass
+                    )
+                },
+            ),
+            Ok(None) | Err(_) => true,
+        }
+    }
+
     async fn request_approval(
         &self,
         request_id: &str,
@@ -3830,12 +3860,6 @@ fn build_runtime_turn_evaluation_event(
             json!(state.current_run_owner_generation),
         );
         metadata.insert("llm_rounds".into(), json!(state.llm_rounds_completed));
-        if let Some(notice) = astra_turn_core::evaluation::turn_evaluation_status_notice_for_records(
-            &eval,
-            &state.stall.tool_call_records,
-        ) {
-            metadata.insert("status_notice".into(), Value::String(notice));
-        }
         metadata.insert("tool_evaluation_success".into(), Value::Bool(eval.success));
         metadata.insert("run_status".into(), Value::String(settled_status.into()));
         metadata.insert(
@@ -7146,6 +7170,7 @@ impl AgenticRunLifecycleService {
         turn: u32,
         token: Arc<CancellationToken>,
         interactive: bool,
+        interaction_mode: RequestedTurnInteractionMode,
         provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
     ) {
         let (approval_tx, approval_rx) = interactive.then(|| mpsc::channel::<Value>(64)).unzip();
@@ -7159,6 +7184,7 @@ impl AgenticRunLifecycleService {
             approval_tx,
             None,
         )
+        .with_interaction_mode(interaction_mode)
         .with_cancel_token(token.clone());
         executor.set_approval_gate(Arc::new(approval_gate));
         if let Some(rx) = approval_rx {
@@ -16015,6 +16041,7 @@ impl AgenticRunLifecycleService {
                         Some(approval_tx),
                         event_tx.clone(),
                     )
+                    .with_interaction_mode(Self::effective_requested_interaction_mode(&request))
                     .with_cancel_token(llm_cancel_token.clone());
                     executor.set_approval_gate(std::sync::Arc::new(approval_gate));
                     self.approval_channels
@@ -24576,6 +24603,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         None,
                         None,
                     )
+                    .with_interaction_mode(config.interaction_mode)
                     .with_cancel_token(local_cancel_token.clone()),
                 ));
                 let user_prompt_gate = Arc::new(

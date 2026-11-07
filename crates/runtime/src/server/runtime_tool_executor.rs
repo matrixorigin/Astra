@@ -16904,6 +16904,17 @@ for line in sys.stdin:
                 .set_active_plan(user_id, session_id, plan_id)
                 .await
         }
+        async fn finish_authoring(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            plan_id: &str,
+            version: u64,
+        ) -> Result<bool, astra_plan::PlanLoadError> {
+            self.inner
+                .finish_authoring(user_id, session_id, plan_id, version)
+                .await
+        }
         async fn active_plan_for_session(
             &self,
             user_id: &str,
@@ -17236,6 +17247,28 @@ for line in sys.stdin:
         ) -> Result<(), astra_plan::PlanLoadError> {
             *self.active_plan.write().await = plan_id.map(str::to_string);
             Ok(())
+        }
+        async fn finish_authoring(
+            &self,
+            _user_id: &str,
+            _session_id: &str,
+            plan_id: &str,
+            version: u64,
+        ) -> Result<bool, astra_plan::PlanLoadError> {
+            let mut active = self.active_plan.write().await;
+            let mut plan = self.plan_state.write().await;
+            if active.as_deref() != Some(plan_id)
+                || !plan
+                    .as_ref()
+                    .is_some_and(|(id, state)| id == plan_id && state.version == version)
+            {
+                return Ok(false);
+            }
+            if let Some((_, state)) = plan.as_mut() {
+                state.session_hint = None;
+            }
+            *active = None;
+            Ok(true)
         }
         async fn active_plan_for_session(
             &self,

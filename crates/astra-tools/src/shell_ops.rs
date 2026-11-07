@@ -37,36 +37,8 @@ fn is_background_task_tool_shell_invocation(command: &str, tool: &str) -> bool {
     })
 }
 
-/// Reject bash commands that try to read background-task output files
-/// directly off disk (`/tmp/astra/bg_tasks/...` or `${TMPDIR}/astra/bg_tasks/...`).
-/// The model must use `task_output` for this — disk reads bypass the
-/// snapshot protocol, return stale partial bytes mid-write, and miss
-/// the registry's terminal-status accounting. Reading these files via
-/// bash is the canonical "I'm polling" anti-pattern from the trace
-/// where a model burned 12 LLM rounds tail'ing the stderr file.
-pub fn background_task_output_dir_read_error(command: &str) -> Option<String> {
-    if !command.contains("bg_tasks") {
-        return None;
-    }
-    let lower = command.to_ascii_lowercase();
-    let bg_path_marker = "/astra/bg_tasks/";
-    if !lower.contains(bg_path_marker) {
-        return None;
-    }
-    Some(
-        "Error: bash cannot read background task output files directly. \
-         Call the `task_output` tool with the task_id (e.g. `bg-shell-1`) instead. \
-         For a terminal failure, use its `pattern` argument to search an exact test or error \
-         with bounded context. \
-         The runtime delivers a <task_notification> when the task terminates; \
-         polling the on-disk files via bash returns stale partial bytes and \
-         bypasses terminal-status reporting."
-            .into(),
-    )
-}
-
 pub fn background_task_tool_pseudo_call_error(command: &str) -> Option<String> {
-    let tool = ["task_output", "task_list", "task_stop"]
+    let tool = ["task_output", "task_list", "task_input", "task_stop"]
         .into_iter()
         .find(|tool| is_background_task_tool_shell_invocation(command, tool))?;
     Some(format!(
@@ -78,27 +50,11 @@ pub fn background_task_tool_pseudo_call_error(command: &str) -> Option<String> {
     ))
 }
 
-/// Canonical bash pre-execution validator for the background-task contract.
-///
-/// Returns `Err(message)` for the two anti-patterns that *must* be blocked
-/// at the validator layer in every bash entry point:
-///
-/// 1. Pseudo-tool invocations (`task_output(...)`, `task_list`, `task_stop ...`)
-///    — the model thinks these are shell programs. Blocking here turns the
-///    mistake into an immediate corrective error instead of a `command not
-///    found` round-trip.
-/// 2. Direct disk reads of background-task stdout/stderr files
-///    (`tail /tmp/astra/bg_tasks/...`). The trace this guards against had a
-///    model burn 12 LLM rounds tail'ing a stderr file instead of calling
-///    `task_output`.
-///
-/// All bash entry points (in-process and edge) MUST funnel through this
-/// helper. Adding a new check requires editing one place, not two.
+/// Correct tool-as-program mistakes and protect private runtime artifacts.
+/// Ordinary authorized log inspection is allowed; observation frequency is
+/// the model's decision within the normal execution budgets.
 pub fn validate_bash_background_task_contract(command: &str) -> Result<(), String> {
     if let Some(err) = background_task_tool_pseudo_call_error(command) {
-        return Err(err);
-    }
-    if let Some(err) = background_task_output_dir_read_error(command) {
         return Err(err);
     }
     if let Some(err) =
@@ -1180,13 +1136,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     }
     if coordination_unsettled
         || scope_quarantined
-        || (execution_started
-            && scope_ownership.is_none()
-            && !crate::workspace_observation::bash_command_is_detachable_safe(
-                args.get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            ))
+        || (execution_started && scope_ownership.is_none())
     {
         result.is_error = true;
         result.output.push_str("\n\nThe command's final outcome could not be confirmed; a child process may still be running. Inspect the current state before retrying.");
@@ -5957,41 +5907,14 @@ printf 'probe.txt:1:needle\n'
         );
     }
 
-    /// Regression: bash must refuse to read background task stdout/stderr
-    /// files directly off disk. The trace this guards against had a model
-    /// burn 12 LLM rounds running `tail /tmp/astra/bg_tasks/default/bg-shell-1.stderr`
-    /// instead of calling `task_output` — that's the canonical polling
-    /// anti-pattern. The denial is path-aware (it allows unrelated
-    /// commands that happen to mention "bg_tasks") and unconditional on
-    /// the read tool (tail/cat/head/less/grep all fail equivalently
-    /// because the validator doesn't care HOW you'd read it).
     #[test]
-    fn validate_execute_bash_rejects_background_task_output_dir_reads() {
+    fn authorized_background_log_reads_are_not_a_polling_policy_error() {
         for command in [
-            "tail -20 /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
-            "cat /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
-            "head -50 /tmp/astra/bg_tasks/some-session/bg-shell-2.stderr",
-            "less /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
-            "wc -l /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
-            "grep error /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
-            "tail -f /var/folders/abc/T/astra/bg_tasks/sess-1/bg-shell-1.stdout",
+            "tail -20 /tmp/astra/bg_tasks/default/task.stderr",
+            "cat /tmp/astra/bg_tasks/default/task.stdout",
         ] {
-            let error = validate_execute_bash_command(command).expect_err(command);
-            assert!(
-                error.contains("background task output files"),
-                "{command}: {error}"
-            );
-            assert!(error.contains("task_output"), "{command}: {error}");
-            assert!(error.contains("pattern"), "{command}: {error}");
+            assert!(validate_execute_bash_command(command).is_ok(), "{command}");
         }
-        assert!(
-            validate_execute_bash_command("echo bg_tasks is not a path here").is_ok(),
-            "the literal word 'bg_tasks' without the astra path prefix must not trigger"
-        );
-        assert!(
-            validate_execute_bash_command("ls /tmp/astra/").is_ok(),
-            "directories above bg_tasks/ remain freely listable"
-        );
     }
 
     /// Runtime-owned tool-result artifacts are not workspace files. Blocking

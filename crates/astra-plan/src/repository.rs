@@ -119,6 +119,16 @@ pub trait PlanRepository: Send + Sync {
         plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError>;
 
+    /// Finish only the exact submitted revision still bound to this session.
+    /// A concurrent edit/rebind returns false and must retain authoring.
+    async fn finish_authoring(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        plan_id: &str,
+        expected_version: u64,
+    ) -> Result<bool, PlanLoadError>;
+
     /// Return the currently active `plan_id` for an owned session, if any.
     async fn active_plan_for_session(
         &self,
@@ -556,6 +566,39 @@ impl PlanRepository for CloudPlanRepository {
         Ok(())
     }
 
+    async fn finish_authoring(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        plan_id: &str,
+        expected_version: u64,
+    ) -> Result<bool, PlanLoadError> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        // Lock the binding before touching its plan. Approval is not authority
+        // to clear a newer plan selected while the review was open.
+        let binding: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+        ).bind(user_id).bind(session_id).fetch_optional(&mut *tx).await.map_err(map_sqlx)?;
+        if binding
+            .as_ref()
+            .is_some_and(|(active,)| active.as_deref() != Some(plan_id))
+        {
+            tx.rollback().await.map_err(map_sqlx)?;
+            return Ok(false);
+        }
+        let changed = sqlx::query(
+            "UPDATE plans SET session_id = NULL, updated_at = NOW(6) WHERE user_id = ? AND plan_id = ? AND version = ? AND session_id = ?",
+        ).bind(user_id).bind(plan_id).bind(expected_version).bind(session_id).execute(&mut *tx).await.map_err(map_sqlx)?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await.map_err(map_sqlx)?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE agent_sessions SET active_plan_id = NULL WHERE user_id = ? AND session_id = ? AND active_plan_id = ?")
+            .bind(user_id).bind(session_id).bind(plan_id).execute(&mut *tx).await.map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
+    }
+
     async fn active_plan_for_session(
         &self,
         user_id: &str,
@@ -750,6 +793,32 @@ impl PlanRepository for InMemoryPlanRepository {
             }
         }
         Ok(())
+    }
+
+    async fn finish_authoring(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        plan_id: &str,
+        expected_version: u64,
+    ) -> Result<bool, PlanLoadError> {
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
+        let binding_key = (user_id.to_string(), session_id.to_string());
+        if guard.active_plans.get(&binding_key).map(String::as_str) != Some(plan_id) {
+            return Ok(false);
+        }
+        let Some(plan) = guard
+            .plans
+            .get_mut(&(user_id.to_string(), plan_id.to_string()))
+        else {
+            return Ok(false);
+        };
+        if plan.version != expected_version {
+            return Ok(false);
+        }
+        plan.session_hint = None;
+        guard.active_plans.remove(&binding_key);
+        Ok(true)
     }
 
     async fn active_plan_for_session(

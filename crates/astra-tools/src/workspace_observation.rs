@@ -83,58 +83,6 @@ static DESIRED_STATE_MARKER_REGISTRY: OnceLock<
 const MAX_LIVE_DESIRED_STATE_MARKERS: usize = 4096;
 pub const OBSERVATION_RECEIPT_FIELD: &str = "workspace_observation_receipt";
 pub const OBSERVATION_SCOPE_FIELD: &str = "workspace_observation_scope";
-/// Minimal path for the only external helper allowed in a detached command
-/// (`sleep`). Builtins do not consult PATH, and clearing the inherited
-/// environment removes BASH_ENV, exported functions, LD_PRELOAD, and user
-/// PATH shadowing from the detached process.
-pub const DETACHABLE_PATH: &str = "/usr/bin:/bin";
-
-/// Detached execution is intentionally narrower than ordinary execution.
-/// Without a terminal-owned post receipt, only shell builtins (plus the
-/// harmless `sleep` helper used by interactive flows) are eligible; all
-/// filesystem/network/tool commands stay foreground where the observer can
-/// attribute their final state.
-pub fn bash_command_is_detachable_safe(command: &str) -> bool {
-    let command = command.trim();
-    if command.is_empty()
-        || ["&&", "||", ";", "|", ">", "<", "$(", "`", "\n", "&"]
-            .iter()
-            .any(|marker| command.contains(marker))
-    {
-        return false;
-    }
-    let mut words = command.split_whitespace();
-    let Some(first) = words.next() else {
-        return false;
-    };
-    if is_env_assignment(first) || first == "env" {
-        return false;
-    }
-    matches!(
-        first,
-        "echo" | "printf" | "pwd" | "true" | "false" | ":" | "test" | "[" | "sleep"
-    )
-}
-
-fn is_env_assignment(word: &str) -> bool {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
-        _ => return false,
-    }
-    let mut saw_equal = false;
-    for ch in chars {
-        if ch == '=' {
-            saw_equal = true;
-            break;
-        }
-        if !(ch.is_ascii_alphanumeric() || ch == '_') {
-            return false;
-        }
-    }
-    saw_equal
-}
-
 static WRITER_EPOCHS: OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<std::path::PathBuf, std::sync::Weak<WriterEpochState>>,
@@ -5538,21 +5486,6 @@ mod tests {
                 )
                 .is_none()
             );
-        }
-    }
-
-    #[test]
-    fn detached_gate_allows_only_non_mutating_builtin_shape() {
-        for command in ["echo done", "printf done", "pwd", "sleep 1"] {
-            assert!(bash_command_is_detachable_safe(command), "{command}");
-        }
-        for command in [
-            "env echo done",
-            "python3 -c 'open(\"out\", \"w\").write(\"x\")'",
-            "git status",
-            "find . -name '*.rs'",
-        ] {
-            assert!(!bash_command_is_detachable_safe(command), "{command}");
         }
     }
 

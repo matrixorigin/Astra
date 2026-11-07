@@ -5,7 +5,7 @@
 
 //! Background task proxy and projection functions.
 //!
-//! Bridges between [`super::background_tasks::BackgroundTaskRegistry`] and
+//! Bridges between [`crate::edge_tools::background_tasks::BackgroundTaskRegistry`] and
 //! the TUI rendering layer ([`super::bottom_pane::background_task_view`]).
 //! Extracted from `event_loop.rs` to keep the event loop focused on
 //! orchestration.
@@ -261,7 +261,7 @@ pub(crate) fn background_task_output_dir(session_id: Option<&str>) -> std::path:
 }
 
 pub(crate) async fn restore_background_task_projections(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     session_id: Option<&str>,
 ) -> Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
@@ -309,7 +309,7 @@ pub(crate) async fn restore_background_task_projections(
 }
 
 pub(crate) async fn persist_background_task_projections_if_changed(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     session_id: Option<&str>,
     model: Option<&str>,
     last_persisted: &mut Vec<astra_services::session_workspace::BackgroundShellTaskProjection>,
@@ -461,30 +461,8 @@ pub(crate) fn format_background_task_stop_error_system_message(
     }
 }
 
-fn shell_output_status(
-    status: super::background_tasks::BgTaskStatus,
-) -> crate::edge_tools::BgTaskOutputStatus {
-    match status {
-        super::background_tasks::BgTaskStatus::Running => {
-            crate::edge_tools::BgTaskOutputStatus::Running
-        }
-        super::background_tasks::BgTaskStatus::Stopping => {
-            crate::edge_tools::BgTaskOutputStatus::Stopping
-        }
-        super::background_tasks::BgTaskStatus::Completed => {
-            crate::edge_tools::BgTaskOutputStatus::Completed
-        }
-        super::background_tasks::BgTaskStatus::Failed => {
-            crate::edge_tools::BgTaskOutputStatus::Failed
-        }
-        super::background_tasks::BgTaskStatus::Killed => {
-            crate::edge_tools::BgTaskOutputStatus::Cancelled
-        }
-    }
-}
-
 pub(crate) async fn background_task_output_snapshot(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     task_id: &str,
     offset: u64,
     max_bytes: usize,
@@ -495,18 +473,29 @@ pub(crate) async fn background_task_output_snapshot(
             .get(task_id)
             .ok_or_else(|| BackgroundTaskError::not_found(task_id))?;
         (
-            shell_output_status(handle.status()),
+            handle.work_unit_status(),
             handle.description.clone(),
-            format!(
-                "stdout: {} · stderr: {}",
-                handle.stdout_path.display(),
-                handle.stderr_path.display()
-            ),
+            handle.output_reference(),
         )
     };
-    let (output, end_offset, total_bytes, total_lines) = background_registry
-        .get_combined_output_since_async(task_id, offset, max_bytes)
-        .await?;
+    // Sample before reading either stream. A racing write can cause a later
+    // duplicate wake, but cannot be acknowledged before it was observable.
+    let output_revision = if status.is_terminal() {
+        None
+    } else {
+        background_registry
+            .output_activity(task_id)
+            .map(|activity| *activity.borrow())
+    };
+    let (output, end_offset, total_bytes, total_lines) = if status.is_terminal() {
+        background_registry
+            .get_combined_output_since_async(task_id, offset, max_bytes)
+            .await?
+    } else {
+        background_registry
+            .get_live_output_async(task_id, max_bytes)
+            .await?
+    };
 
     Ok(crate::edge_tools::BgTaskOutputSnapshot {
         kind: "shell".to_string(),
@@ -517,11 +506,12 @@ pub(crate) async fn background_task_output_snapshot(
         total_lines,
         status,
         output_ref,
+        output_revision,
     })
 }
 
 pub(crate) async fn background_task_output_search_snapshot(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     task_id: &str,
     pattern: &str,
     context_lines: usize,
@@ -533,24 +523,11 @@ pub(crate) async fn background_task_output_search_snapshot(
             .get(task_id)
             .ok_or_else(|| BackgroundTaskError::not_found(task_id))?;
         (
-            shell_output_status(handle.status()),
+            handle.work_unit_status(),
             handle.description.clone(),
-            format!(
-                "stdout: {} · stderr: {}",
-                handle.stdout_path.display(),
-                handle.stderr_path.display()
-            ),
+            handle.output_reference(),
         )
     };
-    if !status.is_terminal() {
-        return Err(BackgroundTaskError::output_unavailable(
-            task_id,
-            format!(
-                "diagnostic search requires a terminal shell task; current status is {}. Use one current task_output snapshot and wait for the automatic completion notification.",
-                status.as_str()
-            ),
-        ));
-    }
     let (output, matching_lines, truncated) = background_registry
         .search_combined_output_async(task_id, pattern, context_lines, max_bytes)
         .await?;
@@ -618,6 +595,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
         total_lines,
         status,
         output_ref: format!("agent_state: {}", agent.agent_id),
+        output_revision: None,
     }
 }
 
@@ -659,6 +637,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
         total_lines,
         status,
         output_ref: format!("workspace_projection: {}", projection.id),
+        output_revision: None,
     }
 }
 
@@ -764,10 +743,10 @@ pub(crate) fn background_task_status_label(status: &str) -> &'static str {
 }
 
 pub(crate) fn background_task_event_system_message(
-    ev: &super::background_tasks::BgTaskEvent,
+    ev: &crate::edge_tools::background_tasks::BgTaskEvent,
 ) -> Option<String> {
     match ev {
-        super::background_tasks::BgTaskEvent::Completed {
+        crate::edge_tools::background_tasks::BgTaskEvent::Completed {
             id,
             title,
             exit_code,
@@ -785,19 +764,17 @@ pub(crate) fn background_task_event_system_message(
                 ))
             }
         }
-        super::background_tasks::BgTaskEvent::Failed { id, title, error } => Some(format!(
-            "Background shell {} failed: {error}",
-            background_shell_notification_label(id, title)
-        )),
-        // This is advisory activity evidence, not a lifecycle transition or
-        // a chat message. The workbench row projects it without interrupting
-        // the conversation.
-        super::background_tasks::BgTaskEvent::NoRecentOutput { .. } => None,
-        super::background_tasks::BgTaskEvent::Killed { id, title } => Some(format!(
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, title, error } => {
+            Some(format!(
+                "Background shell {} failed: {error}",
+                background_shell_notification_label(id, title)
+            ))
+        }
+        crate::edge_tools::background_tasks::BgTaskEvent::Killed { id, title } => Some(format!(
             "Background shell {} was stopped",
             background_shell_notification_label(id, title)
         )),
-        super::background_tasks::BgTaskEvent::Started { .. } => None,
+        crate::edge_tools::background_tasks::BgTaskEvent::Started { .. } => None,
     }
 }
 
@@ -811,14 +788,14 @@ pub(crate) fn background_shell_notification_label(id: &str, title: &str) -> Stri
 }
 
 pub(crate) fn background_task_event_system_messages(
-    events: &[super::background_tasks::BgTaskEvent],
+    events: &[crate::edge_tools::background_tasks::BgTaskEvent],
 ) -> Vec<String> {
     let low_risk_successes = events
         .iter()
         .filter(|ev| {
             matches!(
                 ev,
-                super::background_tasks::BgTaskEvent::Completed {
+                crate::edge_tools::background_tasks::BgTaskEvent::Completed {
                     exit_code: Some(0),
                     ..
                 }
@@ -832,7 +809,7 @@ pub(crate) fn background_task_event_system_messages(
     for ev in events {
         let is_low_risk_success = matches!(
             ev,
-            super::background_tasks::BgTaskEvent::Completed {
+            crate::edge_tools::background_tasks::BgTaskEvent::Completed {
                 exit_code: Some(0),
                 ..
             }
@@ -858,27 +835,21 @@ mod tests {
     use super::{background_task_output_dir, background_task_output_search_snapshot};
 
     #[tokio::test]
-    async fn diagnostic_search_rejects_live_shell_output() {
+    async fn diagnostic_search_observes_live_output_without_completing_the_task() {
         let temp = crate::tests::test_temp_dir();
-        let mut registry =
-            super::super::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
-        let task_id = registry.spawn_shell("sleep 5", "long test");
-
-        let error =
+        let mut registry = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("tasks"),
+        );
+        let task_id = registry.spawn_shell("sleep 10", "live diagnostics").await;
+        let snapshot =
             background_task_output_search_snapshot(&mut registry, &task_id, "failure", 3, 8192)
                 .await
-                .expect_err("live output must not be treated as stable diagnostic evidence");
-
-        assert!(
-            matches!(
-                error,
-                crate::background_task_error::BackgroundTaskError::OutputUnavailable {
-                    ref detail,
-                    ..
-                } if detail.contains("requires a terminal shell task")
-            ),
-            "{error}"
-        );
+                .unwrap();
+        assert!(!snapshot.status.is_terminal());
+        assert_eq!(snapshot.matching_lines, 0);
+        registry
+            .kill_all_and_wait(std::time::Duration::from_secs(3))
+            .await;
     }
 
     #[test]

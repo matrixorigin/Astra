@@ -58,7 +58,7 @@ fn enqueue_pushes_view_and_renders_plan_body_plus_choices() {
     );
     // All four choices present in the radio block.
     assert!(
-        frame.contains("Approve · auto"),
+        frame.contains("Approve · keep permissions"),
         "choice 1 missing:\n{frame}"
     );
     assert!(
@@ -75,13 +75,13 @@ fn enqueue_pushes_view_and_renders_plan_body_plus_choices() {
     );
     // Default selection marker on the first option.
     assert!(
-        frame.contains("● Approve · auto"),
-        "the active choice marker should sit on Approve · auto initially:\n{frame}"
+        frame.contains("● Approve · keep permissions"),
+        "the active choice marker should sit on Approve · keep permissions initially:\n{frame}"
     );
 }
 
 #[test]
-fn enter_on_default_selection_approves_with_auto_mode() {
+fn enter_on_default_selection_keeps_execution_permissions() {
     let mut bp = BottomPane::new();
     let mut rx = enqueue(&mut bp, "1. Plan");
 
@@ -93,10 +93,8 @@ fn enter_on_default_selection_approves_with_auto_mode() {
     );
     assert_eq!(
         rx.try_recv().unwrap(),
-        PlanReviewDecision::Approve {
-            mode: PermissionMode::Auto
-        },
-        "default selection corresponds to Approve · auto"
+        PlanReviewDecision::Approve { mode: None },
+        "default selection retains execution permissions"
     );
 }
 
@@ -111,7 +109,7 @@ fn tab_walks_through_each_choice_in_order() {
     assert_eq!(
         rx.try_recv().unwrap(),
         PlanReviewDecision::Approve {
-            mode: PermissionMode::AcceptEdits
+            mode: Some(PermissionMode::AcceptEdits)
         }
     );
 
@@ -123,7 +121,7 @@ fn tab_walks_through_each_choice_in_order() {
     assert_eq!(
         rx.try_recv().unwrap(),
         PlanReviewDecision::Approve {
-            mode: PermissionMode::Prompt
+            mode: Some(PermissionMode::Prompt)
         }
     );
 
@@ -141,7 +139,7 @@ fn shift_tab_moves_selection_backwards() {
     let mut bp = BottomPane::new();
     let mut rx = enqueue(&mut bp, "1. Plan");
 
-    // From default (auto), Shift+Tab wraps to Keep planning.
+    // From default (keep permissions), Shift+Tab wraps to Keep planning.
     bp.handle_key(shift(KeyCode::BackTab));
     bp.handle_key(key(KeyCode::Enter));
     assert_eq!(rx.try_recv().unwrap(), PlanReviewDecision::KeepPlanning);
@@ -157,7 +155,7 @@ fn number_keys_jump_directly_to_choice() {
     assert_eq!(
         rx.try_recv().unwrap(),
         PlanReviewDecision::Approve {
-            mode: PermissionMode::Prompt
+            mode: Some(PermissionMode::Prompt)
         },
         "number 3 must select Approve · default"
     );
@@ -206,9 +204,7 @@ fn scroll_keys_do_not_dispatch_a_decision() {
     bp.handle_key(key(KeyCode::Enter));
     assert_eq!(
         rx.try_recv().unwrap(),
-        PlanReviewDecision::Approve {
-            mode: PermissionMode::Auto
-        }
+        PlanReviewDecision::Approve { mode: None }
     );
 }
 
@@ -253,7 +249,7 @@ fn long_plan_remains_navigable_with_scroll() {
     );
     // Choice block is not eaten by the body.
     assert!(
-        frame.contains("Approve · auto"),
+        frame.contains("Approve · keep permissions"),
         "choice block must remain rendered even with a 40-line plan:\n{frame}"
     );
 }

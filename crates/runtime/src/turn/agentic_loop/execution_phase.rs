@@ -3947,6 +3947,22 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         state.last_llm_context_manifest_trace = Some(trace);
     }
+    let preparation_context_error = turn_result
+        .as_ref()
+        .err()
+        .filter(|error| error.kind == astra_core::ErrorKind::ContextWindow)
+        .cloned();
+    let turn_result = match turn_result {
+        Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => Ok(HostTurnResult {
+            accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                error_message: Some(error.message),
+                ..Default::default()
+            },
+            ttft_ms: None,
+            error_kind: Some(astra_core::ErrorKind::ContextWindow),
+        }),
+        other => other,
+    };
     let mut turn_result = match turn_result {
         Ok(turn_result) => {
             let delivered_children: Vec<_> = state
@@ -4131,11 +4147,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             "collapsed same-boundary observation facet fanout into composite overview calls"
         );
     }
-    state.rate_limit_cooldown.record_success();
-    // Clear pipeline recovery escalation after a successful LLM call —
-    // the PTL pressure is relieved.
-    if let Some(ref mut sess) = state.pipeline_session {
-        sess.recovery.reset_on_success();
+    if turn_result.accum.error_message.is_none() {
+        state.rate_limit_cooldown.record_success();
+        if let Some(ref mut session) = state.pipeline_session {
+            session.recovery.reset_on_success();
+        }
     }
     let snap = agentic_turn_stream_snapshot_with_kind(
         &turn_result.accum,
@@ -4184,7 +4200,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
         consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
     };
-    let ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
+    let mut ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
+    if let (Some(original), AgenticTurnIngestOutcome::Fatal(error)) =
+        (preparation_context_error, &mut ingest_outcome)
+    {
+        // Share recovery decisions without replacing the preparation owner's
+        // structured budget, stage and non-execution diagnostics.
+        *error = original;
+    }
     // Ingest already materializes successful text-only replies. Attach protocol
     // state before the canonical transcript owner records those new messages.
     if state.final_text_model_item_id.is_some()
@@ -4612,26 +4635,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         try_write_heavy_checkpoint(state);
                         return Ok(TurnExecutionControl::ContinueLoop);
                     }
-                    super::super::compaction_replay::CompactionReplayOutcome::CircuitOpen => {
-                        // Session has burned enough futile attempts; don't
-                        // run the pipeline again. Fall through to the
-                        // ContextOverflow interruption path below so the
-                        // caller can resume from checkpoint.
-                        if !prep.quiet {
-                            host.emit_headless_line(
-                                HeadlessStderrStyle::Yellow,
-                                format!(
-                                    "♻ Context overflow — compaction circuit open after {} \
-                                     futile attempts; giving up for this session.",
-                                    state.compaction_effectiveness.consecutive_futile_attempts,
-                                ),
-                            );
-                        }
-                    }
                     super::super::compaction_replay::CompactionReplayOutcome::Futile => {
-                        // Single futile attempt — counter advanced by the
-                        // checked helper. Next turn's check may trip the
-                        // breaker. Fall through to interruption.
+                        // No candidate reduced the protected request. Preserve
+                        // progress and report actionable context pressure;
+                        // historical counters cannot disable later recovery.
                     }
                 }
             }
@@ -4641,7 +4648,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             if is_context_overflow {
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::ContextOverflow,
-                    ResumeAction::CompactAndRetry,
+                    ResumeAction::RequiresIntervention { description: "Automatic context reduction could not fit the protected conversation. Choose a larger-context authorized model or reduce the request before retrying; progress is preserved.".into() },
                     interruption_state_summary(
                         state,
                         Some(format!("Context overflow after compaction: {}", e.message)),
@@ -14908,6 +14915,37 @@ mod tests {
         assert_eq!(error_state.llm_rounds_completed, 1);
         assert_eq!(error_state.telemetry.local_usage_attempts, 1);
         assert_eq!(error_state.telemetry.local_usage_unavailable, 1);
+    }
+
+    #[tokio::test]
+    async fn preparation_context_failure_preserves_structured_diagnostics() {
+        let details = serde_json::json!({"source":"final_wire","stage":"request_preparation","execution_started":false,"budget":{"input_tokens":1234,"limit":1000}}).to_string();
+        let mut host = DirectErrorHost::new(
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContextWindow,
+                "protected request is too large",
+            )
+            .with_details_json(details.clone()),
+        );
+        let mut state = make_state();
+        state.messages = vec![
+            serde_json::json!({"role":"system","content":"protected"}),
+            serde_json::json!({"role":"user","content":"current goal"}),
+        ];
+        let result = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            1,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+        let error = result.err().expect("protected overflow remains actionable");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(error.details_json.as_deref(), Some(details.as_str()));
+        assert_eq!(host.turn_count(), 1);
     }
 
     #[tokio::test]

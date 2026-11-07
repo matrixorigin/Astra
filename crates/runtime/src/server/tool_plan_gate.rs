@@ -29,8 +29,8 @@ pub(crate) fn plan_mode_blocked_tool_result(tool: &str) -> astra_tools::ToolResu
     let mut result = astra_tools::ToolResult::error(format!(
         "Tool '{tool}' is blocked while plan mode is active. \
          Use read-only tools to finish the plan, then call \
-         `exit_plan_mode(plan='...')` to submit it for trusted user \
-         approval before write tools can run."
+         `exit_plan_mode(plan='...')` when ready. Existing permissions and \
+         explicit review requests determine how authoring finishes."
     ));
     result.metadata = Some(Map::from_iter([
         (
@@ -249,7 +249,7 @@ pub(crate) async fn execute_enter_plan_mode(
 
     format!(
         "Entered plan mode. plan_id={} goal=\"{}\". Write tools are now blocked — \
-         author the plan, then call `exit_plan_mode(plan='...')` when ready for trusted review.",
+         author the plan, then call `exit_plan_mode(plan='...')` when ready; existing permissions and explicit review requests govern execution.",
         plan_id, goal
     )
 }
@@ -278,6 +278,7 @@ pub(crate) async fn execute_exit_plan_mode(
         Err(error) => return format!("Error: lookup active plan: {error}"),
     };
 
+    let mut submitted_version = None;
     if let Some(plan_md) = args
         .get("plan")
         .and_then(Value::as_str)
@@ -294,6 +295,7 @@ pub(crate) async fn execute_exit_plan_mode(
             let expected = Some(state.version);
             match repo.save(user_id, &active, &mut state, expected).await {
                 Ok(()) => {
+                    submitted_version = Some(state.version);
                     last_conflict = None;
                     break;
                 }
@@ -313,53 +315,76 @@ pub(crate) async fn execute_exit_plan_mode(
         }
     }
 
-    if let Ok(writer) =
-        astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
-    {
-        let _ = writer.append(
-            &astra_services::session_journal::JournalEvent::plan_lifecycle(
-                Some(session_id),
-                "plan_submitted_for_approval",
-                Some(serde_json::json!({ "plan_id": active })),
-            ),
-        );
-    }
-
-    let Some(approval_gate) = approval_gate else {
-        invalidate_plan_mode_cache(
-            Some(&repo),
-            user_id,
-            session_id,
-            cache,
-            resume_hint_handle,
-            authoring_active_handle,
-        )
-        .await;
-        return format!(
-            "Error: Plan {active} was saved, but this run has no interactive approval channel. \
-             Write tools remain blocked; reconnect from an interactive client and submit the plan again."
-        );
+    let submitted_version = match submitted_version {
+        Some(version) => version,
+        None => match repo.load(user_id, &active).await {
+            Ok(state) => state.version,
+            Err(error) => return format!("Error: load submitted plan: {error}"),
+        },
     };
 
-    match approval_gate
-        .request_approval(approval_request_id, "exit_plan_mode", args)
-        .await
-    {
-        astra_tools::ApprovalDecision::Approved => {
-            if let Err(error) = repo.set_active_plan(user_id, session_id, None).await {
-                invalidate_plan_mode_cache(
-                    Some(&repo),
-                    user_id,
-                    session_id,
-                    cache,
-                    resume_hint_handle,
-                    authoring_active_handle,
-                )
-                .await;
-                return format!(
-                    "Error: Plan {active} was approved, but plan mode could not be cleared: {error}. \
-                     Write tools remain blocked."
-                );
+    let review_required = args.get("review").and_then(Value::as_bool).unwrap_or(false)
+        || match approval_gate {
+            Some(gate) => gate.plan_review_required().await,
+            None => true,
+        };
+    let decision = if review_required {
+        let Some(gate) = approval_gate else {
+            invalidate_plan_mode_cache(
+                Some(&repo),
+                user_id,
+                session_id,
+                cache,
+                resume_hint_handle,
+                authoring_active_handle,
+            )
+            .await;
+            return format!(
+                "Error: Plan {active} was saved, but this run has no interactive approval channel. Write tools remain blocked; reconnect from an interactive client and submit the plan again."
+            );
+        };
+        if let Ok(writer) =
+            astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
+        {
+            let _ = writer.append(
+                &astra_services::session_journal::JournalEvent::plan_lifecycle(
+                    Some(session_id),
+                    "plan_submitted_for_approval",
+                    Some(serde_json::json!({"plan_id":active})),
+                ),
+            );
+        }
+        Some(
+            gate.request_approval(approval_request_id, "exit_plan_mode", args)
+                .await,
+        )
+    } else {
+        None
+    };
+
+    match decision {
+        None | Some(astra_tools::ApprovalDecision::Approved) => {
+            match repo
+                .finish_authoring(user_id, session_id, &active, submitted_version)
+                .await
+            {
+                Ok(true) => {}
+                changed => {
+                    invalidate_plan_mode_cache(
+                        Some(&repo),
+                        user_id,
+                        session_id,
+                        cache,
+                        resume_hint_handle,
+                        authoring_active_handle,
+                    )
+                    .await;
+                    return match changed {
+                        Ok(false) => "Error: The plan changed while it was being reviewed. Current authoring remains active; review and submit the current plan again.".into(),
+                        Err(error) => format!("Error: Plan {active} was saved, but authoring could not finish: {error}. Write tools remain blocked."),
+                        Ok(true) => unreachable!(),
+                    };
+                }
             }
             clear_shared_plan_mode_state(cache, resume_hint_handle, authoring_active_handle).await;
             if let Ok(writer) =
@@ -368,14 +393,26 @@ pub(crate) async fn execute_exit_plan_mode(
                 let _ = writer.append(
                     &astra_services::session_journal::JournalEvent::plan_lifecycle(
                         Some(session_id),
-                        "plan_approved",
+                        if review_required {
+                            "plan_approved"
+                        } else {
+                            "plan_authoring_completed"
+                        },
                         Some(serde_json::json!({ "plan_id": active })),
                     ),
                 );
             }
-            format!("Plan {active} approved. Plan mode is off and write tools are available.")
+            if review_required {
+                format!(
+                    "Plan {active} approved. Plan mode is off and existing execution permissions apply."
+                )
+            } else {
+                format!(
+                    "Plan {active} finalized; continuing under existing authorization. Plan mode is off."
+                )
+            }
         }
-        astra_tools::ApprovalDecision::Denied { reason } => {
+        Some(astra_tools::ApprovalDecision::Denied { reason }) => {
             invalidate_plan_mode_cache(
                 Some(&repo),
                 user_id,
@@ -390,7 +427,7 @@ pub(crate) async fn execute_exit_plan_mode(
                 "Plan {active} was not approved: {reason}. Plan mode remains active and write tools remain blocked."
             )
         }
-        astra_tools::ApprovalDecision::Timeout => {
+        Some(astra_tools::ApprovalDecision::Timeout) => {
             invalidate_plan_mode_cache(
                 Some(&repo),
                 user_id,
@@ -413,6 +450,113 @@ mod tests {
     use astra_plan::PlanRepository;
     use astra_plan::{SubtaskPlan, TaskStatus};
     use serde_json::json;
+
+    #[test]
+    fn blocked_plan_write_points_to_the_current_review_policy() {
+        let result = plan_mode_blocked_tool_result("write_file");
+        assert!(result.is_error);
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["error_kind"],
+            "policy_denied"
+        );
+        assert!(result.output.contains("exit_plan_mode"));
+        assert!(
+            result
+                .output
+                .contains("Existing permissions and explicit review")
+        );
+        assert!(!result.output.contains("approval before write tools"));
+    }
+
+    struct ReviewGate {
+        repo: Arc<dyn PlanRepository>,
+        required: bool,
+        edit_during_review: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl astra_tools::ToolApprovalGate for ReviewGate {
+        async fn plan_review_required(&self) -> bool {
+            self.required
+        }
+        fn requires_approval(&self, _: &str) -> bool {
+            false
+        }
+        async fn request_approval(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Value,
+        ) -> astra_tools::ApprovalDecision {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.edit_during_review {
+                let mut state = self.repo.load("u", "p").await.unwrap();
+                let expected = state.version;
+                state.plan_md = Some("newer draft".into());
+                self.repo
+                    .save("u", "p", &mut state, Some(expected))
+                    .await
+                    .unwrap();
+            }
+            astra_tools::ApprovalDecision::Approved
+        }
+    }
+
+    #[tokio::test]
+    async fn authoring_exit_preserves_policy_explicit_review_and_reviewed_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let _journal = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        for (required, explicit, edit) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, false, true),
+        ] {
+            let repo: Arc<dyn PlanRepository> = Arc::new(astra_plan::InMemoryPlanRepository::new());
+            let mut state = astra_plan::PlanModeState::new_with_owner("goal".into(), "u".into());
+            repo.save("u", "p", &mut state, None).await.unwrap();
+            repo.set_active_plan("u", "s", Some("p")).await.unwrap();
+            let gate = ReviewGate {
+                repo: repo.clone(),
+                required,
+                edit_during_review: edit,
+                calls: Default::default(),
+            };
+            let cache = tokio::sync::RwLock::new(PlanModeSnapshot::default());
+            let result = execute_exit_plan_mode(
+                Some(&repo),
+                "u",
+                "s",
+                &cache,
+                None,
+                None,
+                Some(&gate),
+                "request",
+                &json!({"plan":"submitted draft", "review":explicit}),
+            )
+            .await;
+            assert_eq!(
+                gate.calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(required || explicit)
+            );
+            let active = repo.active_plan_for_session("u", "s").await.unwrap();
+            if edit {
+                assert!(result.starts_with("Error:"), "{result}");
+                assert_eq!(active.as_deref(), Some("p"));
+                assert_eq!(
+                    repo.load("u", "p").await.unwrap().plan_md.as_deref(),
+                    Some("newer draft")
+                );
+                assert_eq!(cache.read().await.authoring_active, None);
+            } else {
+                assert!(active.is_none(), "{result}");
+                assert!(!result.starts_with("Error:"), "{result}");
+                assert_eq!(result.contains("approved"), required || explicit);
+                assert_eq!(cache.read().await.authoring_active, Some(false));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn active_binding_keeps_write_guard_after_embedded_task_completion() {
@@ -441,7 +585,7 @@ mod tests {
             "only trusted approval may release the write guard"
         );
         let hint = hint.expect("active draft hint");
-        assert!(hint.contains("awaiting trusted user review"), "{hint}");
+        assert!(hint.contains("A plan draft is active"), "{hint}");
         assert!(!hint.contains("completed"), "{hint}");
     }
 

@@ -3413,7 +3413,10 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_rederives_tool_
         state.idempotency_cache.is_empty(),
         "event-derived semantic observations must not cross the recovery boundary"
     );
-    assert_eq!(state.consecutive_context_window_errors, 5);
+    assert_eq!(
+        state.consecutive_context_window_errors, 0,
+        "a fresh request must not inherit the previous request's retry count"
+    );
     assert_eq!(state.compaction_effectiveness.attempt_count, 6);
     assert_eq!(
         state.compaction_effectiveness.cumulative_tokens_freed,
@@ -3426,8 +3429,8 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_rederives_tool_
     );
     assert!(!state.compaction_effectiveness.last_was_insufficient);
     assert_eq!(
-        state.compaction_effectiveness.consecutive_futile_attempts,
-        1
+        state.compaction_effectiveness.consecutive_futile_attempts, 1,
+        "historical diagnostics remain available without gating a fresh request"
     );
 }
 

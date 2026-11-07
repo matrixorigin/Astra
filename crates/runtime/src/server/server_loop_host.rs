@@ -4149,7 +4149,7 @@ fn install_provider_execution_directory(
     .collect::<Vec<_>>();
 
     if entries.is_empty() {
-        texts.push(format!("{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nNo provider-owned collaborator is currently advertised. Do not discover provider configuration through workspace tools or Bash; an explicit provider request needs an available capability."));
+        texts.push(format!("{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nNo structured provider collaborator is currently advertised. Explicitly requested local programs may still run through admitted Bash on the selected CLI/User Runner. Do not inspect credentials or silently substitute the requested provider/model."));
     } else {
         let model_selection_complete = entries.iter().all(|entry| {
             entry
@@ -7831,36 +7831,114 @@ impl ServerAgenticLoopHost {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let admission_schemas = self.current_admission_schemas();
         let snapshot = self.admission_snapshot(&admission_schemas, &registry);
-        crate::turn::agentic::tool_interception::resolve_carrier_tool_admission_with_identity(
-            admission,
-            &activations,
-            schema_digest,
-            |activation| {
-                Self::deferred_activation_descriptor_is_current(
-                    activation,
-                    &snapshot.decision(&activation.name),
+        let mut resolved =
+            crate::turn::agentic::tool_interception::resolve_carrier_tool_admission_with_identity(
+                admission,
+                &activations,
+                schema_digest,
+                |activation| {
+                    Self::deferred_activation_descriptor_is_current(
+                        activation,
+                        &snapshot.decision(&activation.name),
+                    )
+                },
+                |name, arguments| {
+                    self.valid_tools.contains(name)
+                        && snapshot.decision(name).visible
+                        && state
+                            .runtime_tool_executor
+                            .as_deref()
+                            .is_some_and(|executor| executor.tool_runtime_ready(name))
+                        && state
+                            .sticky_tool_schemas
+                            .iter()
+                            .chain(self.tool_schemas.iter())
+                            .find(|schema| tool_schema_name(schema) == Some(name))
+                            .is_some_and(|schema| {
+                                astra_tools::schemas::validate_tool_arguments_against_schema(
+                                    name, arguments, schema,
+                                )
+                                .is_ok()
+                            })
+                },
+            );
+        for rejected in &mut resolved.rejected {
+            let Ok(mut result) = serde_json::from_str::<Value>(&rejected.result) else {
+                continue;
+            };
+            if !matches!(
+                result["error_kind"].as_str(),
+                Some("deferred_tool_descriptor_stale" | "deferred_tool_activation_stale")
+            ) {
+                continue;
+            }
+            let selected = rejected.invocation.activation().or_else(|| {
+                let args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                    rejected.invocation.physical_provider_call(),
                 )
-            },
-            |name, arguments| {
-                self.valid_tools.contains(name)
-                    && snapshot.decision(name).visible
-                    && state
-                        .runtime_tool_executor
-                        .as_deref()
-                        .is_some_and(|executor| executor.tool_runtime_ready(name))
-                    && state
-                        .sticky_tool_schemas
-                        .iter()
-                        .chain(self.tool_schemas.iter())
-                        .find(|schema| tool_schema_name(schema) == Some(name))
-                        .is_some_and(|schema| {
-                            astra_tools::schemas::validate_tool_arguments_against_schema(
-                                name, arguments, schema,
-                            )
-                            .is_ok()
-                        })
-            },
-        )
+                .ok()?;
+                let target =
+                    astra_turn_core::tool::deferred_activation::parse_deferred_tool_invocation(
+                        &args,
+                    )
+                    .ok()?;
+                activations
+                    .iter()
+                    .find(|activation| activation.name == target.name)
+            });
+            let Some(selected) = selected else {
+                continue;
+            };
+            let decision = snapshot.decision(&selected.name);
+            let current = decision
+                .selected_offer
+                .as_ref()
+                .and_then(crate::server::tool_admission::ToolOffer::descriptor_ref);
+            let current_schema = schema_digest(&selected.name);
+            let mut changed = Vec::new();
+            if !decision.visible {
+                changed.push("availability");
+            }
+            if selected
+                .descriptor
+                .as_ref()
+                .map(|descriptor| &descriptor.identity)
+                != current.as_ref().map(|descriptor| &descriptor.identity)
+            {
+                changed.push("execution_owner");
+            }
+            if selected
+                .descriptor
+                .as_ref()
+                .map(|descriptor| &descriptor.descriptor_version)
+                != current
+                    .as_ref()
+                    .map(|descriptor| &descriptor.descriptor_version)
+            {
+                changed.push("executable_contract");
+            }
+            if Some(selected.schema_digest.as_str()) != current_schema.as_deref() {
+                changed.push("input_schema");
+            }
+            let fingerprint = |value: Value| {
+                format!(
+                    "sha256:{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(
+                        astra_core::canonical_json_string(&value).as_bytes()
+                    )
+                )
+            };
+            result["stage"] = json!("descriptor_admission");
+            result["execution_started"] = json!(false);
+            result["side_effects_maybe"] = json!(false);
+            result["contract_difference"] = json!({
+                "changed_components": changed,
+                "selected": fingerprint(json!({"descriptor":selected.descriptor,"schema":selected.schema_digest})),
+                "current": fingerprint(json!({"descriptor":current,"schema":current_schema})),
+            });
+            rejected.result = result.to_string();
+        }
+        resolved
     }
 
     fn current_deferred_tool_contract_schemas(&self, state: &AgenticLoopState) -> Vec<Value> {
@@ -17279,6 +17357,14 @@ impl ServerAgenticLoopHost {
         wire_tools: &[Value],
         state: &mut AgenticLoopState,
     ) {
+        state.deferred_tool_activations =
+            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+                &state.messages,
+                std::mem::take(&mut state.deferred_tool_activations),
+            );
+        // A fresh request may bind unchanged learned contracts to its currently
+        // authorized provider. This is current admission, never permission to
+        // reroute an invocation already emitted under a frozen request.
         let discovery = self.sync_valid_tools_to_wire_surface_for_state(wire_tools, state);
         if state.deferred_tool_activations.is_empty() {
             return;
@@ -17910,7 +17996,7 @@ impl ServerAgenticLoopHost {
             );
             let available_output_tokens = candidate_status
                 .model_limit
-                .saturating_sub(candidate_status.estimated_input_tokens)
+                .saturating_sub(candidate_status.known_input_tokens())
                 .saturating_sub(candidate_status.reserved_protocol_tokens);
             if !candidate_status.hard_limit_exceeded() {
                 // Keep the typed candidate for the caller.  The consolidated
@@ -20751,7 +20837,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .map_err(|message| astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, message))?;
         let context_output_limit = final_wire_budget_status
             .model_limit
-            .saturating_sub(final_wire_budget_status.estimated_input_tokens)
+            .saturating_sub(final_wire_budget_status.known_input_tokens())
             .saturating_sub(final_wire_budget_status.reserved_protocol_tokens);
         let mut output_cap_retry_limit = output_cap_retry_limit(
             max_output_tokens,
@@ -23827,7 +23913,7 @@ mod tests {
         );
         assert_eq!(texts.len(), 2);
         assert_eq!(texts[0], "existing runtime fact");
-        assert!(texts[1].contains("No provider-owned collaborator is currently advertised"));
+        assert!(texts[1].contains("No structured provider collaborator is currently advertised"));
     }
 
     include!("server_loop_host_replay_tests.rs");
@@ -27168,11 +27254,6 @@ mod tests {
         settlement: EdgeApprovalSettlement,
     ) -> (AdmittedToolCallOutcome, Vec<Value>) {
         let mut host = test_host_builder(user_id.to_string(), session_id.to_string())
-            .with_execution_time_budget(Some(ExecutionTimeBudget {
-                // This fixture exercises approval reconciliation only; it has
-                // no following provider request or tool execution to budget.
-                remaining_seconds: 1,
-            }))
             .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
             .with_interactive_client(true)
             .build();
@@ -27198,6 +27279,19 @@ mod tests {
             "type": "function",
             "function": {"name": "bash", "arguments": "{}"}
         });
+        // This fixture tests timeout reconciliation, not a provider's final
+        // answer reserve. Give its approval wait an explicit work cutoff and
+        // use the paused clock in the callers for deterministic timing.
+        host.execution_time_budget = Some(
+            ExecutionDeadlineAuthority::from_snapshot_at(
+                astra_services::runs::ExecutionDeadlineSnapshot {
+                    deadline_unix_ms: 100,
+                    work_deadline_unix_ms: 100,
+                },
+                0,
+            )
+            .unwrap(),
+        );
         let outcome = host
             .deliver_edge_tools_via_ledger(run_id, "chain", &[call], &context)
             .await;
@@ -27217,7 +27311,7 @@ mod tests {
         (outcome, approval_waits)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn competing_denial_replaces_local_approval_timeout_result() {
         let (outcome, approval_waits) = competing_settlement_after_local_timeout(
             "u-compete-deny",
@@ -27250,7 +27344,7 @@ mod tests {
         assert_eq!(approval_waits[0]["outcome"], "rejected");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn competing_allow_replaces_local_approval_timeout_trace() {
         let (outcome, approval_waits) = competing_settlement_after_local_timeout(
             "u-compete-allow",
@@ -36065,7 +36159,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_abort_returns_error_and_records_alert() {
+    fn historical_overflow_does_not_refuse_a_fresh_pipeline_request() {
         let mut host = test_host_builder("u1", "s1")
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
@@ -36083,23 +36177,18 @@ mod tests {
         state.pipeline_session = Some(pipeline_session);
         let tools = host.tool_schemas.clone();
 
-        let error = match host.run_turn_pipeline(
-            &mut state,
-            &tools,
-            "anthropic",
-            "claude-sonnet",
-            "continue",
-        ) {
-            Ok(_) => panic!("pipeline abort must stop the turn instead of using a fallback prompt"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
         assert!(
+            host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet", "continue")
+                .is_ok()
+        );
+        assert_eq!(
             state
-                .turn_event_buffer
+                .pipeline_session
                 .as_ref()
-                .is_some_and(|buffer| !buffer.is_empty()),
-            "pipeline abort should record an alert event for harness/journal analysis"
+                .unwrap()
+                .recovery
+                .consecutive_ptl_errors,
+            3
         );
     }
 
@@ -37957,6 +38046,9 @@ mod tests {
     #[test]
     fn explain_preparation_budget_uses_each_attempts_effective_output_cap() {
         let final_status = crate::turn::wire_assembly::WireBudgetStatus {
+            opaque_estimated_tokens: 0,
+            opaque_reasoning_bytes: 0,
+            transport_metadata_bytes: 0,
             estimated_input_tokens: 1_200,
             estimated_system_tokens: 480,
             tool_schema_tokens: 120,
@@ -46616,7 +46708,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn responses_reasoning_only_work_retry_is_dispatched_and_restorable_after_failure() {
+    async fn responses_reasoning_work_retry_keeps_opaque_state_without_false_compaction() {
         use astra_services::models::{
             PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
             PromptCacheVolatileDeliveryData, PromptCacheVolatilePlacementData,
@@ -46753,8 +46845,8 @@ mod tests {
             trace
                 .pointer("/wire/retry_history_compactions")
                 .and_then(Value::as_array)
-                .is_some_and(|boundaries| !boundaries.is_empty()),
-            "the actual retry must exercise pressure compaction"
+                .is_none_or(|boundaries| boundaries.is_empty()),
+            "opaque encoding alone must not force history compaction"
         );
         assert!(
             requests[1].body["input"]

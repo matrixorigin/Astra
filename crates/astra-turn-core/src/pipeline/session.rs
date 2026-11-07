@@ -439,13 +439,9 @@ impl PipelineSession {
                 .record_section_fingerprints(&output.optimized.sections);
         }
 
-        // Do not advance `turns_completed` on the abort path. A truncated
-        // response that trips the unrecoverable-error streak is not a
-        // successful turn — counting it inflates goal/milestone tracking and
-        // pressure-tier denominators.
-        if !self.recovery.should_abort() {
-            self.turns_completed += 1;
-        }
+        // Feedback describes a physically completed provider round. Whether
+        // the overall user request needs another attempt belongs to its loop.
+        self.turns_completed += 1;
     }
 
     /// Record the canonical runtime frame for one successfully ingested model
@@ -538,12 +534,6 @@ impl PipelineSession {
         // Delegate to the single source of truth for recovery escalation
         // (CompactionTier::escalate_for_recovery) to avoid threshold desync.
         CompactionTier::Normal.escalate_for_recovery(&self.recovery)
-    }
-
-    /// Whether the session should abort (unrecoverable error streak).
-    #[must_use]
-    pub fn should_abort(&self) -> bool {
-        self.recovery.should_abort()
     }
 
     /// Prompt-facing working memory for goal/task continuity.
@@ -923,7 +913,6 @@ mod tests {
     fn new_session_starts_with_zero_turns() {
         let sess = PipelineSession::new(PipelineConfig::default());
         assert_eq!(sess.turns_completed(), 0);
-        assert!(!sess.should_abort());
     }
 
     #[test]
@@ -1262,26 +1251,23 @@ mod tests {
     }
 
     #[test]
-    fn ptl_errors_escalate_and_abort() {
+    fn ptl_errors_inform_planning_without_disabling_execution() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
-        assert!(!sess.should_abort());
 
         sess.record_ptl_error();
-        assert!(!sess.should_abort());
         // 1 PTL → TrimSchemas (matches escalate_for_recovery canonical mapping)
         assert_eq!(sess.current_pressure_tier(), CompactionTier::TrimSchemas);
 
         sess.record_ptl_error();
-        assert!(!sess.should_abort());
         // 2 PTL → CompactHistory
         assert_eq!(sess.current_pressure_tier(), CompactionTier::CompactHistory);
 
         sess.record_ptl_error();
-        assert!(sess.should_abort());
+        assert_eq!(sess.recovery.consecutive_ptl_errors, 3);
     }
 
     #[test]
-    fn aborted_session_refuses_run_turn() {
+    fn prior_overflow_does_not_prevent_rebuilding_a_request() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         sess.record_ptl_error();
         sess.record_ptl_error();
@@ -1306,7 +1292,10 @@ mod tests {
         };
 
         let result = sess.run_turn(input);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "retry authority belongs to the request loop"
+        );
     }
 
     #[test]

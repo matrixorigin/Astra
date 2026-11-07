@@ -86,11 +86,13 @@ available for audit.
 
 The local CLI and Edge foreground Bash executors share the output-capture owner
 without replacing their existing process-settlement or workspace-lease owners.
-They keep stdout and stderr pipes as the command's own stdout and stderr,
-and capture their original bytes in
-separate `0600` files with a shared random 16-lowercase-hex basename and
-`.stdout` / `.stderr` suffixes under the selected workspace's
-`astra-bash-outputs/` directory. This dedicated top-level directory holds
+They keep stdout and stderr pipes as the command's own stdout and stderr.
+The CLI stages output in its session's private task capture; after settlement,
+large or incomplete output is copied to exclusive workspace files. The Edge
+foreground executor writes its captures directly in the selected workspace.
+Published original bytes use separate `0600` files with a shared random
+16-lowercase-hex basename and `.stdout` / `.stderr` suffixes under the selected
+workspace's `astra-bash-outputs/` directory. This dedicated top-level directory holds
 ordinary user-readable output data, not Astra's private `.astra/` state; it is
 excluded from executor workspace-mutation fingerprints without excluding
 other user paths. Git-backed observation excludes that exact directory before
@@ -99,9 +101,9 @@ observer's byte or entry budget. This is a tap after the top-level Bash
 process, so shell pipelines and explicit redirection keep their normal
 behavior. The file-retention threshold is the lesser of the configured
 per-tool byte limit and the shared 8,000-character model inline budget. The
-formatted, redacted output plus its actual exit note determines retention;
-small results remain inline even with a low configured budget. Stream-preview
-capping also retains the files. Byte counting is conservative for UTF-8.
+CLI also retains a capture when its formatted result is truncated or its
+bytes are not valid UTF-8. Small complete text results remain inline. Byte
+counting is conservative for UTF-8.
 Retained results return both
 file paths, byte counts and SHA-256 digests. The redacted preview uses space
 remaining after the receipt and terminal facts in a 4,000-byte presentation
@@ -130,7 +132,8 @@ output. A post-execution capture failure preserves the command's exit and
 process-settlement facts. Capture files follow the selected workspace's
 lifetime: an ephemeral workspace disappears with its existing lease; a local
 workspace retains large-output files like any other Bash-created file. There
-is no independent output-file retention service.
+is no independent output-file retention service. Session task retention applies
+only to private observation captures; it never deletes published workspace files.
 
 File outlines use the shared AST parser for supported languages, including
 Python stub, JavaScript module and TypeScript module extensions. Unsupported

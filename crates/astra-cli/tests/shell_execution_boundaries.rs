@@ -23,6 +23,55 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 #[tokio::test]
+async fn standalone_shell_waits_for_terminal_and_rejects_unusable_stdin() {
+    let workspace = tempfile::tempdir().unwrap();
+    let executor = std::sync::Arc::new(executor(workspace.path()));
+    let running = executor.clone();
+    let mut call = tokio::spawn(async move {
+        running
+            .execute_with_metadata(
+                "bash",
+                &json!({
+                    "command":"touch started; while [ ! -f release ]; do sleep 0.01; done; printf finished",
+                    "yield_time_ms":0,
+                    "timeout":5
+                }),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !workspace.path().join("started").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("command started");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut call)
+            .await
+            .is_err(),
+        "a standalone executor cannot return a live task it will abandon"
+    );
+    std::fs::write(workspace.path().join("release"), b"").unwrap();
+    let result = call.await.unwrap();
+    assert!(!result.is_error, "{result:?}");
+    assert!(result.output.contains("finished"));
+    assert_eq!(result.tool_result_fields.unwrap()["exit_code"], 0);
+
+    let rejected = executor
+        .execute_with_metadata(
+            "bash",
+            &json!({"command":"touch unintended", "stdin":true, "yield_time_ms":0}),
+        )
+        .await;
+    assert!(rejected.is_error);
+    let fields = rejected.tool_result_fields.unwrap();
+    assert_eq!(fields["execution_started"], false);
+    assert_eq!(fields["side_effects_maybe"], false);
+    assert!(!workspace.path().join("unintended").exists());
+}
+
+#[tokio::test]
 async fn public_cli_bash_retains_byte_exact_large_output_and_terminal_facts() {
     use sha2::{Digest, Sha256};
     let workspace = tempfile::tempdir().unwrap();
@@ -31,7 +80,7 @@ async fn public_cli_bash_retains_byte_exact_large_output_and_terminal_facts() {
         .execute_with_metadata(
             "bash",
             &json!({
-                "command":"seq 1 20000; printf '\\000\\377stderr-tail\\n' >&2; exit 7"
+                "command":"seq 1 20000; printf '\\000\\377stderr-tail\\n' >&2; sleep 30 & exit 7"
             }),
         )
         .await;
@@ -41,7 +90,15 @@ async fn public_cli_bash_retains_byte_exact_large_output_and_terminal_facts() {
     assert_eq!(fields["exit_code"], 7);
     assert_eq!(fields["bash_output_capture"]["complete"], true);
     assert!(output.output.contains("complete=true"));
-    assert!(output.output.contains("exit_code=7"));
+    assert!(output.output.contains("[bash terminal facts:"));
+    assert!(output.output.contains("\"exit_code\":7"));
+    assert_eq!(fields["background_children_reaped"], true);
+    assert!(
+        output
+            .output
+            .contains("\"background_children_reaped\":true")
+    );
+    assert!(output.output.contains("\"cleanup_authoritative\":"));
     let stdout = (1..=20000)
         .map(|index| format!("{index}\n"))
         .collect::<String>()
@@ -115,14 +172,55 @@ async fn public_cli_cancelled_bash_keeps_an_explicit_partial_capture() {
 }
 
 #[tokio::test]
+async fn short_non_utf8_output_keeps_its_original_bytes() {
+    let workspace = tempfile::tempdir().unwrap();
+    let result = executor(workspace.path())
+        .execute_with_metadata("bash", &json!({"command":"printf '\\377'"}))
+        .await;
+    assert!(!result.is_error, "{result:?}");
+    let path = result.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["stdout"]["path"]
+        .as_str()
+        .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), [0xff]);
+}
+
+#[tokio::test]
+async fn whitespace_only_output_is_not_lost() {
+    let workspace = tempfile::tempdir().unwrap();
+    let result = executor(workspace.path())
+        .execute_with_metadata(
+            "bash",
+            &json!({"command":"printf '  \\n'; printf '\\t\\n' >&2"}),
+        )
+        .await;
+    assert!(!result.is_error, "{result:?}");
+    assert!(
+        result.output.contains("output contains only whitespace"),
+        "{result:?}"
+    );
+    let path = result.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["stdout"]["path"]
+        .as_str()
+        .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"  \n");
+    let stderr =
+        result.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["stderr"]["path"]
+            .as_str()
+            .unwrap();
+    assert_eq!(std::fs::read(stderr).unwrap(), b"\t\n");
+}
+
+#[tokio::test]
 async fn public_cli_capture_failure_does_not_erase_the_observed_exit() {
     let workspace = tempfile::tempdir().unwrap();
     let executor = executor(workspace.path());
+    // Make the public destination unavailable without affecting execution or
+    // the private capture, so publication failure cannot erase exit facts.
+    std::fs::write(workspace.path().join("astra-bash-outputs"), b"occupied").unwrap();
     let output = executor
         .execute_with_metadata(
             "bash",
             &json!({
-                "command":"printf done > command-done; mv astra-bash-outputs captured-away"
+                "command":"printf done > command-done; seq 1 20000"
             }),
         )
         .await;

@@ -181,13 +181,14 @@ pub fn tool_selection_contract(schema: &Value) -> Option<Value> {
 
 /// Stable content address for one compact selection contract.
 ///
-/// The digest covers exactly the contract returned to the model by
-/// `tool_search`: canonical name, compact description, parameter shape, and
-/// truncation fact. Provider binding and capability authority are deliberately
+/// The digest addresses the full executable input schema and canonical name.
+/// Presentation text, truncation and directory refreshes do not revoke a
+/// selected unchanged contract. Provider binding and capability authority are deliberately
 /// excluded and must be revalidated at execution time.
 #[must_use]
 pub fn tool_selection_contract_digest(selection: &Value) -> String {
-    let canonical = astra_core::canonical_json_string(selection);
+    let executable = json!({"name": selection.get("name"), "parameters": selection.get("parameters").map(astra_turn_types::executable_schema)});
+    let canonical = astra_core::canonical_json_string(&executable);
     format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()))
 }
 
@@ -1039,14 +1040,16 @@ mod tests {
 
     #[test]
     fn selection_contract_digest_is_stable_for_equivalent_object_key_order() {
-        let left = json!({
+        let left = super::tool_selection_contract(&json!({
             "type": "function",
             "function": {"name": "read_file", "parameters": {"type": "object"}}
-        });
-        let right = json!({
+        }))
+        .unwrap();
+        let right = super::tool_selection_contract(&json!({
             "function": {"parameters": {"type": "object"}, "name": "read_file"},
             "type": "function"
-        });
+        }))
+        .unwrap();
 
         assert_eq!(
             tool_selection_contract_digest(&left),
@@ -1054,10 +1057,10 @@ mod tests {
         );
         assert_ne!(
             tool_selection_contract_digest(&left),
-            tool_selection_contract_digest(&json!({
+            tool_selection_contract_digest(&super::tool_selection_contract(&json!({
                 "type": "function",
                 "function": {"name": "read_file", "parameters": {"type": "object", "additionalProperties": false}}
-            }))
+            })).unwrap())
         );
     }
 

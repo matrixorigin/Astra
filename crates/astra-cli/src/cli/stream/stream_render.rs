@@ -7555,14 +7555,6 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
             "Native collaborators require canonical child dispatch with an immutable execution grant, not a root tool callback".into(),
         );
     }
-    if tool_name == "bash"
-        && let Some(outcome) = executor
-            .bash_detachable_with_metadata(&args, invocation, cancel_token.as_ref())
-            .await
-    {
-        return outcome;
-    }
-
     // The async Bash path owns the workspace pre/post observer and its
     // per-root lease. Keep it on this path even when the caller is the
     // responsive stream renderer; the shell itself is moved to a blocking
@@ -10473,144 +10465,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn responsive_bash_uses_real_detach_slot_for_ctrl_b_handoff() {
-        let dir = tempdir().expect("tempdir");
-        let nested = dir.path().join("nested");
-        std::fs::create_dir(&nested).unwrap();
-        let (slot, listener) = astra_tools::detach::new_slot_with_handle();
+    async fn responsive_bash_releases_wait_without_transferring_the_process() {
+        let dir = tempdir().unwrap();
+        let control = astra_tools::detach::ForegroundWaitControl::default();
         let executor = std::sync::Arc::new(
-            crate::edge_tools::ToolExecutor::new(dir.path()).with_bash_detach_slot(slot),
+            crate::edge_tools::ToolExecutor::new(dir.path())
+                .with_background_tasks(
+                    crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                        dir.path().join("tasks"),
+                    ),
+                )
+                .with_foreground_wait_control(control.clone()),
         );
-
+        let tasks = executor.background_tasks.clone();
         let execution = tokio::spawn(execute_with_invocation_metadata_responsive(
             executor,
-            "bash".to_string(),
-            serde_json::json!({
-                // Detach is reserved for a pure long-running builtin.  A
-                // compound shell command stays foreground so the edge
-                // executor can emit its post-workspace receipt.
-                "command": "sleep 5",
-                "workdir": "nested",
-                "timeout": 30.0,
-            }),
+            "bash".into(),
+            serde_json::json!({"command":"sleep 10", "timeout":20}),
             astra_tools::tool_engine::ToolInvocationMetadata::default(),
             None,
         ));
-
-        for _ in 0..100 {
-            if listener.is_active() {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !control.is_active() {
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            listener.is_active(),
-            "foreground edge bash must activate the TUI detach listener"
-        );
-
-        listener.signal_tx.send(true).expect("signal detach");
-        let payload = tokio::time::timeout(std::time::Duration::from_secs(2), listener.payload_rx)
-            .await
-            .expect("edge bash should hand off promptly after Ctrl+B")
-            .expect("payload");
-        assert_eq!(payload.command, "sleep 5");
-        #[cfg(target_os = "linux")]
-        {
-            let pid = payload.child.id().expect("live detached child");
-            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).expect("child cwd");
-            assert_eq!(cwd.canonicalize().unwrap(), nested.canonicalize().unwrap());
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let pid = payload.child.id().expect("live detached child").to_string();
-            let probe = std::process::Command::new("/usr/sbin/lsof")
-                .args(["-a", "-p", &pid, "-d", "cwd", "-Fn"])
-                .output()
-                .expect("system lsof child-cwd probe");
-            assert!(probe.status.success(), "child cwd must remain observable");
-            let text = String::from_utf8(probe.stdout).unwrap();
-            let cwd = text
-                .lines()
-                .find_map(|line| line.strip_prefix('n'))
-                .expect("child cwd path");
-            assert_eq!(
-                std::path::Path::new(cwd).canonicalize().unwrap(),
-                nested.canonicalize().unwrap()
-            );
-        }
-
-        payload
-            .adoption_tx
-            .send(Ok("bg-shell-edge".to_string()))
-            .expect("ack adoption");
-
+        })
+        .await
+        .expect("foreground wait registered");
+        assert!(control.release());
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), execution)
             .await
-            .expect("detached edge bash should finish the tool call")
-            .expect("join");
+            .unwrap()
+            .unwrap();
         assert!(!outcome.is_error, "{outcome:?}");
-        assert_eq!(
-            outcome.tool_result_fields.as_ref().unwrap()["bash_workdir"]["resolved_workspace_relative"],
-            "nested"
-        );
-        assert!(
-            outcome.output.contains("bash_detached"),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            outcome.output.contains("bg-shell-edge"),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            outcome.output.contains("continue with independent work"),
-            "{}",
-            outcome.output
-        );
-        assert!(outcome.output.contains("Do NOT poll"), "{}", outcome.output);
-        assert!(
-            outcome
-                .output
-                .contains("call `task_output` ONCE with block=false"),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            outcome.output.contains("tail/cat/head/less are denied"),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            !outcome.output.contains("task_output("),
-            "{}",
-            outcome.output
-        );
-        assert!(
-            !outcome.output.contains("task_list()"),
-            "{}",
-            outcome.output
-        );
-        assert!(!outcome.output.contains("task_stop("), "{}", outcome.output);
-        assert_eq!(
-            outcome
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("background_task_id"))
-                .and_then(Value::as_str),
-            Some("bg-shell-edge")
-        );
-        let work = outcome
-            .tool_result_fields
-            .as_ref()
-            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
-            .expect("edge detach receipt must publish the shared work-unit contract");
-        assert_eq!(work.id, "bg-shell-edge");
-        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Running);
-        assert_eq!(
-            work.mode,
-            astra_core::work_unit::WorkUnitObservationMode::Transition
-        );
+        let id = outcome.tool_result_fields.as_ref().unwrap()["task_id"]
+            .as_str()
+            .unwrap();
+        let handle = tasks.get(id).expect("same executor owns background work");
+        assert!(!handle.status().is_terminal());
+        assert!(outcome.output.contains(id));
+        let mut tasks = tasks;
+        tasks
+            .kill_all_and_wait(std::time::Duration::from_secs(3))
+            .await;
+        assert!(tasks.get(id).unwrap().status().is_terminal());
     }
 
     #[test]
@@ -11687,7 +11585,7 @@ mod tests {
             request
                 .response_tx
                 .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
-                    mode: crate::cli::permission_manager::PermissionMode::AcceptEdits,
+                    mode: Some(crate::cli::permission_manager::PermissionMode::AcceptEdits),
                 })
                 .expect("send plan decision");
         };
@@ -12356,7 +12254,10 @@ mod tests {
             .expect("command cap ends execution before delivery deadline");
             assert_eq!(results.len(), 1);
             let result = &results[0];
-            assert!(result.output.contains("timed out"), "{}", result.output);
+            assert_eq!(
+                result.tool_result_fields.as_ref().unwrap()["error_kind"],
+                "tool_timeout"
+            );
             assert_eq!(result.args, args);
             assert_eq!(request.args, args);
             requests.push(request);

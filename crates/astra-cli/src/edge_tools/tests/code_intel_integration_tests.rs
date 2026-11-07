@@ -51,7 +51,7 @@ pub fn handle_request(config: &AppConfig) -> String {
     )
     .unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
 
     // Find definition of AppConfig — should find it in config.rs
     let result = executor
@@ -132,7 +132,7 @@ def get_user_view(user_id: int):
     )
     .unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
 
     // Find UserModel definition
     let result = executor
@@ -190,7 +190,7 @@ def load_config() -> AppConfig:
     )
     .unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "find_definition",
@@ -243,7 +243,7 @@ function startApp(config: UserConfig): void {
     )
     .unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
 
     let result = executor
         .execute(
@@ -318,7 +318,7 @@ func main() {
     )
     .unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
 
     let result = executor
         .execute(
@@ -351,7 +351,7 @@ async fn find_definition_cross_directory_with_path_filter() {
     )
     .unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
 
     // Unrestricted search finds both
     let all_result = executor
@@ -415,7 +415,7 @@ pub fn dispatch(src: &str) -> Vec<String> {
 "#,
     )
     .unwrap();
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     (dir, executor)
 }
 

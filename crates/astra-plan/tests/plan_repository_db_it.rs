@@ -804,3 +804,35 @@ async fn session_hint_round_trips_through_load() {
     cleanup_session(&pool, &sess, &user).await;
 }
 }
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn finish_authoring_keeps_newer_revision_and_session_binding() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-{}", Uuid::new_v4().simple());
+    let session = format!("s-{}", Uuid::new_v4().simple());
+    let first = format!("pit-finish-a-{}", Uuid::new_v4().simple());
+    let second = format!("pit-finish-b-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session, &user).await;
+    let mut state = make_state_with_goal(&user, "review exact version");
+    repo.save(&user, &first, &mut state, None).await.unwrap();
+    repo.set_active_plan(&user, &session, Some(&first)).await.unwrap();
+    let submitted = state.version;
+    state.plan_md = Some("newer unreviewed proposal".into());
+    repo.save(&user, &first, &mut state, Some(submitted)).await.unwrap();
+    assert!(!repo.finish_authoring(&user, &session, &first, submitted).await.unwrap());
+    assert_eq!(repo.active_plan_for_session(&user, &session).await.unwrap().as_deref(), Some(first.as_str()));
+    let mut replacement = make_state_with_goal(&user, "replacement proposal");
+    repo.save(&user, &second, &mut replacement, None).await.unwrap();
+    repo.set_active_plan(&user, &session, Some(&second)).await.unwrap();
+    assert!(!repo.finish_authoring(&user, &session, &first, state.version).await.unwrap());
+    assert_eq!(repo.active_plan_for_session(&user, &session).await.unwrap().as_deref(), Some(second.as_str()));
+    assert!(!repo.finish_authoring("another-owner", &session, &second, replacement.version).await.unwrap());
+    assert!(repo.finish_authoring(&user, &session, &second, replacement.version).await.unwrap());
+    assert_eq!(repo.active_plan_for_session(&user, &session).await.unwrap(), None);
+    assert_eq!(repo.load(&user, &second).await.unwrap().session_hint, None);
+    cleanup_session(&pool, &session, &user).await;
+    cleanup_plans(&pool, &first).await;
+    cleanup_plans(&pool, &second).await;
+}
+}

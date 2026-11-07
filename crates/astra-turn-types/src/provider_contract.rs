@@ -559,6 +559,75 @@ pub struct ResolvedProviderSnapshotRef {
     pub content_hash: String,
 }
 
+/// Schema annotations inform the model, but do not change validation or
+/// execution. Recurse only through schema positions: a property or enum value
+/// named `description` is data and must retain its exact meaning.
+pub fn executable_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema.clone();
+    };
+    Value::Object(
+        object
+            .iter()
+            .filter_map(|(key, value)| {
+                if matches!(
+                    key.as_str(),
+                    "description"
+                        | "title"
+                        | "$comment"
+                        | "examples"
+                        | "deprecated"
+                        | "x-astra-discovery-summary"
+                ) {
+                    return None;
+                }
+                let value = match key.as_str() {
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                    | "dependentSchemas" => value
+                        .as_object()
+                        .map(|schemas| {
+                            Value::Object(
+                                schemas
+                                    .iter()
+                                    .map(|(name, schema)| (name.clone(), executable_schema(schema)))
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or_else(|| value.clone()),
+                    "allOf" | "anyOf" | "oneOf" | "prefixItems" => value
+                        .as_array()
+                        .map(|schemas| {
+                            Value::Array(schemas.iter().map(executable_schema).collect())
+                        })
+                        .unwrap_or_else(|| value.clone()),
+                    "items" if value.is_array() => Value::Array(
+                        value
+                            .as_array()
+                            .expect("array checked")
+                            .iter()
+                            .map(executable_schema)
+                            .collect(),
+                    ),
+                    "items"
+                    | "additionalProperties"
+                    | "additionalItems"
+                    | "unevaluatedProperties"
+                    | "unevaluatedItems"
+                    | "contains"
+                    | "propertyNames"
+                    | "not"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "contentSchema" => executable_schema(value),
+                    _ => value.clone(),
+                };
+                Some((key.clone(), value))
+            })
+            .collect(),
+    )
+}
+
 /// Resolver output before the parent snapshot reference is known. The public
 /// constructor for `ResolvedProviderSnapshot` consumes drafts atomically so a
 /// descriptor cannot be attached to a different snapshot accidentally.
@@ -1216,7 +1285,26 @@ impl ResolvedProviderSnapshot {
 
         let mut versioned_drafts = Vec::with_capacity(drafts.len());
         for draft in drafts {
-            let encoded = serde_json::to_vec(&draft)
+            // The full snapshot still addresses presentation, provenance and
+            // model-directory changes. Invocation identity addresses only the
+            // executable contract, so a description refresh cannot revoke a
+            // selected unchanged tool. Owner/schema/security changes still do.
+            let semantics = &draft.semantic_baseline;
+            let mut execution_extensions = draft.extension_fields.clone();
+            execution_extensions.remove(PROVIDER_MODEL_CATALOG_KEY);
+            let executable = serde_json::json!({
+                "identity": draft.identity,
+                "native_tool_name": draft.native_tool_name,
+                "stable_tool_alias": draft.stable_tool_alias,
+                "input_schema": executable_schema(&draft.input_schema),
+                "output_schema": draft.output_schema.as_ref().map(executable_schema),
+                "claims": draft.claims,
+                "task_support": draft.task_support,
+                "extension_fields": execution_extensions,
+                "semantics": {"effect":semantics.effect,"idempotency":semantics.idempotency,
+                    "concurrency":semantics.concurrency,"semantic_cache":semantics.semantic_cache},
+            });
+            let encoded = serde_json::to_vec(&executable)
                 .map_err(|error| ProviderContractError::Serialization(error.to_string()))?;
             let descriptor_version =
                 DescriptorVersion::new(format!("sha256:{:x}", Sha256::digest(encoded)))?;
