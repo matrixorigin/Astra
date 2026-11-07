@@ -221,6 +221,18 @@ queue, so network waiting does not block keyboard handling or redraw. Password
 authentication (including any environment-identity check) also has a 15-second
 deadline. Once exchange starts, Escape/Ctrl-C reports that completion is pending
 instead of claiming cancellation after credentials may have committed.
+Both password and browser completion rebuild identity-owned Skill/MCP services
+and the session-memory port before runtime initialization. Credential publication
+invalidates the preceding private cache even if registration later fails. The
+event loop replaces its own registry, MCP and observer references and restarts
+discovery; signed-out onboarding installs the memory port for the first time.
+Post-login preference/outbox delivery and model discovery use the existing
+catalog task owner independently. Their completion carries the originating
+identity and session epoch; stale completions cannot modify another login, and
+model completion cannot replace a newer explicit model selection. Preference
+application and journal enqueue are local; the durable outbox owner delivers the
+new marker in the background. Slow sync neither holds terminal borrows nor
+delays model selection, and read cancellation/shutdown aborts these waits.
 If registration fails, the saved login and model preference remain available;
 queued messages return to the composer for manual review and are not sent
 automatically. Local-state failures ask users to check workspace/state write
@@ -264,17 +276,17 @@ When execution selection rejects a new turn with
 `execution_binding_provider_required` before durable run creation, it includes
 `metadata.attempt_admission_state: rejected`. The CLI preserves that code, restores the
 draft and suggests `/login` or restarting only when no earlier dispatched
-attempt remains ambiguous. The thin transport updates the admission owner's live
-dispatch evidence before sending and settles each attempt on a complete response
-or a proven connector failure. This preserves uncertainty on retry exhaustion,
-authentication errors, cancellation, and admission-deadline expiry as well as on
-successful response returns. Connector failures known to precede HTTP request
-dispatch (including a refused connection) do not create ambiguity; they also
-cannot clear ambiguity from an earlier attempt that may have reached the Server.
-Older clients ignore this new attempt-only field
-instead of interpreting it as the legacy `admission_state: rejected` guarantee. A lost response followed by a rejected retry keeps
-recovery evidence and reports unknown execution state without restoring a draft
-or claiming no model/tool ran. An admitted run or resume failure is never
+attempt remains ambiguous. The thin transport publishes dispatch evidence
+immediately before sending. Non-idempotent starts retry only after an HTTP 429
+rejection or a proven connector failure before sending; a potentially committed
+request is never replayed just because response headers were lost. Receipt of
+successful HTTP headers alone leaves the outcome unknown until the canonical
+stream identifies the Run or proves rejection. Headers followed by EOF or a
+truncated body without that evidence retain recovery state and explicit
+unknown-execution guidance, without restoring a draft or claiming no model/tool
+ran. Connector failures cannot clear an earlier uncertain dispatch. Older clients
+ignore the new attempt-only field rather than interpreting it as the legacy
+`admission_state: rejected` guarantee. An admitted run or resume failure is never
 relabeled as an unexecuted turn.
 
 At browser re-login the CLI drains and retires its old session-memory service

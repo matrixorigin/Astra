@@ -30,7 +30,15 @@ async fn build_request(
     url: &str,
     token: Option<&str>,
 ) -> Result<reqwest::RequestBuilder, String> {
-    let native_binding = crate::cli::native_auth::active();
+    build_request_with_binding(method, url, token, crate::cli::native_auth::active()).await
+}
+
+async fn build_request_with_binding(
+    method: reqwest::Method,
+    url: &str,
+    token: Option<&str>,
+    native_binding: Option<std::sync::Arc<crate::cli::native_auth::Binding>>,
+) -> Result<reqwest::RequestBuilder, String> {
     let builder = astra_core::net::client_builder_for_target(url)
         .timeout(std::time::Duration::from_secs(PREFS_HTTP_TIMEOUT_SECS));
     let builder = if native_binding.is_some() {
@@ -70,11 +78,34 @@ pub async fn pull_all_preferences(
     token: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     let url = format!("{}/preferences", cloud_base.trim_end_matches('/'));
-    let resp = build_request(reqwest::Method::GET, &url, token)
-        .await?
-        .send()
-        .await
-        .map_err(|e| format!("network: {e}"))?;
+    read_preferences(build_request(reqwest::Method::GET, &url, token).await?).await
+}
+
+pub(crate) async fn pull_all_preferences_for_owner(
+    cloud_base: &str,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> Result<Vec<(String, String)>, String> {
+    if !owner.is_current() {
+        return Err("sign-in changed during preference sync".into());
+    }
+    let url = format!("{}/preferences", cloud_base.trim_end_matches('/'));
+    let token = owner.access_token().await;
+    read_preferences(
+        build_request_with_binding(
+            reqwest::Method::GET,
+            &url,
+            token.as_deref(),
+            owner.native_binding.clone(),
+        )
+        .await?,
+    )
+    .await
+}
+
+async fn read_preferences(
+    request: reqwest::RequestBuilder,
+) -> Result<Vec<(String, String)>, String> {
+    let resp = request.send().await.map_err(|e| format!("network: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

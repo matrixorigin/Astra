@@ -1119,11 +1119,12 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
                 return Vec::new();
             }
         };
-    if prefs.is_empty() {
-        return Vec::new();
-    }
+    apply_cloud_preferences(state, &prefs)
+}
+
+fn apply_cloud_preferences(state: &mut SessionState, prefs: &[(String, String)]) -> Vec<String> {
     let keys: Vec<String> = prefs.iter().map(|(k, _)| k.clone()).collect();
-    for (key, value) in &prefs {
+    for (key, value) in prefs {
         match key.as_str() {
             pref_keys::EXPLAIN_MODE => {
                 state.explain = match value.as_str() {
@@ -1184,6 +1185,7 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
     keys
 }
 
+#[cfg(test)]
 pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport {
     let auth_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     try_drain_sync_outbox_for_snapshot(limit, &auth_snapshot).await
@@ -2524,6 +2526,71 @@ pub(crate) async fn run_post_auth_sync(
         schedule_sync_outbox_drain_after(delay);
     }
     report
+}
+
+/// Network result owned by the initiating identity. Applying it never waits
+/// for HTTP; the TUI can redraw, handle input and shut down during sync.
+pub(crate) struct PostAuthCloudResync {
+    pull: CloudPullResult,
+    preferences: Vec<(String, String)>,
+    pub(crate) report: SyncOutboxDrainReport,
+}
+
+pub(crate) async fn prepare_post_auth_cloud_resync(
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> PostAuthCloudResync {
+    let preferences = match owner
+        .native_binding
+        .as_ref()
+        .map(|binding| binding.endpoint().to_owned())
+        .or_else(resolve_cloud_base)
+    {
+        Some(base) => {
+            crate::cli::preferences_client::pull_all_preferences_for_owner(&base, owner).await
+        }
+        None => Err("cloud unconfigured".into()),
+    };
+    let pull = CloudPullResult {
+        cloud_reachable: preferences.is_ok(),
+    };
+    let preferences = preferences.unwrap_or_else(|_| {
+        tracing::warn!(target: "astra_cli::cloud_sync", operation = "post_auth_resync", error = "preference_pull_unavailable", "post-authentication preference pull skipped");
+        Vec::new()
+    });
+    let report = try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, owner).await;
+    if report.can_retry_automatically() && owner.is_current() {
+        schedule_sync_outbox_drain();
+    } else if owner.is_current()
+        && let Some(delay) = report.blocker.and_then(SyncOutboxDrainBlocker::retry_delay)
+    {
+        notify_sync_issue(&owner.owner_scope);
+        schedule_sync_outbox_drain_after(delay);
+    }
+    PostAuthCloudResync {
+        pull,
+        preferences,
+        report,
+    }
+}
+
+pub(crate) fn apply_post_auth_cloud_resync(
+    profile: Option<&str>,
+    state: &mut SessionState,
+    result: PostAuthCloudResync,
+) -> SyncOutboxDrainReport {
+    let keys = apply_cloud_preferences(state, &result.preferences);
+    let binding = matching_session_journal(state)
+        .map(|writer| (writer.owner_scope().clone(), writer.session_id().to_owned()));
+    let projection = append_cloud_pull_sync_journal_for_immediate_drain(
+        state,
+        profile.unwrap_or("default"),
+        "post_login",
+        &result.pull,
+        &keys,
+    );
+    let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    tokio::spawn(run_post_auth_sync(projection, binding, snapshot));
+    result.report
 }
 
 #[cfg(test)]

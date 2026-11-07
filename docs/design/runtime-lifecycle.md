@@ -394,6 +394,11 @@ await before sending. Stopping while credentials are pending cannot start a
 new admission when they resolve; an earlier dispatched attempt remains ambiguous.
 A dispatched request whose identity remains unknown is still unconfirmed;
 absence of a run header alone is not proof that nothing was admitted.
+Non-idempotent start transport retries require a proven pre-send connector
+failure or an HTTP 429 rejection. A lost response does not authorize replay, and
+successful HTTP headers do not settle an unidentified Run. EOF or truncation
+before authoritative stream identity/rejection retains unknown-execution
+guidance and recovery evidence.
 The opted-in shared SSE owner stops before tools or approvals from that same
 chunk; zero-grace hosts keep their existing chunk handling.
 Drain and exact-run cancellation share one existing ten-second deadline;

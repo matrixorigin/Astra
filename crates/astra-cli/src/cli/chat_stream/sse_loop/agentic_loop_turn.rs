@@ -1785,6 +1785,21 @@ pub(crate) async fn fetch_chat_turn_sse(
         stream_json_exchange,
     )
     .await;
+    // Headers alone cannot identify a durable Run. Settle dispatch evidence
+    // only from the canonical stream identity or an explicit rejection proof.
+    if turn
+        .core
+        .run_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+        || super::server_admission_host::is_pre_admission_rejection(
+            turn.core.error_code.as_deref(),
+            turn.core.error_metadata.as_ref(),
+            turn.core.run_id.as_deref(),
+        )
+    {
+        *prior_admission_ambiguous = false;
+    }
     if ui.timing {
         eprintln!(
             "{}",
