@@ -250,7 +250,8 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
         let request = tokio::time::timeout(Duration::from_secs(10), edge_rx.recv())
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .into_attempted_message();
         let EdgeServerMessage::ToolRequest {
             request_id,
             delivery_generation,
@@ -283,6 +284,7 @@ async fn native_stage_receipt_journey(scenario: Scenario) {
                     .await
                     .unwrap()
                     .unwrap()
+                    .into_attempted_message()
             else {
                 panic!("expected guidance")
             };

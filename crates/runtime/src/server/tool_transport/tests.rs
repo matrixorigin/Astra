@@ -114,11 +114,13 @@ impl ServerLocalToolTransport for PendingLocalTransport {
 struct StaticEdgeDispatch {
     inserted_edge_agent_ids: Mutex<Vec<String>>,
     inserted_identities: Mutex<Vec<EdgeDispatchIdentity>>,
+    delivered_receipts: Mutex<Vec<(EdgeDispatchIdentity, String, String)>>,
     failed_dispatches: Mutex<Vec<(String, String)>>,
     return_result: bool,
     result_status: &'static str,
     terminal_admission_result: Option<String>,
     admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
+    wait_error: bool,
     direct_claimed: AtomicBool,
 }
 
@@ -127,11 +129,13 @@ impl Default for StaticEdgeDispatch {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             inserted_identities: Mutex::new(Vec::new()),
+            delivered_receipts: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
             result_status: "completed",
             terminal_admission_result: None,
             admission_error: None,
+            wait_error: false,
             direct_claimed: AtomicBool::new(false),
         }
     }
@@ -140,27 +144,15 @@ impl Default for StaticEdgeDispatch {
 impl StaticEdgeDispatch {
     fn no_result() -> Self {
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
-            result_status: "completed",
-            terminal_admission_result: None,
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
     fn failed_result() -> Self {
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
-            return_result: true,
             result_status: "failed",
-            terminal_admission_result: None,
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
@@ -179,16 +171,11 @@ impl StaticEdgeDispatch {
             },
         );
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
-            result_status: "completed",
             terminal_admission_result: Some(
                 serde_json::to_string(&result).expect("terminal result fixture must serialize"),
             ),
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
@@ -283,10 +270,15 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
 
     async fn deliver_result(
         &self,
-        _identity: &EdgeDispatchIdentity,
-        _edge_agent_id: &str,
-        _result_json: &str,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
     ) -> Result<bool, String> {
+        self.delivered_receipts.lock().unwrap().push((
+            identity.clone(),
+            edge_agent_id.to_owned(),
+            result_json.to_owned(),
+        ));
         Ok(true)
     }
 
@@ -308,6 +300,9 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         identity: &EdgeDispatchIdentity,
         _timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
+        if self.wait_error {
+            return Err("database observation failed".into());
+        }
         if !self.return_result {
             return Ok(None);
         }
@@ -2529,7 +2524,8 @@ async fn edge_offline_does_not_call_server_local() {
 #[tokio::test]
 async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register(
         "user-1",
         "edge-other",
@@ -2596,7 +2592,8 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
 #[tokio::test]
 async fn unscoped_edge_binding_does_not_route_to_another_users_connected_edge() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-2",
         "edge-selected",
@@ -2650,7 +2647,8 @@ async fn unscoped_edge_binding_does_not_route_to_another_users_connected_edge() 
 #[tokio::test]
 async fn edge_websocket_without_durable_dispatch_authority_does_not_send() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "edge-selected",
@@ -2732,7 +2730,8 @@ async fn current_provider_executor_authorization_allows_one_durable_socket_dispa
     });
 
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -2772,7 +2771,9 @@ async fn current_provider_executor_authorization_allows_one_durable_socket_dispa
             .execute(tool_request, &CountingLocalTransport::new())
             .await
     });
-    let message = rx.recv().await.expect("authorized edge tool request");
+    let mut queued = rx.recv().await.expect("authorized edge tool request");
+    queued.mark_attempted();
+    let message = queued.message().clone();
     let (request_id, delivery_generation) = match message {
         astra_server_types::EdgeServerMessage::ToolRequest {
             request_id,
@@ -2849,7 +2850,8 @@ async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
     });
 
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(2);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(2);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -2901,7 +2903,9 @@ async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
     }
     start.wait().await;
 
-    let message = rx.recv().await.expect("claimed edge tool request");
+    let mut queued = rx.recv().await.expect("claimed edge tool request");
+    queued.mark_attempted();
+    let message = queued.message().clone();
     let (request_id, delivery_generation) = match message {
         astra_server_types::EdgeServerMessage::ToolRequest {
             request_id,
@@ -2974,7 +2978,8 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
     });
 
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -3043,7 +3048,8 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
 #[tokio::test]
 async fn completed_authorized_dispatch_replays_without_provider_reauthorization() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -3130,7 +3136,8 @@ async fn authorized_provider_executor_cannot_fall_back_to_server_sandbox_local_e
 #[tokio::test]
 async fn replayed_authorized_provider_executor_without_context_fails_before_dispatch() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "runner-selected",
@@ -3208,7 +3215,8 @@ async fn replayed_authorized_provider_executor_without_context_fails_before_disp
 async fn terminal_durable_dispatch_replays_without_socket_redispatch() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let dispatch = Arc::new(StaticEdgeDispatch::terminal_admission("durable-result"));
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "edge-selected",
@@ -3256,7 +3264,8 @@ async fn terminal_durable_dispatch_replays_without_socket_redispatch() {
 async fn workspace_service_account_edge_separates_route_owner_from_invocation_owner() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let dispatch = Arc::new(StaticEdgeDispatch::default());
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "sandbox-service-account",
         "edge-selected",
@@ -3301,7 +3310,9 @@ async fn workspace_service_account_edge_separates_route_owner_from_invocation_ow
             .await
     });
 
-    let message = rx.recv().await.expect("service-account edge tool request");
+    let mut queued = rx.recv().await.expect("service-account edge tool request");
+    queued.mark_attempted();
+    let message = queued.message().clone();
     let (request_id, delivery_generation, identity) = match message {
         astra_server_types::EdgeServerMessage::ToolRequest {
             request_id,
@@ -3347,7 +3358,8 @@ async fn workspace_service_account_edge_separates_route_owner_from_invocation_ow
 async fn edge_ws_result_preserves_tool_result_fields() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let dispatch = Arc::new(StaticEdgeDispatch::default());
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
     pool.register_with_capabilities(
         "user-1",
         "edge-selected",
@@ -3380,7 +3392,9 @@ async fn edge_ws_result_preserves_tool_result_fields() {
         service.execute(request, &local).await
     });
 
-    let message = rx.recv().await.expect("edge tool request");
+    let mut queued = rx.recv().await.expect("edge tool request");
+    queued.mark_attempted();
+    let message = queued.message().clone();
     assert_eq!(
         *dispatch
             .inserted_edge_agent_ids
@@ -3423,6 +3437,68 @@ async fn edge_ws_result_preserves_tool_result_fields() {
     assert_eq!(metadata["transport"], "edge_ws");
     assert_eq!(metadata["exit_code"], 7);
     assert_eq!(metadata["result_class"], "execution_error");
+}
+
+#[tokio::test]
+async fn dropped_unattempted_direct_request_records_nonexecution_receipt() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "edge-selected",
+        Some("MacBook Pro".into()),
+        Some("/Users/test/project".into()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
+        tx,
+    );
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch.clone())
+        .build();
+    let handle = tokio::spawn(async move {
+        service
+            .execute(
+                request(
+                    "bash",
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-selected",
+                        "MacBook Pro",
+                        ToolTransportKind::EdgeWs,
+                        ExecutorStatus::Online,
+                    ),
+                ),
+                &CountingLocalTransport::new(),
+            )
+            .await
+    });
+    drop(rx.recv().await.expect("durably admitted direct request"));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("unattempted request must wake its owner")
+        .unwrap();
+    assert!(result.is_error);
+    assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+    let receipts = dispatch.delivered_receipts.lock().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].0,
+        dispatch.inserted_identities.lock().unwrap()[0]
+    );
+    assert_eq!(receipts[0].1, "edge-selected");
+    let receipt: astra_thin_client::ToolResultRequest =
+        serde_json::from_str(&receipts[0].2).unwrap();
+    assert_eq!(receipt.status, "rejected");
+    assert_eq!(
+        receipt.tool_result_fields.unwrap()["execution_fact"],
+        "not_executed"
+    );
 }
 
 #[tokio::test]
@@ -3920,6 +3996,45 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         .expect("failed dispatches lock");
     assert_eq!(failed_dispatches.len(), 1);
     assert_eq!(failed_dispatches[0].1, "expired");
+}
+
+#[tokio::test]
+async fn edge_dispatch_observation_error_does_not_expire_running_work() {
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        wait_error: true,
+        ..StaticEdgeDispatch::default()
+    });
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+    assert!(result.is_error);
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert!(dispatch.failed_dispatches.lock().unwrap().is_empty());
+    assert_eq!(local.calls(), 0);
 }
 
 #[tokio::test]

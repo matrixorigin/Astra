@@ -1439,7 +1439,8 @@ mod tests {
     #[tokio::test]
     async fn default_tool_execution_service_does_not_bypass_durable_dispatch() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<astra_server_types::edge_connection_pool::EdgeOutbound>(1);
         state.edge_connection_pool.register_with_capabilities(
             "user-1",
             "edge-selected",
