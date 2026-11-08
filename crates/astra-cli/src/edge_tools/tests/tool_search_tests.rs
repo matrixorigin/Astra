@@ -101,7 +101,7 @@ async fn direct_tool_search_fails_closed_without_installed_surface() {
 #[tokio::test]
 async fn select_resolves_only_current_visible_tools_with_full_schema() {
     let executor = executor();
-    set_visible(&executor, &["bash", "tool_search"]);
+    set_visible(&executor, &["bash", "rollback_file_edits", "tool_search"]);
 
     let parsed = run_search(&executor, json!({"query": "select:bash"})).await;
 
@@ -110,7 +110,7 @@ async fn select_resolves_only_current_visible_tools_with_full_schema() {
     assert_eq!(field_strings(&parsed, "requested"), strings(&["bash"]));
     assert!(field_strings(&parsed, "missing").is_empty());
     assert_eq!(match_names(&parsed), strings(&["bash"]));
-    assert_eq!(parsed["total_tools"].as_u64(), Some(2));
+    assert_eq!(parsed["total_tools"].as_u64(), Some(3));
     assert!(
         parsed["matches"][0].get("parameters").is_some(),
         "select mode must return callable parameter shape: {parsed}"
@@ -119,8 +119,19 @@ async fn select_resolves_only_current_visible_tools_with_full_schema() {
         .as_object()
         .expect("select mode must return callable properties");
     assert!(
-        properties.contains_key("source_artifacts"),
-        "selection must restore bash's canonical advanced contract, not its resident projection: {parsed}"
+        !properties.contains_key("source_artifacts") && properties.contains_key("command"),
+        "selection must expose the callable local bash contract: {parsed}"
+    );
+    let rollback = run_search(&executor, json!({"query": "select:rollback_file_edits"})).await;
+    let properties = &rollback["matches"][0]["parameters"]["properties"];
+    assert!(properties.get("receipt_id").is_none(), "{rollback}");
+    assert!(
+        !properties["scope"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|scope| scope == "source_receipt"),
+        "{rollback}"
     );
 }
 

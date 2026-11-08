@@ -387,6 +387,8 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "mode",
                 "timeout",
                 "force",
+                "stdin",
+                "yield_time_ms",
                 // These fields are present only on the CLI edge projection.
                 // The shared/server Bash schema does not declare them, so
                 // retaining them here cannot widen a foreground executor.
@@ -617,6 +619,9 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
     for property in properties.values_mut() {
         astra_tools::tool_search::compact_parameter_descriptions(property, true);
     }
+    let interactive_shell = name == "bash"
+        && properties.contains_key("stdin")
+        && properties.contains_key("yield_time_ms");
     // A managed edge Bash schema is a real executable contract, not a rare
     // catalog-only option: without these fields the model cannot keep a
     // service alive across calls. Preserve the small lifecycle shape when the
@@ -642,6 +647,11 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 Value::String("Maximum managed service lifetime in seconds.".to_string());
         }
     }
+    let description = if interactive_shell {
+        format!("{description} stdin=true enables task_input; task_output observes running tasks.")
+    } else {
+        description.to_string()
+    };
     function.insert(
         "description".to_string(),
         Value::String(if managed_background {

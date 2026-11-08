@@ -32,9 +32,9 @@ use crate::tui::markdown_render::render_markdown_text_with_width;
 
 const CHOICES: &[(&str, PlanChoice, &str)] = &[
     (
-        "Approve · auto",
-        PlanChoice::ApproveAuto,
-        "All tool calls auto-approved",
+        "Approve · keep permissions",
+        PlanChoice::ApproveRetain,
+        "Continue with the current execution permissions",
     ),
     (
         "Approve · edit",
@@ -55,7 +55,7 @@ const CHOICES: &[(&str, PlanChoice, &str)] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanChoice {
-    ApproveAuto,
+    ApproveRetain,
     ApproveEdit,
     ApproveDefault,
     KeepPlanning,
@@ -64,14 +64,12 @@ enum PlanChoice {
 impl PlanChoice {
     fn into_decision(self) -> PlanReviewDecision {
         match self {
-            Self::ApproveAuto => PlanReviewDecision::Approve {
-                mode: PermissionMode::Auto,
-            },
+            Self::ApproveRetain => PlanReviewDecision::Approve { mode: None },
             Self::ApproveEdit => PlanReviewDecision::Approve {
-                mode: PermissionMode::AcceptEdits,
+                mode: Some(PermissionMode::AcceptEdits),
             },
             Self::ApproveDefault => PlanReviewDecision::Approve {
-                mode: PermissionMode::Prompt,
+                mode: Some(PermissionMode::Prompt),
             },
             Self::KeepPlanning => PlanReviewDecision::KeepPlanning,
         }
@@ -300,15 +298,10 @@ mod tests {
     #[test]
     fn enter_submits_currently_selected_choice() {
         let (mut view, mut rx) = make_view();
-        // Default selection is "Approve auto" (index 0).
+        // Default selection is "Approve · keep permissions" (index 0).
         view.handle_key(key(KeyCode::Enter));
         let decision = rx.try_recv().expect("decision sent");
-        assert_eq!(
-            decision,
-            PlanReviewDecision::Approve {
-                mode: PermissionMode::Auto
-            }
-        );
+        assert_eq!(decision, PlanReviewDecision::Approve { mode: None });
         assert!(view.is_complete());
     }
 
@@ -344,7 +337,7 @@ mod tests {
         assert_eq!(
             rx.try_recv().expect("decision sent"),
             PlanReviewDecision::Approve {
-                mode: PermissionMode::Prompt
+                mode: Some(PermissionMode::Prompt)
             }
         );
     }

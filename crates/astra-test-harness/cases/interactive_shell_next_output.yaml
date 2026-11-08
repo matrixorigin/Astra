@@ -1,0 +1,84 @@
+name: interactive_shell_next_output
+description: |
+  Exercise one interactive shell across output, input, and terminal delivery.
+  An ordered owner-bound witness must connect both challenges, their inputs,
+  the output revision and the successful terminal result.
+prompt: |
+  Run `python3 -u fixtures/harness/interactive-shell/challenge.py` from the workspace,
+  setting the working directory if needed. Launch Bash with stdin=true.
+  Use task_input to send each code, including a newline, to the same task.
+  To wait for new output, use task_output with block=true, wake_on_output=true,
+  and after_output_revision set to the previously observed output revision.
+  This is an interactive program: read the code after FIRST>, send that exact code on a
+  line, then wait for new output and send the code after SECOND> on a line.
+  The second prompt is intentionally delayed. Use the last output revision
+  when waiting for new output, so old output does not wake the wait. Wait for
+  the program to finish and report its final result. Allow up to 150 seconds
+  for the command, including the time between interactions. Do not edit files.
+models:
+  - deepseek-v4-flash
+capability: tool_use
+difficulty: 3
+weight: 2.0
+timeout_seconds: 180
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: execution_tool_count
+    name: bash
+    min: 1
+    max: 1
+    root_only: true
+    ok: true
+    predicates:
+      - {document: arguments, path: /stdin, equals: true}
+      - {document: arguments, path: /command, contains: challenge.py}
+  - type: execution_tool_sequence
+    tools: [bash, task_output, task_input, task_output, task_input, task_output]
+    last_ok: true
+    require_settled: true
+    steps:
+      - ok: true
+        predicates:
+          - {document: arguments, path: /stdin, equals: true}
+          - {document: arguments, path: /command, contains: challenge.py}
+        bindings:
+          - {name: task, document: result, path: '', capture: '(bg-shell-[0-9a-f]{32})'}
+      - ok: true
+        bindings:
+          - {name: task, document: arguments, path: /task_id}
+          - {name: first, document: result, path: /output, capture: '(?s)\A(?:<stdout tail>\n)?[^<]*FIRST> ([0-9a-f]{16})\r?\n'}
+          - {name: revision, document: result, path: /output_revision}
+      - ok: true
+        predicates:
+          - {document: result, path: /input_delivery, equals: written}
+        bindings:
+          - {name: task, document: arguments, path: /task_id}
+          - {name: first, document: arguments, path: /input, capture: '\A[ \t]*([0-9a-f]{16})[ \t]*\r?\n\z'}
+      - ok: true
+        predicates:
+          - {document: arguments, path: /block, equals: true}
+          - {document: arguments, path: /wake_on_output, equals: true}
+        bindings:
+          - {name: task, document: arguments, path: /task_id}
+          - {name: revision, document: arguments, path: /after_output_revision}
+          - {name: second, document: result, path: /output, capture: '(?s)\A(?:<stdout tail>\n)?[^<]*SECOND> ([0-9a-f]{16})\r?\n'}
+      - ok: true
+        predicates:
+          - {document: result, path: /input_delivery, equals: written}
+        bindings:
+          - {name: task, document: arguments, path: /task_id}
+          - {name: second, document: arguments, path: /input, capture: '\A[ \t]*([0-9a-f]{16})[ \t]*\r?\n\z'}
+      - ok: true
+        predicates:
+          - {document: result, path: /terminal, equals: true}
+          - {document: result, path: /status, equals: completed}
+          - {document: result, path: /offset, equals: 0}
+          - {document: result, path: /execution/execution_fact, equals: executed}
+          - {document: result, path: /execution/exit_code, equals: 0}
+        bindings:
+          - {name: task, document: arguments, path: /task_id}
+          - {name: finished, document: result, path: /output, capture: '(?s)\A[^<]*(INTERACTIVE_OK)'}
+  - type: text_contains
+    needle: INTERACTIVE_OK

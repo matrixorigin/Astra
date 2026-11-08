@@ -88,7 +88,6 @@ impl ObservabilitySession {
             turn_timings: Vec::new(),
             fuzzy_match_events: Vec::new(),
             last_denial_pressure: None,
-            recent_failing_tests: Vec::new(),
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
@@ -123,7 +122,6 @@ impl ObservabilitySession {
             turn_timings: Vec::new(),
             fuzzy_match_events: Vec::new(),
             last_denial_pressure: None,
-            recent_failing_tests: Vec::new(),
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             outcome_bias: std::collections::BTreeMap::new(),
@@ -154,7 +152,7 @@ impl ObservabilitySession {
     /// new run so the freshness report resets `rounds_alive` to 0 and
     /// clears a stale status.
     ///
-    /// The self-model channels (`RecentFailingTests`, `OutcomeBias`)
+    /// The self-model channel (`OutcomeBias`)
     /// are derived from this session's own state. Everything else
     /// comes from the caller because only the bridge / CLI sees what
     /// actually landed in `edge_profile` / `dynamic_sections` this
@@ -180,13 +178,6 @@ impl ObservabilitySession {
     ) {
         use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
         let round = self.turn_number;
-
-        let failing_text = self.recent_failing_tests.join(",");
-        self.injection_history.observe(
-            round,
-            InjectionChannel::RecentFailingTests,
-            InjectionFingerprint::from_content(&failing_text),
-        );
 
         let bias_text = self
             .outcome_bias
@@ -415,42 +406,6 @@ impl ObservabilitySession {
             let drop = self.recent_correction_excerpts.len() - MAX_EXCERPTS;
             self.recent_correction_excerpts.drain(0..drop);
         }
-    }
-
-    /// Gap 2: publish names of tests that failed in a recent tool outcome.
-    /// Dedup preserves the newest occurrence; the ring is bounded.
-    pub fn record_failing_test_names(&mut self, names: impl IntoIterator<Item = String>) {
-        const MAX_NAMES: usize = 8;
-        for name in names {
-            if name.trim().is_empty() {
-                continue;
-            }
-            self.recent_failing_tests.retain(|n| n != &name);
-            self.recent_failing_tests.push(name);
-        }
-        if self.recent_failing_tests.len() > MAX_NAMES {
-            let drop = self.recent_failing_tests.len() - MAX_NAMES;
-            self.recent_failing_tests.drain(0..drop);
-        }
-    }
-
-    /// Tier 1 expiry: clear the bounded failing-test ring because a
-    /// later build/test run came back green. Called by the shell
-    /// handler when parsed output reports `passed == true` and no error
-    /// messages — at that point, any previously-recorded failures are
-    /// either (a) actually fixed, or (b) not part of the scope being
-    /// validated; in either case the signal is stale and should not be
-    /// re-rendered into the self-awareness block for the next turn.
-    ///
-    /// If the scope-b case is relevant (operator ran only a subset and
-    /// other tests remain broken), the next red test run will
-    /// re-populate the ring within one turn — so clearing is self-
-    /// healing, not information-destroying. This fixes the f85a02bb
-    /// regression where a mis-cwd Cargo.toml failure recorded on round
-    /// 0 persisted for 58 consecutive rounds after every later cargo
-    /// invocation succeeded.
-    pub fn clear_failing_tests(&mut self) {
-        self.recent_failing_tests.clear();
     }
 
     /// Gap 3: record a permission rejection with its reason. Dedups by

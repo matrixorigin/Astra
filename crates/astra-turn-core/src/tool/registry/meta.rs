@@ -689,6 +689,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 25,
     },
     ToolMeta {
+        name: "task_input",
+        description: "Write input or close stdin on an owned running shell task.",
+        triggers: &["task stdin", "task input", "interactive process"],
+        intents: &[IntentType::CodeEdit],
+        scope: Scope::Local,
+        requires: &[Capability::LocalBackgroundTasks],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 40,
+    },
+    ToolMeta {
         name: "task_list",
         description: "List typed background tasks for this session.",
         triggers: &[

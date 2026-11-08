@@ -3159,7 +3159,7 @@ async fn ensure_core_schema_while_leased(
                 (delete_requested_at, user_id, session_id),
             INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
             INDEX idx_agent_sessions_agent_status (agent_id, status),
-            INDEX idx_agent_sessions_active_plan_id (active_plan_id),
+            INDEX idx_agent_sessions_active_plan_id (user_id, active_plan_id),
             INDEX idx_agent_sessions_config_version (config_version_id),
             INDEX idx_sessions_project (user_id, project_id, updated_at)
         )",

@@ -146,7 +146,7 @@ fn persist_permission_mode_to_workspace(session_id: &str, mode: PermissionMode) 
 /// segments. It lets a user trust an existing outside directory once and
 /// later create/read a new child beneath it, while avoiding raw-string
 /// prefix checks that can be bypassed with symlinks.
-fn canonicalize_existing_or_parent(p: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn canonicalize_existing_or_parent(p: &Path) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind};
     use std::path::Component;
 

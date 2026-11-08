@@ -500,6 +500,58 @@ fn seed_trusted_workspace(home: &std::path::Path) {
     .expect("write workspace trust ledger");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_turn_does_not_restart_when_background_shell_finishes() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::BackgroundThenQuestion,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("Start the task and ask me what to do next.");
+    astra.wait_for("Approval · Bash", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("Which option should I choose?", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
+    // Release the real shell only after the final answer and wait until the
+    // TUI observes it. The previous implementation started a second run here.
+    std::fs::write(home.path().join("release-background"), "go").unwrap();
+    astra.wait_for("Background shell", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("completed", UI_TRANSITION_TIMEOUT);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        astra.receive(Duration::from_millis(50));
+        assert_eq!(
+            mock.received_requests().len(),
+            1,
+            "a task update started a new turn"
+        );
+    }
+
+    astra.paste_and_submit("Choose the first option.");
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the user's follow-up was not sent"
+        );
+        astra.receive(Duration::from_millis(50));
+    }
+    let requests = mock.received_requests();
+    assert!(
+        requests[1].to_string().contains("gated background task"),
+        "the next user turn lost the background update: {}",
+        requests[1]
+    );
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}
+
 fn seed_account(home: &std::path::Path) {
     // Exercise the authenticated account binding used by production run controls.
     astra_credentials::CredentialStore::with_path(home.join(".astra/credentials.json"))
@@ -1932,6 +1984,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.paste_and_submit("delegate_one_child_and_keep_it_observable");
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("1 live", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
@@ -1943,6 +1996,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     mock.release_held_response();
     astra.write(&[0x0f]);
     astra.wait_for("Agent completed", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_absent("1 live", UI_TRANSITION_TIMEOUT);
     for _ in 0..2 {
         astra.select_completed_conversation("Mock child review");
         astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);

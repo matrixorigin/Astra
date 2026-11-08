@@ -2068,10 +2068,13 @@ mod tests {
 
         let summary = session_agent_delivery_summary(&events).unwrap();
 
-        assert!(summary.contains("0/3"), "{summary}");
+        assert!(summary.contains("3 spawned, 0 completed"), "{summary}");
         assert!(summary.contains("3 interrupted"), "{summary}");
         assert!(summary.contains("0 other terminal"), "{summary}");
-        assert!(summary.contains("0 without terminal evidence"), "{summary}");
+        assert!(
+            summary.contains("do not establish task completion"),
+            "{summary}"
+        );
     }
     use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
     use astra_services::session_journal::{

@@ -1,60 +1,6 @@
-/// Unicode-aware token estimation for a string.
-///
-/// BPE tokenizers (GPT-4, Claude, etc.) encode dense non-ASCII scripts
-/// (CJK, kana, Hangul, Cyrillic, Arabic, etc.) at roughly 1.5 tokens per
-/// character on average. A single character often splits into 2 BPE tokens,
-/// while common bigrams merge back. We use 3/2 integer arithmetic for a
-/// conservative estimate without floating point. ASCII text averages ~4 bytes
-/// per token.
-///
-/// JSON content uses ~2 bytes per token due to many single-character tokens
-/// (`{`, `}`, `:`, `,`, `"`). Detected by leading `{` or `[`.
-///
-/// Emoji typically consume 2-3 tokens each, so they use a separate 2.5-token
-/// estimate. All non-ASCII text not classified as emoji uses the dense-script
-/// estimate; this avoids brittle Unicode block allowlists.
-pub fn estimate_str_tokens(s: &str) -> usize {
-    let mut dense_unicode_tokens: usize = 0;
-    let mut emoji_tokens: usize = 0;
-    let mut ascii_bytes: usize = 0;
-
-    for ch in s.chars() {
-        if ch.is_ascii() {
-            ascii_bytes += ch.len_utf8();
-        } else if is_emoji_like(ch) {
-            emoji_tokens += 1;
-        } else {
-            dense_unicode_tokens += 1;
-        }
-    }
-
-    // Dense Unicode scripts: ~1.5 tokens per char (3*n/2).
-    let dense_unicode_total = (dense_unicode_tokens * 3).div_ceil(2);
-    // Emoji: ~2.5 tokens each (5*n/2)
-    let emoji_total = (emoji_tokens * 5).div_ceil(2);
-
-    // JSON-like content: ~2 bytes/token. Regular text: ~4 bytes/token.
-    // Trim leading whitespace before peeking — tool results often have
-    // newlines or spaces before the opening brace.
-    let first = s
-        .as_bytes()
-        .iter()
-        .find(|b| !b.is_ascii_whitespace())
-        .copied()
-        .unwrap_or(0);
-    let ascii_divisor = if first == b'{' || first == b'[' { 2 } else { 4 };
-
-    dense_unicode_total + emoji_total + ascii_bytes / ascii_divisor
-}
-
-fn is_emoji_like(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x1F000..=0x1FAFF // pictographs, flags, symbols, supplemental emoji
-            | 0x2600..=0x27BF // miscellaneous symbols and dingbats
-            | 0xFE00..=0xFE0F // variation selectors used in emoji presentation
-    )
-}
+pub use astra_core::model_wire::token_estimate::{
+    estimate_json_tokens as estimate_json_value_tokens, estimate_str_tokens,
+};
 
 /// Approximate token count with CJK-aware estimation.
 /// Adds overhead per message for role/formatting tokens, plus system prompt
@@ -141,29 +87,9 @@ pub(crate) const PER_MESSAGE_OVERHEAD: usize = 4;
 /// (serde_json::to_string → char count → token estimate), which is coarser
 /// but available at a lower layer without depending on this crate.
 /// Both are approximations; the provider tokenizer is authoritative.
-pub fn estimate_json_value_tokens(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Null | serde_json::Value::Bool(_) => 1,
-        serde_json::Value::Number(number) => estimate_str_tokens(&number.to_string()).max(1),
-        serde_json::Value::String(text) => estimate_str_tokens(text).saturating_add(1),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .map(estimate_json_value_tokens)
-            .fold(1_usize, usize::saturating_add),
-        serde_json::Value::Object(map) => map
-            .iter()
-            .map(|(key, value)| {
-                estimate_str_tokens(key)
-                    .saturating_add(1)
-                    .saturating_add(estimate_json_value_tokens(value))
-            })
-            .fold(1_usize, usize::saturating_add),
-    }
-}
-
 /// Estimate tokens for a single provider message in any JSON wire shape.
 pub(crate) fn estimate_single_message_tokens(m: &serde_json::Value) -> usize {
-    estimate_json_value_tokens(m)
+    astra_core::model_wire::token_estimate::measure_message(m).text_tokens
 }
 
 // ---------------------------------------------------------------------------

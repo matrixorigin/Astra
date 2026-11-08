@@ -1,4 +1,3 @@
-pub(crate) mod agent_guide_view;
 pub(crate) mod agent_transcript_view;
 pub(crate) mod ask_user_view;
 pub(crate) mod background_task_view;
@@ -11,12 +10,14 @@ pub(crate) mod help_view;
 pub(crate) mod in_flight_agents_view;
 pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
+pub(crate) mod local_output_view;
 pub(crate) mod login_view;
 pub(crate) mod paste_burst;
 pub(crate) mod plan_review_view;
 pub(crate) mod root_transcript_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
+pub(crate) mod task_input_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
 pub(crate) mod transcript_view;
@@ -1347,6 +1348,13 @@ impl BottomPane {
     }
 
     pub(crate) fn activate_agent_transcript(&mut self, agent_id: &str, run_id: &str) -> bool {
+        if !run_id.is_empty() && let Some(tab_id) = self.view_stack.iter().find_map(|view| {
+            let tab_id = view.conversation_tab_id()?;
+            matches!(&tab_id, ConversationTabId::Run { run_id: open_run, .. } if open_run == run_id)
+                .then_some(tab_id)
+        }) {
+            return self.activate_conversation_tab(&tab_id);
+        }
         self.activate_conversation_tab(&ConversationTabId::Run {
             agent_id: agent_id.to_string(),
             run_id: run_id.to_string(),

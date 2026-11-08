@@ -21,7 +21,6 @@ pub mod session_tool_contract;
 pub mod web_fetch;
 pub mod web_search;
 
-pub mod build_test;
 // run_script is the programmatic tool-calling / code execution RPC bridge.
 // It uses Unix domain sockets for the script↔host RPC channel. Windows
 // would need named pipes — deferred. Gate the modules so the crate still
@@ -843,6 +842,12 @@ pub enum ApprovalDecision {
 /// execute immediately.
 #[async_trait]
 pub trait ToolApprovalGate: Send + Sync {
+    /// Whether authoring must wait for human review under the current user
+    /// policy. A model may request review, never waive a required review.
+    async fn plan_review_required(&self) -> bool {
+        true
+    }
+
     /// Request approval for a tool invocation. The implementation should send
     /// the request to the UI and block until the user responds or timeout.
     async fn request_approval(

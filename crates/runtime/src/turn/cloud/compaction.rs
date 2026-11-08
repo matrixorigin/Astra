@@ -85,6 +85,90 @@ pub(crate) fn prepare_prefix_summary(
     })
 }
 
+/// Replace completed history with a model-generated summary while retaining
+/// user intent, runtime authority, and the current tool continuation. Unlike
+/// mechanical pruning, a summary can replace whole completed provider rounds.
+pub(crate) fn prepare_conversation_summary(
+    messages: &[Value],
+    spill_count: usize,
+    summary: Value,
+    schema_tokens: usize,
+    max_tokens: u64,
+    system_prompt_tokens: Option<usize>,
+    sent_prefix: Option<usize>,
+) -> Option<(PrefixSummaryCompaction, Option<usize>)> {
+    if spill_count == 0 || spill_count > messages.len() {
+        return None;
+    }
+    // Provider continuation belongs to each retained round, not to the
+    // summarized rounds. Analyze the semantic history without cloning opaque
+    // provider state, but retain the original message whenever it is needed.
+    let semantic: Vec<_> = messages
+        .iter()
+        .map(astra_core::model_wire::responses::without_continuation)
+        .collect();
+    let authority = authority_retention(&semantic, None, None)?;
+    let mut keep: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            index >= spill_count
+                || astra_turn_types::is_human_user_message(message)
+                || (astra_turn_types::is_runtime_owned_message(message)
+                    && astra_turn_types::runtime_message_delivery(message)
+                        != Some(
+                            astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext,
+                        ))
+                || authority.protected[index]
+        })
+        .collect();
+    retain_latest_tool_batch(&semantic, &mut keep);
+    close_retained_dependencies(&semantic, &mut keep);
+    if authority_retention(&semantic, Some(&keep), None)?.active != authority.active {
+        return None;
+    }
+    let first_removed = keep.iter().position(|keep| !keep)?;
+    let mut compacted = Vec::with_capacity(messages.len());
+    let mut mapped_prefix = sent_prefix.map(|_| 0usize);
+    for (index, message) in messages.iter().enumerate() {
+        if index == first_removed {
+            compacted.push(summary.clone());
+            if sent_prefix.is_some_and(|prefix| index < prefix) {
+                *mapped_prefix.as_mut()? += 1;
+            }
+        }
+        if keep[index] {
+            compacted.push(message.clone());
+            if sent_prefix.is_some_and(|prefix| index < prefix) {
+                *mapped_prefix.as_mut()? += 1;
+            }
+        }
+    }
+    astra_turn_types::validate_canonical_tool_pairing(&compacted).ok()?;
+    let estimate = |history: &[Value]| {
+        crate::turn::agentic_loop::lifecycle::estimate_context_pressure_with_system_prompt_tokens(
+            history,
+            schema_tokens,
+            max_tokens,
+            system_prompt_tokens,
+        )
+        .1
+    };
+    let tokens_before = estimate(messages);
+    let tokens_after = estimate(&compacted);
+    (tokens_after < tokens_before).then(|| {
+        (
+            PrefixSummaryCompaction {
+                messages_removed: messages.len() - compacted.len(),
+                messages: compacted,
+                tokens_before,
+                tokens_after,
+            },
+            mapped_prefix,
+        )
+    })
+}
+
 pub(crate) fn adjust_spill_boundary_for_tool_pairs(
     messages: &[serde_json::Value],
     mut spill_count: usize,
@@ -3663,6 +3747,112 @@ mod prefix_summary_tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn summarized_long_turn_continues_with_the_latest_responses_tool_round() {
+        let route = "11111111-1111-4111-8111-111111111111";
+        let key = astra_services::FernetTokenEncryptor::new("fixture-key").unwrap();
+        let mut history =
+            vec![json!({"role":"user", "content":"Fix the issue; preserve this constraint"})];
+        let expired = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "This instruction applies only to the next decision",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap()
+        .unwrap();
+        history.push(expired.clone());
+        for index in 0..8 {
+            let call = format!("call-{index}");
+            let mut saved = json!({"connection_id":route, "model":"model", "items":[
+                {"type":"reasoning", "id":format!("reason-{index}"), "content":[{"type":"reasoning_text", "text":"private state"}]},
+                {"type":"function_call", "call_id":call, "name":"read_file", "arguments":"{}"}
+            ]});
+            crate::turn::llm::private_continuation::seal(&mut saved, &key, "owner", "session")
+                .unwrap();
+            history.push(json!({"role":"assistant", "content":"", "tool_calls":[{"id":call, "function":{"name":"read_file", "arguments":"{}"}}],
+                astra_core::model_wire::responses::CONTINUATION_KEY:saved}));
+            history.push(json!({"role":"tool", "tool_call_id":call, "content":"observed evidence ".repeat(200)}));
+            if index < 7 {
+                history.push(json!({"role":"assistant", "content":"Completed inspection"}));
+            }
+        }
+        let control = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "continue active Work",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        history.push(control.clone());
+        let spill = adjust_spill_boundary_for_tool_pairs(&history, history.len() - 5);
+        let summary = astra_turn_core::cloud::history_summary::history_summary_message(
+            "Completed inspections and their findings".into(),
+        );
+        let (candidate, _) = prepare_conversation_summary(
+            &history,
+            spill,
+            summary,
+            0,
+            10_000,
+            None,
+            Some(history.len() - 4),
+        )
+        .expect("a summarized completed prefix should reduce the active turn");
+        assert!(candidate.messages_removed > 0);
+        assert_eq!(candidate.messages[0], history[0]);
+        assert_eq!(candidate.messages.last(), Some(&control));
+        assert!(
+            !candidate.messages.contains(&expired),
+            "an expired control must not revive"
+        );
+        assert!(
+            !candidate
+                .messages
+                .iter()
+                .any(|message| message["tool_call_id"] == "call-0")
+        );
+        assert!(
+            candidate
+                .messages
+                .iter()
+                .any(|message| message["tool_call_id"] == "call-7")
+        );
+        astra_turn_types::validate_canonical_tool_pairing(&candidate.messages).unwrap();
+
+        let mut proof =
+            crate::turn::canonical_commit::CanonicalRewriteProof::from_materialized_admission(
+                &history, "root", 1,
+            );
+        let permit = proof.begin(&history);
+        proof.finish(permit, &candidate.messages, None);
+        let (_, segments) = crate::turn::canonical_commit::canonical_commit_delta(
+            &history,
+            true,
+            &candidate.messages,
+            Some(&proof),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let mut restored = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(segments.concat()).unwrap();
+        crate::turn::llm::private_continuation::open(
+            &mut restored,
+            &key,
+            "owner",
+            &std::collections::HashSet::from(["session".to_string()]),
+            route,
+            "model",
+        )
+        .unwrap();
+        let request = astra_core::model_wire::responses::request(
+            "model", &restored, None, route, false, None,
+        )
+        .unwrap();
+        let input = request["input"].as_array().unwrap();
+        assert!(input.iter().any(|item| item["id"] == "reason-7"));
+        assert!(input.iter().any(|item| item["call_id"] == "call-7"));
     }
 
     #[test]

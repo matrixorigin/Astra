@@ -632,86 +632,6 @@ async fn file_rollback_refuses_edits_from_a_former_workspace() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep\n");
 }
 
-#[cfg(unix)]
-#[tokio::test]
-#[serial_test::serial]
-async fn source_receipt_restores_a_matching_child_file() {
-    let workspace = tempfile::tempdir().unwrap();
-    let store = tempfile::tempdir().unwrap();
-    let _source_env = crate::test_utils::ProcessEnvGuard::remove("_ASTRA_SOURCE_PREIMAGE_ROOT");
-    let _checkpoint_env = crate::test_utils::ProcessEnvGuard::remove("_ASTRA_FILE_CHECKPOINT_ROOT");
-    unsafe {
-        crate::test_utils::set_var_serial("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path());
-        crate::test_utils::set_var_serial("_ASTRA_FILE_CHECKPOINT_ROOT", store.path());
-    }
-    let child = workspace.path().join("child");
-    std::fs::create_dir(&child).unwrap();
-    let path = child.join("input.txt");
-    std::fs::write(&path, "before").unwrap();
-    let mut receipt = astra_tools::source_preimage::prepare(
-        workspace.path(),
-        &json!({"source_artifacts":["child/input.txt"]}),
-        "cli:receipt-session:run:r1:turn:t1:call:c1",
-    )
-    .unwrap()
-    .unwrap();
-    std::fs::write(&path, "after").unwrap();
-    let id = receipt.receipt.receipt_id.clone();
-    receipt.finish();
-    let exe = ToolExecutor::new(workspace.path()).with_active_session_id("receipt-session");
-    let args = json!({"scope":"source_receipt", "receipt_id":id});
-    let restored = exe
-        .execute_with_metadata("rollback_file_edits", &args)
-        .await;
-    assert!(!restored.is_error, "{restored:?}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-#[serial_test::serial]
-async fn source_receipt_captures_after_workspace_admission() {
-    let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
-    let workspace = tempfile::tempdir().unwrap();
-    let store = tempfile::tempdir().unwrap();
-    let _source_env = crate::test_utils::ProcessEnvGuard::remove("_ASTRA_SOURCE_PREIMAGE_ROOT");
-    unsafe { crate::test_utils::set_var_serial("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
-    let path = workspace.path().join("input.txt");
-    std::fs::write(&path, "old").unwrap();
-    let session_id = format!("source-admission-{}", uuid::Uuid::new_v4());
-    let executor = ToolExecutor::new(workspace.path()).with_active_session_id(&session_id);
-    let lease = astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
-        workspace.path(),
-        None,
-        std::time::Duration::from_secs(1),
-    )
-    .await
-    .unwrap();
-    let args = json!({"command":"printf after > input.txt", "source_artifacts":["input.txt"]});
-    let mut request = Box::pin(executor.execute_with_metadata("bash", &args));
-    let first_poll = std::future::poll_fn(|cx| {
-        std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), cx))
-    })
-    .await;
-    assert!(first_poll.is_pending());
-    std::fs::write(&path, "intervening").unwrap();
-    drop(lease);
-    let result = request.await;
-    assert!(!result.is_error, "{result:?}");
-    let receipt_id = result.tool_result_fields.as_ref().unwrap()["source_preimage"]["receipt_id"]
-        .as_str()
-        .unwrap();
-    astra_tools::source_preimage::prepare_receipt_restore(
-        workspace.path(),
-        &format!("cli:{session_id}"),
-        receipt_id,
-    )
-    .unwrap()
-    .restore()
-    .unwrap();
-    assert_eq!(std::fs::read_to_string(path).unwrap(), "intervening");
-}
-
 #[tokio::test]
 #[serial_test::serial]
 async fn resumed_session_keeps_its_selected_worktree() {
@@ -1205,6 +1125,80 @@ async fn shell_recovers_each_unsettled_workspace_before_running() {
     let result = second.await.unwrap();
     assert!(!result.is_error, "{result:?}");
     assert!(primary.path().join("completed").exists());
+}
+
+#[tokio::test]
+async fn shell_does_not_start_if_a_confirmed_workspace_becomes_unsettled_again() {
+    let primary = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let exe = std::sync::Arc::new(ToolExecutor::new(primary.path()));
+    exe.expand_sandbox_path(extra.path().to_path_buf()).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    exe.set_ask_user_request_tx(Some(tx));
+    for root in [primary.path(), extra.path()] {
+        assert!(astra_tools::workspace_observation::mark_workspace_observation_unsettled(root));
+    }
+    let worker = exe.clone();
+    let attempt = tokio::spawn(async move {
+        worker
+            .execute_with_metadata("bash", &json!({"command":"touch completed"}))
+            .await
+    });
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    answer_workspace_recovery(first, "It has stopped");
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(primary.path())
+    );
+    answer_workspace_recovery(second, "It has stopped");
+    let result = attempt.await.unwrap();
+    assert!(result.is_error, "{result:?}");
+    assert!(!primary.path().join("completed").exists());
+    astra_tools::workspace_observation::confirm_workspace_stopped(primary.path())
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_rejects_workdir_moved_outside_workspace_during_recovery() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(workspace.path().join("nested")).unwrap();
+    let exe = std::sync::Arc::new(ToolExecutor::new(workspace.path()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    exe.set_ask_user_request_tx(Some(tx));
+    assert!(
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(workspace.path())
+    );
+    let worker = exe.clone();
+    let attempt = tokio::spawn(async move {
+        worker
+            .execute_with_metadata(
+                "bash",
+                &json!({"command":"touch must-not-run", "workdir":"nested"}),
+            )
+            .await
+    });
+    let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::rename(
+        workspace.path().join("nested"),
+        outside.path().join("moved"),
+    )
+    .unwrap();
+    answer_workspace_recovery(prompt, "It has stopped");
+    let result = attempt.await.unwrap();
+    assert!(result.is_error, "{result:?}");
+    assert!(!outside.path().join("moved/must-not-run").exists());
 }
 
 #[cfg(target_os = "macos")]

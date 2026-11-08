@@ -157,9 +157,9 @@ jobs:
           # Only the automatic main push may publish; custom/manual source cannot.
           save-cache: ${{ github.event_name == 'push' && github.repository == 'matrixorigin/Astra' && inputs.repository == github.repository && inputs.ref == github.sha }}
 
-      - name: Build current Server, CLI and harness
+      - name: Build current Server, CLI, Edge and harness
         run: |
-          cargo build --locked -p astra-runtime --bin astra-server -p astra-cli --bin astra -p astra-test-harness --bin astra-test
+          cargo build --locked -p astra-runtime --bin astra-server -p astra-cli --bin astra -p astra-edge --bin astra-edge -p astra-test-harness --bin astra-test
 
       - name: Start disposable dependencies and candidate Server
         timeout-minutes: 15
@@ -200,7 +200,7 @@ jobs:
             done
           git -C "$workspace" remote set-url origin "$(git remote get-url origin)"
           git -C "$workspace" checkout --quiet --detach "$ASTRA_BUILD_SOURCE_GIT_SHA"
-          sha256sum target/debug/astra target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
+          sha256sum target/debug/astra target/debug/astra-edge target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
           suite="$GITHUB_WORKSPACE/crates/astra-test-harness/cases"
           budget=3300
           if [ "${CASE_PROFILE:-full}" = regression ]; then
@@ -226,6 +226,20 @@ jobs:
             --filter "$CASE_FILTER" --force-model deepseek-v4.1-flash \
             --judger-model deepseek-v4.1-flash --parallel 1 --runs "$CASE_RUNS" \
             --report-file "$RUNNER_TEMP/harness/report.json"
+
+      - name: Harness regression - Edge WS shell contract
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          ASTRA_COMPAT_BOOTSTRAP_USERNAME: admin
+          ASTRA_COMPAT_BOOTSTRAP_PASSWORD: "11111111"
+        run: |
+          export ASTRA_COMPAT_SERVER_SOURCE="$ASTRA_BUILD_SOURCE_GIT_SHA"
+          python3 scripts/ci/client_compatibility.py --api-url "$ASTRA_API_URL" \
+            --report "$RUNNER_TEMP/harness/edge-shell.json" \
+            --current-cli "$GITHUB_WORKSPACE/target/debug/astra" \
+            --current-edge "$GITHUB_WORKSPACE/target/debug/astra-edge" \
+            --disposable-server --edge-shell-only --existing-admin
 
       - name: Diagnose failure without exposing provider responses
         if: ${{ failure() }}
@@ -318,6 +332,7 @@ jobs:
             ${{ runner.temp }}/harness/binaries.sha256
             ${{ runner.temp }}/harness/diagnostic.json
             ${{ runner.temp }}/harness/report.preflight.json
+            ${{ runner.temp }}/harness/edge-shell.json
           if-no-files-found: ignore
           retention-days: 7
 

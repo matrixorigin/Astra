@@ -593,15 +593,6 @@ impl ToolExecutor {
                 }
             }
         };
-        // This executor owns the workspace read, so it is the only boundary
-        // allowed to issue an edit-capable redaction reference.  Redact the
-        // full content before any output budget/window is applied; otherwise
-        // a credential split at the model limit becomes an unrecognisable
-        // partial secret.  Keep `raw_content` for AST parsing, line-range
-        // accounting, and the staleness cache.
-        let (safe_content, _) =
-            astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content);
-
         // Outline isolation: return only definition signatures with line numbers
         if has_outline {
             let total_lines = raw_content.lines().count();
@@ -646,6 +637,7 @@ impl ToolExecutor {
         // otherwise it would be compressed after we had incorrectly recorded
         // the file as fully delivered.
         const AUTO_EXPAND_MAX_BYTES: usize = 16_384;
+        let mut expanded_view = None;
         if is_ranged {
             if let Ok(meta) = fs::metadata(&path)
                 && (meta.len() as usize) <= AUTO_EXPAND_MAX_BYTES
@@ -679,10 +671,15 @@ impl ToolExecutor {
                     );
                     return Ok(expanded);
                 }
+                expanded_view = Some(expanded_content);
             }
         }
 
         if !is_ranged {
+            // Redact the complete source before applying the output budget so
+            // a truncated secret cannot escape detection.
+            let (safe_content, _) =
+                astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content);
             let lines: Vec<&str> = safe_content.split('\n').collect();
             let total_lines = raw_content.lines().count();
             let numbered = add_line_numbers(&safe_content, 1);
@@ -756,11 +753,19 @@ impl ToolExecutor {
             ));
         }
         let actual_start_line = s + 1; // 1-indexed
-        let safe_range = astra_text_utils::credential_redaction::redact_line_window(
-            &raw_content,
-            actual_start_line,
-            e,
-        );
+        let safe_range = match expanded_view {
+            Some(view) => view
+                .split('\n')
+                .skip(s)
+                .take(e - s)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => astra_text_utils::credential_redaction::redact_line_window(
+                &raw_content,
+                actual_start_line,
+                e,
+            ),
+        };
         let source_line_count = e.saturating_sub(s);
         let line_numbers_preserve_source = safe_range.lines().count() == source_line_count;
         let numbered = add_line_numbers(&safe_range, actual_start_line);
@@ -1366,51 +1371,6 @@ impl ToolExecutor {
         }
 
         match scope {
-            "source_receipt" => {
-                let receipt_id = match args.get("receipt_id").and_then(Value::as_str) {
-                    Some(receipt_id) if !receipt_id.trim().is_empty() => receipt_id,
-                    _ => {
-                        return json!({
-                            "success": false,
-                            "scope": "source_receipt",
-                            "error": "missing 'receipt_id' for scope=source_receipt",
-                        })
-                        .to_string();
-                    }
-                };
-                let Some(session_id) = self
-                    .active_session_id()
-                    .filter(|id| !id.trim().is_empty())
-                else {
-                    return json!({
-                        "success": false,
-                        "scope": "source_receipt",
-                        "error": "source receipt restore requires an active CLI session",
-                    })
-                    .to_string();
-                };
-                let owner_scope = format!("cli:{session_id}");
-                match astra_tools::source_preimage::prepare_receipt_restore(
-                    &self.effective_project_root(),
-                    &owner_scope,
-                    receipt_id,
-                ).and_then(|receipt| receipt.restore()) {
-                    Ok(()) => json!({
-                        "success": true,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "summary": "Restored the retained source preimage.",
-                    })
-                    .to_string(),
-                    Err(error) => json!({
-                        "success": false,
-                        "scope": "source_receipt",
-                        "receipt_id": receipt_id,
-                        "error": error,
-                    })
-                    .to_string(),
-                }
-            }
             "list" => {
                 let summary = match self.file_journal.lock() {
                     Ok(journal) => journal.summary(),
@@ -1461,7 +1421,11 @@ impl ToolExecutor {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut undo_result = Ok(None);
                 for candidate in &candidates {
-                    if let Some(entry) = journal.entries().filter(|entry| entry.path == *candidate).last() {
+                    if let Some(entry) = journal
+                        .entries()
+                        .filter(|entry| entry.path == *candidate)
+                        .last()
+                    {
                         if !entry.belongs_to_workspace(&root) {
                             undo_result = Err(std::io::Error::other(
                                 "This edit belongs to another workspace; no file was rolled back",
@@ -1579,7 +1543,7 @@ impl ToolExecutor {
             other => json!({
                 "success": false,
                 "error": format!(
-                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list, source_receipt)"
+                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list)"
                 ),
             })
             .to_string(),
@@ -3057,6 +3021,25 @@ mod tests {
             r2.contains("delta") && r2.contains("epsilon"),
             "second read should return the requested content: {r2}"
         );
+    }
+
+    #[test]
+    fn ranged_read_reuses_safe_small_file_view_when_auto_expand_exceeds_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut raw = (0..100)
+            .map(|i| format!("line {i}: {}\r\n", "x".repeat(48)))
+            .collect::<String>();
+        raw.push_str("-----BEGIN PRIVATE KEY-----\r\nprivatebody\r\n-----END PRIVATE KEY-----\r\nlast\r\n\r\n");
+        assert!(raw.len() < 16_384);
+        std::fs::write(dir.path().join("budgeted-small.txt"), raw).unwrap();
+        let executor = test_executor_in(dir.path());
+        let result = executor.read_file(&json!({
+            "path": "budgeted-small.txt", "start_line": 102, "end_line": 104
+        }));
+        assert!(!result.contains("Auto-expanded"), "{result}");
+        assert!(!result.contains("privatebody"), "{result}");
+        assert!(result.contains("[REDACTED:PRIVATE_KEY]"), "{result}");
+        assert!(result.contains("last"), "{result}");
     }
 
     // ── Read observations preserve legitimate repeated and ranged reads ─────

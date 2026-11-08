@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -88,6 +89,26 @@ class CapabilityAssessmentTests(unittest.TestCase):
             1,
         )
         self.assertEqual(self.run_event(completed).returncode, 0)
+
+    def test_local_preflight_validates_proposed_title_and_body(self):
+        body_path = Path(self.directory.name) / "proposed-body.md"
+        checker = Path(__file__).with_name("check_pr_metadata.py")
+        valid_body = "Capability assessment: Unchanged: Existing capabilities are unchanged.\n"
+        for title, body, accepted in [
+            ("fix(runtime): preserve execution", valid_body, True),
+            ("fix(runtime): preserve execution", "## Summary\nMissing assessment.", False),
+            ("preserve execution", valid_body, False),
+            ("fix(runtime): preserve execution", "\ufeff" + valid_body, False),
+            ("fix(runtime): preserve execution", valid_body.replace("\n", "\r\n"), True),
+            ("fix(runtime): preserve execution", valid_body.rstrip("\n") + "\r", False),
+        ]:
+            with self.subTest(title=title, body=body):
+                body_path.write_text(body, encoding="utf-8")
+                result = subprocess.run(
+                    [sys.executable, str(checker), "--title", title, "--body-file", str(body_path)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
     def test_bot_and_release_bodies_are_inert_data_with_the_same_contract(self):
         sentinel = Path(self.directory.name) / "must-not-exist"

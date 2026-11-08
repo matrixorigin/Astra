@@ -7,7 +7,7 @@ use super::*;
 use astra_turn_core::headless_tool_assembly::{
     READ_ONLY_TOOLS, headless_idempotency_hit_openai_pair,
     headless_openai_duplicate_within_turn_pair, openai_tool_roundtrip_values,
-    unknown_local_tool_error_message,
+    openai_tool_roundtrip_values_with_result_fields, unknown_local_tool_error_message,
 };
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
@@ -104,10 +104,18 @@ pub(super) fn emit_blocked_tool_result(
     if !quiet && let Some(status_line) = blocked.status_line {
         term.emit_line(HeadlessStderrStyle::Yellow, status_line);
     }
-    let (tool_msg, err_tr) = openai_tool_roundtrip_values(
+    let unavailable = matches!(
+        blocked.journal_kind,
+        HeadlessShortCircuitJournalKind::Unavailable
+    )
+    .then(crate::server::tool_plan_gate::plan_mode_unavailable_tool_result);
+    let (tool_msg, err_tr) = openai_tool_roundtrip_values_with_result_fields(
         blocked.id,
         blocked.name,
         &blocked.err_msg,
+        unavailable
+            .as_ref()
+            .and_then(|result| result.metadata.as_ref()),
         astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
     );
     messages.push(tool_msg);
@@ -137,6 +145,18 @@ pub(super) fn emit_blocked_tool_result(
             blocked.early_exit_ms,
             error_kind,
         ),
+        HeadlessShortCircuitJournalKind::Unavailable => {
+            let mut record = journal_record_tool_not_admitted(
+                blocked.id.to_string(),
+                blocked.name.to_string(),
+                preview,
+                &blocked.journal_reason,
+                blocked.early_exit_ms,
+            );
+            record.error = Some(blocked.reason_code.to_string());
+            record.result_preview = Some(blocked.journal_reason.chars().take(500).collect());
+            record
+        }
     };
     tool_call_records.push(journal_record_with_documents(
         record,
@@ -974,7 +994,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             let args_str = serde_json::to_string(&execution.args).ok();
             let permission_context = self.ctx.permission_context;
             let effective_permission_timeout = self.ctx.effective_permission_timeout;
-            let plan_mode_active = self.ctx.plan_mode_active;
+            let mut plan_mode_active = self.ctx.plan_mode_active;
             let provider_lookup = self.ctx.runtime_tool_executor.map_or(
                 crate::server::runtime_tool_executor::ProviderPolicyLookup::NotProvider,
                 |executor| executor.provider_policy_lookup(&execution.name),
@@ -985,6 +1005,58 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
                 _ => None,
             };
+            // A failed lookup is retried only for an invocation that would be
+            // blocked by plan mode. Reads and plan-control tools never wait on
+            // the database, and explicit Plan permission remains authoritative.
+            if plan_mode_active
+                && crate::turn::permission_gate::plan_mode_blocks(
+                    &execution.name,
+                    &astra_turn_core::tool_argument_hints::normalize_llm_function_arguments(
+                        &execution.args,
+                    ),
+                    provider_policy,
+                )
+                && let Some(executor) = self.ctx.runtime_tool_executor
+            {
+                let explicit_plan = match permission_context {
+                    Some(context) => {
+                        context.read().await.mode() == astra_turn_types::PermissionMode::Plan
+                    }
+                    None => true,
+                };
+                if !explicit_plan {
+                    match executor.plan_mode_for_write().await {
+                        Some(active) => plan_mode_active = active,
+                        None => {
+                            let result =
+                                crate::server::tool_plan_gate::plan_mode_unavailable_tool_result();
+                            emit_blocked_tool_result(
+                                HeadlessBlockedTool {
+                                    id: &execution.id,
+                                    name: &execution.name,
+                                    args: &execution.args,
+                                    reason_code: "tool_unavailable",
+                                    journal_kind: HeadlessShortCircuitJournalKind::Unavailable,
+                                    journal_reason: result.output.clone(),
+                                    err_msg: result.output,
+                                    early_exit_ms: execution.early_exit_ms,
+                                    status_line: Some(format!(
+                                        "  ⚠ Tool temporarily unavailable: {}",
+                                        execution.name
+                                    )),
+                                },
+                                self.ctx.step_recorder,
+                                self.ctx.quiet,
+                                self.ctx.term,
+                                self.ctx.messages,
+                                self.ctx.tool_results,
+                                self.ctx.tool_call_records,
+                            );
+                            return HeadlessPipelineStage::ShortCircuit;
+                        }
+                    }
+                }
+            }
             let source_discovery_tool = self
                 .ctx
                 .runtime_tool_executor
