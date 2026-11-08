@@ -522,7 +522,7 @@ async fn try_edge_websocket(
             let receipt = serde_json::to_string(&receipt)
                 .expect("typed Edge result contains only serializable protocol fields");
             // Preserve proof of non-delivery even if receipt persistence is
-            // uncertain. This owner never enqueued physical work.
+            // uncertain. This owner never attempted socket delivery.
             if !matches!(
                 dispatch
                     .deliver_result(&dispatch_identity, &edge.edge_agent_id, &receipt)
@@ -800,10 +800,19 @@ async fn try_edge_dispatch(
                     true,
                 ));
             }
-            result = wait_result => result.ok().flatten(),
+            result = wait_result => result,
         }
     } else {
-        wait_result.await.ok().flatten()
+        wait_result.await
+    };
+    let result_json = match result_json {
+        Ok(result) => result,
+        Err(error) => {
+            // An observation failure is not proof that the execution expired.
+            // Preserve its durable result for replay or a later observer.
+            tracing::warn!(%error, request_id = %request_id, "edge dispatch result observation failed");
+            return EdgeTransportAttempt::TransportDisconnected;
+        }
     };
     let Some(result_json) = result_json else {
         if let Err(e) = dispatch
@@ -835,7 +844,7 @@ fn delivered_dispatch_result(
         }
         Err(error) => EdgeTransportAttempt::Delivered(
             plan.delivered_result_with_fields(
-                format!("Error: the executor returned an invalid result: {error}. The operation may have completed; inspect its effects before retrying."),
+                format!("Error: the recorded dispatch result could not be decoded: {error}. The operation may have completed; inspect its effects before retrying."),
                 true, transport, None,
             ).with_execution_outcome_unknown(),
         ),
