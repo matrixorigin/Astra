@@ -170,16 +170,47 @@ Durable dispatch subscribes before a connection is published. The existing
 per-Server database observer discovers work admitted on another Server or
 before subscription; a wake only prompts the socket to claim durable work.
 There is no per-socket periodic dispatch query during normal observation.
+The observer batches up to 1,024 connected targets and uses the
+status-leading dispatch index. Its SQL can match cross-pairs; only exact local
+subscriptions are notified. Idle sweeps wait 500 ms, so a remote admission
+after an idle sweep can take that long to be observed. The index permits a
+status-prefix scan without reading completed history; the chosen plan depends
+on MatrixOne. Each Server may still scan the global pending backlog and the
+database may aggregate cross-pairs.
 A stalled observation query wakes connections for bounded-concurrency
 individual probes; failed batches also trigger their own recovery probes.
-Each send has a deadline; a slow earlier request does not reject untouched
-requests in the same claimed batch. Requests known not to have been sent are
+Relay socket sends finish when the write completes, the connection fails, or the
+connection is cancelled;
+a slow earlier request does not reject untouched requests in the same claimed
+batch. The Edge heartbeat can still close a connection that receives no Pong
+for its existing timeout while a large unfragmented frame is in progress.
+Application Pong and result ACK messages share the existing bounded writer
+queue. If it is full, the Server closes the socket. The Edge cancels its running
+invocations on disconnect; a result already persisted without an ACK is
+replayed on reconnect.
+Queued direct work is checked again after acquiring the socket writer: a request
+already cancelled or expired at that check is skipped. Cancellation racing with
+the check may arrive after sending starts. On one Server, the current connection
+generation is checked before starting a relay claim and through the first send
+poll. A claim already in progress can race with replacement; replacement on
+another Server is still detected through the existing registry heartbeat. Direct request writes
+retain their existing five-second timeout; after an uncertain partial write,
+cancellation across reconnect remains best effort.
+Requests known not to have been sent are
 settled together in one conditional update with explicit non-execution results.
-An attempted send remains `dispatched` for result replay. The batch owner
-retries an unconfirmed settlement without returning it to the queue. Its
-existing permit bounds retained batches, so a prolonged database outage can
-backpressure claims. A Server crash loses the in-memory proof that a claimed
+An attempted send remains `dispatched` for result replay. Each connection owns
+at most one claimed batch; claim queries, settlement owners, and active
+settlement queries have separate limits. Returned settlement errors retry for up to 30 seconds; an
+in-flight query remains owned until it returns. If ownership or retries are
+exhausted, the row stays `dispatched` with an unknown outcome and is never
+returned to the claimable queue. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
+The number of retained batches is bounded by connection and settlement ownership,
+but their bytes are not: outbound requests are materialized whole. Many active
+connections with large batches can therefore use substantial memory. The
+current Edge clients also retain their WebSocket library's incoming frame and
+message limits; accepting a durable request does not guarantee that an
+oversized frame can be delivered.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity
@@ -199,8 +230,9 @@ automatically resumes batched observation. Ordinary database errors are
 retried. A lost notification subscription closes the Edge connection so it can
 reconnect. Pools of one or two connections use recovery probes to preserve
 capacity for normal requests. The shared observer and registry heartbeat still
-access the database; this is not a claim of zero idle SQL or bounded historical
-scans.
+access the database; this is not a claim of zero idle SQL or bounded active
+backlog scans. The dispatch index uses the fresh schema; there is no automatic
+upgrade of the previous index shape.
 
 ## Durable sync dependency
 

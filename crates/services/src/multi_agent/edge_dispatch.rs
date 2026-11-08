@@ -8,13 +8,13 @@
 //!
 //! Split from the monolithic `multi_agent.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, TryStreamExt};
 use sqlx::{MySql, Row};
 
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
@@ -114,8 +114,13 @@ fn canonical_edge_dispatch_payload_json(payload_json: &str) -> Result<String, se
     serde_json::to_string(&serde_json::from_str::<serde_json::Value>(payload_json)?)
 }
 
-fn edge_dispatch_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> {
-    json_payloads_match(persisted, replayed)
+fn edge_dispatch_payloads_match(
+    persisted: &serde_json::Value,
+    replayed: &str,
+) -> Result<bool, String> {
+    let replayed = serde_json::from_str::<serde_json::Value>(replayed)
+        .map_err(|error| format!("replayed durable payload is invalid JSON: {error}"))?;
+    Ok(persisted == &replayed)
 }
 
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
@@ -193,15 +198,12 @@ pub trait EdgeDispatchService: Send + Sync {
         }
     }
 
-    /// Limit concurrent claim owners. A durable relay caller must hold this
-    /// permit from before `poll_pending` until its entire claimed batch has
-    /// been sent or the unsent rows have been settled.
-    fn pending_claim_limit(&self) -> Option<&tokio::sync::Semaphore> {
+    /// Resource limits for durable claim, delivery, and settlement work.
+    fn pending_limits(&self) -> Option<&EdgeDispatchLimits> {
         None
     }
 
-    /// Claim pending dispatches for a (user, agent) pair. A durable caller
-    /// must first acquire `pending_claim_limit` and retain it for the batch.
+    /// Claim pending dispatches for a (user, agent) pair.
     async fn poll_pending(
         &self,
         user_id: &str,
@@ -317,7 +319,25 @@ pub struct DatabaseEdgeDispatchService {
     metrics: Option<SharedMultiAgentMetrics>,
     wait_coordinator: Arc<EdgeDispatchWaitCoordinator>,
     wake_hub: Arc<EdgeDispatchWakeHub>,
-    claim_limit: tokio::sync::Semaphore,
+    limits: EdgeDispatchLimits,
+}
+
+/// Per-service limits bound database work and retained settlement receipts.
+pub struct EdgeDispatchLimits {
+    pub claim: tokio::sync::Semaphore,
+    pub receipts: tokio::sync::Semaphore,
+    pub settlement: tokio::sync::Semaphore,
+}
+
+impl EdgeDispatchLimits {
+    pub fn new(pool_size: u32) -> Self {
+        let claims = dispatch_claim_concurrency(pool_size) as usize;
+        Self {
+            claim: tokio::sync::Semaphore::new(claims),
+            receipts: tokio::sync::Semaphore::new(128),
+            settlement: tokio::sync::Semaphore::new(claims.min(4)),
+        }
+    }
 }
 
 impl DatabaseEdgeDispatchService {
@@ -326,13 +346,13 @@ impl DatabaseEdgeDispatchService {
         let wake_hub = Arc::new(EdgeDispatchWakeHub::new(pool.clone()));
         // Reserve pool capacity for heartbeats and normal requests if a slow
         // wake query causes many Edges to probe at once.
-        let claim_limit = dispatch_claim_concurrency(pool.options().get_max_connections());
+        let limits = EdgeDispatchLimits::new(pool.options().get_max_connections());
         Self {
             pool,
             metrics: None,
             wait_coordinator,
             wake_hub,
-            claim_limit: tokio::sync::Semaphore::new(claim_limit as usize),
+            limits,
         }
     }
 
@@ -445,11 +465,18 @@ impl EdgeDispatchWakeHub {
     async fn notify(&self, user_id: &str, edge_agent_id: &str) {
         let key = (user_id.to_owned(), edge_agent_id.to_owned());
         let mut subscribers = self.subscribers.lock().await;
-        if let Some(sender) = subscribers.get(&key) {
+        Self::notify_key(&mut subscribers, &key);
+    }
+
+    fn notify_key(
+        subscribers: &mut HashMap<(String, String), tokio::sync::watch::Sender<u64>>,
+        key: &(String, String),
+    ) {
+        if let Some(sender) = subscribers.get(key) {
             if sender.receiver_count() > 0 {
                 sender.send_modify(|generation| *generation = generation.saturating_add(1));
             } else {
-                subscribers.remove(&key);
+                subscribers.remove(key);
             }
         }
     }
@@ -534,6 +561,7 @@ impl EdgeDispatchWakeHub {
             };
 
             let mut failed = false;
+            let mut found_pending = false;
             for batch in targets.chunks(EDGE_DISPATCH_WAKE_BATCH_SIZE) {
                 let mut recovery = tokio::time::interval_at(
                     tokio::time::Instant::now() + EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
@@ -560,8 +588,10 @@ impl EdgeDispatchWakeHub {
                 };
                 match result {
                     Ok(pending) => {
-                        for (user_id, edge_agent_id) in pending {
-                            self.notify(&user_id, &edge_agent_id).await;
+                        found_pending |= !pending.is_empty();
+                        let mut subscribers = self.subscribers.lock().await;
+                        for key in pending {
+                            Self::notify_key(&mut subscribers, &key);
                         }
                     }
                     Err(error) => {
@@ -585,7 +615,11 @@ impl EdgeDispatchWakeHub {
                     .saturating_mul(2)
                     .min(EDGE_DISPATCH_WAKE_RETRY_MAX);
             } else {
-                retry_delay = EDGE_DISPATCH_WAKE_POLL_INTERVAL;
+                retry_delay = if found_pending {
+                    EDGE_DISPATCH_WAKE_POLL_INTERVAL
+                } else {
+                    EDGE_DISPATCH_WAKE_IDLE_INTERVAL
+                };
             }
             tokio::time::sleep(retry_delay).await;
         }
@@ -601,18 +635,22 @@ impl EdgeDispatchWakeHub {
         }
         let mut query = sqlx::QueryBuilder::<MySql>::new(
             "SELECT user_id, edge_agent_id FROM edge_pending_dispatch
-             WHERE status = 'pending' AND (",
+             WHERE status = 'pending' AND user_id IN (",
         );
-        for (index, (user_id, edge_agent_id)) in targets.iter().enumerate() {
+        let users: HashSet<_> = targets.iter().map(|(user, _)| user.as_str()).collect();
+        let edges: HashSet<_> = targets.iter().map(|(_, edge)| edge.as_str()).collect();
+        for (index, user_id) in users.into_iter().enumerate() {
             if index > 0 {
-                query.push(" OR ");
+                query.push(", ");
             }
-            query
-                .push("(user_id = ")
-                .push_bind(user_id)
-                .push(" AND edge_agent_id = ")
-                .push_bind(edge_agent_id)
-                .push(")");
+            query.push_bind(user_id);
+        }
+        query.push(") AND edge_agent_id IN (");
+        for (index, edge_agent_id) in edges.into_iter().enumerate() {
+            if index > 0 {
+                query.push(", ");
+            }
+            query.push_bind(edge_agent_id);
         }
         query.push(") GROUP BY user_id, edge_agent_id");
         let connection = pool.acquire().await.map_err(WakeQueryError::Acquire)?;
@@ -623,22 +661,24 @@ impl EdgeDispatchWakeHub {
             inner: connection,
             completed: false,
         };
-        let rows = query
-            .build()
-            .fetch_all(&mut *connection.inner)
-            .await
-            .map_err(WakeQueryError::Query)?;
+        let wanted: HashSet<_> = targets
+            .iter()
+            .map(|(user, edge)| (user.as_str(), edge.as_str()))
+            .collect();
+        let mut pending = Vec::new();
+        let mut rows = query.build().fetch(&mut *connection.inner);
+        while let Some(row) = rows.try_next().await.map_err(WakeQueryError::Query)? {
+            let user_id: String = row.try_get("user_id").map_err(WakeQueryError::Decode)?;
+            let edge_agent_id: String = row
+                .try_get("edge_agent_id")
+                .map_err(WakeQueryError::Decode)?;
+            if wanted.contains(&(user_id.as_str(), edge_agent_id.as_str())) {
+                pending.push((user_id, edge_agent_id));
+            }
+        }
+        drop(rows);
         connection.completed = true;
-        rows.into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get::<String, _>("user_id")
-                        .map_err(WakeQueryError::Decode)?,
-                    row.try_get::<String, _>("edge_agent_id")
-                        .map_err(WakeQueryError::Decode)?,
-                ))
-            })
-            .collect()
+        Ok(pending)
     }
 
     async fn has_live_targets(&self, targets: &[(String, String)]) -> bool {
@@ -654,8 +694,9 @@ impl EdgeDispatchWakeHub {
 const EDGE_DISPATCH_WAIT_BATCH_SIZE: usize = 128;
 const EDGE_DISPATCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EDGE_DISPATCH_WAIT_UNKNOWN_ERROR_BUDGET: Duration = Duration::from_secs(30);
-const EDGE_DISPATCH_WAKE_BATCH_SIZE: usize = 128;
+const EDGE_DISPATCH_WAKE_BATCH_SIZE: usize = 1024;
 const EDGE_DISPATCH_WAKE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const EDGE_DISPATCH_WAKE_IDLE_INTERVAL: Duration = Duration::from_millis(500);
 const EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const EDGE_DISPATCH_WAKE_RETRY_MAX: Duration = Duration::from_secs(2);
 const EDGE_DISPATCH_WAKE_UNKNOWN_RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -1007,8 +1048,9 @@ fn decode_claimed_dispatch_row(row: &impl EdgeDispatchDbRow) -> Result<EdgeDispa
             .string_column("request_id")
             .map_err(|e| edge_dispatch_decode_error("poll row", "request_id", e))?,
         payload_json: row
-            .string_column("payload_json")
-            .map_err(|e| edge_dispatch_decode_error("poll row", "payload_json", e))?,
+            .json_column("payload_json")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "payload_json", e))?
+            .to_string(),
         result_json: row
             .optional_string_column("result_json")
             .map_err(|e| edge_dispatch_decode_error("poll row", "result_json", e))?,
@@ -1145,8 +1187,8 @@ fn validate_claimed_dispatch_update_count(expected: usize, actual: u64) -> Resul
 
 #[async_trait]
 impl EdgeDispatchService for DatabaseEdgeDispatchService {
-    fn pending_claim_limit(&self) -> Option<&tokio::sync::Semaphore> {
-        Some(&self.claim_limit)
+    fn pending_limits(&self) -> Option<&EdgeDispatchLimits> {
+        Some(&self.limits)
     }
 
     #[tracing::instrument(skip(self, identity, payload_json), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, edge_agent_id = %edge_agent_id, request_id = %identity.request_id))]
@@ -1219,7 +1261,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .await
             .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?;
         let row = sqlx::query(
-            "SELECT edge_agent_id, CAST(payload_json AS CHAR) AS payload_json, \
+            "SELECT edge_agent_id, payload_json, \
                     status, result_json \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND session_id = ? AND run_id = ? \
@@ -1247,7 +1289,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 "edge_dispatch admit edge_agent_id decode: {error}"
             ))
         })?;
-        let persisted_payload: String = row.try_get("payload_json").map_err(|error| {
+        let persisted_payload = row.json_column("payload_json").map_err(|error| {
             EdgeDispatchAdmissionError::OutcomeUnknown(format!(
                 "edge_dispatch admit payload_json decode: {error}"
             ))
@@ -1341,7 +1383,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             }
         };
         let row = match sqlx::query(
-            "SELECT edge_agent_id, CAST(payload_json AS CHAR) AS payload_json, \
+            "SELECT edge_agent_id, payload_json, \
                     status, result_json \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND session_id = ? AND run_id = ? \
@@ -1374,7 +1416,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 "edge_dispatch direct admit edge decode: {error}"
             ))
         })?;
-        let persisted_payload: String = row.try_get("payload_json").map_err(|error| {
+        let persisted_payload = row.json_column("payload_json").map_err(|error| {
             EdgeDispatchAdmissionError::OutcomeUnknown(format!(
                 "edge_dispatch direct admit payload decode: {error}"
             ))
@@ -1548,9 +1590,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .await
             .map_err(|e| format!("edge_dispatch poll begin tx: {e}"))?;
 
-        let rows = match sqlx::query(
-            "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
-             CAST(payload_json AS CHAR) AS payload_json, \
+        let selected = async {
+            let mut rows = sqlx::query(
+                "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
+             payload_json, \
              result_json, \
              status, \
              COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
@@ -1558,37 +1601,35 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
              WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
              ORDER BY created_at ASC, request_id ASC LIMIT 50 \
              FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(edge_agent_id)
-        .fetch_all(&mut *tx)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                rollback_edge_dispatch_tx(tx, "poll select").await;
-                return Err(format!("edge_dispatch poll SELECT: {e}"));
+            )
+            .bind(user_id)
+            .bind(edge_agent_id)
+            .fetch(&mut *tx);
+            let mut claimed = Vec::new();
+            while let Some(row) = rows
+                .try_next()
+                .await
+                .map_err(|error| format!("edge_dispatch poll SELECT: {error}"))?
+            {
+                claimed.push(decode_claimed_dispatch_row(&row)?);
+            }
+            Ok::<_, String>(claimed)
+        }
+        .await;
+        let claimed_rows = match selected {
+            Ok(rows) => rows,
+            Err(error) => {
+                rollback_edge_dispatch_tx(tx, "poll select or decode").await;
+                return Err(error);
             }
         };
 
-        if rows.is_empty() {
+        if claimed_rows.is_empty() {
             tx.commit()
                 .await
                 .map_err(|e| format!("edge_dispatch poll commit (no rows): {e}"))?;
             return Ok(vec![]);
         }
-
-        let claimed_rows: Vec<EdgeDispatchRow> = match rows
-            .iter()
-            .map(decode_claimed_dispatch_row)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                rollback_edge_dispatch_tx(tx, "decode claimed rows").await;
-                return Err(e);
-            }
-        };
 
         // Mark claimed rows as dispatched within the same transaction.
         // MatrixOne rejects row-value `IN ((?, ?), ...)`, so spell the identity
@@ -2397,6 +2438,16 @@ mod tests {
     }
 
     impl EdgeDispatchDbRow for FakeEdgeDispatchRow {
+        fn json_column(&self, column: &str) -> Result<serde_json::Value, sqlx::Error> {
+            if self.failed_column == Some(column) {
+                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
+            }
+            match column {
+                "payload_json" => Ok(json!({"tool":"agent_fanout"})),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
         fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
             if self.failed_column == Some(column) {
                 return Err(sqlx::Error::ColumnNotFound(column.to_string()));
@@ -2422,7 +2473,6 @@ mod tests {
                 "turn_chain_id" => "turn-chain-1",
                 "edge_agent_id" => "edge-1",
                 "request_id" => "request-1",
-                "payload_json" => r#"{"tool":"agent_fanout"}"#,
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
             .to_string())
@@ -2501,126 +2551,69 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-    async fn matrixone_progressing_observer_wakes_only_the_pending_edge() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let admin = setup_edge_dispatch_db_it().await;
-        let database = format!("astra_test_progress_{}", Uuid::new_v4().simple());
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
-            .execute(admin.get())
-            .await
-            .unwrap();
-        let mut settings = astra_core::MatrixOneSettings::from_env();
-        settings.database = database.clone();
-        let setup = astra_core::SharedPool::new(&settings).await.unwrap();
-        sqlx::query("CREATE TABLE edge_pending_dispatch (user_id VARCHAR(128), edge_agent_id VARCHAR(255), status VARCHAR(16))")
-            .execute(setup.get()).await.unwrap();
-
-        // Slow each response without stalling any individual query.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let upstream = (settings.host.clone(), settings.port);
-        let proxy = tokio::spawn(async move {
-            loop {
-                let (client, _) = listener.accept().await.unwrap();
-                let server = tokio::net::TcpStream::connect(&upstream).await.unwrap();
-                tokio::spawn(async move {
-                    let (mut client_read, mut client_write) = client.into_split();
-                    let (mut server_read, mut server_write) = server.into_split();
-                    let requests = tokio::io::copy(&mut client_read, &mut server_write);
-                    let responses = async move {
-                        let mut buffer = [0; 16384];
-                        while let Ok(n) = server_read.read(&mut buffer).await {
-                            if n == 0 {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                            if client_write.write_all(&buffer[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    };
-                    tokio::select! { _ = requests => {}, _ = responses => {} }
-                });
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_pending_observer_filters_cross_pairs() {
+        let pool = setup_edge_dispatch_db_it().await;
+        let service = DatabaseEdgeDispatchService::from_shared(&pool);
+        let unique = Uuid::new_v4().to_string();
+        let user_a = format!("wake-a-{unique}");
+        let user_b = format!("wake-b-{unique}");
+        let user_c = format!("wake-c-{unique}");
+        let edge_a = format!("edge-a-{unique}");
+        let edge_b = format!("edge-b-{unique}");
+        let targets = vec![
+            (user_a.clone(), edge_a.clone()),
+            (user_b.clone(), edge_b.clone()),
+        ];
+        let mut receivers = Vec::new();
+        {
+            let mut subscribers = service.wake_hub.subscribers.lock().await;
+            for key in &targets {
+                let (sender, receiver) = tokio::sync::watch::channel(0);
+                subscribers.insert(key.clone(), sender);
+                receivers.push(receiver);
             }
-        });
-        settings.host = address.ip().to_string();
-        settings.port = address.port();
-        let pool = sqlx::mysql::MySqlPoolOptions::new()
-            .max_connections(4)
-            .connect(&settings.database_url_with_password())
-            .await
-            .unwrap();
-        let hub = Arc::new(EdgeDispatchWakeHub::new(pool.clone()));
-        let targets: Vec<_> = (0..512)
-            .map(|i| ("idle-user".to_string(), format!("edge-{i}")))
-            .collect();
-        let (ordered, mut wakes) = {
-            let mut subscribers = hub.subscribers.lock().await;
-            let wakes = targets
-                .iter()
-                .map(|key| {
-                    let (sender, receiver) = tokio::sync::watch::channel(0);
-                    subscribers.insert(key.clone(), sender);
-                    (key.clone(), receiver)
-                })
-                .collect::<HashMap<_, _>>();
-            (subscribers.keys().cloned().collect::<Vec<_>>(), wakes)
-        };
-        let pending = ordered[EDGE_DISPATCH_WAKE_BATCH_SIZE * 3].clone();
-        sqlx::query("INSERT INTO edge_pending_dispatch VALUES (?, ?, 'pending')")
-            .bind(&pending.0)
-            .bind(&pending.1)
-            .execute(setup.get())
-            .await
-            .unwrap();
-        let started = tokio::time::Instant::now();
+        }
+        let rows = [
+            (
+                EdgeDispatchIdentity::new(&user_a, "s", "r", "t", "cross"),
+                &edge_b,
+            ),
+            (
+                EdgeDispatchIdentity::new(&user_c, "s", "r", "t", "unrelated"),
+                &edge_a,
+            ),
+            (
+                EdgeDispatchIdentity::new(&user_a, "s", "r", "t", "target-a"),
+                &edge_a,
+            ),
+            (
+                EdgeDispatchIdentity::new(&user_b, "s", "r", "t", "target-b"),
+                &edge_b,
+            ),
+        ];
+        for (identity, edge) in &rows[..2] {
+            service.insert_dispatch(identity, edge, "{}").await.unwrap();
+        }
         assert!(
-            hub.pending_targets(&ordered[..EDGE_DISPATCH_WAKE_BATCH_SIZE])
+            service
+                .wake_hub
+                .pending_targets(&targets)
                 .await
                 .unwrap()
                 .is_empty()
         );
-        assert!(
-            started.elapsed() < EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
-            "individual observer query must complete inside the recovery interval"
-        );
-        let started = tokio::time::Instant::now();
-        hub.ensure_cross_pod_observer();
-        tokio::time::timeout(
-            Duration::from_secs(8),
-            wakes.get_mut(&pending).unwrap().changed(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(
-            started.elapsed() >= EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
-            "the pending Edge must be reached only after multiple batches"
-        );
-        assert!(
-            wakes
-                .iter()
-                .all(|(key, wake)| key == &pending || !wake.has_changed().unwrap()),
-            "a progressing multi-batch sweep must not wake idle Edges"
-        );
-        drop(wakes);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while hub.running.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap();
-        pool.close().await;
-        proxy.abort();
-        setup.get().close().await;
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
-            .execute(admin.get())
-            .await
-            .unwrap();
+        for (identity, edge) in &rows[2..] {
+            service.insert_dispatch(identity, edge, "{}").await.unwrap();
+        }
+        let found = service.wake_hub.pending_targets(&targets).await.unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(targets.iter().all(|target| found.contains(target)));
+        for (identity, _) in &rows {
+            cleanup_edge_dispatch_fixture(&pool, identity).await;
+        }
+        drop(receivers);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2985,7 +2978,12 @@ mod tests {
             format!("request-{unique}"),
         );
         cleanup_edge_dispatch_fixture(&pool, &identity).await;
-        let payload = json!({"request_id": identity.request_id, "tool": "bash"}).to_string();
+        let payload = json!({
+            "request_id": identity.request_id,
+            "tool": "bash",
+            "args": {"command": "😀x".repeat(30_000)},
+        })
+        .to_string();
 
         let admission = direct
             .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, &payload)
@@ -2994,7 +2992,7 @@ mod tests {
 
         assert_eq!(admission, EdgeDirectDispatchAdmission::Claimed);
         let persisted = sqlx::query(
-            "SELECT edge_agent_id, CAST(payload_json AS CHAR) AS payload_json, status \
+            "SELECT edge_agent_id, payload_json, status \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND session_id = ? AND run_id = ? \
                AND turn_chain_id = ? AND request_id = ?",
@@ -3019,15 +3017,23 @@ mod tests {
                 .expect("persisted dispatch status"),
             "dispatched"
         );
-        assert!(
-            json_payloads_match(
-                &persisted
-                    .try_get::<String, _>("payload_json")
-                    .expect("persisted dispatch payload"),
-                &payload,
-            )
-            .expect("persisted direct payload is valid JSON")
+        assert_eq!(
+            persisted.json_column("payload_json").unwrap(),
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap()
         );
+        assert_eq!(
+            direct
+                .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, &payload)
+                .await
+                .unwrap(),
+            EdgeDirectDispatchAdmission::Observing
+        );
+        assert!(matches!(
+            direct
+                .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, "{}")
+                .await,
+            Err(EdgeDispatchAdmissionError::Rejected(_))
+        ));
         assert!(
             relay
                 .poll_pending(&user_id, &edge_agent_id)
@@ -3077,13 +3083,16 @@ mod tests {
         let payload = json!({
             "request_id": request_id,
             "tool": "bash",
-            "args": {"cmd": "printf ok"}
+            "args": {"cmd": "printf ok", "content": "😀x".repeat(30_000)}
         })
         .to_string();
-        pod_a
-            .insert_dispatch(&identity, &edge_agent_id, &payload)
-            .await
-            .expect("insert pending dispatch");
+        assert_eq!(
+            pod_a
+                .admit_dispatch(&identity, &edge_agent_id, &payload)
+                .await
+                .expect("admit pending dispatch"),
+            EdgeDispatchAdmission::Pending
+        );
         pod_a
             .insert_dispatch(&identity, &edge_agent_id, &payload)
             .await
@@ -3133,6 +3142,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&payload).expect("payload should be JSON")
         );
         assert_eq!(claimed[0].status, "dispatched");
+        let payload = json!({"tool": "bash", "args": {"cmd": "printf ok"}}).to_string();
         assert!(
             pod_b
                 .poll_pending(&user_id, &edge_agent_id)

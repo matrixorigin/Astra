@@ -35128,7 +35128,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             request_id,
             delivery_generation,
             ..
-        } = edge_rx.recv().await.unwrap()
+        } = edge_rx.recv().await.unwrap().into_attempted_message()
         else {
             panic!("missing physical dispatch");
         };
@@ -35163,7 +35163,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                 request_id: observed_id,
                 delivery_generation: observed_generation,
                 input: observed,
-            } = edge_rx.recv().await.unwrap()
+            } = edge_rx.recv().await.unwrap().into_attempted_message()
             else {
                 panic!("missing native steer");
             };
@@ -35244,7 +35244,7 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
                     request_id,
                     delivery_generation,
                     input,
-                } = edge_rx.recv().await.unwrap()
+                } = edge_rx.recv().await.unwrap().into_attempted_message()
                 else {
                     panic!("corrected guidance did not reach the native input owner");
                 };

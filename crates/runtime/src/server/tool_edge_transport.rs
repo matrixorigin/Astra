@@ -522,7 +522,7 @@ async fn try_edge_websocket(
             let receipt = serde_json::to_string(&receipt)
                 .expect("typed Edge result contains only serializable protocol fields");
             // Preserve proof of non-delivery even if receipt persistence is
-            // uncertain. This owner never enqueued physical work.
+            // uncertain. This owner never attempted socket delivery.
             if !matches!(
                 dispatch
                     .deliver_result(&dispatch_identity, &edge.edge_agent_id, &receipt)

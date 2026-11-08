@@ -7,7 +7,7 @@
 //! 4. After edge disconnects, it disappears from the pool
 //! 5. Multiple edges per user tracked correctly
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -460,7 +460,7 @@ struct TestEdgeDispatch {
     pause_poll_result: std::sync::atomic::AtomicBool,
     poll_started: tokio::sync::Notify,
     release_poll: tokio::sync::Notify,
-    claim_limit: tokio::sync::Semaphore,
+    limits: astra_services::multi_agent::EdgeDispatchLimits,
     gate_requests: AtomicUsize,
     gate_entered: tokio::sync::Notify,
     block_settlement: std::sync::atomic::AtomicBool,
@@ -468,6 +468,7 @@ struct TestEdgeDispatch {
     continue_settlement: tokio::sync::Notify,
     settlement_returns_error: std::sync::atomic::AtomicBool,
     settlement_fails_before_write: std::sync::atomic::AtomicBool,
+    settlement_failure_edges: Mutex<HashSet<String>>,
     settlement_calls: AtomicUsize,
     block_result: std::sync::atomic::AtomicBool,
     result_started: tokio::sync::Notify,
@@ -485,7 +486,7 @@ impl Default for TestEdgeDispatch {
             pause_poll_result: std::sync::atomic::AtomicBool::new(false),
             poll_started: tokio::sync::Notify::new(),
             release_poll: tokio::sync::Notify::new(),
-            claim_limit: tokio::sync::Semaphore::new(4),
+            limits: astra_services::multi_agent::EdgeDispatchLimits::new(16),
             gate_requests: AtomicUsize::new(0),
             gate_entered: tokio::sync::Notify::new(),
             block_settlement: std::sync::atomic::AtomicBool::new(false),
@@ -493,6 +494,7 @@ impl Default for TestEdgeDispatch {
             continue_settlement: tokio::sync::Notify::new(),
             settlement_returns_error: std::sync::atomic::AtomicBool::new(false),
             settlement_fails_before_write: std::sync::atomic::AtomicBool::new(false),
+            settlement_failure_edges: Mutex::default(),
             settlement_calls: AtomicUsize::new(0),
             block_result: std::sync::atomic::AtomicBool::new(false),
             result_started: tokio::sync::Notify::new(),
@@ -549,11 +551,11 @@ impl TestEdgeDispatch {
 
 #[async_trait]
 impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
-    fn pending_claim_limit(&self) -> Option<&tokio::sync::Semaphore> {
+    fn pending_limits(&self) -> Option<&astra_services::multi_agent::EdgeDispatchLimits> {
         if self.gate_requests.fetch_add(1, Ordering::Relaxed) > 0 {
             self.gate_entered.notify_one();
         }
-        Some(&self.claim_limit)
+        Some(&self.limits)
     }
 
     async fn insert_dispatch(
@@ -639,6 +641,14 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         receipts: &[(EdgeDispatchIdentity, String)],
     ) -> Result<(), String> {
         self.settlement_calls.fetch_add(1, Ordering::SeqCst);
+        if self
+            .settlement_failure_edges
+            .lock()
+            .unwrap()
+            .contains(edge_agent_id)
+        {
+            return Err("injected persistent settlement failure".into());
+        }
         if self.block_settlement.swap(false, Ordering::SeqCst) {
             self.settlement_started.notify_one();
             self.continue_settlement.notified().await;
@@ -1126,6 +1136,23 @@ async fn edge_ws_ping_pong() {
     server.abort();
 }
 
+#[tokio::test]
+async fn edge_ws_protocol_ping_receives_pong() {
+    let (addr, _state, server) = spawn_test_server().await;
+    let mut socket = ws_auth(addr, "edge-raw-ping", "ping-host").await;
+    socket
+        .send(Message::Ping(b"probe".to_vec().into()))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(frame, Message::Pong(ref data) if data.as_ref() == b"probe"));
+    server.abort();
+}
+
 fn test_relay_request(index: usize) -> (EdgeDispatchIdentity, String) {
     let invocation = astra_turn_types::ToolInvocationIdentity::new(
         "test-user-1",
@@ -1355,7 +1382,7 @@ async fn disconnected_relay_keeps_claim_owner_until_all_unsent_rows_settle() {
     })
     .await
     .expect("disconnect must not wait indefinitely for database work");
-    assert_eq!(dispatch.claim_limit.available_permits(), 3);
+    assert_eq!(dispatch.limits.claim.available_permits(), 3);
     let closed = tokio::time::timeout(Duration::from_secs(3), socket.next())
         .await
         .expect("the socket must close while the claim remains blocked");
@@ -1378,7 +1405,7 @@ async fn disconnected_relay_keeps_claim_owner_until_all_unsent_rows_settle() {
             .await;
     }
     tokio::time::timeout(Duration::from_secs(2), async {
-        while dispatch.claim_limit.available_permits() != 4 {
+        while dispatch.limits.claim.available_permits() != 4 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1423,9 +1450,275 @@ async fn disconnect_during_unsent_settlement_does_not_keep_socket_open() {
 }
 
 #[tokio::test]
+async fn failed_settlements_do_not_block_other_edges() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let mut sockets = Vec::new();
+    let mut failed = Vec::new();
+    for index in 0..4 {
+        let edge = format!("edge-settlement-failure-{index}");
+        dispatch
+            .settlement_failure_edges
+            .lock()
+            .unwrap()
+            .insert(edge.clone());
+        let (identity, _) = test_relay_request(1000 + index);
+        dispatch
+            .insert_dispatch(&identity, &edge, "{}")
+            .await
+            .unwrap();
+        sockets.push(ws_auth(addr, &edge, "failure-host").await);
+        dispatch.wake("test-user-1", &edge);
+        failed.push(identity);
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let all_claimed = {
+                let rows = dispatch.rows.lock().unwrap();
+                failed
+                    .iter()
+                    .all(|identity| rows[identity].status == "dispatched")
+            };
+            if all_claimed && dispatch.settlement_calls.load(Ordering::SeqCst) >= 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all four failed batches must attempt settlement");
+
+    let (identity, payload) = test_relay_request(2000);
+    dispatch
+        .insert_dispatch(&identity, "edge-healthy", &payload)
+        .await
+        .unwrap();
+    let mut healthy = ws_auth(addr, "edge-healthy", "healthy-host").await;
+    dispatch.wake("test-user-1", "edge-healthy");
+    let request = tokio::time::timeout(Duration::from_secs(2), healthy.next())
+        .await
+        .expect("healthy Edge must not wait for failed settlements")
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+    assert_eq!(request["request_id"], identity.request_id);
+    let (other, _) = test_relay_request(2001);
+    dispatch
+        .insert_dispatch(&other, "edge-other-reject", "{}")
+        .await
+        .unwrap();
+    let _other = ws_auth(addr, "edge-other-reject", "healthy-host").await;
+    dispatch.wake("test-user-1", "edge-other-reject");
+    let settled = dispatch
+        .wait_for_status("test-user-1", &other.request_id, "completed")
+        .await;
+    let receipt: astra_thin_client::ToolResultRequest =
+        serde_json::from_str(settled.result_json.as_deref().unwrap()).unwrap();
+    assert_eq!(receipt.status, "rejected");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    {
+        let rows = dispatch.rows.lock().unwrap();
+        for identity in &failed {
+            assert_eq!(
+                rows[identity].status, "dispatched",
+                "unknown outcomes must not become claimable"
+            );
+        }
+    }
+    dispatch.settlement_failure_edges.lock().unwrap().clear();
+    for identity in &failed {
+        dispatch
+            .wait_for_status("test-user-1", &identity.request_id, "completed")
+            .await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while dispatch.limits.settlement.available_permits() != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed settlement retries must release their owners");
+    drop(sockets);
+    server.abort();
+}
+
+#[tokio::test]
+async fn saturated_settlement_owners_do_not_requeue_or_block_claims() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let owners = dispatch.limits.receipts.acquire_many(128).await.unwrap();
+    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let (identity, _) = test_relay_request(2002);
+    dispatch
+        .insert_dispatch(&identity, "edge-saturated", "{}")
+        .await
+        .unwrap();
+    let _socket = ws_auth(addr, "edge-saturated", "saturated-host").await;
+    dispatch.wake("test-user-1", "edge-saturated");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let dispatched = dispatch.rows.lock().unwrap()[&identity].status == "dispatched";
+            if dispatched && dispatch.limits.claim.available_permits() == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("saturated settlement ownership must release the claim");
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        dispatch
+            .poll_pending("test-user-1", "edge-saturated")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(owners);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn slow_sockets_do_not_block_an_independent_edge() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let mut sockets = Vec::new();
+    let mut work = Vec::new();
+    for index in 0..8 {
+        let edge = format!("edge-slow-peer-{index}");
+        sockets.push(ws_auth(addr, &edge, "slow-host").await);
+        let (identity, payload) = test_relay_request(3000 + index);
+        let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        payload["args"]["command"] = "x".repeat(12 * 1024 * 1024).into();
+        work.push((identity, edge, serde_json::to_string(&payload).unwrap()));
+    }
+    for (identity, edge, payload) in &work {
+        dispatch
+            .insert_dispatch(identity, edge, payload)
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let claimed = {
+                let rows = dispatch.rows.lock().unwrap();
+                work.iter()
+                    .all(|(identity, _, _)| rows[identity].status == "dispatched")
+            };
+            if claimed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all slow connections must claim their work");
+    for socket in &sockets {
+        let tokio_tungstenite::MaybeTlsStream::Plain(connection) = socket.get_ref() else {
+            panic!("test uses local plaintext WebSockets");
+        };
+        tokio::time::timeout(Duration::from_secs(2), connection.readable())
+            .await
+            .expect("each slow socket must receive the start of a large frame")
+            .unwrap();
+    }
+    let (identity, payload) = test_relay_request(4000);
+    dispatch
+        .insert_dispatch(&identity, "edge-fast-peer", &payload)
+        .await
+        .unwrap();
+    let mut healthy = ws_auth(addr, "edge-fast-peer", "healthy-host").await;
+    dispatch.wake("test-user-1", "edge-fast-peer");
+    let request = tokio::time::timeout(Duration::from_secs(2), healthy.next())
+        .await
+        .expect("a healthy Edge must not wait for slow socket sends")
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+    assert_eq!(request["request_id"], identity.request_id);
+    drop(sockets);
+    server.abort();
+}
+
+#[tokio::test]
+async fn progressing_large_relay_survives_the_old_send_deadline() {
+    use tokio::io::AsyncReadExt;
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+    tcp.set_recv_buffer_size(64 * 1024).unwrap();
+    let stream = tcp.connect(addr).await.unwrap();
+    let (mut socket, _) =
+        tokio_tungstenite::client_async(ws_request(addr, "test-edge-token"), stream)
+            .await
+            .unwrap();
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "edge_auth",
+                "edge_agent_id": "edge-progressing",
+                "materialization_id": "materialization-test",
+                "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                "hostname": "slow-host",
+                "workspace_dir": "/home/test/project",
+                "capabilities": edge_capabilities("edge-progressing")
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let auth: serde_json::Value =
+        serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(auth["type"], "edge_auth_ok");
+    let (identity, payload) = test_relay_request(4001);
+    let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    payload["args"]["command"] = "x".repeat(15 * 1024 * 1024).into();
+    dispatch
+        .insert_dispatch(
+            &identity,
+            "edge-progressing",
+            &serde_json::to_string(&payload).unwrap(),
+        )
+        .await
+        .unwrap();
+    dispatch.wake("test-user-1", "edge-progressing");
+    let started = tokio::time::Instant::now();
+    let stream = socket.get_mut();
+    let received = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut header = [0; 2];
+        stream.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0] & 0x0f, 1, "server must send a text frame");
+        assert_eq!(
+            header[1] & 0x7f,
+            127,
+            "fixture requires a 64-bit frame length"
+        );
+        let mut length = [0; 8];
+        stream.read_exact(&mut length).await.unwrap();
+        let length = u64::from_be_bytes(length) as usize;
+        let mut bytes = vec![0; length];
+        for chunk in bytes.chunks_mut(256 * 1024) {
+            stream.read_exact(chunk).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        bytes
+    })
+    .await
+    .expect("slow but progressing delivery must complete");
+    assert!(started.elapsed() > Duration::from_secs(5));
+    let request: serde_json::Value = serde_json::from_slice(&received).unwrap();
+    assert_eq!(request["request_id"], identity.request_id);
+    server.abort();
+}
+
+#[tokio::test]
 async fn disconnected_relay_does_not_claim_after_waiting_for_a_permit() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
-    let permit = dispatch.claim_limit.acquire_many(4).await.unwrap();
+    let permit = dispatch.limits.claim.acquire_many(4).await.unwrap();
     let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let socket = ws_auth(addr, "edge-waiting-claim", "wait-host").await;
     dispatch.wake("test-user-1", "edge-waiting-claim");
@@ -1483,7 +1776,7 @@ async fn disconnected_relay_retries_unconfirmed_settlement_without_redelivery() 
     .unwrap();
     dispatch.continue_settlement.notify_one();
     tokio::time::timeout(Duration::from_secs(2), async {
-        while dispatch.claim_limit.available_permits() != 4 {
+        while dispatch.limits.claim.available_permits() != 4 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1575,6 +1868,14 @@ async fn failed_relay_preserves_a_direct_result_already_being_persisted() {
         .await
         .unwrap();
     dispatch.wake("test-user-1", edge);
+    let tokio_tungstenite::MaybeTlsStream::Plain(connection) = socket.get_ref() else {
+        panic!("test uses a local plaintext WebSocket");
+    };
+    tokio::time::timeout(Duration::from_secs(2), connection.readable())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(socket);
     tokio::time::timeout(Duration::from_secs(12), async {
         while state.edge_connection_pool.has_connected_edge("test-user-1") {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1618,7 +1919,7 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
     dispatch
         .settlement_returns_error
         .store(true, Ordering::SeqCst);
-    let reserved = dispatch.claim_limit.acquire_many(3).await.unwrap();
+    let reserved = dispatch.limits.claim.acquire_many(3).await.unwrap();
     let (addr, state, server) =
         spawn_test_server_with_services(Some(dispatch.clone()), Some(registry.clone())).await;
     let edge = "edge-blocked-socket";
@@ -1647,12 +1948,13 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         ))
         .await
         .unwrap();
+    drop(socket);
     tokio::time::timeout(
         Duration::from_secs(15),
         dispatch.settlement_started.notified(),
     )
     .await
-    .expect("socket write must time out and begin unsent-batch cleanup");
+    .expect("disconnect must cancel the blocked write and begin unsent-batch cleanup");
     tokio::time::timeout(
         Duration::from_secs(2),
         registry.unregister_started.notified(),
@@ -1669,7 +1971,7 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
     .expect("a blocked cleanup must not leave the Edge published");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(registry.unregister_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(dispatch.claim_limit.available_permits(), 0);
+    assert_eq!(dispatch.limits.claim.available_permits(), 1);
     let (other_identity, other_payload) = test_relay_request(57);
     dispatch
         .insert_dispatch(&other_identity, "edge-fairness", &other_payload)
@@ -1677,7 +1979,6 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         .unwrap();
     let mut other = ws_auth(addr, "edge-fairness", "fair-host").await;
     dispatch.wake("test-user-1", "edge-fairness");
-    dispatch.continue_settlement.notify_one();
     let other_request = tokio::time::timeout(Duration::from_secs(2), other.next())
         .await
         .expect("another Edge must acquire the claim permit")
@@ -1687,7 +1988,15 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         .unwrap();
     let other_request: serde_json::Value = serde_json::from_str(&other_request).unwrap();
     assert_eq!(other_request["request_id"], other_identity.request_id);
+    dispatch.continue_settlement.notify_one();
     registry.continue_unregister.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while dispatch.settlement_calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the uncertain settlement must be retried");
     assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 2);
     let attempted = {
         let rows = dispatch.rows.lock().unwrap();
@@ -1715,7 +2024,6 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         );
         attempted.into_iter().next().unwrap()
     };
-    drop(socket);
     let request: serde_json::Value = serde_json::from_str(&attempted.payload_json).unwrap();
     let mut replacement = ws_auth(addr, edge, "blocked-host").await;
     dispatch.wake("test-user-1", edge);
@@ -1954,7 +2262,7 @@ async fn edge_ws_tool_request_roundtrip() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn queued_cancellation_never_precedes_its_request_on_the_real_socket() {
+async fn cancellation_skips_unattempted_work_and_follows_forwarded_work() {
     use std::{future::Future, task::Poll};
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
@@ -2001,24 +2309,360 @@ async fn queued_cancellation_never_precedes_its_request_on_the_real_socket() {
     })
     .await;
     drop(invocation);
-    let frames = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let mut frames = Vec::new();
-        for _ in 0..2 {
-            let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
-            frames.push(serde_json::from_str::<serde_json::Value>(&frame).unwrap());
-        }
-        frames
-    })
-    .await
-    .expect("queued cancellation must reach the real Edge socket");
-    assert_eq!(frames[0]["type"], "edge_tool_request");
-    assert_eq!(frames[1]["type"], "edge_tool_cancel");
-    assert_eq!(frames[0]["request_id"], frames[1]["request_id"]);
+    socket
+        .send(Message::Text(
+            json!({"type":"edge_ping"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the writer must drain the cancelled request")
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
     assert_eq!(
-        frames[0]["delivery_generation"],
-        frames[1]["delivery_generation"]
+        serde_json::from_str::<serde_json::Value>(&frame).unwrap()["type"],
+        "edge_pong"
+    );
+
+    let forwarded = astra_turn_types::ToolInvocationIdentity::new(
+        "test-user-1",
+        "direct-session",
+        "direct-run",
+        "direct-turn",
+        "forwarded-cancel",
+    )
+    .unwrap();
+    let forwarded_durable = EdgeDispatchIdentity::new(
+        &forwarded.user_id,
+        &forwarded.session_id,
+        &forwarded.run_id,
+        &forwarded.turn_chain_id,
+        forwarded.storage_key(),
+    );
+    dispatch
+        .admit_and_claim_direct_dispatch(&forwarded_durable, "edge-order", "{}")
+        .await
+        .unwrap();
+    let mut invocation = Box::pin(
+        state
+            .edge_connection_pool
+            .execute_durably_admitted_invocation_with_cancel(
+                &forwarded,
+                "edge-order",
+                "bash",
+                &arguments,
+                None,
+            ),
+    );
+    std::future::poll_fn(|cx| {
+        assert!(invocation.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let request: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["type"], "edge_tool_request");
+    drop(invocation);
+    let cancel: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cancel["type"], "edge_tool_cancel");
+    assert_eq!(request["request_id"], cancel["request_id"]);
+    assert_eq!(
+        request["delivery_generation"],
+        cancel["delivery_generation"]
     );
     socket.close(None).await.unwrap();
+    server.abort();
+}
+
+async fn queued_direct_request_does_not_outlive_writer(replace: bool) {
+    use std::{future::Future, task::Poll};
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-busy-writer-cancel";
+    let mut socket = ws_auth(addr, edge, "busy-host").await;
+    let (relay, payload) = test_relay_request(4002);
+    let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    payload["args"]["command"] = "x".repeat(12 * 1024 * 1024).into();
+    dispatch
+        .insert_dispatch(&relay, edge, &serde_json::to_string(&payload).unwrap())
+        .await
+        .unwrap();
+    dispatch.wake("test-user-1", edge);
+    let tokio_tungstenite::MaybeTlsStream::Plain(connection) = socket.get_ref() else {
+        panic!("test uses a local plaintext WebSocket");
+    };
+    tokio::time::timeout(Duration::from_secs(2), connection.readable())
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        "test-user-1",
+        "direct-session",
+        "direct-run",
+        "direct-turn",
+        "busy-cancel",
+    )
+    .unwrap();
+    let durable = EdgeDispatchIdentity::new(
+        &identity.user_id,
+        &identity.session_id,
+        &identity.run_id,
+        &identity.turn_chain_id,
+        identity.storage_key(),
+    );
+    dispatch
+        .admit_and_claim_direct_dispatch(&durable, edge, "{}")
+        .await
+        .unwrap();
+    let args = json!({"command":"true"});
+    let ceiling = astra_server_types::edge_ws_protocol::EdgeExecutionCeiling {
+        workspace_root: "/home/test/project".into(),
+        workspace_id: None,
+        materialization_id: Some("materialization-test".into()),
+        execution_binding_generation: 1,
+        runtime_read_paths: Vec::new(),
+        workspace_write_allowed: false,
+        network_allowed: false,
+    };
+    let mut invocation = Some(Box::pin(
+        state
+            .edge_connection_pool
+            .execute_durably_admitted_invocation_on_connection_with_cancel(
+                astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                    provider_stage_dispatch: None,
+                    execution_ceiling: Some(&ceiling),
+                    connection_user_id: "test-user-1",
+                    identity: &identity,
+                    edge_agent_id: edge,
+                    tool: "bash",
+                    args: &args,
+                    runtime_process_authorization: None,
+                    timeout_secs: None,
+                    execution_deadline_unix_ms: None,
+                    execution_timeout_ms: None,
+                    command_timeout_cap_ms: None,
+                    cancel_token: None,
+                    traceparent: None,
+                    tracestate: None,
+                },
+            ),
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(invocation.as_mut().unwrap().as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::task::yield_now().await;
+    let mut replacement = if replace {
+        Some(ws_auth(addr, edge, "replacement-host").await)
+    } else {
+        drop(invocation.take());
+        None
+    };
+    let frame: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(frame["request_id"], relay.request_id);
+    socket
+        .send(Message::Text(
+            json!({"type":"edge_ping"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let next: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        next["type"], "edge_pong",
+        "the cancelled or superseded direct request must not be sent"
+    );
+    if let Some(socket) = &mut replacement {
+        let result = tokio::time::timeout(Duration::from_secs(2), invocation.take().unwrap())
+            .await
+            .expect("unbudgeted caller must be notified when its queued request is not sent");
+        assert!(matches!(
+            result,
+            Err(astra_server_types::edge_connection_pool::EdgeInvocationDeliveryError::NotSent(_))
+        ));
+        socket
+            .send(Message::Text(
+                json!({"type":"edge_ping"}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        let next: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(next["type"], "edge_pong", "must not replay direct work");
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_while_relay_owns_writer_skips_direct_request() {
+    queued_direct_request_does_not_outlive_writer(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replacement_while_relay_owns_writer_skips_direct_request() {
+    queued_direct_request_does_not_outlive_writer(true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replacement_after_first_relay_poll_settles_only_the_unsent_suffix() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-relay-replaced";
+    let mut requests = [test_relay_request(4003), test_relay_request(4004)];
+    requests.sort_unstable_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
+    let mut payload: serde_json::Value = serde_json::from_str(&requests[0].1).unwrap();
+    payload["args"]["command"] = "x".repeat(12 * 1024 * 1024).into();
+    requests[0].1 = serde_json::to_string(&payload).unwrap();
+    for (identity, payload) in &requests {
+        dispatch
+            .insert_dispatch(identity, edge, payload)
+            .await
+            .unwrap();
+    }
+    let mut old = ws_auth(addr, edge, "old-host").await;
+    dispatch.wake("test-user-1", edge);
+    let tokio_tungstenite::MaybeTlsStream::Plain(connection) = old.get_ref() else {
+        panic!("test uses a local plaintext WebSocket");
+    };
+    tokio::time::timeout(Duration::from_secs(2), connection.readable())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut replacement = ws_auth(addr, edge, "replacement-host").await;
+    let first: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(5), old.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["request_id"], requests[0].0.request_id);
+    dispatch
+        .wait_for_status("test-user-1", &requests[0].0.request_id, "dispatched")
+        .await;
+    let unsent = dispatch
+        .wait_for_status("test-user-1", &requests[1].0.request_id, "completed")
+        .await;
+    let receipt: astra_thin_client::ToolResultRequest =
+        serde_json::from_str(unsent.result_json.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        receipt.tool_result_fields.unwrap()["execution_fact"],
+        "not_executed"
+    );
+    replacement
+        .send(Message::Text(
+            json!({"type":"edge_ping"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let next: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), replacement.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(next["type"], "edge_pong", "must not replay unsent work");
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replacement_claims_new_work_without_polling_the_superseded_socket() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-claim-replaced";
+    let mut old = ws_auth(addr, edge, "old-host").await;
+    let mut replacement = ws_auth(addr, edge, "replacement-host").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !state
+            .edge_connection_pool
+            .get_all_user_edges("test-user-1")
+            .iter()
+            .any(|connection| connection.hostname.as_deref() == Some("replacement-host"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement must be published before new work is admitted");
+    let polls_before = dispatch.polls.load(Ordering::SeqCst);
+    let (identity, payload) = test_relay_request(4005);
+    dispatch
+        .insert_dispatch(&identity, edge, &payload)
+        .await
+        .unwrap();
+    let received: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), replacement.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(received["request_id"], identity.request_id);
+    let old_result = tokio::time::timeout(Duration::from_secs(2), old.next())
+        .await
+        .expect("the superseded relay must observe the wake and stop");
+    assert!(!matches!(old_result, Some(Ok(Message::Text(_)))));
+    assert_eq!(
+        dispatch.polls.load(Ordering::SeqCst) - polls_before,
+        1,
+        "only the current socket may start a new claim after handoff"
+    );
     server.abort();
 }
 

@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-05-v121";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-08-v122";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -4397,7 +4397,7 @@ async fn ensure_core_schema_while_leased(
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id),
-            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id),
+            INDEX idx_edge_dispatch_status_user (status, user_id, edge_agent_id, created_at, session_id, run_id, turn_chain_id, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",
     )
@@ -5685,11 +5685,11 @@ async fn verify_core_schema_shape(
     ensure_index_shape(
         &indexes,
         "edge_pending_dispatch",
-        "idx_edge_dispatch_user_status",
+        "idx_edge_dispatch_status_user",
         &[
+            "status",
             "user_id",
             "edge_agent_id",
-            "status",
             "created_at",
             "session_id",
             "run_id",

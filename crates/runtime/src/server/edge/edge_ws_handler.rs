@@ -6,7 +6,7 @@
 
 use super::*;
 use astra_runtime_env::CapacityProvider;
-use astra_server_types::edge_connection_pool::EdgeToolResult;
+use astra_server_types::edge_connection_pool::{EdgeOutbound, EdgeToolResult};
 use astra_server_types::edge_ws_protocol::*;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
@@ -27,7 +27,6 @@ const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-const EDGE_DISPATCH_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct EdgeSocketWriter {
     sink: tokio::sync::Mutex<Option<SplitSink<WebSocket, Message>>>,
@@ -35,6 +34,12 @@ struct EdgeSocketWriter {
 }
 
 type SharedEdgeSocketWriter = Arc<EdgeSocketWriter>;
+type SocketAuthority<'a> = (
+    &'a astra_server_types::edge_connection_pool::EdgeConnectionPool,
+    &'a str,
+    &'a str,
+    u64,
+);
 
 type EdgeRegistryReleaseReconciliation = Pin<Box<dyn Future<Output = bool> + Send>>;
 
@@ -522,7 +527,7 @@ async fn handle_edge_connection(
             || state
                 .execution
                 .edge_dispatch_service
-                .pending_claim_limit()
+                .pending_limits()
                 .is_none()
     }) {
         close_unavailable_edge(&ws_sink, "edge dispatch notifications unavailable").await;
@@ -791,15 +796,16 @@ async fn handle_edge_connection(
     // pool commit guarantees the connection is never selectable for dispatch
     // while its forward loop is not yet running, so a message admitted right
     // after commit cannot sit undrained (and be lost on teardown).
-    let (pool_tx, mut pool_rx) = mpsc::channel::<EdgeServerMessage>(
+    let (pool_tx, mut pool_rx) = mpsc::channel::<EdgeOutbound>(
         astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
     );
+    let control_tx = pool_tx.clone();
     let ws_sink_fwd = ws_sink.clone();
     let forward_pool = state.edge_connection_pool.clone();
     let forward_user = user_id.clone();
     let forward_edge = edge_agent_id.clone();
     let (forward_generation_tx, forward_generation_rx) = tokio::sync::oneshot::channel();
-    let forward_task = tokio::spawn(async move {
+    let mut forward_task = tokio::spawn(async move {
         let Ok(generation) = forward_generation_rx.await else {
             return;
         };
@@ -813,23 +819,18 @@ async fn handle_edge_connection(
         cancel_wake.notify_one();
         loop {
             let msg = tokio::select! {
-                biased;
                 _ = cancel_wake.notified() => {
             for (request_id, delivery_generation) in forward_pool
                 .pending_cancellations_for_connection(&forward_user, &forward_edge, generation)
             {
-                let sent = tokio::time::timeout(
-                    astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT,
-                    send_edge_msg(
+                let sent = send_edge_msg(
                         &ws_sink_fwd,
                         EdgeServerMessage::ToolCancel {
                             request_id: request_id.clone(),
                             delivery_generation,
                         },
-                    ),
-                )
-                .await;
-                if !matches!(sent, Ok(Ok(()))) {
+                    ).await;
+                if sent.is_err() {
                     return;
                 }
                 forward_pool.cancellation_forwarded(&request_id, delivery_generation, generation);
@@ -838,10 +839,10 @@ async fn handle_edge_connection(
                 },
                 msg = pool_rx.recv() => msg,
             };
-            let Some(msg) = msg else {
+            let Some(mut msg) = msg else {
                 break;
             };
-            let request_delivery = match &msg {
+            let request_delivery = match msg.message() {
                 EdgeServerMessage::ToolRequest {
                     request_id,
                     delivery_generation,
@@ -860,15 +861,49 @@ async fn handle_edge_connection(
                 }
                 _ => None,
             };
-            if !matches!(
-                tokio::time::timeout(
-                    astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT,
-                    send_edge_msg(&ws_sink_fwd, msg),
+            let direct_timeout = request_delivery
+                .as_ref()
+                .map(|_| astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT);
+            let authority = request_delivery.as_ref().map(|_| {
+                (
+                    &forward_pool,
+                    forward_user.as_str(),
+                    forward_edge.as_str(),
+                    generation,
                 )
-                .await,
-                Ok(Ok(()))
-            ) {
-                break;
+            });
+            let text = match serde_json::to_string(msg.message()) {
+                Ok(text) => text,
+                Err(_) => break,
+            };
+            match send_edge_frame_if(
+                &ws_sink_fwd,
+                Message::Text(text.into()),
+                direct_timeout,
+                authority,
+                || {
+                    let live = request_delivery.as_ref().is_none_or(
+                        |(request_id, delivery_generation)| {
+                            forward_pool.queued_request_is_live(
+                                &forward_user,
+                                &forward_edge,
+                                generation,
+                                request_id,
+                                *delivery_generation,
+                            )
+                        },
+                    );
+                    if live {
+                        msg.mark_attempted();
+                    }
+                    live
+                },
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(()) => break,
             }
             if let Some((request_id, delivery_generation)) = request_delivery {
                 forward_pool.request_forwarded(
@@ -959,6 +994,7 @@ async fn handle_edge_connection(
     let forward_abort = forward_task.abort_handle();
     let relay_registry_id = registration_lease.current.registry_id.clone();
     let relay_materialization_id = registration_lease.current.materialization_id.clone();
+    let relay_connection_permit = Arc::downgrade(&cleanup._live_permit);
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
     let (relay_failed_tx, mut relay_failed_rx) = tokio::sync::oneshot::channel();
     let mut dispatch_task = Some(tokio::spawn(async move {
@@ -982,13 +1018,16 @@ async fn handle_edge_connection(
                     }
                 }
             }
-            let Some(claim_limit) = dispatch_svc.pending_claim_limit() else {
+            let Some(limits) = dispatch_svc.pending_limits() else {
+                break;
+            };
+            let Some(connection_permit) = relay_connection_permit.upgrade() else {
                 break;
             };
             let claim_permit = tokio::select! {
                 biased;
                 _ = dispatch_cancel_rx.changed() => break,
-                permit = claim_limit.acquire() => match permit {
+                permit = limits.claim.acquire() => match permit {
                     Ok(permit) => permit,
                     Err(_) => break,
                 },
@@ -996,10 +1035,22 @@ async fn handle_edge_connection(
             if dispatch_cancel_rx.has_changed().unwrap_or(true) {
                 break;
             }
-            match dispatch_svc
-                .poll_pending(&dispatch_user_id, &dispatch_agent_id)
-                .await
+            if relay_pool
+                .with_current_generation(
+                    &dispatch_user_id,
+                    &dispatch_agent_id,
+                    pool_generation,
+                    || (),
+                )
+                .is_none()
             {
+                break;
+            }
+            let claim = dispatch_svc
+                .poll_pending(&dispatch_user_id, &dispatch_agent_id)
+                .await;
+            drop(claim_permit);
+            match claim {
                 Ok(rows) if !rows.is_empty() => {
                     let mut receipts = Vec::new();
                     let mut connection_failed = false;
@@ -1091,7 +1142,18 @@ async fn handle_edge_connection(
                         }
                         let (attempted, sent) = match dispatch_sink.upgrade() {
                             Some(sink) => {
-                                send_relay_frame(&sink, &mut dispatch_cancel_rx, text).await
+                                send_relay_frame(
+                                    &sink,
+                                    &mut dispatch_cancel_rx,
+                                    text,
+                                    (
+                                        &relay_pool,
+                                        &dispatch_user_id,
+                                        &dispatch_agent_id,
+                                        pool_generation,
+                                    ),
+                                )
+                                .await
                             }
                             None => (false, false),
                         };
@@ -1131,8 +1193,15 @@ async fn handle_edge_connection(
                     // Only compact receipts are needed if the database is
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
-                    settle_unsent_dispatches(dispatch_svc.as_ref(), &dispatch_agent_id, &receipts)
-                        .await;
+                    settle_unsent_dispatches(
+                        dispatch_svc.as_ref(),
+                        &limits.receipts,
+                        &limits.settlement,
+                        connection_permit,
+                        &dispatch_agent_id,
+                        &receipts,
+                    )
+                    .await;
                     if connection_failed {
                         break 'dispatch;
                     }
@@ -1142,17 +1211,15 @@ async fn handle_edge_connection(
                     user_id = %dispatch_user_id,
                     edge_agent_id = %dispatch_agent_id,
                     %error,
-                    "edge dispatch claim outcome is unavailable; pending work remains observable"
+                    "edge dispatch claim outcome is unavailable; rows may be pending or dispatched"
                 ),
             }
-            drop(claim_permit);
         }
     }));
 
     // ── Phase 3: Bidirectional message loop ──────────────────────────
     let heartbeat_interval = Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS);
 
-    let ws_sink_write = ws_sink.clone();
     let user_id_cleanup = user_id.clone();
     let edge_agent_id_cleanup = edge_agent_id.clone();
     let read_inflight = inflight_dispatches.clone();
@@ -1290,14 +1357,13 @@ async fn handle_edge_connection(
                                                 delivery_generation,
                                                 direct_result,
                                             );
-                                        if send_edge_msg(
-                                            &ws_sink_write,
+                                        if queue_edge_msg(
+                                            &control_tx,
                                             EdgeServerMessage::ToolResultAck {
                                                 request_id: request_id.clone(),
                                                 delivery_generation,
                                             },
                                         )
-                                        .await
                                         .is_err()
                                         {
                                             break;
@@ -1364,7 +1430,9 @@ async fn handle_edge_connection(
                                     }
                                 }
                                 Ok(EdgeClientMessage::Ping {}) => {
-                                    let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong {}).await;
+                                    if queue_edge_msg(&control_tx, EdgeServerMessage::Pong {}).is_err() {
+                                        break;
+                                    }
                                 }
                                 Ok(EdgeClientMessage::Auth { .. }) => {
                                     // Already authenticated, ignore duplicate auth
@@ -1380,14 +1448,13 @@ async fn handle_edge_connection(
                             }
                         }
                         Some(Ok(Message::Close(_))) | None => break,
-                        Some(Ok(Message::Ping(data))) => {
-                            let _ = send_edge_frame(&ws_sink_write, Message::Pong(data)).await;
-                        }
+                        // Tungstenite queues the protocol Pong when it reads Ping.
+                        Some(Ok(Message::Ping(_))) => {}
                         _ => {} // ignore binary, pong
                     }
                 }
                 _ = heartbeat.tick() => {
-                    if send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong {}).await.is_err() {
+                    if queue_edge_msg(&control_tx, EdgeServerMessage::Pong {}).is_err() {
                         break;
                     }
                     // B3: update last_heartbeat_at in DB registry, guarded by
@@ -1427,13 +1494,7 @@ async fn handle_edge_connection(
                             if consecutive_heartbeat_storage_failures
                                 >= EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET
                             {
-                                let _ = send_edge_msg(
-                                    &ws_sink_write,
-                                    EdgeServerMessage::Closing {
-                                        reason: "edge registry heartbeat unavailable".into(),
-                                    },
-                                )
-                                .await;
+                                send_edge_closing(&ws_sink, "edge registry heartbeat unavailable").await;
                                 break;
                             }
                         }
@@ -1456,12 +1517,7 @@ async fn handle_edge_connection(
                                 %error,
                                 "edge WebSocket: registration publication task failed"
                             );
-                            let _ = send_edge_msg(
-                                &ws_sink_write,
-                                EdgeServerMessage::Closing {
-                                    reason: "edge registry publication unavailable".into(),
-                                },
-                            ).await;
+                            send_edge_closing(&ws_sink, "edge registry publication unavailable").await;
                             break;
                         }
                     };
@@ -1479,15 +1535,14 @@ async fn handle_edge_connection(
                             edge_agent_id = %edge_agent_id,
                             "edge WebSocket: durable registration was superseded during publication reconciliation"
                         );
-                        let _ = send_edge_msg(
-                            &ws_sink_write,
-                            EdgeServerMessage::Closing {
-                                reason: "edge registry registration claim lost".into(),
-                            },
-                        )
-                        .await;
+                        send_edge_closing(&ws_sink, "edge registry registration claim lost").await;
                         break;
                     }
+                }
+                result = &mut forward_task => {
+                    tracing::warn!(user_id = %user_id, edge_agent_id = %edge_agent_id, ?result,
+                        "edge socket writer stopped; closing the connection");
+                    break;
                 }
                 result = async {
                     match dispatch_task.as_mut() {
@@ -1532,8 +1587,8 @@ async fn handle_edge_connection(
             .is_err()
     {
         tracing::warn!("edge dispatch claim is still settling after disconnect");
-        // Dropping a Tokio JoinHandle detaches the bounded claim owner; the
-        // permit remains held until its SQL and unsent-batch cleanup finish.
+        // Dropping the handle detaches the bounded owner until its submitted
+        // claim or settlement completes.
         drop(dispatch_task);
     }
     let disconnected_dispatches = inflight_dispatches.drain().await;
@@ -1707,12 +1762,41 @@ fn validate_relay_attestation(
 }
 
 /// Helper: serialize and send an EdgeServerMessage over the WebSocket.
+fn queue_edge_msg(sender: &mpsc::Sender<EdgeOutbound>, msg: EdgeServerMessage) -> Result<(), ()> {
+    sender.try_send(msg.into()).map_err(|_| ())
+}
+
+async fn send_edge_closing(sink: &SharedEdgeSocketWriter, reason: &'static str) {
+    let _ = tokio::time::timeout(
+        Duration::from_millis(250),
+        send_edge_msg(
+            sink,
+            EdgeServerMessage::Closing {
+                reason: reason.into(),
+            },
+        ),
+    )
+    .await;
+}
+
 async fn send_edge_msg(sink: &SharedEdgeSocketWriter, msg: EdgeServerMessage) -> Result<(), ()> {
     let text = serde_json::to_string(&msg).map_err(|_| ())?;
     send_edge_frame(sink, Message::Text(text.into())).await
 }
 
 async fn send_edge_frame(sink: &SharedEdgeSocketWriter, message: Message) -> Result<(), ()> {
+    send_edge_frame_if(sink, message, None, None, || true)
+        .await
+        .map(|_| ())
+}
+
+async fn send_edge_frame_if(
+    sink: &SharedEdgeSocketWriter,
+    message: Message,
+    send_timeout: Option<Duration>,
+    authority: Option<SocketAuthority<'_>>,
+    should_send: impl FnOnce() -> bool,
+) -> Result<bool, ()> {
     use futures_util::SinkExt;
     let mut guard = sink.sink.lock().await;
     if sink.closed.load(Ordering::Acquire) {
@@ -1721,12 +1805,40 @@ async fn send_edge_frame(sink: &SharedEdgeSocketWriter, message: Message) -> Res
     // A cancelled send drops this owned sink instead of returning a partially
     // flushed frame to another writer.
     let mut writer = guard.take().ok_or(())?;
-    writer.send(message).await.map_err(|_| ())?;
+    let sent = {
+        let send = writer.send(message);
+        tokio::pin!(send);
+        let mut first = Some(should_send);
+        let poll = std::future::poll_fn(|cx| {
+            let result = if let Some(check) = first.take() {
+                let first_poll = || check().then(|| send.as_mut().poll(cx));
+                match authority {
+                    Some((pool, user, edge, generation)) => pool
+                        .with_current_generation(user, edge, generation, first_poll)
+                        .flatten(),
+                    None => first_poll(),
+                }
+            } else {
+                Some(send.as_mut().poll(cx))
+            };
+            match result {
+                None => std::task::Poll::Ready(Ok(false)),
+                Some(std::task::Poll::Pending) => std::task::Poll::Pending,
+                Some(std::task::Poll::Ready(result)) => {
+                    std::task::Poll::Ready(result.map(|_| true).map_err(|_| ()))
+                }
+            }
+        });
+        match send_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, poll).await.map_err(|_| ())?,
+            None => poll.await,
+        }
+    }?;
     if sink.closed.load(Ordering::Acquire) {
         return Err(());
     }
     *guard = Some(writer);
-    Ok(())
+    Ok(sent)
 }
 
 /// Returns whether the frame was polled and whether the send completed.
@@ -1735,13 +1847,13 @@ async fn send_relay_frame(
     sink: &SharedEdgeSocketWriter,
     cancel: &mut tokio::sync::watch::Receiver<()>,
     text: String,
+    authority: SocketAuthority<'_>,
 ) -> (bool, bool) {
     use futures_util::SinkExt;
-    let deadline = tokio::time::Instant::now() + EDGE_DISPATCH_SEND_TIMEOUT;
     let guard = tokio::select! {
         biased;
         _ = cancel.changed() => None,
-        result = tokio::time::timeout_at(deadline, sink.sink.lock()) => result.ok(),
+        guard = sink.sink.lock() => Some(guard),
     };
     let Some(mut guard) = guard else {
         sink.closed.store(true, Ordering::Release);
@@ -1754,8 +1866,12 @@ async fn send_relay_frame(
         sink.closed.store(true, Ordering::Release);
         return (false, false);
     };
-    let (attempted, sent) =
-        poll_relay_send(writer.send(Message::Text(text.into())), cancel, deadline).await;
+    let (attempted, sent) = poll_relay_send(
+        writer.send(Message::Text(text.into())),
+        cancel,
+        Some(authority),
+    )
+    .await;
     if sent && !sink.closed.load(Ordering::Acquire) {
         *guard = Some(writer);
         (attempted, true)
@@ -1770,20 +1886,39 @@ async fn send_relay_frame(
 async fn poll_relay_send<F, E>(
     send: F,
     cancel: &mut tokio::sync::watch::Receiver<()>,
-    deadline: tokio::time::Instant,
+    authority: Option<SocketAuthority<'_>>,
 ) -> (bool, bool)
 where
     F: Future<Output = Result<(), E>>,
 {
     tokio::pin!(send);
     let mut attempted = false;
+    let mut first = true;
     let sent = tokio::select! {
         biased;
         _ = cancel.changed() => false,
-        result = tokio::time::timeout_at(deadline, std::future::poll_fn(|cx| {
-            attempted = true;
-            send.as_mut().poll(cx)
-        })) => matches!(result, Ok(Ok(()))),
+        result = std::future::poll_fn(|cx| {
+            let mut poll = || {
+                attempted = true;
+                send.as_mut().poll(cx)
+            };
+            let outcome = if first {
+                first = false;
+                match authority {
+                    Some((pool, user, edge, generation)) => {
+                        pool.with_current_generation(user, edge, generation, poll)
+                    }
+                    None => Some(poll()),
+                }
+            } else {
+                Some(poll())
+            };
+            match outcome {
+                None => std::task::Poll::Ready(false),
+                Some(std::task::Poll::Pending) => std::task::Poll::Pending,
+                Some(std::task::Poll::Ready(result)) => std::task::Poll::Ready(result.is_ok()),
+            }
+        }) => result,
     };
     (attempted, sent)
 }
@@ -1853,12 +1988,7 @@ mod inflight_dispatch_tracker_tests {
             panic!("cancelled send must not be polled")
         });
         assert_eq!(
-            poll_relay_send(
-                never_polled,
-                &mut receiver,
-                tokio::time::Instant::now() + Duration::from_secs(1),
-            )
-            .await,
+            poll_relay_send(never_polled, &mut receiver, None).await,
             (false, false)
         );
 
@@ -1869,17 +1999,43 @@ mod inflight_dispatch_tracker_tests {
             notify.notify_one();
             std::task::Poll::Pending
         });
-        let send = tokio::spawn(async move {
-            poll_relay_send(
-                pending,
-                &mut receiver,
-                tokio::time::Instant::now() + Duration::from_secs(1),
-            )
-            .await
-        });
+        let send = tokio::spawn(async move { poll_relay_send(pending, &mut receiver, None).await });
         polled.notified().await;
         drop(cancel);
         assert_eq!(send.await.unwrap(), (true, false));
+    }
+
+    #[tokio::test]
+    async fn relay_checks_generation_only_at_the_first_poll() {
+        let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let old = pool.register("user", "edge", None, None, old_tx);
+        let (cancel, mut receiver) = tokio::sync::watch::channel(());
+        let mut in_progress = Box::pin(poll_relay_send(
+            std::future::pending::<Result<(), ()>>(),
+            &mut receiver,
+            Some((&pool, "user", "edge", old)),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(in_progress.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        pool.register("user", "edge", None, None, new_tx);
+        drop(cancel);
+        assert_eq!(in_progress.await, (true, false));
+
+        let (_cancel, mut receiver) = tokio::sync::watch::channel(());
+        assert_eq!(
+            poll_relay_send(
+                std::future::pending::<Result<(), ()>>(),
+                &mut receiver,
+                Some((&pool, "user", "edge", old)),
+            )
+            .await,
+            (false, false)
+        );
     }
 
     fn dispatch(request_id: &str) -> InflightEdgeDispatch {
@@ -1985,18 +2141,35 @@ fn append_unsent_receipts(
 
 async fn settle_unsent_dispatches(
     dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
+    owners: &tokio::sync::Semaphore,
+    limit: &tokio::sync::Semaphore,
+    connection_permit: Arc<EdgeWsConnectionPermit>,
     edge_agent_id: &str,
     receipts: &[(astra_services::multi_agent::EdgeDispatchIdentity, String)],
 ) {
     let Some((first, _)) = receipts.first() else {
         return;
     };
+    let Ok(_owner) = owners.try_acquire() else {
+        tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
+            "edge dispatch settlement is saturated; claimed outcome remains unknown");
+        return;
+    };
+    drop(connection_permit);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut delay = Duration::from_millis(100);
     loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, limit.acquire()).await else {
+            break;
+        };
         let error = match dispatch.settle_unsent(edge_agent_id, receipts).await {
             Ok(()) => return,
             Err(error) => error,
         };
+        drop(permit);
         // The response may have been lost after commit. Retrying the same
         // conditional terminal update is safe; never return these rows to
         // the claimable queue or invent a winning result.
@@ -2008,9 +2181,14 @@ async fn settle_unsent_dispatches(
             ?delay,
             "unable to confirm settlement of unsent Edge dispatches; retrying"
         );
-        tokio::time::sleep(delay).await;
-        delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
+        delay = delay.saturating_mul(2).min(Duration::from_secs(2));
     }
+    tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
+        "edge dispatch settlement exhausted retries; claimed outcome remains unknown");
 }
 
 /// Validate edge self-reported capabilities against the server-side tool
