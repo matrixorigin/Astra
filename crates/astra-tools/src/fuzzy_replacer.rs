@@ -45,6 +45,9 @@ pub fn fuzzy_find_replacement<'a>(
     old_str: &str,
     replace_all: bool,
 ) -> Option<FuzzyMatch<'a>> {
+    if old_str.trim().is_empty() {
+        return None;
+    }
     // Cascade through strategies in priority order.
     // Each returns Vec of actual content substrings that match.
     type Strategy = (&'static str, fn(&str, &str) -> Vec<String>);
@@ -73,6 +76,12 @@ pub fn fuzzy_find_replacement<'a>(
         if matches.is_empty() {
             continue;
         }
+        if *name == STRATEGY_QUOTE_NORMALIZED
+            && !replace_all
+            && quote_normalized_match_count(content, old_str) > 1
+        {
+            return None;
+        }
         if matches.len() > 1 {
             if replace_all {
                 return None;
@@ -81,7 +90,7 @@ pub fn fuzzy_find_replacement<'a>(
         }
         let actual = &matches[0];
         if let Some(pos) = content.find(actual) {
-            let is_unique = !content[pos + actual.len()..].contains(actual);
+            let is_unique = astra_text_utils::first_two_match_positions(content, actual).is_none();
             if is_unique || replace_all {
                 return Some(FuzzyMatch {
                     actual: &content[pos..pos + actual.len()],
@@ -129,6 +138,9 @@ fn line_number_stripped_find(content: &str, old_str: &str) -> Vec<String> {
         .map(|l| strip_line_number_prefix(l))
         .collect::<Vec<_>>()
         .join("\n");
+    if stripped.trim().is_empty() {
+        return vec![];
+    }
 
     // Try exact match with stripped version
     let mut results = Vec::new();
@@ -136,7 +148,7 @@ fn line_number_stripped_find(content: &str, old_str: &str) -> Vec<String> {
     while let Some(pos) = content[search_start..].find(&stripped) {
         let abs_pos = search_start + pos;
         results.push(content[abs_pos..abs_pos + stripped.len()].to_string());
-        search_start = abs_pos + 1;
+        search_start = content.ceil_char_boundary(abs_pos + 1);
         if results.len() > 2 {
             break;
         }
@@ -465,7 +477,7 @@ fn indentation_flexible_find(content: &str, old_str: &str) -> Vec<String> {
 /// Handles: LLM using literal \n instead of newline, \t instead of tab, etc.
 fn escape_normalized_find(content: &str, old_str: &str) -> Vec<String> {
     let unescaped = unescape_str(old_str);
-    if unescaped == old_str {
+    if unescaped == old_str || unescaped.is_empty() {
         return vec![]; // No escape sequences found, skip
     }
 
@@ -475,7 +487,7 @@ fn escape_normalized_find(content: &str, old_str: &str) -> Vec<String> {
     while let Some(pos) = content[search_start..].find(&unescaped) {
         let abs_pos = search_start + pos;
         results.push(content[abs_pos..abs_pos + unescaped.len()].to_string());
-        search_start = abs_pos + 1;
+        search_start = content.ceil_char_boundary(abs_pos + 1);
         if results.len() > 2 {
             break; // Too many matches, won't be unique
         }
@@ -588,7 +600,14 @@ fn normalize_quotes(s: &str) -> String {
 pub fn quote_normalized_match_count(content: &str, search: &str) -> usize {
     let norm_search = normalize_quotes(search);
     let norm_content = normalize_quotes(content);
-    norm_content.matches(&norm_search).count()
+    let count = norm_content.matches(&norm_search).count();
+    if count == 1
+        && astra_text_utils::first_two_match_positions(&norm_content, &norm_search).is_some()
+    {
+        2
+    } else {
+        count
+    }
 }
 
 pub fn preserve_quote_style(old_str: &str, actual_old_str: &str, new_str: &str) -> String {
@@ -1029,6 +1048,14 @@ mod tests {
     }
 
     // ─── fuzzy_find_replacement (integration) ───────────────────────────────
+
+    #[test]
+    fn fuzzy_replacement_rejects_empty_anchors() {
+        assert!(fuzzy_find_replacement("content", "", false).is_none());
+        assert!(fuzzy_find_replacement("content", " \n", false).is_none());
+        assert!(fuzzy_find_replacement("“””", "\"\"", false).is_none());
+        assert!(fuzzy_find_replacement("“””", "\"\"", true).is_some());
+    }
 
     #[test]
     fn cascade_cases() {

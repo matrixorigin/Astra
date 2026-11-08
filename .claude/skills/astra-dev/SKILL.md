@@ -302,6 +302,13 @@ every push resolve and report remote URL, source branch, destination ref, and
 remote default branch; never push a MatrixOrigin default branch. Keep credentials,
 private endpoints, and unsanitized session/benchmark evidence out of commits.
 
+Before creating or editing a PR title or body, save the exact proposed body to a
+file and run `python3 scripts/ci/check_pr_metadata.py --title "$pr_title" --body-file "$pr_body_file"`.
+This executes the repository's actual PR metadata workflow locally. Preserve the
+required `Capability assessment: Updated|Unchanged|N/A: explanation` first
+line when rewriting the body, and revise the assessment if the capability impact
+changed. A valid Conventional Commit title alone is not sufficient.
+
 ## Appendix: Ownership Map
 
 | Area | Owner / anchor |

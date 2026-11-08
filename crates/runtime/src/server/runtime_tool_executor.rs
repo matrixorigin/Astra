@@ -74,7 +74,8 @@ use crate::server::tool_local_execution::{
     run_local_tool_policy_preflight, unknown_local_tool_result, validate_local_tool_arguments,
 };
 use crate::server::tool_plan_gate::{
-    PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
+    CachedAuthoring, PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
+    plan_mode_unavailable_tool_result,
 };
 use crate::server::tool_route_runtime::{
     ExecutedToolRoute, ToolRouteObserver, ToolRouteRuntimeContext,
@@ -2999,6 +3000,25 @@ impl RuntimeToolExecutor {
         self.plan_repo = Some(repo);
     }
 
+    /// Resolve the existing plan guard only when a write needs admission.
+    pub(crate) async fn plan_mode_for_write(&self) -> Option<bool> {
+        // The inner lookup has its own timeout; also bound time waiting for
+        // another transition that already owns this session's cache lock.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            plan_mode_authoring_active(
+                self.plan_repo.as_ref(),
+                &self.user_id,
+                &self.session_id,
+                self.plan_mode_cache.as_ref(),
+                self.plan_authoring_active_handle.as_ref(),
+            ),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Inject the host's plan-resume hint handle so tool-driven plan-mode
     /// changes (enter_plan_mode / exit_plan_mode) can refresh the system
     /// prompt injection mid-run. `None` (the default) leaves the host's
@@ -5420,13 +5440,10 @@ impl RuntimeToolExecutor {
         }
 
         let plan_mode_authoring_active = if is_plan_mode_blocked_tool(name, args) {
-            plan_mode_authoring_active(
-                self.plan_repo.as_ref(),
-                &self.user_id,
-                &self.session_id,
-                self.plan_mode_cache.as_ref(),
-            )
-            .await
+            let Some(active) = self.plan_mode_for_write().await else {
+                return LocalToolPreflight::ShortCircuit(plan_mode_unavailable_tool_result());
+            };
+            active
         } else {
             false
         };
@@ -16904,6 +16921,17 @@ for line in sys.stdin:
                 .set_active_plan(user_id, session_id, plan_id)
                 .await
         }
+        async fn finish_authoring(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            plan_id: &str,
+            version: u64,
+        ) -> Result<bool, astra_plan::PlanLoadError> {
+            self.inner
+                .finish_authoring(user_id, session_id, plan_id, version)
+                .await
+        }
         async fn active_plan_for_session(
             &self,
             user_id: &str,
@@ -16914,6 +16942,77 @@ for line in sys.stdin:
                 .active_plan_for_session(user_id, session_id)
                 .await
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plan_lookup_failure_reports_not_executed_and_can_recover() {
+        let (mut exec, _dir) = test_executor();
+        let shared = Arc::new(std::sync::RwLock::new(false));
+        exec.set_plan_authoring_active_handle(shared.clone());
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://root@127.0.0.1:1/astra")
+            .unwrap();
+        pool.close().await;
+        let active_calls = Arc::new(AtomicU32::new(0));
+        let load_calls = Arc::new(AtomicU32::new(0));
+        exec.set_plan_repository(Arc::new(QueryCountingPlanRepo {
+            inner: Arc::new(astra_plan::CloudPlanRepository::new(pool)),
+            active_calls: active_calls.clone(),
+            load_calls: load_calls.clone(),
+            fail_load: false,
+        }));
+        let LocalToolPreflight::ShortCircuit(result) = exec
+            .run_local_tool_preflight("bash", &json!({"command": "true"}))
+            .await
+        else {
+            panic!("an unavailable plan lookup must prevent execution");
+        };
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata["error_kind"], "tool_unavailable");
+        assert_eq!(metadata["execution_fact"], "not_executed");
+        assert_eq!(metadata["retryable"], true);
+        assert_eq!(metadata["retry_after_ms"], 5000);
+        assert!(!result.output.contains("plan mode is active"));
+
+        for _ in 0..20 {
+            assert!(matches!(
+                exec.run_local_tool_preflight("bash", &json!({"command": "true"}))
+                    .await,
+                LocalToolPreflight::ShortCircuit(_)
+            ));
+        }
+        assert_eq!(active_calls.load(Ordering::Relaxed), 1);
+        assert!(*shared.read().unwrap());
+        exec.set_plan_repository(Arc::new(QueryCountingPlanRepo {
+            inner: Arc::new(astra_plan::InMemoryPlanRepository::new()),
+            active_calls: active_calls.clone(),
+            load_calls,
+            fail_load: false,
+        }));
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        assert!(matches!(
+            exec.run_local_tool_preflight("bash", &json!({"command": "true"}))
+                .await,
+            LocalToolPreflight::Continue
+        ));
+        assert_eq!(active_calls.load(Ordering::Relaxed), 2);
+        assert!(!*shared.read().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plan_lookup_bounds_wait_for_an_in_progress_transition() {
+        let (exec, _dir) = test_executor();
+        let _transition = exec.plan_mode_cache.write().await;
+        let LocalToolPreflight::ShortCircuit(result) = exec
+            .run_local_tool_preflight("bash", &json!({"command": "true"}))
+            .await
+        else {
+            panic!("an unresolved plan transition must not authorize a write");
+        };
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata["error_kind"], "tool_unavailable");
+        assert_eq!(metadata["execution_fact"], "not_executed");
+        assert_eq!(metadata["retryable"], true);
     }
 
     #[tokio::test]
@@ -16941,8 +17040,10 @@ for line in sys.stdin:
                 &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
+                None,
             )
             .await
+            .unwrap()
         );
         let active_after_first = active.load(Ordering::Relaxed);
         let load_after_first = load.load(Ordering::Relaxed);
@@ -16958,8 +17059,10 @@ for line in sys.stdin:
                     &exec.user_id,
                     &exec.session_id,
                     exec.plan_mode_cache.as_ref(),
+                    None,
                 )
                 .await
+                .unwrap()
             );
         }
         assert_eq!(
@@ -16975,7 +17078,7 @@ for line in sys.stdin:
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn active_plan_load_failure_keeps_write_guard_fail_closed() {
         let inner: Arc<dyn astra_plan::PlanRepository> =
             Arc::new(astra_plan::InMemoryPlanRepository::new());
@@ -17001,15 +17104,17 @@ for line in sys.stdin:
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(wrapper);
 
-        assert!(
+        assert_eq!(
             plan_mode_authoring_active(
                 exec.plan_repo.as_ref(),
                 &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
+                None,
             )
             .await,
-            "an active binding must remain authoritative when only its optional draft payload is unavailable"
+            None,
+            "a failed draft read must keep the guard closed without caching a permanent plan state"
         );
     }
 
@@ -17082,10 +17187,8 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn plan_mode_cache_invalidated_by_enter_exit_tools() {
-        // After a tool mutates plan-mode state, the next authoring check must
-        // re-read the repo. Without invalidation, the cache would keep
-        // returning the stale pre-enter/exit answer and the write guard
-        // would misbehave for the rest of the run.
+        // Explicit transitions refresh the shared snapshot, while later
+        // ordinary authoring checks reuse it without another repository read.
         let active = Arc::new(AtomicU32::new(0));
         let load = Arc::new(AtomicU32::new(0));
         let inner: Arc<dyn astra_plan::PlanRepository> =
@@ -17107,8 +17210,10 @@ for line in sys.stdin:
                 &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
+                None,
             )
             .await
+            .unwrap()
         );
         let before = active.load(Ordering::Relaxed);
 
@@ -17120,16 +17225,17 @@ for line in sys.stdin:
             "enter_plan_mode must run through the real tool path: {enter_result}"
         );
 
-        // Next authoring check re-queries and sees the active plan created by
-        // the tool call.
+        // The next authoring check sees the active plan created by the tool.
         assert!(
             plan_mode_authoring_active(
                 exec.plan_repo.as_ref(),
                 &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
+                None,
             )
             .await
+            .unwrap()
         );
         assert!(
             active.load(Ordering::Relaxed) > before,
@@ -17161,14 +17267,15 @@ for line in sys.stdin:
                 &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
+                None,
             )
             .await
+            .unwrap()
         );
-        assert!(
-            active.load(Ordering::Relaxed) > after_exit_tool,
-            "exit_plan_mode invalidation must force a fresh active_plan_for_session lookup \
-             — active count after tool={after_exit_tool}, after check={}",
-            active.load(Ordering::Relaxed)
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            after_exit_tool,
+            "ordinary checks must reuse the snapshot refreshed by exit_plan_mode"
         );
     }
 
@@ -17236,6 +17343,28 @@ for line in sys.stdin:
         ) -> Result<(), astra_plan::PlanLoadError> {
             *self.active_plan.write().await = plan_id.map(str::to_string);
             Ok(())
+        }
+        async fn finish_authoring(
+            &self,
+            _user_id: &str,
+            _session_id: &str,
+            plan_id: &str,
+            version: u64,
+        ) -> Result<bool, astra_plan::PlanLoadError> {
+            let mut active = self.active_plan.write().await;
+            let mut plan = self.plan_state.write().await;
+            if active.as_deref() != Some(plan_id)
+                || !plan
+                    .as_ref()
+                    .is_some_and(|(id, state)| id == plan_id && state.version == version)
+            {
+                return Ok(false);
+            }
+            if let Some((_, state)) = plan.as_mut() {
+                state.session_hint = None;
+            }
+            *active = None;
+            Ok(true)
         }
         async fn active_plan_for_session(
             &self,
@@ -17413,8 +17542,10 @@ for line in sys.stdin:
                 &exec.user_id,
                 &exec.session_id,
                 exec.plan_mode_cache.as_ref(),
+                None,
             )
-            .await,
+            .await
+            .unwrap(),
             "trusted approval must synchronously unlock the same executor"
         );
     }
@@ -17574,7 +17705,7 @@ for line in sys.stdin:
             .execute("exit_plan_mode", &json!({"plan": "1. Continue drafting"}))
             .await;
         assert!(
-            exit.contains("remain blocked"),
+            exit.contains("no interactive approval channel"),
             "rejected plan should stay in authoring mode, got: {exit}"
         );
 

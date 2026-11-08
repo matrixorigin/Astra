@@ -44,7 +44,7 @@ const TRUSTED_GIT_PATH: &str = r"C:\Windows\System32";
 
 fn is_executor_owned_fingerprint_path(path: &Path) -> bool {
     matches!(path.components().next(), Some(Component::Normal(name))
-        if name == ".astra" || name == crate::shell_output_capture::CAPTURE_DIRECTORY_NAME)
+        if name == ".astra")
 }
 
 /// Metadata keys carried in a `ToolResult` and projected into the lossless
@@ -83,58 +83,6 @@ static DESIRED_STATE_MARKER_REGISTRY: OnceLock<
 const MAX_LIVE_DESIRED_STATE_MARKERS: usize = 4096;
 pub const OBSERVATION_RECEIPT_FIELD: &str = "workspace_observation_receipt";
 pub const OBSERVATION_SCOPE_FIELD: &str = "workspace_observation_scope";
-/// Minimal path for the only external helper allowed in a detached command
-/// (`sleep`). Builtins do not consult PATH, and clearing the inherited
-/// environment removes BASH_ENV, exported functions, LD_PRELOAD, and user
-/// PATH shadowing from the detached process.
-pub const DETACHABLE_PATH: &str = "/usr/bin:/bin";
-
-/// Detached execution is intentionally narrower than ordinary execution.
-/// Without a terminal-owned post receipt, only shell builtins (plus the
-/// harmless `sleep` helper used by interactive flows) are eligible; all
-/// filesystem/network/tool commands stay foreground where the observer can
-/// attribute their final state.
-pub fn bash_command_is_detachable_safe(command: &str) -> bool {
-    let command = command.trim();
-    if command.is_empty()
-        || ["&&", "||", ";", "|", ">", "<", "$(", "`", "\n", "&"]
-            .iter()
-            .any(|marker| command.contains(marker))
-    {
-        return false;
-    }
-    let mut words = command.split_whitespace();
-    let Some(first) = words.next() else {
-        return false;
-    };
-    if is_env_assignment(first) || first == "env" {
-        return false;
-    }
-    matches!(
-        first,
-        "echo" | "printf" | "pwd" | "true" | "false" | ":" | "test" | "[" | "sleep"
-    )
-}
-
-fn is_env_assignment(word: &str) -> bool {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
-        _ => return false,
-    }
-    let mut saw_equal = false;
-    for ch in chars {
-        if ch == '=' {
-            saw_equal = true;
-            break;
-        }
-        if !(ch.is_ascii_alphanumeric() || ch == '_') {
-            return false;
-        }
-    }
-    saw_equal
-}
-
 static WRITER_EPOCHS: OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<std::path::PathBuf, std::sync::Weak<WriterEpochState>>,
@@ -3233,17 +3181,6 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
     let Some(mut status_command) = hardened_git_command(root) else {
         return GitFingerprint::UseManifest;
     };
-    let capture_path = relative_root.join(crate::shell_output_capture::CAPTURE_DIRECTORY_NAME);
-    let Some(capture_path) = capture_path.to_str() else {
-        return GitFingerprint::Unknown;
-    };
-    // Exclude the workspace's exact top-level output directory in Git, before
-    // the bounded status probe counts bytes or entries. A nested directory
-    // with the same name remains within the observed workspace.
-    let capture_exclusion = format!(
-        ":(top,exclude,literal){}/",
-        capture_path.replace(std::path::MAIN_SEPARATOR, "/")
-    );
     status_command.args([
         "status",
         "--porcelain=v1",
@@ -3256,7 +3193,6 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         "--ignored=matching",
         "--",
         ".",
-        &capture_exclusion,
     ]);
     let Some(output) = run_bounded_probe(
         status_command,
@@ -5541,21 +5477,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn detached_gate_allows_only_non_mutating_builtin_shape() {
-        for command in ["echo done", "printf done", "pwd", "sleep 1"] {
-            assert!(bash_command_is_detachable_safe(command), "{command}");
-        }
-        for command in [
-            "env echo done",
-            "python3 -c 'open(\"out\", \"w\").write(\"x\")'",
-            "git status",
-            "find . -name '*.rs'",
-        ] {
-            assert!(!bash_command_is_detachable_safe(command), "{command}");
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn bounded_probe_timeout_kills_the_probe_without_blocking_the_lease() {
@@ -6684,7 +6605,7 @@ mod tests {
         fs::create_dir(&capture_directory).expect("capture directory");
         fs::write(capture_directory.join("capture.stdout"), "generated").expect("capture");
         let after_capture = WorkspaceFingerprint::capture(temp.path()).expect("after capture");
-        assert!(!before.changed_from(Some(after_capture.clone())));
+        assert!(before.changed_from(Some(after_capture.clone())));
 
         let nested = temp.path().join("user-data/astra-bash-outputs");
         fs::create_dir_all(&nested).expect("user directory");
@@ -6694,14 +6615,14 @@ mod tests {
     }
 
     #[test]
-    fn capture_output_does_not_mask_other_workspace_changes_in_manifest() {
+    fn similarly_named_user_directory_is_observed_in_manifest() {
         let temp = tempfile::tempdir().expect("tempdir");
         let before = WorkspaceFingerprint::capture(temp.path()).expect("baseline");
         let capture_directory = temp.path().join("astra-bash-outputs");
         fs::create_dir(&capture_directory).expect("capture directory");
         fs::write(capture_directory.join("capture.stdout"), "generated").expect("capture");
         let after_capture = WorkspaceFingerprint::capture(temp.path()).expect("after capture");
-        assert!(!before.changed_from(Some(after_capture.clone())));
+        assert!(before.changed_from(Some(after_capture.clone())));
 
         let nested = temp.path().join("user-data/astra-bash-outputs");
         fs::create_dir_all(&nested).expect("user directory");
@@ -6738,7 +6659,7 @@ mod tests {
     }
 
     #[test]
-    fn git_fingerprint_excludes_capture_files_before_status_limits() {
+    fn git_fingerprint_observes_similarly_named_user_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(
             Command::new("git")
@@ -6750,20 +6671,16 @@ mod tests {
         let before = WorkspaceFingerprint::capture(temp.path()).expect("baseline");
         let capture_directory = temp.path().join("astra-bash-outputs");
         fs::create_dir(&capture_directory).expect("capture directory");
-        for index in 0..=MAX_STATUS_ENTRIES {
-            fs::File::create(capture_directory.join(format!("{index:05}.stdout")))
-                .expect("capture file");
-        }
-        let after = WorkspaceFingerprint::capture(temp.path())
-            .expect("capture files must not consume Git status limits");
-        assert!(!before.changed_from(Some(after.clone())));
+        fs::write(capture_directory.join("user.txt"), "user data").expect("user file");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("user directory");
+        assert!(before.changed_from(Some(after.clone())));
         fs::write(temp.path().join("user.txt"), "user content").expect("user file");
         let after_user = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
         assert!(after.changed_from(Some(after_user)));
     }
 
     #[test]
-    fn git_fingerprint_excludes_only_capture_directory_of_nested_workspace() {
+    fn git_fingerprint_observes_similarly_named_directory_in_nested_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(
             Command::new("git")
@@ -6779,7 +6696,7 @@ mod tests {
         fs::create_dir(&capture_directory).expect("capture directory");
         fs::write(capture_directory.join("generated.stdout"), "generated").expect("capture file");
         let after_capture = WorkspaceFingerprint::capture(&workspace).expect("after capture");
-        assert!(!before.changed_from(Some(after_capture.clone())));
+        assert!(before.changed_from(Some(after_capture.clone())));
 
         let user_directory = workspace.join("user/astra-bash-outputs");
         fs::create_dir_all(&user_directory).expect("user directory");

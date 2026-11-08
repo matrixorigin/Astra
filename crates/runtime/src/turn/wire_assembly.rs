@@ -271,6 +271,10 @@ pub(crate) fn observe_context_compaction(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WireBudgetStatus {
     pub estimated_input_tokens: usize,
+    /// Encoded reasoning is an uncertain token estimate, never plaintext.
+    pub opaque_estimated_tokens: usize,
+    pub opaque_reasoning_bytes: usize,
+    pub transport_metadata_bytes: usize,
     /// Token cost of provider-visible system messages, including their
     /// per-message framing. This is the prompt overhead that can be reused
     /// when the next pressure estimate is based on canonical history.
@@ -294,21 +298,31 @@ impl WireBudgetStatus {
 
     #[must_use]
     pub fn soft_target_exceeded(self) -> bool {
-        self.estimated_input_tokens > self.effective_input_limit
+        self.known_input_tokens() > self.effective_input_limit
     }
 
     #[must_use]
     pub fn hard_limit_exceeded(self) -> bool {
-        self.estimated_input_tokens
+        self.known_input_tokens()
             .saturating_add(self.requested_output_tokens)
             .saturating_add(self.reserved_protocol_tokens)
             > self.model_limit
+    }
+
+    pub fn known_input_tokens(self) -> usize {
+        self.estimated_input_tokens
+            .saturating_sub(self.opaque_estimated_tokens)
     }
 
     #[must_use]
     pub fn to_json(self) -> Value {
         serde_json::json!({
             "estimated_input_tokens": self.estimated_input_tokens,
+            "known_input_tokens": self.known_input_tokens(),
+            "opaque_estimated_tokens": self.opaque_estimated_tokens,
+            "opaque_reasoning_bytes": self.opaque_reasoning_bytes,
+            "transport_metadata_bytes": self.transport_metadata_bytes,
+            "opaque_token_conversion": "unknown_provider_authoritative",
             "estimated_system_tokens": self.estimated_system_tokens,
             "tool_schema_tokens": self.tool_schema_tokens,
             "requested_output_tokens": self.requested_output_tokens,
@@ -351,35 +365,43 @@ pub(crate) fn wire_budget_status_with_metadata(
         .map(crate::prompts::estimate_json_value_tokens)
         .map(|tokens| tokens.saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD))
         .sum();
-    let projected = if let Some((connection, wire_model)) = responses_scope
-        && messages.iter().any(|message| {
-            message
-                .get(astra_core::model_wire::responses::CONTINUATION_KEY)
-                .is_some()
-        }) {
-        // Measure the actual request-wide projection, including the tool
-        // results needed to validate replay. Visit one item at a time so a
-        // large history is not copied solely for budget accounting.
-        let mut projected = tool_tokens.saturating_add(crate::prompts::MODEL_FRAMING_TOKENS);
-        astra_core::model_wire::responses::visit_input_items(
+    let mut text_tokens = tool_tokens.saturating_add(crate::prompts::MODEL_FRAMING_TOKENS);
+    let mut opaque_estimated_tokens = 0_usize;
+    let mut opaque_reasoning_bytes = 0_usize;
+    let transport_metadata_bytes = messages
+        .iter()
+        .map(|message| astra_core::model_wire::token_estimate::continuation_metadata_bytes(message))
+        .fold(0_usize, usize::saturating_add);
+    let mut measure = |item: &Value| {
+        let estimate = astra_core::model_wire::token_estimate::measure_message(item);
+        text_tokens = text_tokens
+            .saturating_add(estimate.text_tokens)
+            .saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD);
+        opaque_estimated_tokens =
+            opaque_estimated_tokens.saturating_add(estimate.opaque_estimated_tokens);
+        opaque_reasoning_bytes = opaque_reasoning_bytes.saturating_add(estimate.opaque_bytes);
+    };
+    if let Some((connection, wire_model)) = responses_scope {
+        // Replay is measured only after the inference owner has authorized
+        // and opened route-bound continuations. Never tokenize their sealed
+        // storage wrapper as provider text or charge both replay and content.
+        let projected = astra_core::model_wire::responses::visit_input_items(
             wire_model,
             messages,
             connection,
-            |item| {
-                projected = projected
-                    .saturating_add(crate::prompts::estimate_json_value_tokens(&item))
-                    .saturating_add(crate::prompts::PER_MESSAGE_OVERHEAD);
-            },
-        )
-        .is_ok()
-        .then_some(projected)
-        // Invalid state retains the conservative estimate. The dispatch
-        // boundary independently rejects an invalid active continuation.
+            |item| measure(&item),
+        );
+        if projected.is_err() {
+            // Invalid continuations are rejected at the inference boundary;
+            // no token estimate can authorize or repair their binding.
+            text_tokens = crate::prompts::estimate_wire_input_tokens(messages, tool_tokens);
+            opaque_estimated_tokens = 0;
+            opaque_reasoning_bytes = 0;
+        }
     } else {
-        None
-    };
-    let estimated_input_tokens = projected
-        .unwrap_or_else(|| crate::prompts::estimate_wire_input_tokens(messages, tool_tokens));
+        messages.iter().for_each(measure);
+    }
+    let estimated_input_tokens = text_tokens.saturating_add(opaque_estimated_tokens);
     let budget = crate::prompts::budget_for_model_with_metadata(
         Some(model_name),
         context_window,
@@ -388,6 +410,9 @@ pub(crate) fn wire_budget_status_with_metadata(
     let policy = budget.window_policy();
     WireBudgetStatus {
         estimated_input_tokens,
+        opaque_estimated_tokens,
+        opaque_reasoning_bytes,
+        transport_metadata_bytes,
         estimated_system_tokens: system_tokens,
         tool_schema_tokens: tool_tokens,
         requested_output_tokens,
@@ -422,7 +447,7 @@ pub(crate) fn compact_history_for_wire_budget(
     let mut candidate = history.clone();
     candidate.extend_from_slice(staged_authority);
     let deficit = status
-        .estimated_input_tokens
+        .known_input_tokens()
         .saturating_add(status.requested_output_tokens)
         .saturating_add(status.reserved_protocol_tokens)
         .saturating_sub(status.model_limit);
@@ -4141,8 +4166,14 @@ mod tests {
         assert!(scoped.estimated_input_tokens.abs_diff(actual) < 100);
         assert!(switched.estimated_input_tokens.abs_diff(switched_actual) < 100);
         assert!(!scoped.hard_limit_exceeded() && !switched.hard_limit_exceeded());
-        assert!(unprojected.hard_limit_exceeded());
-        assert!(unprojected.estimated_input_tokens > scoped.estimated_input_tokens + 1_000);
+        assert!(!unprojected.hard_limit_exceeded());
+        assert!(
+            unprojected
+                .estimated_input_tokens
+                .abs_diff(scoped.estimated_input_tokens)
+                < 100
+        );
+        assert!(unprojected.transport_metadata_bytes > 0);
     }
 
     #[test]
@@ -4315,6 +4346,9 @@ mod tests {
             }));
         }
         let status = WireBudgetStatus {
+            opaque_estimated_tokens: 0,
+            opaque_reasoning_bytes: 0,
+            transport_metadata_bytes: 0,
             estimated_input_tokens: 4_000,
             estimated_system_tokens: 500,
             tool_schema_tokens: 200,
@@ -4352,6 +4386,9 @@ mod tests {
         }
         let history_tokens = crate::prompts::estimate_wire_input_tokens(&history, 0);
         let status = WireBudgetStatus {
+            opaque_estimated_tokens: 0,
+            opaque_reasoning_bytes: 0,
+            transport_metadata_bytes: 0,
             // The fixed portion includes a 500-token tool-schema surface.
             estimated_input_tokens: history_tokens + 1_000,
             estimated_system_tokens: 500,

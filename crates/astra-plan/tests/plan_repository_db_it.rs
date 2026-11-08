@@ -22,6 +22,12 @@ use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
+// Reuse the protocol-level fault injector used by the storage integration
+// tests; the other boundaries in this shared fixture serve those tests.
+#[allow(dead_code)]
+#[path = "../../services/tests/common/mysql_response_proxy.rs"]
+mod mysql_response_proxy;
+
 // ── Test harness ─────────────────────────────────────────────────────────────
 
 fn require_db_it_env() -> MatrixOneSettings {
@@ -128,6 +134,131 @@ async fn ensure_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str, user_i
 
 fn make_state_with_goal(owner: &str, goal: &str) -> PlanModeState {
     PlanModeState::new_with_owner(goal.to_string(), owner.to_string())
+}
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn cancelled_plan_reads_release_the_shared_pool() {
+    use mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool};
+    use std::sync::{Arc, atomic::Ordering};
+    use std::time::Duration;
+
+    let (direct, pool) = setup_repo().await;
+    let settings = require_db_it_env();
+    let user = format!("pool-user-{}", Uuid::new_v4().simple());
+    let session = format!("pool-session-{}", Uuid::new_v4().simple());
+    let plan = format!("pool-plan-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session, &user).await;
+    let mut state = make_state_with_goal(&user, "connection recovery");
+    direct.save(&user, &plan, &mut state, None).await.unwrap();
+    direct.set_active_plan(&user, &session, Some(&plan)).await.unwrap();
+    for (boundary, load) in [
+        (Boundary::Rows(b"SELECT active_plan_id FROM agent_sessions"), false),
+        (Boundary::Rows(b"SELECT plan_json, plan_md, session_id, version FROM plans"), true),
+        (Boundary::RowTerminator(b"SELECT active_plan_id FROM agent_sessions"), false),
+        (Boundary::RowTerminator(b"SELECT plan_json, plan_md, session_id, version FROM plans"), true),
+    ] {
+        let proxy = ResponseProxy::start(settings.host.clone(), settings.port, boundary).await;
+        let shared = proxy_pool(&settings, proxy.port).await;
+        let repo = Arc::new(CloudPlanRepository::new(shared.get().clone()));
+        for _ in 0..3 {
+            proxy.gate.armed.store(true, Ordering::SeqCst);
+            let (start_timeout, wait_for_barrier) = tokio::sync::oneshot::channel::<()>();
+            let mut pending = tokio::spawn({
+                let repo = repo.clone();
+                let user = user.clone();
+                let session = session.clone();
+                let plan = plan.clone();
+                async move {
+                    let query = async {
+                        if load {
+                            repo.load(&user, &plan).await.map(|_| ())
+                        } else {
+                            repo.active_plan_for_session(&user, &session).await.map(|_| ())
+                        }
+                    };
+                    tokio::pin!(query);
+                    tokio::select! {
+                        _ = &mut query => false,
+                        _ = wait_for_barrier => tokio::time::timeout(Duration::from_millis(200), &mut query).await.is_err(),
+                    }
+                }
+            });
+            tokio::select! {
+                barrier = tokio::time::timeout(Duration::from_secs(10), proxy.gate.received.notified()) =>
+                    barrier.expect("the real database must execute the query before cancellation"),
+                result = &mut pending => panic!("query completed before the response barrier: {result:?}"),
+            }
+            start_timeout.send(()).unwrap();
+            assert!(pending.await.unwrap(), "the in-flight read must time out");
+            let connection = tokio::time::timeout(Duration::from_secs(1), shared.get().acquire())
+                .await.expect("cancelled read must release the only pool slot")
+                .expect("replacement connection must be usable");
+            drop(connection);
+        }
+        assert_eq!(repo.active_plan_for_session(&user, &session).await.unwrap().as_deref(), Some(plan.as_str()));
+    }
+    direct.set_active_plan(&user, &session, None).await.unwrap();
+    direct.delete(&user, &plan).await.unwrap();
+    cleanup_session(&pool, &session, &user).await;
+}
+}
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn cancelled_plan_creation_preserves_pool_and_transaction_outcome() {
+    use mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let (direct, pool) = setup_repo().await;
+    let settings = require_db_it_env();
+    let user = format!("create-user-{}", Uuid::new_v4().simple());
+    let session = format!("create-session-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session, &user).await;
+    for (boundary, committed) in [
+        (Boundary::Write(b"INSERT INTO plans"), false),
+        (Boundary::Commit, true),
+    ] {
+        let plan = format!("cancel-create-{}", Uuid::new_v4().simple());
+        let proxy = ResponseProxy::start(settings.host.clone(), settings.port, boundary).await;
+        let shared = proxy_pool(&settings, proxy.port).await;
+        let repo = Arc::new(CloudPlanRepository::new(shared.get().clone()));
+        let pending = tokio::spawn({
+            let (repo, user, session, plan) = (repo.clone(), user.clone(), session.clone(), plan.clone());
+            async move {
+                let mut state = make_state_with_goal(&user, "cancelled creation");
+                state.session_hint = Some(session);
+                repo.save(&user, &plan, &mut state, None).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), proxy.gate.received.notified())
+            .await.expect("database must reach the selected response boundary");
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        proxy.gate.release.notify_one();
+        let mut connection = tokio::time::timeout(Duration::from_secs(3), shared.get().acquire())
+            .await.expect("cancelled save must release the pool slot").unwrap();
+        let one: (i64,) = sqlx::query_as("SELECT 1").fetch_one(&mut *connection).await.unwrap();
+        assert_eq!(one.0, 1);
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let exists = direct.load(&user, &plan).await.is_ok();
+                if exists == committed { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("rollback or acknowledged commit must become observable");
+        if !committed {
+            let mut retry = make_state_with_goal(&user, "fresh creation after rollback");
+            retry.session_hint = Some(session.clone());
+            tokio::time::timeout(Duration::from_secs(5), direct.save(&user, &plan, &mut retry, None))
+                .await.expect("cancelled transaction must release its locks").unwrap();
+        }
+        cleanup_plans(&pool, &plan).await;
+    }
+    cleanup_session(&pool, &session, &user).await;
+}
 }
 
 fn make_state_with_subtasks(owner: &str, goal: &str, ids: &[&str]) -> PlanModeState {
@@ -395,22 +526,18 @@ async fn set_active_plan_enforces_single_session_invariant() {
         None
     );
 
-    // Session B takes over — A must be cleared atomically.
-    repo.set_active_plan(&user, &sess_b, Some(&plan_id))
-        .await
-        .unwrap();
+    // Another session cannot silently invalidate A's live plan guard.
+    assert!(matches!(repo.set_active_plan(&user, &sess_b, Some(&plan_id)).await,
+        Err(PlanLoadError::PlanInUse(_))));
     assert_eq!(
-        repo.active_plan_for_session(&user, &sess_b)
+        repo.active_plan_for_session(&user, &sess_a)
             .await
             .unwrap()
             .as_deref(),
         Some(plan_id.as_str()),
     );
-    assert_eq!(
-        repo.active_plan_for_session(&user, &sess_a).await.unwrap(),
-        None,
-        "session A must have been cleared when B took the plan"
-    );
+    repo.set_active_plan(&user, &sess_a, None).await.unwrap();
+    repo.set_active_plan(&user, &sess_b, Some(&plan_id)).await.unwrap();
 
     // Clearing with None releases the plan from B.
     repo.set_active_plan(&user, &sess_b, None).await.unwrap();
@@ -433,7 +560,7 @@ async fn set_active_plan_enforces_single_session_invariant() {
 
 matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn delete_clears_active_plan_id() {
+async fn delete_rejects_an_active_plan_without_affecting_another_owner() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-{}", Uuid::new_v4().simple());
     let sess = format!("sit-del-{}", Uuid::new_v4().simple());
@@ -455,15 +582,14 @@ async fn delete_clears_active_plan_id() {
     repo.save(&other_user, &plan_id, &mut other_plan, None).await.unwrap();
     repo.set_active_plan(&other_user, &other_session, Some(&plan_id)).await.unwrap();
 
-    repo.delete(&user, &plan_id).await.expect("delete");
-    assert!(matches!(repo.load(&user, &plan_id).await, Err(PlanLoadError::NotFound(_))));
-
-    // Session's active_plan_id must be cleared so we don't dangle.
+    assert!(matches!(repo.delete(&user, &plan_id).await, Err(PlanLoadError::PlanInUse(_))));
     assert_eq!(
-        repo.active_plan_for_session(&user, &sess).await.unwrap(),
-        None,
-        "delete must clear active_plan_id on any session pointing at the plan"
+        repo.active_plan_for_session(&user, &sess).await.unwrap().as_deref(),
+        Some(plan_id.as_str()),
     );
+    repo.set_active_plan(&user, &sess, None).await.unwrap();
+    repo.delete(&user, &plan_id).await.expect("delete inactive plan");
+    assert!(matches!(repo.load(&user, &plan_id).await, Err(PlanLoadError::NotFound(_))));
 
     assert_eq!(repo.load(&other_user, &plan_id).await.unwrap().goal, other_plan.goal);
     assert_eq!(repo.active_plan_for_session(&other_user, &other_session).await.unwrap().as_deref(), Some(plan_id.as_str()));
@@ -780,6 +906,82 @@ async fn plan_resume_hint_for_session_returns_active_plans_digest() {
 
 matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn explicit_recovery_waits_for_an_unsettled_session_binding() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-settle-{}", Uuid::new_v4().simple());
+    let session = format!("s-settle-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session, &user).await;
+    for commit in [false, true] {
+        let mut binding = pool.begin().await.unwrap();
+        sqlx::query("UPDATE agent_sessions SET active_plan_id = 'pending' WHERE user_id = ? AND session_id = ?")
+            .bind(&user).bind(&session).execute(&mut *binding).await.unwrap();
+        let (task_user, task_session) = (user.clone(), session.clone());
+        let task_repo = repo.clone();
+        let mut recovery = tokio::spawn(async move {
+            task_repo.settled_active_plan_for_session(&task_user, &task_session).await
+        });
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(150), &mut recovery).await.is_err());
+        if commit { binding.commit().await.unwrap(); } else { binding.rollback().await.unwrap(); }
+        let observed = recovery.await.unwrap().unwrap();
+        assert_eq!(observed.as_deref(), commit.then_some("pending"));
+    }
+    cleanup_session(&pool, &session, &user).await;
+}
+}
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn cancelled_binding_waiting_for_plan_does_not_outlive_the_caller() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-cancel-{}", Uuid::new_v4().simple());
+    let session = format!("s-cancel-{}", Uuid::new_v4().simple());
+    let plan = format!("p-cancel-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session, &user).await;
+    let mut state = make_state_with_goal(&user, "goal");
+    repo.save(&user, &plan, &mut state, None).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT plan_id FROM plans WHERE user_id = ? AND plan_id = ? FOR UPDATE")
+        .bind(&user).bind(&plan).fetch_one(&mut *blocker).await.unwrap();
+    let (task_user, task_session, task_plan) = (user.clone(), session.clone(), plan.clone());
+    let task_repo = repo.clone();
+    let mut bind = tokio::spawn(async move {
+        task_repo.set_active_plan(&task_user, &task_session, Some(&task_plan)).await
+    });
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(150), &mut bind).await.is_err());
+    bind.abort();
+    assert!(bind.await.unwrap_err().is_cancelled());
+    let mut successor = pool.begin().await.unwrap();
+    let binding: Option<String> = sqlx::query_scalar("SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE")
+        .bind(&user).bind(&session).fetch_one(&mut *successor).await.unwrap();
+    assert_eq!(binding, None);
+    successor.commit().await.unwrap();
+    blocker.commit().await.unwrap();
+    assert_eq!(repo.active_plan_for_session(&user, &session).await.unwrap(), None);
+    cleanup_session(&pool, &session, &user).await;
+    cleanup_plans(&pool, &plan).await;
+}
+}
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_plan_creation_rolls_back_after_deletion_fence() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-fence-{}", Uuid::new_v4().simple());
+    let session = format!("s-fence-{}", Uuid::new_v4().simple());
+    let plan = format!("p-fence-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session, &user).await;
+    sqlx::query("UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&session).execute(&pool).await.unwrap();
+    let mut state = make_state_with_goal(&user, "goal");
+    state.session_hint = Some(session.clone());
+    assert!(matches!(repo.save(&user, &plan, &mut state, None).await, Err(PlanLoadError::SessionUnavailable)));
+    assert!(matches!(repo.load(&user, &plan).await, Err(PlanLoadError::NotFound(_))));
+    cleanup_session(&pool, &session, &user).await;
+}
+}
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_hint_round_trips_through_load() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-hint-{}", Uuid::new_v4().simple());
@@ -802,5 +1004,133 @@ async fn session_hint_round_trips_through_load() {
 
     cleanup_plans(&pool, &plan_id).await;
     cleanup_session(&pool, &sess, &user).await;
+}
+}
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn finish_authoring_keeps_newer_revision_and_session_binding() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-{}", Uuid::new_v4().simple());
+    let session = format!("s-{}", Uuid::new_v4().simple());
+    let first = format!("pit-finish-a-{}", Uuid::new_v4().simple());
+    let second = format!("pit-finish-b-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session, &user).await;
+    let mut state = make_state_with_goal(&user, "review exact version");
+    repo.save(&user, &first, &mut state, None).await.unwrap();
+    repo.set_active_plan(&user, &session, Some(&first)).await.unwrap();
+    let submitted = state.version;
+    state.plan_md = Some("newer unreviewed proposal".into());
+    repo.save(&user, &first, &mut state, Some(submitted)).await.unwrap();
+    assert!(!repo.finish_authoring(&user, &session, &first, submitted).await.unwrap());
+    assert_eq!(repo.active_plan_for_session(&user, &session).await.unwrap().as_deref(), Some(first.as_str()));
+    let mut replacement = make_state_with_goal(&user, "replacement proposal");
+    repo.save(&user, &second, &mut replacement, None).await.unwrap();
+    repo.set_active_plan(&user, &session, Some(&second)).await.unwrap();
+    assert!(!repo.finish_authoring(&user, &session, &first, state.version).await.unwrap());
+    assert_eq!(repo.active_plan_for_session(&user, &session).await.unwrap().as_deref(), Some(second.as_str()));
+    assert!(!repo.finish_authoring("another-owner", &session, &second, replacement.version).await.unwrap());
+    assert!(repo.finish_authoring(&user, &session, &second, replacement.version).await.unwrap());
+    assert_eq!(repo.active_plan_for_session(&user, &session).await.unwrap(), None);
+    assert_eq!(repo.load(&user, &second).await.unwrap().session_hint, None);
+    cleanup_session(&pool, &session, &user).await;
+    cleanup_plans(&pool, &first).await;
+    cleanup_plans(&pool, &second).await;
+}
+}
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn concurrent_plan_switches_keep_one_consistent_binding() {
+    let (repo, pool) = setup_repo().await;
+    let user = format!("u-{}", Uuid::new_v4().simple());
+    let a = format!("s-a-{}", Uuid::new_v4().simple());
+    let b = format!("s-b-{}", Uuid::new_v4().simple());
+    let p = format!("pit-race-p-{}", Uuid::new_v4().simple());
+    let q = format!("pit-race-q-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &a, &user).await;
+    ensure_session(&pool, &b, &user).await;
+    let mut first = make_state_with_goal(&user, "first");
+    let mut second = make_state_with_goal(&user, "second");
+    repo.save(&user, &p, &mut first, None).await.unwrap();
+    repo.save(&user, &q, &mut second, None).await.unwrap();
+
+    assert!(matches!(
+        repo.set_active_plan(&user, "missing-session", Some(&p)).await,
+        Err(PlanLoadError::SessionUnavailable)
+    ));
+    assert!(repo.load(&user, &p).await.unwrap().session_hint.is_none());
+    sqlx::query("UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&a).execute(&pool).await.unwrap();
+    assert!(matches!(
+        repo.set_active_plan(&user, &a, Some(&p)).await,
+        Err(PlanLoadError::SessionUnavailable)
+    ));
+    assert!(repo.load(&user, &p).await.unwrap().session_hint.is_none());
+    sqlx::query("UPDATE agent_sessions SET status = 'active' WHERE user_id = ? AND session_id = ?")
+        .bind(&user).bind(&a).execute(&pool).await.unwrap();
+
+    for _ in 0..10 {
+        repo.set_active_plan(&user, &a, None).await.unwrap();
+        repo.set_active_plan(&user, &b, None).await.unwrap();
+        repo.set_active_plan(&user, &a, Some(&p)).await.unwrap();
+        repo.set_active_plan(&user, &b, Some(&q)).await.unwrap();
+        let (left, right) = tokio::join!(
+            repo.set_active_plan(&user, &a, Some(&q)),
+            repo.set_active_plan(&user, &b, Some(&p)),
+        );
+        assert!(matches!(left, Err(PlanLoadError::PlanInUse(_))));
+        assert!(matches!(right, Err(PlanLoadError::PlanInUse(_))));
+        let a_plan = repo.active_plan_for_session(&user, &a).await.unwrap();
+        let b_plan = repo.active_plan_for_session(&user, &b).await.unwrap();
+        for (id, state) in [(&p, repo.load(&user, &p).await.unwrap()), (&q, repo.load(&user, &q).await.unwrap())] {
+            let holders: Vec<_> = [(&a, &a_plan), (&b, &b_plan)].into_iter()
+                .filter(|(_, active)| active.as_deref() == Some(id.as_str()))
+                .map(|(session, _)| session.as_str()).collect();
+            assert!(holders.len() <= 1, "plan {id} has multiple holders");
+            assert_eq!(state.session_hint.as_deref(), holders.first().copied());
+        }
+    }
+
+    for _ in 0..10 {
+        repo.set_active_plan(&user, &a, None).await.unwrap();
+        repo.set_active_plan(&user, &b, None).await.unwrap();
+        let (left, right) = tokio::join!(
+            repo.set_active_plan(&user, &a, Some(&p)),
+            repo.set_active_plan(&user, &b, Some(&p)),
+        );
+        assert!(matches!((&left, &right), (Ok(()), Err(PlanLoadError::PlanInUse(_))) | (Err(PlanLoadError::PlanInUse(_)), Ok(()))));
+        let a_plan = repo.active_plan_for_session(&user, &a).await.unwrap();
+        let b_plan = repo.active_plan_for_session(&user, &b).await.unwrap();
+        let holders: Vec<_> = [(&a, &a_plan), (&b, &b_plan)].into_iter()
+            .filter(|(_, active)| active.as_deref() == Some(p.as_str()))
+            .map(|(session, _)| session.as_str()).collect();
+        assert_eq!(holders.len(), 1, "concurrent binding must have exactly one holder");
+        assert_eq!(repo.load(&user, &p).await.unwrap().session_hint.as_deref(), holders.first().copied());
+    }
+
+    // Finalizing while the same plan is rebound must serialize without
+    // clearing a newer binding or leaving a dangling routing hint.
+    repo.set_active_plan(&user, &a, None).await.unwrap();
+    repo.set_active_plan(&user, &b, None).await.unwrap();
+    repo.set_active_plan(&user, &a, Some(&p)).await.unwrap();
+    // A stale routing hint cannot permit takeover or prevent finalization.
+    sqlx::query("UPDATE plans SET session_id = NULL WHERE user_id = ? AND plan_id = ?")
+        .bind(&user).bind(&p).execute(&pool).await.unwrap();
+    assert!(matches!(repo.set_active_plan(&user, &b, Some(&p)).await, Err(PlanLoadError::PlanInUse(_))));
+    assert!(matches!(repo.delete(&user, &p).await, Err(PlanLoadError::PlanInUse(_))));
+    let (finished, rebound) = tokio::join!(
+        repo.finish_authoring(&user, &a, &p, first.version),
+        repo.set_active_plan(&user, &a, Some(&p)),
+    );
+    finished.expect("concurrent finish");
+    rebound.expect("concurrent rebind");
+    let active = repo.active_plan_for_session(&user, &a).await.unwrap();
+    let hint = repo.load(&user, &p).await.unwrap().session_hint;
+    assert_eq!(hint.as_deref(), active.as_deref().map(|_| a.as_str()));
+    cleanup_plans(&pool, &p).await;
+    cleanup_plans(&pool, &q).await;
+    cleanup_session(&pool, &a, &user).await;
+    cleanup_session(&pool, &b, &user).await;
 }
 }

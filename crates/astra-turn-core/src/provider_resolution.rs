@@ -1118,7 +1118,8 @@ mod tests {
         assert_eq!(first, reordered);
 
         let mut changed_b = declaration("b", ProviderToolClaims::default());
-        changed_b.description = Some("changed sibling".to_string());
+        changed_b.input_schema =
+            json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}});
         let changed = resolve_provider_snapshot(
             &discovery(vec![declaration("a", read_claims), changed_b]),
             &trusted_mcp(),
@@ -1137,6 +1138,46 @@ mod tests {
         assert_eq!(version(&first, "a"), version(&changed, "a"));
         assert_ne!(version(&first, "b"), version(&changed, "b"));
         assert_ne!(first.content_hash, changed.content_hash);
+    }
+
+    #[test]
+    fn descriptor_refresh_preserves_executable_identity_but_revokes_real_changes() {
+        let resolve = |tool| {
+            resolve_provider_snapshot(&discovery(vec![tool]), &trusted_mcp(), &aliases(&["read"]))
+                .unwrap()
+        };
+        let mut tool = declaration("read", ProviderToolClaims::default());
+        tool.input_schema = json!({"type":"object","properties":{
+            "description":{"type":"string","description":"help","enum":["old"]}
+        },"required":["description"],"additionalProperties":false});
+        let original = resolve(tool.clone());
+        tool.description = Some("clearer help".into());
+        tool.title = Some("Read".into());
+        tool.input_schema["properties"]["description"]["description"] = json!("updated help");
+        let presented = resolve(tool.clone());
+        assert_eq!(
+            original.descriptors[0].descriptor_ref(),
+            presented.descriptors[0].descriptor_ref()
+        );
+        assert_ne!(original.content_hash, presented.content_hash);
+        for change in 0..3 {
+            let mut changed = tool.clone();
+            match change {
+                0 => changed.input_schema["properties"]["description"]["enum"] = json!(["new"]),
+                1 => changed.task_support = ProviderTaskSupport::Required,
+                _ => changed.claims.read_only = Some(protocol_claim(true, "readOnlyHint")),
+            }
+            assert_ne!(
+                original.descriptors[0].descriptor_ref(),
+                resolve(changed).descriptors[0].descriptor_ref()
+            );
+        }
+        let moved = discovery_for_binding("other-owner", vec![tool]);
+        let moved = resolve_provider_snapshot(&moved, &trusted_mcp(), &aliases(&["read"])).unwrap();
+        assert_ne!(
+            original.descriptors[0].descriptor_ref(),
+            moved.descriptors[0].descriptor_ref()
+        );
     }
 
     #[test]

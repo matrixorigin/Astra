@@ -338,13 +338,13 @@ fn cache_marker_indices_match_serialized_system_blocks() {
 }
 
 #[test]
-fn pipeline_aborts_on_consecutive_ptl_errors() {
+fn pipeline_rebuilds_context_after_prior_overflow_errors() {
     let (statics, agent, latches, session, mut turn, ext, stats) = build_sources();
     // Simulate 3 consecutive PTL errors
     turn.recovery.record_ptl_error();
     turn.recovery.record_ptl_error();
     turn.recovery.record_ptl_error();
-    assert!(turn.recovery.should_abort());
+    assert_eq!(turn.recovery.consecutive_ptl_errors, 3);
 
     let sources = ContextSources {
         statics: &statics,
@@ -371,12 +371,9 @@ fn pipeline_aborts_on_consecutive_ptl_errors() {
         query_source: "harness",
     });
 
-    assert!(result.is_err());
-    assert_eq!(
-        result.unwrap_err(),
-        PipelineAbort::ConsecutivePtlExhausted {
-            consecutive_errors: 3
-        }
+    assert!(
+        result.is_ok(),
+        "recovery informs optimization, not permanent refusal: {result:?}"
     );
 }
 

@@ -600,6 +600,12 @@ impl AgenticRunLifecycleService {
                 &cursor.canonical_root_hash,
                 cursor.compaction_generation,
             );
+        } else if canonical.prior_messages.is_empty() {
+            state.initialize_canonical_rewrite_proof(
+                &canonical.prior_messages,
+                &astra_turn_types::canonical_conversation_root(&canonical.prior_messages),
+                0,
+            );
         }
         host.restore_handoff_continuation(&mut state, &handoff, &canonical.prior_messages)
             .await
@@ -767,6 +773,7 @@ impl AgenticRunLifecycleService {
             state.session_turn,
             token.clone(),
             interactive,
+            interaction_mode,
             None,
         )
         .await;

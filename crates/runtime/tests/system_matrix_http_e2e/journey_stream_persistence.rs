@@ -847,9 +847,15 @@ async fn assert_concurrent_fanout_stream(
             if case.terminal == OnlineFanoutTerminal::Completed {
                 result["result"].as_str() == Some(case.child_provenance.as_str())
             } else if case.terminal == OnlineFanoutTerminal::EmptyCompletion {
-                result["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("empty_completion"))
+                // A live child reports its interruption in the error; a
+                // recovered durable child carries the code separately and
+                // exposes the public interruption message as its error.
+                let interruption = astra_turn_core::interruption::InterruptionKind::EmptyCompletion;
+                result["error"].as_str().is_some_and(|error| {
+                    error.contains(interruption.label())
+                        || (result["finish_reason"] == interruption.label()
+                            && error.contains(interruption.user_description()))
+                })
             } else {
                 result["error"].as_str().is_some_and(|error| {
                     error.contains(
@@ -858,8 +864,8 @@ async fn assert_concurrent_fanout_stream(
                 })
             }
         }),
-        "{}: every fixed slot must retain its own payload provenance: {aggregate}",
-        case.name
+        "{}: every fixed slot must retain its own payload provenance: {results:?}",
+        case.name,
     );
     if case.terminal == OnlineFanoutTerminal::Failed {
         assert!(!raw_sse.contains(&case.child_provenance));

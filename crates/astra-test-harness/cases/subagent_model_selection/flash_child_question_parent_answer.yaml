@@ -4,8 +4,8 @@ description: |
   and only then completes its work.
 prompt: |
   This is a read-only analysis task; do not change files or external state.
-  Ask a {{model}} subagent to produce a one-line handoff marker. Let the normal
-  spawn default select the bounded read-only child persona. In its initial
+  Ask a {{model}} subagent with the explicit `explore` persona to produce a
+  one-line handoff marker. In its initial
   task, give it both possible outputs: JSON means exactly
   ASTRA-CHILD-ANSWERED-JSON, while TEXT means exactly
   ASTRA-CHILD-ANSWERED-TEXT. Do not choose the format for it yet. It must ask
@@ -16,7 +16,6 @@ prompt: |
   done in reasoning.
 debug_log: true
 capability: delegation
-timeout_seconds: 90
 criteria:
   - type: exit_code
     code: 0
@@ -54,3 +53,6 @@ criteria:
       - {document: arguments, path: /message_type, equals: answer}
   - type: text_contains
     needle: ASTRA-CHILD-ANSWERED-JSON
+  - type: duration_between
+    min_ms: 0
+    max_ms: 90000

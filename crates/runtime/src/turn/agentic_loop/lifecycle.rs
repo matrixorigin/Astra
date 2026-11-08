@@ -2000,10 +2000,6 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     kind: CompactionKind,
     audit_label: &str,
 ) {
-    if state.compaction_effectiveness.is_circuit_open() {
-        return;
-    }
-
     let max_tokens = state.max_turn_input_tokens;
     let budget = TokenBudget {
         max_prompt_tokens: max_tokens,
@@ -2523,22 +2519,34 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
     maybe_pre_route_skill(host, state).await;
 
-    if turn_index > 0 {
+    if turn_index > 0 || state.messages.len() > 10 {
         // Context pressure estimation + adaptive compaction.
         // When pipeline_session is active, use its pressure model (predictive
         // with reserves) and cascade-aware limits. Otherwise fall back to
         // legacy inline estimation.
+        // The last provider measurement includes protocol-owned input which
+        // the local text estimator cannot see. Use it until a new request is
+        // measured, discounting only the savings from rewrites in this pass.
+        let mut measured_floor = state.last_measured_prompt_tokens.unwrap_or(0);
+        let pressure_with_measurement = |state: &AgenticLoopState, floor: u64| {
+            let (pressure, estimate) = estimate_context_pressure_for_state(state);
+            if state.max_turn_input_tokens == 0 || estimate >= floor {
+                (pressure, estimate)
+            } else {
+                (floor as f64 / state.max_turn_input_tokens as f64, floor)
+            }
+        };
         let (mut pressure, mut pressure_estimate_tokens) =
-            estimate_context_pressure_for_state(state);
+            pressure_with_measurement(state, measured_floor);
 
         // Pre-turn LLM compact: if pressure exceeds the model-adaptive
         // trigger, let the host run an optional cache-friendly inline-summary
         // pass before the next LLM call.
         if pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens)
-            && state.compact_tier_applied < CompactionTier::CompactHistory
             && state.messages.len() > 10
         {
             if let Some(event) = host.maybe_pre_turn_compact(state, pressure).await {
+                measured_floor = measured_floor.saturating_sub(event.tokens_freed);
                 state.context_compression_triggered = true;
                 state
                     .compaction_effectiveness
@@ -2559,7 +2567,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     sess.stats.record_compaction(event.tokens_freed);
                 }
                 host.on_compaction(event);
-                (pressure, pressure_estimate_tokens) = estimate_context_pressure_for_state(state);
+                (pressure, pressure_estimate_tokens) =
+                    pressure_with_measurement(state, measured_floor);
             }
         }
 
@@ -2624,6 +2633,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             )
         };
         if mc.results_compacted > 0 {
+            measured_floor = measured_floor.saturating_sub(mc.tokens_saved as u64);
             state.finish_canonical_rewrite(rewrite_permit);
             state.context_compression_triggered = true;
             let event = CompactionEvent::new(
@@ -2659,7 +2669,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // them, the guard under-estimates pressure and skips compaction
         // (observed in session 540c37d1 where budget_pressure=0.887 but
         // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
-        let (post_mc_pressure, post_mc_tokens) = estimate_context_pressure_for_state(state);
+        let (post_mc_pressure, post_mc_tokens) = pressure_with_measurement(state, measured_floor);
 
         // Proactive compression gate: if pressure is still high after
         // microcompact, run the full compression pipeline *before* calling
@@ -2667,30 +2677,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         if post_mc_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
             let is_aggressive =
                 post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens);
-            let (kind, label) = if is_aggressive {
+            let (kind, label) = if turn_index == 0 {
+                (CompactionKind::Resume, "resume")
+            } else if is_aggressive {
                 (CompactionKind::ProactiveAggressive, "aggressive")
             } else {
                 (CompactionKind::ProactiveDefault, "default")
             };
             run_proactive_compaction(post_mc_pressure, post_mc_tokens, state, host, kind, label);
-        }
-    }
-
-    // ── Compaction-on-resume: if turn 0 has many messages (restored from
-    // checkpoint), estimate context pressure from raw content size and
-    // proactively compress before the first LLM call.  This prevents an
-    // immediate 413 when resuming from a CompactAndRetry interruption.
-    if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
-        let (estimated_pressure, estimated_tokens) = estimate_context_pressure_for_state(state);
-        if estimated_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
-            run_proactive_compaction(
-                estimated_pressure,
-                estimated_tokens,
-                state,
-                host,
-                CompactionKind::Resume,
-                "resume",
-            );
         }
     }
 
@@ -6333,6 +6327,33 @@ mod tests {
             "resume compaction must reduce message count from 100; got {}",
             state.messages.len()
         );
+    }
+
+    #[tokio::test]
+    async fn provider_measurement_triggers_compaction_when_text_estimate_is_low() {
+        for turn_index in [0, 1] {
+            let mut host = MockHost::new(Vec::new());
+            let mut state = make_state();
+            state.max_turn_input_tokens = 200_000;
+            state.messages = vec![json!({"role":"user", "content":"Complete the task"})];
+            state.messages.extend((0..30).map(|index| {
+                json!({"role":"assistant", "content":format!("evidence {index}: {}", "detail ".repeat(300))})
+            }));
+            assert!(estimate_context_pressure_for_state(&state).0 < 0.5);
+            state.last_measured_prompt_tokens = Some(195_000);
+
+            prepare_turn_iteration(&mut host, &mut state, turn_index)
+                .await
+                .unwrap();
+
+            assert!(
+                host.compaction_events.iter().any(|event| matches!(
+                    event.kind,
+                    CompactionKind::Resume | CompactionKind::ProactiveAggressive
+                )),
+                "provider pressure must reach the compaction owner before the next request"
+            );
+        }
     }
 
     #[tokio::test]

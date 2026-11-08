@@ -6716,9 +6716,11 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .await
         .unwrap();
     assert_eq!(delivery_report.data_coverage.events, 15);
-    assert!(delivery_report.summary.contains(
-        "1/4 spawned agents produced complete deliverables; 1 interrupted, 1 failed, 1 cancelled"
-    ));
+    assert!(
+        delivery_report
+            .summary
+            .contains("4 spawned, 1 completed, 1 interrupted, 1 failed, 1 cancelled")
+    );
 
     let introspection =
         DatabaseIntrospectionService::new(settings.clone()).with_pool(shared.clone());

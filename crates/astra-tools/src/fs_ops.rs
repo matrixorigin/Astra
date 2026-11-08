@@ -1106,7 +1106,10 @@ fn resolve_replacement_match<'a>(
 ) -> Result<(&'a str, Cow<'a, str>, Option<&'static str>), ToolResult> {
     let count = content.matches(old_str).count();
     if count > 0 {
-        if count > 1 && !replace_all {
+        let overlapping = (count == 1 && !replace_all)
+            .then(|| astra_text_utils::first_two_match_positions(content, old_str))
+            .flatten();
+        if !replace_all && (count > 1 || overlapping.is_some()) {
             let label = edit_index.map_or_else(
                 || "old_str".to_owned(),
                 |index| format!("edit[{index}] old_str"),
@@ -1116,15 +1119,30 @@ fn resolve_replacement_match<'a>(
             } else {
                 "Add surrounding context to match exactly once, or use replace_all=true to replace every occurrence."
             };
+            let detail = if overlapping.is_some() {
+                "old_str matched at least 2 overlapping locations; anchors must be unique."
+                    .to_string()
+            } else {
+                format!("old_str matched {count} times; anchors must be unique.")
+            };
             let mut message = str_replace_fail(
                 &format!("{label} is ambiguous in {path_str}."),
-                &format!("old_str matched {count} times; anchors must be unique."),
+                &detail,
                 next,
             );
-            let locations: Vec<_> = content
-                .match_indices(old_str)
-                .take(10)
-                .map(|(offset, _)| {
+            let positions: Vec<_> = overlapping.map_or_else(
+                || {
+                    content
+                        .match_indices(old_str)
+                        .take(10)
+                        .map(|(offset, _)| offset)
+                        .collect()
+                },
+                |(first, second)| vec![first, second],
+            );
+            let locations: Vec<_> = positions
+                .into_iter()
+                .map(|offset| {
                     content[..offset]
                         .bytes()
                         .filter(|byte| *byte == b'\n')
@@ -4067,6 +4085,175 @@ mod tests {
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "foo qux baz\n");
+    }
+
+    #[test]
+    fn str_replace_rejects_overlapping_literal_occurrences() {
+        for (raw, anchor) in [("aaa", "aa"), ("界界界", "界界")] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("f.data");
+            std::fs::write(&path, raw).unwrap();
+            let result = str_replace(
+                tmp.path(),
+                &serde_json::json!({"path":"f.data","old_str":anchor,"new_str":"z"}),
+            );
+            assert!(
+                result.is_error,
+                "overlapping exact anchors must be ambiguous"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            let all = str_replace(
+                tmp.path(),
+                &serde_json::json!({"path":"f.data","old_str":anchor,"new_str":"z","replace_all":true}),
+            );
+            assert!(!all.is_error, "{}", all.output);
+            assert!(std::fs::read_to_string(path).unwrap().starts_with('z'));
+        }
+    }
+
+    #[test]
+    fn str_replace_rejects_overlapping_quote_normalized_occurrences() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("f.data");
+        for raw in ["“““", "“””"] {
+            std::fs::write(&path, raw).unwrap();
+            let result = str_replace(
+                tmp.path(),
+                &serde_json::json!({"path":"f.data","old_str":"\"\"","new_str":"x"}),
+            );
+            assert!(
+                result.is_error,
+                "overlapping normalized matches must be ambiguous"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+        let all = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"f.data","old_str":"\"\"","new_str":"x","replace_all":true}),
+        );
+        assert!(!all.is_error, "{}", all.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "x”");
+    }
+
+    #[test]
+    fn str_replace_handles_unicode_and_empty_fuzzy_anchors() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("f.data");
+        std::fs::write(&path, "你好").unwrap();
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"f.data","old_str":"1. 你","new_str":"再"}),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "再好");
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"f.data","old_str":"1.","new_str":"x"}),
+        );
+        assert!(result.is_error, "an empty stripped anchor must be rejected");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "再好");
+        std::fs::write(&path, "你\n好吗").unwrap();
+        let escaped = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"f.data","old_str":"你\\n好","new_str":"再"}),
+        );
+        assert!(!escaped.is_error, "{}", escaped.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "再吗");
+    }
+
+    #[test]
+    fn str_replace_checks_overlapping_pem_anchor_locations() {
+        for duplicate in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let blocks = (0..3)
+                .map(|i| {
+                    format!(
+                        "-----BEGIN PRIVATE KEY-----\nkey{}\n-----END PRIVATE KEY-----",
+                        if duplicate { 0 } else { i }
+                    )
+                })
+                .collect::<Vec<_>>();
+            let raw = blocks.join("\n");
+            let path = tmp.path().join("keys.data");
+            std::fs::write(&path, &raw).unwrap();
+            let safe = astra_text_utils::credential_redaction::redact_credentials_in_text(&raw).0;
+            let markers = safe.lines().collect::<Vec<_>>();
+            let anchor = markers[1..].join("\n");
+            let result = str_replace(
+                tmp.path(),
+                &serde_json::json!({"path":"keys.data","old_str":anchor,"new_str":"replaced"}),
+            );
+            let actual = std::fs::read_to_string(path).unwrap();
+            if duplicate {
+                assert!(result.is_error, "ambiguous anchor must not write");
+                assert_eq!(actual, raw);
+            } else {
+                assert!(!result.is_error, "{}", result.output);
+                assert_eq!(actual, format!("{}\nreplaced", blocks[0]));
+            }
+        }
+    }
+
+    #[test]
+    fn str_replace_rejects_noncanonical_overlapping_pem_occurrence() {
+        let tmp = TempDir::new().unwrap();
+        let first = "-----BEGIN PRIVATE KEY-----\nfirst\n-----END PRIVATE KEY-----";
+        let second = "-----BEGIN PRIVATE KEY-----\nsecond\n-----END PRIVATE KEY-----";
+        let raw = format!("{first}{}{second}-", &second[5..]);
+        let path = tmp.path().join("keys.data");
+        std::fs::write(&path, &raw).unwrap();
+        let safe = astra_text_utils::credential_redaction::redact_credentials_in_text(&raw).0;
+        let anchor = &safe[safe.rfind("[REDACTED:").unwrap()..];
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"keys.data","old_str":anchor,"new_str":"replaced"}),
+        );
+        assert!(
+            result.is_error,
+            "a raw overlapping duplicate must not be written"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn str_replace_accepts_reference_from_overlapping_redaction_rules() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.data");
+        let raw =
+            "--token abcdefghijklmnopqrstAKIAABCDEFGHIJKLMNOP\n--token abcdefghijklmnopqrst\n";
+        std::fs::write(&path, raw).unwrap();
+        let safe = astra_text_utils::credential_redaction::redact_credentials_in_text(raw).0;
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"config.data","old_str":safe,"new_str":"replaced"}),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "replaced");
+    }
+
+    #[test]
+    fn source_read_and_edit_share_overlapping_credential_groups() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.data");
+        let raw = "--token AKIAABCDEFGHIJKLMNOPsuffixsuffixsuffix";
+        std::fs::write(&path, raw).unwrap();
+        let read = read_file(
+            tmp.path(),
+            &serde_json::json!({"path":"config.data","start_line":1,"end_line":1}),
+        );
+        assert!(
+            !read.is_error && !read.output.contains("suffixsuffixsuffix"),
+            "{}",
+            read.output
+        );
+        let start = read.output.find("[REDACTED:").unwrap();
+        let end = start + read.output[start..].find(']').unwrap() + 1;
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({"path":"config.data","old_str":&read.output[start..end],"new_str":"replaced"}),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "--token replaced");
     }
 
     #[test]

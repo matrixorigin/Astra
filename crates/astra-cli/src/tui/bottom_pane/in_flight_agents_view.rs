@@ -181,6 +181,19 @@ pub(crate) struct InFlightAgentsView {
     pending_action: Option<ViewActionRequest>,
 }
 
+fn selected_run_index(
+    rows: &[AgentRow],
+    selected: Option<(Option<String>, Option<String>, String)>,
+) -> Option<usize> {
+    let (run_id, spawn_call_id, agent_id) = selected?;
+    rows.iter()
+        .position(|row| match (run_id.as_deref(), spawn_call_id.as_deref()) {
+            (Some(run_id), _) => row.run_id.as_deref() == Some(run_id),
+            (None, Some(spawn_call_id)) => row.spawn_tool_call_id.as_deref() == Some(spawn_call_id),
+            (None, None) => row.agent_id == agent_id,
+        })
+}
+
 impl InFlightAgentsView {
     pub fn new(snapshot: impl Into<AgentMonitorSnapshot>) -> Self {
         let mut view = Self {
@@ -201,7 +214,13 @@ impl InFlightAgentsView {
     }
 
     fn toggle_history(&mut self) {
-        let selected_id = self.rows.get(self.selected).map(|row| row.agent_id.clone());
+        let selected = self.rows.get(self.selected).map(|row| {
+            (
+                row.run_id.clone(),
+                row.spawn_tool_call_id.clone(),
+                row.agent_id.clone(),
+            )
+        });
         self.show_history = !self.show_history;
         let mut rows = std::mem::take(&mut self.rows);
         for (index, row) in self.hidden_terminal_rows.drain(..) {
@@ -212,9 +231,7 @@ impl InFlightAgentsView {
             server_truth_state: self.server_truth_state,
             durable_snapshot_truncated: self.durable_snapshot_truncated,
         });
-        if let Some(index) =
-            selected_id.and_then(|id| self.rows.iter().position(|row| row.agent_id == id))
-        {
+        if let Some(index) = selected_run_index(&self.rows, selected) {
             self.selected = index;
         }
     }
@@ -225,7 +242,13 @@ impl InFlightAgentsView {
             server_truth_state,
             durable_snapshot_truncated,
         } = snapshot;
-        let selected_id = self.rows.get(self.selected).map(|row| row.agent_id.clone());
+        let selected = self.rows.get(self.selected).map(|row| {
+            (
+                row.run_id.clone(),
+                row.spawn_tool_call_id.clone(),
+                row.agent_id.clone(),
+            )
+        });
         // Keep terminal ancestors of live/uncertain descendants so filtering
         // history never severs the visible run tree. This is presentation only.
         let by_run: std::collections::HashMap<_, _> = rows
@@ -268,9 +291,7 @@ impl InFlightAgentsView {
         self.hidden_terminal_rows = hidden;
         let rows: Vec<_> = rows.into_iter().map(|(_, row)| row).collect();
         let (live_count, failed_count, uncertain_count) = count_rows(&rows);
-        self.selected = selected_id
-            .and_then(|id| rows.iter().position(|row| row.agent_id == id))
-            .unwrap_or(0);
+        self.selected = selected_run_index(&rows, selected).unwrap_or(0);
         self.rows = rows;
         self.server_truth_state = server_truth_state;
         self.durable_snapshot_truncated = durable_snapshot_truncated;
@@ -2137,6 +2158,31 @@ mod tests {
         assert_eq!(v.rows[v.selected].agent_id, "agent-1");
         assert_eq!(v.live_count, 0);
         assert_eq!(v.failed_count, 1);
+    }
+
+    #[test]
+    fn refresh_keeps_selection_on_the_run_when_its_agent_key_changes() {
+        let mut v = InFlightAgentsView::new(rows(3));
+        v.handle_key(key(KeyCode::Down));
+        let mut updated = rows(3);
+        updated[0].agent_id = "agent-1".into();
+        updated[1].agent_id = "resolved-agent".into();
+
+        assert!(v.refresh_agent_monitor(updated.into()));
+        assert_eq!(v.rows[v.selected].run_id.as_deref(), Some("run-1"));
+        assert_eq!(v.rows[v.selected].agent_id, "resolved-agent");
+
+        let mut pending = rows(2);
+        pending[1].agent_id = "pending:spawn-call".into();
+        pending[1].run_id = None;
+        pending[1].spawn_tool_call_id = Some("spawn-call".into());
+        let mut v = InFlightAgentsView::new(pending);
+        v.handle_key(key(KeyCode::Down));
+        let mut resolved = rows(2);
+        resolved[0].agent_id = "pending:spawn-call".into();
+        resolved[1].spawn_tool_call_id = Some("spawn-call".into());
+        assert!(v.refresh_agent_monitor(resolved.into()));
+        assert_eq!(v.rows[v.selected].run_id.as_deref(), Some("run-1"));
     }
 
     #[test]

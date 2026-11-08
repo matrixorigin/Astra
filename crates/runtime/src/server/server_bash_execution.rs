@@ -42,6 +42,14 @@ pub(crate) async fn execute_server_bash(
     args: &Value,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
 ) -> astra_tools::ToolResult {
+    if args.get("stdin").is_some() || args.get("yield_time_ms").is_some() {
+        return pre_dispatch_rejection_tool_result(
+            "Error: interactive shell controls require a session-owned shell; no command was run",
+        )
+        .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+            astra_core::ErrorKind::ToolUnavailable,
+        ));
+    }
     if args.get("run_in_background").is_some()
         || args.get("ready_check").is_some()
         || args.get("background_ttl").is_some()
@@ -489,6 +497,25 @@ mod tests {
         assert_eq!(metadata["disposition"], "rejected");
         assert_eq!(metadata["execution_started"], false);
         assert_eq!(metadata["execution_fact"], "not_executed");
+    }
+
+    #[tokio::test]
+    async fn server_bash_rejects_unowned_interactive_controls_before_execution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::permissive(workspace.path());
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+        for args in [
+            serde_json::json!({"command":"touch marker","stdin":true}),
+            serde_json::json!({"command":"touch marker","yield_time_ms":0}),
+        ] {
+            let result =
+                execute_server_bash(&policy, workspace.path(), &binding, None, &args, None).await;
+            assert!(result.is_error, "{result:?}");
+            let metadata = result.metadata.unwrap();
+            assert_eq!(metadata["execution_fact"], "not_executed");
+            assert_eq!(metadata["error_kind"], "tool_unavailable");
+            assert!(!workspace.path().join("marker").exists());
+        }
     }
 
     #[tokio::test]

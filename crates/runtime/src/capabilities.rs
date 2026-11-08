@@ -149,6 +149,7 @@ pub fn runtime_executor_tool_schemas(
     let pool = schema_pool_declared_by_providers(&[provider]);
     let mut schemas =
         astra_turn_core::tool_surface::resolve(CapabilitySurface::Web, capabilities, &pool);
+    astra_tools::schemas::hide_shell_task_controls(&mut schemas);
     #[cfg(unix)]
     {
         astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
@@ -1054,6 +1055,8 @@ mod tests {
         assert!(properties.get("run_in_background").is_none());
         assert!(properties.get("ready_check").is_none());
         assert!(properties.get("background_ttl").is_none());
+        assert!(properties.get("stdin").is_none());
+        assert!(properties.get("yield_time_ms").is_none());
         for hidden in ["powershell", "display_sixel"] {
             assert!(
                 !tool_names.contains(hidden),

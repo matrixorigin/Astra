@@ -1,4 +1,4 @@
-//! Bounded newline-delimited process I/O on the existing invocation owner.
+//! Bounded byte-stream and newline-delimited I/O on one invocation owner.
 //! Admission, JSON interpretation, native sessions and requests belong to the
 //! selected CLI/User Runner adapter, not this physical process boundary.
 
@@ -11,14 +11,14 @@ use std::io;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// Explicit resource budget for one physical process, not a logical session.
 #[derive(Debug, Clone, Copy)]
-pub struct FramedProcessLimits {
+pub struct ProcessIoLimits {
     /// Payload bytes per stdin/stdout frame, excluding the LF delimiter.
     pub max_frame_bytes: usize,
     /// Capacity of each input/output queue. Slow consumers apply backpressure.
@@ -29,7 +29,7 @@ pub struct FramedProcessLimits {
     pub timeout: Option<Duration>,
 }
 
-impl FramedProcessLimits {
+impl ProcessIoLimits {
     fn deadline(self) -> io::Result<Option<Instant>> {
         // Include both queues, their active frames and Vec growth. This is a
         // retained-buffer budget, not a lifetime quota on a long-running stream
@@ -70,15 +70,50 @@ impl FramedProcessLimits {
 /// accepted by the native protocol. Native request/response IDs provide that
 /// acknowledgement. No caller-owned payload is copied until a slot is reserved.
 #[derive(Debug, Clone)]
-pub struct FramedProcessInput {
-    sender: mpsc::Sender<Vec<u8>>,
+pub struct ProcessInput {
+    sender: mpsc::Sender<InputWrite>,
     cancel: CancellationToken,
     max_frame_bytes: usize,
+    framed: bool,
 }
 
-impl FramedProcessInput {
+#[derive(Debug)]
+pub enum ProcessInputError {
+    NotSent(io::Error),
+    Unconfirmed(io::Error),
+}
+
+impl std::fmt::Display for ProcessInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSent(error) => write!(f, "input was not sent: {error}"),
+            Self::Unconfirmed(error) => write!(f, "input delivery is unconfirmed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessInputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            Self::NotSent(error) | Self::Unconfirmed(error) => error,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct InputWrite {
+    bytes: Option<Vec<u8>>,
+    written: Option<oneshot::Sender<io::Result<()>>>,
+}
+
+impl ProcessInput {
+    pub fn is_open(&self) -> bool {
+        !self.sender.is_closed() && !self.cancel.is_cancelled()
+    }
+
     pub async fn send_frame(&self, frame: &[u8]) -> io::Result<()> {
-        if frame.is_empty()
+        if !self.framed
+            || frame.is_empty()
             || frame.len() > self.max_frame_bytes
             || frame.iter().any(|byte| matches!(*byte, b'\n' | b'\r'))
         {
@@ -92,16 +127,81 @@ impl FramedProcessInput {
             _ = self.cancel.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "process cancelled")),
             permit = self.sender.reserve() => {
                 let permit = permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "process input closed"))?;
-                permit.send(frame.to_vec());
+                permit.send(InputWrite { bytes: Some(frame.to_vec()), written: None });
                 Ok(())
             }
         }
     }
+
+    /// Acknowledges bytes written to the pipe, not processing by the child.
+    /// Cancellation or a lost acknowledgement never authorizes replay.
+    pub async fn write_bytes(
+        &self,
+        bytes: &[u8],
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), ProcessInputError> {
+        if self.framed || bytes.len() > self.max_frame_bytes {
+            return Err(ProcessInputError::NotSent(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid process input",
+            )));
+        }
+        self.write(Some(bytes), deadline, cancel).await
+    }
+
+    pub async fn close(
+        &self,
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), ProcessInputError> {
+        self.write(None, deadline, cancel).await
+    }
+
+    async fn write(
+        &self,
+        bytes: Option<&[u8]>,
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), ProcessInputError> {
+        let permit = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(ProcessInputError::NotSent(io::Error::new(io::ErrorKind::Interrupted, "process cancelled"))),
+            _ = async { match cancel { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => return Err(ProcessInputError::NotSent(io::Error::new(io::ErrorKind::Interrupted, "input cancelled"))),
+            _ = tokio::time::sleep_until(deadline) => return Err(ProcessInputError::NotSent(io::Error::new(io::ErrorKind::TimedOut, "input deadline elapsed before submission"))),
+            permit = self.sender.reserve() => permit.map_err(|_| ProcessInputError::NotSent(io::Error::new(io::ErrorKind::BrokenPipe, "process input closed")))?,
+        };
+        let (written, acknowledgement) = oneshot::channel();
+        permit.send(InputWrite {
+            bytes: bytes.map(<[u8]>::to_vec),
+            written: Some(written),
+        });
+        tokio::select! {
+            biased;
+            result = acknowledgement => result
+                .map_err(|_| ProcessInputError::Unconfirmed(io::Error::other("write acknowledgement was lost")))?
+                .map_err(ProcessInputError::Unconfirmed),
+            _ = async { match cancel { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => Err(ProcessInputError::Unconfirmed(io::Error::new(io::ErrorKind::Interrupted, "input acknowledgement wait cancelled"))),
+            _ = tokio::time::sleep_until(deadline) => Err(ProcessInputError::Unconfirmed(io::Error::new(io::ErrorKind::TimedOut, "input acknowledgement deadline elapsed"))),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ProcessOutput {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+#[derive(Clone, Copy)]
+enum IoMode {
+    Framed,
+    Bytes { stdin: bool },
 }
 
 /// Physical transport stop cause; none of these implies a native turn outcome.
 #[derive(Debug)]
-pub enum FramedProcessEnd {
+pub enum ProcessEnd {
     Exited,
     Cancelled,
     TimedOut,
@@ -117,8 +217,8 @@ pub enum FramedProcessEnd {
 /// proves descendant cleanup, even when the exit code is zero. stderr is
 /// diagnostic bytes, not model input.
 #[derive(Debug)]
-pub struct FramedProcessOutcome {
-    pub end: FramedProcessEnd,
+pub struct ProcessOutcome {
+    pub end: ProcessEnd,
     /// Whether authenticated START was sent. This permits target execution,
     /// not a native request acknowledgement. None means ownership evidence
     /// was lost (e.g. a handshake worker panic), never "not started".
@@ -133,21 +233,31 @@ pub struct FramedProcessOutcome {
 /// Dropping it requests cancellation; use `cancel_and_wait` to obtain settlement
 /// evidence. While Tokio remains alive, the private driver continues cleanup if
 /// a caller future is dropped; runtime teardown retains the owner's RAII guard.
-pub struct FramedProcess {
-    input: Option<FramedProcessInput>,
-    output: mpsc::Receiver<Vec<u8>>,
-    completion: Option<JoinHandle<FramedProcessOutcome>>,
+pub struct OwnedProcess {
+    input: Option<ProcessInput>,
+    output: mpsc::Receiver<ProcessOutput>,
+    completion: Option<JoinHandle<ProcessOutcome>>,
     cancel: CancellationToken,
 }
 
-impl FramedProcess {
-    pub fn input(&self) -> FramedProcessInput {
-        self.input.as_ref().expect("live process input").clone()
+impl OwnedProcess {
+    /// Input is available for framed processes and shells launched with stdin.
+    pub fn input(&self) -> Option<ProcessInput> {
+        self.input.clone()
     }
 
     /// Complete LF-delimited stdout payloads only. EOF or a closed queue is not
     /// a native success: inspect the final outcome and the adapter's protocol.
     pub async fn recv_frame(&mut self) -> Option<Vec<u8>> {
+        while let Some(output) = self.output.recv().await {
+            if let ProcessOutput::Stdout(bytes) = output {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    pub async fn recv_output(&mut self) -> Option<ProcessOutput> {
         self.output.recv().await
     }
 
@@ -159,19 +269,19 @@ impl FramedProcess {
     /// Close this handle's input and drain/discard remaining frames while
     /// waiting. Retained input clones must also be dropped for stdin EOF.
     /// Consumers that need all evidence must receive it before calling wait.
-    pub async fn wait(mut self) -> Result<FramedProcessOutcome, tokio::task::JoinError> {
+    pub async fn wait(mut self) -> Result<ProcessOutcome, tokio::task::JoinError> {
         self.input.take();
         while self.output.recv().await.is_some() {}
         self.completion.take().expect("process completion").await
     }
 
-    pub async fn cancel_and_wait(self) -> Result<FramedProcessOutcome, tokio::task::JoinError> {
+    pub async fn cancel_and_wait(self) -> Result<ProcessOutcome, tokio::task::JoinError> {
         self.cancel();
         self.wait().await
     }
 }
 
-impl Drop for FramedProcess {
+impl Drop for OwnedProcess {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
@@ -206,13 +316,10 @@ impl BashInvocationOwner {
     /// outcome, with no fabricated settlement receipt.
     pub fn spawn_framed(
         self,
-        mut command: Command,
-        limits: FramedProcessLimits,
+        command: Command,
+        limits: ProcessIoLimits,
         cancel: CancellationToken,
-    ) -> io::Result<FramedProcess> {
-        let deadline = limits.deadline()?;
-        tokio::runtime::Handle::try_current()
-            .map_err(|error| io::Error::other(format!("framed process requires Tokio: {error}")))?;
+    ) -> io::Result<OwnedProcess> {
         if cancel.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -225,8 +332,45 @@ impl BashInvocationOwner {
                 "framed process requires a start-gated invocation supervisor",
             ));
         }
+        self.spawn_io(command, limits, cancel, IoMode::Framed, ())
+    }
+
+    /// Raw shell I/O shares the exact same deadline, cancellation and cleanup
+    /// driver as structured collaborators. Weak owners never mint settlement.
+    pub fn spawn_streamed<C: Send + 'static>(
+        self,
+        command: Command,
+        limits: ProcessIoLimits,
+        cancel: CancellationToken,
+        stdin: bool,
+        custody: C,
+    ) -> io::Result<OwnedProcess> {
+        self.spawn_io(command, limits, cancel, IoMode::Bytes { stdin }, custody)
+    }
+
+    fn spawn_io<C: Send + 'static>(
+        self,
+        mut command: Command,
+        limits: ProcessIoLimits,
+        cancel: CancellationToken,
+        mode: IoMode,
+        custody: C,
+    ) -> io::Result<OwnedProcess> {
+        let deadline = limits.deadline()?;
+        tokio::runtime::Handle::try_current()
+            .map_err(|error| io::Error::other(format!("framed process requires Tokio: {error}")))?;
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "process cancelled before spawn",
+            ));
+        }
         command
-            .stdin(Stdio::piped())
+            .stdin(if matches!(mode, IoMode::Bytes { stdin: false }) {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -243,10 +387,11 @@ impl BashInvocationOwner {
         let cancel = cancel.child_token();
         let (input_tx, input_rx) = mpsc::channel(limits.max_queued_frames);
         let (output_tx, output_rx) = mpsc::channel(limits.max_queued_frames);
-        let input = FramedProcessInput {
+        let input = ProcessInput {
             sender: input_tx,
             cancel: cancel.clone(),
             max_frame_bytes: limits.max_frame_bytes,
+            framed: matches!(mode, IoMode::Framed),
         };
         let completion = tokio::spawn(drive(
             child,
@@ -256,9 +401,11 @@ impl BashInvocationOwner {
             limits,
             deadline,
             cancel.clone(),
+            mode,
+            custody,
         ));
-        Ok(FramedProcess {
-            input: Some(input),
+        Ok(OwnedProcess {
+            input: (!matches!(mode, IoMode::Bytes { stdin: false })).then_some(input),
             output: output_rx,
             completion: Some(completion),
             cancel,
@@ -268,7 +415,7 @@ impl BashInvocationOwner {
 
 async fn read_frames(
     mut reader: impl AsyncRead + Unpin,
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<ProcessOutput>,
     limit: usize,
 ) -> io::Result<()> {
     let mut buffer = [0u8; READ_CHUNK_SIZE];
@@ -300,9 +447,12 @@ async fn read_frames(
             }
             frame.extend_from_slice(payload);
             if complete {
-                sender.send(std::mem::take(&mut frame)).await.map_err(|_| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "stdout consumer closed")
-                })?;
+                sender
+                    .send(ProcessOutput::Stdout(std::mem::take(&mut frame)))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "stdout consumer closed")
+                    })?;
             }
         }
     }
@@ -310,14 +460,71 @@ async fn read_frames(
 
 async fn write_frames(
     mut writer: impl AsyncWrite + Unpin,
-    mut receiver: mpsc::Receiver<Vec<u8>>,
+    mut receiver: mpsc::Receiver<InputWrite>,
+    framed: bool,
 ) -> io::Result<()> {
-    while let Some(frame) = receiver.recv().await {
-        writer.write_all(&frame).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+    while let Some(request) = receiver.recv().await {
+        // A cancelled caller has not authorized a queued write that has not
+        // started yet. An in-flight write can still be partial/unknown.
+        if request
+            .written
+            .as_ref()
+            .is_some_and(oneshot::Sender::is_closed)
+        {
+            continue;
+        }
+        let close = request.bytes.is_none();
+        let result = async {
+            if let Some(bytes) = request.bytes {
+                writer.write_all(&bytes).await?;
+                if framed {
+                    writer.write_all(b"\n").await?;
+                }
+                writer.flush().await
+            } else {
+                writer.shutdown().await
+            }
+        }
+        .await;
+        let failed = result
+            .as_ref()
+            .err()
+            .map(|error| io::Error::new(error.kind(), error.to_string()));
+        if let Some(written) = request.written {
+            let _ = written.send(result);
+        }
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        if close {
+            return Ok(());
+        }
     }
     writer.shutdown().await
+}
+
+async fn read_bytes(
+    mut reader: impl AsyncRead + Unpin,
+    sender: mpsc::Sender<ProcessOutput>,
+    stderr: bool,
+    limit: usize,
+) -> io::Result<()> {
+    let mut buffer = vec![0; READ_CHUNK_SIZE.min(limit)];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        let bytes = buffer[..count].to_vec();
+        let output = if stderr {
+            ProcessOutput::Stderr(bytes)
+        } else {
+            ProcessOutput::Stdout(bytes)
+        };
+        sender.send(output).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "process output consumer closed")
+        })?;
+    }
 }
 
 async fn drain_stderr(
@@ -346,15 +553,20 @@ impl Drop for CancelOnDrop {
     }
 }
 
-async fn drive(
+// Keep the private invocation's ownership transfer explicit; a parameter-only
+// wrapper would not add another lifecycle or useful abstraction.
+#[allow(clippy::too_many_arguments)]
+async fn drive<C: Send + 'static>(
     mut child: tokio::process::Child,
     guard: IsolatedScopeAbortGuard,
-    input: mpsc::Receiver<Vec<u8>>,
-    output: mpsc::Sender<Vec<u8>>,
-    limits: FramedProcessLimits,
+    input: mpsc::Receiver<InputWrite>,
+    output: mpsc::Sender<ProcessOutput>,
+    limits: ProcessIoLimits,
     deadline: Option<Instant>,
     cancel: CancellationToken,
-) -> FramedProcessOutcome {
+    mode: IoMode,
+    custody: C,
+) -> ProcessOutcome {
     let _cancel_on_drop = CancelOnDrop(cancel.clone());
     let leader_pid = child.id();
     let supervised = guard
@@ -422,52 +634,83 @@ async fn drive(
         .owner
         .as_ref()
         .and_then(|owner| owner.supervisor.as_ref())
-        .and_then(super::InvocationSupervisor::target_released);
+        .and_then(super::InvocationSupervisor::target_released)
+        .or_else(|| (!supervised && startup_error.is_none()).then_some(true));
     let end = if let Some(error) = startup_error {
         match error.kind() {
-            io::ErrorKind::Interrupted => FramedProcessEnd::Cancelled,
-            io::ErrorKind::TimedOut => FramedProcessEnd::TimedOut,
-            _ => FramedProcessEnd::OwnershipFailed(error),
+            io::ErrorKind::Interrupted => ProcessEnd::Cancelled,
+            io::ErrorKind::TimedOut => ProcessEnd::TimedOut,
+            _ => ProcessEnd::OwnershipFailed(error),
         }
     } else {
         let stdout = child.stdout.take().expect("piped stdout");
-        let stdin = child.stdin.take().expect("piped stdin");
+        let stdin = child.stdin.take();
         let stderr_pipe = child.stderr.take().expect("piped stderr");
-        let stdout = read_frames(stdout, output, limits.max_frame_bytes);
-        let stdin = write_frames(stdin, input);
-        let stderr_reader = drain_stderr(
-            stderr_pipe,
-            &mut stderr,
-            &mut stderr_capped,
-            limits.max_stderr_bytes,
-        );
+        let stderr_output = output.clone();
+        let stdout = async {
+            match mode {
+                IoMode::Framed => read_frames(stdout, output, limits.max_frame_bytes).await,
+                IoMode::Bytes { .. } => {
+                    read_bytes(stdout, output, false, limits.max_frame_bytes).await
+                }
+            }
+        };
+        let stdin = async {
+            match stdin {
+                Some(stdin) => write_frames(stdin, input, matches!(mode, IoMode::Framed)).await,
+                None => Ok(()),
+            }
+        };
+        let stderr_reader = async {
+            match mode {
+                IoMode::Framed => {
+                    drain_stderr(
+                        stderr_pipe,
+                        &mut stderr,
+                        &mut stderr_capped,
+                        limits.max_stderr_bytes,
+                    )
+                    .await
+                }
+                IoMode::Bytes { .. } => {
+                    read_bytes(stderr_pipe, stderr_output, true, limits.max_frame_bytes).await
+                }
+            }
+        };
         tokio::pin!(stdout, stdin, stderr_reader);
         let (mut stdout_done, mut stdin_done, mut stderr_done) = (false, false, false);
         let mut drain_deadline = None;
         loop {
             if status.is_some() && stdout_done && stderr_done {
-                break FramedProcessEnd::Exited;
+                break ProcessEnd::Exited;
             }
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => break FramedProcessEnd::Cancelled,
-                _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break FramedProcessEnd::TimedOut,
+                _ = cancel.cancelled() => break ProcessEnd::Cancelled,
+                _ = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => break ProcessEnd::TimedOut,
                 _ = async { if let Some(deadline) = drain_deadline { tokio::time::sleep_until(deadline).await } }, if drain_deadline.is_some() => {
-                    break FramedProcessEnd::OutputDrainTimedOut;
+                    break ProcessEnd::OutputDrainTimedOut;
                 }
                 result = &mut stdout, if !stdout_done => {
-                    match result { Ok(()) => stdout_done = true, Err(error) => break FramedProcessEnd::OutputFailed(error) }
+                    match result { Ok(()) => stdout_done = true, Err(error) => break ProcessEnd::OutputFailed(error) }
                 }
                 result = &mut stdin, if !stdin_done => {
-                    match result { Ok(()) => stdin_done = true, Err(error) => break FramedProcessEnd::InputFailed(error) }
+                    match result {
+                        Ok(()) => stdin_done = true,
+                        // A shell may close stdin while continuing useful
+                        // work. The write caller receives its I/O error; that
+                        // rejected input is not authority to kill the task.
+                        Err(_) if matches!(mode, IoMode::Bytes { .. }) => stdin_done = true,
+                        Err(error) => break ProcessEnd::InputFailed(error),
+                    }
                 }
                 result = &mut stderr_reader, if !stderr_done => {
-                    match result { Ok(()) => stderr_done = true, Err(error) => break FramedProcessEnd::StderrFailed(error) }
+                    match result { Ok(()) => stderr_done = true, Err(error) => break ProcessEnd::StderrFailed(error) }
                 }
                 result = child.wait(), if status.is_none() => {
                     match result {
                         Ok(exit) => status = Some(exit),
-                        Err(error) => break FramedProcessEnd::WaitFailed(error),
+                        Err(error) => break ProcessEnd::WaitFailed(error),
                     }
                     settlement = settle_isolated_owner_after_exit(guard.take_owner().expect("started owner"), leader_pid).await;
                     guard.disarm();
@@ -492,7 +735,10 @@ async fn drive(
         status = child.try_wait().ok().flatten();
         guard.disarm();
     }
-    FramedProcessOutcome {
+    // Workspace leases and pinned resources outlive cancellation, pipe drain
+    // and descendant cleanup even when the presentation-side handle is lost.
+    drop(custody);
+    ProcessOutcome {
         end,
         target_released,
         status,

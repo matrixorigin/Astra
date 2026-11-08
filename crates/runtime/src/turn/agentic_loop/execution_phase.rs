@@ -3947,6 +3947,22 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         state.last_llm_context_manifest_trace = Some(trace);
     }
+    let preparation_context_error = turn_result
+        .as_ref()
+        .err()
+        .filter(|error| error.kind == astra_core::ErrorKind::ContextWindow)
+        .cloned();
+    let turn_result = match turn_result {
+        Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => Ok(HostTurnResult {
+            accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                error_message: Some(error.message),
+                ..Default::default()
+            },
+            ttft_ms: None,
+            error_kind: Some(astra_core::ErrorKind::ContextWindow),
+        }),
+        other => other,
+    };
     let mut turn_result = match turn_result {
         Ok(turn_result) => {
             let delivered_children: Vec<_> = state
@@ -4131,11 +4147,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             "collapsed same-boundary observation facet fanout into composite overview calls"
         );
     }
-    state.rate_limit_cooldown.record_success();
-    // Clear pipeline recovery escalation after a successful LLM call —
-    // the PTL pressure is relieved.
-    if let Some(ref mut sess) = state.pipeline_session {
-        sess.recovery.reset_on_success();
+    if turn_result.accum.error_message.is_none() {
+        state.rate_limit_cooldown.record_success();
+        if let Some(ref mut session) = state.pipeline_session {
+            session.recovery.reset_on_success();
+        }
     }
     let snap = agentic_turn_stream_snapshot_with_kind(
         &turn_result.accum,
@@ -4184,7 +4200,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
         consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
     };
-    let ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
+    let mut ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
+    if let (Some(original), AgenticTurnIngestOutcome::Fatal(error)) =
+        (preparation_context_error, &mut ingest_outcome)
+    {
+        // Share recovery decisions without replacing the preparation owner's
+        // structured budget, stage and non-execution diagnostics.
+        *error = original;
+    }
     // Ingest already materializes successful text-only replies. Attach protocol
     // state before the canonical transcript owner records those new messages.
     if state.final_text_model_item_id.is_some()
@@ -4612,26 +4635,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         try_write_heavy_checkpoint(state);
                         return Ok(TurnExecutionControl::ContinueLoop);
                     }
-                    super::super::compaction_replay::CompactionReplayOutcome::CircuitOpen => {
-                        // Session has burned enough futile attempts; don't
-                        // run the pipeline again. Fall through to the
-                        // ContextOverflow interruption path below so the
-                        // caller can resume from checkpoint.
-                        if !prep.quiet {
-                            host.emit_headless_line(
-                                HeadlessStderrStyle::Yellow,
-                                format!(
-                                    "♻ Context overflow — compaction circuit open after {} \
-                                     futile attempts; giving up for this session.",
-                                    state.compaction_effectiveness.consecutive_futile_attempts,
-                                ),
-                            );
-                        }
-                    }
                     super::super::compaction_replay::CompactionReplayOutcome::Futile => {
-                        // Single futile attempt — counter advanced by the
-                        // checked helper. Next turn's check may trip the
-                        // breaker. Fall through to interruption.
+                        // No candidate reduced the protected request. Preserve
+                        // progress and report actionable context pressure;
+                        // historical counters cannot disable later recovery.
                     }
                 }
             }
@@ -4641,7 +4648,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             if is_context_overflow {
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::ContextOverflow,
-                    ResumeAction::CompactAndRetry,
+                    ResumeAction::RequiresIntervention { description: "Automatic context reduction could not fit the protected conversation. Choose a larger-context authorized model or reduce the request before retrying; progress is preserved.".into() },
                     interruption_state_summary(
                         state,
                         Some(format!("Context overflow after compaction: {}", e.message)),
@@ -5726,8 +5733,6 @@ fn emit_subrun_text_preview<H: AgenticLoopHost>(
     }
 }
 
-const MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS: u32 = 3;
-
 async fn handle_token_budget<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -5776,10 +5781,6 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     //   1. Aggressive compression pipeline (clear tool results)
     //   2. If still over: persist old messages as a session artifact, keep an introspect reference
     // Only if both fail do we inject the stop directive.
-    // Skip tier-1 mechanical compression if pre-turn LLM compact already ran,
-    // but still allow tier-2 artifact spill as an independent recovery path.
-    if !state.budget_wrapup_injected
-        && state.compaction_effectiveness.attempt_count < MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS
     {
         let rewrite_permit = state.begin_canonical_rewrite();
         let budget = super::super::TokenBudget {
@@ -5791,24 +5792,30 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 .unwrap_or_default()
                 .as_secs(),
         };
-        let mut total_freed = 0u64;
-        let mut layer_descriptions: Vec<String> = Vec::new();
-        let mut total_messages_removed: usize = 0;
-        if state.compact_tier_applied < CompactionTier::CompactHistory {
-            let pipeline = super::super::CompactionEngine::aggressive_pipeline();
-            let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
-            total_freed = outcome.total_tokens_freed;
-            total_messages_removed = outcome
-                .layer_results
-                .iter()
-                .map(|(_, r)| r.messages_removed)
-                .sum();
-            layer_descriptions = outcome
-                .layer_results
-                .iter()
-                .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
-                .collect();
-        }
+        // A pre-turn summary already replaced completed history; running the
+        // mechanical pipeline again would rewrite its retained rounds into
+        // `[Cleared]` tombstones. Artifact spill below remains an independent
+        // recovery path, so it stays available regardless of the tier.
+        let (mut total_freed, mut total_messages_removed, mut layer_descriptions) =
+            if state.compact_tier_applied < CompactionTier::CompactHistory {
+                let pipeline = super::super::CompactionEngine::aggressive_pipeline();
+                let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+                (
+                    outcome.total_tokens_freed,
+                    outcome
+                        .layer_results
+                        .iter()
+                        .map(|(_, r)| r.messages_removed)
+                        .sum::<usize>(),
+                    outcome
+                        .layer_results
+                        .iter()
+                        .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
+                        .collect::<Vec<String>>(),
+                )
+            } else {
+                (0, 0, Vec::new())
+            };
 
         // Commit an artifact-backed rewrite only after durable storage succeeds.
         if measured.saturating_sub(total_freed) > state.max_turn_input_tokens {
@@ -5870,7 +5877,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         }
     }
 
-    // Compaction didn't help (or already tried once) — inject stop directive.
+    // Compaction made no progress — inject the stop directive.
     state.budget_wrapup_injected = true;
     state.hooks.completion_settlement.wrapup_origin =
         Some(super::host::BudgetWrapupOrigin::TokenRail);
@@ -13570,12 +13577,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactive_compaction_attempt_cap_forces_wrapup() {
+    async fn prior_compactions_do_not_prevent_recovery_from_new_pressure() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.max_turn_input_tokens = 80_000;
         state.last_measured_prompt_tokens = Some(90_000);
-        state.compaction_effectiveness.attempt_count = MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS;
+        state.compaction_effectiveness.attempt_count = 14;
         state
             .messages
             .push(serde_json::json!({"role": "user", "content": "diagnose and fix the issue"}));
@@ -13599,15 +13606,15 @@ mod tests {
 
         assert!(matches!(control, Some(TurnExecutionControl::ContinueLoop)));
         assert!(
-            state.budget_wrapup_injected,
-            "after bounded compaction attempts, token pressure must transition to wrapup"
+            !state.budget_wrapup_injected,
+            "previous compactions must not prevent a useful recovery"
         );
         assert!(
             state
                 .volatile_pending
                 .iter()
-                .any(|entry| entry.kind == VolatileKind::BudgetAdvisory),
-            "attempt cap should inject the normal budget wrapup advisory"
+                .any(|entry| entry.kind == VolatileKind::CompactResume),
+            "successful recovery should continue the user's task"
         );
     }
 
@@ -14908,6 +14915,37 @@ mod tests {
         assert_eq!(error_state.llm_rounds_completed, 1);
         assert_eq!(error_state.telemetry.local_usage_attempts, 1);
         assert_eq!(error_state.telemetry.local_usage_unavailable, 1);
+    }
+
+    #[tokio::test]
+    async fn preparation_context_failure_preserves_structured_diagnostics() {
+        let details = serde_json::json!({"source":"final_wire","stage":"request_preparation","execution_started":false,"budget":{"input_tokens":1234,"limit":1000}}).to_string();
+        let mut host = DirectErrorHost::new(
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContextWindow,
+                "protected request is too large",
+            )
+            .with_details_json(details.clone()),
+        );
+        let mut state = make_state();
+        state.messages = vec![
+            serde_json::json!({"role":"system","content":"protected"}),
+            serde_json::json!({"role":"user","content":"current goal"}),
+        ];
+        let result = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            1,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+        let error = result.err().expect("protected overflow remains actionable");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
+        assert_eq!(error.details_json.as_deref(), Some(details.as_str()));
+        assert_eq!(host.turn_count(), 1);
     }
 
     #[tokio::test]
