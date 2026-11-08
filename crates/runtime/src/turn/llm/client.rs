@@ -5715,6 +5715,9 @@ async fn call_prepared_llm_with_total_budget(
         // Keep the dispatch marker inside the future selected below. If a
         // cancellation branch wins before the send future is ever polled,
         // diagnostics must not claim that transport execution started.
+        // The attempt span exists before the request is built so its W3C
+        // context reaches the provider instead of the empty current span.
+        let mut llm_attempt = LlmAttemptSpan::start();
         let send_request = async {
             if let Some(attempt_index) = observed_attempt {
                 attempt_observer
@@ -5724,9 +5727,8 @@ async fn call_prepared_llm_with_total_budget(
             let mut request = req.body(prepared_request.body()).build()?;
             crate::server::outbound_trace::rewrite(&mut request);
             client.execute(request).await
-        };
-        let mut llm_attempt = LlmAttemptSpan::start();
-        let send_request = send_request.instrument(llm_attempt.span.clone());
+        }
+        .instrument(llm_attempt.span.clone());
         let send_result = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -8309,6 +8311,9 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         model_name,
         "LLM non-stream request sending"
     );
+    // The attempt span exists before the request is built so its W3C context
+    // reaches the provider instead of the empty current span.
+    let mut llm_attempt = LlmAttemptSpan::start();
     let send_request = async {
         if let Some(attempt_index) = observed_attempt {
             attempt_observer
@@ -8321,9 +8326,8 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             .build()?;
         crate::server::outbound_trace::rewrite(&mut request);
         client.execute(request).await
-    };
-    let mut llm_attempt = LlmAttemptSpan::start();
-    let send_request = send_request.instrument(llm_attempt.span.clone());
+    }
+    .instrument(llm_attempt.span.clone());
     let resp = match send_request.await {
         Ok(response) => response,
         Err(e) => {
