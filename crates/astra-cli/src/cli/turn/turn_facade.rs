@@ -506,6 +506,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_cancellation_without_execution_settlement_stays_unconfirmed() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let unsettled = serde_json::json!({
+            "run_id":"exact", "status":"cancelled", "execution_settled":false
+        });
+        Mock::given(method("DELETE"))
+            .and(path("/chat/runs/exact"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(unsettled.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/exact/cancel"))
+            .respond_with(move |_: &wiremock::Request| {
+                let _ = observed.send(());
+                ResponseTemplate::new(200).set_body_json(unsettled.clone())
+            })
+            .expect(2..)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let cancel = super::cancel_exact_run_until_settled_with_deadline(
+            &api,
+            "token",
+            "exact",
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        );
+        let expire = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                observations.recv().await.expect("first settlement check");
+                observations.recv().await.expect("second settlement check");
+            })
+            .await
+            .expect("unsettled cancellation must keep checking");
+            // The second check proves the first false response was consumed.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(11)).await;
+        };
+        let (result, ()) = tokio::join!(cancel, expire);
+        tokio::time::resume();
+        let error = result.expect_err("a terminal status is not execution settlement");
+        assert!(
+            error.contains("did not settle") || error.contains("timed out"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn expired_owner_observation_reissues_only_the_exact_cancel_command() {
         use std::sync::{
             Arc,
@@ -553,25 +607,8 @@ mod tests {
             Some("cancel-owner"),
         )
         .unwrap();
-        for (second_status, settles, refresh_delay, cancel_delay, budget) in [
-            (200, true, 0, 0, 1000),
-            (401, false, 0, 0, 1000),
-            (403, false, 0, 0, 1000),
-            // A terminal status alone does not release execution ownership.
-            (200, false, 0, 0, 80),
-            // The response fits a fresh HTTP budget but not the remaining
-            // absolute budget after refresh. Restarting the deadline would
-            // wrongly return success, without relying on scheduler jitter.
-            (200, true, 240, 300, 400),
-        ] {
-            // The slow case must refresh before the first DELETE. A 401
-            // refresh followed by a new loop iteration would recompute the
-            // budget and miss the stale-duration regression.
-            let admitted_token = if refresh_delay > 0 {
-                "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature"
-            } else {
-                "old-cancel"
-            };
+        for (second_status, settles) in [(200, true), (401, false), (403, false), (200, false)] {
+            let admitted_token = "old-cancel";
             let mut creds = CredentialsFile::default();
             creds.profiles.insert(
                 "default".into(),
@@ -588,23 +625,31 @@ mod tests {
                 .and(path("/chat/runs/exact-owner-run"))
                 .and(header("authorization", format!("Bearer {admitted_token}")))
                 .respond_with(ResponseTemplate::new(401))
-                .expect(if refresh_delay > 0 { 0 } else { 1 })
+                .expect(1)
                 .mount(&server)
                 .await;
             Mock::given(method("POST")).and(path("/auth/refresh"))
-                .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(refresh_delay))
+                .respond_with(ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"user_id":"cancel-owner", "access_token":"new-cancel", "refresh_token":"new-refresh"})))
                 .expect(1).mount(&server).await;
             Mock::given(method("DELETE"))
                 .and(path("/chat/runs/exact-owner-run"))
                 .and(header("authorization", "Bearer new-cancel"))
                 .respond_with(
-                    ResponseTemplate::new(second_status)
-                        .set_delay(std::time::Duration::from_millis(cancel_delay))
-                        .set_body_json(
+                    ResponseTemplate::new(second_status).set_body_json(
                             serde_json::json!({"run_id":"exact-owner-run", "status":"cancelled", "execution_settled":settles}),
                         ),
                 )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/chat/runs/exact-owner-run/cancel"))
+                .and(header("authorization", "Bearer new-cancel"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "run_id":"exact-owner-run", "status":"cancelled", "execution_settled":true
+                })))
+                .expect(u64::from(second_status == 200 && !settles))
                 .mount(&server)
                 .await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
@@ -617,26 +662,22 @@ mod tests {
                 admitted_token,
                 "exact-owner-run",
                 Some(&owner),
-                start + std::time::Duration::from_millis(budget),
+                start + std::time::Duration::from_secs(10),
             )
             .await;
-            assert_eq!(result.is_ok(), settles && cancel_delay == 0);
-            let requests = server.received_requests().await.unwrap();
-            if cancel_delay > 0 {
-                assert_eq!(
-                    requests
-                        .iter()
-                        .filter(|request| request.method.as_str() == "DELETE")
-                        .count(),
-                    1,
-                    "the refresh completed and the HTTP phase exercised the remaining absolute budget"
-                );
-            }
-            assert!(
-                requests.iter().all(|r| r.url.path() == "/auth/refresh"
-                    || r.url.path() == "/chat/runs/exact-owner-run")
+            assert_eq!(
+                result.is_ok(),
+                second_status == 200,
+                "status={second_status}, result={result:?}"
             );
+            let requests = server.received_requests().await.unwrap();
+            assert!(requests.iter().all(|r| r.url.path() == "/auth/refresh"
+                || r.url.path() == "/chat/runs/exact-owner-run"
+                || r.url.path() == "/chat/runs/exact-owner-run/cancel"));
             if second_status == 401 || second_status == 403 {
+                let error = result.as_ref().unwrap_err();
+                assert!(error.contains(&second_status.to_string()), "{error}");
+                assert!(error.contains("remains unsettled"), "{error}");
                 assert_eq!(
                     requests
                         .iter()
@@ -645,6 +686,164 @@ mod tests {
                     2
                 );
             }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn captured_owner_cancel_keeps_original_deadline_after_refresh() {
+        use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
+        use crate::cli::session::session_runtime::capture_admitted_auth_owner;
+        use axum::{
+            Json, Router,
+            http::HeaderMap,
+            routing::{delete, post},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        use tokio::sync::{Notify, mpsc};
+
+        async fn wait_for_phase<T>(receiver: &mut mpsc::UnboundedReceiver<T>, phase: &str) -> T {
+            // This is only an I/O watchdog. The cancellation deadline uses the
+            // independently paused Tokio clock, not this wall-clock allowance.
+            let started = std::time::Instant::now();
+            loop {
+                match receiver.try_recv() {
+                    Ok(value) => return value,
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(error) => panic!("{phase} channel closed: {error}"),
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "{phase} was not reached"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Positive control: the same response is valid under a genuinely longer
+        // deadline, so a transport/auth failure cannot masquerade as this regression.
+        for budget_ms in [400, 640] {
+            let _credentials = crate::tests::isolate_credentials();
+            let _identity =
+                crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                    "default",
+                    Some("cancel-owner"),
+                )
+                .unwrap();
+            // Proactively refresh before DELETE, as in the stale-duration regression.
+            // Reactive refresh would start a new loop and recompute its duration.
+            let token = "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature";
+            let mut creds = CredentialsFile::default();
+            creds.profiles.insert(
+                "default".into(),
+                Profile {
+                    account_id: Some("cancel-owner".into()),
+                    access_token: Some(token.into()),
+                    refresh_token: Some("old-refresh".into()),
+                    ..Default::default()
+                },
+            );
+            save_credentials(&creds).unwrap();
+            let refresh_calls = Arc::new(AtomicUsize::new(0));
+            let cancel_calls = Arc::new(AtomicUsize::new(0));
+            let release_refresh = Arc::new(Notify::new());
+            let release_cancel = Arc::new(Notify::new());
+            let (refresh_seen, mut refresh_arrivals) = mpsc::unbounded_channel();
+            let (cancel_seen, mut cancel_arrivals) = mpsc::unbounded_channel();
+            let refresh_count = refresh_calls.clone();
+            let refresh_gate = release_refresh.clone();
+            let cancel_count = cancel_calls.clone();
+            let cancel_gate = release_cancel.clone();
+            let app = Router::new()
+                .route("/auth/refresh", post(move |Json(body): Json<serde_json::Value>| {
+                    let (calls, seen, gate) = (refresh_count.clone(), refresh_seen.clone(), refresh_gate.clone());
+                    async move {
+                        assert_eq!(body["refresh_token"], "old-refresh");
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        seen.send(()).unwrap();
+                        gate.notified().await;
+                        Json(serde_json::json!({"user_id":"cancel-owner", "access_token":"new-cancel", "refresh_token":"new-refresh"}))
+                    }
+                }))
+                .route("/chat/runs/exact-owner-run", delete(move |headers: HeaderMap| {
+                    let (calls, seen, gate) = (cancel_count.clone(), cancel_seen.clone(), cancel_gate.clone());
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer new-cancel");
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        seen.send(()).unwrap();
+                        gate.notified().await;
+                        Json(serde_json::json!({"run_id":"exact-owner-run", "status":"cancelled", "execution_settled":true}))
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = astra_thin_client::ThinClient::new(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                None,
+            )
+            .unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let owner = capture_admitted_auth_owner(&api, None, token)
+                .await
+                .unwrap();
+            // The phase waiter remains runnable while real socket I/O proceeds;
+            // only explicit transitions below advance the paused clock.
+            tokio::time::pause();
+            let started = tokio::time::Instant::now();
+            let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+            let cancel = async {
+                let result = super::cancel_exact_run_until_settled_with_deadline(
+                    &api,
+                    token,
+                    "exact-owner-run",
+                    Some(&owner),
+                    started + Duration::from_millis(budget_ms),
+                )
+                .await;
+                completion_tx.send(result).unwrap();
+            };
+            let drive_phases = async {
+                wait_for_phase(&mut refresh_arrivals, "credential refresh").await;
+                tokio::time::advance(Duration::from_millis(240)).await;
+                release_refresh.notify_one();
+                // A received authenticated DELETE proves refresh and persistence
+                // completed, and that the HTTP phase really used the remaining time.
+                wait_for_phase(&mut cancel_arrivals, "authenticated cancellation").await;
+                tokio::time::advance(Duration::from_millis(170)).await;
+                // In the short case, wait for the timeout before releasing the
+                // response, so timer and response cannot race at the deadline.
+                if budget_ms == 400 {
+                    let result = wait_for_phase(&mut completion_rx, "cancellation timeout").await;
+                    release_cancel.notify_one();
+                    result
+                } else {
+                    release_cancel.notify_one();
+                    wait_for_phase(&mut completion_rx, "cancellation result").await
+                }
+            };
+            let ((), result) = tokio::join!(cancel, drive_phases);
+            let elapsed = started.elapsed();
+            tokio::time::resume();
+            server.abort();
+            if budget_ms == 400 {
+                let error = result.expect_err("refresh must not restart the cancellation budget");
+                assert!(
+                    error.contains("cancellation timed out"),
+                    "unexpected phase failure: {error}"
+                );
+            } else {
+                result.expect(
+                    "the same late response must settle when the deadline actually permits it",
+                );
+            }
+            assert_eq!(elapsed, Duration::from_millis(410));
+            assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
         }
     }
 
