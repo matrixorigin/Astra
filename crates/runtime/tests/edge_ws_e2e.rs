@@ -35,6 +35,9 @@ use tokio_tungstenite::{
 struct CapacityTestRegistry {
     record: Mutex<Option<astra_services::multi_agent::EdgeAgentRecord>>,
     unavailable: std::sync::atomic::AtomicBool,
+    block_unregister: std::sync::atomic::AtomicBool,
+    unregister_started: Notify,
+    continue_unregister: Notify,
 }
 
 #[async_trait]
@@ -116,6 +119,10 @@ impl astra_services::multi_agent::EdgeRegistryService for CapacityTestRegistry {
         agent: &str,
         socket: &str,
     ) -> Result<bool, String> {
+        if self.block_unregister.load(Ordering::SeqCst) {
+            self.unregister_started.notify_one();
+            self.continue_unregister.notified().await;
+        }
         let mut record = self.record.lock().unwrap();
         if record.as_ref().is_some_and(|row| {
             row.user_id == user && row.edge_agent_id == agent && row.edge_id == socket
@@ -444,11 +451,12 @@ struct TestEdgeDispatch {
     claim_limit: tokio::sync::Semaphore,
     gate_requests: AtomicUsize,
     gate_entered: tokio::sync::Notify,
-    block_release: std::sync::atomic::AtomicBool,
-    release_started: tokio::sync::Notify,
-    continue_release: tokio::sync::Notify,
-    release_returns_error: std::sync::atomic::AtomicBool,
-    release_calls: AtomicUsize,
+    block_settlement: std::sync::atomic::AtomicBool,
+    settlement_started: tokio::sync::Notify,
+    continue_settlement: tokio::sync::Notify,
+    settlement_returns_error: std::sync::atomic::AtomicBool,
+    settlement_fails_before_write: std::sync::atomic::AtomicBool,
+    settlement_calls: AtomicUsize,
 }
 
 impl Default for TestEdgeDispatch {
@@ -465,11 +473,12 @@ impl Default for TestEdgeDispatch {
             claim_limit: tokio::sync::Semaphore::new(4),
             gate_requests: AtomicUsize::new(0),
             gate_entered: tokio::sync::Notify::new(),
-            block_release: std::sync::atomic::AtomicBool::new(false),
-            release_started: tokio::sync::Notify::new(),
-            continue_release: tokio::sync::Notify::new(),
-            release_returns_error: std::sync::atomic::AtomicBool::new(false),
-            release_calls: AtomicUsize::new(0),
+            block_settlement: std::sync::atomic::AtomicBool::new(false),
+            settlement_started: tokio::sync::Notify::new(),
+            continue_settlement: tokio::sync::Notify::new(),
+            settlement_returns_error: std::sync::atomic::AtomicBool::new(false),
+            settlement_fails_before_write: std::sync::atomic::AtomicBool::new(false),
+            settlement_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -570,7 +579,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
         self.polls.fetch_add(1, Ordering::Relaxed);
-        let claimed = {
+        let mut claimed = {
             let mut rows = self.rows.lock().expect("test edge dispatch rows");
             let mut claimed = Vec::new();
             for row in rows.values_mut() {
@@ -598,6 +607,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
             }
             claimed
         };
+        claimed.sort_unstable_by(|left, right| left.request_id.cmp(&right.request_id));
         if self.pause_poll_result.swap(false, Ordering::SeqCst) {
             self.poll_started.notify_one();
             self.release_poll.notified().await;
@@ -605,32 +615,36 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         Ok(claimed)
     }
 
-    async fn release_unsent(
+    async fn settle_unsent(
         &self,
         edge_agent_id: &str,
-        identities: Vec<EdgeDispatchIdentity>,
+        receipts: Vec<(EdgeDispatchIdentity, String)>,
     ) -> Result<(), String> {
-        self.release_calls.fetch_add(1, Ordering::SeqCst);
-        if self.block_release.swap(false, Ordering::SeqCst) {
-            self.release_started.notify_one();
-            self.continue_release.notified().await;
+        self.settlement_calls.fetch_add(1, Ordering::SeqCst);
+        if self.block_settlement.swap(false, Ordering::SeqCst) {
+            self.settlement_started.notify_one();
+            self.continue_settlement.notified().await;
+        }
+        if self
+            .settlement_fails_before_write
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err("injected storage outage before settlement".into());
         }
         let mut rows = self.rows.lock().unwrap();
-        for identity in &identities {
+        for (identity, receipt) in &receipts {
             if let Some(row) = rows.get_mut(identity)
                 && row.edge_agent_id == edge_agent_id
                 && row.status == "dispatched"
             {
-                row.status = "pending".to_string();
+                row.status = "completed".to_string();
+                row.result_json = Some(receipt.clone());
             }
         }
         drop(rows);
         self.terminal.notify_waiters();
-        if self.release_returns_error.swap(false, Ordering::SeqCst) {
+        if self.settlement_returns_error.swap(false, Ordering::SeqCst) {
             return Err("injected lost response after commit".into());
-        }
-        if let Some(first) = identities.first() {
-            self.wake(&first.user_id, edge_agent_id);
         }
         Ok(())
     }
@@ -792,6 +806,13 @@ async fn spawn_test_server() -> (std::net::SocketAddr, AppState, tokio::task::Jo
 async fn spawn_test_server_with_dispatch(
     dispatch: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
 ) -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
+    spawn_test_server_with_services(dispatch, None).await
+}
+
+async fn spawn_test_server_with_services(
+    dispatch: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
+    registry: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
+) -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
     let state = AppState::new(
         ServiceInfo::new("edge-e2e-test", "0.0.0-test", ""),
         Arc::new(StubHealthChecker),
@@ -799,6 +820,11 @@ async fn spawn_test_server_with_dispatch(
     .with_auth_service(Arc::new(StubAuthService));
     let state = if let Some(dispatch) = dispatch {
         state.with_edge_dispatch_service(dispatch)
+    } else {
+        state
+    };
+    let state = if let Some(registry) = registry {
+        state.with_edge_registry_service(registry)
     } else {
         state
     };
@@ -1167,6 +1193,78 @@ async fn durable_relay_keeps_wake_arriving_during_empty_claim() {
 }
 
 #[tokio::test]
+async fn relay_batch_budget_rejects_only_unsent_work_and_keeps_socket_usable() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    dispatch.block_settlement.store(true, Ordering::SeqCst);
+    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-batch-budget";
+    let mut requests: Vec<_> = (60..63).map(test_relay_request).collect();
+    requests.sort_unstable_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
+    requests[1].1 = "{}".into();
+    for (identity, payload) in &requests {
+        dispatch
+            .insert_dispatch(identity, edge, payload)
+            .await
+            .unwrap();
+    }
+    let mut socket = ws_auth(addr, edge, "budget-host").await;
+    dispatch.wake("test-user-1", edge);
+    let sent: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sent["request_id"], requests[0].0.request_id);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        dispatch.settlement_started.notified(),
+    )
+    .await
+    .expect("the invalid second request must reach settlement");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::time::resume();
+    dispatch.continue_settlement.notify_one();
+    let unsent = dispatch
+        .wait_for_status("test-user-1", &requests[2].0.request_id, "completed")
+        .await;
+    let receipt: astra_thin_client::ToolResultRequest =
+        serde_json::from_str(unsent.result_json.as_ref().unwrap()).unwrap();
+    assert_eq!(receipt.status, "rejected");
+    assert!(receipt.output.contains("not sent"));
+    let fields = receipt.tool_result_fields.unwrap();
+    assert_eq!(fields["execution_fact"], "not_executed");
+    assert_eq!(fields["retryable"], true);
+    assert_eq!(fields["side_effects_maybe"], false);
+    dispatch
+        .wait_for_status("test-user-1", &requests[0].0.request_id, "dispatched")
+        .await;
+    socket
+        .send(Message::Text(
+            json!({"type": "edge_ping"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["type"], "edge_pong");
+    server.abort();
+}
+
+#[tokio::test]
 async fn disconnected_relay_keeps_claim_owner_until_all_unsent_rows_settle() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     dispatch.pause_poll_result.store(true, Ordering::SeqCst);
@@ -1200,7 +1298,7 @@ async fn disconnected_relay_keeps_claim_owner_until_all_unsent_rows_settle() {
     dispatch.release_poll.notify_one();
     for identity in [&first, &second] {
         dispatch
-            .wait_for_status("test-user-1", &identity.request_id, "pending")
+            .wait_for_status("test-user-1", &identity.request_id, "completed")
             .await;
     }
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1238,12 +1336,74 @@ async fn disconnected_relay_does_not_claim_after_waiting_for_a_permit() {
 }
 
 #[tokio::test]
+async fn disconnected_relay_does_not_redeliver_after_settlement_fails() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    dispatch.pause_poll_result.store(true, Ordering::SeqCst);
+    dispatch.block_settlement.store(true, Ordering::SeqCst);
+    dispatch
+        .settlement_fails_before_write
+        .store(true, Ordering::SeqCst);
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-settlement-outage";
+    let (identity, payload) = test_relay_request(58);
+    dispatch
+        .insert_dispatch(&identity, edge, &payload)
+        .await
+        .unwrap();
+    let socket = ws_auth(addr, edge, "outage-host").await;
+    dispatch.wake("test-user-1", edge);
+    tokio::time::timeout(Duration::from_secs(2), dispatch.poll_started.notified())
+        .await
+        .unwrap();
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state.edge_connection_pool.has_connected_edge("test-user-1") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    dispatch.release_poll.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        dispatch.settlement_started.notified(),
+    )
+    .await
+    .unwrap();
+    dispatch.continue_settlement.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while dispatch.claim_limit.available_permits() != 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    dispatch
+        .wait_for_status("test-user-1", &identity.request_id, "dispatched")
+        .await;
+    let mut replacement = ws_auth(addr, edge, "outage-host").await;
+    dispatch.wake("test-user-1", edge);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), replacement.next())
+            .await
+            .is_err(),
+        "an unconfirmed settlement must not make claimed work deliverable again"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
-    dispatch.block_release.store(true, Ordering::SeqCst);
-    dispatch.release_returns_error.store(true, Ordering::SeqCst);
+    let registry = Arc::new(CapacityTestRegistry::default());
+    registry.block_unregister.store(true, Ordering::SeqCst);
+    dispatch.block_settlement.store(true, Ordering::SeqCst);
+    dispatch
+        .settlement_returns_error
+        .store(true, Ordering::SeqCst);
     let reserved = dispatch.claim_limit.acquire_many(3).await.unwrap();
-    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let (addr, state, server) =
+        spawn_test_server_with_services(Some(dispatch.clone()), Some(registry.clone())).await;
     let edge = "edge-blocked-socket";
     for index in [55, 56] {
         let (identity, payload) = test_relay_request(index);
@@ -1270,9 +1430,19 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(15), dispatch.release_started.notified())
-        .await
-        .expect("socket write must time out and begin unsent-batch cleanup");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        dispatch.settlement_started.notified(),
+    )
+    .await
+    .expect("socket write must time out and begin unsent-batch cleanup");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        registry.unregister_started.notified(),
+    )
+    .await
+    .expect("registry unregistration must be blocked independently");
+    registry.block_unregister.store(false, Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(3), async {
         while state.edge_connection_pool.has_connected_edge("test-user-1") {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1288,7 +1458,7 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         .unwrap();
     let mut other = ws_auth(addr, "edge-fairness", "fair-host").await;
     dispatch.wake("test-user-1", "edge-fairness");
-    dispatch.continue_release.notify_one();
+    dispatch.continue_settlement.notify_one();
     let other_request = tokio::time::timeout(Duration::from_secs(2), other.next())
         .await
         .expect("another Edge must acquire the claim permit")
@@ -1298,12 +1468,21 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         .unwrap();
     let other_request: serde_json::Value = serde_json::from_str(&other_request).unwrap();
     assert_eq!(other_request["request_id"], other_identity.request_id);
-    assert_eq!(dispatch.release_calls.load(Ordering::SeqCst), 1);
+    registry.continue_unregister.notify_waiters();
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 1);
     let attempted = {
         let rows = dispatch.rows.lock().unwrap();
+        let settled: Vec<_> = rows
+            .values()
+            .filter(|row| row.edge_agent_id == edge && row.status == "completed")
+            .collect();
+        assert_eq!(settled.len(), 1);
+        let receipt: astra_thin_client::ToolResultRequest =
+            serde_json::from_str(settled[0].result_json.as_ref().unwrap()).unwrap();
+        assert_eq!(receipt.status, "rejected");
         assert_eq!(
-            rows.values().filter(|row| row.status == "pending").count(),
-            1
+            receipt.tool_result_fields.unwrap()["execution_fact"],
+            "not_executed"
         );
         let attempted: Vec<_> = rows
             .values()
@@ -1339,8 +1518,7 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut acknowledged = false;
-        let mut redelivered = false;
-        while !acknowledged || !redelivered {
+        while !acknowledged {
             let frame = replacement
                 .next()
                 .await
@@ -1351,14 +1529,19 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
             let message: serde_json::Value = serde_json::from_str(&frame).unwrap();
             match message["type"].as_str() {
                 Some("edge_tool_result_ack") => acknowledged = true,
-                Some("edge_tool_request") => redelivered = true,
                 other => panic!("unexpected Edge message: {other:?}"),
             }
         }
     })
     .await
-    .expect("late result must be acknowledged and the unsent request redelivered");
-    assert_eq!(dispatch.release_calls.load(Ordering::SeqCst), 1);
+    .expect("late result must be acknowledged");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), replacement.next())
+            .await
+            .is_err(),
+        "settled unsent work must not be redelivered on reconnect"
+    );
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 1);
     dispatch
         .wait_for_status("test-user-1", &attempted.identity.request_id, "completed")
         .await;

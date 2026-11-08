@@ -878,11 +878,23 @@ async fn handle_edge_connection(
                     for (idx, row) in rows.iter().enumerate() {
                         if dispatch_cancel_rx.has_changed().unwrap_or(true) {
                             drop(dispatch_sink);
-                            release_unsent_dispatches(dispatch_svc.as_ref(), &rows[idx..]).await;
+                            settle_unsent_dispatches(
+                                dispatch_svc.as_ref(),
+                                &rows[idx..],
+                                "the Edge disconnected",
+                                true,
+                            )
+                            .await;
                             break 'dispatch;
                         }
                         if tokio::time::Instant::now() >= deadline {
-                            release_unsent_dispatches(dispatch_svc.as_ref(), &rows[idx..]).await;
+                            settle_unsent_dispatches(
+                                dispatch_svc.as_ref(),
+                                &rows[idx..],
+                                "the Edge was busy",
+                                true,
+                            )
+                            .await;
                             break;
                         }
                         let msg = match decode_relay_edge_dispatch_payload(&row.payload_json) {
@@ -896,10 +908,11 @@ async fn handle_edge_connection(
                                     error = %error,
                                     "Edge dispatch relay failed to decode claimed payload; marking dispatch failed"
                                 );
-                                fail_claimed_edge_dispatch(
+                                settle_unsent_dispatches(
                                     dispatch_svc.as_ref(),
-                                    row,
-                                    "edge_dispatch_payload_decode_failed",
+                                    std::slice::from_ref(row),
+                                    "the dispatch payload was invalid",
+                                    false,
                                 )
                                 .await;
                                 continue;
@@ -918,17 +931,24 @@ async fn handle_edge_connection(
                                 reason,
                                 "Edge dispatch relay rejected workspace attestation for this materialization"
                             );
-                            fail_claimed_edge_dispatch(dispatch_svc.as_ref(), row, reason).await;
+                            settle_unsent_dispatches(
+                                dispatch_svc.as_ref(),
+                                std::slice::from_ref(row),
+                                reason,
+                                false,
+                            )
+                            .await;
                             continue;
                         }
                         let text = match serde_json::to_string(&msg) {
                             Ok(text) => text,
                             Err(error) => {
                                 tracing::warn!(%error, "unable to encode Edge dispatch");
-                                fail_claimed_edge_dispatch(
+                                settle_unsent_dispatches(
                                     dispatch_svc.as_ref(),
-                                    row,
-                                    "edge_dispatch_payload_encode_failed",
+                                    std::slice::from_ref(row),
+                                    "the dispatch payload could not be encoded",
+                                    false,
                                 )
                                 .await;
                                 continue;
@@ -947,7 +967,13 @@ async fn handle_edge_connection(
                                 "Edge dispatch relay rejected claimed dispatch because websocket cleanup is closing"
                             );
                             drop(dispatch_sink);
-                            release_unsent_dispatches(dispatch_svc.as_ref(), &rows[idx..]).await;
+                            settle_unsent_dispatches(
+                                dispatch_svc.as_ref(),
+                                &rows[idx..],
+                                "the Edge disconnected",
+                                true,
+                            )
+                            .await;
                             break 'dispatch;
                         }
                         let (attempted, sent) = {
@@ -998,12 +1024,18 @@ async fn handle_edge_connection(
                             );
                             // The Edge may already have received and executed
                             // an attempted request. Keep it claimed for result
-                            // replay; return only work not yet sent.
+                            // replay; settle only work not yet sent.
                             let (_, unregister) = tokio::join!(
-                                release_unsent_dispatches(
-                                    dispatch_svc.as_ref(),
-                                    &rows[idx + usize::from(attempted)..],
-                                ),
+                                async {
+                                    settle_unsent_dispatches(
+                                        dispatch_svc.as_ref(),
+                                        &rows[idx + usize::from(attempted)..],
+                                        "the Edge disconnected",
+                                        true,
+                                    )
+                                    .await;
+                                    drop(claim_permit);
+                                },
                                 unregister_durable_edge_generation(
                                     relay_registry.as_ref(),
                                     &dispatch_user_id,
@@ -1740,58 +1772,56 @@ mod inflight_dispatch_tracker_tests {
     }
 }
 
-async fn fail_claimed_edge_dispatch(
-    dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
-    row: &astra_services::multi_agent::EdgeDispatchRow,
-    reason: &'static str,
-) {
-    match dispatch
-        .fail_dispatch(&row.identity(), &row.edge_agent_id, reason)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                target: "astra_runtime::edge_ws",
-                user_id = %row.user_id,
-                edge_agent_id = %row.edge_agent_id,
-                request_id = %row.request_id,
-                reason,
-                "Edge dispatch relay failed to mark claimed dispatch terminal because row was already gone"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_runtime::edge_ws",
-                user_id = %row.user_id,
-                edge_agent_id = %row.edge_agent_id,
-                request_id = %row.request_id,
-                reason,
-                error = %error,
-                "Edge dispatch relay failed to mark claimed dispatch terminal"
-            );
-        }
-    }
-}
-
-async fn release_unsent_dispatches(
+async fn settle_unsent_dispatches(
     dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
     rows: &[astra_services::multi_agent::EdgeDispatchRow],
+    reason: &str,
+    retryable: bool,
 ) {
     let Some(first) = rows.first() else { return };
-    let identities = rows.iter().map(|row| row.identity()).collect();
-    if let Err(error) = dispatch
-        .release_unsent(&first.edge_agent_id, identities)
-        .await
-    {
-        // The update may have committed. Never retry it: another owner may
-        // already have claimed and started sending one of these rows.
+    let receipts = rows
+        .iter()
+        .map(|row| {
+            let guidance = if retryable {
+                "Try again when the Edge is ready."
+            } else {
+                "Check the request and Edge binding before retrying."
+            };
+            let mut result = astra_tools::ToolResult::error(format!(
+                "Tool request was not sent because {reason}. {guidance}"
+            ))
+            .with_execution_not_started();
+            let fields = result.metadata.get_or_insert_with(serde_json::Map::new);
+            fields.insert("retryable".into(), retryable.into());
+            fields.insert("side_effects_maybe".into(), false.into());
+            let receipt = astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: row.session_id.clone(),
+                    run_id: row.run_id.clone(),
+                    turn_chain_id: row.turn_chain_id.clone(),
+                    request_id: row.request_id.clone(),
+                    edge_agent_id: row.edge_agent_id.clone(),
+                    status: "rejected".into(),
+                    output: result.output,
+                    duration_ms: 0,
+                    tool_result_fields: result.metadata,
+                },
+            );
+            (
+                row.identity(),
+                serde_json::to_string(&receipt).expect("typed Edge receipt is serializable"),
+            )
+        })
+        .collect();
+    if let Err(error) = dispatch.settle_unsent(&first.edge_agent_id, receipts).await {
+        // The update may have committed. Neither terminal nor still-claimed
+        // rows can be delivered by another relay.
         tracing::warn!(
             user_id = %first.user_id,
             edge_agent_id = %first.edge_agent_id,
             count = rows.len(),
             %error,
-            "unable to confirm return of unsent Edge dispatches"
+            "unable to confirm settlement of unsent Edge dispatches"
         );
     }
 }

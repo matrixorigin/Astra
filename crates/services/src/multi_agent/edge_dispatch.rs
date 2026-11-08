@@ -208,15 +208,14 @@ pub trait EdgeDispatchService: Send + Sync {
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String>;
 
-    /// Return only rows the claim owner has not attempted to send. A caller
-    /// must submit a batch at most once: an error may follow a committed update,
-    /// after which another owner can already have claimed the rows.
-    async fn release_unsent(
+    /// Settle claimed rows the owner has not attempted to send with their
+    /// canonical non-execution receipts. Concurrent terminal results win.
+    async fn settle_unsent(
         &self,
         _edge_agent_id: &str,
-        _identities: Vec<EdgeDispatchIdentity>,
+        _receipts: Vec<(EdgeDispatchIdentity, String)>,
     ) -> Result<(), String> {
-        Err("returning unsent edge dispatches is unavailable".to_string())
+        Err("settling unsent edge dispatches is unavailable".to_string())
     }
 
     /// Subscribe to durable-admission wakeups. Database-backed implementations
@@ -535,13 +534,13 @@ impl EdgeDispatchWakeHub {
             };
 
             let mut failed = false;
-            let mut recovery = tokio::time::interval_at(
-                tokio::time::Instant::now() + EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
-                EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
-            );
-            recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut stalled = false;
             for batch in targets.chunks(EDGE_DISPATCH_WAKE_BATCH_SIZE) {
+                let mut recovery = tokio::time::interval_at(
+                    tokio::time::Instant::now() + EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
+                    EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
+                );
+                recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut stalled = false;
                 let query = self.pending_targets(batch);
                 tokio::pin!(query);
                 let result = loop {
@@ -1517,33 +1516,49 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(claimed_rows)
     }
 
-    async fn release_unsent(
+    async fn settle_unsent(
         &self,
         edge_agent_id: &str,
-        identities: Vec<EdgeDispatchIdentity>,
+        receipts: Vec<(EdgeDispatchIdentity, String)>,
     ) -> Result<(), String> {
-        let Some(first) = identities.first() else {
+        let Some((first, _)) = receipts.first() else {
             return Ok(());
         };
-        if identities
+        if receipts
             .iter()
-            .any(|identity| identity.user_id != first.user_id)
+            .any(|(identity, _)| identity.user_id != first.user_id)
         {
-            return Err("cannot return dispatches from different users in one batch".into());
+            return Err("cannot settle dispatches from different users in one batch".into());
         }
         let mut update = sqlx::QueryBuilder::<MySql>::new(
-            "UPDATE edge_pending_dispatch SET status = 'pending', dispatched_at = NULL \
-             WHERE status = 'dispatched' AND edge_agent_id = ",
+            "UPDATE edge_pending_dispatch SET status = 'completed', completed_at = NOW(6), \
+             result_json = CASE ",
         );
-        update.push_bind(edge_agent_id).push(" AND (");
-        for (index, identity) in identities.iter().enumerate() {
+        for (identity, receipt) in &receipts {
+            update
+                .push("WHEN session_id = ")
+                .push_bind(&identity.session_id)
+                .push(" AND run_id = ")
+                .push_bind(&identity.run_id)
+                .push(" AND turn_chain_id = ")
+                .push_bind(&identity.turn_chain_id)
+                .push(" AND request_id = ")
+                .push_bind(&identity.request_id)
+                .push(" THEN ")
+                .push_bind(receipt);
+        }
+        update
+            .push(" ELSE result_json END WHERE status = 'dispatched' AND edge_agent_id = ")
+            .push_bind(edge_agent_id)
+            .push(" AND user_id = ")
+            .push_bind(&first.user_id)
+            .push(" AND (");
+        for (index, (identity, _)) in receipts.iter().enumerate() {
             if index > 0 {
                 update.push(" OR ");
             }
             update
-                .push("(user_id = ")
-                .push_bind(&identity.user_id)
-                .push(" AND session_id = ")
+                .push("(session_id = ")
                 .push_bind(&identity.session_id)
                 .push(" AND run_id = ")
                 .push_bind(&identity.run_id)
@@ -1554,12 +1569,20 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 .push(")");
         }
         update.push(")");
-        update
+        let updated = update
             .build()
             .execute(&self.pool)
             .await
-            .map_err(|error| format!("edge_dispatch return unsent: {error}"))?;
-        self.wake_hub.notify(&first.user_id, edge_agent_id).await;
+            .map_err(|error| format!("edge_dispatch settle unsent: {error}"))?
+            .rows_affected();
+        if let Some(ref metrics) = self.metrics {
+            for _ in 0..updated {
+                saturating_decrement(&metrics.dispatch_queue_depth);
+            }
+            metrics
+                .dispatch_deliver_hits_total
+                .fetch_add(updated, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -2084,6 +2107,128 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_progressing_observer_wakes_only_the_pending_edge() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let admin = setup_edge_dispatch_db_it().await;
+        let database = format!("astra_test_progress_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+            .execute(admin.get())
+            .await
+            .unwrap();
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.database = database.clone();
+        let setup = astra_core::SharedPool::new(&settings).await.unwrap();
+        sqlx::query("CREATE TABLE edge_pending_dispatch (user_id VARCHAR(128), edge_agent_id VARCHAR(255), status VARCHAR(16))")
+            .execute(setup.get()).await.unwrap();
+
+        // Slow each response without stalling any individual query.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = (settings.host.clone(), settings.port);
+        let proxy = tokio::spawn(async move {
+            loop {
+                let (client, _) = listener.accept().await.unwrap();
+                let server = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+                tokio::spawn(async move {
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut server_read, mut server_write) = server.into_split();
+                    let requests = tokio::io::copy(&mut client_read, &mut server_write);
+                    let responses = async move {
+                        let mut buffer = [0; 16384];
+                        while let Ok(n) = server_read.read(&mut buffer).await {
+                            if n == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            if client_write.write_all(&buffer[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! { _ = requests => {}, _ = responses => {} }
+                });
+            }
+        });
+        settings.host = address.ip().to_string();
+        settings.port = address.port();
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(4)
+            .connect(&settings.database_url_with_password())
+            .await
+            .unwrap();
+        let hub = Arc::new(EdgeDispatchWakeHub::new(pool.clone()));
+        let targets: Vec<_> = (0..512)
+            .map(|i| ("idle-user".to_string(), format!("edge-{i}")))
+            .collect();
+        let (ordered, mut wakes) = {
+            let mut subscribers = hub.subscribers.lock().await;
+            let wakes = targets
+                .iter()
+                .map(|key| {
+                    let (sender, receiver) = tokio::sync::watch::channel(0);
+                    subscribers.insert(key.clone(), sender);
+                    (key.clone(), receiver)
+                })
+                .collect::<HashMap<_, _>>();
+            (subscribers.keys().cloned().collect::<Vec<_>>(), wakes)
+        };
+        let pending = ordered[EDGE_DISPATCH_WAKE_BATCH_SIZE * 3].clone();
+        sqlx::query("INSERT INTO edge_pending_dispatch VALUES (?, ?, 'pending')")
+            .bind(&pending.0)
+            .bind(&pending.1)
+            .execute(setup.get())
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(
+            hub.pending_targets(&ordered[..EDGE_DISPATCH_WAKE_BATCH_SIZE])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            started.elapsed() < EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
+            "individual observer query must complete inside the recovery interval"
+        );
+        let started = tokio::time::Instant::now();
+        hub.ensure_cross_pod_observer();
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            wakes.get_mut(&pending).unwrap().changed(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            started.elapsed() >= EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
+            "the pending Edge must be reached only after multiple batches"
+        );
+        assert!(
+            wakes
+                .iter()
+                .all(|(key, wake)| key == &pending || !wake.has_changed().unwrap()),
+            "a progressing multi-batch sweep must not wake idle Edges"
+        );
+        drop(wakes);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while hub.running.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        pool.close().await;
+        proxy.abort();
+        setup.get().close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+            .execute(admin.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
     async fn matrixone_slow_observer_preserves_recovery_and_pool_capacity() {
         let admin = setup_edge_dispatch_db_it().await;
         let database = format!("astra_test_wake_{}", Uuid::new_v4().simple());
@@ -2602,11 +2747,19 @@ mod tests {
         );
 
         let unsent = identity.for_request_id(format!("unsent-{request_id}"));
+        let same_request_other_session = EdgeDispatchIdentity::new(
+            &user_id,
+            format!("other-session-{request_id}"),
+            &identity.run_id,
+            &identity.turn_chain_id,
+            &unsent.request_id,
+        );
         let cancelled = identity.for_request_id(format!("cancelled-{request_id}"));
         let cancelled_after = identity.for_request_id(format!("cancelled-after-{request_id}"));
         let other_edge = identity.for_request_id(format!("other-edge-{request_id}"));
         for (row, edge) in [
             (&unsent, &edge_agent_id),
+            (&same_request_other_session, &edge_agent_id),
             (&cancelled, &edge_agent_id),
             (&cancelled_after, &edge_agent_id),
             (&other_edge, &other_edge_agent_id),
@@ -2619,7 +2772,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            3
+            4
         );
         assert_eq!(
             pod_b
@@ -2636,45 +2789,67 @@ mod tests {
                 .unwrap()
         );
         pod_b
-            .release_unsent(
+            .settle_unsent(
                 &edge_agent_id,
                 vec![
-                    unsent.clone(),
-                    cancelled.clone(),
-                    cancelled_after.clone(),
-                    other_edge.clone(),
+                    (unsent.clone(), r#"{"result":"unsent"}"#.into()),
+                    (
+                        same_request_other_session.clone(),
+                        r#"{"result":"other session"}"#.into(),
+                    ),
+                    (cancelled.clone(), r#"{"result":"cancelled"}"#.into()),
+                    (cancelled_after.clone(), r#"{"result":"settled"}"#.into()),
+                    (other_edge.clone(), r#"{"result":"wrong edge"}"#.into()),
                 ],
             )
             .await
-            .expect("return the untouched part of a claim in one update");
-        // A different Server must discover the persisted pending row without
-        // relying on the returning owner's in-process notification.
-        let recovering = DatabaseEdgeDispatchService::from_shared(&pool);
-        let mut recovered_wakeup = recovering
-            .subscribe_pending_wakeup(&user_id, &edge_agent_id)
-            .await
-            .unwrap()
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), recovered_wakeup.changed())
-            .await
-            .expect("another observer must discover the returned row")
-            .unwrap();
+            .expect("settle the untouched part of a claim in one update");
         assert!(
-            pod_c
+            !pod_c
                 .fail_dispatch(&cancelled_after, &edge_agent_id, "cancelled")
                 .await
                 .unwrap()
         );
-        let reclaimed = pod_c.poll_pending(&user_id, &edge_agent_id).await.unwrap();
-        assert_eq!(reclaimed.len(), 1);
-        assert_eq!(reclaimed[0].request_id, unsent.request_id);
+        assert_eq!(
+            pod_c
+                .wait_result(&unsent, Some(Duration::ZERO))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"result":"unsent"}"#)
+        );
+        assert_eq!(
+            pod_c
+                .wait_result(&cancelled_after, Some(Duration::ZERO))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"result":"settled"}"#)
+        );
+        assert_eq!(
+            pod_c
+                .wait_result(&same_request_other_session, Some(Duration::ZERO))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"result":"other session"}"#),
+            "equal request ids from different sessions must retain their own receipts"
+        );
+        assert!(
+            pod_c
+                .poll_pending(&user_id, &edge_agent_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "settled work must never be returned to the pending queue"
+        );
         assert!(
             pod_c
                 .poll_pending(&user_id, &other_edge_agent_id)
                 .await
                 .unwrap()
                 .is_empty(),
-            "returning unsent work must not reset a different Edge's claim"
+            "settling unsent work must not reset a different Edge's claim"
         );
         assert!(
             pod_c
@@ -2800,6 +2975,7 @@ mod tests {
         cleanup_edge_dispatch_fixture(&pool, &identity).await;
         cleanup_edge_dispatch_fixture(&pool, &other_identity).await;
         cleanup_edge_dispatch_fixture(&pool, &unsent).await;
+        cleanup_edge_dispatch_fixture(&pool, &same_request_other_session).await;
         cleanup_edge_dispatch_fixture(&pool, &cancelled).await;
         cleanup_edge_dispatch_fixture(&pool, &cancelled_after).await;
         cleanup_edge_dispatch_fixture(&pool, &other_edge).await;

@@ -170,13 +170,15 @@ Durable dispatch subscribes before a connection is published. The existing
 per-Server database observer discovers work admitted on another Server or
 before subscription; a wake only prompts the socket to claim durable work.
 There is no per-socket periodic dispatch query during normal observation.
-A stalled observation cycle wakes connections for bounded-concurrency
+A stalled observation query wakes connections for bounded-concurrency
 individual probes; failed batches also trigger their own recovery probes.
 Each claimed batch has a shared send budget so a slow Edge yields to other
-connections. Requests not yet sent return to `pending` in one conditional
-update; a request whose send was attempted remains `dispatched` for result
-replay. The owner never retries an unconfirmed return, since another Server
-may already have claimed the same request.
+connections. Requests known not to have been sent are settled in one
+conditional update with explicit non-execution results, including when the
+batch budget is exhausted. An attempted send remains `dispatched` for result
+replay. An unconfirmed settlement is not retried or returned to the queue.
+The claim permit is released as soon as settlement finishes; registry cleanup
+is independent and generation-fenced.
 Queries remain owned until they finish because disconnecting the database
 client does not guarantee server-side cancellation. On a panic or unknown query
 outcome, the observer rate-limits retries while sending recovery wakes, then
