@@ -115,9 +115,8 @@ pub struct MultiAgentMetrics {
     pub dispatch_cleanup_deleted_total: AtomicU64,
     /// Total wait_result calls that reached timeout without a terminal result.
     pub dispatch_wait_result_timeouts_total: AtomicU64,
-    /// Total claimed dispatches whose unsent settlement exited without a
-    /// confirmed terminal receipt after retries or settlement capacity was
-    /// exhausted. The durable row keeps `dispatched` with an unknown outcome.
+    /// Claimed, unsent dispatches whose durable terminalization could not be
+    /// confirmed. A write may have committed despite a lost response.
     pub dispatch_settlement_unknown_total: AtomicU64,
     /// Dispatch identities reported without a durable outcome after the
     /// database-observation unknown-error budget was exhausted.
@@ -224,7 +223,7 @@ impl MultiAgentMetrics {
         );
         target.register_counter(
             "astra_edge_dispatch_settlement_unknown_total",
-            "Total claimed edge dispatches whose unsent settlement exited without a confirmed terminal receipt",
+            "Total claimed, unsent edge dispatches whose durable terminalization could not be confirmed",
         );
         target.register_counter(
             "astra_edge_dispatch_observation_unknown_total",

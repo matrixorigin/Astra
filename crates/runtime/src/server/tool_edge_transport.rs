@@ -407,14 +407,17 @@ async fn try_edge_websocket(
             if let Some(authorization) = plan.runtime_edge_dispatch_authorization()
                 && let Err(error) = authorize_edge_dispatch(authorization, request).await
             {
-                return match dispatch
+                let terminalized = dispatch
                     .fail_dispatch(
                         &dispatch_identity,
                         &edge.edge_agent_id,
                         "provider authorization denied before delivery",
                     )
-                    .await
-                {
+                    .await;
+                if !matches!(&terminalized, Ok(true)) {
+                    dispatch.record_unconfirmed_direct_settlement();
+                }
+                return match terminalized {
                     Ok(true) => EdgeTransportAttempt::AdmissionRejected(error),
                     Ok(false) => EdgeTransportAttempt::AdmissionOutcomeUnknown(
                         "provider authorization was denied but the durable claim was no longer fail-able"
@@ -529,6 +532,7 @@ async fn try_edge_websocket(
                     .await,
                 Ok(true)
             ) {
+                dispatch.record_unconfirmed_direct_settlement();
                 result
                     .metadata
                     .get_or_insert_with(serde_json::Map::new)

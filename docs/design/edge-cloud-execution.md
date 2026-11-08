@@ -202,10 +202,14 @@ An attempted send remains `dispatched` for result replay. Each connection owns
 at most one claimed batch; claim queries, settlement owners, and active
 settlement queries have separate limits. Returned settlement errors retry for up to 30 seconds; an
 in-flight query remains owned until it returns. If ownership or retries are
-exhausted, the row stays `dispatched` with an unknown outcome and is never
+exhausted, the outcome is unconfirmed and the dispatch is not deliberately
 returned to the claimable queue. The
 `astra_edge_dispatch_settlement_unknown_total` counter records claimed
-dispatches whose settlement could not be confirmed. The
+unsent dispatches whose durable terminalization could not be confirmed,
+including direct delivery and relay settlement. A lost response may mean the
+write committed, or another terminal result may have won. Custom dispatch
+adapters must implement the direct-settlement reporting hook to include their
+direct outcomes. The
 `astra_edge_dispatch_observation_unknown_total` counter records dispatch
 identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
