@@ -918,6 +918,7 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn file_writer_drains_only_valid_json_lines() {
         let _credentials = crate::test_utils::isolate_credentials();

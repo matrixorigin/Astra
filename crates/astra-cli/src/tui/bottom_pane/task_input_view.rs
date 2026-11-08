@@ -21,6 +21,14 @@ use super::view::{
 
 enum InputPurpose {
     Guide(crate::tui::event_loop::AgentGuideTarget),
+    Returned {
+        target: crate::tui::event_loop::AgentGuideTarget,
+        intent_id: String,
+        uncertain: bool,
+    },
+    RootUnconfirmed {
+        intent_id: String,
+    },
     Continue(crate::tui::event_loop::SessionContinuationTarget),
     Shell {
         task_id: String,
@@ -32,6 +40,7 @@ pub(crate) struct TaskInputView {
     purpose: InputPurpose,
     input: TextArea,
     error: Option<String>,
+    acknowledged_unknown: Vec<String>,
     local_preview: Option<(String, String)>,
     completed: bool,
     pending_action: Option<ViewActionRequest>,
@@ -53,6 +62,7 @@ impl TaskInputView {
             },
             input,
             error,
+            acknowledged_unknown: Vec::new(),
             local_preview: None,
             completed: false,
             pending_action: None,
@@ -63,6 +73,7 @@ impl TaskInputView {
             purpose: InputPurpose::Guide(target),
             input: TextArea::new(),
             error: None,
+            acknowledged_unknown: Vec::new(),
             local_preview: None,
             completed: false,
             pending_action: None,
@@ -80,6 +91,7 @@ impl TaskInputView {
             purpose: InputPurpose::Continue(target),
             input,
             error,
+            acknowledged_unknown: Vec::new(),
             local_preview: None,
             completed: false,
             pending_action: None,
@@ -97,10 +109,67 @@ impl TaskInputView {
         view
     }
 
+    pub(crate) fn returned(
+        target: crate::tui::event_loop::AgentGuideTarget,
+        intent_id: String,
+        text: &str,
+        uncertain: bool,
+    ) -> Self {
+        let mut view = Self::new(target.clone());
+        view.purpose = InputPurpose::Returned {
+            target,
+            intent_id,
+            uncertain,
+        };
+        view.input.set_text(text);
+        view
+    }
+
+    pub(crate) fn returned_with_error(
+        target: crate::tui::event_loop::AgentGuideTarget,
+        intent_id: String,
+        text: &str,
+        error: &str,
+        acknowledged_unknown: Vec<String>,
+    ) -> Self {
+        let mut view = Self::returned(target, intent_id, text, false);
+        view.error = Some(error.into());
+        view.acknowledged_unknown = acknowledged_unknown;
+        view
+    }
+
+    pub(crate) fn unconfirmed_root(intent_id: String, text: &str) -> Self {
+        let mut input = TextArea::new();
+        input.set_text(text);
+        Self {
+            purpose: InputPurpose::RootUnconfirmed { intent_id },
+            input,
+            error: None,
+            acknowledged_unknown: Vec::new(),
+            local_preview: None,
+            completed: false,
+            pending_action: None,
+        }
+    }
+
     pub(crate) fn with_local_preview(mut self, preview: Option<(String, String)>) -> Self {
         self.local_preview =
             preview.filter(|(stdout, stderr)| !stdout.is_empty() || !stderr.is_empty());
         self
+    }
+
+    pub(crate) fn with_uncertain_draft(
+        target: crate::tui::event_loop::AgentGuideTarget,
+        draft: String,
+        earlier_intents: Vec<String>,
+    ) -> Self {
+        let mut view = Self::with_draft(
+            target,
+            draft,
+            "Earlier delivery is unknown and may arrive later. Enter again to send anyway.",
+        );
+        view.acknowledged_unknown = earlier_intents;
+        view
     }
 
     fn preview_height(&self, area: Rect) -> u16 {
@@ -122,6 +191,20 @@ impl TaskInputView {
     }
 
     fn submit(&mut self) {
+        if matches!(self.purpose, InputPurpose::RootUnconfirmed { .. })
+            || matches!(
+                self.purpose,
+                InputPurpose::Returned {
+                    uncertain: true,
+                    ..
+                }
+            )
+        {
+            self.error = Some(
+                "Delivery is unknown and may still be used. Copy or discard explicitly.".into(),
+            );
+            return;
+        }
         let content = if matches!(self.purpose, InputPurpose::Shell { .. }) {
             self.input.text().to_owned()
         } else {
@@ -136,7 +219,19 @@ impl TaskInputView {
                 InputPurpose::Guide(target) => BottomPaneViewAction::SubmitAgentGuide {
                     target: target.clone(),
                     content,
+                    acknowledged_unknown: self.acknowledged_unknown.clone(),
                 },
+                InputPurpose::Returned {
+                    target, intent_id, ..
+                } => BottomPaneViewAction::RetryReturnedAgentGuide {
+                    target: target.clone(),
+                    intent_id: intent_id.clone(),
+                    content,
+                    acknowledged_unknown: self.acknowledged_unknown.clone(),
+                },
+                InputPurpose::RootUnconfirmed { .. } => {
+                    unreachable!("unknown delivery cannot be retried")
+                }
                 InputPurpose::Continue(target) => BottomPaneViewAction::SubmitSessionContinuation {
                     target: target.clone(),
                     content,
@@ -163,16 +258,28 @@ impl BottomPaneView for TaskInputView {
         let theme = crate::tui::theme::current();
         let (title, name, state, placeholder) = match &self.purpose {
             InputPurpose::Guide(target) => (
-                " Guide ",
+                " Message ",
                 target.agent_name(),
-                " · active ",
-                "What should this agent adjust, inspect, or prioritize?",
+                " ",
+                "What would you like this agent to do?",
             ),
+            InputPurpose::Returned {
+                target, uncertain, ..
+            } => {
+                if *uncertain {
+                    (" Message ", target.agent_name(), " · delivery unknown ", "")
+                } else {
+                    (" Unsent message ", target.agent_name(), " · not used ", "")
+                }
+            }
+            InputPurpose::RootUnconfirmed { .. } => {
+                (" Message ", "main conversation", " · delivery unknown ", "")
+            }
             InputPurpose::Continue(_) => (
-                " Continue ",
+                " Next message ",
                 "main conversation",
-                " · next turn ",
-                "What should the conversation continue or change?",
+                " · after this turn ",
+                "What would you like to do next?",
             ),
             InputPurpose::Shell { task_id, .. } => (
                 " Send input ",
@@ -275,6 +382,69 @@ impl BottomPaneView for TaskInputView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if let InputPurpose::RootUnconfirmed { intent_id } = &self.purpose
+            && key.modifiers == crossterm::event::KeyModifiers::ALT
+        {
+            let action = match key.code {
+                KeyCode::Char('c') => Some(BottomPaneViewAction::CopyUnconfirmedRootGuidance {
+                    intent_id: intent_id.clone(),
+                    text: self.input.text().to_owned(),
+                }),
+                KeyCode::Char('d') => Some(BottomPaneViewAction::DismissUnconfirmedRootGuidance {
+                    intent_id: intent_id.clone(),
+                }),
+                _ => None,
+            };
+            if let Some(action) = action {
+                let disposition = if matches!(
+                    action,
+                    BottomPaneViewAction::DismissUnconfirmedRootGuidance { .. }
+                ) {
+                    ViewActionDisposition::Close
+                } else {
+                    ViewActionDisposition::KeepOpen
+                };
+                self.pending_action = Some(ViewActionRequest {
+                    action,
+                    disposition,
+                });
+                return;
+            }
+        }
+        if let InputPurpose::Returned {
+            target, intent_id, ..
+        } = &self.purpose
+        {
+            if key.modifiers == crossterm::event::KeyModifiers::ALT {
+                let action = match key.code {
+                    KeyCode::Char('c') => Some(BottomPaneViewAction::CopyReturnedAgentGuide {
+                        target: target.clone(),
+                        intent_id: intent_id.clone(),
+                        text: self.input.text().to_owned(),
+                    }),
+                    KeyCode::Char('d') => Some(BottomPaneViewAction::DismissReturnedAgentGuide {
+                        target: target.clone(),
+                        intent_id: intent_id.clone(),
+                    }),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    let disposition = if matches!(
+                        action,
+                        BottomPaneViewAction::DismissReturnedAgentGuide { .. }
+                    ) {
+                        ViewActionDisposition::Close
+                    } else {
+                        ViewActionDisposition::KeepOpen
+                    };
+                    self.pending_action = Some(ViewActionRequest {
+                        action,
+                        disposition,
+                    });
+                    return;
+                }
+            }
+        }
         if key.code == KeyCode::Char('d')
             && key
                 .modifiers
@@ -343,8 +513,22 @@ impl BottomPaneView for TaskInputView {
 
     fn hint_keys(&self) -> Option<String> {
         Some(
-            if matches!(self.purpose, InputPurpose::Shell { .. }) {
+            if matches!(self.purpose, InputPurpose::RootUnconfirmed { .. })
+                || matches!(
+                    self.purpose,
+                    InputPurpose::Returned {
+                        uncertain: true,
+                        ..
+                    }
+                )
+            {
+                "Alt+C copy · Alt+D discard · Esc keep"
+            } else if matches!(self.purpose, InputPurpose::Returned { .. }) {
+                "Enter retry · Alt+C copy · Alt+D discard · Esc keep original"
+            } else if matches!(self.purpose, InputPurpose::Shell { .. }) {
                 "Enter send line · Ctrl+D close input · Esc cancel"
+            } else if !self.acknowledged_unknown.is_empty() {
+                "Enter send anyway · Shift+Enter newline · Esc cancel"
             } else {
                 "Enter send · Shift+Enter newline · Esc cancel"
             }
@@ -431,11 +615,58 @@ mod tests {
                 action: BottomPaneViewAction::SubmitAgentGuide {
                     target: submitted_target,
                     content,
+                    acknowledged_unknown,
                 },
                 disposition: ViewActionDisposition::Close,
-            }) if submitted_target == target
+            }) if acknowledged_unknown.is_empty() && submitted_target == target
                 && content == "inspect the failing test"
         ));
+
+        let mut warned = TaskInputView::with_uncertain_draft(
+            target.clone(),
+            "second message".into(),
+            vec!["prior-intent".into()],
+        );
+        assert!(warned.hint_keys().unwrap().contains("Enter send anyway"));
+        warned.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            warned.take_action_request(),
+            Some(ViewActionRequest {
+                action: BottomPaneViewAction::SubmitAgentGuide {
+                    target: submitted_target,
+                    content,
+                    acknowledged_unknown: prior,
+                },
+                disposition: ViewActionDisposition::Close,
+            }) if submitted_target == target && content == "second message" && prior == ["prior-intent"]
+        ));
+
+        let mut uncertain =
+            TaskInputView::returned(target, "unknown".into(), "first message", true);
+        uncertain.handle_key(key(KeyCode::Enter));
+        assert!(uncertain.take_action_request().is_none());
+        assert!(
+            uncertain
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("may still be used")
+        );
+        uncertain.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        assert!(
+            matches!(uncertain.take_action_request(), Some(ViewActionRequest {
+            action: BottomPaneViewAction::DismissReturnedAgentGuide { intent_id, .. }, ..
+        }) if intent_id == "unknown")
+        );
+        let mut root = TaskInputView::unconfirmed_root("root".into(), "first message");
+        root.handle_key(key(KeyCode::Enter));
+        assert!(root.take_action_request().is_none());
+        root.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        assert!(
+            matches!(root.take_action_request(), Some(ViewActionRequest {
+            action: BottomPaneViewAction::DismissUnconfirmedRootGuidance { intent_id }, ..
+        }) if intent_id == "root")
+        );
     }
 
     #[test]

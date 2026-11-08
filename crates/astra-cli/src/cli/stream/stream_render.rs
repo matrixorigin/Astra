@@ -1307,6 +1307,10 @@ struct CliSseStreamHost<'a> {
     last_context_window_policy: Option<(u64, u64)>,
     /// Last durable server run identity forwarded to active-run controls.
     last_bound_run_id: Option<String>,
+    /// Identity is essential to route live input. Publish it reliably at the
+    /// next async render boundary instead of sampling it with token events.
+    pending_session_binding: Option<String>,
+    pending_run_binding: Option<String>,
     /// Last provider-confirmed input occupancy forwarded to observers.
     last_context_window_measured: Option<Option<u64>>,
     /// Last provider-normalized request lanes forwarded to observers.
@@ -1830,6 +1834,8 @@ impl<'a> CliSseStreamHost<'a> {
             last_context_system_prompt_tokens: None,
             last_context_window_policy: None,
             last_bound_run_id: None,
+            pending_session_binding: None,
+            pending_run_binding: None,
             last_context_window_measured: None,
             last_request_token_usage: None,
             stream_event_sink: ctx.stream_event_sink,
@@ -4084,7 +4090,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
         // The shared SSE consumer de-duplicates this stream's identity. A
         // resumed executor already having the id does not bind a new observer.
-        self.try_emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id.into()));
+        self.pending_session_binding = Some(session_id.into());
         if let Some(pm) = self.perm_manager.as_mut() {
             pm.set_active_session_id(session_id);
         }
@@ -4102,9 +4108,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             match self.last_bound_run_id.as_deref() {
                 None => {
                     self.last_bound_run_id = Some(run_id.to_string());
-                    self.try_emit_stream_event(chat_stream::StreamEvent::RunBound(
-                        run_id.to_string(),
-                    ));
+                    self.pending_run_binding = Some(run_id.to_string());
                 }
                 Some(bound) if bound != run_id => {
                     tracing::warn!(
@@ -4188,6 +4192,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
+        if let Some(session_id) = self.pending_session_binding.take() {
+            self.emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id))
+                .await;
+        }
+        if let Some(run_id) = self.pending_run_binding.take() {
+            self.emit_stream_event(chat_stream::StreamEvent::RunBound(run_id))
+                .await;
+        }
         // Forward to stream event channel (even when quiet/suppress are on)
         if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
             use crate::cli::chat_stream::StreamEvent;
@@ -8206,6 +8218,95 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn edge_identity_binding_survives_backpressure_and_respects_cancellation() {
+        for cancel_while_blocked in [false, true] {
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+            let root = tempdir().unwrap();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
+                .await
+                .unwrap();
+            let mut cache = EdgeToolCache::new(8);
+            let mut host = CliSseStreamHost::from_edge_ctx(
+                EdgeSseContext {
+                    api: &api,
+                    token: "unused",
+                    executor_id: "unused",
+                    executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(
+                        root.path(),
+                    )),
+                    render_policy: RenderPolicy::Silent,
+                    perm_manager: None,
+                    cancel_token: Some(&cancel),
+                    stream_event_tx: Some(tx),
+                    stream_event_sink: None,
+                    approval_request_tx: None,
+                    ask_user_request_tx: None,
+                    skill_resolver: None,
+                    compensate_non_file_on_failure: false,
+                    tool_cache: &mut cache,
+                    incremental_state: None,
+                    request_session_execution_lease: None,
+                },
+                80,
+                false,
+            );
+            host.on_session_id("session");
+            let accum = ChatTurnSseAccum {
+                run_id: Some("run".into()),
+                ..Default::default()
+            };
+            host.on_accum_update(&accum);
+            {
+                let delivery = host.on_render_effects(vec![]);
+                tokio::pin!(delivery);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                        .await
+                        .is_err()
+                );
+                if cancel_while_blocked {
+                    cancel.cancel();
+                    tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        rx.recv().await,
+                        Some(chat_stream::StreamEvent::StatusLine(_))
+                    ));
+                } else {
+                    assert!(matches!(
+                        rx.recv().await,
+                        Some(chat_stream::StreamEvent::StatusLine(_))
+                    ));
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        matches!(rx.recv().await, Some(chat_stream::StreamEvent::SessionBound(id)) if id == "session")
+                    );
+                    tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(rx.recv().await, Some(chat_stream::StreamEvent::RunBound(id)) if id == "run")
+                    );
+                }
+            }
+            host.on_accum_update(&accum);
+            host.on_accum_update(&ChatTurnSseAccum {
+                run_id: Some("conflict".into()),
+                ..Default::default()
+            });
+            host.on_render_effects(vec![]).await;
+            assert!(rx.try_recv().is_err());
+        }
+    }
 
     #[tokio::test]
     async fn hook_config_diagnostics_reach_silent_tui_under_backpressure() {

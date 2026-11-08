@@ -326,6 +326,39 @@ impl CliOwnerAuthSnapshot {
             }
     }
 
+    /// A new authenticated binding for the same account may inspect its old
+    /// local drafts. This does not authorize effects using the old binding.
+    pub(crate) fn same_presentation_owner(&self, other: &Self) -> bool {
+        self == other
+            || (self.server_account_id.is_some()
+                && self.server_account_id == other.server_account_id
+                && self.profile_name == other.profile_name
+                && self.owner_scope == other.owner_scope)
+    }
+
+    pub(crate) fn can_view_local_draft(&self) -> bool {
+        if self.is_current() {
+            return true;
+        }
+        let (profile, account) = installed_cli_owner_metadata();
+        if account.is_none()
+            || self.server_account_id != account
+            || self.profile_name != profile
+            || self.owner_scope != astra_services::local_owner_scope()
+        {
+            return false;
+        }
+        let Some(profile) = profile else { return false };
+        if let Some(binding) = crate::cli::native_auth::active() {
+            return binding.profile_name() == profile;
+        }
+        let key = (credential_store().path().clone(), profile);
+        astra_core::sync_poison::recover_mutex_lock(&LEGACY_AUTH_BINDINGS)
+            .get(&key)
+            .and_then(|entry| entry.binding.upgrade())
+            .is_some_and(|binding| binding.is_active())
+    }
+
     pub(crate) async fn access_token(&self) -> Option<String> {
         let binding = self.legacy_binding.as_ref()?;
         let pair = binding.pair.lock().await;

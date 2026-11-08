@@ -419,28 +419,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── Help ────────────────────────────────────────────────────
-        "/help" => match help_command_route(args) {
-            HelpCommandRoute::Commands => {
-                use crate::tui::bottom_pane::help_view::HelpView;
-                ctx.open_view("Opened command help", Box::new(HelpView::new()));
-                SlashResult::Handled
-            }
-            HelpCommandRoute::Keys => {
-                use crate::tui::bottom_pane::info_view::InfoView;
-                ctx.open_view(
-                    "Opened keyboard shortcuts",
-                    Box::new(InfoView::from_key_value(
-                        "Keyboard shortcuts",
-                        keyboard_shortcut_pairs(),
-                    )),
-                );
-                SlashResult::Handled
-            }
-            HelpCommandRoute::Unsupported => {
-                ctx.show_error("Usage: /help [keys]".into());
-                SlashResult::Handled
-            }
-        },
+        "/help" => {
+            open_help(args, ctx.bottom_pane, ctx.chat_widget);
+            SlashResult::Handled
+        }
 
         // ── Auth forms (inline TUI card instead of dropping out to
         //    bare-terminal prompts that looked disjoint and stole keys) ─
@@ -2951,6 +2933,65 @@ fn help_command_route(args: &str) -> HelpCommandRoute {
     }
 }
 
+fn open_help(
+    args: &str,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) {
+    use crate::tui::bottom_pane::{help_view::HelpView, info_view::InfoView};
+    match help_command_route(args) {
+        HelpCommandRoute::Commands => {
+            chat_widget.commit_system(SystemCell::response("Opened command help"));
+            bottom_pane.push_view(Box::new(HelpView::new()));
+        }
+        HelpCommandRoute::Keys => {
+            chat_widget.commit_system(SystemCell::response("Opened keyboard shortcuts"));
+            bottom_pane.push_view(Box::new(InfoView::from_key_value(
+                "Keyboard shortcuts",
+                keyboard_shortcut_pairs(),
+            )));
+        }
+        HelpCommandRoute::Unsupported => {
+            chat_widget.commit_system(SystemCell::error("Usage: /help [keys]"))
+        }
+    }
+}
+
+pub(crate) fn open_active_help(
+    text: &str,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) -> bool {
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return false;
+    };
+    let (command, args) = parse_slash(text);
+    if !matches!(command_registry::resolve_command(command), Ok("/help")) {
+        return false;
+    }
+    open_help(args, bottom_pane, chat_widget);
+    true
+}
+
+pub(crate) fn active_permission_command(
+    text: &str,
+) -> Option<crate::cli::permission_command::PermissionCommandAction<'_>> {
+    use crate::cli::permission_command::{PermissionCommandAction, parse_permission_command};
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return None;
+    };
+    let (command, args) = parse_slash(text);
+    if !matches!(command_registry::resolve_command(command), Ok("/allow")) {
+        return None;
+    }
+    match parse_permission_command(args) {
+        action @ (PermissionCommandAction::ChooseMode | PermissionCommandAction::SetMode(_)) => {
+            Some(action)
+        }
+        _ => None,
+    }
+}
+
 /// Key bindings that are meaningful in the current workbench.  This is an
 /// action-oriented panel, not a dump of every editor binding: it answers the
 /// user's high-frequency questions about recovery, transcript navigation,
@@ -2978,6 +3019,10 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
         (
             "Ctrl+G",
             "open the run navigator; Enter/Right opens the selected conversation".into(),
+        ),
+        (
+            "Alt+U",
+            "review unsent or unconfirmed messages".into(),
         ),
         (
             "Shift+Left/Right",
@@ -3046,6 +3091,27 @@ pub(crate) fn is_model_picker_request(text: &str) -> bool {
         && matches!(args.trim(), "" | "list")
 }
 
+/// Direct model choices are configuration for future turns. Management and
+/// info remain separate actions, and a bare `/model` opens the picker.
+pub(crate) fn active_model_override(text: &str) -> Option<Option<String>> {
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return None;
+    };
+    let (command, args) = parse_slash(text);
+    if !matches!(command_registry::resolve_command(command), Ok("/model")) {
+        return None;
+    }
+    let args = args.trim();
+    let (sub, _) = split_sub(args);
+    if args.is_empty() || matches!(sub, "list" | "add" | "manage" | "info") {
+        return None;
+    }
+    if sub == "clear" {
+        return Some(None);
+    }
+    Some(crate::cli::cli_config::cli_utils::normalize_model_override(Some(args)).map(str::to_owned))
+}
+
 /// Build the model picker view from a fetched model list and push it.
 ///
 /// This is deliberately a synchronous UI projection: networking belongs to
@@ -3057,12 +3123,20 @@ pub(crate) fn push_model_picker(
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
     models: Vec<String>,
 ) -> bool {
+    push_model_picker_for_choice(state.model.as_ref(), bottom_pane, chat_widget, models)
+}
+
+pub(crate) fn push_model_picker_for_choice(
+    current: Option<&crate::cli::session::session_state::SessionModelChoice>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    models: Vec<String>,
+) -> bool {
     // Strip any `-thinking:*` suffix from the cached model when
     // highlighting the current row — the picker shows base names only,
     // and the suffix is re-applied by the thinking stage.
-    let current_raw = state
-        .model
-        .as_deref()
+    let current_raw = current
+        .map(|choice| &**choice)
         .map(str::to_string)
         .unwrap_or_default();
     let current_base = current_raw
@@ -3078,7 +3152,7 @@ pub(crate) fn push_model_picker(
         .iter()
         .map(|row| row.name.as_str())
         .eq(models.iter().map(String::as_str));
-    let selected_id = match state.model.as_ref() {
+    let selected_id = match current {
         Some(crate::cli::session::session_state::SessionModelChoice::Selected(choice)) => {
             Some(choice.offering_id.as_str())
         }
@@ -3141,6 +3215,23 @@ pub(crate) fn apply_model_picker_result(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) -> Option<bool> {
+    match prepare_model_picker_result(result, bottom_pane, chat_widget)? {
+        Ok(Some(selection)) => {
+            apply_model_selection(state, bottom_pane, chat_widget, selection);
+            Some(false)
+        }
+        Ok(None) => Some(true),
+        Err(()) => Some(false),
+    }
+}
+
+/// Validate the same catalog and thinking selection for both idle and active turns.
+/// `Ok(None)` means the second picker is now open.
+pub(crate) fn prepare_model_picker_result(
+    result: &ViewResult,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+) -> Option<Result<Option<crate::cli::session::session_runtime::ServerModelSelection>, ()>> {
     let (base_model, config) = match result {
         ViewResult::Model { name } => (name, None),
         ViewResult::ModelThinking { base_model, config } => (base_model, Some(config)),
@@ -3149,7 +3240,8 @@ pub(crate) fn apply_model_picker_result(
     let entry = crate::cli::session::session_runtime::find_model_entry_by_name(
         bottom_pane.current_model_catalog(),
         base_model,
-    );
+    )
+    .filter(|entry| crate::cli::session::session_runtime::model_list_entry_is_active(entry));
     let resolved = entry.and_then(|entry| {
         crate::cli::session::session_runtime::model_selection_from_list_entry(entry)
             .map(|selection| (entry, selection))
@@ -3158,7 +3250,7 @@ pub(crate) fn apply_model_picker_result(
         chat_widget.commit_system(SystemCell::error(
             "Selected model is no longer available in this account's catalog. Reopen /model.",
         ));
-        return Some(false);
+        return Some(Err(()));
     };
     let protocol = entry.thinking_protocol.unwrap_or_default();
     let personal_responses = entry.access_kind
@@ -3189,7 +3281,7 @@ pub(crate) fn apply_model_picker_result(
             chat_widget.commit_system(SystemCell::error(
                 "Selected thinking mode is no longer supported. Reopen /model.",
             ));
-            return Some(false);
+            return Some(Err(()));
         }
     } else if !opts.is_empty() {
         let items = opts
@@ -3222,18 +3314,27 @@ pub(crate) fn apply_model_picker_result(
                     .collect(),
             ),
         ));
-        return Some(true);
+        return Some(Ok(None));
     }
     let suffix = config
         .map(astra_turn_core::thinking_config::thinking_suffix_for)
         .unwrap_or_default();
     let name = format!("{}{suffix}", entry.name);
     selection.name = name.clone();
+    Some(Ok(Some(selection)))
+}
+
+pub(crate) fn apply_model_selection(
+    state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    selection: crate::cli::session::session_runtime::ServerModelSelection,
+) {
+    let name = selection.name.clone();
     state.cli_context.select_model(Some(&name));
     state.model = Some(crate::cli::session::session_state::SessionModelChoice::Selected(selection));
     bottom_pane.footer.model = Some(name.clone());
     chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
-    Some(false)
 }
 
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
@@ -3266,26 +3367,29 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         ctx.show_error("Model name cannot be empty — choose one with `/model`.".into());
         return;
     }
-    let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
-        ctx.state.cli_context.select_model(None);
-        ctx.state.model = None;
-        ctx.bottom_pane.footer.model = None;
-        ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
-        return;
-    };
-    ctx.state.cli_context.select_model(Some(name));
-    ctx.state.model = Some((name.to_string()).into());
-    ctx.bottom_pane.footer.model = Some(name.to_string());
-    ctx.show_response(format!("Set model to {name}"));
+    let name = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name));
+    apply_requested_model(ctx.state, ctx.bottom_pane, ctx.chat_widget, name);
+}
+
+pub(crate) fn apply_requested_model(
+    state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    name: Option<&str>,
+) {
+    state.cli_context.select_model(name);
+    state.model = name.map(|name| name.to_owned().into());
+    bottom_pane.footer.model = name.map(str::to_owned);
+    chat_widget.commit_system(SystemCell::response(match name {
+        Some(name) => format!("Set model to {name}"),
+        None => "Model selection cleared — choose a model before the next turn.".into(),
+    }));
 }
 
 /// `/model clear` — unset the session model. Reports the change to
 /// scrollback so the user sees the footer switch.
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    ctx.state.cli_context.select_model(None);
-    ctx.state.model = None;
-    ctx.bottom_pane.footer.model = None;
-    ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
+    apply_requested_model(ctx.state, ctx.bottom_pane, ctx.chat_widget, None);
     SlashResult::Handled
 }
 
@@ -4082,6 +4186,21 @@ mod routing_tests {
         assert!(!is_model_picker_request("/model info"));
         assert!(!is_model_picker_request("/model gpt-5"));
         assert!(!is_model_picker_request("/context"));
+        assert_eq!(
+            super::active_model_override("/model gpt-5"),
+            Some(Some("gpt-5".into()))
+        );
+        assert_eq!(super::active_model_override("/model clear"), Some(None));
+        for text in [
+            "/model",
+            "/model list",
+            "/model info",
+            "/model add",
+            "/model manage",
+            "please use /model gpt-5",
+        ] {
+            assert_eq!(super::active_model_override(text), None, "{text}");
+        }
     }
 
     #[test]

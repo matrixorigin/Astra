@@ -188,6 +188,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::ClientUpdateNotice(_)
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
+        | TuiAppEvent::ObservedUserIntent { .. }
         | TuiAppEvent::PermissionAutoApproved { .. } => None,
     }
 }

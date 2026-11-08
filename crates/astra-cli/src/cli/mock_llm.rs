@@ -354,6 +354,7 @@ struct ServerState {
     callback_ready: Arc<tokio::sync::Notify>,
     emitted_text: Arc<Mutex<Vec<(String, String)>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
+    held_binding_release: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Keep tool dispatch and continuation under one Server-owned response. Dropping
@@ -606,6 +607,9 @@ fn server_orchestration_response(state: ServerState) -> Response<axum::body::Bod
         let call = "mock-control-call";
         let mut body = String::new();
         if phase == 0 {
+            if let Some(release) = &state.held_binding_release {
+                release.notified().await;
+            }
             body.push_str(&session_info(root));
             let agents = snapshot.runs.iter().enumerate().map(|(index, run)| serde_json::json!({
                 "slot_index": index, "id": format!("review-{}", index+1),
@@ -1273,23 +1277,33 @@ pub struct MockLlmServer {
     completed_fanout_children: Arc<AtomicU8>,
     cancelled_runs: Arc<Mutex<Vec<String>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
+    held_binding_release: Option<Arc<tokio::sync::Notify>>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 impl MockLlmServer {
     /// Start the mock server on a random free port. Returns immediately.
     pub async fn start(scenario: MockScenario) -> Result<Self, String> {
-        Self::start_inner(scenario, false, Router::new()).await
+        Self::start_inner(scenario, false, false, Router::new()).await
     }
 
     /// Add boundary-specific protocol fixtures alongside the scripted chat.
     pub async fn start_with_routes(scenario: MockScenario, routes: Router) -> Result<Self, String> {
-        Self::start_inner(scenario, false, routes).await
+        Self::start_inner(scenario, false, false, routes).await
     }
 
     /// Hold a Server orchestration stream until the test releases its terminal
     /// facts. Partial fanout results are published explicitly by the test.
     pub async fn start_with_held_orchestration(scenario: MockScenario) -> Result<Self, String> {
+        Self::start_with_held_orchestration_and_routes(scenario, false, Router::new()).await
+    }
+
+    /// Add protocol routes while retaining deterministic orchestration timing.
+    pub async fn start_with_held_orchestration_and_routes(
+        scenario: MockScenario,
+        hold_binding: bool,
+        routes: Router,
+    ) -> Result<Self, String> {
         if !matches!(
             scenario,
             MockScenario::AgentThenComplete
@@ -1298,19 +1312,20 @@ impl MockLlmServer {
         ) {
             return Err("held orchestration requires an agent or fanout scenario".to_string());
         }
-        Self::start_inner(scenario, true, Router::new()).await
+        Self::start_inner(scenario, true, hold_binding, routes).await
     }
 
     /// Start the slow-response fixture at an explicit provider boundary.
     /// The test releases the response only after it has observed the UI state
     /// under test, so cancellation coverage cannot race a fixed sleep.
     pub async fn start_with_held_slow_response(read_routes: Router) -> Result<Self, String> {
-        Self::start_inner(MockScenario::Slow, true, read_routes).await
+        Self::start_inner(MockScenario::Slow, true, false, read_routes).await
     }
 
     async fn start_inner(
         scenario: MockScenario,
         hold_response: bool,
+        hold_binding: bool,
         read_routes: Router,
     ) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1325,6 +1340,7 @@ impl MockLlmServer {
         let completed_fanout_children = Arc::new(AtomicU8::new(0));
         let cancelled_runs = Arc::new(Mutex::new(Vec::new()));
         let held_response_release = hold_response.then(|| Arc::new(tokio::sync::Notify::new()));
+        let held_binding_release = hold_binding.then(|| Arc::new(tokio::sync::Notify::new()));
         let state = ServerState {
             scenario,
             call_count: Arc::new(AtomicU32::new(0)),
@@ -1336,6 +1352,7 @@ impl MockLlmServer {
             callback_ready: Arc::new(tokio::sync::Notify::new()),
             emitted_text: Arc::new(Mutex::new(Vec::new())),
             held_response_release: held_response_release.clone(),
+            held_binding_release: held_binding_release.clone(),
         };
 
         let app = Router::new()
@@ -1379,6 +1396,7 @@ impl MockLlmServer {
             completed_fanout_children,
             cancelled_runs,
             held_response_release,
+            held_binding_release,
             _shutdown: tx,
         })
     }
@@ -1418,6 +1436,13 @@ impl MockLlmServer {
         self.held_response_release
             .as_ref()
             .expect("mock server was not started with a held response")
+            .notify_one();
+    }
+
+    pub fn release_held_binding(&self) {
+        self.held_binding_release
+            .as_ref()
+            .expect("mock server was not started with a held binding")
             .notify_one();
     }
 }
@@ -1597,9 +1622,10 @@ mod tests {
             MockScenario::FanoutThenComplete,
             MockScenario::FanoutPartialThenComplete,
         ] {
-            let server = super::MockLlmServer::start_inner(scenario, true, axum::Router::new())
-                .await
-                .unwrap();
+            let server =
+                super::MockLlmServer::start_inner(scenario, true, false, axum::Router::new())
+                    .await
+                    .unwrap();
             let mut response = astra_core::net::client_builder_for_target(&server.base_url)
                 .build()
                 .unwrap()

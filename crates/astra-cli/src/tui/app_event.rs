@@ -107,6 +107,12 @@ pub(crate) enum TuiAppEvent {
         event_index: usize,
         content: String,
     },
+    /// A durable disposition observed outside the foreground stream drain.
+    /// The physical turn identity prevents a late result crossing turn ownership.
+    ObservedUserIntent {
+        turn_id: String,
+        event: Box<TuiAppEvent>,
+    },
     AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
     AgentLiveBatch(Vec<astra_turn_core::agent_live_event::AgentLiveEvent>),
     AgentLiveGap(astra_turn_core::agent_live_event::AgentLiveGap),

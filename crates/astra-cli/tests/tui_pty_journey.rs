@@ -552,6 +552,181 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_turn_guidance_sends_messages_in_order_while_first_ack_is_delayed() {
+    use axum::{
+        Json,
+        extract::Path,
+        http::{StatusCode, header},
+        routing::{get, post},
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let _journey = pty_journey_lock().lock().await;
+    let received = Arc::new(Mutex::new(Vec::<(String, String, u64)>::new()));
+    let sequence = Arc::new(AtomicUsize::new(0));
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let release_rejection = Arc::new(tokio::sync::Notify::new());
+    let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let routes = axum::Router::new()
+        .route(
+            "/chat/runs/{run_id}/intents",
+            post({
+                let received = received.clone();
+                let sequence = sequence.clone();
+                let release_first = release_first.clone();
+                let release_rejection = release_rejection.clone();
+                move |Path(run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+                    let received = received.clone();
+                    let sequence = sequence.clone();
+                    let release_first = release_first.clone();
+                    let release_rejection = release_rejection.clone();
+                    let sent_tx = sent_tx.clone();
+                    async move {
+                        let n = sequence.fetch_add(1, Ordering::SeqCst);
+                        let intent_id = body["intent_id"].as_str().unwrap().to_string();
+                        let text = body["input"]["content"].as_str().unwrap().to_string();
+                        let index = (n as u64) * 2 + 1;
+                        let rejected = text == "needs correction";
+                        if !rejected {
+                            received
+                                .lock()
+                                .unwrap()
+                                .push((intent_id.clone(), text.clone(), index));
+                        }
+                        sent_tx.send((run_id.clone(), text)).unwrap();
+                        if n == 0 {
+                            release_first.notified().await;
+                        }
+                        if rejected {
+                            release_rejection.notified().await;
+                            (StatusCode::FORBIDDEN, Json(serde_json::json!({"detail": "Please correct this message"})))
+                        } else {
+                            (StatusCode::OK, Json(serde_json::json!({
+                                "run_id": run_id, "intent_id": intent_id,
+                                "status": "accepted_remote", "duplicate": false, "event_index": index
+                            })))
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/chat/runs/{run_id}/stream",
+            get({
+                let received = received.clone();
+                move |Path(run_id): Path<String>| {
+                    let received = received.clone();
+                    async move {
+                        let body = received
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|(intent_id, text, index)| {
+                                format!(
+                                    "data: {}\n\n",
+                                    serde_json::json!({
+                                        "type": "user_intent_applied", "run_id": run_id,
+                                        "intent_id": intent_id, "delivery": "guide_current_run",
+                                        "status": "applied", "event_index": index,
+                                        "content": text, "index": index + 1
+                                    })
+                                )
+                            })
+                            .collect::<String>();
+                        ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                    }
+                }
+            }),
+        );
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
+        astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+        true,
+        routes,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.paste_and_submit("Start a review.");
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().is_empty() {
+        assert!(Instant::now() < deadline, "turn did not reach the server");
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    astra.paste_and_submit("first instruction");
+    astra.wait_for("first instruction", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("second instruction");
+    astra.wait_for("second instruction", UI_TRANSITION_TIMEOUT);
+    assert!(
+        sent_rx.try_recv().is_err(),
+        "guidance cannot be sent before run binding"
+    );
+    mock.release_held_binding();
+    let first = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        sent_rx.try_recv().is_err(),
+        "second message overtook the delayed first acknowledgement"
+    );
+    release_first.notify_one();
+    let second = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first,
+        ("mock-run-agent-root".into(), "first instruction".into())
+    );
+    assert_eq!(
+        second,
+        ("mock-run-agent-root".into(), "second instruction".into())
+    );
+    astra.paste_and_submit("needs correction");
+    let rejected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.1, "needs correction");
+    astra.paste_and_submit("later pending");
+    astra.wait_for("later pending", UI_TRANSITION_TIMEOUT);
+    assert!(
+        sent_rx.try_recv().is_err(),
+        "queued input must wait for the prior result"
+    );
+    release_rejection.notify_one();
+    astra.wait_for("403", UI_TRANSITION_TIMEOUT);
+    assert!(astra.current_screen().contains("needs correction"));
+    assert!(astra.current_screen().contains("later pending"));
+    assert!(
+        sent_rx.try_recv().is_err(),
+        "a rejected message must not let later input overtake it"
+    );
+    astra.write(&[0x03]); // Clear the nonempty draft without stopping the task.
+    astra.wait_for_absent("later pending", UI_TRANSITION_TIMEOUT);
+    assert!(mock.cancelled_runs().is_empty());
+    astra.paste_and_submit("corrected instruction");
+    let corrected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        corrected,
+        ("mock-run-agent-root".into(), "corrected instruction".into())
+    );
+    mock.release_held_response();
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}
+
 fn seed_account(home: &std::path::Path) {
     // Exercise the authenticated account binding used by production run controls.
     astra_credentials::CredentialStore::with_path(home.join(".astra/credentials.json"))
@@ -566,6 +741,119 @@ fn seed_account(home: &std::path::Path) {
             );
         })
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_model_picker_applies_to_a_queued_next_turn() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration(
+        astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    seed_account(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("Start the current task.");
+    astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
+
+    // Queue a message first: the new choice governs all turns not yet started.
+    astra.write(b"\x1b[200~queued follow-up\x1b[201~\x11");
+    astra.wait_for("queued follow-up", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/model");
+    astra.wait_for("Select model", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b");
+    astra.wait_for_absent("Select model", UI_TRANSITION_TIMEOUT);
+    assert_eq!(
+        mock.received_requests().len(),
+        1,
+        "cancelling the picker must leave the run alone"
+    );
+    astra.paste_and_submit("/model");
+    astra.wait_for("Select model", UI_TRANSITION_TIMEOUT);
+    astra.write(b"gpt-5");
+    astra.wait_for("gpt-5", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("applies after this task", UI_TRANSITION_TIMEOUT);
+    assert_eq!(
+        mock.received_requests().len(),
+        1,
+        "choosing a model must not interrupt the current run"
+    );
+
+    mock.release_held_response();
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "queued message did not start\n{}",
+            astra.screen_diagnostic()
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    let requests = mock.received_requests();
+    assert_eq!(requests[1]["message"], "queued follow-up");
+    assert!(
+        requests[1].to_string().contains("gpt-5"),
+        "next turn did not use the chosen model: {}",
+        requests[1]
+    );
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_permission_command_shows_requested_until_execution_applies_it() {
+    use axum::{Json, extract::Path, routing::post};
+    let _journey = pty_journey_lock().lock().await;
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let routes = axum::Router::new().route(
+        "/chat/runs/{run_id}/permission-mode",
+        post(
+            move |Path(run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    requests.send((run_id, body.clone())).unwrap();
+                    Json(serde_json::json!({
+                        "request_id": body["request_id"], "mode": body["mode"], "revision": 1
+                    }))
+                }
+            },
+        ),
+    );
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
+        astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+        false,
+        routes,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    seed_account(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("Start the current task.");
+    astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/allow read_only");
+    let (run_id, body) = tokio::time::timeout(UI_TRANSITION_TIMEOUT, received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run_id, "mock-run-agent-root");
+    assert_eq!(body["expected_session_id"], "mock-session");
+    assert_eq!(body["mode"], "plan");
+    astra.wait_for("requested: Read-only", UI_TRANSITION_TIMEOUT);
+    assert!(
+        astra.current_screen().contains("Ask"),
+        "unapplied mode must not replace the live policy"
+    );
+    mock.release_held_response();
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1823,7 +2111,7 @@ async fn live_child_pause_guidance_resume_preserves_execution_identity() {
     let value = format!("release-{}", uuid::Uuid::new_v4().simple());
     let guidance = "正式版刚更新了，请重新读取 final.txt；最终把发布代码转成大写，只输出代码。";
     astra.write(b"g");
-    astra.wait_for("What should this agent", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("What would you like this agent", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit(guidance);
     astra.write(&[0x07]);
     astra.select_conversation_run(child_id, 2, Some("P pause/resume/continue"));

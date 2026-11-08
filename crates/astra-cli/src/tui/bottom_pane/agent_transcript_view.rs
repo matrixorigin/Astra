@@ -1247,6 +1247,14 @@ impl AgentTranscriptView {
     }
 
     fn apply_live_event(&mut self, event: &AgentLiveEvent) -> bool {
+        let changed = self.apply_live_event_without_rebuild(event);
+        if changed {
+            self.rebuild_transcript();
+        }
+        changed
+    }
+
+    fn apply_live_event_without_rebuild(&mut self, event: &AgentLiveEvent) -> bool {
         if event.run_id.trim().is_empty() {
             return false;
         }
@@ -1443,7 +1451,6 @@ impl AgentTranscriptView {
             &self.items,
             Some(&event.kind),
         );
-        self.rebuild_transcript();
         true
     }
 }
@@ -2398,6 +2405,17 @@ impl BottomPaneView for AgentTranscriptView {
         self.apply_live_event(event)
     }
 
+    fn refresh_agent_live_events(&mut self, events: &[AgentLiveEvent]) -> bool {
+        let mut changed = false;
+        for event in events {
+            changed |= self.apply_live_event_without_rebuild(event);
+        }
+        if changed {
+            self.rebuild_transcript();
+        }
+        changed
+    }
+
     fn refresh_agent_live_gap(
         &mut self,
         gap: &astra_turn_core::agent_live_event::AgentLiveGap,
@@ -2406,6 +2424,9 @@ impl BottomPaneView for AgentTranscriptView {
             return false;
         }
         if self.run_id.trim().is_empty() {
+            if gap.agent_id != self.agent_id {
+                return false;
+            }
             self.run_id = gap.run_id.clone();
             self.error = None;
         } else if gap.run_id != self.run_id {
@@ -5068,6 +5089,96 @@ mod tests {
             }),
             "a reused profile must not leak a gap into another run's transcript"
         );
+    }
+
+    #[test]
+    fn unbound_agent_view_ignores_another_agents_gap() {
+        let mut view = AgentTranscriptView::live_unbound(
+            "agent-a".into(),
+            "A".into(),
+            String::new(),
+            None,
+            "agents",
+            80,
+            24,
+        );
+        assert!(
+            !view.refresh_agent_live_gap(&astra_turn_core::agent_live_event::AgentLiveGap {
+                run_id: "run-b".into(),
+                agent_id: "agent-b".into(),
+                dropped_event_count: 1,
+            })
+        );
+        assert!(view.has_pending_agent_transcript_identity());
+        assert!(
+            view.refresh_agent_live_gap(&astra_turn_core::agent_live_event::AgentLiveGap {
+                run_id: "run-a".into(),
+                agent_id: "agent-a".into(),
+                dropped_event_count: 1,
+            })
+        );
+        assert_eq!(view.run_id, "run-a");
+    }
+
+    #[test]
+    fn live_batch_preserves_the_same_conversation_and_terminal_refresh_as_single_events() {
+        let mut single = loading_view(80, 24);
+        let mut batch = loading_view(80, 24);
+        single.apply_page(page(), true, AgentTranscriptSource::DurableServer);
+        batch.apply_page(page(), true, AgentTranscriptSource::DurableServer);
+        let events = vec![
+            AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::ThinkingDelta {
+                    model_item_id: Some("thinking".into()),
+                    text: "Checking ".into(),
+                },
+            },
+            AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("answer".into()),
+                    text: "Found ".into(),
+                },
+            },
+            AgentLiveEvent {
+                agent_id: "other".into(),
+                run_id: "other-run".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: "wrong agent".into(),
+                },
+            },
+            AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("answer".into()),
+                    text: "the answer".into(),
+                },
+            },
+            AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                    duration_ms: 1,
+                    reason: None,
+                },
+            },
+        ];
+        for event in &events {
+            single.refresh_agent_live_event(event);
+        }
+        assert!(batch.refresh_agent_live_events(&events));
+        assert_eq!(rendered(&batch), rendered(&single));
+        assert_eq!(
+            batch.take_action_request().map(|r| r.action),
+            single.take_action_request().map(|r| r.action)
+        );
+        assert!(!rendered(&batch).contains("wrong agent"));
     }
 
     #[test]

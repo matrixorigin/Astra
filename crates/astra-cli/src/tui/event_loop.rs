@@ -116,8 +116,53 @@ enum ModelCatalogEffect {
     Ready {
         owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
         attachment_epoch: u64,
+        initial_bound_session: Option<Arc<std::sync::Mutex<Option<String>>>>,
         result: Result<Vec<astra_services::ModelListItemResponse>, String>,
     },
+}
+
+enum NextModelSelection {
+    Picked {
+        result: Box<bottom_pane::view::ViewResult>,
+        selection: crate::cli::session::session_runtime::ServerModelSelection,
+    },
+    Requested(Option<String>),
+}
+
+fn active_model_picker_choice(
+    staged: Option<&NextModelSelection>,
+    current: Option<&crate::cli::session::session_state::SessionModelChoice>,
+) -> Option<crate::cli::session::session_state::SessionModelChoice> {
+    match staged {
+        None => current.cloned(),
+        Some(NextModelSelection::Picked { selection, .. }) => Some(
+            crate::cli::session::session_state::SessionModelChoice::Selected(selection.clone()),
+        ),
+        Some(NextModelSelection::Requested(name)) => name.clone().map(Into::into),
+    }
+}
+
+fn spawn_model_catalog_request(
+    api: astra_thin_client::ThinClient,
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    attachment_epoch: u64,
+    initial_bound_session: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    tx: tokio::sync::mpsc::Sender<ModelCatalogEffect>,
+    tasks: &mut tokio::task::JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let result = crate::cli::session::session_runtime::fetch_owner_model_catalog(&api, &owner)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = tx
+            .send(ModelCatalogEffect::Ready {
+                owner,
+                attachment_epoch,
+                initial_bound_session,
+                result,
+            })
+            .await;
+    });
 }
 
 enum LoginEffect {
@@ -1133,12 +1178,45 @@ fn apply_model_catalog_effect(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
 ) -> bool {
+    apply_model_catalog_effect_for_choice(
+        effect,
+        state.model.as_ref(),
+        state.session_id.as_deref(),
+        state.session_attachment_epoch,
+        bottom_pane,
+        chat_widget,
+    )
+}
+
+fn apply_model_catalog_effect_for_choice(
+    effect: ModelCatalogEffect,
+    model: Option<&crate::cli::session::session_state::SessionModelChoice>,
+    current_session: Option<&str>,
+    current_epoch: u64,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> bool {
     let ModelCatalogEffect::Ready {
         owner,
         attachment_epoch,
+        initial_bound_session,
         result,
     } = effect;
-    if attachment_epoch != state.session_attachment_epoch || !owner.is_current() {
+    let bound_from_initial = current_epoch == attachment_epoch.saturating_add(1)
+        && initial_bound_session.as_ref().is_some_and(|binding| {
+            astra_core::sync_poison::recover_mutex_lock(binding)
+                .as_deref()
+                .is_some_and(|session| {
+                    current_session == Some(session) && chat_widget.session_id() == session
+                })
+        });
+    if !owner.is_current() {
+        return false;
+    }
+    if attachment_epoch != current_epoch && !bound_from_initial {
+        chat_widget.commit_system(history_cell::system::SystemCell::info(
+            "Session changed before the model picker opened. Open /model again.",
+        ));
         return false;
     }
     match result {
@@ -1149,13 +1227,26 @@ fn apply_model_catalog_effect(
                 .map(ToOwned::to_owned)
                 .collect();
             bottom_pane.cache_model_catalog(catalog);
-            slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, names)
+            slash_dispatch::push_model_picker_for_choice(model, bottom_pane, chat_widget, names)
         }
         Err(error) => {
             chat_widget.commit_system(history_cell::system::SystemCell::error(error));
             false
         }
     }
+}
+
+fn model_selection_attachment_matches(
+    start_session: Option<&str>,
+    start_epoch: u64,
+    current_session: Option<&str>,
+    current_epoch: u64,
+    observed_session: &str,
+) -> bool {
+    (start_epoch == current_epoch && start_session == current_session)
+        || (start_session.is_none()
+            && current_epoch == start_epoch.saturating_add(1)
+            && current_session.is_some_and(|session| session == observed_session))
 }
 
 fn load_worktree_entries() -> Vec<crate::tui::worktrees::model::WorktreeEntry> {
@@ -2748,6 +2839,21 @@ fn settle_followup_submissions(
     (!restored.is_empty()).then_some(restored)
 }
 
+/// Put locally held guidance back among explicitly queued next-turn entries
+/// at the positions captured when the user sent it.
+fn merge_unsubmitted_guidance(
+    queued: &mut VecDeque<NextTurnSubmission>,
+    intents: Vec<bottom_pane::PendingUserIntent>,
+) {
+    for (inserted, intent) in intents.into_iter().enumerate() {
+        let position = intent
+            .next_turn_position
+            .saturating_add(inserted)
+            .min(queued.len());
+        queued.insert(position, NextTurnSubmission::Guidance(intent));
+    }
+}
+
 /// Returning input must preserve its purpose and captured authority. Only
 /// interactive entries may return to the command-aware composer.
 fn restore_queued_input(entries: VecDeque<NextTurnSubmission>, bottom_pane: &mut BottomPane) {
@@ -2755,6 +2861,9 @@ fn restore_queued_input(entries: VecDeque<NextTurnSubmission>, bottom_pane: &mut
     for entry in entries {
         match entry {
             NextTurnSubmission::Interactive(text) => interactive.push(text),
+            NextTurnSubmission::Guidance(intent) => {
+                bottom_pane.retain_returned_root_guidance(intent);
+            }
             NextTurnSubmission::Conversation { target, content } => {
                 bottom_pane.push_workbench_input(Box::new(
                     bottom_pane::task_input_view::TaskInputView::for_continuation(
@@ -2791,45 +2900,11 @@ fn active_submission_routes_to_next_turn(
     text: &str,
     output_has_settled: bool,
     guidance_admission_closed: bool,
-    follow_up_deferred_before_bind: bool,
+    earlier_next_turn_pending: bool,
 ) -> bool {
     guidance_admission_closed
-        || follow_up_deferred_before_bind
+        || earlier_next_turn_pending
         || active_submission_belongs_to_next_turn(text, output_has_settled)
-}
-
-/// Current-run guidance needs the durable server run id from `RunBound`.
-/// Until that identity exists, a follow-up stays on the next-turn queue.
-/// An empty id is not a target.
-fn follow_up_waits_for_unbound_run(remote_run_id: Option<&str>) -> bool {
-    remote_run_id
-        .map(str::trim)
-        .filter(|run_id| !run_id.is_empty())
-        .is_none()
-}
-
-/// Queue one model-facing follow-up while the durable run id is still absent.
-/// The first queued message latches the rest of this turn onto the next-turn
-/// FIFO, so a later `RunBound` cannot deliver a newer message ahead of it.
-/// Keeping this branch shared by the event loop and its regression test is
-/// deliberate: this path must not open a remote guidance submission.
-fn defer_follow_up_before_run_bind(
-    text: &str,
-    remote_run_id: Option<&str>,
-    follow_up_deferred_before_bind: &mut bool,
-    bottom_pane: &mut BottomPane,
-    chat_widget: &mut chat_widget::ChatWidget,
-) -> bool {
-    if !follow_up_waits_for_unbound_run(remote_run_id) {
-        return false;
-    }
-    if bottom_pane.queue_next_turn_submission(text.to_string()) {
-        *follow_up_deferred_before_bind = true;
-        chat_widget.commit_system(history_cell::system::SystemCell::info(
-            UNBOUND_RUN_FOLLOW_UP_NOTICE.to_string(),
-        ));
-    }
-    true
 }
 
 /// Handle the one active-run slash command that is a pure navigation action.
@@ -2876,9 +2951,11 @@ fn should_start_queued_followups(
 }
 
 fn model_facing_followup_backlog(queued: &VecDeque<NextTurnSubmission>) -> bool {
-    queued.iter().any(|entry| {
-        matches!(entry, NextTurnSubmission::Conversation { .. })
-            || !slash_dispatch::parse_submission(entry.text()).is_command()
+    queued.iter().any(|entry| match entry {
+        NextTurnSubmission::Guidance(_) | NextTurnSubmission::Conversation { .. } => true,
+        NextTurnSubmission::Interactive(text) => {
+            !slash_dispatch::parse_submission(text).is_command()
+        }
     })
 }
 
@@ -2956,7 +3033,7 @@ fn handoff_queued_followups(
         }
         restore_queued_input(std::mem::take(queued_followup_submissions), bottom_pane);
         chat_widget.commit_system(history_cell::system::SystemCell::info(
-            "A message queued for the previous Session was kept in the composer after the Session changed. Review it before sending.".to_string(),
+            "Session changed. Unsent messages were kept for review.".to_string(),
         ));
         return QueuedFollowupHandoff::RestoredAfterSessionChange;
     }
@@ -3017,6 +3094,13 @@ fn consume_queued_handoff(
         return None;
     }
     let next = queue.pop_front()?;
+    if let NextTurnSubmission::Guidance(intent) = &next
+        && !bottom_pane.can_restore_root_guidance(intent)
+    {
+        queue.push_front(next);
+        restore_queued_input(std::mem::take(queue), bottom_pane);
+        return None;
+    }
     if let NextTurnSubmission::Conversation { target, .. } = &next
         && !target
             .0
@@ -3037,8 +3121,13 @@ fn resume_queued_followups_after_modal(
     followup_replay_armed: &mut bool,
     gate: FollowupReleaseGate,
 ) -> QueuedFollowupHandoff {
-    let handoff =
-        handoff_queued_followups(queued_followup_submissions, bottom_pane, chat_widget, gate);
+    let handoff = handoff_after_session_update(
+        queued_followup_submissions,
+        bottom_pane,
+        chat_widget,
+        state,
+        gate,
+    );
     schedule_queued_handoff(
         &handoff,
         state,
@@ -3046,6 +3135,17 @@ fn resume_queued_followups_after_modal(
         followup_replay_armed,
     );
     handoff
+}
+
+fn handoff_after_session_update(
+    queued_followup_submissions: &mut VecDeque<NextTurnSubmission>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    state: &crate::cli::session::session_state::SessionState,
+    gate: FollowupReleaseGate,
+) -> QueuedFollowupHandoff {
+    bottom_pane.set_session_attachment(state.session_id.as_deref(), state.session_attachment_epoch);
+    handoff_queued_followups(queued_followup_submissions, bottom_pane, chat_widget, gate)
 }
 
 fn schedule_queued_handoff(
@@ -3229,6 +3329,15 @@ fn primary_guidance_disposition_event(
     }
 }
 
+fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Option<TuiAppEvent> {
+    match event {
+        TuiAppEvent::ObservedUserIntent { turn_id, event } => {
+            (current_turn == Some(turn_id.as_str())).then_some(*event)
+        }
+        event => Some(event),
+    }
+}
+
 struct PrimaryGuidanceObserverClaim(
     std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
 );
@@ -3277,6 +3386,7 @@ where
 async fn project_primary_guidance_disposition(
     tui_tx: &stream_bridge::TuiAppEventTx,
     run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+    turn_id: &str,
     disposition: TuiAppEvent,
 ) -> Option<bool> {
     let intent_id = match &disposition {
@@ -3287,9 +3397,12 @@ async fn project_primary_guidance_disposition(
     let active_run_control = run_control.upgrade()?;
     let projection_ack = active_run_control.remote_disposition_projection_ack(intent_id);
     drop(active_run_control);
+    let scoped = TuiAppEvent::ObservedUserIntent {
+        turn_id: turn_id.to_owned(),
+        event: Box::new(disposition),
+    };
     let _delivery =
-        await_guidance_future_while_owner_alive(tui_tx.send(disposition.clone()), run_control)
-            .await?;
+        await_guidance_future_while_owner_alive(tui_tx.send(scoped), run_control).await?;
     if !projection_ack.wait().await {
         return None;
     }
@@ -3300,8 +3413,10 @@ async fn project_primary_guidance_disposition(
 fn spawn_primary_guidance_reconciliation(
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     tui_tx: stream_bridge::TuiAppEventTx,
     run_control: std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>,
+    turn_id: String,
     receipt: crate::cli::turn::local_run_control::UserIntentReceipt,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let run_id = receipt.run_id?;
@@ -3328,6 +3443,9 @@ fn spawn_primary_guidance_reconciliation(
         // resolves by stable intent_id.
         let mut retry_delay = Duration::from_millis(100);
         loop {
+            if !owner.is_current() {
+                return;
+            }
             {
                 let Some(run_control) = run_control.upgrade() else {
                     return;
@@ -3337,7 +3455,7 @@ fn spawn_primary_guidance_reconciliation(
                 }
             }
             let Some(token) = await_guidance_future_while_owner_alive(
-                crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref()),
+                owner_bound_access_token(&api, &owner, profile.as_deref()),
                 &run_control,
             )
             .await
@@ -3386,6 +3504,7 @@ fn spawn_primary_guidance_reconciliation(
                             let Some(observer_is_idle) = project_primary_guidance_disposition(
                                 &tui_tx,
                                 &run_control,
+                                &turn_id,
                                 disposition,
                             )
                             .await
@@ -3443,6 +3562,7 @@ fn spawn_primary_guidance_reconciliation(
 struct ActiveRunGuidanceRequest<'a> {
     api: &'a astra_thin_client::ThinClient,
     profile: Option<&'a str>,
+    owner: &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     remote_run_id: &'a std::sync::Arc<std::sync::Mutex<Option<String>>>,
     run_control: &'a std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
     intent_id: &'a str,
@@ -3451,12 +3571,29 @@ struct ActiveRunGuidanceRequest<'a> {
     work_unit_observations: &'a [astra_core::work_unit::WorkUnitObservation],
 }
 
+pub(super) async fn owner_bound_access_token(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    profile: Option<&str>,
+) -> Option<String> {
+    if !owner.is_current() {
+        return None;
+    }
+    let token = if owner.native_binding.is_some() || owner.legacy_binding.is_some() {
+        crate::cli::session::session_runtime::owner_access_token(api, owner, None).await
+    } else {
+        crate::cli::session::session_runtime::fresh_access_token(api, profile).await
+    };
+    owner.is_current().then_some(token).flatten()
+}
+
 async fn submit_active_run_guidance(
     request: ActiveRunGuidanceRequest<'_>,
 ) -> Result<crate::cli::turn::local_run_control::UserIntentReceipt, GuidanceSubmissionError> {
     let ActiveRunGuidanceRequest {
         api,
         profile,
+        owner,
         remote_run_id,
         run_control,
         intent_id,
@@ -3478,7 +3615,7 @@ async fn submit_active_run_guidance(
     )
     .map_err(GuidanceSubmissionError::Rejected)?;
     let submission = async {
-        let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+        let token = owner_bound_access_token(api, owner, profile)
             .await
             .ok_or_else(|| {
                 GuidanceSubmissionError::Rejected(
@@ -3492,6 +3629,14 @@ async fn submit_active_run_guidance(
         };
         let mut last_unconfirmed = None;
         for attempt in 0..2 {
+            if !owner.is_current() {
+                return Err(match last_unconfirmed {
+                    Some(previous) => GuidanceSubmissionError::Unconfirmed(previous),
+                    None => GuidanceSubmissionError::Rejected(
+                        "Sign-in changed before the message was sent.".into(),
+                    ),
+                });
+            }
             match api
                 .submit_run_user_intent(Some(&token), &run_id, &request)
                 .await
@@ -3518,10 +3663,25 @@ async fn submit_active_run_guidance(
                 }
                 Err(error) => match GuidanceSubmissionError::from_thin_client(error) {
                     GuidanceSubmissionError::Rejected(error) => {
-                        return Err(GuidanceSubmissionError::Rejected(error));
+                        // A rejection of the retry does not prove that the
+                        // earlier request failed to commit. Keep its original
+                        // identity until the server's disposition is known.
+                        return Err(if let Some(previous) = last_unconfirmed {
+                            GuidanceSubmissionError::Unconfirmed(format!(
+                                "{previous} Retry was rejected: {error}"
+                            ))
+                        } else {
+                            GuidanceSubmissionError::Rejected(error)
+                        });
                     }
                     GuidanceSubmissionError::GuidanceClosed(notice) => {
-                        return Err(GuidanceSubmissionError::GuidanceClosed(notice));
+                        return Err(if let Some(previous) = last_unconfirmed {
+                            GuidanceSubmissionError::Unconfirmed(format!(
+                                "{previous} The retry found that the run had finished."
+                            ))
+                        } else {
+                            GuidanceSubmissionError::GuidanceClosed(notice)
+                        });
                     }
                     GuidanceSubmissionError::Unconfirmed(error) => {
                         last_unconfirmed = Some(error);
@@ -3681,10 +3841,7 @@ const RUN_INTENT_RUN_TERMINAL_ERROR_CODE: &str = "run_intent_run_terminal";
 /// it is printed — the text is on the next-turn queue — without promising a
 /// delivery the settlement path may not make.
 const RUN_TERMINAL_FOLLOW_UP_NOTICE: &str =
-    "That run has already finished. Your message was moved to the next-turn queue.";
-
-const UNBOUND_RUN_FOLLOW_UP_NOTICE: &str =
-    "The current run is starting. Your message is queued and will be sent as the next turn.";
+    "The task has finished. Your message was queued for the next turn.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum GuidanceSubmissionError {
@@ -3722,13 +3879,18 @@ fn api_error_code(body: &str) -> Option<String> {
 fn release_closed_run_guidance(
     run_control: &crate::cli::turn::local_run_control::LocalRunControl,
     bottom_pane: &mut BottomPane,
+    turn_id: &str,
     intent_id: &str,
-    text: &str,
     queue_index: usize,
 ) -> bool {
     run_control.release_remote_user_intent_submission(intent_id);
-    bottom_pane.remove_local_user_intent(intent_id);
-    bottom_pane.insert_next_turn_submission(queue_index, text.to_string())
+    if !bottom_pane.root_intent_is_visible(intent_id) {
+        bottom_pane.retain_unsent_detached_turn(turn_id);
+        return false;
+    }
+    bottom_pane
+        .remove_local_user_intent(intent_id)
+        .is_some_and(|intent| bottom_pane.insert_next_turn_guidance(queue_index, intent))
 }
 
 impl GuidanceSubmissionError {
@@ -4519,8 +4681,7 @@ fn apply_tui_control_event(
         } => {
             if bottom_pane.return_user_intent(intent_id, *status, content) {
                 chat_widget.commit_system(history_cell::system::SystemCell::info(
-                    "Your guidance was not adopted; it was restored as an unsent draft."
-                        .to_string(),
+                    "Your guidance was not adopted; it remains available for editing.".to_string(),
                 ));
                 UserIntentProjection::Returned
             } else {
@@ -4666,8 +4827,31 @@ fn apply_active_turn_tui_control_event(
     chat_widget: &mut chat_widget::ChatWidget,
     run_control: &crate::cli::turn::local_run_control::LocalRunControl,
     attachment_epoch: u64,
-) {
-    match apply_tui_control_event(event, bottom_pane, chat_widget, attachment_epoch) {
+    turn_id: &str,
+) -> UserIntentProjection {
+    if let TuiAppEvent::UserIntentApplied { intent_id, .. }
+    | TuiAppEvent::UserIntentReturned { intent_id, .. } = event
+        && bottom_pane.user_intent_belongs_to_other_turn(intent_id, turn_id)
+    {
+        return UserIntentProjection::None;
+    }
+    let detached = match event {
+        TuiAppEvent::UserIntentApplied { intent_id, .. }
+            if bottom_pane.settle_detached_root_intent(intent_id, false) =>
+        {
+            Some(UserIntentProjection::Applied)
+        }
+        TuiAppEvent::UserIntentReturned { intent_id, .. }
+            if bottom_pane.settle_detached_root_intent(intent_id, true) =>
+        {
+            Some(UserIntentProjection::Returned)
+        }
+        _ => None,
+    };
+    let projection = detached.unwrap_or_else(|| {
+        apply_tui_control_event(event, bottom_pane, chat_widget, attachment_epoch)
+    });
+    match projection {
         UserIntentProjection::Applied => {
             let TuiAppEvent::UserIntentApplied {
                 intent_id,
@@ -4697,6 +4881,7 @@ fn apply_active_turn_tui_control_event(
         }
         UserIntentProjection::None => {}
     }
+    projection
 }
 
 fn context_window_from_trace(
@@ -4795,6 +4980,10 @@ enum AgentWorkbenchOutcome {
         intent_id: String,
     },
     GuideApplied {
+        target: AgentGuideTarget,
+        intent_id: String,
+    },
+    GuideReturned {
         target: AgentGuideTarget,
         intent_id: String,
     },
@@ -4939,10 +5128,38 @@ impl AgentGuideTarget {
         &self.0.run_id
     }
 
+    pub(crate) fn same_execution(&self, other: &Self) -> bool {
+        self.0.run_id == other.0.run_id
+            && self.0.target == other.0.target
+            && self.0.session_id == other.0.session_id
+            && self.0.attachment_epoch == other.0.attachment_epoch
+            && self.0.owner == other.0.owner
+    }
+
+    pub(crate) fn same_recipient(&self, other: &Self) -> bool {
+        self.0.run_id == other.0.run_id
+            && self.0.target == other.0.target
+            && self.same_session(other)
+    }
+
+    pub(crate) fn same_session(&self, other: &Self) -> bool {
+        self.0.session_id == other.0.session_id
+            && self.0.owner.same_presentation_owner(&other.0.owner)
+            && (self.0.session_id.is_some() || self.0.attachment_epoch == other.0.attachment_epoch)
+    }
+
     pub(crate) fn is_attached(&self, session_id: Option<&str>, attachment_epoch: u64) -> bool {
         self.0.attachment_epoch == attachment_epoch
             && self.0.session_id.as_deref() == session_id
             && self.0.owner.is_current()
+    }
+
+    /// Reading an already returned draft may resume in the same session, but
+    /// must never authorize a new delivery against the old attachment.
+    pub(crate) fn can_view_draft(&self, session_id: Option<&str>, attachment_epoch: u64) -> bool {
+        self.0.owner.can_view_local_draft()
+            && self.0.session_id.as_deref() == session_id
+            && (session_id.is_some() || self.0.attachment_epoch == attachment_epoch)
     }
 
     pub(crate) fn retire_observation(&self) {
@@ -5164,10 +5381,25 @@ fn drain_agent_workbench_outcomes(
         if matches!(&outcome,
             AgentWorkbenchOutcome::GuideAccepted { target, .. }
                 | AgentWorkbenchOutcome::GuideApplied { target, .. }
+                | AgentWorkbenchOutcome::GuideReturned { target, .. }
                 | AgentWorkbenchOutcome::GuideRejected { target, .. }
                 | AgentWorkbenchOutcome::GuideUnconfirmed { target, .. }
                 if !target.is_attached(active_session_id, attachment_epoch)
         ) {
+            match &outcome {
+                AgentWorkbenchOutcome::GuideApplied { intent_id, target } => {
+                    bottom_pane.remove_detached_agent_guide(intent_id, target);
+                }
+                AgentWorkbenchOutcome::GuideReturned { intent_id, target } => {
+                    bottom_pane.mark_agent_guide_returned(intent_id, target);
+                }
+                AgentWorkbenchOutcome::GuideRejected {
+                    intent_id, target, ..
+                } => {
+                    bottom_pane.mark_agent_guide_rejected(intent_id, target);
+                }
+                _ => {}
+            }
             continue;
         }
         match outcome {
@@ -5308,9 +5540,18 @@ fn drain_agent_workbench_outcomes(
                 {
                     let agent_name = target.agent_name();
                     chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                        "Guidance applied to {agent_name}"
+                        "Message added for {agent_name}"
                     )));
                 }
+            }
+            AgentWorkbenchOutcome::GuideReturned { intent_id, target } => {
+                if !bottom_pane.mark_agent_guide_returned(&intent_id, &target) {
+                    continue;
+                }
+                let agent_name = target.agent_name().to_owned();
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                    format!("Message to {agent_name} was not used. Press Alt+U to view it."),
+                ));
             }
             AgentWorkbenchOutcome::GuideRejected {
                 intent_id,
@@ -5318,24 +5559,12 @@ fn drain_agent_workbench_outcomes(
                 reason,
                 ..
             } => {
-                let Some(intent) = bottom_pane.remove_agent_guide(
-                    &intent_id,
-                    active_session_id,
-                    attachment_epoch,
-                    Some(&target.0.run_id),
-                ) else {
+                if !bottom_pane.mark_agent_guide_rejected(&intent_id, &target) {
                     continue;
-                };
-                let agent_name = target.agent_name().to_owned();
-                bottom_pane.push_view(Box::new(
-                    bottom_pane::task_input_view::TaskInputView::with_draft(
-                        target,
-                        intent.text,
-                        format!("Not sent: {reason}"),
-                    ),
-                ));
+                }
+                let agent_name = target.agent_name();
                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                    "Could not send guidance to {agent_name}: {reason}. Your draft is preserved."
+                    "Could not send the message to {agent_name}: {reason}. Press Alt+U to view it."
                 )));
             }
             AgentWorkbenchOutcome::GuideUnconfirmed {
@@ -5347,7 +5576,7 @@ fn drain_agent_workbench_outcomes(
                 let agent_name = target.agent_name();
                 if bottom_pane.mark_user_intent_unconfirmed(&intent_id) {
                     chat_widget.commit_system(history_cell::system::SystemCell::warning(format!(
-                        "Guidance to {agent_name} is unconfirmed: {reason}. Its stable identity is retained; it was not resent."
+                        "Couldn't confirm the outcome of your message to {agent_name}: {reason}. It won't be sent again automatically."
                     )));
                 }
             }
@@ -5397,9 +5626,26 @@ fn stage_permission_mode_for_next_round(
 ) {
     bottom_pane.stage_permission_mode_for_next_round(mode);
     chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
-        "{} · requested for next model round",
+        "{} · requested; waiting for the current task to apply it",
         slash_dispatch::permission_mode_feedback(mode)
     )));
+}
+
+fn finish_staged_permission_selection(
+    state: &mut crate::cli::session::session_state::SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    same_turn_scope: bool,
+) {
+    if let Some(mode) = bottom_pane.take_staged_permission_mode() {
+        if same_turn_scope {
+            slash_dispatch::apply_permission_mode_selection(state, bottom_pane, chat_widget, mode);
+        } else {
+            chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                "Account or session changed; the permission selection was not applied here.",
+            ));
+        }
+    }
 }
 
 /// The pending selection is the cycle cursor; the applied policy remains
@@ -6502,6 +6748,12 @@ async fn submit_agent_guide(
     })?
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AgentGuideDisposition {
+    Applied,
+    Returned,
+}
+
 async fn observe_agent_guide(
     mut stream: impl tokio_stream::Stream<
         Item = Result<astra_thin_client::StreamEvent, astra_thin_client::ThinClientError>,
@@ -6510,7 +6762,7 @@ async fn observe_agent_guide(
     intent_id: &str,
     observation: &tokio_util::sync::CancellationToken,
     outcome_tx: &tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
-) -> Result<(), String> {
+) -> Result<Option<AgentGuideDisposition>, String> {
     use astra_thin_client::StreamEvent;
     let mut deadline = tokio::time::Instant::now() + AGENT_GUIDE_APPLICATION_TIMEOUT;
     let mut paused_remaining = None;
@@ -6518,8 +6770,8 @@ async fn observe_agent_guide(
     let mut accepted_seen = false;
     loop {
         let next = tokio::select! {
-            _ = observation.cancelled() => return Ok(()),
-            _ = outcome_tx.closed() => return Ok(()),
+            _ = observation.cancelled() => return Ok(None),
+            _ = outcome_tx.closed() => return Ok(None),
             next = async {
                 if paused_remaining.is_some() {
                     Ok(stream.next().await)
@@ -6560,13 +6812,15 @@ async fn observe_agent_guide(
                 run_id: id,
                 intent_id: intent,
                 ..
-            }) if id == run_id && intent == intent_id => return Ok(()),
+            }) if id == run_id && intent == intent_id => {
+                return Ok(Some(AgentGuideDisposition::Applied));
+            }
             Ok(StreamEvent::RunUserIntentReturned {
                 run_id: id,
                 intent_id: intent,
                 ..
             }) if id == run_id && intent == intent_id => {
-                return Err("the agent run ended before applying the guidance; delivery ownership was returned".into());
+                return Ok(Some(AgentGuideDisposition::Returned));
             }
             Ok(StreamEvent::RunFinished { .. }) | Ok(StreamEvent::RunCancelled { .. }) => {
                 return Err("the agent run ended before a matching applied event".into());
@@ -6586,16 +6840,37 @@ async fn observe_agent_guide(
 fn dispatch_agent_guide(
     receipt: AgentGuideTarget,
     content: String,
+    acknowledged_unknown: Vec<String>,
+    recovery: Option<(AgentGuideTarget, String)>,
     backends: ViewActionBackends,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
     frame_requester: &FrameRequester,
-) {
+) -> bool {
+    let reopen =
+        |receipt: AgentGuideTarget, content: String, message: &str, acknowledged: Vec<String>| {
+            if let Some((target, intent_id)) = &recovery {
+                bottom_pane::task_input_view::TaskInputView::returned_with_error(
+                    target.clone(),
+                    intent_id.clone(),
+                    &content,
+                    message,
+                    acknowledged,
+                )
+            } else if acknowledged.is_empty() {
+                bottom_pane::task_input_view::TaskInputView::with_draft(receipt, content, message)
+            } else {
+                bottom_pane::task_input_view::TaskInputView::with_uncertain_draft(
+                    receipt,
+                    content,
+                    acknowledged,
+                )
+            }
+        };
     let run_id = receipt.0.run_id.clone();
     let target = receipt.0.target.clone();
     let owner = receipt.0.owner.clone();
     let api = receipt.0.api.clone();
-    let intent_id = uuid::Uuid::new_v4().to_string();
     if !receipt.is_attached(
         backends.session_id.as_deref(),
         backends.session_attachment_epoch,
@@ -6604,20 +6879,48 @@ fn dispatch_agent_guide(
         .rows
         .iter()
         .any(|row| row.guide_target() == Some((&receipt.0.target, receipt.0.run_id.as_str())))
-        || !bottom_pane.accept_agent_guide(intent_id.clone(), receipt.clone(), content.clone())
     {
         chat_widget.commit_system(history_cell::system::SystemCell::error(
-            "Could not stage agent guidance. The draft was not sent.",
+            "Message not sent. Your draft is preserved.",
         ));
-        bottom_pane.push_view(Box::new(
-            bottom_pane::task_input_view::TaskInputView::with_draft(
+        bottom_pane.push_view(Box::new(reopen(
+            receipt,
+            content,
+            "This agent is no longer available. Check the target before sending.",
+            Vec::new(),
+        )));
+        frame_requester.schedule_frame();
+        return false;
+    }
+    if let Some(barrier) = bottom_pane.agent_delivery_barrier(&receipt, &acknowledged_unknown) {
+        let view = match barrier {
+            bottom_pane::AgentDeliveryBarrier::Sending => reopen(
                 receipt,
                 content,
-                "Not sent: local validation failed",
+                "An earlier message is still sending. Try again when it is received.",
+                Vec::new(),
             ),
-        ));
+            bottom_pane::AgentDeliveryBarrier::Unconfirmed(intent_ids) => reopen(
+                receipt,
+                content,
+                "Earlier delivery is unknown and may arrive later. Enter again to send anyway.",
+                intent_ids,
+            ),
+        };
+        bottom_pane.push_view(Box::new(view));
         frame_requester.schedule_frame();
-        return;
+        return false;
+    }
+    let intent_id = uuid::Uuid::new_v4().to_string();
+    if !bottom_pane.accept_agent_guide(intent_id.clone(), receipt.clone(), content.clone()) {
+        bottom_pane.push_view(Box::new(reopen(
+            receipt,
+            content,
+            "Message not sent. Wait for received messages, or review uncertain messages with Alt+U.",
+            Vec::new(),
+        )));
+        frame_requester.schedule_frame();
+        return false;
     }
 
     let ViewActionBackends {
@@ -6761,10 +7064,15 @@ fn dispatch_agent_guide(
         };
         let receipt = AgentGuideTarget(context);
         let outcome = match observed {
-            Ok(()) => AgentWorkbenchOutcome::GuideApplied {
+            Ok(Some(AgentGuideDisposition::Applied)) => AgentWorkbenchOutcome::GuideApplied {
                 target: receipt.clone(),
                 intent_id,
             },
+            Ok(Some(AgentGuideDisposition::Returned)) => AgentWorkbenchOutcome::GuideReturned {
+                target: receipt.clone(),
+                intent_id,
+            },
+            Ok(None) => return,
             Err(reason) => AgentWorkbenchOutcome::GuideUnconfirmed {
                 target: receipt.clone(),
                 intent_id,
@@ -6774,6 +7082,7 @@ fn dispatch_agent_guide(
         let _ = outcome_tx.send(outcome).await;
     });
     frame_requester.schedule_frame();
+    true
 }
 
 fn projected_truth_for_plan_task(
@@ -6820,9 +7129,29 @@ fn rebind_workbench_observers(
 /// events. In particular, a Work lifecycle receipt may arrive in the first
 /// tool round of a newly created conversation; delaying this until turn
 /// settlement leaves its projection detached from the session that owns it.
+fn live_turn_attachment_epoch(
+    start_session: Option<&str>,
+    start_epoch: u64,
+    bound_session: Option<&str>,
+    observed_session: &str,
+) -> Option<u64> {
+    if observed_session.trim().is_empty()
+        || bound_session != Some(observed_session)
+        || start_session.is_some_and(|session| session != observed_session)
+    {
+        return None;
+    }
+    Some(if start_session.is_none() {
+        start_epoch.saturating_add(1)
+    } else {
+        start_epoch
+    })
+}
+
 fn apply_live_session_binding(
     event: &TuiAppEvent,
     chat_widget: &mut chat_widget::ChatWidget,
+    pane_attachment: (&mut BottomPane, u64),
     task_board: &task_board_observer::TaskBoardObserver,
     server_agent_observer: &crate::tui::server_agent_observer::ServerAgentObserver,
     plan_task_observer: &crate::tui::plan_task_observer::PlanTaskObserver,
@@ -6835,6 +7164,9 @@ fn apply_live_session_binding(
     if session_id.is_empty() {
         return false;
     }
+    pane_attachment
+        .0
+        .set_session_attachment(Some(session_id), pane_attachment.1);
     if chat_widget.session_id() == session_id {
         return false;
     }
@@ -7112,7 +7444,159 @@ async fn dispatch_bottom_pane_view_action(
             )));
             frame_requester.schedule_frame();
         }
-        BottomPaneViewAction::SubmitAgentGuide { target, content } => {
+        BottomPaneViewAction::RecoverReturnedRootGuidance => {
+            if bottom_pane.recover_returned_root_guidance() {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "Unsent message restored to the composer. Review it before sending.",
+                ));
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::OpenUnconfirmedRootGuidance => {
+            if let Some(intent) = bottom_pane.unconfirmed_root_guidance(None).cloned() {
+                bottom_pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                        intent.intent_id,
+                        &intent.text,
+                    ),
+                ));
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::CopyUnconfirmedRootGuidance { intent_id, text } => {
+            if bottom_pane
+                .unconfirmed_root_guidance(Some(&intent_id))
+                .is_some()
+            {
+                let outcome_tx = backends.agent_workbench_tx.clone();
+                tokio::spawn(async move {
+                    let result = crate::cli::clipboard::copy_to_clipboard_async(text).await;
+                    let _ = outcome_tx
+                        .send(AgentWorkbenchOutcome::Clipboard {
+                            success_message: "Message copied".into(),
+                            result,
+                        })
+                        .await;
+                });
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::DismissUnconfirmedRootGuidance { intent_id } => {
+            bottom_pane.dismiss_unconfirmed_root_guidance(&intent_id);
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::OpenReturnedAgentGuide => {
+            let intent = bottom_pane
+                .returned_agent_guide(
+                    backends.session_id.as_deref(),
+                    backends.session_attachment_epoch,
+                    None,
+                )
+                .cloned();
+            if let Some(intent) = intent
+                && let bottom_pane::PendingUserIntentTarget::AgentRun { target } = intent.target
+            {
+                bottom_pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::returned(
+                        target,
+                        intent.intent_id,
+                        &intent.text,
+                        intent.status != astra_turn_types::UserIntentStatus::Returned,
+                    ),
+                ));
+            } else {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "No unsent agent message belongs to this session.",
+                ));
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::CopyReturnedAgentGuide {
+            target,
+            intent_id,
+            text,
+        } => {
+            let allowed = bottom_pane
+                .returned_agent_guide(
+                    backends.session_id.as_deref(),
+                    backends.session_attachment_epoch,
+                    Some(&intent_id),
+                )
+                .filter(|intent| {
+                    matches!(&intent.target,
+                bottom_pane::PendingUserIntentTarget::AgentRun { target: owner }
+                    if owner.same_execution(&target))
+                })
+                .is_some();
+            if allowed {
+                let outcome_tx = backends.agent_workbench_tx.clone();
+                tokio::spawn(async move {
+                    let result = crate::cli::clipboard::copy_to_clipboard_async(text).await;
+                    let _ = outcome_tx
+                        .send(AgentWorkbenchOutcome::Clipboard {
+                            success_message: "Message copied".into(),
+                            result,
+                        })
+                        .await;
+                });
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::RetryReturnedAgentGuide {
+            target,
+            intent_id,
+            content,
+            acknowledged_unknown,
+        } => {
+            if let Some(mut original) = bottom_pane.take_returned_agent_guide(
+                &intent_id,
+                &target,
+                backends.session_id.as_deref(),
+                backends.session_attachment_epoch,
+            ) {
+                if original.delivery_is_unconfirmed() {
+                    bottom_pane.restore_returned_agent_guide(original);
+                    frame_requester.schedule_frame();
+                    return;
+                }
+                original.text = content.clone();
+                let current = AgentGuideTarget::capture(
+                    target.agent_name().to_owned(),
+                    target.run_id().to_owned(),
+                    target.0.target.clone(),
+                    backends.api.clone(),
+                    backends.session_id.clone(),
+                    backends.session_attachment_epoch,
+                );
+                if !dispatch_agent_guide(
+                    current,
+                    content,
+                    acknowledged_unknown,
+                    Some((target, intent_id)),
+                    backends,
+                    bottom_pane,
+                    chat_widget,
+                    frame_requester,
+                ) {
+                    bottom_pane.restore_returned_agent_guide(original);
+                }
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::DismissReturnedAgentGuide { target, intent_id } => {
+            bottom_pane.take_returned_agent_guide(
+                &intent_id,
+                &target,
+                backends.session_id.as_deref(),
+                backends.session_attachment_epoch,
+            );
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::SubmitAgentGuide {
+            target,
+            content,
+            acknowledged_unknown,
+        } => {
             // The guide input was popped by its typed Close disposition. Close
             // the monitor beneath it as well so delivery status is immediately
             // visible in the normal pending-intent band.
@@ -7120,6 +7604,8 @@ async fn dispatch_bottom_pane_view_action(
             dispatch_agent_guide(
                 target,
                 content,
+                acknowledged_unknown,
+                None,
                 backends,
                 bottom_pane,
                 chat_widget,
@@ -7587,6 +8073,7 @@ fn refresh_footer_from_state(
     bottom_pane: &mut BottomPane,
     state: &crate::cli::session::session_state::SessionState,
 ) {
+    bottom_pane.set_session_attachment(state.session_id.as_deref(), state.session_attachment_epoch);
     bottom_pane.footer.model = state.model.as_deref().map(str::to_string);
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     if let Some(trace) = latest_context_trace(state)
@@ -7885,6 +8372,7 @@ pub(crate) async fn run_tui_session(
     let (file_writer, file_writer_runtime, mut file_write_errors) = super::file_writer::spawn();
     let mut reported_file_write_errors = std::collections::HashSet::new();
     let mut bottom_pane = BottomPane::new();
+    bottom_pane.set_session_attachment(state.session_id.as_deref(), state.session_attachment_epoch);
     bottom_pane.set_file_writer(file_writer.clone());
     // ── Enter TUI ───────────────────────────────────────────────────────
     let (draw_tx, draw_rx) = tokio::sync::mpsc::channel(1);
@@ -7952,6 +8440,7 @@ pub(crate) async fn run_tui_session(
                     .send(ModelCatalogEffect::Ready {
                         owner,
                         attachment_epoch: epoch,
+                        initial_bound_session: None,
                         result,
                     })
                     .await;
@@ -8907,6 +9396,8 @@ pub(crate) async fn run_tui_session(
                                 };
                                 match next {
                                     NextTurnSubmission::Interactive(text) => (None, BottomPaneAction::SubmitInput(text)),
+                                    NextTurnSubmission::Guidance(intent) => (None, BottomPaneAction::SubmitInput(
+                                        slash_dispatch::conversation_for_composer(&intent.text).into_owned())),
                                     NextTurnSubmission::Conversation { target, content } => (Some(target), BottomPaneAction::SubmitInput(content)),
                                 }
                             }
@@ -9295,23 +9786,8 @@ pub(crate) async fn run_tui_session(
                                         let owner =
                                             crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
                                         let attachment_epoch = state.session_attachment_epoch;
-                                        let api = api.clone();
-                                        let model_catalog_tx = model_catalog_tx.clone();
-                                        model_catalog_tasks.spawn(async move {
-                                            let result = crate::cli::session::session_runtime::fetch_owner_model_catalog(
-                                                &api,
-                                                &owner,
-                                            )
-                                            .await
-                                            .map_err(|error| error.to_string());
-                                            let _ = model_catalog_tx
-                                                .send(ModelCatalogEffect::Ready {
-                                                    owner,
-                                                    attachment_epoch,
-                                                    result,
-                                                })
-                                                .await;
-                                        });
+                                        spawn_model_catalog_request(api.clone(), owner, attachment_epoch, None,
+                                            model_catalog_tx.clone(), &mut model_catalog_tasks);
                                     }
                                     pending_deferred_slash_flush = false;
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -9371,6 +9847,7 @@ pub(crate) async fn run_tui_session(
                                         pending_work_retries: &mut pending_work_retries,
                                     };
                                     let result = slash_dispatch::dispatch(&text, &mut dctx).await;
+                                    bottom_pane.set_session_attachment(state.session_id.as_deref(), state.session_attachment_epoch);
                                     let slash_finished_synchronously =
                                         slash_result_releases_followups(&result);
                                     let flush_slash_response =
@@ -9716,14 +10193,13 @@ pub(crate) async fn run_tui_session(
                                         ActiveRunGuidanceSubmission,
                                     >(1);
                                     let mut guidance_submission_in_flight = false;
+                                    let mut guidance_dispatch_needed = false;
                                     // The server has definitively closed current-run guidance.
                                     // Later input stays queued for the next turn. This does not
                                     // mean the visible reply has settled.
                                     let mut guidance_admission_closed = false;
-                                    // Set when a model-facing follow-up was queued before
-                                    // RunBound. Later plain text stays behind it for this
-                                    // turn. Slash-only queue entries must not set this.
-                                    let mut follow_up_deferred_before_bind =
+                                    // An older next-turn backlog must stay ahead of new input.
+                                    let earlier_next_turn_pending =
                                         model_facing_followup_backlog(&queued_followup_submissions);
                                     // Queue length when the in-flight guidance was submitted.
                                     // A delayed fence inserts there, ahead of messages queued
@@ -9734,11 +10210,29 @@ pub(crate) async fn run_tui_session(
                                     > = None;
                                     let mut guidance_closure_deadline: Option<tokio::time::Instant> =
                                         None;
+                                    let mut guidance_handoff_blocked = false;
+                                    let turn_submission_id = uuid::Uuid::now_v7().to_string();
+                                    let turn_model_choice = state.model.clone();
+                                    let turn_model_session = state.session_id.clone();
+                                    let turn_model_epoch = state.session_attachment_epoch;
+                                    let turn_model_owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                                    let mut picker_owner = None;
+                                    let mut staged_model: Option<NextModelSelection> = None;
 
                                     let mut permission_control = super::permission_control::ActivePermissionControl::new(
-                                        api.clone(), profile.map(str::to_owned), active_remote_run_id.clone(),
+                                        api.clone(), profile.map(str::to_owned), turn_model_owner.clone(), active_remote_run_id.clone(),
                                         state.perm_manager.permission_control_signal(),
                                     );
+                                    if let Some(session_id) = state.session_id.as_deref() {
+                                        permission_control.bind_session(session_id);
+                                    }
+                                    let turn_bound_session = permission_control.session_binding();
+                                    bottom_pane.set_root_intent_scope(Arc::new(
+                                        bottom_pane::RootIntentScope::new(
+                                            turn_model_owner.clone(), turn_model_epoch,
+                                            turn_bound_session.clone(),
+                                        ),
+                                    ));
                                     let turn_result = {
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let active_turn_local_run_control =
@@ -9761,10 +10255,9 @@ pub(crate) async fn run_tui_session(
                                             slash_dispatch::session_hub_snapshot(&state);
                                         let turn_session_id = state.session_id.clone();
                                         let turn_session_attachment_epoch = state.session_attachment_epoch;
+                                        let mut live_session_attachment_epoch = turn_session_attachment_epoch;
                                         let native_delivery_refresh = state.native_delivery_refresh_handle();
                                         let turn_permission_policy = state.perm_manager.subscribe_permission_policy();
-                                        let turn_submission_id =
-                                            uuid::Uuid::now_v7().to_string();
                                         let bound_turn_api = continuation.as_ref().map(|target| match &target.0.owner.native_binding {
                                             Some(binding) => api.clone().with_bearer_provider(binding.clone()),
                                             None => api.clone().without_bearer_provider(),
@@ -9873,6 +10366,62 @@ pub(crate) async fn run_tui_session(
                                                 );
                                                 continue;
                                             }
+                                            // One turn owns one FIFO of user messages. Wait for
+                                            // its RunBound and submit one at a time so neither a
+                                            // slow acknowledgement nor startup can reorder them.
+                                            if guidance_dispatch_needed {
+                                                guidance_dispatch_needed = false;
+                                            if !guidance_submission_in_flight
+                                                && !guidance_admission_closed
+                                                && !interrupt_pending
+                                                && !exit_after_turn_settlement
+                                                && output_settled_at.is_none()
+                                                && turn_result_ready.is_none()
+                                                && let Some(intent) =
+                                                    bottom_pane.next_unsent_guidance(&turn_submission_id)
+                                                && astra_core::sync_poison::recover_mutex_lock(&active_remote_run_id)
+                                                    .as_deref().is_some_and(|id| !id.trim().is_empty())
+                                            {
+                                                let intent_id = intent.intent_id.clone();
+                                                let text = intent.text.clone();
+                                                let queue_index = intent.next_turn_position;
+                                                let active_work_snapshot = bg_task_list_cache_for_turn.read().await.clone();
+                                                let active_work_observations = active_work_registry_for_turn.active_work_observations();
+                                                preinstalled_run_control.expect_remote_user_intent_submission(&intent_id);
+                                                let submission_owner = turn_model_owner.clone();
+                                                let submission_api = match &submission_owner.native_binding {
+                                                    Some(binding) => api.clone().with_bearer_provider(binding.clone()),
+                                                    None => api.clone().without_bearer_provider(),
+                                                };
+                                                let submission_profile = profile.map(str::to_string);
+                                                let submission_run_id = active_remote_run_id.clone();
+                                                let submission_run_control = Arc::downgrade(&preinstalled_run_control);
+                                                let submission_tx = guidance_submission_tx.clone();
+                                                in_flight_guidance_queue_index = Some(queue_index);
+                                                guidance_submission_in_flight = true;
+                                                guidance_submission_task = Some(tokio::spawn(async move {
+                                                    let result = submit_active_run_guidance(
+                                                        ActiveRunGuidanceRequest {
+                                                            api: &submission_api,
+                                                            profile: submission_profile.as_deref(),
+                                                            owner: &submission_owner,
+                                                            remote_run_id: &submission_run_id,
+                                                            run_control: &submission_run_control,
+                                                            intent_id: &intent_id,
+                                                            text: &text,
+                                                            background_work_snapshot: Some(&active_work_snapshot),
+                                                            work_unit_observations: &active_work_observations,
+                                                        },
+                                                    ).await;
+                                                    let _ = submission_tx.send(ActiveRunGuidanceSubmission {
+                                                        intent_id,
+                                                        text,
+                                                        result,
+                                                    }).await;
+                                                }));
+                                                frame_requester.schedule_frame();
+                                            }
+                                            }
                                             let closure_barriers = TurnClosureBarriers::capture(
                                                 &preinstalled_run_control,
                                                 guidance_submission_in_flight,
@@ -9922,9 +10471,11 @@ pub(crate) async fn run_tui_session(
                                                         bottom_pane
                                                             .mark_user_intent_unconfirmed(&intent_id);
                                                     }
+                                                    guidance_handoff_blocked = true;
+                                                    guidance_admission_closed = true;
                                                     chat_widget.commit_system(
                                                         history_cell::system::SystemCell::info(
-                                                            "Guidance reconciliation did not finish before the bounded turn handoff. Its stable identity remains unconfirmed and will not be replayed as a new turn."
+                                                            "Couldn't confirm the message before the task ended. It won't be sent again automatically."
                                                                 .to_string(),
                                                         ),
                                                     );
@@ -9935,6 +10486,27 @@ pub(crate) async fn run_tui_session(
                                             tokio::select! {
                                                 _ = session_shutdown_token.cancelled() => {
                                                     break 'main Ok(());
+                                                }
+                                                Some(effect) = model_catalog_rx.recv(), if model_catalog_loading => {
+                                                    model_catalog_loading = false;
+                                                    let ModelCatalogEffect::Ready { owner, .. } = &effect;
+                                                    let owner = owner.clone();
+                                                    let chosen = active_model_picker_choice(staged_model.as_ref(), turn_model_choice.as_ref());
+                                                    if apply_model_catalog_effect_for_choice(
+                                                        effect, chosen.as_ref(),
+                                                        turn_model_session.as_deref(), turn_model_epoch, &mut bottom_pane, &mut chat_widget,
+                                                    ) {
+                                                        picker_owner = Some(owner);
+                                                    }
+                                                    bottom_pane.sync_popups();
+                                                    frame_requester.schedule_frame();
+                                                }
+                                                Some(Err(error)) = model_catalog_tasks.join_next(), if !model_catalog_tasks.is_empty() => {
+                                                    model_catalog_loading = false;
+                                                    chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                                                        "Model catalog request stopped: {error}"
+                                                    )));
+                                                    frame_requester.schedule_frame();
                                                 }
                                                 Some(completion) = slash_background_read_rx.recv() => {
                                                     let Some(effect) = completion.accept(
@@ -9972,7 +10544,15 @@ pub(crate) async fn run_tui_session(
                                                 Some(submission) = guidance_submission_rx.recv() => {
                                                     guidance_submission_in_flight = false;
                                                     guidance_submission_task = None;
+                                                    guidance_dispatch_needed = true;
                                                     let submitted_queue_index = in_flight_guidance_queue_index.take();
+                                                    // The stream may resolve the exact intent before
+                                                    // the POST acknowledgement reaches the UI.
+                                                    if bottom_pane.user_intent_is_resolved(&submission.intent_id) {
+                                                        preinstalled_run_control.release_remote_user_intent_submission(&submission.intent_id);
+                                                        frame_requester.schedule_frame();
+                                                        continue;
+                                                    }
                                                     match submission.result {
                                                         Ok(receipt) => {
                                                             debug_assert_eq!(receipt.intent_id, submission.intent_id);
@@ -9980,15 +10560,20 @@ pub(crate) async fn run_tui_session(
                                                                 &submission.intent_id,
                                                             );
                                                             let _ = spawn_primary_guidance_reconciliation(
-                                                                api.clone(),
+                                                                match &turn_model_owner.native_binding {
+                                                                    Some(binding) => api.clone().with_bearer_provider(binding.clone()),
+                                                                    None => api.clone().without_bearer_provider(),
+                                                                },
                                                                 profile.map(str::to_string),
+                                                                turn_model_owner.clone(),
                                                                 tui_tx.clone(),
                                                                 preinstalled_run_control.clone(),
+                                                                turn_submission_id.clone(),
                                                                 receipt,
                                                             );
                                                             chat_widget.commit_concurrent_system(
                                                                 history_cell::system::SystemCell::runtime_control(
-                                                                    "Guidance accepted; not yet applied. It replaces stale work before next unstarted action."
+                                                                    "Message received · waiting to take effect."
                                                                         .to_string(),
                                                                 ),
                                                             );
@@ -9997,11 +10582,28 @@ pub(crate) async fn run_tui_session(
                                                             preinstalled_run_control.release_remote_user_intent_submission(
                                                                 &submission.intent_id,
                                                             );
-                                                            bottom_pane.remove_local_user_intent(&submission.intent_id);
-                                                            bottom_pane.restore_into_composer(&submission.text);
-                                                            chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::error(error),
-                                                            );
+                                                            if turn_model_owner.is_current()
+                                                                && bottom_pane.root_intent_is_visible(&submission.intent_id) {
+                                                                bottom_pane.remove_local_user_intent(&submission.intent_id);
+                                                                let unsent = bottom_pane.take_unsent_turn_guidance(&turn_submission_id);
+                                                                let draft = std::iter::once(submission.text.clone())
+                                                                    .chain(unsent.into_iter().map(|intent| intent.text))
+                                                                    .collect::<Vec<_>>()
+                                                                    .join("\n\n");
+                                                                bottom_pane.start_composer_draft(
+                                                                    &slash_dispatch::conversation_for_composer(&draft),
+                                                                );
+                                                                chat_widget.commit_system(
+                                                                    history_cell::system::SystemCell::error(error),
+                                                                );
+                                                            } else {
+                                                                guidance_admission_closed = true;
+                                                                guidance_handoff_blocked = true;
+                                                                bottom_pane.retain_unsent_detached_turn(&turn_submission_id);
+                                                                chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                                                    "Sign-in changed. Unsent messages remain with their original session."
+                                                                ));
+                                                            }
                                                         }
                                                         Err(GuidanceSubmissionError::GuidanceClosed(notice)) => {
                                                             let queue_index = submitted_queue_index.unwrap_or_else(
@@ -10013,8 +10615,8 @@ pub(crate) async fn run_tui_session(
                                                             let queued = release_closed_run_guidance(
                                                                 &preinstalled_run_control,
                                                                 &mut bottom_pane,
+                                                                &turn_submission_id,
                                                                 &submission.intent_id,
-                                                                &submission.text,
                                                                 queue_index,
                                                             );
                                                             guidance_admission_closed = true;
@@ -10024,6 +10626,11 @@ pub(crate) async fn run_tui_session(
                                                                         notice.to_string(),
                                                                     ),
                                                                 );
+                                                            } else {
+                                                                guidance_handoff_blocked = true;
+                                                                chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                                                    "Session changed. Unsent messages remain with their original session."
+                                                                ));
                                                             }
                                                         }
                                                         Err(GuidanceSubmissionError::Unconfirmed(error)) => {
@@ -10031,9 +10638,11 @@ pub(crate) async fn run_tui_session(
                                                                 &submission.intent_id,
                                                             );
                                                             bottom_pane.mark_user_intent_unconfirmed(&submission.intent_id);
+                                                            guidance_admission_closed = true;
+                                                            guidance_handoff_blocked = true;
                                                             chat_widget.commit_system(
                                                                 history_cell::system::SystemCell::info(format!(
-                                                                    "Guidance delivery could not be confirmed. Its stable identity is retained and will not be resent as another turn. ({error})"
+                                                                    "Couldn't confirm whether your message was received. It won't be sent again automatically. ({error})"
                                                                 )),
                                                             );
                                                         }
@@ -10074,7 +10683,7 @@ pub(crate) async fn run_tui_session(
                                                                             file_writer: Some(file_writer.clone()),
                                                                             agent_workbench_tx: agent_workbench_tx.clone(),
                                                                             native_delivery_refresh: native_delivery_refresh.clone(),
-                                                                            session_attachment_epoch: turn_session_attachment_epoch,
+                                                                            session_attachment_epoch: live_session_attachment_epoch,
                                                                         },
                                                                         &frame_requester,
                                                                     );
@@ -10348,139 +10957,102 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
+                                                                        if slash_dispatch::open_active_help(&queued_text, &mut bottom_pane, &mut chat_widget) {
+                                                                            bottom_pane.sync_popups();
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        if let Some(action) = slash_dispatch::active_permission_command(&queued_text) {
+                                                                            use crate::cli::permission_command::PermissionCommandAction;
+                                                                            match action {
+                                                                                PermissionCommandAction::ChooseMode => bottom_pane.push_view(Box::new(
+                                                                                    slash_dispatch::build_permission_mode_picker(perm_mode_mirror.current()),
+                                                                                )),
+                                                                                PermissionCommandAction::SetMode(mode) if slash_dispatch::permission_mode_requires_confirmation(mode) => {
+                                                                                    bottom_pane.push_view(Box::new(slash_dispatch::build_permission_mode_confirmation(mode)));
+                                                                                }
+                                                                                PermissionCommandAction::SetMode(mode) => {
+                                                                                    stage_permission_mode_for_next_round(&mut bottom_pane, &mut chat_widget, mode, perm_mode_mirror.current());
+                                                                                    permission_control.request(mode);
+                                                                                }
+                                                                                _ => unreachable!("only permission picker and mode selections are active commands"),
+                                                                            }
+                                                                            bottom_pane.sync_popups();
+                                                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        if slash_dispatch::is_model_picker_request(&queued_text) {
+                                                                            if model_catalog_loading {
+                                                                                chat_widget.commit_system(history_cell::system::SystemCell::info("Model catalog is already loading."));
+                                                                            } else {
+                                                                                model_catalog_loading = true;
+                                                                                chat_widget.commit_system(history_cell::system::SystemCell::info("Loading models… Current task continues."));
+                                                                                let owner = turn_model_owner.clone();
+                                                                                let bound = turn_model_session.is_none()
+                                                                                    .then(|| permission_control.session_binding());
+                                                                                spawn_model_catalog_request(api.clone(), owner, turn_model_epoch, bound,
+                                                                                    model_catalog_tx.clone(), &mut model_catalog_tasks);
+                                                                            }
+                                                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        if let Some(requested) = slash_dispatch::active_model_override(&queued_text) {
+                                                                            if turn_model_owner.is_current() {
+                                                                                let label = requested.as_deref().unwrap_or("no model");
+                                                                                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                                                                                    "Selected {label} · applies after this task, including queued messages."
+                                                                                )));
+                                                                                staged_model = Some(NextModelSelection::Requested(requested));
+                                                                            } else {
+                                                                                chat_widget.commit_system(history_cell::system::SystemCell::warning("Account changed. Reopen /model to select a model."));
+                                                                            }
+                                                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
                                                                         if active_submission_routes_to_next_turn(
                                                                             &queued_text,
                                                                             output_settled_at.is_some(),
                                                                                                                                             guidance_admission_closed,
-                                                                            follow_up_deferred_before_bind,
+                                                                            earlier_next_turn_pending,
                                                                         ) {
-                                                                            // The response stream has ended, the server has
-                                                                            // fenced current-run guidance, or an
-                                                                            // earlier follow-up is already waiting
-                                                                            // for RunBound. Hold the text until this
-                                                                            // turn hands ownership back.
+                                                                            // The current run has closed, or an older
+                                                                            // next-turn message already has priority.
+                                                                            if slash_dispatch::parse_submission(&queued_text).is_command() {
+                                                                                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                                                                    "Command queued until the current task finishes."
+                                                                                ));
+                                                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                            }
                                                                             bottom_pane.queue_next_turn_submission(queued_text);
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
-                                                                        let remote_run_id = astra_core::sync_poison::recover_mutex_lock(
-                                                                            &active_remote_run_id,
-                                                                        )
-                                                                        .clone();
-                                                                        if defer_follow_up_before_run_bind(
-                                                                            &queued_text,
-                                                                            remote_run_id.as_deref(),
-                                                                            &mut follow_up_deferred_before_bind,
-                                                                            &mut bottom_pane,
-                                                                            &mut chat_widget,
-                                                                        ) {
-                                                                            let w = guard
-                                                                                .terminal
-                                                                                .size()
-                                                                                .map(|s| s.width)
-                                                                                .unwrap_or(80);
-                                                                            flush_chat_widget(
-                                                                                &mut guard,
-                                                                                &mut chat_widget,
-                                                                                w,
-                                                                            );
-                                                                            frame_requester.schedule_frame();
-                                                                            continue;
-                                                                        }
-                                                                        if guidance_submission_in_flight {
-                                                                            bottom_pane.restore_into_composer(&queued_text);
-                                                                            chat_widget.commit_system(
-                                                                                history_cell::system::SystemCell::info(
-                                                                                    "Another guidance message is still being submitted. Wait for its acknowledgement before sending another."
-                                                                                        .to_string(),
-                                                                                ),
-                                                                            );
-                                                                            frame_requester.schedule_frame();
-                                                                            continue;
-                                                                        }
-                                                                        let active_work_snapshot =
-                                                                            bg_task_list_cache_for_turn
-                                                                                .read()
-                                                                                .await
-                                                                                .clone();
-                                                                        let active_work_observations =
-                                                                            active_work_registry_for_turn
-                                                                                .active_work_observations();
                                                                         let intent_id = format!(
                                                                             "intent_{}",
                                                                             uuid::Uuid::now_v7().simple()
                                                                         );
-                                                                        if let Err(reason) = bottom_pane.try_accept_user_intent(
-                                                                            intent_id.clone(),
-                                                                            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-                                                                            astra_turn_types::UserIntentStatus::AcceptedLocal,
+                                                                        if let Err(reason) = bottom_pane.accept_turn_user_intent(
+                                                                            &turn_submission_id,
+                                                                            intent_id,
                                                                             slash_dispatch::parse_submission(&queued_text).text().to_owned(),
                                                                         ) {
-                                                                            // Empty input is not a guidance intent. It can be
-                                                                            // produced by an internal wake-up submission and must
-                                                                            // remain a quiet no-op, never an ownership error.
                                                                             if reason == UserIntentRejectReason::EmptyText {
                                                                                 continue;
                                                                             }
                                                                             bottom_pane.restore_into_composer(&queued_text);
                                                                             chat_widget.commit_system(
-                                                                                history_cell::system::SystemCell::error(
-                                                                                    reason.message(),
-                                                                                ),
+                                                                                history_cell::system::SystemCell::error(reason.message()),
                                                                             );
                                                                             continue;
                                                                         }
-                                                                        // A parent instruction releases only its foreground
-                                                                        // waits. Task ownership and stdin stay unchanged.
-                                                                        preinstalled_run_control
-                                                                            .expect_remote_user_intent_submission(&intent_id);
+                                                                        // Release only waits present at this gesture. A
+                                                                        // delayed RunBound must not release a later task.
                                                                         foreground_wait_control_for_ctrl_b.release();
-                                                                        // Project local custody before awaiting the network.
-                                                                        // The user can now distinguish "sending" from a
-                                                                        // server-owned intent, and an ambiguous response cannot
-                                                                        // silently turn the same bytes into a second submission.
-                                                                        flush_chat_widget(
-                                                                            &mut guard,
-                                                                            &mut chat_widget,
-                                                                            w,
-                                                                        );
+                                                                        guidance_dispatch_needed = true;
                                                                         frame_requester.schedule_frame();
-                                                                        let submission_api = api.clone();
-                                                                        let submission_profile = profile.map(str::to_string);
-                                                                        let submission_run_id = active_remote_run_id.clone();
-                                                                        let submission_run_control = std::sync::Arc::downgrade(
-                                                                            &preinstalled_run_control,
-                                                                        );
-                                                                        let submission_intent_id = intent_id.clone();
-                                                                        let submission_text = queued_text.clone();
-                                                                        let submission_tx = guidance_submission_tx.clone();
-                                                                        in_flight_guidance_queue_index = Some(
-                                                                            bottom_pane
-                                                                                .queued_next_turn_submission_count(),
-                                                                        );
-                                                                        guidance_submission_in_flight = true;
-                                                                        guidance_submission_task = Some(tokio::spawn(async move {
-                                                                            let result = submit_active_run_guidance(
-                                                                                ActiveRunGuidanceRequest {
-                                                                                    api: &submission_api,
-                                                                                    profile: submission_profile.as_deref(),
-                                                                                    remote_run_id: &submission_run_id,
-                                                                                    run_control: &submission_run_control,
-                                                                                    intent_id: &submission_intent_id,
-                                                                                    text: slash_dispatch::parse_submission(&submission_text).text(),
-                                                                                    background_work_snapshot: Some(&active_work_snapshot),
-                                                                                    work_unit_observations: &active_work_observations,
-                                                                                },
-                                                                            )
-                                                                            .await;
-                                                                            let _ = submission_tx
-                                                                                .send(ActiveRunGuidanceSubmission {
-                                                                                    intent_id: submission_intent_id,
-                                                                                    text: submission_text,
-                                                                                    result,
-                                                                                })
-                                                                                .await;
-                                                                        }));
                                                                     }
                                                                     BottomPaneAction::ExternalEditorUnavailable => {
                                                                         surface_external_editor_unavailable(
@@ -10511,7 +11083,7 @@ pub(crate) async fn run_tui_session(
                                                                                 file_writer: Some(file_writer.clone()),
                                                                                 agent_workbench_tx: agent_workbench_tx.clone(),
                                                                                 native_delivery_refresh: native_delivery_refresh.clone(),
-                                                                                session_attachment_epoch: turn_session_attachment_epoch,
+                                                                                session_attachment_epoch: live_session_attachment_epoch,
                                                                             },
                                                                             &restored_local_agent_task_projections,
                                                                             &mut chat_widget,
@@ -10521,6 +11093,40 @@ pub(crate) async fn run_tui_session(
                                                                             terminal_height,
                                                                         )
                                                                         .await;
+                                                                    }
+                                                                    BottomPaneAction::ViewCompleted {
+                                                                        result: Some(result @ (bottom_pane::view::ViewResult::Model { .. }
+                                                                            | bottom_pane::view::ViewResult::ModelThinking { .. })), ..
+                                                                    } => {
+                                                                        if picker_owner.as_ref().is_some_and(|owner| owner.is_current()) {
+                                                                            match slash_dispatch::prepare_model_picker_result(&result, &mut bottom_pane, &mut chat_widget) {
+                                                                                Some(Ok(Some(selection))) => {
+                                                                                    chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+                                                                                        "Selected {} · applies after this task, including queued messages.", selection.name
+                                                                                    )));
+                                                                                    staged_model = Some(NextModelSelection::Picked { result: Box::new(result), selection });
+                                                                                    picker_owner = None;
+                                                                                }
+                                                                                Some(Err(())) => picker_owner = None,
+                                                                                _ => {}
+                                                                            }
+                                                                        } else {
+                                                                            chat_widget.commit_system(history_cell::system::SystemCell::warning("Account changed. Reopen /model to select a model."));
+                                                                            picker_owner = None;
+                                                                        }
+                                                                        bottom_pane.sync_popups();
+                                                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                                        frame_requester.schedule_frame();
+                                                                    }
+                                                                    BottomPaneAction::ViewCompleted {
+                                                                        result: Some(bottom_pane::view::ViewResult::ModelSetup(_)), ..
+                                                                    } => {
+                                                                        bottom_pane.queue_next_turn_submission("/model add".into());
+                                                                        chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                                                            "Model setup will open after the current task."
+                                                                        ));
+                                                                        picker_owner = None;
+                                                                        frame_requester.schedule_frame();
                                                                     }
                                                                     BottomPaneAction::ViewCompleted {
                                                                         result: Some(bottom_pane::view::ViewResult::Permission(mode)),
@@ -10707,6 +11313,7 @@ pub(crate) async fn run_tui_session(
                                                     }
                                                 }
                                                 Some(ae) = tui_rx.recv() => {
+                                                    let Some(ae) = accept_owned_tui_event(ae, Some(&turn_submission_id)) else { continue; };
                                                     if let TuiAppEvent::RestoreInput(request) = &ae {
                                                         // A queue-full fallback may contain the
                                                         // same request if a retry raced the normal
@@ -10729,13 +11336,27 @@ pub(crate) async fn run_tui_session(
                                                     }
                                                     if let TuiAppEvent::SessionBound(session_id) = &ae {
                                                         permission_control.bind_session(session_id);
+                                                        let bound = astra_core::sync_poison::recover_mutex_lock(&turn_bound_session);
+                                                        let Some(epoch) = live_turn_attachment_epoch(
+                                                            turn_session_id.as_deref(), turn_session_attachment_epoch,
+                                                            bound.as_deref(), session_id,
+                                                        ) else {
+                                                            tracing::warn!("ignored conflicting session binding on active turn");
+                                                            continue;
+                                                        };
+                                                        live_session_attachment_epoch = epoch;
                                                     }
-                                                    if let TuiAppEvent::RunBound(run_id) = &ae {
+                                                    if let TuiAppEvent::RunBound(run_id) = &ae
+                                                        && !run_id.trim().is_empty()
+                                                    {
                                                         let mut bound = astra_core::sync_poison::recover_mutex_lock(
                                                             &active_remote_run_id,
                                                         );
                                                         match bound.as_deref() {
-                                                            None => *bound = Some(run_id.clone()),
+                                                            None => {
+                                                                *bound = Some(run_id.clone());
+                                                                guidance_dispatch_needed = true;
+                                                            }
                                                             Some(existing) if existing != run_id => {
                                                                 tracing::warn!(
                                                                     bound_run_id = existing,
@@ -10743,12 +11364,13 @@ pub(crate) async fn run_tui_session(
                                                                     "ignored conflicting active-run binding"
                                                                 );
                                                             }
-                                                            Some(_) => {}
+                                                            Some(_) => guidance_dispatch_needed = true,
                                                         }
                                                     }
                                                     if apply_live_session_binding(
                                                         &ae,
                                                         &mut chat_widget,
+                                                        (&mut bottom_pane, live_session_attachment_epoch),
                                                         &task_board,
                                                         &server_agent_observer,
                                                         &plan_task_observer,
@@ -10849,13 +11471,17 @@ pub(crate) async fn run_tui_session(
                                                             &frame_requester,
                                                         );
                                                     }
-                                                    apply_active_turn_tui_control_event(
+                                                    if apply_active_turn_tui_control_event(
                                                         &ae,
                                                         &mut bottom_pane,
                                                         &mut chat_widget,
                                                         &preinstalled_run_control,
-                                                        turn_session_attachment_epoch,
-                                                    );
+                                                        live_session_attachment_epoch,
+                                                        &turn_submission_id,
+                                                    ) == UserIntentProjection::Returned {
+                                                        guidance_admission_closed = true;
+                                                        guidance_handoff_blocked = true;
+                                                    }
                                                     refresh_open_transcript_view(
                                                         &chat_widget,
                                                         &mut bottom_pane,
@@ -10983,7 +11609,7 @@ pub(crate) async fn run_tui_session(
                                                     drain_agent_workbench_outcomes(
                                                         &mut agent_workbench_rx,
                                                         (!workbench_session_id.is_empty()).then_some(workbench_session_id.as_str()),
-                                                        turn_session_attachment_epoch,
+                                                        live_session_attachment_epoch,
                                                         &mut chat_widget,
                                                         &mut bottom_pane,
                                                         &frame_requester,
@@ -11008,7 +11634,7 @@ pub(crate) async fn run_tui_session(
                                                             file_writer: Some(file_writer.clone()),
                                                             agent_workbench_tx: agent_workbench_tx.clone(),
                                                             native_delivery_refresh: native_delivery_refresh.clone(),
-                                                            session_attachment_epoch: turn_session_attachment_epoch,
+                                                            session_attachment_epoch: live_session_attachment_epoch,
                                                         },
                                                         &restored_local_agent_task_projections,
                                                         &mut chat_widget,
@@ -11149,7 +11775,8 @@ pub(crate) async fn run_tui_session(
                                                     // here would clash. Catches turn-boundary
                                                     // pivots (e.g. exit_plan_mode → Auto) within
                                                     // one inner tick.
-                                                    if let Some(outcome) = permission_control.reconcile(&perm_mode_mirror) {
+                                                    if turn_model_owner.is_current()
+                                                        && let Some(outcome) = permission_control.reconcile(&perm_mode_mirror) {
                                                         match outcome {
                                                             Ok(_) => bottom_pane.clear_staged_permission_mode(),
                                                             Err(error) => {
@@ -11158,7 +11785,7 @@ pub(crate) async fn run_tui_session(
                                                         }
                                                     }
                                                     let live_mode = perm_mode_mirror.current();
-                                                    if bottom_pane.footer.permission_mode
+                                                    if turn_model_owner.is_current() && bottom_pane.footer.permission_mode
                                                         != Some(live_mode)
                                                     {
                                                         bottom_pane.footer.permission_mode = Some(live_mode);
@@ -11202,24 +11829,43 @@ pub(crate) async fn run_tui_session(
                                         r
                                     };
 
-                                    if matches!(permission_control.reconcile(&perm_mode_mirror), Some(Ok(_))) {
+                                    let first_bound_session = astra_core::sync_poison::recover_mutex_lock(&turn_bound_session).clone();
+                                    let same_turn_scope = turn_model_owner.is_current() && model_selection_attachment_matches(
+                                        turn_model_session.as_deref(), turn_model_epoch,
+                                        state.session_id.as_deref(), state.session_attachment_epoch,
+                                        first_bound_session.as_deref().unwrap_or(""),
+                                    );
+                                    if same_turn_scope && matches!(permission_control.reconcile(&perm_mode_mirror), Some(Ok(_))) {
                                         bottom_pane.clear_staged_permission_mode();
                                     }
                                     drop(permission_control);
+                                    if let Some(selection) = staged_model.take() {
+                                        if same_turn_scope {
+                                            match selection {
+                                                NextModelSelection::Picked { result, .. } => {
+                                                    slash_dispatch::apply_model_picker_result(
+                                                        &result, &mut state, &mut bottom_pane, &mut chat_widget,
+                                                    );
+                                                }
+                                                NextModelSelection::Requested(name) => slash_dispatch::apply_requested_model(
+                                                    &mut state, &mut bottom_pane, &mut chat_widget, name.as_deref(),
+                                                ),
+                                            }
+                                        } else {
+                                            chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                                "Account or session changed; model selection was not applied. Reopen /model."
+                                            ));
+                                        }
+                                    }
                                     if !deferred_active_bg_notifications.is_empty() {
                                         state
                                             .pending_bg_notifications
                                             .extend(deferred_active_bg_notifications);
                                     }
 
-                                    if let Some(mode) = bottom_pane.take_staged_permission_mode() {
-                                        slash_dispatch::apply_permission_mode_selection(
-                                            &mut state,
-                                            &mut bottom_pane,
-                                            &mut chat_widget,
-                                            mode,
-                                        );
-                                    }
+                                    finish_staged_permission_selection(
+                                        &mut state, &mut bottom_pane, &mut chat_widget, same_turn_scope,
+                                    );
 
                                     *astra_core::sync_poison::recover_mutex_lock(
                                         &state.active_turn_local_run_control,
@@ -11255,25 +11901,27 @@ pub(crate) async fn run_tui_session(
                                         turn_result,
                                         Ok(crate::cli::turn::turn_entry::InteractiveTurnOutcome::Completed(_))
                                     );
-                                    let should_start_followups = should_start_queued_followups(
+                                    let should_start_followups = !guidance_handoff_blocked && should_start_queued_followups(
                                         turn_succeeded,
                                         state.last_turn_interrupted,
                                                                     exit_after_turn_settlement,
                                         turn_not_started,
                                     );
                                     let locally_owned_user_intents =
-                                        bottom_pane.take_client_recoverable_user_intents();
+                                        bottom_pane.finish_turn_user_intents(&turn_submission_id);
                                     if interrupt_pending {
                                         interrupt_pending = false;
                                         bottom_pane.interrupt_pending = false;
                                     }
                                     let mut post_output_submissions =
                                         bottom_pane.take_queued_next_turn_submissions();
+                                    merge_unsubmitted_guidance(
+                                        &mut post_output_submissions,
+                                        locally_owned_user_intents,
+                                    );
                                     if let Some(restored) = settle_followup_submissions(
                                         &mut queued_followup_submissions,
-                                        locally_owned_user_intents
-                                            .iter()
-                                            .map(|intent| slash_dispatch::conversation_for_composer(&intent.text).into_owned()),
+                                        std::iter::empty(),
                                         &mut post_output_submissions,
                                         should_start_followups,
                                     ) {
@@ -11961,6 +12609,7 @@ pub(crate) async fn run_tui_session(
                                                 )),
                                             );
                                         }
+                                        bottom_pane.set_session_attachment(state.session_id.as_deref(), state.session_attachment_epoch);
                                         let session_rebound = state.session_id != pre_sid
                                             || state.session_attachment_epoch != pre_attachment_epoch;
                                         followup_session_rebound = session_rebound;
@@ -12187,6 +12836,16 @@ pub(crate) async fn run_tui_session(
                 }
             }
             Some(ae) = tui_rx.recv() => {
+                let Some(ae) = accept_owned_tui_event(ae, None) else { continue; };
+                if let TuiAppEvent::UserIntentApplied { intent_id, .. }
+                | TuiAppEvent::UserIntentReturned { intent_id, .. } = &ae
+                    && bottom_pane.user_intent_belongs_to_other_turn(intent_id, "")
+                {
+                    // This disposition outlived its foreground turn. Leave its
+                    // original message unconfirmed rather than moving it to a
+                    // possibly different session or inventing a current owner.
+                    continue;
+                }
                 if let TuiAppEvent::RestoreInput(request) = &ae {
                     discard_restore_input_request(&restore_input_queue, request);
                     if apply_restore_input_request(
@@ -12204,6 +12863,7 @@ pub(crate) async fn run_tui_session(
                 if apply_live_session_binding(
                     &ae,
                     &mut chat_widget,
+                    (&mut bottom_pane, state.session_attachment_epoch),
                     &task_board,
                     &server_agent_observer,
                     &plan_task_observer,
@@ -13038,6 +13698,7 @@ fn handle_app_event(
         | TuiAppEvent::RestoreInput(_)
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
+        | TuiAppEvent::ObservedUserIntent { .. }
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainAnalyze(_)
         | TuiAppEvent::ExplainAnalyzeSnapshot { .. }
@@ -13196,6 +13857,9 @@ mod tests {
             .into_iter()
             .map(|item| match item {
                 NextTurnSubmission::Interactive(text) => text,
+                NextTurnSubmission::Guidance(intent) => {
+                    slash_dispatch::conversation_for_composer(&intent.text).into_owned()
+                }
                 NextTurnSubmission::Conversation { .. } => panic!("expected interactive custody"),
             })
             .collect()
@@ -14359,6 +15023,135 @@ mod tests {
     }
 
     #[test]
+    fn guidance_disposition_before_post_ack_wins_and_preserves_returned_input() {
+        let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        for (id, status) in [
+            ("applied", UserIntentProjection::Applied),
+            ("returned", UserIntentProjection::Returned),
+        ] {
+            pane.accept_turn_user_intent("turn", id.into(), "keep the original message".into())
+                .unwrap();
+            control.expect_remote_user_intent_submission(id);
+            let event = match status {
+                UserIntentProjection::Applied => TuiAppEvent::UserIntentApplied {
+                    intent_id: id.into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Applied,
+                    event_index: 1,
+                    content: "keep the original message".into(),
+                },
+                UserIntentProjection::Returned => TuiAppEvent::UserIntentReturned {
+                    intent_id: id.into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Returned,
+                    event_index: 1,
+                    content: "keep the original message".into(),
+                },
+                UserIntentProjection::None => unreachable!(),
+            };
+            assert_eq!(
+                apply_active_turn_tui_control_event(
+                    &event,
+                    &mut pane,
+                    &mut widget,
+                    &control,
+                    0,
+                    "turn"
+                ),
+                status
+            );
+            assert!(pane.user_intent_is_resolved(id));
+            assert!(control.pending_remote_submission_ids().is_empty());
+        }
+        assert_eq!(pane.composer.text(), "keep the original message");
+    }
+
+    #[test]
+    fn model_selection_keeps_its_attachment_across_initial_binding_only() {
+        assert!(model_selection_attachment_matches(
+            Some("same"),
+            7,
+            Some("same"),
+            7,
+            "same"
+        ));
+        assert!(model_selection_attachment_matches(
+            None,
+            7,
+            Some("new"),
+            8,
+            "new"
+        ));
+        assert!(!model_selection_attachment_matches(
+            Some("old"),
+            7,
+            Some("new"),
+            8,
+            "new"
+        ));
+        assert!(!model_selection_attachment_matches(
+            None,
+            7,
+            Some("other"),
+            8,
+            "new"
+        ));
+        assert!(!model_selection_attachment_matches(
+            None,
+            7,
+            Some("new"),
+            9,
+            "new"
+        ));
+    }
+
+    #[test]
+    fn late_guidance_disposition_does_not_mutate_the_next_turn() {
+        let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("new-session");
+        for (id, returned) in [("old-applied", false), ("old-returned", true)] {
+            pane.accept_turn_user_intent("old-turn", id.into(), "old message".into())
+                .unwrap();
+            assert!(pane.mark_user_intent_unconfirmed(id));
+            let event = if returned {
+                TuiAppEvent::UserIntentReturned {
+                    intent_id: id.into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Returned,
+                    event_index: 1,
+                    content: "old message".into(),
+                }
+            } else {
+                TuiAppEvent::UserIntentApplied {
+                    intent_id: id.into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Applied,
+                    event_index: 1,
+                    content: "old message".into(),
+                }
+            };
+            assert_eq!(
+                apply_active_turn_tui_control_event(
+                    &event,
+                    &mut pane,
+                    &mut widget,
+                    &control,
+                    1,
+                    "new-turn"
+                ),
+                UserIntentProjection::None
+            );
+        }
+        assert_eq!(pane.pending_user_intent_count(), 2);
+        assert!(pane.composer.is_empty());
+        assert!(!rendered_transcript_overlay(&widget, 80).contains("old message"));
+        assert!(control.pending_remote_disposition_ids().is_empty());
+    }
+
+    #[test]
     fn guidance_observer_claim_does_not_keep_a_finished_turn_alive() {
         let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
         run_control.expect_remote_user_intent_disposition("intent-1", 7);
@@ -14614,6 +15407,7 @@ mod tests {
             project_primary_guidance_disposition(
                 &tx,
                 &weak,
+                "turn",
                 TuiAppEvent::UserIntentApplied {
                     intent_id: "intent-1".into(),
                     delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -14639,7 +15433,10 @@ mod tests {
             !projection.is_finished(),
             "channel admission is not a reducer-completion acknowledgement"
         );
-        let disposition = rx.recv().await.expect("queued guidance disposition");
+        let scoped = rx.recv().await.expect("queued guidance disposition");
+        assert!(accept_owned_tui_event(scoped.clone(), Some("next-turn")).is_none());
+        assert!(accept_owned_tui_event(scoped.clone(), None).is_none());
+        let disposition = accept_owned_tui_event(scoped, Some("turn")).unwrap();
         assert!(matches!(
             &disposition,
             TuiAppEvent::UserIntentApplied { intent_id, .. } if intent_id == "intent-1"
@@ -14664,6 +15461,7 @@ mod tests {
             &mut chat_widget,
             &run_control,
             0,
+            "turn",
         );
         assert_eq!(
             projection.await.unwrap(),
@@ -14682,6 +15480,7 @@ mod tests {
             &mut chat_widget,
             &run_control,
             0,
+            "turn",
         );
         assert!(run_control.pending_remote_disposition_ids().is_empty());
         assert_eq!(
@@ -15254,6 +16053,96 @@ mod tests {
                 assert_eq!(pane.composer.text(), "unsent draft");
             }
         }
+    }
+
+    #[test]
+    fn same_account_reauthentication_can_inspect_but_not_replay_old_guidance() {
+        const CHILD: &str = "ASTRA_GUIDANCE_REAUTH_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tui::event_loop::tests::same_account_reauthentication_can_inspect_but_not_replay_old_guidance"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        use crate::cli::{cli_config::cli_utils, native_auth};
+        use astra_credentials::native::NativeStore;
+        let _credentials = crate::test_utils::isolate_credentials();
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeStore::with_directory(root.path().join("auth"));
+        let mut original = native_auth::test_session();
+        let (session_a, _) = store.publish(original.clone()).unwrap();
+        let binding_a = native_auth::binding_for_test(store.clone(), session_a);
+        let _active_a = native_auth::install_active_for_test(binding_a.clone());
+        let profile = binding_a.profile_name();
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test(&profile, Some("astra-a")).unwrap();
+        let owner_a = cli_utils::cli_owner_auth_snapshot();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let target = || crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+            run_id: "child".into(),
+        };
+        let old_child = AgentGuideTarget::capture(
+            "Reviewer".into(),
+            "child".into(),
+            target(),
+            api.clone(),
+            Some("session".into()),
+            1,
+        );
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 1);
+        pane.set_root_intent_scope(Arc::new(bottom_pane::RootIntentScope::new(
+            owner_a.clone(),
+            1,
+            Arc::new(std::sync::Mutex::new(Some("session".into()))),
+        )));
+        pane.accept_turn_user_intent("turn", "root".into(), "root private".into())
+            .unwrap();
+        pane.mark_user_intent_unconfirmed("root");
+        pane.accept_agent_guide("child".into(), old_child.clone(), "child private".into());
+        pane.mark_user_intent_unconfirmed("child");
+        original.access_token = "new-token".into();
+        original.refresh_token = "new-refresh".into();
+        let (session_b, _) = store.publish(original.clone()).unwrap();
+        let _active_b = native_auth::install_active_for_test(native_auth::binding_for_test(
+            store.clone(),
+            session_b,
+        ));
+        assert!(!owner_a.is_current());
+        assert!(owner_a.can_view_local_draft());
+        pane.set_session_attachment(Some("session"), 2);
+        assert!(pane.unconfirmed_root_guidance(Some("root")).is_some());
+        assert!(!pane.root_intent_is_visible("root"));
+        assert!(old_child.can_view_draft(Some("session"), 2));
+        assert!(!old_child.is_attached(Some("session"), 2));
+        let new_child = AgentGuideTarget::capture(
+            "Reviewer".into(),
+            "child".into(),
+            target(),
+            api,
+            Some("session".into()),
+            2,
+        );
+        assert!(matches!(pane.agent_delivery_barrier(&new_child, &[]),
+            Some(bottom_pane::AgentDeliveryBarrier::Unconfirmed(ids)) if ids == ["child"]));
+        original.astra_user_id = "astra-b".into();
+        original.subject = "account-b".into();
+        let (session_c, _) = store.publish(original).unwrap();
+        let binding_c = native_auth::binding_for_test(store, session_c);
+        let _active_c = native_auth::install_active_for_test(binding_c.clone());
+        let _other = cli_utils::install_cli_profile_identity_for_test(
+            &binding_c.profile_name(),
+            Some("astra-b"),
+        )
+        .unwrap();
+        assert!(pane.unconfirmed_root_guidance(Some("root")).is_none());
+        assert!(!old_child.can_view_draft(Some("session"), 2));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16362,8 +17251,8 @@ mod tests {
         assert!(release_closed_run_guidance(
             &control,
             &mut pane,
+            "",
             "in-flight-guidance",
-            "older guidance",
             queue_index,
         ));
         assert!(control.pending_remote_submission_ids().is_empty());
@@ -16389,107 +17278,81 @@ mod tests {
     }
 
     #[test]
-    fn unbound_run_holds_follow_up_for_the_next_turn() {
-        assert!(follow_up_waits_for_unbound_run(None));
-        assert!(follow_up_waits_for_unbound_run(Some("")));
-        assert!(follow_up_waits_for_unbound_run(Some("   ")));
-        assert!(!follow_up_waits_for_unbound_run(Some("run-1")));
+    fn staged_guidance_keeps_turn_identity_and_submission_order() {
+        let mut pane = BottomPane::new();
+        pane.accept_turn_user_intent("old-turn", "old".into(), "older uncertainty".into())
+            .unwrap();
+        assert!(pane.mark_user_intent_unconfirmed("old"));
+        pane.accept_turn_user_intent("turn", "first".into(), "用 Python 写".into())
+            .unwrap();
+        assert!(pane.queue_next_turn_submission("explicit next turn".into()));
+        pane.accept_turn_user_intent("turn", "second".into(), "再加测试".into())
+            .unwrap();
 
-        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
-        let mut bottom_pane = BottomPane::new();
-        let mut chat_widget = chat_widget::ChatWidget::new("");
-        let mut deferred = false;
-        assert!(defer_follow_up_before_run_bind(
-            "用 Python 写",
-            None,
-            &mut deferred,
-            &mut bottom_pane,
-            &mut chat_widget,
-        ));
-        assert!(deferred);
-        assert!(run_control.pending_remote_submission_ids().is_empty());
-        assert_eq!(bottom_pane.pending_user_intent_count(), 0);
-
-        // RunBound flips the id, but the latch keeps the newer message behind A.
-        assert!(!defer_follow_up_before_run_bind(
-            "再加测试",
-            Some("run-1"),
-            &mut deferred,
-            &mut bottom_pane,
-            &mut chat_widget,
-        ));
-        assert!(active_submission_routes_to_next_turn(
-            "再加测试",
-            false,
-            false,
-            deferred
-        ));
-        assert!(bottom_pane.queue_next_turn_submission("再加测试".to_string()));
-        assert!(run_control.pending_remote_submission_ids().is_empty());
-
-        // A slash command already queued must not itself arm the latch.
-        let mut slash_only = BottomPane::new();
-        let mut slash_deferred = false;
-        assert!(slash_only.queue_next_turn_submission("/status".to_string()));
-        assert!(!defer_follow_up_before_run_bind(
-            "plain text after slash",
-            Some("run-1"),
-            &mut slash_deferred,
-            &mut slash_only,
-            &mut chat_widget,
-        ));
-        assert!(!slash_deferred);
-
-        let mut queued = bottom_pane.take_queued_next_turn_submissions();
-        let mut followups = std::collections::VecDeque::new();
-        assert!(
-            settle_followup_submissions(&mut followups, std::iter::empty(), &mut queued, true)
-                .is_none()
+        // No binding is needed to retain either input. Once bound, the
+        // dispatcher selects the first unsent entry for this physical turn.
+        assert_eq!(
+            pane.next_unsent_guidance("turn").map(|intent| (
+                intent.intent_id.as_str(),
+                intent.text.as_str(),
+                intent.next_turn_position
+            )),
+            Some(("first", "用 Python 写", 0))
+        );
+        assert!(pane.promote_user_intent_accepted("first"));
+        assert_eq!(
+            pane.next_unsent_guidance("turn").map(|intent| (
+                intent.intent_id.as_str(),
+                intent.text.as_str(),
+                intent.next_turn_position
+            )),
+            Some(("second", "再加测试", 1))
+        );
+        assert!(pane.next_unsent_guidance("other-turn").is_none());
+        let unsent = pane.finish_turn_user_intents("turn");
+        let mut queued = pane.take_queued_next_turn_submissions();
+        merge_unsubmitted_guidance(&mut queued, unsent);
+        assert_eq!(
+            interactive_texts(queued),
+            vec!["explicit next turn", "再加测试"]
         );
         assert_eq!(
-            interactive_texts(followups),
-            vec!["用 Python 写".to_string(), "再加测试".to_string()]
+            pane.pending_user_intent_count(),
+            2,
+            "old uncertainty and accepted input remain owned"
         );
-        assert!(!UNBOUND_RUN_FOLLOW_UP_NOTICE.contains("HTTP"));
-        assert!(UNBOUND_RUN_FOLLOW_UP_NOTICE.contains("queued"));
 
-        // A is replayed as the next turn while B is still queued. C must stay
-        // behind B even after that turn's run id binds.
-        let mut replayed = interactive_queue(["用 Python 写".to_string(), "再加测试".to_string()]);
-        let mut replay_pane = BottomPane::new();
-        let mut replay_chat = chat_widget::ChatWidget::new("");
-        assert!(matches!(
-            release_next_queued_followup(&mut replayed, &mut replay_pane, &mut replay_chat),
-            QueuedFollowupRelease::SubmitNext
-        ));
-        assert!(replay_pane.composer.is_empty());
-        assert_eq!(replayed.pop_front().unwrap().text(), "用 Python 写");
-        replay_pane.composer.set_text("");
-        let replay_latch = model_facing_followup_backlog(&replayed);
-        assert!(replay_latch);
-        assert!(active_submission_routes_to_next_turn(
-            "第三句",
-            false,
-            false,
-            replay_latch
-        ));
-        let mut replay_deferred = replay_latch;
-        assert!(!defer_follow_up_before_run_bind(
-            "第三句",
-            Some("run-1"),
-            &mut replay_deferred,
-            &mut replay_pane,
-            &mut replay_chat,
-        ));
-        assert!(replay_pane.queue_next_turn_submission("第三句".to_string()));
-        let mut post = replay_pane.take_queued_next_turn_submissions();
-        assert!(
-            settle_followup_submissions(&mut replayed, std::iter::empty(), &mut post, true)
-                .is_none()
-        );
+        // If a run never binds, recover all unsent inputs around explicitly
+        // queued messages in the original order.
+        let mut pane = BottomPane::new();
+        pane.accept_turn_user_intent("unbound", "a".into(), "first".into())
+            .unwrap();
+        assert!(pane.queue_next_turn_submission("later turn".into()));
+        pane.accept_turn_user_intent("unbound", "b".into(), "second".into())
+            .unwrap();
+        let unsent = pane.finish_turn_user_intents("unbound");
+        let mut queued = pane.take_queued_next_turn_submissions();
+        merge_unsubmitted_guidance(&mut queued, unsent);
         assert_eq!(
-            interactive_texts(replayed),
-            vec!["再加测试".to_string(), "第三句".to_string()]
+            interactive_texts(queued),
+            vec!["first", "later turn", "second"]
+        );
+
+        let mut pane = BottomPane::new();
+        pane.accept_turn_user_intent("turn", "a".into(), "first".into())
+            .unwrap();
+        pane.accept_turn_user_intent("turn", "b".into(), "second".into())
+            .unwrap();
+        assert!(pane.mark_user_intent_unconfirmed("a"));
+        assert!(
+            pane.next_unsent_guidance("turn").is_none(),
+            "an unknown first delivery cannot be overtaken"
+        );
+        pane.accept_turn_user_intent("next-turn", "c".into(), "new task".into())
+            .unwrap();
+        assert_eq!(
+            pane.next_unsent_guidance("next-turn").unwrap().intent_id,
+            "c"
         );
 
         let mut slash_queue = interactive_queue(["/model gpt".to_string(), "plain A".to_string()]);
@@ -18906,11 +19769,13 @@ mod tests {
             crate::tui::server_agent_observer::ServerAgentObserver::new(api.clone(), None, None);
         let work_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api, None, None);
         let mut chat = chat_widget::ChatWidget::new(String::new());
+        let mut pane = BottomPane::new();
         let mut pin = Some(false);
 
         assert!(apply_live_session_binding(
             &TuiAppEvent::SessionBound("session-live".into()),
             &mut chat,
+            (&mut pane, 0),
             &task_board,
             &server_agents,
             &work_observer,
@@ -20079,6 +20944,499 @@ mod tests {
         assert!(matches!(timed_out, GuidanceSubmissionError::Unconfirmed(_)));
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn active_guidance_retry_keeps_earlier_ambiguous_delivery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _credentials = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var(
+                "ASTRA_ACCESS_TOKEN",
+                "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDAwMDAwMDB9.sig",
+            );
+        }
+        for (responses, expected) in [
+            (vec![503, 403], "unknown"),
+            (vec![503, 409], "unknown"),
+            (vec![503, 200], "accepted"),
+            (vec![403], "rejected"),
+            (vec![409], "closed"),
+        ] {
+            let server = MockServer::start().await;
+            let count = Arc::new(AtomicUsize::new(0));
+            let request_count = count.clone();
+            let response_codes = responses.clone();
+            Mock::given(method("POST"))
+                .and(path("/chat/runs/run-1/intents"))
+                .respond_with(move |_: &wiremock::Request| {
+                    let index = request_count.fetch_add(1, Ordering::SeqCst);
+                    let status = response_codes[index];
+                    if status == 200 {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "run_id": "run-1", "intent_id": "intent-1",
+                            "status": "accepted_remote", "duplicate": true, "event_index": 7
+                        }))
+                    } else if status == 409 {
+                        ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                            "error_code": "run_intent_run_terminal"
+                        }))
+                    } else {
+                        ResponseTemplate::new(status)
+                    }
+                })
+                .expect(responses.len() as u64)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let run_id = Arc::new(std::sync::Mutex::new(Some("run-1".to_string())));
+            let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            let result = submit_active_run_guidance(ActiveRunGuidanceRequest {
+                api: &api,
+                profile: None,
+                owner: &crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                remote_run_id: &run_id,
+                run_control: &Arc::downgrade(&control),
+                intent_id: "intent-1",
+                text: "change the plan",
+                background_work_snapshot: None,
+                work_unit_observations: &[],
+            })
+            .await;
+            match expected {
+                "unknown" => assert!(matches!(
+                    result,
+                    Err(GuidanceSubmissionError::Unconfirmed(_))
+                )),
+                "accepted" => assert_eq!(result.unwrap().event_index, 7),
+                "rejected" => assert!(matches!(result, Err(GuidanceSubmissionError::Rejected(_)))),
+                "closed" => assert!(matches!(
+                    result,
+                    Err(GuidanceSubmissionError::GuidanceClosed(_))
+                )),
+                _ => unreachable!(),
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), responses.len());
+            assert!(requests.windows(2).all(|pair| pair[0].body == pair[1].body));
+        }
+        let _original = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("original-owner"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let _replacement =
+            crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "default",
+                Some("replacement-owner"),
+            )
+            .unwrap();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let run_id = Arc::new(std::sync::Mutex::new(Some("run-1".into())));
+        let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let result = submit_active_run_guidance(ActiveRunGuidanceRequest {
+            api: &api,
+            profile: None,
+            owner: &owner,
+            remote_run_id: &run_id,
+            run_control: &Arc::downgrade(&control),
+            intent_id: "old",
+            text: "private",
+            background_work_snapshot: None,
+            work_unit_observations: &[],
+        })
+        .await;
+        assert!(matches!(result, Err(GuidanceSubmissionError::Rejected(_))));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    async fn held_json_response(
+        path: &'static str,
+        status: axum::http::StatusCode,
+        body: serde_json::Value,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let observed = Arc::new(std::sync::Mutex::new(Some(observed_tx)));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post({
+                let release = release.clone();
+                move || {
+                    let observed = observed.clone();
+                    let release = release.clone();
+                    let body = body.clone();
+                    async move {
+                        if let Some(tx) = observed.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        release.notified().await;
+                        (status, axum::Json(body))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, observed_rx, release, task)
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn terminal_guidance_reply_after_account_switch_preserves_the_original_drafts() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var(
+                "ASTRA_ACCESS_TOKEN",
+                "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDAwMDAwMDB9.sig",
+            );
+        }
+        let _original = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("original-owner"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let (url, observed_rx, release, server) = held_json_response(
+            "/chat/runs/run-1/intents",
+            axum::http::StatusCode::CONFLICT,
+            serde_json::json!({"error_code": "run_intent_run_terminal"}),
+        )
+        .await;
+        let api = astra_thin_client::ThinClient::new(&url, None).unwrap();
+        let run_id = Arc::new(std::sync::Mutex::new(Some("run-1".into())));
+        let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let binding = Arc::new(std::sync::Mutex::new(Some("session".into())));
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 1);
+        pane.set_root_intent_scope(Arc::new(bottom_pane::RootIntentScope::new(
+            owner.clone(),
+            1,
+            binding,
+        )));
+        pane.accept_turn_user_intent("turn", "first".into(), "private first".into())
+            .unwrap();
+        pane.accept_turn_user_intent("turn", "later".into(), "private later".into())
+            .unwrap();
+        control.expect_remote_user_intent_submission("first");
+        let control_weak = Arc::downgrade(&control);
+        let submission = submit_active_run_guidance(ActiveRunGuidanceRequest {
+            api: &api,
+            profile: None,
+            owner: &owner,
+            remote_run_id: &run_id,
+            run_control: &control_weak,
+            intent_id: "first",
+            text: "private first",
+            background_work_snapshot: None,
+            work_unit_observations: &[],
+        });
+        tokio::pin!(submission);
+        tokio::select! {
+            result = &mut submission => panic!("request completed too early: {result:?}"),
+            result = observed_rx => result.unwrap(),
+        }
+        let replacement = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("other-owner"),
+        )
+        .unwrap();
+        release.notify_one();
+        assert!(matches!(
+            submission.await,
+            Err(GuidanceSubmissionError::GuidanceClosed(_))
+        ));
+        assert!(!release_closed_run_guidance(
+            &control, &mut pane, "turn", "first", 0
+        ));
+        assert!(control.pending_remote_submission_ids().is_empty());
+        assert!(pane.take_queued_next_turn_submissions().is_empty());
+        assert!(pane.finish_turn_user_intents("turn").is_empty());
+        assert!(pane.composer.is_empty());
+        assert!(!pane.recover_returned_root_guidance());
+        drop(replacement);
+        assert!(pane.recover_returned_root_guidance());
+        assert_eq!(pane.composer.text(), "private first");
+        pane.composer.set_text("");
+        assert!(pane.recover_returned_root_guidance());
+        assert!(pane.composer.text().contains("private later"));
+        server.abort();
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn delayed_permission_change_does_not_apply_to_a_replacement_account() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        unsafe {
+            std::env::set_var(
+                "ASTRA_ACCESS_TOKEN",
+                "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDAwMDAwMDB9.sig",
+            );
+        }
+        let _original = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("original-owner"),
+        )
+        .unwrap();
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let (url, observed_rx, release, server) = held_json_response(
+            "/chat/runs/run-1/permission-mode",
+            axum::http::StatusCode::OK,
+            serde_json::json!({}),
+        )
+        .await;
+        let api = astra_thin_client::ThinClient::new(&url, None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id("session");
+        let start_epoch = state.session_attachment_epoch;
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        let (approval_tx, mut approval_rx) = tokio::sync::oneshot::channel();
+        pane.enqueue_approval(
+            "bash".into(),
+            "Run command".into(),
+            None,
+            "approval required".into(),
+            serde_json::json!({}),
+            approval_tx,
+        );
+        let mut control = crate::tui::permission_control::ActivePermissionControl::new(
+            api,
+            None,
+            owner.clone(),
+            Arc::new(std::sync::Mutex::new(Some("run-1".into()))),
+            state.perm_manager.permission_control_signal(),
+        );
+        control.bind_session("session");
+        stage_permission_mode_for_next_round(
+            &mut pane,
+            &mut widget,
+            crate::cli::permission_manager::PermissionMode::Bypass,
+            state.perm_manager.mode(),
+        );
+        control.request(crate::cli::permission_manager::PermissionMode::Bypass);
+        tokio::time::timeout(Duration::from_secs(3), observed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let _replacement =
+            crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "default",
+                Some("different-owner"),
+            )
+            .unwrap();
+        let bound = control.session_binding();
+        let bound = astra_core::sync_poison::recover_mutex_lock(&bound).clone();
+        let same_scope = owner.is_current()
+            && model_selection_attachment_matches(
+                Some("session"),
+                start_epoch,
+                state.session_id.as_deref(),
+                state.session_attachment_epoch,
+                bound.as_deref().unwrap_or(""),
+            );
+        drop(control);
+        release.notify_one();
+        finish_staged_permission_selection(&mut state, &mut pane, &mut widget, same_scope);
+        assert_eq!(
+            state.perm_manager.mode(),
+            crate::cli::permission_manager::PermissionMode::Prompt
+        );
+        assert!(pane.has_pending_approvals());
+        assert!(matches!(
+            approval_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        server.abort();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn queued_session_switch_keeps_unsent_guidance_with_its_original_session() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("owner"),
+        )
+        .unwrap();
+        for terminal_rejection in [false, true] {
+            let mut state = crate::cli::session::session_state::SessionState::default();
+            state.set_session_id("session-a");
+            let original_epoch = state.session_attachment_epoch;
+            let mut pane = BottomPane::new();
+            pane.set_session_attachment(Some("session-a"), original_epoch);
+            pane.set_root_intent_scope(Arc::new(bottom_pane::RootIntentScope::new(
+                crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                original_epoch,
+                Arc::new(std::sync::Mutex::new(Some("session-a".into()))),
+            )));
+            assert!(pane.queue_next_turn_submission("/session".into()));
+            pane.accept_turn_user_intent("turn", "intent".into(), "private guidance".into())
+                .unwrap();
+            let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            if terminal_rejection {
+                control.expect_remote_user_intent_submission("intent");
+                assert!(release_closed_run_guidance(
+                    &control, &mut pane, "turn", "intent", 1
+                ));
+                pane.set_session_attachment(Some("session-b"), original_epoch + 1);
+                let screen = render_bottom_pane_text(&pane, 100, 20);
+                assert!(!screen.contains("private guidance"), "{screen}");
+                pane.set_session_attachment(Some("session-a"), original_epoch);
+            }
+            let unsent = pane.finish_turn_user_intents("turn");
+            let mut queue = pane.take_queued_next_turn_submissions();
+            merge_unsubmitted_guidance(&mut queue, unsent);
+            assert_eq!(
+                queue.pop_front(),
+                Some(NextTurnSubmission::Interactive("/session".into()))
+            );
+            state.set_session_id("session-b");
+            let mut widget = chat_widget::ChatWidget::new("session-b");
+            assert_eq!(
+                handoff_after_session_update(
+                    &mut queue,
+                    &mut pane,
+                    &mut widget,
+                    &state,
+                    FollowupReleaseGate {
+                        model_catalog_loading: false,
+                        background_reads_in_flight: false,
+                        foreground_busy: false,
+                        session_rebound: true
+                    }
+                ),
+                QueuedFollowupHandoff::RestoredAfterSessionChange
+            );
+            assert!(pane.composer.is_empty());
+            let screen = render_bottom_pane_text(&pane, 100, 20);
+            assert!(!screen.contains("private guidance"), "{screen}");
+            assert!(!pane.recover_returned_root_guidance());
+            state.set_session_id("session-a");
+            pane.set_session_attachment(
+                state.session_id.as_deref(),
+                state.session_attachment_epoch,
+            );
+            assert!(pane.recover_returned_root_guidance());
+            assert_eq!(pane.composer.text(), "private guidance");
+        }
+    }
+
+    #[test]
+    fn literal_slash_guidance_remains_a_model_facing_fifo_entry() {
+        let mut pane = BottomPane::new();
+        pane.accept_turn_user_intent("turn", "literal".into(), "/stop".into())
+            .unwrap();
+        let unsent = pane.finish_turn_user_intents("turn");
+        let mut queue = VecDeque::new();
+        merge_unsubmitted_guidance(&mut queue, unsent);
+        assert!(model_facing_followup_backlog(&queue));
+        assert!(active_submission_routes_to_next_turn(
+            "later message",
+            false,
+            false,
+            model_facing_followup_backlog(&queue)
+        ));
+        assert_eq!(interactive_texts(queue), vec!["//stop"]);
+    }
+
+    #[test]
+    fn active_model_picker_respects_explicit_clear() {
+        let current: crate::cli::session::session_state::SessionModelChoice = "old-model".into();
+        assert!(active_model_picker_choice(None, Some(&current)).is_some());
+        assert!(
+            active_model_picker_choice(Some(&NextModelSelection::Requested(None)), Some(&current))
+                .is_none()
+        );
+        assert!(
+            active_model_picker_choice(
+                Some(&NextModelSelection::Requested(Some("new-model".into()))),
+                Some(&current)
+            )
+            .is_some()
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn returned_guidance_keeps_later_messages_and_command_drafts_editable() {
+        for later in ["later message", "/session"] {
+            let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+            let mut pane = BottomPane::new();
+            pane.set_session_attachment(Some("session"), 1);
+            pane.set_root_intent_scope(Arc::new(bottom_pane::RootIntentScope::new(
+                owner,
+                1,
+                Arc::new(std::sync::Mutex::new(Some("session".into()))),
+            )));
+            pane.accept_turn_user_intent("turn", "a".into(), "first".into())
+                .unwrap();
+            pane.accept_turn_user_intent("turn", "b".into(), "second".into())
+                .unwrap();
+            pane.promote_user_intent_accepted("a");
+            pane.queue_next_turn_submission(later.into());
+            pane.composer.set_text("current draft");
+            let mut widget = chat_widget::ChatWidget::new("session");
+            let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+            let returned = TuiAppEvent::UserIntentReturned {
+                intent_id: "a".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Returned,
+                event_index: 1,
+                content: "first".into(),
+            };
+            assert_eq!(
+                apply_active_turn_tui_control_event(
+                    &returned,
+                    &mut pane,
+                    &mut widget,
+                    &control,
+                    1,
+                    "turn"
+                ),
+                UserIntentProjection::Returned
+            );
+            let unsent = pane.finish_turn_user_intents("turn");
+            let mut queue = pane.take_queued_next_turn_submissions();
+            merge_unsubmitted_guidance(&mut queue, unsent);
+            restore_queued_input(queue, &mut pane);
+            assert!(pane.recover_returned_root_guidance());
+            assert_eq!(pane.composer.text(), "first");
+            pane.composer.set_text("");
+            assert!(pane.recover_returned_root_guidance());
+            assert_eq!(pane.composer.text(), "second");
+            pane.composer.set_text("");
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Left,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            if later == "/session" {
+                assert_eq!(pane.composer.text(), "current draft");
+                pane.composer.set_text("");
+                pane.handle_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Left,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+                assert_eq!(pane.composer.text(), "/session");
+            } else {
+                assert_eq!(pane.composer.text(), "current draft\n\nlater message");
+            }
+        }
+    }
+
     /// Terminal-guidance rejection (`run_intent_run_terminal`) reuses the exact
     /// next-turn queue; its wording promises only "queued", not "will be sent"
     /// (see `RUN_TERMINAL_FOLLOW_UP_NOTICE`),
@@ -20109,8 +21467,8 @@ mod tests {
             assert!(release_closed_run_guidance(
                 &run_control,
                 &mut bottom_pane,
+                "",
                 "intent-terminal-completed",
-                "rejected by completed run",
                 queue_index,
             ));
 
@@ -20157,8 +21515,8 @@ mod tests {
             assert!(release_closed_run_guidance(
                 &run_control,
                 &mut bottom_pane,
+                "",
                 "intent-terminal-cancelled",
-                "rejected by cancelled run",
                 queue_index,
             ));
 
@@ -20204,8 +21562,8 @@ mod tests {
             assert!(release_closed_run_guidance(
                 &run_control,
                 &mut bottom_pane,
+                "",
                 "intent-terminal-failed",
-                "rejected by failed run",
                 queue_index,
             ));
 
@@ -20245,8 +21603,8 @@ mod tests {
         assert!(release_closed_run_guidance(
             &run_control,
             &mut bottom_pane,
+            "",
             "intent-a",
-            "message A",
             queue_index,
         ));
         let mut queued = bottom_pane.take_queued_next_turn_submissions();
@@ -20289,8 +21647,8 @@ mod tests {
         assert!(release_closed_run_guidance(
             &run_control,
             &mut bottom_pane,
+            "",
             "intent-a",
-            "message A",
             queue_index,
         ));
 
@@ -20341,6 +21699,47 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
+    fn first_session_binding_keeps_child_observation_attached_after_parent_finishes() {
+        let epoch = live_turn_attachment_epoch(None, 5, Some("session"), "session").unwrap();
+        assert_eq!(epoch, 6);
+        assert_eq!(
+            live_turn_attachment_epoch(None, 5, Some("session"), "other"),
+            None
+        );
+        let guide = test_member_guide_target(Some("session".into()), epoch);
+        let observer = guide.0.observation.clone();
+        let mut pane = BottomPane::new();
+        pane.accept_agent_guide("guide".into(), guide.clone(), "message".into());
+        pane.promote_agent_guide_accepted("guide");
+        let mut widget = chat_widget::ChatWidget::new("session");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            epoch,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(!observer.is_cancelled());
+        tx.try_send(AgentWorkbenchOutcome::GuideApplied {
+            target: guide,
+            intent_id: "guide".into(),
+        })
+        .unwrap();
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            epoch,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(pane.pending_user_intent_count(), 0);
+    }
+
+    #[serial_test::serial]
+    #[test]
     fn member_guidance_outcomes_cannot_cross_session_or_owner_replacement() {
         let _credentials = crate::tests::isolate_credentials();
         let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
@@ -20368,7 +21767,6 @@ mod tests {
                 guide.clone(),
                 "private guidance".into(),
             ));
-            let before = render_bottom_pane_text(&pane, 100, 20);
             let observation = guide.0.observation.clone();
             let mut widget = chat_widget::ChatWidget::new("new-session");
             let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -20408,9 +21806,16 @@ mod tests {
             );
             assert!(observation.is_cancelled());
             assert_eq!(pane.pending_user_intent_count(), 1);
-            assert_eq!(render_bottom_pane_text(&pane, 100, 20), before);
+            let detached = render_bottom_pane_text(&pane, 100, 20);
+            assert!(!detached.contains("private guidance"), "{detached}");
+            assert!(!detached.contains("Reviewer"), "{detached}");
+            assert!(!detached.contains("Alt+U"), "{detached}");
             for outcome in [
                 AgentWorkbenchOutcome::GuideAccepted {
+                    target: guide.clone(),
+                    intent_id: "guide".into(),
+                },
+                AgentWorkbenchOutcome::GuideReturned {
                     target: guide.clone(),
                     intent_id: "guide".into(),
                 },
@@ -20438,7 +21843,7 @@ mod tests {
                     &mut pane,
                     &FrameRequester::test_dummy(),
                 );
-                assert_eq!(render_bottom_pane_text(&pane, 100, 20), before);
+                assert_eq!(render_bottom_pane_text(&pane, 100, 20), detached);
                 assert!(!pane.has_active_view());
                 assert!(widget.history().is_empty());
             }
@@ -20455,6 +21860,7 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
     #[test]
     fn member_guidance_settles_once_and_uncertain_application_keeps_custody() {
         // Definitive rejection, unknown POST, and accepted-but-unconfirmed application.
@@ -20500,9 +21906,9 @@ mod tests {
                 assert!(pane.take_client_recoverable_user_intents().is_empty());
                 assert!(pane.take_queued_next_turn_submissions().is_empty());
                 let phase = if accepted {
-                    "application unknown"
+                    "used your message"
                 } else {
-                    "delivery unknown"
+                    "received your message"
                 };
                 assert!(render_bottom_pane_text(&pane, 100, 20).contains(phase));
                 for _ in 0..2 {
@@ -20523,29 +21929,242 @@ mod tests {
                 &mut pane,
                 &FrameRequester::test_dummy(),
             );
-            assert_eq!(pane.pending_user_intent_count(), 0);
             let rendered = rendered_transcript_overlay(&widget, 100);
             assert!(!rendered.contains("private guidance"), "{rendered}");
             if applied {
+                assert_eq!(pane.pending_user_intent_count(), 0);
                 assert!(
                     !pane.has_active_view(),
                     "a rejection after Applied must not reopen a draft"
                 );
-                assert_eq!(rendered.matches("Guidance applied to Reviewer").count(), 1);
+                assert_eq!(rendered.matches("Message added for Reviewer").count(), 1);
             } else {
-                assert!(pane.has_active_view());
+                assert_eq!(pane.pending_user_intent_count(), 1);
+                assert!(!pane.has_active_view());
                 assert!(render_bottom_pane_text(&pane, 100, 20).contains("private guidance"));
-                assert_eq!(rendered.matches("Your draft is preserved").count(), 1);
-                pane.handle_key(crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Esc,
-                    crossterm::event::KeyModifiers::NONE,
-                ));
-                assert!(
-                    !pane.has_active_view(),
-                    "duplicate rejection must not stack draft views"
-                );
+                assert_eq!(rendered.matches("Press Alt+U").count(), 1);
             }
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn returned_member_guidance_remains_visible_without_becoming_main_input() {
+        use astra_thin_client::StreamEvent;
+
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("returned-guide-owner"),
+        )
+        .unwrap();
+
+        let returned = |run: &str, intent: &str| StreamEvent::RunUserIntentReturned {
+            run_id: run.into(),
+            intent_id: intent.into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            event_index: 1,
+            content: "inspect the error\nand retry".into(),
+            index: 2,
+        };
+        let (outcomes, mut rx) = tokio::sync::mpsc::channel(4);
+        let disposition = observe_agent_guide(
+            tokio_stream::iter(vec![
+                Ok(returned("other-run", "guide")),
+                Ok(returned("member-run", "guide")),
+            ]),
+            "member-run",
+            "guide",
+            &tokio_util::sync::CancellationToken::new(),
+            &outcomes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(disposition, Some(AgentGuideDisposition::Returned));
+
+        let guide = test_member_guide_target(Some("session".into()), 3);
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        assert!(pane.accept_agent_guide(
+            "guide".into(),
+            guide.clone(),
+            "inspect the error\nand retry".into()
+        ));
+        for _ in 0..2 {
+            outcomes
+                .try_send(AgentWorkbenchOutcome::GuideReturned {
+                    target: guide.clone(),
+                    intent_id: "guide".into(),
+                })
+                .unwrap();
+        }
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(pane.pending_user_intent_count(), 1);
+        assert!(!pane.has_active_view());
+        assert!(pane.composer.is_empty());
+        let rendered = rendered_transcript_overlay(&widget, 100);
+        assert!(rendered.contains("Reviewer"), "{rendered}");
+        assert!(rendered.contains("not used"), "{rendered}");
+        assert_eq!(rendered.matches("not used").count(), 1);
+        assert!(
+            pane.returned_agent_guide(Some("other-session"), 3, None)
+                .is_none()
+        );
+        assert_eq!(
+            pane.returned_agent_guide(Some("session"), 3, None)
+                .unwrap()
+                .text,
+            "inspect the error\nand retry"
+        );
+        pane.set_session_attachment(Some("other-session"), 4);
+        let other_session = render_bottom_pane_text(&pane, 100, 20);
+        assert!(
+            !other_session.contains("inspect the error"),
+            "{other_session}"
+        );
+        assert!(!other_session.contains("Reviewer"), "{other_session}");
+        assert!(!other_session.contains("Alt+U"), "{other_session}");
+        pane.set_session_attachment(Some("session"), 4);
+        let open = pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::ALT,
+        ));
+        assert!(matches!(
+            open,
+            BottomPaneAction::ViewAction(BottomPaneViewAction::OpenReturnedAgentGuide)
+        ));
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
+            api.clone(),
+            None,
+            Some("session"),
+        );
+        let output = tempfile::tempdir().unwrap();
+        let mut background = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            output.path().to_path_buf(),
+        );
+        let (agent_workbench_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let backends = || ViewActionBackends {
+            agent_spawner: None,
+            api: api.clone(),
+            profile: None,
+            session_id: Some("session".into()),
+            session_attachment_epoch: 4,
+            file_writer: None,
+            agent_workbench_tx: agent_workbench_tx.clone(),
+            native_delivery_refresh: Default::default(),
+        };
+        dispatch_bottom_pane_view_action(
+            BottomPaneViewAction::OpenReturnedAgentGuide,
+            &mut background,
+            &observer,
+            &mut None,
+            backends(),
+            &[],
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+            100,
+            24,
+        )
+        .await;
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("inspect the error"));
+        assert!(matches!(pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::ALT)),
+            BottomPaneAction::ViewAction(BottomPaneViewAction::CopyReturnedAgentGuide { intent_id, .. }) if intent_id == "guide"));
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            pane.pending_user_intent_count(),
+            1,
+            "closing the view must keep the message"
+        );
+        dispatch_bottom_pane_view_action(
+            BottomPaneViewAction::OpenReturnedAgentGuide,
+            &mut background,
+            &observer,
+            &mut None,
+            backends(),
+            &[],
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+            100,
+            24,
+        )
+        .await;
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let BottomPaneAction::ViewAction(
+            retry @ BottomPaneViewAction::RetryReturnedAgentGuide { .. },
+        ) = pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        else {
+            panic!("retry action expected")
+        };
+        dispatch_bottom_pane_view_action(
+            retry,
+            &mut background,
+            &observer,
+            &mut None,
+            backends(),
+            &[],
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+            100,
+            24,
+        )
+        .await;
+        assert_eq!(
+            pane.pending_user_intent_count(),
+            1,
+            "failed retry preserves the draft"
+        );
+        let failed_retry = render_bottom_pane_text(&pane, 100, 20);
+        assert!(
+            failed_retry.contains("no longer available"),
+            "{failed_retry}"
+        );
+        assert!(failed_retry.contains("retryx"), "{failed_retry}");
+        let BottomPaneAction::ViewAction(
+            dismiss @ BottomPaneViewAction::DismissReturnedAgentGuide { .. },
+        ) = pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::ALT,
+        ))
+        else {
+            panic!("explicit discard action expected")
+        };
+        dispatch_bottom_pane_view_action(
+            dismiss,
+            &mut background,
+            &observer,
+            &mut None,
+            backends(),
+            &[],
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+            100,
+            24,
+        )
+        .await;
+        assert_eq!(pane.pending_user_intent_count(), 0);
+        assert!(pane.take_queued_next_turn_submissions().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -20622,18 +22241,21 @@ mod tests {
                 match case {
                     "cancel" => {
                         observation.cancel();
-                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(()))));
+                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(None))));
                     }
                     "receiver_closed" => {
                         drop(output_rx);
-                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(()))));
+                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(None))));
                     }
                     "resume" => {
                         events.send(Ok(resumed())).await.unwrap();
                         assert!(poll!(&mut future).is_pending());
                         tokio::time::advance(Duration::from_secs(59)).await;
                         events.send(Ok(applied())).await.unwrap();
-                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(()))));
+                        assert!(matches!(
+                            poll!(&mut future),
+                            Poll::Ready(Ok(Some(AgentGuideDisposition::Applied)))
+                        ));
                     }
                     "active_timeout" | "remaining_timeout" => {
                         events.send(Ok(paused())).await.unwrap(); // Duplicate Pause cannot replenish time.
@@ -20803,6 +22425,8 @@ mod tests {
                     9,
                 ),
                 "private guidance".into(),
+                Vec::new(),
+                None,
                 ViewActionBackends {
                     agent_spawner: spawner,
                     api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
@@ -20836,6 +22460,115 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn child_guidance_preserves_later_draft_until_delivery_is_known_or_user_continues() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("child-message-owner"),
+        )
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let target = || {
+            AgentGuideTarget::capture(
+                "Reviewer".into(),
+                "member-run".into(),
+                crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
+                    agent_id: "member".into(),
+                },
+                api.clone(),
+                Some("session".into()),
+                9,
+            )
+        };
+        let mut widget = chat_widget::ChatWidget::new("session");
+        let mut member = agent_info(
+            "member",
+            AgentStatus::Running {
+                activity: "working".into(),
+            },
+        );
+        member.run_id = "member-run".into();
+        widget.reconcile_local_agent_snapshot(
+            &crate::tui::local_agent_snapshot::LocalAgentSnapshot {
+                available: true,
+                agents: vec![member],
+                ..Default::default()
+            },
+            &[],
+        );
+        let mut pane = BottomPane::new();
+        assert!(pane.accept_agent_guide("first".into(), target(), "first message".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let backends = || ViewActionBackends {
+            agent_spawner: None,
+            api: api.clone(),
+            profile: None,
+            session_id: Some("session".into()),
+            session_attachment_epoch: 9,
+            file_writer: None,
+            agent_workbench_tx: tx.clone(),
+            native_delivery_refresh: Default::default(),
+        };
+        dispatch_agent_guide(
+            target(),
+            "second message".into(),
+            Vec::new(),
+            None,
+            backends(),
+            &mut pane,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        let rendered = render_bottom_pane_text(&pane, 100, 20);
+        assert!(
+            rendered.contains("earlier message is still sending"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("second message"), "{rendered}");
+        assert!(rx.try_recv().is_err());
+        pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(pane.mark_user_intent_unconfirmed("first"));
+        dispatch_agent_guide(
+            target(),
+            "second message".into(),
+            Vec::new(),
+            None,
+            backends(),
+            &mut pane,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        let rendered = render_bottom_pane_text(&pane, 100, 20);
+        assert!(rendered.contains("delivery is unknown"), "{rendered}");
+        let BottomPaneAction::ViewAction(BottomPaneViewAction::SubmitAgentGuide {
+            target,
+            content,
+            acknowledged_unknown,
+        }) = pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("the user must explicitly submit the warning view");
+        };
+        assert_eq!(acknowledged_unknown, vec!["first"]);
+        dispatch_agent_guide(
+            target,
+            content,
+            acknowledged_unknown,
+            None,
+            backends(),
+            &mut pane,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap(),
+            Some(AgentWorkbenchOutcome::GuideRejected { intent_id, .. }) if intent_id != "first"
+        ));
     }
 
     #[serial_test::serial]
@@ -22616,6 +24349,18 @@ mod tests {
             Some(false)
         );
         assert_eq!(bottom_pane.footer.model.as_deref(), Some("personal GPT"));
+        let previous = state.model.clone();
+        let mut inactive = bottom_pane.current_model_catalog().to_vec();
+        inactive[0].is_active = false;
+        bottom_pane.cache_model_catalog(inactive);
+        slash_dispatch::apply_model_picker_result(
+            &default,
+            &mut state,
+            &mut bottom_pane,
+            &mut widget,
+        );
+        assert_eq!(state.model, previous);
+        assert!(rendered_transcript_overlay(&widget, 100).contains("no longer available"));
     }
 
     #[test]
@@ -22646,6 +24391,7 @@ mod tests {
             ModelCatalogEffect::Ready {
                 owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
                 attachment_epoch: state.session_attachment_epoch,
+                initial_bound_session: None,
                 result: Ok(catalog)
             },
             &state,
@@ -22921,6 +24667,7 @@ mod tests {
             ModelCatalogEffect::Ready {
                 owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
                 attachment_epoch: state.session_attachment_epoch,
+                initial_bound_session: None,
                 result: Err("Cannot reach server — check connection".into())
             },
             &state,
@@ -22937,6 +24684,45 @@ mod tests {
                 ..
             }) if text == "Cannot reach server — check connection"
         ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delayed_model_catalog_is_scoped_to_the_initially_bound_session() {
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let start_epoch = state.session_attachment_epoch;
+        state.set_session_id("first");
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        let effect = || ModelCatalogEffect::Ready {
+            owner: owner.clone(),
+            attachment_epoch: start_epoch,
+            initial_bound_session: Some(Arc::new(std::sync::Mutex::new(Some("first".into())))),
+            result: Err("catalog failed".into()),
+        };
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("first");
+        assert!(!apply_model_catalog_effect(
+            effect(),
+            &state,
+            &mut pane,
+            &mut widget
+        ));
+        assert_eq!(
+            widget.history().len(),
+            1,
+            "the original binding must receive its result"
+        );
+        state.set_session_id("second");
+        let mut other_widget = chat_widget::ChatWidget::new("second");
+        assert!(!apply_model_catalog_effect(
+            effect(),
+            &state,
+            &mut pane,
+            &mut other_widget
+        ));
+        let history = rendered_transcript_overlay(&other_widget, 100);
+        assert!(history.contains("Open /model again"), "{history}");
+        assert!(!history.contains("catalog failed"), "{history}");
     }
 
     #[test]

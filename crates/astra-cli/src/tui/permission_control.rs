@@ -36,9 +36,14 @@ impl ActivePermissionControl {
     pub(super) fn new(
         api: ThinClient,
         profile: Option<String>,
+        owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
         remote_run_id: Arc<Mutex<Option<String>>>,
         signal: crate::cli::permission_manager::PermissionControlSignal,
     ) -> Self {
+        let api = match &owner.native_binding {
+            Some(binding) => api.with_bearer_provider(binding.clone()),
+            None => api.without_bearer_provider(),
+        };
         let session_id = Arc::new(Mutex::new(None::<String>));
         let bound_session = session_id.clone();
         let (sender, mut receiver) = watch::channel(None::<ModeIntent>);
@@ -51,6 +56,15 @@ impl ActivePermissionControl {
                 // Startup may not yet have delivered the authenticated Run id.
                 // Only an outstanding user request polls; idle sessions do no work.
                 let (run_id, session_id) = loop {
+                    if !owner.is_current() {
+                        result_tx.send_replace(Some(SubmissionResult {
+                            request_id: intent.request_id,
+                            outcome: Err(
+                                "Sign-in changed before the permission request was sent.".into()
+                            ),
+                        }));
+                        return;
+                    }
                     if let (Some(run_id), Some(session_id)) = (
                         recover_mutex_lock(&remote_run_id).clone(),
                         recover_mutex_lock(&bound_session).clone(),
@@ -66,8 +80,11 @@ impl ActivePermissionControl {
                     }
                 };
                 let outcome = tokio::time::timeout(Duration::from_secs(15), async {
-                    let token = crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref())
+                    let token = super::event_loop::owner_bound_access_token(&api, &owner, profile.as_deref())
                         .await.ok_or_else(|| "Authentication unavailable for permission change".to_string())?;
+                    if !owner.is_current() {
+                        return Err("Sign-in changed before the permission request was sent".to_string());
+                    }
                     let request = RunPermissionModeRequest {
                         expected_session_id: session_id.to_owned(),
                         request_id: intent.request_id.clone(), mode: intent.mode,
@@ -103,6 +120,10 @@ impl ActivePermissionControl {
         if bound.is_none() {
             *bound = Some(session_id.to_owned());
         }
+    }
+
+    pub(super) fn session_binding(&self) -> Arc<Mutex<Option<String>>> {
+        self.session_id.clone()
     }
 
     pub(super) fn request(&mut self, mode: PermissionMode) {
@@ -167,6 +188,7 @@ mod tests {
         let mut control = ActivePermissionControl::new(
             api,
             None,
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
             Arc::new(Mutex::new(None)),
             PermissionManager::new(false).permission_control_signal(),
         );
@@ -205,6 +227,7 @@ mod tests {
         let mut control = ActivePermissionControl::new(
             api,
             None,
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
             Arc::new(Mutex::new(None)),
             PermissionManager::new(false).permission_control_signal(),
         );
@@ -242,6 +265,7 @@ mod tests {
         let mut control = ActivePermissionControl::new(
             api,
             None,
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
             Arc::new(Mutex::new(None)),
             manager.permission_control_signal(),
         );

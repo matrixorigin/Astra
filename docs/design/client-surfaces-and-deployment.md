@@ -85,9 +85,29 @@ Durable user guidance keeps its Server acceptance and disposition protocol.
 The TUI composer exposes Enter for ordinary submission and Ctrl+Q for explicit
 next-turn conversational input. The latter stays in the existing client-owned
 FIFO and never becomes current-run guidance. Enqueueing alone does not close
-guidance admission or arm the startup ordering latch. The ordinary lifecycle
+guidance admission. During a run, ordinary messages stay in the existing
+pending-intent list until that turn binds its Run, then are submitted in order.
+An uncertain delivery is not retried as a new message, and unsent messages
+remain editable if the turn cannot hand them off. The ordinary lifecycle
 handoff, modal/draft gates, session-change restoration, and guidance custody
 rules remain authoritative. Local controls retain their dispatcher semantics.
+The agent navigator's message action targets the selected agent. A previous
+message still being sent keeps a later draft editable; if its delivery is
+unknown, the user may explicitly send the later message despite possible
+reordering. A message the agent did not use stays available in the current
+client as a target-scoped draft; Alt+U opens it for editing and retry, copying,
+or explicit discard. An unconfirmed message is instead marked as possibly
+delivered and is never retried automatically. These drafts stay with the same
+account and session; they are neither sent to the main conversation nor
+claimed durable.
+A `/model` selection may be made while a turn is running. That run keeps its
+original model; the selected model applies to all subsequent turns, including
+messages already queued. Permission changes remain visibly requested until the
+active run reports that its execution boundary applied them. A previously
+started model request or tool is not retroactively changed.
+During an active turn, `/allow` and `/allow read_only` use that same permission
+control, while the `/plan` workflow command waits for the turn to finish.
+Other commands that need the mutable Session are queued with explicit feedback.
 A typed client wake rechecks owner/Session attachment and input gates before
 consuming one FIFO entry. Input remains in the FIFO until consumption; terminal
 paste protection and popup handling apply to user gestures independently.

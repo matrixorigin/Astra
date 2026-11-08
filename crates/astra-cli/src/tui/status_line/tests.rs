@@ -128,7 +128,7 @@ fn pending_mode_is_shown_as_a_next_round_intent() {
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
-    assert_eq!(s.plain(), "Ask  next: Auto");
+    assert_eq!(s.plain(), "Ask  requested: Auto");
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn pending_mode_matching_current_remains_visible_until_acknowledged() {
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
-    assert_eq!(s.plain(), "Ask  next: Ask");
+    assert_eq!(s.plain(), "Ask  requested: Ask");
 }
 
 #[test]
@@ -326,7 +326,7 @@ fn narrow_footer_preserves_pending_mode_before_workspace_identity() {
         .collect();
 
     assert!(
-        rendered.contains("Ask") && rendered.contains("next: Auto"),
+        rendered.contains("Ask") && rendered.contains("requested: Auto"),
         "current and pending mode should survive a 40-column layout; got {rendered:?}"
     );
     assert!(
