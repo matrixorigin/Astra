@@ -53,12 +53,6 @@ impl RecoveryState {
         self.consecutive_ptl_errors > 0 || self.has_attempted_reactive_compact
     }
 
-    /// Whether the PTL error count has reached the abort threshold.
-    #[must_use]
-    pub fn should_abort(&self) -> bool {
-        self.consecutive_ptl_errors >= 3
-    }
-
     /// Process API response feedback and update recovery state accordingly.
     ///
     /// Call this after every turn with the feedback from the API response:
@@ -96,7 +90,6 @@ mod tests {
         let r = RecoveryState::default();
         assert_eq!(r.consecutive_ptl_errors, 0);
         assert!(!r.is_in_recovery());
-        assert!(!r.should_abort());
     }
 
     #[test]
@@ -107,9 +100,8 @@ mod tests {
         assert!(r.is_in_recovery());
         r.record_ptl_error();
         assert_eq!(r.consecutive_ptl_errors, 2);
-        assert!(!r.should_abort());
         r.record_ptl_error();
-        assert!(r.should_abort());
+        assert_eq!(r.consecutive_ptl_errors, 3);
     }
 
     #[test]

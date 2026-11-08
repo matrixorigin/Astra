@@ -796,8 +796,9 @@ pub fn render_wait_timeout_outcome(
     agent_id: &str,
     live_status: Option<&AgentStatus>,
     timeout: Duration,
+    run_id: Option<&str>,
 ) -> String {
-    render_child_agent_result(match live_status {
+    let mut result = match live_status {
         Some(status) if !status.is_terminal() => {
             let mut body = project_wait_for_agent_status(agent_id, status, None);
             body["waited_secs"] = json!(timeout.as_secs());
@@ -812,7 +813,11 @@ pub fn render_wait_timeout_outcome(
                 timeout.as_secs()
             ),
         }),
-    })
+    };
+    if let Some(run_id) = run_id.filter(|id| !id.is_empty()) {
+        result["run_id"] = json!(run_id);
+    }
+    render_child_agent_result(result)
 }
 
 pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> String {
@@ -1574,11 +1579,16 @@ mod tests {
         let status = AgentStatus::Running {
             activity: "reviewing".to_string(),
         };
-        let rendered =
-            render_wait_timeout_outcome("reviewer", Some(&status), Duration::from_secs(1));
+        let rendered = render_wait_timeout_outcome(
+            "reviewer",
+            Some(&status),
+            Duration::from_secs(1),
+            Some("run-1"),
+        );
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(parsed["status"], "still_running");
+        assert_eq!(parsed["run_id"], "run-1");
         assert_eq!(parsed["waited_secs"], 1);
         assert!(parsed.get("delivery").is_none());
         assert_eq!(parsed["observation_timed_out"], true);
@@ -1595,6 +1605,7 @@ mod tests {
                 reason: "needs user input".to_string(),
             }),
             Duration::from_secs(1),
+            None,
         ))
         .unwrap();
         assert_eq!(waiting["status"], "waiting");
@@ -1606,6 +1617,7 @@ mod tests {
                 reason: "approval needed".into(),
             }),
             Duration::from_secs(1),
+            None,
         ))
         .unwrap();
         assert_eq!(paused["status"], "paused");

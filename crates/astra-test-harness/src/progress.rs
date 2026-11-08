@@ -302,6 +302,11 @@ fn criteria(
                     crate::criteria::execution_contract_proof(&c.criterion, outcome, session)
                         .map(|(_, diagnostic)| diagnostic)
                         .unwrap_or_else(|failure| failure.diagnostic()),
+                Criterion::JournalToolValueFlowBound { all_consumers: true, .. } =>
+                    c.full_detail.as_deref()
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .filter(|value| value == &json!({"kind":"unavailable"}))
+                        .unwrap_or(Value::Null),
                 Criterion::JournalToolCallCount { .. }
                 | Criterion::JournalToolSuccessRatio { .. } => {
                     match c.full_detail.as_deref().and_then(|raw| {
@@ -342,11 +347,15 @@ fn criteria(
                     }
                 }
                 Criterion::AllOf { .. } | Criterion::AnyOf { .. } => {
+                    let unavailable = c.full_detail.as_deref()
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .is_some_and(|value| value == json!({"kind":"unavailable"}));
                     let nested = c.full_detail.as_deref()
                         .and_then(|raw| serde_json::from_str::<Vec<CriterionResult>>(raw).ok());
-                    match nested {
-                        Some(nested) => json!({"kind":"composite", "checks":criteria(&nested, outcome, session)?}),
-                        None => Value::Null,
+                    match (unavailable, nested) {
+                        (true, _) => json!({"kind":"unavailable"}),
+                        (_, Some(nested)) => json!({"kind":"composite", "checks":criteria(&nested, outcome, session)?}),
+                        _ => Value::Null,
                     }
                 }
                 _ => Value::Null,
@@ -1827,6 +1836,40 @@ mod tests {
                     .unwrap()
                     .contains("private-sentinel"),
                 "{fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_value_flow_projects_unavailable_evidence_without_private_details() {
+        let criterion: Criterion = serde_json::from_value(json!({
+            "type":"journal_tool_value_flow_bound", "producer":"bash",
+            "producer_document":"result", "producer_path":"/id",
+            "producer_filters":[{"document":"arguments","path":"/command","equals":"x"}],
+            "consumer":"task_output", "consumer_document":"arguments",
+            "consumer_paths":["/task_id"], "consumer_filters":[], "all_consumers":true
+        }))
+        .unwrap();
+        for criterion in [
+            criterion.clone(),
+            Criterion::AllOf {
+                criteria: vec![criterion],
+            },
+        ] {
+            let result = CriterionResult {
+                criterion,
+                severity: crate::criteria::CriterionSeverity::Hard,
+                passed: false,
+                detail: "private-sentinel".into(),
+                full_detail: Some(json!({"kind":"unavailable"}).to_string()),
+                score: None,
+            };
+            let projected = fixture_criteria(&[result], &RunOutcome::new("model")).unwrap();
+            assert_eq!(projected[0]["diagnostic"], json!({"kind":"unavailable"}));
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("private-sentinel")
             );
         }
     }

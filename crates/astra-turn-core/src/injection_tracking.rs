@@ -43,8 +43,6 @@ use serde::{Deserialize, Serialize};
 /// goes blind to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum InjectionChannel {
-    /// `SelfModel.recent_failing_tests` rendered as "Recent test failures: ..."
-    RecentFailingTests,
     /// `SelfModel.outcome_bias` rendered as "Tool outcome bias: bash ↑0.10 ..."
     OutcomeBias,
     /// `AgenticLoopState.volatile_pending` content joined into a single fingerprint.
@@ -71,7 +69,6 @@ impl InjectionChannel {
     /// dashboards that scrape introspect output.
     pub fn tag(&self) -> &'static str {
         match self {
-            Self::RecentFailingTests => "recent_failing_tests",
             Self::OutcomeBias => "outcome_bias",
             Self::VolatilePending => "volatile_pending",
             Self::MemoriaPrefetch => "memoria_prefetch",
@@ -89,7 +86,6 @@ impl InjectionChannel {
     /// skip them rather than panic.
     pub fn from_tag(tag: &str) -> Option<Self> {
         match tag {
-            "recent_failing_tests" => Some(Self::RecentFailingTests),
             "outcome_bias" => Some(Self::OutcomeBias),
             "volatile_pending" => Some(Self::VolatilePending),
             "memoria_prefetch" => Some(Self::MemoriaPrefetch),
@@ -103,14 +99,13 @@ impl InjectionChannel {
 
     /// Canonical ordering used when rendering the full report.
     ///
-    /// Ordering policy: self-* signals first (failing tests, bias),
+    /// Ordering policy: self-* signals first (bias),
     /// then volatile/content-derived lanes (volatile pending,
     /// typed memoria prefetch), then behavioural/meta-state
     /// lanes (self-awareness), then operational hints (recent-arg, skill listing, tool-round
     /// guidance). Introspect renders in this order for stable output.
-    pub fn all() -> [Self; 8] {
+    pub fn all() -> [Self; 7] {
         [
-            Self::RecentFailingTests,
             Self::OutcomeBias,
             Self::VolatilePending,
             Self::MemoriaPrefetch,
@@ -430,9 +425,6 @@ fn stale_channel_guidance(channel: InjectionChannel) -> &'static str {
         InjectionChannel::OutcomeBias => {
             "treat tool outcome bias as a weak prior and prefer current tool results until it changes"
         }
-        InjectionChannel::RecentFailingTests => {
-            "recheck the failing test or error source before using it as current evidence"
-        }
         InjectionChannel::VolatilePending => {
             "verify pending runtime nudges still apply before following them"
         }
@@ -447,19 +439,18 @@ mod tests {
     #[test]
     fn channel_all_returns_stable_ordering_of_every_variant() {
         let all = InjectionChannel::all();
-        assert_eq!(all.len(), 8);
-        // Self-* ordering: failing tests → bias.
-        assert_eq!(all[0], InjectionChannel::RecentFailingTests);
-        assert_eq!(all[1], InjectionChannel::OutcomeBias);
-        // Volatile + content-derived block.
-        assert_eq!(all[2], InjectionChannel::VolatilePending);
-        assert_eq!(all[3], InjectionChannel::MemoriaPrefetch);
-        // Behavioural / meta-state block.
-        assert_eq!(all[4], InjectionChannel::SelfAwareness);
-        // Operational hints block.
-        assert_eq!(all[5], InjectionChannel::RecentArgHints);
-        assert_eq!(all[6], InjectionChannel::SkillListing);
-        assert_eq!(all[7], InjectionChannel::ToolRoundGuidance);
+        assert_eq!(
+            all,
+            [
+                InjectionChannel::OutcomeBias,
+                InjectionChannel::VolatilePending,
+                InjectionChannel::MemoriaPrefetch,
+                InjectionChannel::SelfAwareness,
+                InjectionChannel::RecentArgHints,
+                InjectionChannel::SkillListing,
+                InjectionChannel::ToolRoundGuidance,
+            ]
+        );
     }
 
     #[test]
@@ -515,9 +506,9 @@ mod tests {
         let mut h = InjectionHistory::new();
         let fp = InjectionFingerprint::from_content("tests failing: foo");
         for round in 0..15 {
-            h.observe(round, InjectionChannel::RecentFailingTests, fp.clone());
+            h.observe(round, InjectionChannel::SelfAwareness, fp.clone());
         }
-        let latest = h.latest(InjectionChannel::RecentFailingTests).unwrap();
+        let latest = h.latest(InjectionChannel::SelfAwareness).unwrap();
         assert_eq!(latest.first_seen_round, 0);
         assert_eq!(latest.last_seen_round, 14);
         assert_eq!(
@@ -657,12 +648,12 @@ mod tests {
         let fp = InjectionFingerprint::from_content("could not find Cargo.toml");
         // Observed on round 0, still unchanged at round 58 (the f85a02bb case)
         for round in 0..=58 {
-            h.observe(round, InjectionChannel::RecentFailingTests, fp.clone());
+            h.observe(round, InjectionChannel::SelfAwareness, fp.clone());
         }
         let report = freshness_report(&h, 58);
         let failing = report
             .iter()
-            .find(|r| r.channel == InjectionChannel::RecentFailingTests)
+            .find(|r| r.channel == InjectionChannel::SelfAwareness)
             .unwrap();
         match &failing.status {
             ChannelStatus::Stale { rounds_alive } => assert_eq!(*rounds_alive, 58),
@@ -715,25 +706,25 @@ mod tests {
         let mut h = InjectionHistory::new();
         let fp_a = InjectionFingerprint::from_content("old failure");
         for round in 0..20 {
-            h.observe(round, InjectionChannel::RecentFailingTests, fp_a.clone());
+            h.observe(round, InjectionChannel::SelfAwareness, fp_a.clone());
         }
         // Verify stale at round 20
         let before = freshness_report(&h, 20);
         assert!(matches!(
             before
                 .iter()
-                .find(|r| r.channel == InjectionChannel::RecentFailingTests)
+                .find(|r| r.channel == InjectionChannel::SelfAwareness)
                 .unwrap()
                 .status,
             ChannelStatus::Stale { .. }
         ));
         // Content changes at round 21 → fresh again
         let fp_b = InjectionFingerprint::from_content("new different failure");
-        h.observe(21, InjectionChannel::RecentFailingTests, fp_b);
+        h.observe(21, InjectionChannel::SelfAwareness, fp_b);
         let after = freshness_report(&h, 21);
         let entry = after
             .iter()
-            .find(|r| r.channel == InjectionChannel::RecentFailingTests)
+            .find(|r| r.channel == InjectionChannel::SelfAwareness)
             .unwrap();
         assert!(
             matches!(entry.status, ChannelStatus::Fresh { rounds_alive: 0 }),

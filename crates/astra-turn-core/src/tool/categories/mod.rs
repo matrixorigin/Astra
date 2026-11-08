@@ -267,6 +267,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("task_output", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_list", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_stop", MU, OR.union(ToolFlags::TASK_MGMT)),
+    tool("task_input", MU, OR.union(ToolFlags::TASK_MGMT)),
     // ── Shell execution (highest risk) ───────────────────────────────
     tool("bash", SH, AE.union(EX)),
     tool("exec", SH, AE.union(EX)),

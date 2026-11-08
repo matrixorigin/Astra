@@ -32,7 +32,7 @@ fn unrelated() {
 "#;
     std::fs::write(dir.path().join("util.rs"), util_code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "call_graph",
@@ -69,7 +69,7 @@ async fn cross_file_callers_empty_when_no_callers() {
     let code = "pub fn lonely_fn() -> i32 { 42 }\n";
     std::fs::write(dir.path().join("alone.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "call_graph",
@@ -108,7 +108,7 @@ fn start_engine() {
 "#;
     std::fs::write(dir.path().join("starter.rs"), caller_code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "call_graph",
@@ -134,7 +134,7 @@ fn prefilter_files_returns_matching_paths() {
     std::fs::write(dir.path().join("b.rs"), "fn bar() { unrelated(); }").unwrap();
     std::fs::write(dir.path().join("c.rs"), "fn baz() { target_fn(); }").unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let exts = ["rs"];
     let files = executor.prefilter_files_with_symbol("target_fn", &exts);
 
@@ -174,7 +174,7 @@ fn collect_project_files_skips_noise_dirs() {
     std::fs::write(dir.path().join("target/debug.rs"), "fn debug() {}").unwrap();
     std::fs::write(dir.path().join("node_modules/dep.js"), "function x() {}").unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let skip = ["node_modules", "target", ".git"];
     let exts = ["rs", "js"];
     let files = executor.collect_project_files(&skip, &exts, 100);
@@ -218,7 +218,7 @@ fn ast_validate_keeps_all_for_unknown_language() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("data.xyz"), "target is here\n").unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let lines = vec!["data.xyz:1:target is here"];
     let result = executor.ast_validate_references(&lines, "target");
     assert_eq!(result.len(), 1, "unknown language keeps all matches");
@@ -230,7 +230,7 @@ fn ast_validate_python_comments() {
     let code = "# target in comment\ntarget = 42\n";
     std::fs::write(dir.path().join("test.py"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let lines = vec!["test.py:1:# target in comment", "test.py:2:target = 42"];
     let result = executor.ast_validate_references(&lines, "target");
     assert!(
@@ -257,7 +257,7 @@ fn ast_validate_mixed_file() {
 "#;
     std::fs::write(dir.path().join("mixed.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let lines = vec![
         "mixed.rs:2:    // Call target here",
         "mixed.rs:3:    target();",
@@ -296,7 +296,7 @@ async fn find_references_with_validate_false_skips_ast() {
     let code = "fn foo() { target(); }\n// target in comment\n";
     std::fs::write(dir.path().join("test.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "find_references",
@@ -321,7 +321,7 @@ async fn rename_symbol_requires_explicit_non_semantic_preview() {
     let code = "fn target() {}\r\nfn caller() { target(); let s = \"target\"; } // target\r\nmod other { fn target() {} }\r\n";
     let path = dir.path().join("main.rs");
     std::fs::write(&path, code).unwrap();
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
 
     for dry_run in [None, Some(false), Some(true)] {
         let mut args = json!({"symbol": "target", "new_name": "renamed"});
@@ -348,7 +348,7 @@ async fn rename_symbol_preview_across_files_is_read_only() {
     for file in ["lib.rs", "main.rs"] {
         std::fs::write(dir.path().join(file), code).unwrap();
     }
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "rename_symbol",
@@ -373,7 +373,7 @@ async fn rename_symbol_preview_with_include_filter() {
     let python = "def target(): pass\ntarget()\n";
     std::fs::write(dir.path().join("lib.rs"), rust).unwrap();
     std::fs::write(dir.path().join("main.py"), python).unwrap();
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "rename_symbol",
@@ -399,7 +399,7 @@ async fn rename_symbol_errors_on_invalid_name() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.rs"), "fn foo() {}\n").unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
 
     let result = executor
         .execute(
@@ -445,7 +445,7 @@ async fn rename_symbol_errors_on_invalid_name() {
 async fn rename_symbol_preview_no_matches() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.rs"), "fn bar() {}\n").unwrap();
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "rename_symbol",
@@ -466,7 +466,7 @@ async fn dead_code_finds_unused_function() {
         "fn used_fn() -> i32 { 42 }\nfn unused_fn() -> i32 { 99 }\nfn main() { used_fn(); }\n";
     std::fs::write(dir.path().join("main.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "dead_code",
@@ -499,7 +499,7 @@ async fn dead_code_skips_test_functions() {
     let code = "fn helper() -> i32 { 42 }\nfn test_helper() { assert_eq!(helper(), 42); }\n";
     std::fs::write(dir.path().join("test.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "dead_code",
@@ -522,7 +522,7 @@ async fn dead_code_filters_by_kind() {
     let code = "struct UnusedStruct { x: i32 }\nfn unused_fn() -> i32 { 42 }\n";
     std::fs::write(dir.path().join("lib.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
 
     let result_fn = executor
         .execute(
@@ -567,7 +567,7 @@ async fn dead_code_reports_public_symbols() {
     let code = "pub fn exported() -> i32 { 42 }\nfn internal() -> i32 { 99 }\n";
     std::fs::write(dir.path().join("lib.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor.execute("dead_code", &json!({})).await;
 
     // Both should be detected as unused, but public should have marker
@@ -585,7 +585,7 @@ async fn dead_code_clean_project() {
     let code = "fn main() { helper(); }\nfn helper() -> i32 { 42 }\n";
     std::fs::write(dir.path().join("main.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor.execute("dead_code", &json!({})).await;
 
     assert!(
@@ -599,7 +599,7 @@ async fn dead_code_no_files() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("data.txt"), "not a source file\n").unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor.execute("dead_code", &json!({})).await;
 
     assert!(
@@ -614,7 +614,7 @@ async fn dead_code_python() {
     let code = "def used():\n    return 42\n\ndef unused():\n    return 99\n\nresult = used()\n";
     std::fs::write(dir.path().join("main.py"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "dead_code",
@@ -640,7 +640,7 @@ fn documented_fn() -> i32 {
 "#;
     std::fs::write(dir.path().join("lib.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "find_definition",
@@ -667,7 +667,7 @@ async fn find_definition_includes_python_docstring() {
     let code = "def my_func():\n    \"\"\"This is a Python docstring.\"\"\"\n    return 42\n";
     std::fs::write(dir.path().join("module.py"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "find_definition",
@@ -694,7 +694,7 @@ async fn find_definition_no_doc_still_works() {
     let code = "fn bare_fn() -> i32 { 42 }\n";
     std::fs::write(dir.path().join("lib.rs"), code).unwrap();
 
-    let executor = ToolExecutor::new(dir.path());
+    let executor = ToolExecutor::new(dir.path().canonicalize().unwrap());
     let result = executor
         .execute(
             "find_definition",

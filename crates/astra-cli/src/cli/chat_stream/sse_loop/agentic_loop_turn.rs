@@ -3439,10 +3439,11 @@ mod tests {
             schema("read_file"),
         ];
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(1);
-        let executor = Arc::new(
-            ToolExecutor::new(temp_dir.path())
-                .with_bg_task_commands(Arc::new(std::sync::Mutex::new(Vec::new()))),
-        );
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()).with_background_tasks(
+            crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                temp_dir.path().join("tasks"),
+            ),
+        ));
         let messages = vec![json!({"role": "user", "content": "run make check"})];
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
@@ -3526,7 +3527,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filter_removes_background_controls_without_a_registry_binding() {
+    fn runtime_filter_requires_a_session_owner_for_shell_controls() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut schemas = vec![
             schema("bash"),
@@ -3546,8 +3547,32 @@ mod tests {
             astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),
             std::collections::HashSet::from(["bash".to_string()])
         );
-        assert_eq!(report.visible_tools, vec!["bash".to_string()]);
         assert_eq!(report.visible_count, 1);
+
+        let mut schemas = vec![
+            schema("bash"),
+            schema("task_output"),
+            schema("task_list"),
+            schema("task_stop"),
+        ];
+        let mut report = surface_report_from_visible_schemas(&schemas, 4, 4);
+        let executor = crate::edge_tools::ToolExecutor::new(temp_dir.path()).with_background_tasks(
+            crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                temp_dir.path().join("tasks"),
+            ),
+        );
+        assert!(runtime_filter_turn_schemas_and_report(
+            &executor,
+            &mut schemas,
+            &mut report
+        ));
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&schemas),
+            std::collections::HashSet::from(
+                ["bash", "task_output", "task_list", "task_stop"].map(str::to_string)
+            )
+        );
+        assert_eq!(report.visible_count, 4);
     }
 
     #[tokio::test]

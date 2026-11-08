@@ -3,7 +3,6 @@
 //! Provides:
 //! - Extglob/extended-glob disabling (prevents malicious filename expansion after validation)
 //! - IFS reset (prevents word-splitting attacks)
-//! - Stdin redirect to /dev/null (prevents commands from reading spawn's stdin pipe)
 //! - Secret scrubbing from subprocess environments
 //! - Dangerous file path detection
 
@@ -47,8 +46,6 @@ pub struct ShellHardeningConfig {
     pub disable_extglob: bool,
     /// Reset IFS to default (space, tab, newline).
     pub reset_ifs: bool,
-    /// Redirect stdin from /dev/null to prevent commands from reading spawn's stdin.
-    pub redirect_stdin: bool,
     /// Scrub secret environment variables from subprocess.
     pub scrub_secrets: bool,
 }
@@ -59,7 +56,6 @@ impl Default for ShellHardeningConfig {
             pipefail: true,
             disable_extglob: true,
             reset_ifs: true,
-            redirect_stdin: true,
             scrub_secrets: true,
         }
     }
@@ -71,7 +67,8 @@ impl Default for ShellHardeningConfig {
 /// 1. Pipefail (preserves upstream pipeline failures)
 /// 2. Extglob disable (prevents malicious filename expansion post-validation)
 /// 3. IFS reset (prevents word-splitting attacks)
-/// 4. Stdin redirect to /dev/null (prevents stdin pipe hijacking)
+///
+/// Stdin is selected by the process owner, never rewritten into command text.
 ///
 /// The preamble is compatible with both bash and zsh.
 pub fn build_hardened_command(config: &ShellHardeningConfig, user_command: &str) -> String {
@@ -105,10 +102,10 @@ pub fn build_hardened_command(config: &ShellHardeningConfig, user_command: &str)
     }
 
     if parts.is_empty() {
-        return apply_stdin_redirect(config, user_command);
+        return user_command.to_string();
     }
 
-    parts.push(apply_stdin_redirect(config, user_command));
+    parts.push(user_command.to_string());
     parts.join(" && ")
 }
 
@@ -628,23 +625,6 @@ pub fn is_session_tool_result_artifact_reference(path: &str) -> bool {
     )
 }
 
-fn apply_stdin_redirect(config: &ShellHardeningConfig, command: &str) -> String {
-    if !config.redirect_stdin {
-        return command.to_string();
-    }
-    // Don't add redirect if command already has stdin redirect or uses heredoc.
-    let lower = command.to_lowercase();
-    if lower.contains("< ") || lower.contains("<<") || lower.contains("<<<") {
-        return command.to_string();
-    }
-    // Wrap pipe commands in subshell to preserve pipe semantics
-    // while still redirecting the overall stdin to /dev/null.
-    if command.contains('|') {
-        return format!("( {command} ) < /dev/null");
-    }
-    format!("{command} < /dev/null")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,8 +641,7 @@ mod tests {
         );
         assert!(cmd.contains("extglob"), "should disable extglob");
         assert!(cmd.contains("IFS="), "should reset IFS");
-        assert!(cmd.contains("< /dev/null"), "should redirect stdin");
-        assert!(cmd.ends_with("echo hello < /dev/null"));
+        assert!(cmd.ends_with("echo hello"));
     }
 
     #[test]
@@ -690,7 +669,6 @@ mod tests {
             pipefail: false,
             disable_extglob: false,
             reset_ifs: false,
-            redirect_stdin: false,
             scrub_secrets: false,
         };
         let cmd = build_hardened_command(&config, "echo hello");
@@ -731,36 +709,6 @@ mod tests {
         }
         // Non-.jsonl suffix never matches regardless of id validity.
         assert!(!looks_like_session_journal_file("abc-123.txt"));
-    }
-
-    #[test]
-    fn stdin_redirect_skipped_for_heredoc() {
-        let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "cat <<EOF\nhello\nEOF");
-        assert!(!cmd.contains("< /dev/null"));
-    }
-
-    #[test]
-    fn stdin_redirect_skipped_for_existing_redirect() {
-        let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "wc -l < input.txt");
-        assert!(!cmd.ends_with("< /dev/null"));
-    }
-
-    #[test]
-    fn stdin_redirect_skipped_for_pipe() {
-        let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "cat file.txt | grep pattern");
-        // Pipe commands are now wrapped in subshell to preserve pipe semantics
-        // while still redirecting overall stdin to /dev/null.
-        assert!(
-            cmd.contains("< /dev/null"),
-            "pipe commands must have stdin redirect via subshell wrap"
-        );
-        assert!(
-            cmd.contains("(") && cmd.contains(")"),
-            "pipe commands must be wrapped in subshell"
-        );
     }
 
     // --- Secret scrubbing ---
@@ -1030,7 +978,6 @@ mod tests {
             pipefail: false,
             disable_extglob: true,
             reset_ifs: false,
-            redirect_stdin: false,
             scrub_secrets: false,
         };
         let cmd = build_hardened_command(&config, "echo hello");
@@ -1046,7 +993,6 @@ mod tests {
             pipefail: false,
             disable_extglob: false,
             reset_ifs: true,
-            redirect_stdin: false,
             scrub_secrets: false,
         };
         let cmd = build_hardened_command(&config, "ls");
@@ -1056,53 +1002,12 @@ mod tests {
     }
 
     #[test]
-    fn stdin_redirect_skipped_for_pipe_chain() {
-        // Pipe commands now get subshell wrapping with stdin redirect
-        // to prevent right-side commands from reading spawn stdin.
-        let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "echo hello | grep h | wc -l");
-        // Pipeline should be wrapped: ( ... ) < /dev/null
-        assert!(
-            cmd.contains("< /dev/null"),
-            "pipe commands must have stdin redirect via subshell wrap; \
-             got: '{cmd}'"
-        );
-        assert!(
-            cmd.contains("( echo hello | grep h | wc -l )"),
-            "expected subshell wrapper; got: '{cmd}'"
-        );
-    }
-
-    #[test]
-    fn stdin_redirect_wraps_pipe_with_disabled_extras() {
-        let config = ShellHardeningConfig {
-            pipefail: false,
-            disable_extglob: false,
-            reset_ifs: false,
-            redirect_stdin: true,
-            scrub_secrets: false,
-        };
-        let cmd = build_hardened_command(&config, "echo hello | grep hello");
-        // Even with only redirect_stdin enabled, pipe commands get subshell wrap.
-        assert!(
-            cmd.contains("< /dev/null"),
-            "pipe commands must have stdin redirect; got: '{cmd}'"
-        );
-    }
-
-    #[test]
-    fn default_config_preserves_pipeline_failures_and_stdin_guard() {
-        let config = ShellHardeningConfig::default();
-        let cmd = build_hardened_command(&config, "cargo test 2>&1 | tail -20");
-
-        assert!(
-            cmd.contains("pipefail") || cmd.contains("PIPE_FAIL"),
-            "pipeline hardening must enable pipefail; got: '{cmd}'"
-        );
-        assert!(
-            cmd.contains("( cargo test 2>&1 | tail -20 ) < /dev/null"),
-            "pipeline hardening must wrap the whole pipeline for stdin guard; got: '{cmd}'"
-        );
+    fn hardening_preserves_the_user_pipeline_and_process_input() {
+        let script = "cargo test 2>&1 | tail -20";
+        let cmd = build_hardened_command(&ShellHardeningConfig::default(), script);
+        assert!(cmd.contains("pipefail"));
+        assert!(cmd.ends_with(script));
+        assert!(!cmd.contains("< /dev/null"));
     }
 
     #[test]

@@ -17096,6 +17096,8 @@ pub(crate) mod tests {
     async fn spawn_preserves_task_intent_without_granting_execution_authority() {
         use astra_config::user_profile::WorkspaceMutationIntent::{MustMutate, ReadOnly};
         for (agent_type, intent, inherited_read_only, expected_read_only) in [
+            ("general-purpose", MustMutate, false, false),
+            ("general-purpose", ReadOnly, true, true),
             ("task", MustMutate, false, false),
             ("task", ReadOnly, false, false),
             ("task", MustMutate, true, true),

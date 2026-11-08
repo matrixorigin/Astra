@@ -94,7 +94,7 @@ pub struct IntrospectSnapshot {
     #[serde(default)]
     pub stall_state: StallSnapshotSummary,
     /// Per-channel freshness of runtime-injected prompt signals
-    /// (recent_failing_tests, outcome_bias, volatile_pending).
+    /// (outcome_bias, volatile_pending).
     /// Populated by the agentic loop from `AgenticLoopState.injection_history`
     /// at the start of each round. Feeds `facet=noise`. Empty when
     /// the runtime has not yet observed any round.
@@ -3308,7 +3308,7 @@ mod tests {
             current_round: 58,
             injection_freshness: vec![
                 ChannelFreshness {
-                    channel: InjectionChannel::RecentFailingTests,
+                    channel: InjectionChannel::SkillListing,
                     status: ChannelStatus::Stale { rounds_alive: 58 },
                     preview: "could not find Cargo.toml in /home/.../astra".into(),
                     first_seen_round: Some(0),
@@ -3339,7 +3339,7 @@ mod tests {
         let out = render_injection_freshness(&snap);
         assert!(out.contains("## Injection Freshness (round 58)"), "{out}");
         assert!(
-            out.contains("recent_failing_tests") && out.contains("⚠ STALE"),
+            out.contains("skill_listing") && out.contains("⚠ STALE"),
             "stale channel must be flagged: {out}"
         );
         assert!(

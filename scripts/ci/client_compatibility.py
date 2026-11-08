@@ -188,6 +188,64 @@ def paired_tool_result(messages, call_id, tool_name):
     return result
 
 
+def standalone_shell_schema(tools):
+    """Return None if absent; otherwise validate the real provider contract."""
+    if not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools):
+        return False
+    functions = [tool.get("function") for tool in tools]
+    if any(not isinstance(function, dict) for function in functions):
+        return False
+    shells = [function for function in functions if function.get("name") == "bash"]
+    if not shells:
+        return None
+    parameters = shells[0].get("parameters")
+    properties = parameters.get("properties") if isinstance(parameters, dict) else None
+    return (len(shells) == 1 and isinstance(properties, dict) and "command" in properties
+            and "stdin" not in properties and "yield_time_ms" not in properties)
+
+
+def successful_edge_tool_event(events, name, marker):
+    # The Server route can use a different transport call id from the model.
+    # This fixture issues exactly one call to this tool and requires its paired
+    # model result, so its unique typed terminal and marker identify it.
+    terminals = [event for event in events if event.get("type") == "tool_call_end"
+                 and event.get("tool") == name]
+    return (len(terminals) == 1
+            and terminals[0].get("status", "completed") == "completed"
+            and terminals[0].get("success") is True
+            and ("executed" not in terminals[0] or terminals[0]["executed"] is True)
+            and isinstance(terminals[0].get("result"), str) and marker in terminals[0]["result"])
+
+
+def edge_transport_started(events, name, edge_id):
+    starts = [event for event in events if event.get("type") == "tool_transport_started"
+              and event.get("tool") == name]
+    if len(starts) != 1:
+        return False
+    executor = starts[0].get("executor")
+    return (starts[0].get("transport") == "edge_ws" and isinstance(executor, dict)
+            and executor.get("kind") == "edge_agent" and executor.get("executor_id") == edge_id)
+
+
+def edge_tool_event_diagnostics(events, name, marker):
+    """Retain categorical evidence only, never tool bodies or identities."""
+    ends = [event for event in events if event.get("type") == "tool_call_end"]
+    receipts = []
+    for event in ends:
+        if event.get("tool") != name:
+            continue
+        status = event.get("status")
+        executed = event.get("executed") if "executed" in event else "missing"
+        result = event.get("result")
+        receipts.append({
+            "status": status if status in ("completed", "failed", "rejected", "skipped") else None,
+            "success": event.get("success") if isinstance(event.get("success"), bool) else None,
+            "executed": executed if executed in (True, False, None, "missing") else "other",
+            "marker_in_result": isinstance(result, str) and marker in result,
+        })
+    return {"tool_end_count": len(ends), "matching_receipts": receipts}
+
+
 def identify_current(binary, env, home, report):
     build = command(binary, env, home, ["--build-info-json"])
     require(build.returncode == 0, "candidate_cli_identity_unavailable")
@@ -216,6 +274,7 @@ class Provider:
         self.arrived = threading.Event()
         self.release = threading.Event()
         self.tool_result_seen = False
+        self.shell_schema_observed = False
         self.require_readback = False
         self.readback_verified = False
         self.expected_model = None
@@ -245,6 +304,14 @@ class Provider:
                     owner.arrived.set()
                     owner.release.wait(30)
                 messages = body.get("messages", [])
+                if case == "standalone-edge-bash":
+                    schema = standalone_shell_schema(body.get("tools", []))
+                    if schema is not None:
+                        if not schema:
+                            owner.errors.append("edge_shell_schema_unowned_controls")
+                            return mock.write_json(self, mock.HTTPStatus.BAD_REQUEST,
+                                                   {"error": {"code": "fixture_invalid_shell_schema"}})
+                        owner.shell_schema_observed = True
                 if case in ("resume-after-first-cancellation", "resume-after-cancellation"):
                     if not any(message.get("role") == "user" and message.get("content") ==
                                "Wait until cancelled: " + owner.marker for message in messages):
@@ -287,6 +354,8 @@ class Provider:
                     arguments = {"path": owner.target}
                     if tool == "write_file":
                         arguments["content"] = owner.marker + "\n"
+                    elif tool == "bash":
+                        arguments = {"command": "printf '%s\\n' \"$ASTRA_COMPAT_EDGE_PROBE\""}
                     search_id = "compat-search-" + desired_tool + "-" + str(case)
                     with owner.lock:
                         issued_search = (case, search_id) in owner.claimed
@@ -326,7 +395,7 @@ class Provider:
                     return mock.write_json(self, mock.HTTPStatus.OK, response)
                 if mode == "tool":
                     owner.tool_result_seen = tool_result is not None
-                    if owner.tool_name == "read_file" and (
+                    if owner.tool_name in ("read_file", "bash") and (
                             tool_result is None or owner.marker not in json.dumps(tool_result.get("content"))):
                         return mock.write_json(self, mock.HTTPStatus.BAD_REQUEST,
                                                {"error": {"code": "fixture_edge_read_content_missing"}})
@@ -575,11 +644,11 @@ def cancellation(binary, env, home, origin, token, model, provider, seed_history
         rpc.close()
 
 
-def edge_execution(home, origin, token, edge_id, model, provider, report, client):
-    begin_case(report, client, "standalone_edge_tool_execution")
-    provider.case = "standalone-edge"
+def edge_execution(home, origin, token, edge_id, model, provider, report, client, tool_name="read_file"):
+    begin_case(report, client, "standalone_edge_" + tool_name)
+    provider.case = "standalone-edge-" + tool_name
     provider.mode = "tool"
-    provider.tool_name = "read_file"
+    provider.tool_name = tool_name
     provider.target = "compatibility-edge-input.txt"
     provider.tool_result_seen = False
     (home / provider.target).write_text(provider.marker)
@@ -589,9 +658,9 @@ def edge_execution(home, origin, token, edge_id, model, provider, report, client
         rows = catalog if isinstance(catalog, list) else catalog["items"]
         offering = next(row["offering_id"] for row in rows if row["name"] == model)
         payload = {
-            "session_id": session, "message": "Read the compatibility fixture: " + provider.marker,
+            "session_id": session, "message": "Inspect the compatibility fixture: " + provider.marker,
             "model_selection": {"offering_id": offering}, "interaction_mode": "non_interactive",
-            "allow_tools": ["read_file"], "edge_executor_id": edge_id,
+            "allow_tools": [tool_name], "edge_executor_id": edge_id,
             "workspace_binding": {"kind": "edge_workspace", "display_name": "Compatibility workspace",
                 "root": str(home), "source": {"kind": "edge_path", "path": str(home)}, "authority": "read_write"},
             "executor_binding": {"kind": "edge_agent", "executor_id": edge_id,
@@ -628,18 +697,25 @@ def edge_execution(home, origin, token, edge_id, model, provider, report, client
         require(persisted.get("run_id") == terminal["run_id"] and persisted.get("session_id") == session
                 and persisted.get("status") == "completed", "edge_persisted_terminal_mismatch")
         require(provider.tool_result_seen, "edge_tool_result_not_returned")
+        if tool_name == "bash":
+            require(provider.shell_schema_observed, "edge_shell_schema_not_observed")
+            require(edge_transport_started(events, "bash", edge_id), "edge_shell_route_not_proven")
+            if not successful_edge_tool_event(events, "bash", provider.marker):
+                raise Failure("edge_shell_execution_not_proven",
+                              edge_tool_event_diagnostics(events, "bash", provider.marker))
         require(any(event.get("type") == "turn_complete" for event in events), "edge_authoritative_turn_missing")
     finally:
         provider.mode = "text"
         provider.tool_name = "write_file"
 
 
-def edge_case(binary, env, home, origin, token, model, provider, report):
+def edge_case(binary, env, home, origin, token, model, provider, report, shell_only=False):
     begin_case(report, "candidate", "edge_handshake")
     edge_id = "candidate-edge-" + uuid.uuid4().hex
+    edge_env = {**env, "ASTRA_COMPAT_EDGE_PROBE": provider.marker}
     with tempfile.TemporaryFile() as diagnostics:
         process = subprocess.Popen([str(binary), "--server-url", origin, "--workspace-dir", str(home),
-                                    "--edge-id", edge_id, "--reconnect", "false"], env=env, cwd=home,
+                                    "--edge-id", edge_id, "--reconnect", "false"], env=edge_env, cwd=home,
                                    stdout=subprocess.DEVNULL, stderr=diagnostics, start_new_session=True)
         try:
             deadline = time.monotonic() + 45
@@ -647,7 +723,9 @@ def edge_case(binary, env, home, origin, token, model, provider, report):
                 edges = request(origin, "/edges/status", token).get("edges", [])
                 online = any(edge.get("edge_agent_id") == edge_id for edge in edges)
                 if online:
-                    edge_execution(home, origin, token, edge_id, model, provider, report, "candidate")
+                    if not shell_only:
+                        edge_execution(home, origin, token, edge_id, model, provider, report, "candidate")
+                    edge_execution(home, origin, token, edge_id, model, provider, report, "candidate", "bash")
                     return
                 if process.poll() is not None:
                     diagnostics.seek(0)
@@ -668,10 +746,10 @@ def edge_case(binary, env, home, origin, token, model, provider, report):
                     process.wait()
 
 
-def bootstrap(origin, provider):
+def bootstrap(origin, provider, admin_token=None):
     user = "compatibility_" + uuid.uuid4().hex
     password = uuid.uuid4().hex + "Aa9!"
-    registered = request(origin, "/admin/register", payload={"username": user,
+    registered = request(origin, "/admin/register", token=admin_token, payload={"username": user,
         "email": user + "@example.test", "password": password, "display_name": "CI compatibility"})
     token = registered["access_token"]
     model = "compatibility-" + uuid.uuid4().hex
@@ -699,7 +777,13 @@ def run(args, report):
     provider = Provider()
     try:
         begin_case(report, "server", "bootstrap")
-        token, model, username, password = bootstrap(origin, provider)
+        admin_token = None
+        if args.existing_admin:
+            username = os.environ.get("ASTRA_COMPAT_BOOTSTRAP_USERNAME", "")
+            password = os.environ.get("ASTRA_COMPAT_BOOTSTRAP_PASSWORD", "")
+            require(bool(username) and bool(password), "bootstrap_admin_credentials_missing")
+            admin_token = request(origin, "/auth/login", payload={"username": username, "password": password})["access_token"]
+        token, model, username, password = bootstrap(origin, provider, admin_token)
         with tempfile.TemporaryDirectory(prefix="astra-candidate-client-") as directory:
             home = Path(directory)
             env = child_environment(home, origin, token)
@@ -713,6 +797,11 @@ def run(args, report):
             with edge.open("rb") as stream:
                 report["current_edge"] = {"sha256": hashlib.file_digest(stream, "sha256").hexdigest(),
                                           "version": version.stdout.decode().strip()}
+            if args.edge_shell_only:
+                edge_case(edge, env, home, origin, token, model, provider, report, shell_only=True)
+                require(not provider.errors, "provider_contract_failed")
+                report["cases"].append({"client": "candidate", "case": "edge_shell_contract", "status": "passed"})
+                return
             begin_case(report, "candidate", "profile_login")
             authenticate_cli(cli, env, home, origin, username, password)
             begin_case(report, "candidate", "model_catalog")
@@ -773,6 +862,8 @@ def main():
     parser.add_argument("--current-cli", type=Path, required=True)
     parser.add_argument("--current-edge", type=Path, required=True)
     parser.add_argument("--disposable-server", action="store_true", required=True)
+    parser.add_argument("--edge-shell-only", action="store_true", help="Run only the Edge WS shell contract case")
+    parser.add_argument("--existing-admin", action="store_true", help="Authenticate bootstrap using ASTRA_COMPAT_BOOTSTRAP_USERNAME/PASSWORD")
     args = parser.parse_args()
     report = {"schema": 1, "platform": "linux-amd64",
               "server_source": os.environ.get("ASTRA_COMPAT_SERVER_SOURCE"), "cases": [], "status": "failed"}

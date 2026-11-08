@@ -511,6 +511,22 @@ pub(crate) async fn persist_server_loop_canonical_terminal_settlement(
     settlement: CanonicalTerminalSettlement<'_>,
     terminal_operation: Option<RunOwnerLeaseTerminalOperation<'_>>,
 ) -> Result<CanonicalTerminalSettlementCommit, String> {
+    // Normalize the terminal once, before its receipt, claim and replay are
+    // built. A typed interruption owns its public message when there is no
+    // separately classified provider error.
+    let settlement = if let Some(interruption) = state.interruption.as_ref().filter(|_| {
+        settlement.status == STATUS_FAILED
+            && settlement.error_kind.is_none()
+            && settlement.error_metadata.is_none()
+    }) {
+        CanonicalTerminalSettlement {
+            error_message: Some(&interruption.user_message),
+            error_code: Some(interruption.kind.label()),
+            ..settlement
+        }
+    } else {
+        settlement
+    };
     // Once an exact-generation terminal transaction may have reached COMMIT,
     // dropping its future at the lease deadline would bypass the existing
     // lost-acknowledgement resolution and report a committed run as failed.
@@ -635,12 +651,10 @@ async fn prepare_canonical_terminal(
         interruption: state
             .interruption
             .as_ref()
-            .filter(|interruption| {
+            .filter(|_| {
                 settlement.status == STATUS_FAILED
                     && settlement.error_kind.is_none()
                     && settlement.error_metadata.is_none()
-                    && interruption.kind
-                        == astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
             })
             .map(astra_turn_core::interruption::InterruptionRecord::public_projection),
         context,
@@ -1141,7 +1155,9 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     loop_state.idempotency_cache = Default::default();
     // A prior Run's observation quarantine is not execution authority for a
     // new Run. Unresolved calls are surfaced separately from the journal.
-    loop_state.consecutive_context_window_errors = restored.consecutive_context_window_errors;
+    // Retry admission belongs to this request, not checkpoint history. The
+    // user may have changed the model capacity or request since the failure.
+    loop_state.consecutive_context_window_errors = 0;
     if let Some(compaction_state) = restored.compaction_state.as_ref() {
         loop_state.compaction_effectiveness =
             crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(
@@ -1156,6 +1172,9 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
                 current_date,
             ),
         );
+    }
+    if let Some(session) = loop_state.pipeline_session.as_mut() {
+        session.recovery.reset_on_success();
     }
     Ok(())
 }
@@ -5052,10 +5071,6 @@ mod tests {
         }
         let proposed_failure = matches!(case, TerminalCase::Failed | TerminalCase::Incomplete)
             || case.user_cancelled();
-        let public_error = state
-            .interruption
-            .as_ref()
-            .map(|record| record.user_message.clone());
         let settlement = CanonicalTerminalSettlement {
             expected_owner_pod_id: owner,
             expected_statuses: &[STATUS_RUNNING, STATUS_WAITING],
@@ -5067,12 +5082,12 @@ mod tests {
             },
             waiting_for: None,
             error_message: if incomplete {
-                public_error.as_deref()
+                Some("original private runtime diagnostic")
             } else {
                 proposed_failure.then_some("provider disconnected")
             },
             error_code: if incomplete {
-                Some("execution_incomplete")
+                Some("original_runtime_error")
             } else {
                 proposed_failure.then_some("provider_connection_lost")
             },

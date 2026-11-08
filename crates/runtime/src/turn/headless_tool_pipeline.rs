@@ -283,6 +283,7 @@ pub(super) enum HeadlessShortCircuitJournalKind {
     HardBlocked,
     SuppressedRetry,
     Cancelled { error_kind: astra_core::ErrorKind },
+    Unavailable,
 }
 
 enum HeadlessToolSlotControl {

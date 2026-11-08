@@ -991,9 +991,10 @@ pub trait AgenticLoopHost: Send {
     /// round. On success the implementation must return the typed event that
     /// describes the applied mutation and bump
     /// [`AgenticLoopState::compact_tier_applied`] to at least
-    /// [`CompactionTier::CompactHistory`] so the downstream budget guard
-    /// skips redundant mechanical compression. Lifecycle accounting and
-    /// delivery are owned by the caller, independently of quiet rendering.
+    /// [`CompactionTier::CompactHistory`]. Subsequent pressure is evaluated
+    /// against the current history, not the historical tier. Lifecycle
+    /// accounting and delivery are owned by the caller, independently of
+    /// quiet rendering.
     /// Default is a no-op so non-server hosts preserve legacy behavior.
     async fn maybe_pre_turn_compact(
         &mut self,
@@ -6425,6 +6426,7 @@ pub(crate) mod tests {
         pub(crate) handoff_snapshots: Vec<astra_pipeline::step_protocol::HeavyCheckpoint>,
         turn_results: Vec<HostTurnResult>,
         pub(crate) terminal_provider_error: Option<astra_core::ClassifiedError>,
+        direct_context_errors: bool,
         admitted_results_by_turn: Vec<Vec<EdgeToolExecResult>>,
         pre_execution_rejection: Option<String>,
         current_turn: usize,
@@ -6493,6 +6495,7 @@ pub(crate) mod tests {
                 handoff_snapshots: Vec::new(),
                 turn_results,
                 terminal_provider_error: None,
+                direct_context_errors: false,
                 admitted_results_by_turn,
                 pre_execution_rejection: None,
                 current_turn: 0,
@@ -6774,6 +6777,14 @@ pub(crate) mod tests {
             self.current_turn += 1;
             if let Some(counter) = &self.provider_call_counter {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.direct_context_errors
+                && result.error_kind == Some(astra_core::ErrorKind::ContextWindow)
+            {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContextWindow,
+                    result.accum.error_message.unwrap(),
+                ));
             }
             Ok(result)
         }
@@ -8683,6 +8694,43 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn delivered_failed_build_reaches_model_before_success_can_end_turn() {
+        let mut failed = make_edge_tool_with_args(
+            "bash",
+            json!({"command": "go build ./..."}),
+            "cannot find module providing package example/fault",
+        );
+        failed.tool_result_fields.as_mut().unwrap().extend([
+            ("exit_code".into(), json!(1)),
+            ("exit_semantics".into(), json!("domain_negative")),
+            ("result_class".into(), json!("inconclusive")),
+        ]);
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![failed, make_edge_tool("catalog", "catalog ready")],
+                20,
+                10,
+                Some(50),
+            ),
+            text_result("The build could not find the module.", 15, 5, Some(30)),
+        ])
+        .with_valid_tools(&["bash", "catalog"])
+        .with_stop_after_success_completion("catalog", Some("premature success"));
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(host.current_turn, 2);
+        assert!(host.executed_messages[1].iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("cannot find module"))
+        }));
+        assert_eq!(state.final_text, "The build could not find the module.");
+    }
+
+    #[tokio::test]
     async fn non_retryable_rejection_allows_a_different_permitted_action() {
         let rejected = json!({
             "id": "denied-command", "type": "function",
@@ -9472,7 +9520,58 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_unchanged_work_observations_are_bounded_by_runtime() {
+    async fn context_overflow_preparation_and_streaming_rebuild_the_next_request() {
+        for direct in [false, true] {
+            let mut overflow = text_result("", 0, 0, None);
+            overflow.response.accum.error_message =
+                Some("input exceeds the provider context window".into());
+            overflow.response.error_kind = Some(astra_core::ErrorKind::ContextWindow);
+            let mut host = MockHost::new(vec![
+                overflow,
+                text_result("Recovered after compaction", 100, 10, None),
+            ]);
+            host.direct_context_errors = direct;
+            let mut state = make_state();
+            state.max_turn_input_tokens = 100_000;
+            state.messages.clear();
+            for index in 0..20 {
+                state
+                    .messages
+                    .push(json!({"role":"user","content":format!("old question {index}")}));
+                state
+                    .messages
+                    .push(json!({"role":"assistant","content":"old answer ".repeat(200)}));
+            }
+            state.messages.push(
+                json!({"role":"user","content":"Fix this; preserve the authentication boundary."}),
+            );
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(
+                matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+                "{direct}: {outcome:?}"
+            );
+            assert_eq!(host.turn_count(), 2);
+            assert_eq!(
+                state.total_tool_calls, 0,
+                "failed preparation cannot execute tools"
+            );
+            assert!(!host.compaction_events.is_empty());
+            assert!(
+                crate::prompts::estimate_wire_input_tokens(&host.executed_messages[1], 0)
+                    < crate::prompts::estimate_wire_input_tokens(&host.executed_messages[0], 0)
+            );
+            assert!(
+                host.executed_messages[1]
+                    .iter()
+                    .any(|message| message["content"]
+                        == "Fix this; preserve the authentication boundary.")
+            );
+            assert_eq!(state.final_text, "Recovered after compaction");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_unchanged_work_observations_leave_next_step_to_model() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_detached_bash_edge_tool("bg-shell-1")],
@@ -9500,7 +9599,12 @@ pub(crate) mod tests {
                 5,
                 None,
             ),
-            text_result("unreachable model response", 10, 5, None),
+            text_result(
+                "The task is still running; I can inspect it or wait again.",
+                10,
+                5,
+                None,
+            ),
         ])
         .with_valid_tools(&["bash", "task_output"]);
         let mut state = make_state();
@@ -9513,19 +9617,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             host.turn_count(),
-            3,
-            "a second unchanged observation must close the loop without another model call"
+            4,
+            "a repeated observation must leave the next step to the model"
         );
         assert_eq!(state.total_tool_calls, 3);
-        assert!(
-            state.final_text.contains("bg-shell-1"),
-            "{}",
-            state.final_text
-        );
-        assert!(
-            state.final_text.contains("materially changed"),
-            "{}",
-            state.final_text
+        assert_eq!(
+            state.final_text,
+            "The task is still running; I can inspect it or wait again."
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
@@ -9706,7 +9804,12 @@ pub(crate) mod tests {
                 5,
                 None,
             ),
-            text_result("unreachable model response", 10, 5, None),
+            text_result(
+                "The task is still running; I can inspect it or wait again.",
+                10,
+                5,
+                None,
+            ),
         ])
         .with_valid_tools(&["task_output"]);
         let mut state = make_state();
@@ -9719,19 +9822,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             host.turn_count(),
-            3,
-            "a second unchanged live observation must close the loop"
+            4,
+            "a repeated live observation must leave the next step to the model"
         );
         assert_eq!(state.total_tool_calls, 3);
-        assert!(
-            state.final_text.contains("bg-shell-1"),
-            "{}",
-            state.final_text
-        );
-        assert!(
-            state.final_text.contains("has not materially changed"),
-            "{}",
-            state.final_text
+        assert_eq!(
+            state.final_text,
+            "The task is still running; I can inspect it or wait again."
         );
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
