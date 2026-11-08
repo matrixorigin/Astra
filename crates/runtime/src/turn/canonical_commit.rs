@@ -440,61 +440,91 @@ mod tests {
 
     #[test]
     fn recovered_provider_replacement_advances_the_rewrite_proof() {
-        let durable = vec![
-            json!({"role": "user", "content": "old"}),
-            json!({"role": "assistant", "content": "answer"}),
-        ];
-        let base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
-        let wal_base =
-            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let base_manifest_root = "a".repeat(64);
-        assert_ne!(base_manifest_root, base.root_hash);
-        let mut live =
-            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 7);
-        let mut source = durable.clone();
-        source.push(json!({"role": "user", "content": "current"}));
-        let permit = live.begin(&source);
-        let rewritten = vec![json!({"role": "user", "content": "typed summary"})];
-        live.finish(permit, &rewritten, Some(&wal_base));
-        let authorization = live
-            .provider_wal_replacement_authorization(&wal_base, &rewritten)
-            .unwrap();
-        let transition =
-            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+        for (durable, has_head, generation) in [
+            (vec![], false, 0),
+            (
+                vec![
+                    json!({"role": "user", "content": "old"}),
+                    json!({"role": "assistant", "content": "answer"}),
+                ],
+                true,
+                7,
+            ),
+        ] {
+            let base =
+                astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+            let wal_base =
+                astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
+            let base_manifest_root = if has_head {
+                "a".repeat(64)
+            } else {
+                base.root_hash.clone()
+            };
+            let mut live = CanonicalRewriteProof::from_materialized_admission(
+                &durable,
+                &base_manifest_root,
+                generation,
+            );
+            let mut source = durable.clone();
+            source.push(json!({"role": "user", "content": "current"}));
+            let permit = live.begin(&source);
+            let rewritten = vec![json!({"role": "user", "content": "typed summary"})];
+            live.finish(permit, &rewritten, Some(&wal_base));
+            let authorization = live
+                .provider_wal_replacement_authorization(&wal_base, &rewritten)
+                .unwrap();
+            let transition =
+                astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+                    None,
+                    wal_base.clone(),
+                    authorization.generation,
+                    &rewritten,
+                    vec![authority()],
+                )
+                .unwrap();
+
+            let mut recovered = durable.clone();
+            transition.apply_to(&mut recovered).unwrap();
+            let mut restored_proof = CanonicalRewriteProof::from_materialized_admission(
+                &durable,
+                &base_manifest_root,
+                generation,
+            );
+            restored_proof
+                .recover_provider_wal_replacement(&wal_base, &transition, &recovered)
+                .unwrap();
+            let mut completed = recovered.clone();
+            completed.push(json!({"role": "assistant", "content": "done"}));
+            assert_eq!(
+                restored_proof.provider_wal_replacement_authorization(&wal_base, &completed),
                 None,
-                wal_base.clone(),
-                authorization.generation,
-                &rewritten,
-                vec![authority()],
+                "crash recovery must not reissue consumed replacement authority"
+            );
+            let (mode, _) = canonical_commit_delta(
+                &durable,
+                has_head,
+                &completed,
+                Some(&restored_proof),
+                false,
             )
-            .unwrap();
+            .unwrap()
+            .expect("recovered replacement remains committable");
+            assert_eq!(
+                mode,
+                if has_head {
+                    astra_turn_types::CanonicalDeltaModeV1::Replace
+                } else {
+                    astra_turn_types::CanonicalDeltaModeV1::Append
+                }
+            );
 
-        let mut recovered = durable.clone();
-        transition.apply_to(&mut recovered).unwrap();
-        let mut restored_proof =
-            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 7);
-        restored_proof
-            .recover_provider_wal_replacement(&wal_base, &transition, &recovered)
-            .unwrap();
-        let mut completed = recovered.clone();
-        completed.push(json!({"role": "assistant", "content": "done"}));
-        assert_eq!(
-            restored_proof.provider_wal_replacement_authorization(&wal_base, &completed),
-            None,
-            "crash recovery must not reissue consumed replacement authority"
-        );
-        let (mode, _) =
-            canonical_commit_delta(&durable, true, &completed, Some(&restored_proof), false)
-                .unwrap()
-                .expect("recovered replacement remains committable");
-        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
-
-        let second_permit = restored_proof.begin(&completed);
-        let second_rewrite = vec![json!({"role": "user", "content": "summary two"})];
-        restored_proof.finish(second_permit, &second_rewrite, Some(&wal_base));
-        let second_authorization = restored_proof
-            .provider_wal_replacement_authorization(&wal_base, &second_rewrite)
-            .unwrap();
-        assert_eq!(second_authorization.generation, 8);
+            let second_permit = restored_proof.begin(&completed);
+            let second_rewrite = vec![json!({"role": "user", "content": "summary two"})];
+            restored_proof.finish(second_permit, &second_rewrite, Some(&wal_base));
+            let second_authorization = restored_proof
+                .provider_wal_replacement_authorization(&wal_base, &second_rewrite)
+                .unwrap();
+            assert_eq!(second_authorization.generation, generation + 1);
+        }
     }
 }

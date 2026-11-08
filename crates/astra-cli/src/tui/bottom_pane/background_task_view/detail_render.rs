@@ -108,6 +108,16 @@ pub(crate) fn render_detail(
             Span::raw(output_ref.to_string()),
         ]));
     }
+    if let Some((stdout, stderr)) = &row.local_capture_paths {
+        actionable_lines.push(Line::from(vec![
+            Span::styled("  local stdout ", dim),
+            Span::raw(stdout.display().to_string()),
+        ]));
+        actionable_lines.push(Line::from(vec![
+            Span::styled("  local stderr ", dim),
+            Span::raw(stderr.display().to_string()),
+        ]));
+    }
 
     // Keep diagnostics and the next useful action ahead of low-signal
     // counters. The detail viewport is intentionally short, so silently

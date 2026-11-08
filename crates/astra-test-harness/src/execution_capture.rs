@@ -1890,9 +1890,13 @@ pub(crate) mod tests {
     /// Consumer fixture using the published Server wire shape. These tests
     /// prove oracle rejection, not production emission or live task quality.
     pub(crate) fn capture() -> SessionExecutionCapture {
+        capture_with_child("observed-value", "test-model")
+    }
+
+    pub(crate) fn capture_with_child(content: &str, model: &str) -> SessionExecutionCapture {
         let child = serde_json::json!({
             "agent_id": "member", "run_id": "child", "status": "completed",
-            "result_sha256": format!("{:x}", Sha256::digest(b"observed-value")),
+            "result_sha256": format!("{:x}", Sha256::digest(content.as_bytes())),
             "result_truncated": false,
         });
         let fact = |kind: &str, run: &str, outcome: &str, time: &str, children: Value| {
@@ -1935,12 +1939,12 @@ pub(crate) mod tests {
                 "session_id":"session", "snapshot_revision":"revision", "observed_at":"2026-10-07T00:00:03Z",
                 "node_limit":200, "truncated":false, "runs":[
                     node("root", Value::Null, Value::Null, serde_json::json!({})),
-                    node("child", serde_json::json!("root"), serde_json::json!("member"), serde_json::json!({"offering_id":"offer","model_name":"test-model"})),
+                    node("child", serde_json::json!("root"), serde_json::json!("member"), serde_json::json!({"offering_id":"offer","model_name":model})),
                 ]},
             "reflection":reflection,
             "transcript":{"session_id":"session", "has_more":false,"next_before_seq":null,
                 "items":[{"session_id":"session", "item_seq":3, "run_id":"child", "role":"assistant",
-                    "content":"observed-value", "tool_calls":[], "tool_result":null,
+                    "content":content, "tool_calls":[], "tool_result":null,
                     "source_event_id":"child-terminal", "created_at":"2026-10-07T00:00:00Z"}]},
         })).unwrap()
     }

@@ -1772,9 +1772,8 @@ pub(crate) async fn ensure_session_native_delivery(
         .with_shared_file_state(state.file_state.clone())
         .with_shared_database_snapshot_journal(state.database_snapshot_journal.clone())
         .with_shared_session_state_journal(state.session_state_journal.clone())
-        .with_bg_task_commands(state.bg_task_commands.clone())
-        .with_bg_task_list_cache(state.bg_task_list_cache.clone())
-        .with_bash_detach_slot(state.bash_detach_slot.clone());
+        .with_background_tasks(state.background_tasks.clone())
+        .with_foreground_wait_control(state.foreground_wait_control.clone());
     if let Some(observability) = state.observability_session.clone() {
         executor = executor.with_observability_session(observability);
     }

@@ -304,7 +304,7 @@ Allowlist changes take effect only after they reach the trusted base branch.
 
 The authoritative selection is [ci-regression.txt](ci-regression.txt). The
 selector stages those original files unchanged into one suite; it does not copy
-prompts into the workflow or implement another grader. The 18 roots cover
+prompts into the workflow or implement another grader. The 19 roots cover
 distinct delivery, tool, observability, context and delegation boundaries; child
 communication and inherited-model checks bind to the selected model rather than
 requiring an obsolete hard-coded provider version.
@@ -321,6 +321,7 @@ requiring an obsolete hard-coded provider version.
 | `same_model_fanout_handoff_flash` | Medium: two Flash children, exact slot identities, real child results and parent adoption |
 | `file_edit_prepared_bytes` | File creation, localized edit, read-back and exact on-disk bytes |
 | `read_only_shell_diagnostics` | Read-only shell authorization and truthful output delivery |
+| `interactive_shell_next_output` | Real two-stage shell input, waiting for new output, and terminal completion |
 | `introspection_reflection_source_boundary` | Distinct live-process and durable-session evidence |
 | `multi_turn_local_followup_focus` | Topic change, local follow-up and explicit historical recall |
 | `flash_rejected_delegation_preserves_parent_tools` | Parent remains usable after a rejected child request |
@@ -337,6 +338,10 @@ GLM-5.3 is temporarily excluded from this regression because its service is unst
 The full suite retains `multi_model_fanout_handoff`; explicitly configure its GLM
 dependency in `HARNESS_ADDITIONAL_MODELS_JSON` to run it. The regression does not
 claim heterogeneous-model coverage.
+The same CI harness job also runs the standalone Edge WS shell contract against
+a synthetic provider and an actual `astra-edge` process. It verifies the exact
+model-facing shell schema and executes a normal command; it is reported
+separately from the live-model case counts.
 An explicit `deepseek-v4.1-flash` entry in `HARNESS_ADDITIONAL_MODELS_JSON`
 replaces its default configuration unchanged; other additional models remain
 self-contained. Missing/unavailable models fail preflight;
@@ -345,7 +350,7 @@ they are never silently substituted or omitted. No Jev configuration is required
 Run once, serially, with an aggregate **15-minute execution budget** plus at most
 two minutes for cancellation/settlement. This is a budget, not a measured
 performance claim: build, service startup, registration and artifact publication
-are separate and may make the entire workflow longer. Eighteen roots include
+are separate and may make the entire workflow longer. Nineteen roots include
 follow-up turns; these are not counted as additional roots. Per-case timings, results, error classes, usage
 coverage and partial-timeout summaries use the same safe live progress as the
 manual workflow. There is no retry-until-green policy. This sample does not
@@ -615,7 +620,7 @@ focus without duplicating the whole scripted journey.
 | `journal_tool_precedence { predecessor, successor }` | every durable successor call happens after its predecessor | journal |
 | `journal_artifact_consumed { producer, consumer }` | consumer used the exact session artifact advertised by a prior producer result | journal |
 | `journal_tool_value_flow { producer, producer_document, producer_path, producer_filter?, consumer, consumer_document, consumer_paths, consumer_filter? }` | successful consumer call satisfying its structural predicate used an exact scalar emitted by a prior matching producer; `*` path segments project any array/object child without relying on result order | journal |
-| `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters, min_turns_after_producer? }` | conjunctive typed filters bind scope/type to successful value flow; optional visible-turn separation proves a later-turn consumer without using prose or event-order guesses | journal |
+| `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_capture?, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters, min_turns_after_producer? }` | conjunctive typed filters bind scope/type to successful value flow; an optional single regex capture extracts a JSON scalar from text; optional visible-turn separation proves a later-turn consumer | journal |
 | `journal_work_item_execution_from_start { min_distinct_items }` | completed `run_next_work_item` calls report that many distinct server-selected runnable WorkItems from prior `start_work` | journal |
 | `journal_work_replacement_lifecycle { initial_items, cancelled_items, added_items, delivered_items, cancellation_after_deliveries?, added_execution_after_initial_deliveries?, require_added_at_start?, require_added_before_execution?, require_cancel_before_execution?, require_board_before_execution? }` | exact canonical replacement identities and outcomes; optional bounds require prior deliveries before cancellation and before added execution; require_added_at_start requires the complete genesis board, while require_added_before_execution proves every addition was committed by admission or an accepted scoped proposal before the first scoped execution, including failed executions, and corroborated by a subsequent complete board. Cancellation preserves earlier execution history; accepted retirement receipts fence subsequent execution before the next board. require_cancel_before_execution additionally forbids historical execution; require_board_before_execution rejects unbound task execution and requires assigned successful evidence for delivery | journal |
 | `journal_work_graph_patch { require_addition, require_retired_revision, … }` | canonical mutation evidence comes from an admission snapshot, an accepted plan proposal, or a deferred mutation observed after its settlement boundary; retirement is cancellation or supersession, never prose | journal |
@@ -623,6 +628,14 @@ focus without duplicating the whole scripted journey.
 | `hard_judger { question, threshold, model }`        | LLM scores ≥ threshold and failure fails the case            | LLM         |
 
 ### Criterion severity levels
+
+For `journal_tool_value_flow_bound`, `all_consumers: true` requires complete
+execution evidence, exactly one successful matching producer, and at least
+one successful matching consumer. Every call to the named consumer must be
+in the producer's run, at a later (turn, provider-round) position, and carry the exact produced
+scalar at a selected path. Consumer filters select the positive witness; they
+do not exclude other calls from the identity check. This mode requires distinct
+producer and consumer names and does not accept visible-turn bounds.
 
 Use deterministic execution criteria for child identity, actual model execution,
 completion, and original-result custody. For natural-language task correctness,
@@ -953,6 +966,14 @@ lease authority or settlement of uncertain external effects. Canonical Run/C0
 and the effect ledger retain those responsibilities. Remote or restarted runs
 without the authorized trace remain unverifiable; this adds no general cold
 readonly-tool replay or access to another Server's private filesystem.
+
+An `execution_tool_sequence` may provide one `steps` entry per named tool. Each
+step can require an `ok` outcome, structural `predicates`, and named `bindings`
+from arguments or result JSON pointers. Reusing a binding name requires the
+same scalar in one ordered witness; an optional regex extracts exactly one
+group from a string, including a non-JSON result at the empty pointer. Proof
+search and binding sizes are bounded, and missing or ambiguous evidence does
+not pass. These checks prove recorded behavior rather than program identity.
 
 Runtime advisories remain separate from result documents. Opaque non-JSON text
 is retained for exact error diagnostics but cannot satisfy JSON predicates.

@@ -1196,7 +1196,7 @@ fn runtime_control_tool_call_admission(
 
 fn pre_turn_summary_spill_count(messages: &[Value]) -> usize {
     let keep_recent = (messages.len() / 4).max(4);
-    crate::turn::cloud::compaction::protected_history_spill_count(
+    crate::turn::cloud::compaction::adjust_spill_boundary_for_tool_pairs(
         messages,
         messages.len().saturating_sub(keep_recent),
     )
@@ -1209,7 +1209,10 @@ fn apply_pre_turn_summary(
     spill_count: usize,
 ) -> Option<CompactionEvent> {
     let max_tokens = state.max_turn_input_tokens;
-    let candidate = crate::turn::cloud::compaction::prepare_prefix_summary(
+    let rewrite_permit = state
+        .begin_canonical_rewrite()
+        .filter(|permit| permit.is_valid())?;
+    let (candidate, sent_prefix) = crate::turn::cloud::compaction::prepare_conversation_summary(
         &state.messages,
         spill_count,
         astra_turn_core::cloud::history_summary::history_summary_message(format!(
@@ -1220,20 +1223,14 @@ fn apply_pre_turn_summary(
         crate::prompts::measured_prompt_tokens_from_manifest(
             state.last_llm_context_manifest_trace.as_ref(),
         ),
+        state.last_request_message_count,
     )?;
     let tokens_freed = candidate.tokens_freed();
     let tokens_before = candidate.tokens_before;
     let messages_removed = candidate.messages_removed;
-    let rewrite_permit = state.begin_canonical_rewrite();
-    state.last_request_message_count = state.last_request_message_count.map(|prefix| {
-        if prefix == 0 {
-            0
-        } else {
-            prefix.saturating_sub(spill_count).saturating_add(1)
-        }
-    });
+    state.last_request_message_count = sent_prefix;
     state.messages = candidate.messages;
-    state.finish_canonical_rewrite(rewrite_permit);
+    state.finish_canonical_rewrite(Some(rewrite_permit));
     state.compact_tier_applied = CompactionTier::CompactHistory;
     state.context_compression_triggered = true;
 
@@ -4149,7 +4146,7 @@ fn install_provider_execution_directory(
     .collect::<Vec<_>>();
 
     if entries.is_empty() {
-        texts.push(format!("{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nNo provider-owned collaborator is currently advertised. Do not discover provider configuration through workspace tools or Bash; an explicit provider request needs an available capability."));
+        texts.push(format!("{PROVIDER_EXECUTION_DIRECTORY_MARKER}\nNo structured provider collaborator is currently advertised. Explicitly requested local programs may still run through admitted Bash on the selected CLI/User Runner. Do not inspect credentials or silently substitute the requested provider/model."));
     } else {
         let model_selection_complete = entries.iter().all(|entry| {
             entry
@@ -7831,36 +7828,114 @@ impl ServerAgenticLoopHost {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let admission_schemas = self.current_admission_schemas();
         let snapshot = self.admission_snapshot(&admission_schemas, &registry);
-        crate::turn::agentic::tool_interception::resolve_carrier_tool_admission_with_identity(
-            admission,
-            &activations,
-            schema_digest,
-            |activation| {
-                Self::deferred_activation_descriptor_is_current(
-                    activation,
-                    &snapshot.decision(&activation.name),
+        let mut resolved =
+            crate::turn::agentic::tool_interception::resolve_carrier_tool_admission_with_identity(
+                admission,
+                &activations,
+                schema_digest,
+                |activation| {
+                    Self::deferred_activation_descriptor_is_current(
+                        activation,
+                        &snapshot.decision(&activation.name),
+                    )
+                },
+                |name, arguments| {
+                    self.valid_tools.contains(name)
+                        && snapshot.decision(name).visible
+                        && state
+                            .runtime_tool_executor
+                            .as_deref()
+                            .is_some_and(|executor| executor.tool_runtime_ready(name))
+                        && state
+                            .sticky_tool_schemas
+                            .iter()
+                            .chain(self.tool_schemas.iter())
+                            .find(|schema| tool_schema_name(schema) == Some(name))
+                            .is_some_and(|schema| {
+                                astra_tools::schemas::validate_tool_arguments_against_schema(
+                                    name, arguments, schema,
+                                )
+                                .is_ok()
+                            })
+                },
+            );
+        for rejected in &mut resolved.rejected {
+            let Ok(mut result) = serde_json::from_str::<Value>(&rejected.result) else {
+                continue;
+            };
+            if !matches!(
+                result["error_kind"].as_str(),
+                Some("deferred_tool_descriptor_stale" | "deferred_tool_activation_stale")
+            ) {
+                continue;
+            }
+            let selected = rejected.invocation.activation().or_else(|| {
+                let args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                    rejected.invocation.physical_provider_call(),
                 )
-            },
-            |name, arguments| {
-                self.valid_tools.contains(name)
-                    && snapshot.decision(name).visible
-                    && state
-                        .runtime_tool_executor
-                        .as_deref()
-                        .is_some_and(|executor| executor.tool_runtime_ready(name))
-                    && state
-                        .sticky_tool_schemas
-                        .iter()
-                        .chain(self.tool_schemas.iter())
-                        .find(|schema| tool_schema_name(schema) == Some(name))
-                        .is_some_and(|schema| {
-                            astra_tools::schemas::validate_tool_arguments_against_schema(
-                                name, arguments, schema,
-                            )
-                            .is_ok()
-                        })
-            },
-        )
+                .ok()?;
+                let target =
+                    astra_turn_core::tool::deferred_activation::parse_deferred_tool_invocation(
+                        &args,
+                    )
+                    .ok()?;
+                activations
+                    .iter()
+                    .find(|activation| activation.name == target.name)
+            });
+            let Some(selected) = selected else {
+                continue;
+            };
+            let decision = snapshot.decision(&selected.name);
+            let current = decision
+                .selected_offer
+                .as_ref()
+                .and_then(crate::server::tool_admission::ToolOffer::descriptor_ref);
+            let current_schema = schema_digest(&selected.name);
+            let mut changed = Vec::new();
+            if !decision.visible {
+                changed.push("availability");
+            }
+            if selected
+                .descriptor
+                .as_ref()
+                .map(|descriptor| &descriptor.identity)
+                != current.as_ref().map(|descriptor| &descriptor.identity)
+            {
+                changed.push("execution_owner");
+            }
+            if selected
+                .descriptor
+                .as_ref()
+                .map(|descriptor| &descriptor.descriptor_version)
+                != current
+                    .as_ref()
+                    .map(|descriptor| &descriptor.descriptor_version)
+            {
+                changed.push("executable_contract");
+            }
+            if Some(selected.schema_digest.as_str()) != current_schema.as_deref() {
+                changed.push("input_schema");
+            }
+            let fingerprint = |value: Value| {
+                format!(
+                    "sha256:{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(
+                        astra_core::canonical_json_string(&value).as_bytes()
+                    )
+                )
+            };
+            result["stage"] = json!("descriptor_admission");
+            result["execution_started"] = json!(false);
+            result["side_effects_maybe"] = json!(false);
+            result["contract_difference"] = json!({
+                "changed_components": changed,
+                "selected": fingerprint(json!({"descriptor":selected.descriptor,"schema":selected.schema_digest})),
+                "current": fingerprint(json!({"descriptor":current,"schema":current_schema})),
+            });
+            rejected.result = result.to_string();
+        }
+        resolved
     }
 
     fn current_deferred_tool_contract_schemas(&self, state: &AgenticLoopState) -> Vec<Value> {
@@ -12315,12 +12390,16 @@ impl ServerAgenticLoopHost {
             );
             return;
         }
-        let candidates = capability_filter_edge_provided_tool_schemas_for_binding(
+        let mut candidates = capability_filter_edge_provided_tool_schemas_for_binding(
             astra_tools::schemas::all_tool_schemas(),
             &self.workspace_binding,
             &self.executor_binding,
             self.runtime_binding.as_ref(),
         );
+        // A name-only Edge allowlist cannot prove an interactive shell owner.
+        // An EdgeLedger's bound provider contract, when present, is stronger
+        // evidence and is used below instead of this conservative fallback.
+        astra_tools::schemas::hide_shell_task_controls(&mut candidates);
         tracing::debug!(
             allow_set = ?allow_set,
             candidates_count = candidates.len(),
@@ -12345,7 +12424,54 @@ impl ServerAgenticLoopHost {
             "edge_tool_schema: merge_allowlisted_edge_tool_schemas: merged {} tools",
             merged_count
         );
-        for schema in merged {
+        for mut schema in merged {
+            if tool_schema_name(&schema) == Some("bash") {
+                if matches!(
+                    self.executor_binding.transport,
+                    crate::server::tool_transport::ToolTransportKind::EdgeLedger
+                ) && matches!(
+                    self.workspace_binding.kind,
+                    WorkspaceBindingKind::EdgeWorkspace
+                ) && let Some(declared) = self
+                    .edge_provider_tool_schemas
+                    .iter()
+                    .find(|declared| tool_schema_name(declared) == Some("bash"))
+                {
+                    schema = declared.clone();
+                } else if matches!(
+                    self.executor_binding.transport,
+                    crate::server::tool_transport::ToolTransportKind::EdgeLedger
+                ) {
+                    // The CLI executor does not implement source-artifact
+                    // capture. A name-only fallback cannot promise it.
+                    if let Some(properties) = schema
+                        .pointer_mut("/function/parameters/properties")
+                        .and_then(Value::as_object_mut)
+                    {
+                        properties.remove("source_artifacts");
+                    }
+                    schema["function"]["description"] = Value::String(
+                        "Execute a command and report its output and exit status. workdir is call-local.".into(),
+                    );
+                }
+                // Keep the selected executable contract consistent across
+                // admission, direct tools and deferred discovery.
+                for catalog in [
+                    &mut self.admission_tool_schemas,
+                    &mut self.deferred_tool_schemas,
+                ] {
+                    if let Some(existing) = catalog
+                        .iter_mut()
+                        .find(|item| tool_schema_name(item) == Some("bash"))
+                    {
+                        *existing = schema.clone();
+                    } else {
+                        catalog.push(schema.clone());
+                    }
+                }
+            } else {
+                append_tool_schemas_unique(&mut self.deferred_tool_schemas, vec![schema.clone()]);
+            }
             if let Some(name) = tool_schema_name(&schema) {
                 // Admission route selection needs the same provider fact as
                 // schema visibility. Without updating this set, a schema
@@ -12359,7 +12485,6 @@ impl ServerAgenticLoopHost {
             // cache-prune a non-core child capability and leave only
             // tool_search visible; without this catalog entry the activation
             // manifest says the exact allowlisted tool does not exist.
-            append_tool_schemas_unique(&mut self.deferred_tool_schemas, vec![schema.clone()]);
             self.install_admissible_tool_schema(schema, true);
         }
         // MOI runner chat sends `allow_tools` + executor_binding.transport=edge_ws.
@@ -17279,6 +17404,14 @@ impl ServerAgenticLoopHost {
         wire_tools: &[Value],
         state: &mut AgenticLoopState,
     ) {
+        state.deferred_tool_activations =
+            astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
+                &state.messages,
+                std::mem::take(&mut state.deferred_tool_activations),
+            );
+        // A fresh request may bind unchanged learned contracts to its currently
+        // authorized provider. This is current admission, never permission to
+        // reroute an invocation already emitted under a frozen request.
         let discovery = self.sync_valid_tools_to_wire_surface_for_state(wire_tools, state);
         if state.deferred_tool_activations.is_empty() {
             return;
@@ -17910,7 +18043,7 @@ impl ServerAgenticLoopHost {
             );
             let available_output_tokens = candidate_status
                 .model_limit
-                .saturating_sub(candidate_status.estimated_input_tokens)
+                .saturating_sub(candidate_status.known_input_tokens())
                 .saturating_sub(candidate_status.reserved_protocol_tokens);
             if !candidate_status.hard_limit_exceeded() {
                 // Keep the typed candidate for the caller.  The consolidated
@@ -20751,7 +20884,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .map_err(|message| astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, message))?;
         let context_output_limit = final_wire_budget_status
             .model_limit
-            .saturating_sub(final_wire_budget_status.estimated_input_tokens)
+            .saturating_sub(final_wire_budget_status.known_input_tokens())
             .saturating_sub(final_wire_budget_status.reserved_protocol_tokens);
         let mut output_cap_retry_limit = output_cap_retry_limit(
             max_output_tokens,
@@ -22635,20 +22768,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
         pressure: f64,
     ) -> Option<CompactionEvent> {
-        if state.compact_tier_applied >= CompactionTier::CompactHistory
-            || state.messages.len() <= 10
+        if state.messages.len() <= 10 {
+            return None;
+        }
+        if !state
+            .begin_canonical_rewrite()
+            .is_some_and(|permit| permit.is_valid())
         {
             return None;
         }
-        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
-            tracing::debug!(
-                target: "astra::pre_turn_compaction",
-                policy = auxiliary_llm_policy_label(),
-                reason,
-                "pre-turn LLM compaction skipped by capacity policy"
-            );
-            return None;
-        }
+        // Compaction is required to continue the current turn, not optional
+        // auxiliary inference. Its client still uses normal admission.
         let spill_count = pre_turn_summary_spill_count(&state.messages);
         if spill_count == 0 {
             state.compaction_effectiveness.record_futile();
@@ -23827,7 +23957,7 @@ mod tests {
         );
         assert_eq!(texts.len(), 2);
         assert_eq!(texts[0], "existing runtime fact");
-        assert!(texts[1].contains("No provider-owned collaborator is currently advertised"));
+        assert!(texts[1].contains("No structured provider collaborator is currently advertised"));
     }
 
     include!("server_loop_host_replay_tests.rs");
@@ -27168,11 +27298,6 @@ mod tests {
         settlement: EdgeApprovalSettlement,
     ) -> (AdmittedToolCallOutcome, Vec<Value>) {
         let mut host = test_host_builder(user_id.to_string(), session_id.to_string())
-            .with_execution_time_budget(Some(ExecutionTimeBudget {
-                // This fixture exercises approval reconciliation only; it has
-                // no following provider request or tool execution to budget.
-                remaining_seconds: 1,
-            }))
             .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
             .with_interactive_client(true)
             .build();
@@ -27198,6 +27323,19 @@ mod tests {
             "type": "function",
             "function": {"name": "bash", "arguments": "{}"}
         });
+        // This fixture tests timeout reconciliation, not a provider's final
+        // answer reserve. Give its approval wait an explicit work cutoff and
+        // use the paused clock in the callers for deterministic timing.
+        host.execution_time_budget = Some(
+            ExecutionDeadlineAuthority::from_snapshot_at(
+                astra_services::runs::ExecutionDeadlineSnapshot {
+                    deadline_unix_ms: 100,
+                    work_deadline_unix_ms: 100,
+                },
+                0,
+            )
+            .unwrap(),
+        );
         let outcome = host
             .deliver_edge_tools_via_ledger(run_id, "chain", &[call], &context)
             .await;
@@ -27217,7 +27355,7 @@ mod tests {
         (outcome, approval_waits)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn competing_denial_replaces_local_approval_timeout_result() {
         let (outcome, approval_waits) = competing_settlement_after_local_timeout(
             "u-compete-deny",
@@ -27250,7 +27388,7 @@ mod tests {
         assert_eq!(approval_waits[0]["outcome"], "rejected");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn competing_allow_replaces_local_approval_timeout_trace() {
         let (outcome, approval_waits) = competing_settlement_after_local_timeout(
             "u-compete-allow",
@@ -33889,6 +34027,129 @@ mod tests {
             host.server_side_tools,
             "MOI runner allow_tools without MCP must not use edge ledger delivery"
         );
+        for catalog in [
+            &host.tool_schemas,
+            &host.admission_tool_schemas,
+            &host.deferred_tool_schemas,
+        ] {
+            let bash = catalog
+                .iter()
+                .find(|schema| tool_schema_name(schema) == Some("bash"))
+                .unwrap();
+            assert!(
+                bash.pointer("/function/parameters/properties/stdin")
+                    .is_none()
+            );
+            assert!(
+                bash.pointer("/function/parameters/properties/yield_time_ms")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn merge_allowlisted_shell_respects_the_bound_provider_contract() {
+        let mut owner_schema = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some("bash"))
+            .unwrap();
+        // A provider may expose only part of the canonical capability.
+        owner_schema["function"]["parameters"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("yield_time_ms");
+        let mut ownerless_schema = owner_schema.clone();
+        astra_tools::schemas::hide_shell_task_controls(std::slice::from_mut(&mut ownerless_schema));
+        for (snapshot, declared, expected) in [
+            (
+                cli_edge_ledger_snapshot(),
+                owner_schema.clone(),
+                owner_schema.clone(),
+            ),
+            (
+                cli_edge_ledger_snapshot(),
+                ownerless_schema.clone(),
+                ownerless_schema.clone(),
+            ),
+            (
+                edge_runtime_snapshot(),
+                owner_schema.clone(),
+                ownerless_schema.clone(),
+            ),
+        ] {
+            let mut host = test_host_builder("u-bound", "s-bound")
+                .with_server_service_tool_catalog_enabled(false)
+                .with_static_tool_catalog_admissible(false)
+                .with_edge_tools(vec![declared])
+                .with_execution_binding_snapshot(snapshot)
+                .build();
+            host.merge_allowlisted_edge_tool_schemas(&["bash".to_string()]);
+            host.merge_allowlisted_edge_tool_schemas(&["bash".to_string()]);
+            for catalog in [
+                &host.tool_schemas,
+                &host.admission_tool_schemas,
+                &host.deferred_tool_schemas,
+            ] {
+                let shell = catalog
+                    .iter()
+                    .find(|schema| tool_schema_name(schema) == Some("bash"))
+                    .unwrap();
+                for name in ["stdin", "yield_time_ms"] {
+                    assert_eq!(
+                        shell["function"]["parameters"]["properties"].get(name),
+                        expected["function"]["parameters"]["properties"].get(name)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn name_only_or_conflicting_ledger_shell_contract_uses_common_capabilities() {
+        let shell = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some("bash"))
+            .unwrap();
+        let mut conflicting = shell.clone();
+        conflicting["function"]["description"] = json!("different provider contract");
+        for declared in [vec![], vec![shell.clone(), conflicting]] {
+            let mut host = test_host_builder("u-fallback", "s-fallback")
+                .with_server_service_tool_catalog_enabled(false)
+                .with_static_tool_catalog_admissible(false)
+                .with_edge_tools(declared)
+                .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
+                .build();
+            assert!(
+                !host
+                    .edge_provider_tool_schemas
+                    .iter()
+                    .any(|schema| tool_schema_name(schema) == Some("bash"))
+            );
+            host.merge_allowlisted_edge_tool_schemas(&["bash".to_string()]);
+            for catalog in [
+                &host.tool_schemas,
+                &host.admission_tool_schemas,
+                &host.deferred_tool_schemas,
+            ] {
+                let schema = catalog
+                    .iter()
+                    .find(|schema| tool_schema_name(schema) == Some("bash"))
+                    .unwrap();
+                for name in ["stdin", "yield_time_ms", "source_artifacts"] {
+                    assert!(
+                        schema["function"]["parameters"]["properties"]
+                            .get(name)
+                            .is_none()
+                    );
+                }
+                assert!(
+                    !schema["function"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("source_artifacts")
+                );
+            }
+        }
     }
 
     fn schema_names(tools: &[Value]) -> HashSet<String> {
@@ -36065,7 +36326,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_abort_returns_error_and_records_alert() {
+    fn historical_overflow_does_not_refuse_a_fresh_pipeline_request() {
         let mut host = test_host_builder("u1", "s1")
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
@@ -36083,23 +36344,18 @@ mod tests {
         state.pipeline_session = Some(pipeline_session);
         let tools = host.tool_schemas.clone();
 
-        let error = match host.run_turn_pipeline(
-            &mut state,
-            &tools,
-            "anthropic",
-            "claude-sonnet",
-            "continue",
-        ) {
-            Ok(_) => panic!("pipeline abort must stop the turn instead of using a fallback prompt"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
         assert!(
+            host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet", "continue")
+                .is_ok()
+        );
+        assert_eq!(
             state
-                .turn_event_buffer
+                .pipeline_session
                 .as_ref()
-                .is_some_and(|buffer| !buffer.is_empty()),
-            "pipeline abort should record an alert event for harness/journal analysis"
+                .unwrap()
+                .recovery
+                .consecutive_ptl_errors,
+            3
         );
     }
 
@@ -37957,6 +38213,9 @@ mod tests {
     #[test]
     fn explain_preparation_budget_uses_each_attempts_effective_output_cap() {
         let final_status = crate::turn::wire_assembly::WireBudgetStatus {
+            opaque_estimated_tokens: 0,
+            opaque_reasoning_bytes: 0,
+            transport_metadata_bytes: 0,
             estimated_input_tokens: 1_200,
             estimated_system_tokens: 480,
             tool_schema_tokens: 120,
@@ -39057,7 +39316,7 @@ mod tests {
             HISTORY_SUMMARY_FIELD, history_summary_text,
         };
 
-        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "boundary_only");
         for append_only in [false, true] {
             let mut host = test_host_builder("summary-owner", "summary-session")
                 .with_admitted_model_execution(Some(test_gateway_execution(
@@ -39127,7 +39386,13 @@ mod tests {
                     ));
                 assert!(event.tokens_freed > 0);
                 assert_eq!(event.tokens_before - event.tokens_after, event.tokens_freed);
-                assert_eq!(&state.messages[1..], suffix.as_slice());
+                assert!(state.messages.ends_with(&suffix));
+                assert!(
+                    state
+                        .messages
+                        .iter()
+                        .any(|message| message["content"] == CONTINUITY_FACT)
+                );
                 assert_eq!(state.messages.last(), Some(&authority));
                 assert!(
                     history_summary_text(&state.messages[0])
@@ -39284,18 +39549,24 @@ mod tests {
             ]
         };
         state.messages.extend(pair("sent".into()));
-        state.last_request_message_count = Some(state.messages.len());
-        for index in 0..8 {
+        for index in 0..30 {
             state.messages.extend(pair(format!("new-{index}")));
         }
+        state.last_request_message_count = Some(state.messages.len());
+        for index in 30..38 {
+            state.messages.extend(pair(format!("new-{index}")));
+        }
+        state.initialize_canonical_rewrite_proof(
+            &state.messages.clone(),
+            &astra_turn_types::canonical_conversation_root(&state.messages),
+            0,
+        );
         let old_prefix = state.last_request_message_count.unwrap();
         let spill = pre_turn_summary_spill_count(&state.messages);
         assert!(spill > 0 && spill < old_prefix);
         apply_pre_turn_summary(&mut state, 0.9, "summary".into(), spill).unwrap();
-        assert_eq!(
-            state.last_request_message_count,
-            Some(old_prefix - spill + 1)
-        );
+        let new_prefix = state.last_request_message_count.unwrap();
+        assert!(new_prefix < old_prefix);
 
         let stats = astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence_protected_prefix(
             &mut state.messages, 0.0, state.compact_strategy, None, state.last_request_message_count,
@@ -39304,7 +39575,7 @@ mod tests {
         let sent = state
             .messages
             .iter()
-            .find(|message| message["tool_call_id"] == "sent")
+            .find(|message| message["tool_call_id"] == "new-29")
             .unwrap();
         assert!(!astra_turn_core::microcompact::is_cleared_content(
             sent["content"].as_str().unwrap()
@@ -39312,7 +39583,7 @@ mod tests {
         let first_new = state
             .messages
             .iter()
-            .find(|message| message["tool_call_id"] == "new-0")
+            .find(|message| message["tool_call_id"] == "new-30")
             .unwrap();
         assert!(astra_turn_core::microcompact::is_cleared_content(
             first_new["content"].as_str().unwrap()
@@ -39320,7 +39591,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_turn_summary_does_not_rewrite_an_entirely_protected_active_turn() {
+    fn pre_turn_summary_preserves_the_active_user_and_control() {
         let mut state = create_test_state();
         state.max_turn_input_tokens = 20_000;
         state.messages = vec![json!({"role": "user", "content": "long active work"})];
@@ -39330,23 +39601,30 @@ mod tests {
                 "content": format!("evidence {index}: {}", "detail ".repeat(40)),
             }));
         }
-        let mut authority = json!({"role": "user", "content": "continue active Work"});
-        astra_turn_types::mark_append_only_required_context(
-            &mut authority,
-            "active_work_attempt_start",
+        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "continue active Work",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
             astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-        );
+        )
+        .unwrap()
+        .unwrap();
         state.messages.push(authority);
-        let before = state.messages.clone();
+        let active_control = state.messages.last().unwrap().clone();
+        state.initialize_canonical_rewrite_proof(
+            &state.messages.clone(),
+            &astra_turn_types::canonical_conversation_root(&state.messages),
+            0,
+        );
 
         let spill_count = pre_turn_summary_spill_count(&state.messages);
-        assert_eq!(spill_count, 0);
-        assert!(
-            apply_pre_turn_summary(&mut state, 0.95, "summary".to_string(), spill_count).is_none()
+        let event = apply_pre_turn_summary(&mut state, 0.95, "summary".to_string(), spill_count)
+            .expect("completed work within a long user turn can be summarized");
+        assert!(event.messages_removed > 0);
+        assert_eq!(
+            state.messages.first().unwrap()["content"],
+            "long active work"
         );
-        assert_eq!(state.messages, before);
-        assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
-        assert!(!state.context_compression_triggered);
+        assert_eq!(state.messages.last(), Some(&active_control));
     }
 
     #[test]
@@ -39365,6 +39643,11 @@ mod tests {
             }));
         }
         let before = state.messages.clone();
+        state.initialize_canonical_rewrite_proof(
+            &before,
+            &astra_turn_types::canonical_conversation_root(&before),
+            0,
+        );
         let spill_count = pre_turn_summary_spill_count(&state.messages);
         assert!(spill_count > 0);
 
@@ -46616,7 +46899,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn responses_reasoning_only_work_retry_is_dispatched_and_restorable_after_failure() {
+    async fn responses_reasoning_work_retry_keeps_opaque_state_without_false_compaction() {
         use astra_services::models::{
             PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
             PromptCacheVolatileDeliveryData, PromptCacheVolatilePlacementData,
@@ -46753,8 +47036,8 @@ mod tests {
             trace
                 .pointer("/wire/retry_history_compactions")
                 .and_then(Value::as_array)
-                .is_some_and(|boundaries| !boundaries.is_empty()),
-            "the actual retry must exercise pressure compaction"
+                .is_none_or(|boundaries| boundaries.is_empty()),
+            "opaque encoding alone must not force history compaction"
         );
         assert!(
             requests[1].body["input"]
@@ -52602,32 +52885,6 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn single_task_pre_turn_compaction_rejects_before_model_resolution() {
-        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
-        let mut host = test_host_builder("user-no-prefix", "session-no-prefix").build();
-        let mut state = create_test_state();
-        state.messages = vec![json!({"role":"user","content":"Continue the long task"})];
-        for i in 0..16 {
-            state
-                .messages
-                .push(json!({"role":"assistant","content":format!("Observation {i}")}));
-        }
-        let original = state.messages.clone();
-        let event = <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
-            &mut host, &mut state, 0.95,
-        ).await;
-        assert!(event.is_none());
-        assert_eq!(state.messages, original);
-        assert!(host.resolved_llm_config.is_none());
-        assert_eq!(
-            state.compaction_effectiveness.consecutive_futile_attempts,
-            1
-        );
-        assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn maybe_pre_turn_compact_requires_a_durable_inference_ledger() {
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
@@ -52656,6 +52913,11 @@ mod tests {
                 .messages
                 .push(json!({"role": "assistant", "content": format!("answer {i}")}));
         }
+        state.initialize_canonical_rewrite_proof(
+            &state.messages.clone(),
+            &astra_turn_types::canonical_conversation_root(&state.messages),
+            0,
+        );
 
         let event = <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
             &mut host,
@@ -52678,12 +52940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn maybe_pre_turn_compact_skips_gateway_when_provider_admission_is_enabled() {
-        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "capacity_aware");
-        let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
-        let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
-
+    async fn maybe_pre_turn_compact_preserves_history_without_rewrite_authority() {
         let provider = ProviderGateway::start(vec![ProviderScript::new(
             "pre-turn inference must not dispatch",
             |request| request.path == "/v1/chat/completions",
@@ -52691,34 +52948,38 @@ mod tests {
         )])
         .await;
 
-        let mut host = test_host_builder("user-inline", "session-inline").build();
-        host.resolved_llm_config = Some(summary_test_config(format!("{}/v1", provider.base_url)));
-
-        let mut state = create_test_state();
-        state.max_turn_input_tokens = 100;
-        state.message = "Fix the regression".to_string();
-        state.user_intent = state.message.clone();
-        for i in 0..6 {
-            state
-                .messages
-                .push(json!({"role": "user", "content": format!("question {i}")}));
-            state
-                .messages
-                .push(json!({"role": "assistant", "content": format!("answer {i}")}));
+        for stale in [false, true] {
+            let mut host = test_host_builder("user-inline", "session-inline").build();
+            host.resolved_llm_config =
+                Some(summary_test_config(format!("{}/v1", provider.base_url)));
+            let mut state = create_test_state();
+            state.max_turn_input_tokens = 100;
+            for i in 0..6 {
+                state
+                    .messages
+                    .push(json!({"role": "user", "content": format!("question {i}")}));
+                state
+                    .messages
+                    .push(json!({"role": "assistant", "content": format!("answer {i}")}));
+            }
+            if stale {
+                state.initialize_canonical_rewrite_proof(
+                    &state.messages.clone(),
+                    &astra_turn_types::canonical_conversation_root(&state.messages),
+                    0,
+                );
+                state.messages[0]["content"] = json!("changed after admission");
+            }
+            let original = state.messages.clone();
+            let event = <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
+                &mut host, &mut state, 0.95,
+            ).await;
+            assert!(event.is_none());
+            assert_eq!(state.messages, original);
         }
-
-        let event = <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
-            &mut host,
-            &mut state,
-            0.95,
-        )
-        .await;
-        assert!(event.is_none());
-
-        assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
         assert!(
             provider.requests.lock().await.is_empty(),
-            "capacity-aware default must not spend provider RPM on pre-turn LLM compaction"
+            "a missing or stale rewrite authority must not dispatch a summary"
         );
 
         provider.assert_complete();

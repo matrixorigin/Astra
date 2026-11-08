@@ -9,11 +9,21 @@ import subprocess
 import sys
 import tempfile
 from unittest.mock import patch
+from types import SimpleNamespace
 
-from client_compatibility import Failure, identify_current, paired_tool_result, result_json, run, safe_error_summary
+from client_compatibility import Failure, bootstrap, edge_transport_started, identify_current, paired_tool_result, result_json, run, safe_error_summary, standalone_shell_schema, successful_edge_tool_event
 
 
 class CompatibilityDiagnosticsTests(unittest.TestCase):
+    def test_bootstrap_registers_isolated_admin_with_existing_admin_authority(self):
+        provider = SimpleNamespace(server=SimpleNamespace(server_port=12345), expected_model=None)
+        with patch("client_compatibility.request", side_effect=[{"access_token":"new-token"}, {}]) as request:
+            token, model, _, _ = bootstrap("http://127.0.0.1:1", provider, "existing-token")
+        self.assertEqual(token, "new-token")
+        self.assertEqual(provider.expected_model, model)
+        self.assertEqual(request.call_args_list[0].kwargs["token"], "existing-token")
+        self.assertEqual(request.call_args_list[1].args[2], "new-token")
+
     def test_wrong_server_is_rejected_before_bootstrap(self):
         args = Namespace(api_url="http://127.0.0.1:17001")
         with patch("client_compatibility.request", return_value={"build_git_sha": "wrong"}), \
@@ -82,6 +92,37 @@ class CompatibilityDiagnosticsTests(unittest.TestCase):
 
 
 class CompatibilityToolHistoryTests(unittest.TestCase):
+    def test_edge_shell_schema_oracle_requires_actual_ownerless_contract(self):
+        def schema(properties):
+            return {"function": {"name": "bash", "parameters": {"properties": properties}}}
+        valid = schema({"command": {"type": "string"}})
+        self.assertIsNone(standalone_shell_schema([]))
+        self.assertFalse(standalone_shell_schema(None))
+        self.assertFalse(standalone_shell_schema([{"function": None}]))
+        self.assertTrue(standalone_shell_schema([valid]))
+        self.assertFalse(standalone_shell_schema([schema({})]))
+        self.assertFalse(standalone_shell_schema([schema({"command": {}, "stdin": {}})]))
+        self.assertFalse(standalone_shell_schema([schema({"command": {}, "yield_time_ms": {}})]))
+        self.assertFalse(standalone_shell_schema([valid, valid]))
+
+    def test_edge_tool_success_requires_its_own_typed_terminal_receipt(self):
+        good = {"type":"tool_call_end", "call_id":"call", "tool":"bash", "status":"completed",
+                "success":True, "executed":True, "result":"marker"}
+        self.assertTrue(successful_edge_tool_event([good], "bash", "marker"))
+        self.assertTrue(successful_edge_tool_event([{k:v for k,v in good.items() if k not in ("status", "executed")}], "bash", "marker"))
+        for change in ({"status":"failed", "success":False}, {"executed":False},
+                       {"executed":None}, {"tool":"read_file"}, {"result":"different"}):
+            self.assertFalse(successful_edge_tool_event([{**good, **change}], "bash", "marker"))
+        self.assertFalse(successful_edge_tool_event([good, good], "bash", "marker"))
+
+    def test_edge_route_requires_the_selected_edge_ws_executor(self):
+        event = {"type":"tool_transport_started", "tool":"bash", "transport":"edge_ws",
+                 "executor":{"kind":"edge_agent", "executor_id":"selected"}}
+        self.assertTrue(edge_transport_started([event], "bash", "selected"))
+        for change in ({"transport":"server_local"}, {"executor":{"kind":"server_local"}},
+                       {"executor":{"kind":"edge_agent", "executor_id":"other"}}):
+            self.assertFalse(edge_transport_started([{**event, **change}], "bash", "selected"))
+
     def test_runtime_user_suffix_does_not_hide_the_current_tool_result(self):
         call_id = "compat-operation-current-case"
         declaration = {"role": "assistant", "tool_calls": [

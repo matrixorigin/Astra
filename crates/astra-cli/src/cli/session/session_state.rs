@@ -535,7 +535,7 @@ pub(crate) struct SessionState {
     pub pending_bg_notifications: Vec<String>,
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
-    pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    pub(crate) background_tasks: crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     /// Shared background task list cache.
     /// The TUI event loop writes the rendered task-list XML here every tick
     /// (not just on-demand) so [`ToolExecutor::task_list_bg`] can read the
@@ -547,7 +547,7 @@ pub(crate) struct SessionState {
     /// into the executor's ToolContext so each bash invocation can
     /// observe the signal. Headless paths still see it but never
     /// fire the signal so behaviour is unchanged.
-    pub bash_detach_slot: astra_tools::detach::DetachShellSlot,
+    pub foreground_wait_control: astra_tools::detach::ForegroundWaitControl,
 
     // ── Harness (observation + verification layer) ──
     #[cfg(feature = "harness")]
@@ -671,9 +671,14 @@ impl Default for SessionState {
             native_delivery_shutdown: None,
             tui_plan_review_request_tx: None,
             pending_bg_notifications: Vec::new(),
-            bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            background_tasks: crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                std::env::temp_dir()
+                    .join("astra")
+                    .join("bg_tasks")
+                    .join(uuid::Uuid::new_v4().to_string()),
+            ),
             bg_task_list_cache: std::sync::Arc::new(tokio::sync::RwLock::new(String::new())),
-            bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            foreground_wait_control: astra_tools::detach::ForegroundWaitControl::default(),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
         }

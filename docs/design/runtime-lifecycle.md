@@ -779,6 +779,10 @@ Required invariants:
 Plan mode is a policy overlay. Plan persistence owns authoring state and active
 session bindings. Execution attempts, cancellation and custody remain in Work
 and Run; there is no separate plan-step attempt audit.
+An active plan remains owned by its current session. Another session must
+wait for that session to finish or release it; deleting an active plan is
+likewise rejected. A failed binding acknowledgement leaves the write guard
+unavailable until the current binding can be checked.
 
 Allowed by default:
 
@@ -799,9 +803,11 @@ A denial must explain policy and continuation options. It must not pretend the t
 
 Server root executors share the host’s plan authoring and resume-context handles
 through the same construction path for Run and SSE entrypoints. Entering plan
-mode refreshes the next provider request and the host permission gate. Trusted
-approval clears the complete plan hint, including its multiline guidance, while
-other turn-start facts remain fixed. Model tool arguments cannot approve a plan.
+mode refreshes the next provider request and the host permission gate. Finishing
+authoring clears the complete plan hint, including its multiline guidance, while
+other turn-start facts remain fixed. Explicitly requested or policy-required
+review needs a trusted decision; Auto or Bypass can otherwise continue under the
+existing authorization. Model tool arguments cannot approve a plan.
 
 A live Server control watcher owns cross-pod pause/cancel polling and updates
 shared execution flags. Model boundaries consume those observations without

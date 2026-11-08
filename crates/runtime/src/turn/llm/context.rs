@@ -1384,9 +1384,6 @@ fn classify_pipeline_abort(
 ) -> astra_core::ClassifiedError {
     let message = abort.to_string();
     let kind = match abort {
-        astra_turn_core::context_pipeline::PipelineAbort::ConsecutivePtlExhausted { .. } => {
-            astra_core::ErrorKind::ContextWindow
-        }
         astra_turn_core::context_pipeline::PipelineAbort::InvalidModelLimit { .. } => {
             astra_core::ErrorKind::InvalidRequest
         }

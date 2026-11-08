@@ -34,9 +34,9 @@ pub use policy::{
     is_sensitive_system_dir, sensitive_path_rules,
 };
 pub use process_isolation::{
-    BashInvocationOwner, CgroupGuard, FramedProcess, FramedProcessEnd, FramedProcessInput,
-    FramedProcessLimits, FramedProcessOutcome, InvocationSupervisor, IsolatedOutput,
-    IsolationConfig, ScopeOwnership, ScopeSettlement, apply_cgroup, apply_process_scope,
+    BashInvocationOwner, CgroupGuard, InvocationSupervisor, IsolatedOutput, IsolationConfig,
+    OwnedProcess, ProcessEnd, ProcessInput, ProcessInputError, ProcessIoLimits, ProcessOutcome,
+    ProcessOutput, ScopeOwnership, ScopeSettlement, apply_cgroup, apply_process_scope,
     execute_isolated, execute_isolated_with_cancel, invocation_supervisor_is_requested,
     process_scope_available, run_invocation_supervisor_if_requested,
 };

@@ -658,9 +658,9 @@ async fn run_turn(
         unified_skill_registry,
         agent_spawner: None,
         root_agent_id: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         stream_event_tx: Some(stream_tx),
         stream_json_emitter: None,
         #[cfg(feature = "harness")]

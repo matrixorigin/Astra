@@ -145,18 +145,16 @@ fn warm_start_from_serialized_snapshot() {
 }
 
 #[test]
-fn ptl_error_recovery_and_abort() {
+fn ptl_error_history_allows_a_fresh_request() {
     let config = PipelineConfig::default();
     let mut sess = PipelineSession::new(config);
 
     sess.record_ptl_error();
-    assert!(!sess.should_abort());
 
     sess.record_ptl_error();
-    assert!(!sess.should_abort());
 
     sess.record_ptl_error();
-    assert!(sess.should_abort());
+    assert_eq!(sess.recovery.consecutive_ptl_errors, 3);
 
     let statics = StaticSections::test_default();
     let agent = AgentContext::default();
@@ -180,7 +178,10 @@ fn ptl_error_recovery_and_abort() {
     };
 
     let result = sess.run_turn(input);
-    assert!(result.is_err(), "aborted session should refuse run_turn");
+    assert!(
+        result.is_ok(),
+        "the request loop bounds retries; planning remains available"
+    );
 }
 
 #[test]

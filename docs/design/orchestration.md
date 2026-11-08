@@ -69,6 +69,9 @@ Children use the existing same-session run tree and execution owner. Built-in
 profiles may narrow tools, skills, read-only access and budgets; they cannot
 grant capabilities the parent or provider lacks. Explicit model requirements
 remain authoritative; omitted child model selection inherits the parent binding.
+When a child cannot access needed evidence, its parent can provide concise,
+attributed observations. These remain supplied facts, not child verification or
+additional execution authority.
 
 Skills do not introduce reviewer, execution-model or reasoning requirements.
 Independent review follows the user's or configured workflow's requirements;

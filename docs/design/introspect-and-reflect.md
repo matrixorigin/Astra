@@ -342,6 +342,7 @@ budgeted-away facts remain unknown. Absence of a `get_result` call does not prov
 that no result was delivered. This projection adds no database queries or
 lifecycle authority. Reflect and Introspect share support-aware evidence
 selection, keeping selected observations and their evidence together.
+Aggregate terminal-event counts do not establish that delegated tasks succeeded.
 Omitted material is reported through the result budget;
 retained observations and actions must not contain dangling evidence references.
 Explicit `diagnostic` and `forensic` requests retain deeper evidence and graph

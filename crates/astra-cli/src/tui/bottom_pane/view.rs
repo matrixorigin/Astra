@@ -207,6 +207,19 @@ pub(crate) enum BottomPaneViewAction {
     StopBackgroundTask {
         task_id: String,
     },
+    BeginShellInput {
+        task_id: String,
+    },
+    /// An explicit local-only view; refreshes retain the original attachment.
+    ViewShellOutput {
+        task_id: String,
+        attachment_epoch: Option<u64>,
+    },
+    SubmitShellInput {
+        task_id: String,
+        attachment_epoch: u64,
+        input: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

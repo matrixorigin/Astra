@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 pub mod purpose;
 pub mod responses;
 pub mod thinking;
+pub mod token_estimate;
 
 /// Append an API path without placing it after the base URL's query.
 pub fn endpoint_url(base_url: &str, endpoint: &str) -> String {

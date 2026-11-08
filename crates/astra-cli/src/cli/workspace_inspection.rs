@@ -445,9 +445,9 @@ pub(crate) async fn handle_review_command(
 
         git_worktree_journal: None,
         session_state_journal: None,
-        bg_task_commands: None,
+        background_tasks: None,
         bg_task_list_cache: None,
-        bash_detach_slot: None,
+        foreground_wait_control: None,
         turn_index: DEFAULT_TURN_INDEX,
         pipeline_state: None,
         compaction_state: None,
