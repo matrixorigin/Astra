@@ -1195,6 +1195,7 @@ async fn handle_edge_connection(
                     drop(rows);
                     settle_unsent_dispatches(
                         dispatch_svc.as_ref(),
+                        &state.multi_agent_metrics,
                         &limits.receipts,
                         &limits.settlement,
                         connection_permit,
@@ -1940,6 +1941,56 @@ async fn close_unavailable_edge(sink: &SharedEdgeSocketWriter, reason: &'static 
 mod inflight_dispatch_tracker_tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn unsent_settlement_reports_saturation_and_retry_exhaustion() {
+        let metrics = astra_services::multi_agent::shared_metrics();
+        let dispatch = astra_services::multi_agent::UnconfiguredEdgeDispatchService;
+        let receipts = [
+            (
+                astra_services::multi_agent::EdgeDispatchIdentity::new("u", "s", "r", "t", "1"),
+                "receipt".to_string(),
+            ),
+            (
+                astra_services::multi_agent::EdgeDispatchIdentity::new("u", "s", "r", "t", "2"),
+                "receipt".to_string(),
+            ),
+        ];
+        let limit = tokio::sync::Semaphore::new(1);
+        settle_unsent_dispatches(
+            &dispatch,
+            &metrics,
+            &tokio::sync::Semaphore::new(0),
+            &limit,
+            Arc::new(try_acquire_edge_ws_connection().unwrap()),
+            "edge",
+            &receipts,
+        )
+        .await;
+        assert_eq!(
+            metrics
+                .dispatch_settlement_unknown_total
+                .load(Ordering::Relaxed),
+            2
+        );
+
+        settle_unsent_dispatches(
+            &dispatch,
+            &metrics,
+            &tokio::sync::Semaphore::new(1),
+            &limit,
+            Arc::new(try_acquire_edge_ws_connection().unwrap()),
+            "edge",
+            &receipts,
+        )
+        .await;
+        assert_eq!(
+            metrics
+                .dispatch_settlement_unknown_total
+                .load(Ordering::Relaxed),
+            4
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_waits_for_bounded_ownership_before_releasing_connection_slot() {
         let owners = Arc::new(tokio::sync::Semaphore::new(1));
@@ -2141,6 +2192,7 @@ fn append_unsent_receipts(
 
 async fn settle_unsent_dispatches(
     dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
+    metrics: &astra_services::multi_agent::SharedMultiAgentMetrics,
     owners: &tokio::sync::Semaphore,
     limit: &tokio::sync::Semaphore,
     connection_permit: Arc<EdgeWsConnectionPermit>,
@@ -2151,6 +2203,9 @@ async fn settle_unsent_dispatches(
         return;
     };
     let Ok(_owner) = owners.try_acquire() else {
+        metrics
+            .dispatch_settlement_unknown_total
+            .fetch_add(receipts.len() as u64, Ordering::Relaxed);
         tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
             "edge dispatch settlement is saturated; claimed outcome remains unknown");
         return;
@@ -2187,6 +2242,9 @@ async fn settle_unsent_dispatches(
         tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
         delay = delay.saturating_mul(2).min(Duration::from_secs(2));
     }
+    metrics
+        .dispatch_settlement_unknown_total
+        .fetch_add(receipts.len() as u64, Ordering::Relaxed);
     tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
         "edge dispatch settlement exhausted retries; claimed outcome remains unknown");
 }

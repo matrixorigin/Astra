@@ -361,6 +361,7 @@ impl DatabaseEdgeDispatchService {
     }
 
     pub fn with_metrics(mut self, metrics: SharedMultiAgentMetrics) -> Self {
+        let _ = self.wait_coordinator.metrics.set(metrics.clone());
         self.metrics = Some(metrics);
         self
     }
@@ -707,6 +708,9 @@ struct EdgeDispatchWaitCoordinator {
     pool: sqlx::Pool<sqlx::MySql>,
     waiters: tokio::sync::Mutex<HashMap<EdgeDispatchIdentity, EdgeDispatchWaiter>>,
     running: AtomicBool,
+    /// Attached by `DatabaseEdgeDispatchService::with_metrics`; unknown-outcome
+    /// accounting is best effort when no metrics handle was attached.
+    metrics: std::sync::OnceLock<SharedMultiAgentMetrics>,
 }
 
 struct EdgeDispatchWaiter {
@@ -798,6 +802,25 @@ impl EdgeDispatchWaitCoordinator {
             pool,
             waiters: tokio::sync::Mutex::new(HashMap::new()),
             running: AtomicBool::new(false),
+            metrics: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn resolve_observation_error(
+        &self,
+        waiter: EdgeDispatchWaiter,
+        failure: &ObservationFailure,
+        error: &str,
+    ) {
+        // One identity can have multiple subscribers. Count the identity only
+        // when at least one subscriber is still present to receive the error.
+        if waiter.sender.send(Some(Err(error.to_string()))).is_ok()
+            && matches!(failure, ObservationFailure::Unknown)
+            && let Some(metrics) = self.metrics.get()
+        {
+            metrics
+                .dispatch_observation_unknown_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -928,7 +951,11 @@ impl EdgeDispatchWaitCoordinator {
                             if waiter.should_retry(&failure, now) {
                                 transient_failure = true;
                             } else if let Some(waiter) = waiters.remove(identity) {
-                                let _ = waiter.sender.send(Some(Err(error.to_string())));
+                                self.resolve_observation_error(
+                                    waiter,
+                                    &failure,
+                                    &error.to_string(),
+                                );
                             }
                         }
                     }
@@ -1352,7 +1379,6 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 "edge_dispatch direct admit: payload is invalid JSON: {error}"
             ))
         })?;
-
         let mut tx = self.pool.begin().await.map_err(|error| {
             EdgeDispatchAdmissionError::OutcomeUnknown(format!(
                 "edge_dispatch direct admit begin: {error}"
@@ -2107,6 +2133,65 @@ mod tests {
     use uuid::Uuid;
 
     static EDGE_DISPATCH_SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+    #[tokio::test]
+    async fn observation_unknown_counts_identities_with_live_waiters() {
+        let pool =
+            sqlx::MySqlPool::connect_lazy("mysql://unused@127.0.0.1:1/unused").expect("lazy pool");
+        let metrics = super::super::metrics::shared_metrics();
+        let coordinator = EdgeDispatchWaitCoordinator::new(pool);
+        assert!(coordinator.metrics.set(metrics.clone()).is_ok());
+
+        let (sender, mut first) = tokio::sync::watch::channel(None);
+        let mut second = sender.subscribe();
+        coordinator.resolve_observation_error(
+            EdgeDispatchWaiter {
+                sender,
+                unknown_since: None,
+            },
+            &ObservationFailure::Unknown,
+            "observation failed",
+        );
+        first.changed().await.unwrap();
+        second.changed().await.unwrap();
+        assert_eq!(
+            first.borrow().as_ref(),
+            Some(&Err("observation failed".into()))
+        );
+        assert_eq!(second.borrow().as_ref(), first.borrow().as_ref());
+        assert_eq!(
+            metrics
+                .dispatch_observation_unknown_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        drop(receiver);
+        coordinator.resolve_observation_error(
+            EdgeDispatchWaiter {
+                sender,
+                unknown_since: None,
+            },
+            &ObservationFailure::Unknown,
+            "no subscriber",
+        );
+        let (sender, _receiver) = tokio::sync::watch::channel(None);
+        coordinator.resolve_observation_error(
+            EdgeDispatchWaiter {
+                sender,
+                unknown_since: None,
+            },
+            &ObservationFailure::Permanent,
+            "invalid query",
+        );
+        assert_eq!(
+            metrics
+                .dispatch_observation_unknown_total
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
 
     async fn setup_edge_dispatch_db_it() -> astra_core::SharedPool {
         assert_eq!(

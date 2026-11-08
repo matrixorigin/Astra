@@ -115,6 +115,13 @@ pub struct MultiAgentMetrics {
     pub dispatch_cleanup_deleted_total: AtomicU64,
     /// Total wait_result calls that reached timeout without a terminal result.
     pub dispatch_wait_result_timeouts_total: AtomicU64,
+    /// Total claimed dispatches whose unsent settlement exited without a
+    /// confirmed terminal receipt after retries or settlement capacity was
+    /// exhausted. The durable row keeps `dispatched` with an unknown outcome.
+    pub dispatch_settlement_unknown_total: AtomicU64,
+    /// Dispatch identities reported without a durable outcome after the
+    /// database-observation unknown-error budget was exhausted.
+    pub dispatch_observation_unknown_total: AtomicU64,
     /// Total backlog refresh failures.
     pub dispatch_backlog_scrape_errors_total: AtomicU64,
     /// Time from dispatch creation to edge WS claim.
@@ -150,6 +157,8 @@ impl MultiAgentMetrics {
             dispatch_cleanup_expired_total: AtomicU64::new(0),
             dispatch_cleanup_deleted_total: AtomicU64::new(0),
             dispatch_wait_result_timeouts_total: AtomicU64::new(0),
+            dispatch_settlement_unknown_total: AtomicU64::new(0),
+            dispatch_observation_unknown_total: AtomicU64::new(0),
             dispatch_backlog_scrape_errors_total: AtomicU64::new(0),
             dispatch_claim_wait_latency: LatencyTracker::new(),
             dispatch_deliver_update_latency: LatencyTracker::new(),
@@ -212,6 +221,14 @@ impl MultiAgentMetrics {
         target.register_counter(
             "astra_edge_dispatch_wait_result_timeouts_total",
             "Total edge dispatch wait_result calls that timed out without a terminal result",
+        );
+        target.register_counter(
+            "astra_edge_dispatch_settlement_unknown_total",
+            "Total claimed edge dispatches whose unsent settlement exited without a confirmed terminal receipt",
+        );
+        target.register_counter(
+            "astra_edge_dispatch_observation_unknown_total",
+            "Total edge dispatch identities reported without a durable outcome after the unknown-error budget",
         );
         target.register_counter(
             "astra_edge_dispatch_backlog_scrape_errors_total",
@@ -309,6 +326,16 @@ impl MultiAgentMetrics {
         target.set_counter(
             "astra_edge_dispatch_wait_result_timeouts_total",
             self.dispatch_wait_result_timeouts_total
+                .load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_settlement_unknown_total",
+            self.dispatch_settlement_unknown_total
+                .load(Ordering::Relaxed),
+        );
+        target.set_counter(
+            "astra_edge_dispatch_observation_unknown_total",
+            self.dispatch_observation_unknown_total
                 .load(Ordering::Relaxed),
         );
         target.set_counter(
@@ -512,6 +539,8 @@ mod tests {
         assert!(names.contains(&"astra_edge_dispatch_deliver_misses_total"));
         assert!(names.contains(&"astra_edge_dispatch_cleanup_expired_total"));
         assert!(names.contains(&"astra_edge_dispatch_cleanup_deleted_total"));
+        assert!(names.contains(&"astra_edge_dispatch_settlement_unknown_total"));
+        assert!(names.contains(&"astra_edge_dispatch_observation_unknown_total"));
         assert!(names.contains(&"astra_edge_dispatch_backlog_scrape_errors_total"));
         assert!(names.contains(&"astra_edge_dispatch_claim_wait_us_total"));
         assert!(names.contains(&"astra_edge_dispatch_deliver_update_us_total"));
@@ -563,12 +592,24 @@ mod tests {
         let m = MultiAgentMetrics::new();
         m.registry_retry_total.store(42, Ordering::Relaxed);
         m.event_overflow_total.store(7, Ordering::Relaxed);
+        m.dispatch_settlement_unknown_total
+            .store(3, Ordering::Relaxed);
+        m.dispatch_observation_unknown_total
+            .store(2, Ordering::Relaxed);
 
         let spy = SpyTarget::new();
         m.scrape_to(&spy);
 
         // Counters must be stored as u64 (not f64 reinterpreted).
         assert_eq!(spy.counter("astra_edge_registry_retry_total"), Some(42));
+        assert_eq!(
+            spy.counter("astra_edge_dispatch_settlement_unknown_total"),
+            Some(3)
+        );
+        assert_eq!(
+            spy.counter("astra_edge_dispatch_observation_unknown_total"),
+            Some(2)
+        );
         assert_eq!(
             spy.counter("astra_multi_agent_event_overflow_total"),
             Some(7)
