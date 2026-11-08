@@ -28,6 +28,8 @@ const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const EDGE_DISPATCH_BATCH_SEND_BUDGET: Duration = Duration::from_secs(5);
+const EDGE_DISPATCH_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 type EdgeRegistryReleaseReconciliation = Pin<Box<dyn Future<Output = bool> + Send>>;
 
@@ -397,6 +399,38 @@ async fn handle_edge_connection(
         }
     };
 
+    // Subscribe before publishing this connection. A wake is only a hint: the
+    // durable observer also finds work committed before this subscription.
+    let dispatch_wakeup = match state
+        .execution
+        .edge_dispatch_service
+        .subscribe_pending_wakeup(&user_id, &edge_agent_id)
+        .await
+    {
+        Ok(wakeup) => wakeup,
+        Err(error) => {
+            tracing::error!(
+                user_id = %user_id,
+                edge_agent_id = %edge_agent_id,
+                %error,
+                "edge dispatch subscription failed"
+            );
+            close_unavailable_edge(&ws_sink, "edge dispatch notifications unavailable").await;
+            return;
+        }
+    };
+    if dispatch_wakeup.as_ref().is_some_and(|receiver| {
+        receiver.has_changed().is_err()
+            || state
+                .execution
+                .edge_dispatch_service
+                .pending_claim_limit()
+                .is_none()
+    }) {
+        close_unavailable_edge(&ws_sink, "edge dispatch notifications unavailable").await;
+        return;
+    }
+
     tracing::info!(
         user_id = %user_id,
         edge_agent_id = %edge_agent_id,
@@ -508,7 +542,7 @@ async fn handle_edge_connection(
             state
                 .edge_connection_pool
                 .gc_reconnect_lock(&user_id, &edge_agent_id);
-            close_unavailable_edge_registry(&ws_sink).await;
+            close_unavailable_edge(&ws_sink, "edge registry unavailable").await;
             return;
         }
     };
@@ -589,7 +623,7 @@ async fn handle_edge_connection(
                 "edge WebSocket: durable registration finalization failed"
             );
         }
-        close_unavailable_edge_registry(&ws_sink).await;
+        close_unavailable_edge(&ws_sink, "edge registry unavailable").await;
         return;
     }
 
@@ -786,42 +820,53 @@ async fn handle_edge_connection(
         .edge_connection_pool
         .gc_reconnect_lock(&user_id, &edge_agent_id);
 
-    // ── Phase 2b: Spawn cross-pod dispatch relay polling task ─────────
+    // ── Phase 2b: Spawn the event-driven durable dispatch relay ───────
     let inflight_dispatches = InflightEdgeDispatchTracker::default();
     let dispatch_user_id = user_id.clone();
     let dispatch_agent_id = edge_agent_id.clone();
     let dispatch_svc = state.execution.edge_dispatch_service.clone();
     let dispatch_sink = ws_sink.clone();
     let dispatch_inflight = inflight_dispatches.clone();
+    let relay_pool = state.edge_connection_pool.clone();
+    let relay_registry = state.execution.edge_registry_service.clone();
+    let relay_edge_id = edge_id_for_registry.clone();
     let relay_registry_id = registration_lease.current.registry_id.clone();
     let relay_materialization_id = registration_lease.current.materialization_id.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
-    let mut dispatch_wakeup = dispatch_svc
-        .subscribe_pending_wakeup(&dispatch_user_id, &dispatch_agent_id)
-        .await;
-
-    let mut dispatch_task = tokio::spawn(async move {
-        // Same-pod admission wakes immediately; one batched DB observer per
-        // pod fans out cross-pod wakeups. The 2-second per-connection poll is
-        // retained only for missed notifications and process-restart recovery.
-        let mut interval = tokio::time::interval(Duration::from_millis(2000));
-        loop {
-            let triggered = tokio::select! {
-                _ = dispatch_cancel_rx.changed() => false,
-                _ = interval.tick() => true,
-                wakeup_open = async {
-                    match dispatch_wakeup.as_mut() {
-                        Some(receiver) => receiver.changed().await.is_ok(),
-                        None => std::future::pending::<bool>().await,
+    let (relay_failed_tx, mut relay_failed_rx) = tokio::sync::oneshot::channel();
+    let mut dispatch_task = Some(tokio::spawn(async move {
+        let mut relay_failed_tx = Some(relay_failed_tx);
+        let Some(mut dispatch_wakeup) = dispatch_wakeup else {
+            // An unconfigured durable service may still support live capacity.
+            let _ = dispatch_cancel_rx.changed().await;
+            return;
+        };
+        'dispatch: loop {
+            tokio::select! {
+                _ = dispatch_cancel_rx.changed() => break,
+                wakeup = dispatch_wakeup.changed() => {
+                    if wakeup.is_err() {
+                        tracing::error!(
+                            user_id = %dispatch_user_id,
+                            edge_agent_id = %dispatch_agent_id,
+                            "edge dispatch wake subscription closed"
+                        );
+                        break;
                     }
-                } => {
-                    if !wakeup_open {
-                        dispatch_wakeup = None;
-                    }
-                    true
                 }
+            }
+            let Some(claim_limit) = dispatch_svc.pending_claim_limit() else {
+                break;
             };
-            if !triggered {
+            let claim_permit = tokio::select! {
+                biased;
+                _ = dispatch_cancel_rx.changed() => break,
+                permit = claim_limit.acquire() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
+            if dispatch_cancel_rx.has_changed().unwrap_or(true) {
                 break;
             }
             match dispatch_svc
@@ -829,8 +874,17 @@ async fn handle_edge_connection(
                 .await
             {
                 Ok(rows) if !rows.is_empty() => {
-                    let mut stop_dispatch = false;
+                    let deadline = tokio::time::Instant::now() + EDGE_DISPATCH_BATCH_SEND_BUDGET;
                     for (idx, row) in rows.iter().enumerate() {
+                        if dispatch_cancel_rx.has_changed().unwrap_or(true) {
+                            drop(dispatch_sink);
+                            release_unsent_dispatches(dispatch_svc.as_ref(), &rows[idx..]).await;
+                            break 'dispatch;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            release_unsent_dispatches(dispatch_svc.as_ref(), &rows[idx..]).await;
+                            break;
+                        }
                         let msg = match decode_relay_edge_dispatch_payload(&row.payload_json) {
                             Ok(msg) => msg,
                             Err(error) => {
@@ -867,6 +921,19 @@ async fn handle_edge_connection(
                             fail_claimed_edge_dispatch(dispatch_svc.as_ref(), row, reason).await;
                             continue;
                         }
+                        let text = match serde_json::to_string(&msg) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                tracing::warn!(%error, "unable to encode Edge dispatch");
+                                fail_claimed_edge_dispatch(
+                                    dispatch_svc.as_ref(),
+                                    row,
+                                    "edge_dispatch_payload_encode_failed",
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
                         let inflight = InflightEdgeDispatch {
                             identity: row.identity(),
                             edge_agent_id: row.edge_agent_id.clone(),
@@ -879,43 +946,89 @@ async fn handle_edge_connection(
                                 request_id = %inflight.identity.request_id,
                                 "Edge dispatch relay rejected claimed dispatch because websocket cleanup is closing"
                             );
-                            fail_inflight_edge_dispatches(
-                                dispatch_svc.as_ref(),
-                                std::slice::from_ref(&inflight),
-                                "edge_ws_disconnected",
-                            )
-                            .await;
-                            stop_dispatch = true;
-                            break;
+                            drop(dispatch_sink);
+                            release_unsent_dispatches(dispatch_svc.as_ref(), &rows[idx..]).await;
+                            break 'dispatch;
                         }
-                        if send_edge_msg(&dispatch_sink, msg).await.is_err() {
+                        let (attempted, sent) = {
+                            let writer = tokio::select! {
+                                biased;
+                                _ = dispatch_cancel_rx.changed() => None,
+                                result = tokio::time::timeout(
+                                    EDGE_DISPATCH_SEND_TIMEOUT,
+                                    dispatch_sink.lock(),
+                                ) => result.ok(),
+                            };
+                            let attempted = writer.is_some();
+                            let sent = if let Some(mut writer) = writer {
+                                use futures_util::SinkExt;
+                                tokio::select! {
+                                    biased;
+                                    _ = dispatch_cancel_rx.changed() => false,
+                                    result = tokio::time::timeout(
+                                        EDGE_DISPATCH_SEND_TIMEOUT,
+                                        writer.send(Message::Text(text.into())),
+                                    ) => matches!(result, Ok(Ok(()))),
+                                }
+                            } else {
+                                false
+                            };
+                            (attempted, sent)
+                        };
+                        if !sent {
+                            // Do not flush this sink again after an uncertain
+                            // write; the frame may still be buffered in it.
+                            drop(dispatch_sink);
+                            relay_pool.unregister_generation(
+                                &dispatch_user_id,
+                                &dispatch_agent_id,
+                                pool_generation,
+                            );
+                            if let Some(sender) = relay_failed_tx.take() {
+                                let _ = sender.send(());
+                            }
                             dispatch_inflight.remove(&row.request_id).await;
                             tracing::warn!(
                                 target: "astra_runtime::edge_ws",
                                 user_id = %row.user_id,
                                 edge_agent_id = %row.edge_agent_id,
                                 request_id = %row.request_id,
-                                remaining_claimed = rows.len().saturating_sub(idx),
-                                "Edge dispatch relay failed to write to websocket; marking claimed dispatches failed"
+                                attempted,
+                                "Edge dispatch connection is unavailable"
                             );
-                            fail_claimed_edge_dispatches(
-                                dispatch_svc.as_ref(),
-                                &rows[idx..],
-                                "edge_ws_send_failed",
-                            )
-                            .await;
-                            stop_dispatch = true;
-                            break;
+                            // The Edge may already have received and executed
+                            // an attempted request. Keep it claimed for result
+                            // replay; return only work not yet sent.
+                            let (_, unregister) = tokio::join!(
+                                release_unsent_dispatches(
+                                    dispatch_svc.as_ref(),
+                                    &rows[idx + usize::from(attempted)..],
+                                ),
+                                unregister_durable_edge_generation(
+                                    relay_registry.as_ref(),
+                                    &dispatch_user_id,
+                                    &dispatch_agent_id,
+                                    &relay_edge_id,
+                                ),
+                            );
+                            if let Err(error) = unregister {
+                                tracing::warn!(%error, "failed to unregister an unavailable Edge");
+                            }
+                            break 'dispatch;
                         }
                     }
-                    if stop_dispatch {
-                        break;
-                    }
                 }
-                _ => {} // no pending dispatches or error
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    user_id = %dispatch_user_id,
+                    edge_agent_id = %dispatch_agent_id,
+                    %error,
+                    "edge dispatch claim outcome is unavailable; pending work remains observable"
+                ),
             }
+            drop(claim_permit);
         }
-    });
+    }));
 
     // ── Phase 3: Bidirectional message loop ──────────────────────────
     let heartbeat_interval = Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS);
@@ -1257,6 +1370,31 @@ async fn handle_edge_connection(
                         break;
                     }
                 }
+                result = async {
+                    match dispatch_task.as_mut() {
+                        Some(task) => task.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    dispatch_task = None;
+                    tracing::error!(
+                        target: "astra_runtime::edge_ws",
+                        user_id = %user_id,
+                        edge_agent_id = %edge_agent_id,
+                        ?result,
+                        "edge dispatch relay stopped; closing the connection"
+                    );
+                    break;
+                }
+                _ = &mut relay_failed_rx => {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_ws",
+                        user_id = %user_id,
+                        edge_agent_id = %edge_agent_id,
+                        "edge dispatch relay is closing while its batch settles"
+                    );
+                    break;
+                }
             }
         }
     };
@@ -1268,15 +1406,18 @@ async fn handle_edge_connection(
     // publication future has dropped its transaction/connection first.
     registration_release.shutdown().await;
     forward_task.abort();
-    // Drop cancel sender so the dispatch task can break its loop cleanly.
-    drop(dispatch_cancel_tx);
     inflight_dispatches.close_to_new_dispatches().await;
-    if tokio::time::timeout(Duration::from_millis(250), &mut dispatch_task)
-        .await
-        .is_err()
+    // Cancel waiters without aborting an already submitted database claim.
+    drop(dispatch_cancel_tx);
+    if let Some(mut dispatch_task) = dispatch_task
+        && tokio::time::timeout(Duration::from_millis(250), &mut dispatch_task)
+            .await
+            .is_err()
     {
-        dispatch_task.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(2), &mut dispatch_task).await;
+        tracing::warn!("edge dispatch claim is still settling after disconnect");
+        // Dropping a Tokio JoinHandle detaches the bounded claim owner; the
+        // permit remains held until its SQL and unsent-batch cleanup finish.
+        drop(dispatch_task);
     }
     let disconnected_dispatches = inflight_dispatches.drain().await;
     if !disconnected_dispatches.is_empty() {
@@ -1516,59 +1657,21 @@ async fn send_edge_msg(
         .map_err(|_| ())
 }
 
-async fn close_unavailable_edge_registry(
+async fn close_unavailable_edge(
     sink: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
+    reason: &'static str,
 ) {
     use futures_util::SinkExt;
-    // Registration storage is unavailable, not an authoritative rejection of
-    // the credentials. Keep the connection unpublished and let the existing
-    // Edge reconnect lifecycle retry without restarting its host process.
+    // A service dependency is unavailable, not an authoritative credential
+    // rejection. Let the existing Edge reconnect lifecycle retry.
     let _ = sink
         .lock()
         .await
         .send(Message::Close(Some(CloseFrame {
             code: close_code::AGAIN,
-            reason: "edge registry unavailable".into(),
+            reason: reason.into(),
         })))
         .await;
-}
-
-async fn fail_inflight_edge_dispatches(
-    dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
-    rows: &[InflightEdgeDispatch],
-    reason: &'static str,
-) -> usize {
-    let mut failed = 0;
-    for row in rows {
-        match dispatch
-            .fail_dispatch(&row.identity, &row.edge_agent_id, reason)
-            .await
-        {
-            Ok(true) => failed += 1,
-            Ok(false) => {
-                tracing::debug!(
-                    target: "astra_runtime::edge_ws",
-                    user_id = %row.identity.user_id,
-                    edge_agent_id = %row.edge_agent_id,
-                    request_id = %row.identity.request_id,
-                    reason,
-                    "Edge dispatch was already terminal before disconnect cleanup"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::edge_ws",
-                    user_id = %row.identity.user_id,
-                    edge_agent_id = %row.edge_agent_id,
-                    request_id = %row.identity.request_id,
-                    reason,
-                    error = %error,
-                    "Edge dispatch disconnect cleanup failed"
-                );
-            }
-        }
-    }
-    failed
 }
 
 #[cfg(test)]
@@ -1641,12 +1744,12 @@ async fn fail_claimed_edge_dispatch(
     dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
     row: &astra_services::multi_agent::EdgeDispatchRow,
     reason: &'static str,
-) -> bool {
+) {
     match dispatch
         .fail_dispatch(&row.identity(), &row.edge_agent_id, reason)
         .await
     {
-        Ok(true) => true,
+        Ok(true) => {}
         Ok(false) => {
             tracing::warn!(
                 target: "astra_runtime::edge_ws",
@@ -1656,7 +1759,6 @@ async fn fail_claimed_edge_dispatch(
                 reason,
                 "Edge dispatch relay failed to mark claimed dispatch terminal because row was already gone"
             );
-            false
         }
         Err(error) => {
             tracing::warn!(
@@ -1668,23 +1770,30 @@ async fn fail_claimed_edge_dispatch(
                 error = %error,
                 "Edge dispatch relay failed to mark claimed dispatch terminal"
             );
-            false
         }
     }
 }
 
-async fn fail_claimed_edge_dispatches(
+async fn release_unsent_dispatches(
     dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
     rows: &[astra_services::multi_agent::EdgeDispatchRow],
-    reason: &'static str,
-) -> usize {
-    let mut failed = 0;
-    for row in rows {
-        if fail_claimed_edge_dispatch(dispatch, row, reason).await {
-            failed += 1;
-        }
+) {
+    let Some(first) = rows.first() else { return };
+    let identities = rows.iter().map(|row| row.identity()).collect();
+    if let Err(error) = dispatch
+        .release_unsent(&first.edge_agent_id, identities)
+        .await
+    {
+        // The update may have committed. Never retry it: another owner may
+        // already have claimed and started sending one of these rows.
+        tracing::warn!(
+            user_id = %first.user_id,
+            edge_agent_id = %first.edge_agent_id,
+            count = rows.len(),
+            %error,
+            "unable to confirm return of unsent Edge dispatches"
+        );
     }
-    failed
 }
 
 /// Validate edge self-reported capabilities against the server-side tool
@@ -1812,8 +1921,6 @@ fn validate_edge_capabilities(
 mod tests {
     use super::*;
     use astra_runtime_env::{RuntimeEnvironmentAdvertisement, ToolUnavailableReason};
-    use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService};
-    use std::sync::Mutex;
 
     struct FlakyEdgeRegistry {
         failures_before_success: usize,
@@ -1872,81 +1979,6 @@ mod tests {
             } else {
                 Ok(true)
             }
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingEdgeDispatch {
-        failed: Mutex<Vec<(String, String, String)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl EdgeDispatchService for RecordingEdgeDispatch {
-        async fn insert_dispatch(
-            &self,
-            _identity: &EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _payload_json: &str,
-        ) -> Result<(), String> {
-            Err("not used".to_string())
-        }
-
-        async fn poll_pending(
-            &self,
-            _user_id: &str,
-            _edge_agent_id: &str,
-        ) -> Result<Vec<EdgeDispatchRow>, String> {
-            Err("not used".to_string())
-        }
-
-        async fn deliver_result(
-            &self,
-            _identity: &EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            _result_json: &str,
-        ) -> Result<bool, String> {
-            Err("not used".to_string())
-        }
-
-        async fn fail_dispatch(
-            &self,
-            identity: &EdgeDispatchIdentity,
-            _edge_agent_id: &str,
-            reason: &str,
-        ) -> Result<bool, String> {
-            self.failed.lock().unwrap().push((
-                identity.user_id.clone(),
-                identity.request_id.clone(),
-                reason.to_string(),
-            ));
-            Ok(true)
-        }
-
-        async fn wait_result(
-            &self,
-            _identity: &EdgeDispatchIdentity,
-            _timeout: Option<std::time::Duration>,
-        ) -> Result<Option<String>, String> {
-            Err("not used".to_string())
-        }
-
-        async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
-            Err("not used".to_string())
-        }
-    }
-
-    fn dispatch_row(request_id: &str) -> EdgeDispatchRow {
-        EdgeDispatchRow {
-            user_id: "user-1".to_string(),
-            session_id: "session-1".to_string(),
-            run_id: "run-1".to_string(),
-            turn_chain_id: "chain-1".to_string(),
-            edge_agent_id: "edge-1".to_string(),
-            request_id: request_id.to_string(),
-            payload_json: "{}".to_string(),
-            result_json: None,
-            status: "dispatched".to_string(),
-            pending_wait_us: 0,
         }
     }
 
@@ -2314,32 +2346,6 @@ mod tests {
         let mut unknown_schema = edge_advertisement_with_tools(&["read_file"]);
         unknown_schema["schema_version"] = serde_json::json!(u32::MAX);
         assert!(validate_edge_capabilities(Some(unknown_schema), "edge-agent", "user-1").is_err());
-    }
-
-    #[tokio::test]
-    async fn fail_claimed_edge_dispatches_marks_each_row_terminal() {
-        let dispatch = RecordingEdgeDispatch::default();
-        let rows = vec![dispatch_row("req-1"), dispatch_row("req-2")];
-
-        let failed = fail_claimed_edge_dispatches(&dispatch, &rows, "edge_ws_send_failed").await;
-
-        assert_eq!(failed, 2);
-        let calls = dispatch.failed.lock().unwrap().clone();
-        assert_eq!(
-            calls,
-            vec![
-                (
-                    "user-1".to_string(),
-                    "req-1".to_string(),
-                    "edge_ws_send_failed".to_string()
-                ),
-                (
-                    "user-1".to_string(),
-                    "req-2".to_string(),
-                    "edge_ws_send_failed".to_string()
-                ),
-            ]
-        );
     }
 
     fn inflight_dispatch(request_id: &str) -> InflightEdgeDispatch {

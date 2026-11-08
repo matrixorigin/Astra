@@ -835,7 +835,7 @@ fn delivered_dispatch_result(
         }
         Err(error) => EdgeTransportAttempt::Delivered(
             plan.delivered_result_with_fields(
-                format!("Error: the executor returned an invalid result: {error}. The operation may have completed; inspect its effects before retrying."),
+                format!("Error: the recorded dispatch result could not be decoded: {error}. The operation may have completed; inspect its effects before retrying."),
                 true, transport, None,
             ).with_execution_outcome_unknown(),
         ),

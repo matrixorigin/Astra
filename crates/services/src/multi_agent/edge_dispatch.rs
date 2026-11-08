@@ -3,7 +3,7 @@
 //! When the in-memory edge ledger times out or a tool targets an agent connected
 //! to a different pod, the dispatch relay persists the request and the
 //! owning pod's process-wide wake observer notifies its edge WS handler for
-//! delivery. Per-connection polling remains only as a recovery fallback.
+//! delivery. The observer also recovers work committed before subscription.
 //! Results flow back through `deliver_result`.
 //!
 //! Split from the monolithic `multi_agent.rs`.
@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use sqlx::{MySql, Row};
 
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
@@ -192,23 +193,41 @@ pub trait EdgeDispatchService: Send + Sync {
         }
     }
 
-    /// Poll for pending dispatches targeting the given (user, agent) pairs.
-    /// Returns dispatches that are still 'pending' and not yet dispatched.
+    /// Limit concurrent claim owners. A durable relay caller must hold this
+    /// permit from before `poll_pending` until its entire claimed batch has
+    /// been sent or the unsent rows have been settled.
+    fn pending_claim_limit(&self) -> Option<&tokio::sync::Semaphore> {
+        None
+    }
+
+    /// Claim pending dispatches for a (user, agent) pair. A durable caller
+    /// must first acquire `pending_claim_limit` and retain it for the batch.
     async fn poll_pending(
         &self,
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String>;
 
-    /// Subscribe to process-local durable-admission wakeups. The database
-    /// remains the truth and callers must keep a polling fallback because a
-    /// dispatch may be admitted by another pod or while no subscriber exists.
+    /// Return only rows the claim owner has not attempted to send. A caller
+    /// must submit a batch at most once: an error may follow a committed update,
+    /// after which another owner can already have claimed the rows.
+    async fn release_unsent(
+        &self,
+        _edge_agent_id: &str,
+        _identities: Vec<EdgeDispatchIdentity>,
+    ) -> Result<(), String> {
+        Err("returning unsent edge dispatches is unavailable".to_string())
+    }
+
+    /// Subscribe to durable-admission wakeups. Database-backed implementations
+    /// must discover work admitted by other pods and before subscription.
+    /// `None` means durable dispatch is not configured for this connection.
     async fn subscribe_pending_wakeup(
         &self,
         _user_id: &str,
         _edge_agent_id: &str,
-    ) -> Option<tokio::sync::watch::Receiver<u64>> {
-        None
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+        Err("edge dispatch wake notifications are unavailable".to_string())
     }
 
     /// Deliver a tool result (from HTTP callback or WS) — updates status to 'completed'.
@@ -299,17 +318,22 @@ pub struct DatabaseEdgeDispatchService {
     metrics: Option<SharedMultiAgentMetrics>,
     wait_coordinator: Arc<EdgeDispatchWaitCoordinator>,
     wake_hub: Arc<EdgeDispatchWakeHub>,
+    claim_limit: tokio::sync::Semaphore,
 }
 
 impl DatabaseEdgeDispatchService {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
         let wait_coordinator = Arc::new(EdgeDispatchWaitCoordinator::new(pool.clone()));
         let wake_hub = Arc::new(EdgeDispatchWakeHub::new(pool.clone()));
+        // Reserve pool capacity for heartbeats and normal requests if a slow
+        // wake query causes many Edges to probe at once.
+        let claim_limit = dispatch_claim_concurrency(pool.options().get_max_connections());
         Self {
             pool,
             metrics: None,
             wait_coordinator,
             wake_hub,
+            claim_limit: tokio::sync::Semaphore::new(claim_limit as usize),
         }
     }
 
@@ -323,10 +347,60 @@ impl DatabaseEdgeDispatchService {
     }
 }
 
+fn dispatch_claim_concurrency(pool_size: u32) -> u32 {
+    (pool_size / 4).clamp(1, 16)
+}
+
+fn notify_live_subscribers(
+    subscribers: &mut HashMap<(String, String), tokio::sync::watch::Sender<u64>>,
+) {
+    subscribers.retain(|_, sender| {
+        if sender.receiver_count() == 0 {
+            false
+        } else {
+            sender.send_modify(|generation| *generation = generation.saturating_add(1));
+            true
+        }
+    });
+}
+
 struct EdgeDispatchWakeHub {
     subscribers: tokio::sync::Mutex<HashMap<(String, String), tokio::sync::watch::Sender<u64>>>,
     pool: Option<sqlx::Pool<MySql>>,
     running: AtomicBool,
+}
+
+struct WakeQueryConnection {
+    inner: sqlx::pool::PoolConnection<MySql>,
+    completed: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum WakeQueryError {
+    #[error("edge dispatch wake observer has no database pool")]
+    Unconfigured,
+    #[error("edge dispatch wake pool acquisition: {0}")]
+    Acquire(#[source] sqlx::Error),
+    #[error("edge dispatch wake query: {0}")]
+    Query(#[source] sqlx::Error),
+    #[error("edge dispatch wake result decode: {0}")]
+    Decode(#[source] sqlx::Error),
+}
+
+impl WakeQueryError {
+    fn query_outcome_unknown(&self) -> bool {
+        matches!(self, Self::Query(error) if !matches!(error, sqlx::Error::Database(_)))
+    }
+}
+
+impl Drop for WakeQueryConnection {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Dropping a SQLx query does not necessarily stop its server-side
+            // execution. Never return an unfinished observer query to the pool.
+            self.inner.close_on_drop();
+        }
+    }
 }
 
 impl Default for EdgeDispatchWakeHub {
@@ -372,9 +446,12 @@ impl EdgeDispatchWakeHub {
     async fn notify(&self, user_id: &str, edge_agent_id: &str) {
         let key = (user_id.to_owned(), edge_agent_id.to_owned());
         let mut subscribers = self.subscribers.lock().await;
-        subscribers.retain(|_, sender| sender.receiver_count() > 0);
         if let Some(sender) = subscribers.get(&key) {
-            sender.send_modify(|generation| *generation = generation.saturating_add(1));
+            if sender.receiver_count() > 0 {
+                sender.send_modify(|generation| *generation = generation.saturating_add(1));
+            } else {
+                subscribers.remove(&key);
+            }
         }
     }
 
@@ -388,58 +465,141 @@ impl EdgeDispatchWakeHub {
             return;
         }
         let observer = self.clone();
-        tokio::spawn(async move { observer.run().await });
+        tokio::spawn(async move {
+            loop {
+                match std::panic::AssertUnwindSafe(observer.clone().run())
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => tracing::warn!(
+                        %error,
+                        "edge dispatch wake observation lost; retrying after recovery"
+                    ),
+                    Err(_) => tracing::error!(
+                        "edge dispatch wake observer panicked; retrying after recovery"
+                    ),
+                }
+                // A disconnected query may still be executing on MatrixOne.
+                // Limit retries while recovery wakes continue to make progress.
+                if tokio::time::timeout(
+                    EDGE_DISPATCH_WAKE_UNKNOWN_RETRY_DELAY,
+                    observer.clone().run_recovery_only(),
+                )
+                .await
+                .is_ok()
+                {
+                    return;
+                }
+            }
+        });
     }
 
-    async fn run(self: Arc<Self>) {
+    async fn run_recovery_only(self: Arc<Self>) {
+        loop {
+            {
+                let mut subscribers = self.subscribers.lock().await;
+                notify_live_subscribers(&mut subscribers);
+                if subscribers.is_empty() {
+                    self.running.store(false, Ordering::Release);
+                    return;
+                }
+            }
+            tokio::time::sleep(EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL).await;
+        }
+    }
+
+    async fn run(self: Arc<Self>) -> Result<(), WakeQueryError> {
+        let mut retry_delay = EDGE_DISPATCH_WAKE_POLL_INTERVAL;
+        let pool_size = self
+            .pool
+            .as_ref()
+            .map_or(1, |pool| pool.options().get_max_connections());
+        if pool_size <= dispatch_claim_concurrency(pool_size) + 1 {
+            // A pool this small cannot reserve a connection for both the
+            // observer and claims. Use the existing recovery wake instead.
+            self.run_recovery_only().await;
+            return Ok(());
+        }
         loop {
             let targets = {
                 let mut subscribers = self.subscribers.lock().await;
                 subscribers.retain(|_, sender| sender.receiver_count() > 0);
+                if subscribers.is_empty() {
+                    // Keep this transition under the subscription lock: a new
+                    // subscriber will start a replacement after the lock drops.
+                    self.running.store(false, Ordering::Release);
+                    return Ok(());
+                }
                 subscribers.keys().cloned().collect::<Vec<_>>()
             };
-            if targets.is_empty() {
-                self.running.store(false, Ordering::Release);
-                let has_subscribers = !self.subscribers.lock().await.is_empty();
-                if !has_subscribers
-                    || self
-                        .running
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                {
-                    return;
-                }
-                continue;
-            }
 
+            let mut failed = false;
+            let mut recovery = tokio::time::interval_at(
+                tokio::time::Instant::now() + EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
+                EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
+            );
+            recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut stalled = false;
             for batch in targets.chunks(EDGE_DISPATCH_WAKE_BATCH_SIZE) {
-                match self.pending_targets(batch).await {
+                let query = self.pending_targets(batch);
+                tokio::pin!(query);
+                let result = loop {
+                    tokio::select! {
+                        result = &mut query => break result,
+                        _ = recovery.tick() => {
+                            if !stalled {
+                                tracing::warn!("edge dispatch wake observation is slow; using bounded recovery probes");
+                                stalled = true;
+                            }
+                            // Keep the submitted query alive. Closing a client
+                            // connection does not guarantee database cancellation.
+                            let mut subscribers = self.subscribers.lock().await;
+                            notify_live_subscribers(&mut subscribers);
+                        }
+                    }
+                };
+                match result {
                     Ok(pending) => {
                         for (user_id, edge_agent_id) in pending {
                             self.notify(&user_id, &edge_agent_id).await;
                         }
                     }
                     Err(error) => {
+                        if error.query_outcome_unknown() {
+                            return Err(error);
+                        }
+                        failed = true;
                         tracing::warn!(
                             %error,
                             batch_size = batch.len(),
-                            "edge_dispatch cross-pod wake observation failed; per-connection recovery polling remains active"
+                            "edge dispatch wake observation failed; will retry"
                         );
+                        for (user_id, edge_agent_id) in batch {
+                            self.notify(user_id, edge_agent_id).await;
+                        }
                     }
                 }
             }
-            tokio::time::sleep(EDGE_DISPATCH_WAKE_POLL_INTERVAL).await;
+            if failed {
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(EDGE_DISPATCH_WAKE_RETRY_MAX);
+            } else {
+                retry_delay = EDGE_DISPATCH_WAKE_POLL_INTERVAL;
+            }
+            tokio::time::sleep(retry_delay).await;
         }
     }
 
     async fn pending_targets(
         &self,
         targets: &[(String, String)],
-    ) -> Result<Vec<(String, String)>, String> {
-        let pool = self
-            .pool
-            .as_ref()
-            .ok_or_else(|| "edge_dispatch wake observer has no database pool".to_owned())?;
+    ) -> Result<Vec<(String, String)>, WakeQueryError> {
+        let pool = self.pool.as_ref().ok_or(WakeQueryError::Unconfigured)?;
+        if !self.has_live_targets(targets).await {
+            return Ok(Vec::new());
+        }
         let mut query = sqlx::QueryBuilder::<MySql>::new(
             "SELECT user_id, edge_agent_id FROM edge_pending_dispatch
              WHERE status = 'pending' AND (",
@@ -456,21 +616,39 @@ impl EdgeDispatchWakeHub {
                 .push(")");
         }
         query.push(") GROUP BY user_id, edge_agent_id");
-        query
+        let connection = pool.acquire().await.map_err(WakeQueryError::Acquire)?;
+        if !self.has_live_targets(targets).await {
+            return Ok(Vec::new());
+        }
+        let mut connection = WakeQueryConnection {
+            inner: connection,
+            completed: false,
+        };
+        let rows = query
             .build()
-            .fetch_all(pool)
+            .fetch_all(&mut *connection.inner)
             .await
-            .map_err(|error| format!("edge_dispatch cross-pod wake query: {error}"))?
-            .into_iter()
+            .map_err(WakeQueryError::Query)?;
+        connection.completed = true;
+        rows.into_iter()
             .map(|row| {
                 Ok((
                     row.try_get::<String, _>("user_id")
-                        .map_err(|error| format!("edge_dispatch wake user decode: {error}"))?,
+                        .map_err(WakeQueryError::Decode)?,
                     row.try_get::<String, _>("edge_agent_id")
-                        .map_err(|error| format!("edge_dispatch wake agent decode: {error}"))?,
+                        .map_err(WakeQueryError::Decode)?,
                 ))
             })
             .collect()
+    }
+
+    async fn has_live_targets(&self, targets: &[(String, String)]) -> bool {
+        let subscribers = self.subscribers.lock().await;
+        targets.iter().any(|target| {
+            subscribers
+                .get(target)
+                .is_some_and(|sender| sender.receiver_count() > 0)
+        })
     }
 }
 
@@ -478,6 +656,9 @@ const EDGE_DISPATCH_WAIT_BATCH_SIZE: usize = 128;
 const EDGE_DISPATCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EDGE_DISPATCH_WAKE_BATCH_SIZE: usize = 128;
 const EDGE_DISPATCH_WAKE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const EDGE_DISPATCH_WAKE_RETRY_MAX: Duration = Duration::from_secs(2);
+const EDGE_DISPATCH_WAKE_UNKNOWN_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 type WaitResolution = Result<Option<String>, String>;
 
@@ -832,6 +1013,10 @@ fn validate_claimed_dispatch_update_count(expected: usize, actual: u64) -> Resul
 
 #[async_trait]
 impl EdgeDispatchService for DatabaseEdgeDispatchService {
+    fn pending_claim_limit(&self) -> Option<&tokio::sync::Semaphore> {
+        Some(&self.claim_limit)
+    }
+
     #[tracing::instrument(skip(self, identity, payload_json), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, edge_agent_id = %edge_agent_id, request_id = %identity.request_id))]
     async fn insert_dispatch(
         &self,
@@ -1144,8 +1329,8 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         &self,
         user_id: &str,
         edge_agent_id: &str,
-    ) -> Option<tokio::sync::watch::Receiver<u64>> {
-        Some(self.wake_hub.subscribe(user_id, edge_agent_id).await)
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+        Ok(Some(self.wake_hub.subscribe(user_id, edge_agent_id).await))
     }
 
     async fn claim_direct_dispatch(
@@ -1330,6 +1515,52 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         }
 
         Ok(claimed_rows)
+    }
+
+    async fn release_unsent(
+        &self,
+        edge_agent_id: &str,
+        identities: Vec<EdgeDispatchIdentity>,
+    ) -> Result<(), String> {
+        let Some(first) = identities.first() else {
+            return Ok(());
+        };
+        if identities
+            .iter()
+            .any(|identity| identity.user_id != first.user_id)
+        {
+            return Err("cannot return dispatches from different users in one batch".into());
+        }
+        let mut update = sqlx::QueryBuilder::<MySql>::new(
+            "UPDATE edge_pending_dispatch SET status = 'pending', dispatched_at = NULL \
+             WHERE status = 'dispatched' AND edge_agent_id = ",
+        );
+        update.push_bind(edge_agent_id).push(" AND (");
+        for (index, identity) in identities.iter().enumerate() {
+            if index > 0 {
+                update.push(" OR ");
+            }
+            update
+                .push("(user_id = ")
+                .push_bind(&identity.user_id)
+                .push(" AND session_id = ")
+                .push_bind(&identity.session_id)
+                .push(" AND run_id = ")
+                .push_bind(&identity.run_id)
+                .push(" AND turn_chain_id = ")
+                .push_bind(&identity.turn_chain_id)
+                .push(" AND request_id = ")
+                .push_bind(&identity.request_id)
+                .push(")");
+        }
+        update.push(")");
+        update
+            .build()
+            .execute(&self.pool)
+            .await
+            .map_err(|error| format!("edge_dispatch return unsent: {error}"))?;
+        self.wake_hub.notify(&first.user_id, edge_agent_id).await;
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, identity, result_json), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, edge_agent_id = %edge_agent_id))]
@@ -1620,6 +1851,14 @@ pub struct UnconfiguredEdgeDispatchService;
 
 #[async_trait]
 impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
+    async fn subscribe_pending_wakeup(
+        &self,
+        _user_id: &str,
+        _edge_agent_id: &str,
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+        Ok(None)
+    }
+
     async fn insert_dispatch(
         &self,
         _identity: &EdgeDispatchIdentity,
@@ -1821,6 +2060,194 @@ mod tests {
         assert_eq!(*intended.borrow(), 3);
     }
 
+    #[tokio::test]
+    async fn small_pool_uses_recovery_wakes_without_opening_observer_connections() {
+        for size in [1, 2] {
+            let pool = sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(size)
+                .min_connections(0)
+                .connect_lazy("mysql://root:unused@127.0.0.1:1/unused")
+                .unwrap();
+            let hub = Arc::new(EdgeDispatchWakeHub::new(pool.clone()));
+            let mut wake = hub.subscribe("user", "edge").await;
+            tokio::time::timeout(Duration::from_secs(1), wake.changed())
+                .await
+                .expect("small pool must still wake pending dispatches")
+                .expect("wake source remains open");
+            tokio::time::timeout(Duration::from_secs(3), wake.changed())
+                .await
+                .expect("small pool must keep recovering new pending dispatches")
+                .expect("wake source remains open");
+            assert_eq!(pool.size(), 0, "observer must leave the small pool free");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_slow_observer_preserves_recovery_and_pool_capacity() {
+        let admin = setup_edge_dispatch_db_it().await;
+        let database = format!("astra_test_wake_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+            .execute(admin.get())
+            .await
+            .expect("create isolated wake test database");
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.database = database.clone();
+        settings.db_pool_max_connections = 3;
+        settings.db_pool_min_connections = 0;
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        sqlx::query(
+            "CREATE VIEW edge_pending_dispatch AS \
+             SELECT 'slow-user' AS user_id, 'slow-edge' AS edge_agent_id, \
+             IF(SLEEP(8) = 0, 'pending', 'error') AS status",
+        )
+        .execute(pool.get())
+        .await
+        .expect("create slow read-only observer fixture");
+
+        // A TCP proxy lets this test sever exactly the observer connection,
+        // including on MatrixOne versions without SQL KILL CONNECTION.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let upstream = (settings.host.clone(), settings.port);
+        let disconnect = Arc::new(tokio::sync::Notify::new());
+        let proxy_disconnect = disconnect.clone();
+        let proxy = tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let mut server = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+                let disconnect = first.then(|| proxy_disconnect.clone());
+                first = false;
+                tokio::spawn(async move {
+                    if let Some(disconnect) = disconnect {
+                        tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {},
+                            _ = disconnect.notified() => {},
+                        }
+                    } else {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    }
+                });
+            }
+        });
+        settings.host = proxy_address.ip().to_string();
+        settings.port = proxy_address.port();
+        let observed_pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(3)
+            .connect_lazy(&settings.database_url_with_password())
+            .unwrap();
+        let hub = Arc::new(EdgeDispatchWakeHub::new(observed_pool.clone()));
+        let started = tokio::time::Instant::now();
+        let mut wakes = vec![hub.subscribe("slow-user", "slow-edge").await];
+        for index in 0..512 {
+            wakes.push(hub.subscribe("other-user", &format!("edge-{index}")).await);
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let rows = sqlx::query("SHOW FULL PROCESSLIST")
+                    .fetch_all(admin.get())
+                    .await
+                    .expect("inspect the isolated observer query");
+                for row in rows {
+                    let db = row.try_get::<Option<String>, _>("db").ok().flatten();
+                    let info = row.try_get::<Option<String>, _>("info").ok().flatten();
+                    if db.as_deref() == Some(database.as_str())
+                        && info
+                            .as_deref()
+                            .is_some_and(|info| info.contains("FROM edge_pending_dispatch"))
+                    {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a real slow observer query must start");
+        tokio::time::timeout(Duration::from_secs(8), async {
+            for wake in &mut wakes {
+                wake.changed()
+                    .await
+                    .expect("wake subscription remains open");
+            }
+        })
+        .await
+        .expect("a slow batch must not block recovery for later batches");
+        assert!(
+            started.elapsed() >= EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
+            "the fixture must exercise the slow-cycle path, not an immediate error"
+        );
+        let mut late_wake = hub.subscribe("late-user", "late-edge").await;
+        tokio::time::timeout(Duration::from_secs(3), late_wake.changed())
+            .await
+            .expect("a connection joining a stalled cycle must also receive recovery")
+            .expect("late wake source remains open");
+        // The observer owns its slow query until completion, while the pool
+        // retains room for a normal request and for recovery claims.
+        let mut connection = tokio::time::timeout(Duration::from_secs(3), observed_pool.acquire())
+            .await
+            .expect("slow observer must not exhaust the pool")
+            .expect("available connection");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the ordinary request should not wait for the slow observer"
+        );
+        sqlx::query("SELECT 1")
+            .execute(&mut *connection)
+            .await
+            .expect("ordinary connection works");
+        drop(connection);
+
+        // An actual connection loss must trigger temporary recovery, then
+        // return to batched observation without restarting the Server.
+        disconnect.notify_one();
+        sqlx::query("DROP VIEW edge_pending_dispatch")
+            .execute(pool.get())
+            .await
+            .expect("remove slow observer fixture");
+        sqlx::query(
+            "CREATE VIEW edge_pending_dispatch AS \
+             SELECT 'slow-user' AS user_id, 'slow-edge' AS edge_agent_id, 'pending' AS status",
+        )
+        .execute(pool.get())
+        .await
+        .expect("replace it with a fast pending dispatch");
+        let mut slow_wake = wakes.remove(0);
+        let mut unrelated_wake = wakes.remove(0);
+        drop(wakes);
+        drop(late_wake);
+        tokio::time::sleep(EDGE_DISPATCH_WAKE_UNKNOWN_RETRY_DELAY + Duration::from_secs(2)).await;
+        slow_wake.borrow_and_update();
+        unrelated_wake.borrow_and_update();
+        tokio::time::timeout(Duration::from_secs(2), slow_wake.changed())
+            .await
+            .expect("the recovered observer must find pending work")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), unrelated_wake.changed())
+                .await
+                .is_err(),
+            "a recovered observer must stop broadcasting recovery probes"
+        );
+        drop(slow_wake);
+        drop(unrelated_wake);
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while hub.running.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("observer must finish its owned query and stop after disconnect");
+        observed_pool.close().await;
+        proxy.abort();
+        pool.get().close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+            .execute(admin.get())
+            .await
+            .expect("drop isolated wake test database");
+    }
+
     #[test]
     fn claimed_dispatch_row_decode_preserves_null_result_for_pending_rows() {
         let row = decode_claimed_dispatch_row(&FakeEdgeDispatchRow::pending_without_result())
@@ -1946,14 +2373,16 @@ mod tests {
 
     #[test]
     fn failed_dispatch_result_json_uses_tool_error_status() {
+        let identity =
+            EdgeDispatchIdentity::new("user-1", "session-1", "run-1", "turn-chain-1", "request-1");
         let result = edge_dispatch_failed_result_json(
-            serde_json::json!("request-1"),
+            identity.request_id_json_value(),
             "edge dispatch expired".to_string(),
         );
         let value: serde_json::Value =
             serde_json::from_str(&result).expect("failed result should be JSON");
 
-        assert_eq!(value["request_id"], "request-1");
+        assert_eq!(value["request_id"], identity.request_id_json_value());
         assert_eq!(value["status"], "error");
         assert_eq!(value["output"], "edge dispatch expired");
         assert_eq!(value["duration_ms"], 0);
@@ -2101,6 +2530,7 @@ mod tests {
         let mut cross_pod_wakeup = pod_b
             .subscribe_pending_wakeup(&user_id, &edge_agent_id)
             .await
+            .expect("database edge service starts wake subscription")
             .expect("database edge service exposes wake subscription");
 
         let payload = json!({
@@ -2169,6 +2599,88 @@ mod tests {
                 .expect("already claimed poll")
                 .is_empty(),
             "claimed dispatch must not be re-claimed by another pod"
+        );
+
+        let unsent = identity.for_request_id(format!("unsent-{request_id}"));
+        let cancelled = identity.for_request_id(format!("cancelled-{request_id}"));
+        let cancelled_after = identity.for_request_id(format!("cancelled-after-{request_id}"));
+        let other_edge = identity.for_request_id(format!("other-edge-{request_id}"));
+        for (row, edge) in [
+            (&unsent, &edge_agent_id),
+            (&cancelled, &edge_agent_id),
+            (&cancelled_after, &edge_agent_id),
+            (&other_edge, &other_edge_agent_id),
+        ] {
+            pod_a.insert_dispatch(row, edge, &payload).await.unwrap();
+        }
+        assert_eq!(
+            pod_b
+                .poll_pending(&user_id, &edge_agent_id)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            pod_b
+                .poll_pending(&user_id, &other_edge_agent_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            pod_c
+                .fail_dispatch(&cancelled, &edge_agent_id, "cancelled")
+                .await
+                .unwrap()
+        );
+        pod_b
+            .release_unsent(
+                &edge_agent_id,
+                vec![
+                    unsent.clone(),
+                    cancelled.clone(),
+                    cancelled_after.clone(),
+                    other_edge.clone(),
+                ],
+            )
+            .await
+            .expect("return the untouched part of a claim in one update");
+        // A different Server must discover the persisted pending row without
+        // relying on the returning owner's in-process notification.
+        let recovering = DatabaseEdgeDispatchService::from_shared(&pool);
+        let mut recovered_wakeup = recovering
+            .subscribe_pending_wakeup(&user_id, &edge_agent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), recovered_wakeup.changed())
+            .await
+            .expect("another observer must discover the returned row")
+            .unwrap();
+        assert!(
+            pod_c
+                .fail_dispatch(&cancelled_after, &edge_agent_id, "cancelled")
+                .await
+                .unwrap()
+        );
+        let reclaimed = pod_c.poll_pending(&user_id, &edge_agent_id).await.unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].request_id, unsent.request_id);
+        assert!(
+            pod_c
+                .poll_pending(&user_id, &other_edge_agent_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "returning unsent work must not reset a different Edge's claim"
+        );
+        assert!(
+            pod_c
+                .is_server_cancelled_dispatch(&cancelled, &edge_agent_id)
+                .await
+                .unwrap()
         );
 
         let wait_identity = identity.clone();
@@ -2287,5 +2799,9 @@ mod tests {
 
         cleanup_edge_dispatch_fixture(&pool, &identity).await;
         cleanup_edge_dispatch_fixture(&pool, &other_identity).await;
+        cleanup_edge_dispatch_fixture(&pool, &unsent).await;
+        cleanup_edge_dispatch_fixture(&pool, &cancelled).await;
+        cleanup_edge_dispatch_fixture(&pool, &cancelled_after).await;
+        cleanup_edge_dispatch_fixture(&pool, &other_edge).await;
     }
 }

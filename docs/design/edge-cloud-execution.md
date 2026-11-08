@@ -166,6 +166,27 @@ These rules apply to native User Runners and externally provisioned workspace
 runtimes. Provider-specific token formats belong to authentication
 configuration, not this execution contract.
 
+Durable dispatch subscribes before a connection is published. The existing
+per-Server database observer discovers work admitted on another Server or
+before subscription; a wake only prompts the socket to claim durable work.
+There is no per-socket periodic dispatch query during normal observation.
+A stalled observation cycle wakes connections for bounded-concurrency
+individual probes; failed batches also trigger their own recovery probes.
+Each claimed batch has a shared send budget so a slow Edge yields to other
+connections. Requests not yet sent return to `pending` in one conditional
+update; a request whose send was attempted remains `dispatched` for result
+replay. The owner never retries an unconfirmed return, since another Server
+may already have claimed the same request.
+Queries remain owned until they finish because disconnecting the database
+client does not guarantee server-side cancellation. On a panic or unknown query
+outcome, the observer rate-limits retries while sending recovery wakes, then
+automatically resumes batched observation. Ordinary database errors are
+retried. A lost notification subscription closes the Edge connection so it can
+reconnect. Pools of one or two connections use recovery probes to preserve
+capacity for normal requests. The shared observer and registry heartbeat still
+access the database; this is not a claim of zero idle SQL or bounded historical
+scans.
+
 ## Durable sync dependency
 
 ### Sealed live capacity transport
