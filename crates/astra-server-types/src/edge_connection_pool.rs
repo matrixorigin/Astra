@@ -831,6 +831,26 @@ impl EdgeConnectionPool {
         drop(reservation);
     }
 
+    /// Stop selecting this generation while preserving its in-flight result
+    /// callbacks until the connection owner finishes processing them. Returns
+    /// false when a newer socket already replaced it.
+    pub fn quiesce_generation(&self, user_id: &str, edge_agent_id: &str, generation: u64) -> bool {
+        let key = pool_key(user_id, edge_agent_id);
+        let Some(mut connection) = self.connections.get_mut(&key) else {
+            return false;
+        };
+        if connection.generation != generation {
+            return false;
+        }
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        connection.sender = sender;
+        drop(connection);
+        self.capacity_rpc
+            .disconnect(user_id, edge_agent_id, generation);
+        true
+    }
+
     /// Remove only the connection incarnation registered by the caller.
     /// Returns false when a newer socket already replaced it.
     pub fn unregister_generation(
@@ -1169,8 +1189,6 @@ impl EdgeConnectionPool {
                     key = %key,
                     "edge_dispatch: execute_tool_with_cancel pool entry sender already closed"
                 );
-                drop(entry);
-                self.connections.remove(&key);
                 return Err(EdgeInvocationDeliveryError::NotSent(
                     "Edge connection closed",
                 ));
@@ -1716,7 +1734,11 @@ impl EdgeConnectionPool {
 
     /// Remove stale connections (sender closed) and expired pending requests.
     pub fn cleanup_stale(&self) {
-        self.connections.retain(|_, conn| !conn.sender.is_closed());
+        self.connections.retain(|_, conn| {
+            !conn.sender.is_closed()
+                || !conn.pending_results.is_empty()
+                || !conn.pending_inputs.is_empty()
+        });
         self.reclaim_expired_requests();
     }
 

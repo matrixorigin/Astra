@@ -800,10 +800,19 @@ async fn try_edge_dispatch(
                     true,
                 ));
             }
-            result = wait_result => result.ok().flatten(),
+            result = wait_result => result,
         }
     } else {
-        wait_result.await.ok().flatten()
+        wait_result.await
+    };
+    let result_json = match result_json {
+        Ok(result) => result,
+        Err(error) => {
+            // An observation failure is not proof that the execution expired.
+            // Preserve its durable result for replay or a later observer.
+            tracing::warn!(%error, request_id = %request_id, "edge dispatch result observation failed");
+            return EdgeTransportAttempt::TransportDisconnected;
+        }
     };
     let Some(result_json) = result_json else {
         if let Err(e) = dispatch

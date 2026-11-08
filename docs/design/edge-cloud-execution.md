@@ -172,15 +172,28 @@ before subscription; a wake only prompts the socket to claim durable work.
 There is no per-socket periodic dispatch query during normal observation.
 A stalled observation query wakes connections for bounded-concurrency
 individual probes; failed batches also trigger their own recovery probes.
-Each claimed batch has a shared send budget so a slow Edge yields to other
-connections. Requests known not to have been sent are settled in one
-conditional update with explicit non-execution results, including when the
-batch budget is exhausted. An attempted send remains `dispatched` for result
-replay. An unconfirmed settlement is not retried or returned to the queue.
-The claim permit is released as soon as settlement finishes; registry cleanup
-is independent and generation-fenced.
-Queries remain owned until they finish because disconnecting the database
-client does not guarantee server-side cancellation. On a panic or unknown query
+Each send has a deadline; a slow earlier request does not reject untouched
+requests in the same claimed batch. Requests known not to have been sent are
+settled together in one conditional update with explicit non-execution results.
+An attempted send remains `dispatched` for result replay. The batch owner
+retries an unconfirmed settlement without returning it to the queue. Its
+existing permit bounds retained batches, so a prolonged database outage can
+backpressure claims. A Server crash loses the in-memory proof that a claimed
+request was never sent; the durable state alone cannot establish that fact.
+Registry cleanup has a single generation-fenced owner and runs independently
+of batch settlement. A closed connection transfers cleanup to separately
+bounded capacity before its live-connection slot is released; if that capacity
+is exhausted, admission backpressures until an owner finishes. While an Edge's
+result write is in progress, its direct result callbacks remain available;
+a stalled write can therefore delay them until their own deadlines or
+cancellation. Known transient result-observation errors retain waiters until
+their deadlines or cancellation. An unclassified database error is retried
+for up to 30 seconds per dispatch identity without a successful observation,
+then reported as an unknown outcome; a blocked query can delay this check.
+Dispatch claims, settlements, and observer queries are awaited instead of
+deliberately dropped to start another; a lost connection cannot establish
+whether the server stopped the query. Conditional settlement preserves a
+terminal winner even when an earlier outcome is unknown. On a panic or unknown query
 outcome, the observer rate-limits retries while sending recovery wakes, then
 automatically resumes batched observation. Ordinary database errors are
 retried. A lost notification subscription closes the Edge connection so it can

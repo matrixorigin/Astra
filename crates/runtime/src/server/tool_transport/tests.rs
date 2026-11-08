@@ -119,6 +119,7 @@ struct StaticEdgeDispatch {
     result_status: &'static str,
     terminal_admission_result: Option<String>,
     admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
+    wait_error: bool,
     direct_claimed: AtomicBool,
 }
 
@@ -132,6 +133,7 @@ impl Default for StaticEdgeDispatch {
             result_status: "completed",
             terminal_admission_result: None,
             admission_error: None,
+            wait_error: false,
             direct_claimed: AtomicBool::new(false),
         }
     }
@@ -140,27 +142,15 @@ impl Default for StaticEdgeDispatch {
 impl StaticEdgeDispatch {
     fn no_result() -> Self {
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
-            result_status: "completed",
-            terminal_admission_result: None,
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
     fn failed_result() -> Self {
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
-            return_result: true,
             result_status: "failed",
-            terminal_admission_result: None,
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
@@ -179,16 +169,11 @@ impl StaticEdgeDispatch {
             },
         );
         Self {
-            inserted_edge_agent_ids: Mutex::new(Vec::new()),
-            inserted_identities: Mutex::new(Vec::new()),
-            failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
-            result_status: "completed",
             terminal_admission_result: Some(
                 serde_json::to_string(&result).expect("terminal result fixture must serialize"),
             ),
-            admission_error: None,
-            direct_claimed: AtomicBool::new(false),
+            ..Self::default()
         }
     }
 
@@ -308,6 +293,9 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         identity: &EdgeDispatchIdentity,
         _timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
+        if self.wait_error {
+            return Err("database observation failed".into());
+        }
         if !self.return_result {
             return Ok(None);
         }
@@ -3920,6 +3908,45 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         .expect("failed dispatches lock");
     assert_eq!(failed_dispatches.len(), 1);
     assert_eq!(failed_dispatches[0].1, "expired");
+}
+
+#[tokio::test]
+async fn edge_dispatch_observation_error_does_not_expire_running_work() {
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        wait_error: true,
+        ..StaticEdgeDispatch::default()
+    });
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+    assert!(result.is_error);
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert!(dispatch.failed_dispatches.lock().unwrap().is_empty());
+    assert_eq!(local.calls(), 0);
 }
 
 #[tokio::test]
