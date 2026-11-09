@@ -122,6 +122,9 @@ struct StaticEdgeDispatch {
     admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
     wait_error: bool,
     direct_claimed: AtomicBool,
+    receipt_result: Result<bool, &'static str>,
+    fail_result: Result<bool, &'static str>,
+    unconfirmed_direct_settlements: AtomicUsize,
 }
 
 impl Default for StaticEdgeDispatch {
@@ -137,6 +140,9 @@ impl Default for StaticEdgeDispatch {
             admission_error: None,
             wait_error: false,
             direct_claimed: AtomicBool::new(false),
+            receipt_result: Ok(true),
+            fail_result: Ok(true),
+            unconfirmed_direct_settlements: AtomicUsize::new(0),
         }
     }
 }
@@ -204,6 +210,11 @@ impl StaticEdgeDispatch {
 
 #[async_trait]
 impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
+    fn record_unconfirmed_direct_settlement(&self) {
+        self.unconfirmed_direct_settlements
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
     async fn insert_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
@@ -279,7 +290,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
             edge_agent_id.to_owned(),
             result_json.to_owned(),
         ));
-        Ok(true)
+        self.receipt_result.map_err(str::to_owned)
     }
 
     async fn fail_dispatch(
@@ -292,7 +303,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
             .lock()
             .expect("failed dispatches lock")
             .push((identity.request_id.clone(), reason.to_string()));
-        Ok(true)
+        self.fail_result.map_err(str::to_owned)
     }
 
     async fn wait_result(
@@ -2952,6 +2963,12 @@ async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
 
 #[tokio::test]
 async fn revoked_provider_executor_authorization_closes_claim_before_socket_dispatch() {
+    for fail_result in [Ok(true), Ok(false), Err("terminal response lost")] {
+        revoked_provider_executor_authorization_case(fail_result).await;
+    }
+}
+
+async fn revoked_provider_executor_authorization_case(fail_result: Result<bool, &'static str>) {
     let authorization_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&authorization_calls);
     let app = axum::Router::new().route(
@@ -2989,7 +3006,10 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
         None,
         tx,
     );
-    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        fail_result,
+        ..StaticEdgeDispatch::default()
+    });
     let service = ToolExecutionService::builder()
         .edge_connection_pool(pool)
         .edge_dispatch_service(dispatch.clone())
@@ -3019,6 +3039,10 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
         .await;
 
     assert!(result.is_error, "{result:?}");
+    if !matches!(fail_result, Ok(true)) {
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["outcome_certainty"], "unknown");
+    }
     assert_eq!(authorization_calls.load(Ordering::SeqCst), 1);
     assert!(
         rx.try_recv().is_err(),
@@ -3041,6 +3065,12 @@ async fn revoked_provider_executor_authorization_closes_claim_before_socket_disp
             .len(),
         1,
         "a denied claim must become terminal before it can reach the Edge"
+    );
+    assert_eq!(
+        dispatch
+            .unconfirmed_direct_settlements
+            .load(Ordering::SeqCst),
+        usize::from(!matches!(fail_result, Ok(true)))
     );
     server.abort();
 }
@@ -3441,6 +3471,12 @@ async fn edge_ws_result_preserves_tool_result_fields() {
 
 #[tokio::test]
 async fn dropped_unattempted_direct_request_records_nonexecution_receipt() {
+    for receipt_result in [Ok(true), Ok(false), Err("receipt response lost")] {
+        dropped_unattempted_direct_request_case(receipt_result).await;
+    }
+}
+
+async fn dropped_unattempted_direct_request_case(receipt_result: Result<bool, &'static str>) {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     pool.register_with_capabilities(
@@ -3452,7 +3488,10 @@ async fn dropped_unattempted_direct_request_records_nonexecution_receipt() {
         None,
         tx,
     );
-    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let dispatch = Arc::new(StaticEdgeDispatch {
+        receipt_result,
+        ..StaticEdgeDispatch::default()
+    });
     let service = ToolExecutionService::builder()
         .edge_connection_pool(pool)
         .edge_dispatch_service(dispatch.clone())
@@ -3484,7 +3523,21 @@ async fn dropped_unattempted_direct_request_records_nonexecution_receipt() {
         .expect("unattempted request must wake its owner")
         .unwrap();
     assert!(result.is_error);
-    assert_eq!(result.metadata.unwrap()["execution_fact"], "not_executed");
+    let metadata = result.metadata.unwrap();
+    assert_eq!(metadata["execution_fact"], "not_executed");
+    let unconfirmed = !matches!(receipt_result, Ok(true));
+    assert_eq!(
+        metadata
+            .get("dispatch_receipt_unconfirmed")
+            .and_then(Value::as_bool),
+        unconfirmed.then_some(true)
+    );
+    assert_eq!(
+        dispatch
+            .unconfirmed_direct_settlements
+            .load(Ordering::SeqCst),
+        usize::from(unconfirmed)
+    );
     let receipts = dispatch.delivered_receipts.lock().unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(

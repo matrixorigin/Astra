@@ -9,9 +9,9 @@ mod common;
 use std::sync::Arc;
 
 use astra_services::multi_agent::{
-    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchAdmission,
-    EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchService, EdgeRegistrationLease,
-    EdgeRegistryService,
+    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDirectDispatchAdmission,
+    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchService,
+    EdgeRegistrationLease, EdgeRegistryService,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -302,6 +302,58 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
             .expect("fixture terminal result must be valid JSON"),
         "durable replay preserves JSON meaning independently of object-key storage order"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_large_request_preserves_admission_and_replay() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user = format!("ed-large-{}", unique_suffix());
+    let edge = format!("edge-large-{}", unique_suffix());
+    let identity = dispatch_identity(&user, &unique_suffix());
+    let payload =
+        serde_json::json!({"tool": "write_file", "args": {"content": "x".repeat(300 * 1024)}})
+            .to_string();
+
+    assert_eq!(
+        svc.admit_dispatch(&identity, &edge, &payload)
+            .await
+            .unwrap(),
+        EdgeDispatchAdmission::Pending
+    );
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&identity, &edge, &payload)
+            .await
+            .unwrap(),
+        EdgeDirectDispatchAdmission::Claimed
+    );
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&identity, &edge, &payload)
+            .await
+            .unwrap(),
+        EdgeDirectDispatchAdmission::Observing
+    );
+    let result = r#"{"status":"completed","output":"written"}"#;
+    assert!(svc.deliver_result(&identity, &edge, result).await.unwrap());
+    assert_eq!(
+        svc.admit_dispatch(&identity, &edge, &payload)
+            .await
+            .unwrap(),
+        EdgeDispatchAdmission::Terminal(result.to_string())
+    );
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&identity, &edge, &payload)
+            .await
+            .unwrap(),
+        EdgeDirectDispatchAdmission::Terminal(result.to_string())
+    );
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
