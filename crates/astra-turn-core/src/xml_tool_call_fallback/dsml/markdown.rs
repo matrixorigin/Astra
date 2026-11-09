@@ -73,6 +73,7 @@ pub(super) struct Prefix {
     pub continuation_end: usize,
     pub left_context: bool,
     inherited: usize,
+    marker_starts: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -140,16 +141,18 @@ pub(super) struct Cursor {
     continuation_end: usize,
     left_context: bool,
     inherited: usize,
+    marker_starts: Vec<usize>,
 }
 
 impl Cursor {
-    fn enter(&mut self, container: Container) {
+    fn enter(&mut self, container: Container, marker_start: usize) {
         if let Some(Container::List(list)) = self.containers.last_mut() {
             // The marker is content of its parent even if it opens an empty
             // block or CommonMark later classifies it as a rule.
             list.content = ItemContent::Started;
         }
         self.containers.push(container);
+        self.marker_starts.push(marker_start);
     }
 
     fn prefix(&self, at: Position, indented: bool, containers: &[Container]) -> Prefix {
@@ -160,6 +163,7 @@ impl Cursor {
             continuation_end: self.continuation_end,
             left_context: self.left_context,
             inherited: self.inherited,
+            marker_starts: self.marker_starts.clone(),
         }
     }
 
@@ -197,8 +201,9 @@ impl Cursor {
             if at.byte == bytes.len() && !finish {
                 return None;
             }
+            let marker_start = at.byte;
             if at.quote(bytes, finish)? {
-                self.enter(Container::Quote);
+                self.enter(Container::Quote, marker_start);
                 self.at = at;
                 continue;
             }
@@ -237,13 +242,16 @@ impl Cursor {
                     blank_line_start(&bytes[content.byte..], finish)?.then_some(1)
                 };
                 if let Some(padding) = padding {
-                    self.enter(Container::List(ListPrefix {
-                        indent,
-                        marker_len: marker,
-                        delimiter: bytes[at.byte + marker - 1],
-                        width: indent + marker + padding,
-                        content: ItemContent::MarkerLine,
-                    }));
+                    self.enter(
+                        Container::List(ListPrefix {
+                            indent,
+                            marker_len: marker,
+                            delimiter: bytes[at.byte + marker - 1],
+                            width: indent + marker + padding,
+                            content: ItemContent::MarkerLine,
+                        }),
+                        marker_start,
+                    );
                     self.at = content;
                     continue;
                 }
@@ -375,6 +383,12 @@ impl Prefix {
             }
         }
         self.containers.truncate(end);
+        if let Some(&start) = self.marker_starts.get(end - self.inherited) {
+            // A rejected marker and its padding are content, not a prefix.
+            // Revisit them so a marker-only paragraph line isn't read as blank.
+            self.end = start;
+            self.indented = false;
+        }
     }
 }
 

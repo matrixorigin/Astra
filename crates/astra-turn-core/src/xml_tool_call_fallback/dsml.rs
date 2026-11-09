@@ -27,6 +27,22 @@ enum Family {
     Dsml,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParameterEncoding {
+    Text,
+    Json,
+}
+
+impl ParameterEncoding {
+    fn from_attributes(family: Family, attributes: &tag::Attributes) -> Option<Self> {
+        match (family, attributes.string.as_deref()) {
+            (Family::Bare, _) | (Family::Dsml, Some("true") | None) => Some(Self::Text),
+            (Family::Dsml, Some("false")) => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Tag {
     kind: Kind,
@@ -121,14 +137,14 @@ struct Scope {
     previous_same: Option<usize>,
     literal: bool,
     hidden: bool,
-    body: InvocationBody,
+    body: ScopeBody,
 }
 
 /// JSON strings and containers own their bytes before tag recognition, even
 /// when the argument decoder later rejects their shape or syntax. Numbers
 /// and literal keywords contain no string or nested value to protect.
 #[derive(Debug, Default)]
-enum InvocationBody {
+enum ScopeBody {
     #[default]
     Markup,
     Pending,
@@ -139,7 +155,7 @@ enum InvocationBody {
     },
 }
 
-impl InvocationBody {
+impl ScopeBody {
     fn json_prefix(&mut self, text: &str, line_bounded: bool) -> usize {
         let start = if matches!(self, Self::Pending) {
             let Some((index, first)) = text
@@ -237,7 +253,13 @@ impl Scopes {
     fn allows_call(&self, family: Family, kind: Kind) -> bool {
         self.blocking == 0 && (self.is_empty() || (family == Family::Dsml && kind == Kind::Invoke))
     }
-    fn push(&mut self, family: Family, kind: Kind, literal: bool) {
+    fn push(
+        &mut self,
+        family: Family,
+        kind: Kind,
+        literal: bool,
+        attributes: Option<&tag::Attributes>,
+    ) {
         let key = family as usize * 4 + kind as usize;
         let previous_same = self.last[key];
         self.last[key] = Some(self.frames.len());
@@ -251,10 +273,15 @@ impl Scopes {
             previous_same,
             literal,
             hidden,
-            body: if kind == Kind::Invoke {
-                InvocationBody::Pending
+            body: if kind == Kind::Invoke
+                || (kind == Kind::Parameter
+                    && attributes.and_then(|attributes| {
+                        ParameterEncoding::from_attributes(family, attributes)
+                    }) == Some(ParameterEncoding::Json))
+            {
+                ScopeBody::Pending
             } else {
-                InvocationBody::Markup
+                ScopeBody::Markup
             },
         });
     }
@@ -676,7 +703,7 @@ impl Lexer {
                             } else if !closing
                                 && !raw.trim_end_matches('>').trim_end().ends_with('/')
                             {
-                                self.open.push(family, kind, literal);
+                                self.open.push(family, kind, literal, attributes.as_ref());
                             }
                         }
                         self.consume(end);
@@ -1027,7 +1054,12 @@ pub(super) fn decode(text: &str) -> Decoded {
         }
         let self_closed = opener.raw.trim_end_matches('>').trim_end().ends_with('/');
         let mut open = Scopes::default();
-        open.push(opener.family, opener.kind, false);
+        open.push(
+            opener.family,
+            opener.kind,
+            false,
+            opener.attributes.as_ref(),
+        );
         let boundary = if self_closed {
             None
         } else {
@@ -1044,7 +1076,7 @@ pub(super) fn decode(text: &str) -> Decoded {
                         return tag.kind == Kind::Calls;
                     }
                     if !tag.raw.trim_end_matches('>').trim_end().ends_with('/') {
-                        open.push(tag.family, tag.kind, tag.literal);
+                        open.push(tag.family, tag.kind, tag.literal, tag.attributes.as_ref());
                     }
                     false
                 })
@@ -1149,11 +1181,9 @@ fn arguments(body: &str, base: usize, tags: &[&Tag]) -> Option<Value> {
             return None;
         }
         let value = body.get(tag.span.end - base..close.span.start - base)?;
-        let value = match (tag.family, attributes.string.as_deref()) {
-            (Family::Bare, _) => Value::String(value.to_owned()),
-            (_, Some("false")) => serde_json::from_str(value).ok()?,
-            (_, Some("true") | None) => Value::String(value.to_owned()),
-            _ => return None,
+        let value = match ParameterEncoding::from_attributes(tag.family, attributes)? {
+            ParameterEncoding::Text => Value::String(value.to_owned()),
+            ParameterEncoding::Json => serde_json::from_str(value).ok()?,
         };
         args.insert(name.to_owned(), value);
         cursor = close.span.end - base;

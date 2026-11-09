@@ -1066,10 +1066,11 @@ invocation owns its full subtree before name/argument validation, including
 malformed unnamed openers and nested wrappers from another syntax family;
 nested content cannot escape as another call. Only DSML invocations can be
 recovered independently inside a DSML calls wrapper.
-When the body starts with a JSON object, array or string, matching delimiters,
-quotes and escapes determine where the value ends. Protocol spellings inside
-JSON strings remain argument data even when they match the enclosing
-invocation's close tag. Argument validation still requires an object.
+When an invocation body or a typed DSML parameter starts with a JSON object,
+array or string, matching delimiters, quotes and escapes determine where the
+value ends. Protocol spellings inside JSON strings remain argument data even
+when they match an enclosing close tag. An invocation still requires an
+argument object; a typed parameter is decoded as a JSON value.
 Invocation and parameter attributes come only from their own lexical opening
 tags; descendants and quoted values of other attributes cannot supply a name.
 Both invocation families use the shared bounded argument decoder, retaining
@@ -1100,6 +1101,8 @@ lexer replays an unmatched tail once with indexed delimiter runs, including
 when indentation consumes the last bytes of the response. This allows
 real calls outside matched spans to be recovered. The existing CommonMark parser
 determines paragraph continuation, heading boundaries and new container facts.
+When it rejects a provisional container, that marker is scanned as content,
+so a marker-only paragraph line cannot be mistaken for a blank line.
 Structural prefixes are classified through their
 first inline payload character: ordinary list, heading and punctuation-led
 prose streams before newline or EOF. Ambiguous marker-only prefixes remain
