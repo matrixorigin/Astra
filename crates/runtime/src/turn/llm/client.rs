@@ -13562,6 +13562,7 @@ mod tests {
     #[tokio::test]
     async fn collect_llm_stream_dsml_markdown_blocks_and_physical_lines() {
         let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        let wrapped = format!("<|DSML|calls>{call}</|DSML|calls>");
         let first = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"a.txt"}</||DSML||invoke></||DSML||
  tool_calls>"#;
         let second = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"b.txt"}</||DSML||invoke></||DSML||tool_calls>"#;
@@ -13739,6 +13740,46 @@ mod tests {
                 vec!["README.md"],
             ),
             (
+                format!("- item\n-\n    ```\n  {call}\n    ```\n"),
+                format!("- item\n-\n    ```\n  {call}\n    ```\n"),
+                vec![],
+            ),
+            (
+                format!("> - item\n> - \n>     ~~~\n>   {call}\n>     ~~~\n"),
+                format!("> - item\n> - \n>     ~~~\n>   {call}\n>     ~~~\n"),
+                vec![],
+            ),
+            (
+                format!("1. item\n2.\n      ~~~\n   {call}\n      ~~~\n"),
+                format!("1. item\n2.\n      ~~~\n   {call}\n      ~~~\n"),
+                vec![],
+            ),
+            (
+                format!("- item\n-\n    `{call}`\n    {call}"),
+                format!("- item\n-\n    `{call}`\n    "),
+                vec!["README.md"],
+            ),
+            (
+                format!("- item\n-\n    {call}"),
+                "- item\n-\n    ".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Start `{wrapped}\n-     `\n"),
+                "Start `\n-     `\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("Start `{wrapped}\n    `\n"),
+                format!("Start `{wrapped}\n    `\n"),
+                vec![],
+            ),
+            (
+                format!("Start `{wrapped}\n- next `\n"),
+                "Start `\n- next `\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
                 format!("{first}    {second}"),
                 "    ".to_owned(),
                 vec!["a.txt", "b.txt"],
@@ -13747,12 +13788,9 @@ mod tests {
             content.replace('\n', ending), expected.replace('\n', ending),
             paths.iter().map(|path| path.replace('\n', ending)).collect::<Vec<_>>()
         ))) {
-            for character_chunks in [false, true] {
-                let chunks = if character_chunks {
-                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
-                } else {
-                    vec![content.clone()]
-                };
+            let chars = content.chars().collect::<Vec<_>>();
+            for width in [chars.len(), 1, 4, 16, 64] {
+                let chunks = chars.chunks(width).map(|chunk| chunk.iter().collect::<String>());
                 let mut frames = chunks
                     .into_iter()
                     .map(|chunk| {
@@ -13782,7 +13820,7 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(result.full_text, expected, "{content:?}");
-                assert_eq!(published, expected);
+                assert_eq!(published, expected, "callback differs at chunk width {width}: {content:?}");
                 let arguments = result
                     .tool_calls
                     .iter()

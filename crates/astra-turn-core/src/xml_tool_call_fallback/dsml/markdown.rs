@@ -5,7 +5,29 @@
 #[derive(Clone, Debug)]
 pub(super) enum Container {
     Quote,
-    List(usize),
+    List(ListPrefix),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ListPrefix {
+    indent: usize,
+    marker_len: usize,
+    delimiter: u8,
+    width: usize,
+}
+
+impl ListPrefix {
+    fn write_to(&self, output: &mut String) {
+        output.extend(std::iter::repeat_n(' ', self.indent));
+        // The value of an ordered marker on the context line doesn't affect
+        // sibling membership, but its delimiter and column width do.
+        output.extend(std::iter::repeat_n('1', self.marker_len - 1));
+        output.push(char::from(self.delimiter));
+        output.extend(std::iter::repeat_n(
+            ' ',
+            self.width - self.indent - self.marker_len,
+        ));
+    }
 }
 
 #[derive(Debug)]
@@ -155,24 +177,28 @@ impl Cursor {
             if let Some(marker) = marker {
                 let mut content = at;
                 content.marker(marker);
-                if content.byte == bytes.len() && !finish {
-                    return None;
-                }
-                if matches!(bytes.get(content.byte), Some(b' ' | b'\t')) {
+                let padding = if matches!(bytes.get(content.byte), Some(b' ' | b'\t')) {
                     let padding = content.indent(bytes, 5);
-                    if padding < 5 && content.byte == bytes.len() && !finish {
-                        return None;
-                    }
-                    let width = if padding >= 5 {
+                    if padding >= 5 {
                         content = at;
                         content.marker(marker);
                         content.padding_column(bytes);
-                        1
+                        Some(1)
+                    } else if blank_line_start(&bytes[content.byte..], finish)? {
+                        Some(1)
                     } else {
-                        padding
-                    };
-                    self.containers
-                        .push(Container::List(indent + marker + width));
+                        Some(padding)
+                    }
+                } else {
+                    blank_line_start(&bytes[content.byte..], finish)?.then_some(1)
+                };
+                if let Some(padding) = padding {
+                    self.containers.push(Container::List(ListPrefix {
+                        indent,
+                        marker_len: marker,
+                        delimiter: bytes[at.byte + marker - 1],
+                        width: indent + marker + padding,
+                    }));
                     self.at = content;
                     continue;
                 }
@@ -202,15 +228,15 @@ impl Cursor {
                         return Some(Context::Left);
                     }
                 }
-                Container::List(width) => {
-                    let padding = at.indent(bytes, *width);
-                    if padding < *width {
+                Container::List(list) => {
+                    let padding = at.indent(bytes, list.width);
+                    if padding < list.width {
                         if blank_line_start(&bytes[at.byte..], finish)? {
                             return Some(Context::Blank(self.prefix(at, false, containers)));
                         }
                         return Some(Context::Left);
                     }
-                    at.carry = padding - width;
+                    at.carry = padding - list.width;
                 }
             }
             self.at = at;
@@ -280,6 +306,13 @@ enum ContainerKind {
 }
 
 impl Prefix {
+    /// Extra indentation is decisive only within already established
+    /// containers. A new marker can interrupt a paragraph even when the
+    /// item itself begins with indented code.
+    pub(super) fn settled_indentation(&self) -> bool {
+        self.indented && self.inherited == self.containers.len()
+    }
+
     pub(super) fn validate_containers(&mut self, boundary: &Boundary) {
         let mut end = self.inherited;
         for (container, kind) in self.containers[self.inherited..]
@@ -300,25 +333,32 @@ impl Prefix {
     }
 }
 
-fn inspect_line(line: &str, previous_paragraph: bool, tag: Option<(&str, &str)>) -> Boundary {
+fn inspect_line(line: &str, previous: Option<&[Container]>, tag: Option<(&str, &str)>) -> Boundary {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-    let prefix = if previous_paragraph {
-        "paragraph\n"
-    } else {
-        ""
-    };
-    let source = format!("{prefix}{line}");
-    let mut events = Parser::new(&source).into_offset_iter().peekable();
-    let interrupts = previous_paragraph
-        && !matches!(events.peek(),Some((Event::Start(Tag::Paragraph),span)) if span.end>prefix.len());
+    let mut source = String::new();
+    if let Some(containers) = previous {
+        // Matched containers have already been consumed on both lines.
+        // Recreate only the previous paragraph's departing containers so
+        // CommonMark can distinguish a sibling item from a setext underline.
+        for container in containers {
+            match container {
+                Container::Quote => source.push_str("> "),
+                Container::List(list) => list.write_to(&mut source),
+            }
+        }
+        source.push_str("paragraph\n");
+    }
+    let start = source.len();
+    source.push_str(line);
+    let mut interrupts = previous.is_some();
     let mut paragraph = false;
     let mut containers = Vec::new();
     let mut literal_block = false;
     let mut html_block = false;
-    for (event, span) in events {
+    for (event, span) in Parser::new(&source).into_offset_iter() {
         match event {
             Event::Start(Tag::HtmlBlock) => {
-                html_block = span.start >= prefix.len();
+                html_block = span.start >= start;
                 literal_block = true;
             }
             Event::Start(Tag::Heading { .. } | Tag::CodeBlock(_)) => {
@@ -327,16 +367,27 @@ fn inspect_line(line: &str, previous_paragraph: bool, tag: Option<(&str, &str)>)
             Event::End(TagEnd::Heading(_) | TagEnd::CodeBlock | TagEnd::HtmlBlock) => {
                 literal_block = false;
             }
-            Event::Start(Tag::Paragraph) if span.end > prefix.len() => paragraph = true,
+            Event::Start(Tag::Paragraph) if span.end > start => {
+                paragraph = true;
+                if span.start < start {
+                    interrupts = false;
+                }
+            }
+            // Tight list items omit Paragraph events. A break joining the
+            // synthetic text to this line means the same paragraph continues.
+            Event::SoftBreak | Event::HardBreak if span.start < start && span.end == start => {
+                interrupts = false;
+            }
             // Tight list items omit Paragraph events, but their inline content
             // still owns the same paragraph continuation and delimiter lifetime.
-            Event::Text(_) | Event::Code(_) if !literal_block && span.end > prefix.len() => {
+            Event::Text(_) | Event::Code(_) if !literal_block && span.end > start => {
                 paragraph = true
             }
-            Event::Start(Tag::BlockQuote(_)) if span.start >= prefix.len() => {
+            Event::Start(Tag::BlockQuote(_)) if span.start >= start => {
                 containers.push(ContainerKind::Quote);
             }
-            Event::Start(Tag::List(_)) if span.start >= prefix.len() => {
+            // A new sibling opens an Item but shares the enclosing List.
+            Event::Start(Tag::Item) if span.start >= start => {
                 containers.push(ContainerKind::List);
             }
             _ => {}
@@ -414,11 +465,12 @@ impl LineProbe {
         &mut self,
         text: &str,
         prefix: &Prefix,
-        contextual: bool,
+        previous: Option<&[Container]>,
         finish: bool,
     ) -> Option<Boundary> {
         use super::tag::Scan;
         let start = prefix.end;
+        let previous = previous.map(|containers| &containers[prefix.inherited..]);
         if !text[start..].starts_with('<') {
             let payload = &text[start..];
             let end = if payload.starts_with('`') {
@@ -447,7 +499,7 @@ impl LineProbe {
             };
             return Some(inspect_line(
                 &text[prefix.continuation_end..end],
-                contextual,
+                previous,
                 None,
             ));
         }
@@ -458,7 +510,7 @@ impl LineProbe {
                 Scan::Opaque { end, .. } => {
                     return Some(inspect_line(
                         &text[prefix.continuation_end..start + end],
-                        contextual,
+                        previous,
                         None,
                     ));
                 }
@@ -469,7 +521,7 @@ impl LineProbe {
                         self.prefix_checked = true;
                         let boundary = inspect_line(
                             &text[prefix.continuation_end..start + end],
-                            contextual,
+                            previous,
                             Some((&text[start..start + end], name)),
                         );
                         if boundary.html.is_some() {
@@ -478,7 +530,7 @@ impl LineProbe {
                     }
                     // Protocol tags do not start Markdown HTML blocks.
                     return (!matches!(scan, Scan::Pending)).then(|| {
-                        inspect_line(&text[prefix.continuation_end..start + 1], contextual, None)
+                        inspect_line(&text[prefix.continuation_end..start + 1], previous, None)
                     });
                 }
             }
@@ -500,7 +552,7 @@ impl LineProbe {
         };
         Some(inspect_line(
             &text[prefix.continuation_end..end],
-            contextual,
+            previous,
             Some((&text[start..*tag_end], name)),
         ))
     }

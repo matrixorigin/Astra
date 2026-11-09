@@ -455,19 +455,16 @@ impl Lexer {
                     // this same line, before deriving its next block facts.
                     let classify = !self.html.active()
                         && self.literal.is_none_or(|(_, _, fence)| !fence)
+                        && !prefix.settled_indentation()
                         && markdown::may_interrupt(self.remaining());
                     let boundary = if classify {
                         if let Some(boundary) = self.line_probe.inspect(
                             &self.pending[self.cursor..],
                             &prefix,
-                            contextual,
+                            contextual.then_some(&self.block_containers),
                             finish,
                         ) {
                             Some(boundary)
-                        } else if prefix.indented {
-                            // Indentation is already decidable; publish whitespace
-                            // while preserving a continuing paragraph until newline.
-                            None
                         } else {
                             self.prepared_prefix = Some(prefix);
                             break;
