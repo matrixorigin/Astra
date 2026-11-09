@@ -990,7 +990,9 @@ pub(crate) async fn prepare_browser_session_login(
         .await
         .ok_or("Login completed but no usable session credential is available")?;
     crate::cli::edge_lifecycle::register_after_login(&api, &token).await?;
-    let services = build_identity_services(&api, profile).await;
+    let user_id = crate::cli::cli_config::cli_utils::cli_account_id()
+        .ok_or("Login completed but no authenticated account identity is available")?;
+    let services = build_identity_services(&api, profile, &user_id).await;
     Ok(PreparedBrowserLogin {
         api,
         token,
@@ -1073,6 +1075,7 @@ impl IdentityServices {
 pub(crate) async fn build_identity_services(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
+    authenticated_user_id: &str,
 ) -> IdentityServices {
     let modules = crate::cli::session::session_runtime::create_tui_pipeline_modules(
         api,
@@ -1080,8 +1083,13 @@ pub(crate) async fn build_identity_services(
         crate::cli::session::session_runtime::resolved_session_project_root().as_deref(),
     )
     .await;
-    let memory =
-        crate::cli::session::session_startup::build_cli_session_memory_port(api, profile).await;
+    let memory = Some(
+        crate::cli::session::session_startup::session_memory_port_for_authenticated_user(
+            api,
+            profile,
+            authenticated_user_id,
+        ),
+    );
     IdentityServices { modules, memory }
 }
 
@@ -1091,6 +1099,7 @@ pub(crate) struct PasswordAuthentication {
 }
 
 pub(crate) struct PreparedPasswordLogin {
+    pub(crate) user_id: String,
     pub(crate) token: String,
     pub(crate) owner_changed: bool,
     initialize_runtime: bool,
@@ -1155,6 +1164,7 @@ pub(crate) async fn prepare_password_session_login(
     let initialize_runtime =
         commit_session_auth_transition(transition, &authentication.tokens.user_id, state);
     Ok(PreparedPasswordLogin {
+        user_id: authentication.tokens.user_id,
         token: authentication.execution_token,
         owner_changed,
         initialize_runtime,
@@ -1291,7 +1301,7 @@ mod tests {
                 .and(path("/auth/me"))
                 .and(header("authorization", bearer.as_str()))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user_id": owner})))
-                .expect(1)
+                .expect(0)
                 .mount(&server)
                 .await;
             let name = format!("private-{generation}");
@@ -1326,7 +1336,7 @@ mod tests {
                 astra_config::RuntimeConfig::load().memory.retrieval_top_k
             );
             assert!(state.config_version_id.is_some());
-            let _modules = super::build_identity_services(&api, None)
+            let _modules = super::build_identity_services(&api, None, owner)
                 .await
                 .apply(&mut state);
             let memory = state.session_memory_port.as_ref().unwrap();

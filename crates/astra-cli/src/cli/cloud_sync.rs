@@ -2573,11 +2573,66 @@ pub(crate) async fn prepare_post_auth_cloud_resync(
     }
 }
 
+pub(crate) struct CloudPreferenceSnapshot {
+    values: BTreeMap<&'static str, String>,
+    local_revisions: BTreeMap<&'static str, u64>,
+}
+
+/// Capture the initiating values. Explicit local commands also version their key,
+/// so an on/off/on sequence cannot look unchanged and lose the newer intent.
+pub(crate) fn cloud_preference_snapshot(state: &SessionState) -> CloudPreferenceSnapshot {
+    let values = [
+        (pref_keys::EXPLAIN_MODE, format!("{:?}", state.explain)),
+        (
+            pref_keys::AUTO_MEMORY_ENABLED,
+            state.auto_memory_enabled.to_string(),
+        ),
+        (
+            pref_keys::NOTIFICATIONS_ENABLED,
+            state.notifications_enabled.to_string(),
+        ),
+        (
+            pref_keys::NOTIFICATION_METHOD,
+            format!("{:?}", state.notification_method),
+        ),
+        (
+            pref_keys::NOTIFICATION_THRESHOLD_SECS,
+            state.notification_threshold_secs.to_string(),
+        ),
+        (
+            pref_keys::BLOCKED_TOOLS,
+            serde_json::to_string(
+                &state
+                    .tool_health_entries
+                    .iter()
+                    .map(|entry| &entry.name)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("string list serialization"),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    CloudPreferenceSnapshot {
+        values,
+        local_revisions: state.local_preference_revisions.clone(),
+    }
+}
+
 pub(crate) fn apply_post_auth_cloud_resync(
     profile: Option<&str>,
     state: &mut SessionState,
-    result: PostAuthCloudResync,
+    mut result: PostAuthCloudResync,
+    baseline: &CloudPreferenceSnapshot,
 ) -> SyncOutboxDrainReport {
+    let current = cloud_preference_snapshot(state);
+    result.preferences.retain(|(key, _)| {
+        baseline.local_revisions.get(key.as_str()) == current.local_revisions.get(key.as_str())
+            && baseline
+                .values
+                .get(key.as_str())
+                .is_some_and(|value| current.values.get(key.as_str()) == Some(value))
+    });
     let keys = apply_cloud_preferences(state, &result.preferences);
     let binding = matching_session_journal(state)
         .map(|writer| (writer.owner_scope().clone(), writer.session_id().to_owned()));
