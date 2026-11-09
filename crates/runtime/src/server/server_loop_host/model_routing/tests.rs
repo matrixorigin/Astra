@@ -744,6 +744,181 @@ async fn newer_model_choice_wins_before_the_next_provider_request() {
     }
 }
 
+#[tokio::test]
+async fn active_model_change_applies_after_the_current_tool_round() {
+    use crate::server::tool_transport::{
+        ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+    };
+    use astra_turn_types::{ReasoningRequirement, RunModelRequest};
+
+    let (catalog, engine, _, mut state) = fixture().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered_provider = entered.clone();
+    let chunks = [
+        json!({"choices":[{"delta":{"reasoning_content":"private to the first model"}}]}),
+        json!({"choices":[{"delta":{"content":concat!(
+            "<｜DSML｜ calls><｜DSML｜ invoke name=\"tool_search\">",
+            "<｜DSML｜ parameter name=\"query\" string=\"true\">select:glob</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke></｜DSML｜ calls>"
+        )},"finish_reason":"stop"}]}),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n").into_bytes())
+    .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+    .collect();
+    let provider = ProviderGateway::start(vec![
+        ProviderScript::new(
+            "first model finishes its in-flight tool call",
+            move |request| {
+                let matches = request.path == "/v1/chat/completions"
+                    && request.body["model"] == "wire-strong";
+                if matches {
+                    entered_provider.notify_one();
+                }
+                matches
+            },
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((1, release.clone())),
+            }],
+        ),
+        ProviderScript::new(
+            "new model continues with the tool result",
+            |request| request.path == "/v1/chat/completions" && request.body["model"] == "wire-economy",
+            vec![ProviderResponse::OpenAi(json!({
+                "choices":[{"message":{"content":"continued with the selected model"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":12,"completion_tokens":24}
+            }))],
+        ),
+    ]).await;
+    let url = format!("{}/v1/chat/completions", provider.base_url);
+    for model in catalog.models.write().unwrap().values_mut() {
+        model.completions_url_override = Some(url.clone());
+    }
+    let baseline = catalog.models.read().unwrap()["strong"].clone();
+    let observations = crate::server::provider_test_support::ProviderObservationsFixture::default();
+    let mut host = ServerAgenticLoopHostBuilder::new(
+        mock_matrixone(),
+        mock_encryptor(),
+        "router-user".into(),
+        "router-session".into(),
+    )
+    .with_admitted_model_execution(Some(baseline))
+    .with_model_service(Some(catalog))
+    .with_provider_observations(observations.clone())
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    ))
+    .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
+    .build();
+    let decision = astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","assessment":{"difficulty":"easy","difficulty_confidence":"high"}}"#).unwrap();
+    host.apply_work_admission_decision(decision);
+    host.completed_work_admission_phase =
+        Some((Instant::now(), Instant::now(), 0, TurnPhaseOutcome::Decided));
+    state.run_control = Some(Arc::new(engine.clone()));
+    state.skills.request_constraints.allowed_tools = Some(
+        ["glob".to_string(), "tool_search".to_string()]
+            .into_iter()
+            .collect(),
+    );
+    state.permission_context = Some(crate::orchestration::PermissionSyncContext::shared_root(
+        crate::orchestration::PermissionMode::Auto,
+    ));
+    let ledger =
+        crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+            engine.clone(),
+        )
+        .unwrap();
+    let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+        workspace.path().to_path_buf(),
+        "router-user".into(),
+        "router-session".into(),
+        None,
+        None,
+    );
+    executor.set_invocation_ledger(ledger);
+    executor.set_execution_bindings(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    );
+    state.runtime_tool_executor = Some(Arc::new(executor));
+    let run_id = state.current_run_id.clone().unwrap();
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            crate::turn::agentic_loop::host::run_agentic_loop_with_host(&mut host, &mut state),
+            async {
+                entered.notified().await;
+                engine
+                    .request_run_model(
+                        "router-user",
+                        &run_id,
+                        &RunModelRequest {
+                            expected_session_id: "router-session".into(),
+                            request_id: "switch-during-tool-round".into(),
+                            model: astra_turn_types::ModelSelection {
+                                offering_id: "economy".into(),
+                            },
+                            reasoning: ReasoningRequirement::ModelDefault,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                release.notify_one();
+            }
+        )
+    })
+    .await
+    .expect("the active model change and the tool round must complete");
+    result.expect("the same run must continue after changing model");
+    assert_eq!(state.final_text, "continued with the selected model");
+    assert_eq!(
+        state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|record| record.name == "tool_search" && record.was_executed())
+            .count(),
+        1
+    );
+    let requests = provider.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body["model"], "wire-strong");
+    assert_eq!(requests[1].body["model"], "wire-economy");
+    let messages = requests[1].body["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+        .expect("the next model receives the tool call");
+    let call = assistant["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|call| call["function"]["name"] == "tool_search")
+        .expect("the original tool call remains available");
+    let arguments: Value =
+        serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(arguments["query"], "select:glob");
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == call["id"])
+        .expect("the tool result remains paired with its call");
+    assert!(result["content"].to_string().contains("glob"));
+    assert!(!assistant["content"].to_string().contains("DSML"));
+    assert!(
+        !requests[1]
+            .body
+            .to_string()
+            .contains("private to the first model")
+    );
+    drop(requests);
+    observations.assert_quiescent();
+    provider.assert_complete();
+}
+
 #[tokio::test(start_paused = true)]
 async fn cancellation_or_deadline_interrupts_model_admission_without_an_outcome() {
     use astra_turn_types::{ReasoningRequirement, RunModelRequest};

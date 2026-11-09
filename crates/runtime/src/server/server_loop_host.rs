@@ -47253,9 +47253,11 @@ mod tests {
             session_id,
         )
         .unwrap();
+        let mut previous_assistant = json!({"role":"assistant", "content":"previous answer", astra_core::model_wire::responses::CONTINUATION_KEY:previous});
+        host.attest_current_model_message(&state, &mut previous_assistant);
         state.messages = vec![
             json!({"role":"user", "content":"earlier goal"}),
-            json!({"role":"assistant", "content":"previous answer", astra_core::model_wire::responses::CONTINUATION_KEY:previous}),
+            previous_assistant,
             json!({"role":"user", "content":"continue"}),
         ];
         for index in 0..10 {
@@ -52066,9 +52068,9 @@ mod tests {
                 .expect("accepted response");
             state.commit_volatile_attempt_lease();
             assert_eq!(result.accum.tool_calls.len(), batch.len());
-            state
-                .messages
-                .push(json!({"role":"assistant","tool_calls":result.accum.tool_calls}));
+            let mut assistant = json!({"role":"assistant","tool_calls":result.accum.tool_calls});
+            host.attest_current_model_message(&state, &mut assistant);
+            state.messages.push(assistant);
             let accepted = state.messages.last().unwrap()["tool_calls"]
                 .as_array()
                 .unwrap()
