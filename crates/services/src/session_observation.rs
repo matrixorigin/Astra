@@ -157,7 +157,33 @@ impl SessionObservationStore {
         let value = DatabaseSessionContextCoordinator::new(self.pool.clone())
             .materialize_observation(head, candidate.checkpoint.observed_head.as_ref())
             .await
-            .map_err(|_| "observation canonical context could not be materialized".to_owned())?;
+            .map_err(|error| {
+                use crate::session_context_coordinator::SessionContextCoordinatorError;
+                let kind = match error {
+                    SessionContextCoordinatorError::Database { operation, source } => {
+                        let source_kind = match source {
+                            sqlx::Error::PoolTimedOut => "pool_timeout",
+                            sqlx::Error::PoolClosed => "pool_closed",
+                            sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_) => "decode",
+                            sqlx::Error::Io(_) => "io",
+                            sqlx::Error::Database(_) => "database",
+                            _ => "other",
+                        };
+                        format!("{operation}/{source_kind}")
+                    }
+                    SessionContextCoordinatorError::DatabaseJson { entity, .. } => {
+                        format!("{entity}/json")
+                    }
+                    SessionContextCoordinatorError::DivergentManifest => {
+                        "divergent_manifest".into()
+                    }
+                    SessionContextCoordinatorError::NeedsRepair(_) => "needs_repair".into(),
+                    _ => "validation".into(),
+                };
+                // Preserve the failing phase without logging URLs, database
+                // response text, stored content, or owner identifiers.
+                format!("observation canonical context could not be materialized ({kind})")
+            })?;
         astra_core::history_work::record_operation(
             astra_core::history_work::HistoryWorkSite::CanonicalObservationRead,
             value.loaded_manifest_json_bytes,
@@ -393,7 +419,12 @@ mod tests {
                 other => panic!("unexpected commit: {other:?}"),
             });
             if let Some(candidate) = captured.take() {
-                let materialized = store.materialize(&candidate).await.unwrap();
+                let materialized = store.materialize(&candidate).await.unwrap_or_else(|error| {
+                    panic!(
+                        "captured turn {} after {} failed while committing {turn}: {error}",
+                        candidate.turn, candidate.checkpoint.observed_turn
+                    )
+                });
                 assert_eq!(materialized.head, *candidate.head.as_ref().unwrap());
                 let expected_nodes = if turn == 11 { 3 } else { 1 };
                 assert_eq!(materialized.messages.len(), expected_nodes);
