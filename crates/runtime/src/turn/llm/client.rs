@@ -12672,6 +12672,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_null_markers_cannot_hide_raw_usage_conflicts() {
+        let mut frames = Vec::new();
+        for usage in [
+            json!({
+                "prompt_tokens":null,"completion_tokens":null,"input_tokens":4,"output_tokens":7,
+                "cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                "opencode":{"tokens":{"input":5,"output":8,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+            }),
+            json!({"opencode":{"tokens":{"input":4,"output":7}}}),
+        ] {
+            frames.push(Ok(Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"usage":usage})
+            ))));
+        }
+        frames.push(Ok(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )));
+        let result = collect_llm_stream(
+            stream::iter(frames),
+            "opencode-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            None,
+        )
+        .await
+        .expect("invalid accounting evidence must not discard the answer");
+        assert_eq!(result.full_text, "done");
+        assert!(result.usage_presence.input_invalid && result.usage_presence.output_invalid);
+        assert!(result.usage.is_empty());
+        let terminal = provider_attempt_terminal_from_result(&result);
+        assert_ne!(
+            terminal.usage_status,
+            astra_services::InferenceUsageStatus::ProviderExact
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_opencode_partial_write_conflict_respects_frame_boundary() {
+        let partial_tokens = json!({"input":4,"cache_read":6,"cache_write_5m":6});
+        for (updates, expected_usage, expected_status) in [
+            (
+                vec![
+                    json!({"prompt_tokens":15,"completion_tokens":7,"opencode":{"tokens":partial_tokens}}),
+                    json!({"prompt_tokens":16,"opencode":{"tokens":{"cache_write_1h":0}}}),
+                ],
+                json!({"output_tokens":7}),
+                astra_services::InferenceUsageStatus::ProviderPartial,
+            ),
+            (
+                vec![
+                    json!({"prompt_tokens":15,"completion_tokens":7}),
+                    json!({"opencode":{"tokens":partial_tokens}}),
+                    json!({"prompt_tokens":16,"opencode":{"tokens":{"cache_write_1h":0}}}),
+                ],
+                json!({"input_tokens":4,"cached_input_tokens":6,"cache_creation_tokens":6,"output_tokens":7,"total_tokens":23}),
+                astra_services::InferenceUsageStatus::ProviderExact,
+            ),
+        ] {
+            let mut frames: Vec<_> = updates
+                .into_iter()
+                .map(|usage| Ok(Bytes::from(format!("data: {}\n\n", json!({"usage":usage})))))
+                .collect();
+            frames.push(Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )));
+            let result = collect_llm_stream(
+                stream::iter(frames),
+                "opencode-model",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("usage qualification must not discard the answer");
+            assert_eq!(result.full_text, "done");
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage_status, expected_status);
+            assert_eq!(Value::Object(result.usage), expected_usage);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_opencode_usage_reaches_provider_accounting() {
+        for (usage, expected_input, expected_output) in [
+            (
+                json!({
+                    "prompt_tokens":17774, "completion_tokens":1051,
+                    "prompt_tokens_details":{"cached_tokens":9600},
+                    "opencode":{"tokens":{
+                        "input":8174,"output":1051,"reasoning":537,
+                        "cache_read":9600,"cache_write_5m":0,"cache_write_1h":0
+                    }}
+                }),
+                Some((8174, 9600, 0)),
+                1051,
+            ),
+            (
+                json!({
+                    "prompt_tokens":4,"completion_tokens":7,"cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                    "opencode":{"tokens":{"input":4,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                Some((4, 6, 5)),
+                7,
+            ),
+            (
+                json!({
+                    "input_tokens":4,"output_tokens":7,
+                    "opencode":{"tokens":{"input":4,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                Some((4, 6, 5)),
+                7,
+            ),
+            (
+                json!({
+                    "input_tokens":4,"output_tokens":7,"cache_read_input_tokens":6,"cache_creation_input_tokens":5,
+                    "opencode":{"tokens":{"input":5,"output":7,"cache_read":6,"cache_write_5m":2,"cache_write_1h":3}}
+                }),
+                None,
+                7,
+            ),
+        ] {
+            let frame = json!({
+                "choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],
+                "usage":usage
+            });
+            let result = collect_llm_stream(
+                stream::iter(vec![Ok(Bytes::from(format!(
+                    "data: {frame}\n\ndata: [DONE]\n\n"
+                )))]),
+                "opencode-model",
+                Instant::now(),
+                LlmCancel::None,
+                stream_idle_timeout(),
+                stream_idle_timeout_after_progress(),
+                None,
+            )
+            .await
+            .expect("OpenCode stream completes");
+            assert_eq!(result.full_text, "done");
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+            let terminal = provider_attempt_terminal_from_result(&result);
+            assert_eq!(terminal.usage.output_tokens, expected_output);
+            if let Some((input, read, write)) = expected_input {
+                assert_eq!(
+                    terminal.usage_status,
+                    astra_services::InferenceUsageStatus::ProviderExact
+                );
+                assert_eq!(terminal.usage.input.fresh_input_tokens, input);
+                assert_eq!(terminal.usage.input.cache_read_tokens, read);
+                assert_eq!(result.usage["cache_creation_tokens"], write);
+            } else {
+                assert_ne!(
+                    terminal.usage_status,
+                    astra_services::InferenceUsageStatus::ProviderExact
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_preserves_usage_lanes_across_partial_chunks() {
         for (updates, expected_fresh, expected_cached, expected_creation_known) in [
             (
