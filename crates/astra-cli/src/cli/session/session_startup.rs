@@ -646,16 +646,35 @@ pub(crate) async fn build_cli_session_memory_port(
         user_id: String,
     }
 
-    let token = session_runtime::fresh_access_token(api, profile).await?;
-    let me_body = api.get_auth_me_text(&token).await.ok()?;
-    let me = serde_json::from_str::<AuthMeWire>(&me_body).ok()?;
-    let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(
+    // Startup/restore may need identity discovery. Bound the complete optional
+    // read, including credential preparation and response-body consumption.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let token = session_runtime::fresh_access_token(api, profile).await?;
+        let me_body = api.get_auth_me_text(&token).await.ok()?;
+        let me = serde_json::from_str::<AuthMeWire>(&me_body).ok()?;
+        Some(session_memory_port_for_authenticated_user(
+            api,
+            profile,
+            &me.user_id,
+        ))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Login already established this canonical account ID. Reuse that fact
+/// instead of making an optional identity read part of credential settlement.
+pub(crate) fn session_memory_port_for_authenticated_user(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    user_id: &str,
+) -> std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort> {
+    std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(
         api.clone(),
         profile,
-        me.user_id.clone(),
+        user_id,
     ))
-        as std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>;
-    Some(memoria)
 }
 
 pub(crate) async fn complete_session_startup(
