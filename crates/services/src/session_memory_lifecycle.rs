@@ -47,9 +47,6 @@ pub struct SessionMemoryWork {
     pub consolidation_complete: bool,
     pub optional_complete: bool,
     pub last_report: Option<Value>,
-    /// Observation uses canonical Context as its input. Only the checkpoint
-    /// and independent retry schedule are persisted, never another transcript.
-    pub observation: crate::session_observation::ObservationCheckpoint,
 }
 
 impl SessionMemoryWork {
@@ -61,7 +58,6 @@ impl SessionMemoryWork {
     pub fn pending(&self) -> bool {
         self.extraction_pending() || (self.finalize_requested && !self.optional_complete)
     }
-
     pub fn reset_plan(&mut self) {
         self.plan = None;
         self.receipts.clear();

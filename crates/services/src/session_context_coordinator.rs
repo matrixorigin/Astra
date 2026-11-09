@@ -1291,8 +1291,11 @@ impl DatabaseSessionContextCoordinator {
         };
         let head_json = database_to_json("Run context head", &head)?;
         let mut write = if authority.row_exists {
-            let mut write =
-                QueryBuilder::<MySql>::new("UPDATE session_context_heads SET head_json = ");
+            let mut write = QueryBuilder::<MySql>::new(
+                "UPDATE session_context_heads SET observation_due_at = CASE WHEN isolation_domain = 'server' AND branch_id = 'main' AND completed_turn < ",
+            );
+            write.push_bind(i64::from(head.cursor.completed_turn))
+                .push(" THEN CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END ELSE observation_due_at END, head_json = ");
             write
                 .push_bind(&head_json)
                 .push(", canonical_root_hash = ")
@@ -1389,7 +1392,7 @@ impl DatabaseSessionContextCoordinator {
             let mut write = QueryBuilder::<MySql>::new("INSERT INTO session_context_heads
                 (isolation_domain,owner_user_id,session_id,branch_id,head_json,canonical_root_hash,latest_manifest_root,
                  total_canonical_bytes,total_message_count,completed_turn,journal_event_seq,conversation_seq,
-                 projection_schema,compaction_generation,writer_epoch,authorization_epoch,device_trust_epoch,permission_epoch)
+                 projection_schema,compaction_generation,writer_epoch,authorization_epoch,device_trust_epoch,permission_epoch,observation_due_at)
                  SELECT ");
             let mut fields = write.separated(", ");
             fields
@@ -1429,6 +1432,16 @@ impl DatabaseSessionContextCoordinator {
                     "permission epoch",
                     authority.authority_epochs.permission_epoch,
                 )?);
+            write.push(
+                if key.isolation_domain == "server"
+                    && key.branch_id == "main"
+                    && head.cursor.completed_turn > 0
+                {
+                    ", NOW(6)"
+                } else {
+                    ", '9999-12-31 00:00:00'"
+                },
+            );
             write.push(" WHERE NOT EXISTS (SELECT 1 FROM session_context_heads existing WHERE isolation_domain = ")
                 .push_bind(&key.isolation_domain).push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
                 .push(" AND session_id = ").push_bind(&key.session_id).push(" AND branch_id = ").push_bind(&key.branch_id).push(")");
@@ -4888,9 +4901,7 @@ async fn ensure_database_state_admitted(
         "INSERT IGNORE INTO session_context_heads
          (isolation_domain, owner_user_id, session_id, branch_id,
           authorization_epoch, device_trust_epoch, permission_epoch)
-         SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
-            SELECT 1 FROM session_context_heads WHERE isolation_domain = ?
-              AND owner_user_id = ? AND session_id = ? AND branch_id = ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&key.isolation_domain)
     .bind(&key.owner_user_id)
@@ -4905,10 +4916,6 @@ async fn ensure_database_state_admitted(
         epochs.device_trust_epoch,
     )?)
     .bind(i64_from_u64("permission epoch", epochs.permission_epoch)?)
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
     .execute(&mut **tx)
     .await
     .map_err(|source| database_error("ensure_context_head", source))?;
@@ -5883,7 +5890,9 @@ async fn update_database_state(
     })?;
     let update_sql = matrixone_statement_with_null_shape(
         "UPDATE session_context_heads
-         SET head_json = ?, canonical_root_hash = ?, latest_manifest_root = ?,
+         SET observation_due_at = CASE WHEN isolation_domain = 'server' AND branch_id = 'main' AND completed_turn < ?
+                 THEN CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END ELSE observation_due_at END,
+             head_json = ?, canonical_root_hash = ?, latest_manifest_root = ?,
              total_canonical_bytes = ?, total_message_count = ?,
              completed_turn = ?, journal_event_seq = ?, conversation_seq = ?,
              projection_schema = ?, compaction_generation = ?, writer_epoch = ?,
@@ -5906,6 +5915,7 @@ async fn update_database_state(
         ],
     );
     let result = sqlx::query(update_sql)
+        .bind(completed_turn)
         .bind(head_json)
         .bind(canonical_root)
         .bind(manifest_root)

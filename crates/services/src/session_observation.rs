@@ -1,14 +1,14 @@
-//! Bounded observation recovery from canonical completion facts.
-//! No chat transaction writes an observation job or a second transcript.
+//! Observation recovery owned by canonical completion facts.
+//! Completion sets a due marker in its existing head write. Idle discovery reads
+//! only the due index: no historical sweep, extra per-turn SQL or transcript copy.
 use crate::MaterializedConversationV1;
+use crate::session_context_coordinator::{
+    DatabaseSessionContextCoordinator, SessionContextCoordinator,
+};
 use astra_core::SharedPool;
 use astra_turn_types::SessionContextHeadV1;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-
-use crate::session_context_coordinator::{
-    DatabaseSessionContextCoordinator, SessionContextCoordinator,
-};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,7 +17,6 @@ pub struct ObservationCheckpoint {
     pub attempts: u32,
     pub retry_at_ms: i64,
     pub revision: u64,
-    /// Exact write receipt; affected-row counts are not reliable on MatrixOne.
     pub receipt_id: Option<String>,
 }
 
@@ -26,134 +25,104 @@ pub struct ObservationCandidate {
     pub turn: u32,
     head: Result<SessionContextHeadV1, String>,
     pub checkpoint: ObservationCheckpoint,
+    lease_token: String,
 }
 
 #[derive(Clone)]
 pub struct SessionObservationStore {
     pool: SharedPool,
+    owner: String,
 }
+
+// Completion, retry and lease expiry share one due timestamp. The far-future
+// sentinel marks idle heads. It leads the physical primary key because MatrixOne
+// does not reliably prune a nullable secondary due index. The logical SessionKey
+// stays UNIQUE; no historical allocation cursor or extra job projection exists.
+const DUE_SQL: &str = "SELECT owner_user_id, session_id FROM session_context_heads
+    WHERE observation_due_at <= NOW(6) AND isolation_domain = 'server' AND branch_id = 'main'
+    ORDER BY observation_due_at, owner_user_id, session_id LIMIT 64";
+const CLAIM_SQL: &str = "UPDATE session_context_heads
+    SET observation_lease_token = ?, observation_due_at = CASE WHEN EXISTS (
+        SELECT 1 FROM agent_sessions WHERE user_id = ? AND session_id = ? AND delete_requested_at IS NULL)
+        THEN DATE_ADD(NOW(6), INTERVAL 90 SECOND) ELSE '9999-12-31 00:00:00' END
+    WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
+      AND observation_due_at <= NOW(6)";
+const CANDIDATE_SQL: &str = "SELECT head_json, completed_turn, observation_json FROM session_context_heads
+    WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
+      AND observation_lease_token = ? AND observation_due_at > NOW(6)
+      AND observation_due_at < '9999-12-31 00:00:00'";
 
 impl SessionObservationStore {
     pub fn new(pool: SharedPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            owner: uuid::Uuid::new_v4().to_string(),
+        }
     }
 
-    /// Allocation metadata bounds a complete sweep, including deletion gaps.
-    /// This does not aggregate or scan retained Session heads. Concurrent inserts
-    /// and late commits are rediscovered on the next sweep.
-    pub async fn catalog_high_water(&self) -> Result<u64, String> {
-        let next: Option<u64> = sqlx::query_scalar(
-            "SELECT AUTO_INCREMENT FROM information_schema.TABLES
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'session_context_heads'",
-        )
-        .fetch_one(self.pool.get())
-        .await
-        .map_err(|_| "observation catalog bound failed")?;
-        next.map(|next| next.saturating_sub(1))
-            .ok_or("observation catalog sequence unavailable".into())
-    }
-
-    /// A primary-key interval contains at most 64 allocated identities. Both
-    /// bounds reach storage; LIMIT/ORDER BY alone cannot bound MatrixOne input.
-    pub async fn key_page(&self, after: u64) -> Result<Vec<(String, String)>, String> {
-        sqlx::query_as(KEY_PAGE_SQL)
-            .bind(after)
-            .bind(after.saturating_add(64))
+    pub async fn due_keys(&self) -> Result<Vec<(String, String)>, String> {
+        sqlx::query_as(DUE_SQL)
             .fetch_all(self.pool.get())
             .await
-            .map_err(|_| "observation key page failed".into())
+            .map_err(|_| "observation due discovery failed".into())
     }
 
-    pub async fn release_lease(&self, lease_name: &str, pod_id: &str) -> Result<(), String> {
-        sqlx::query("DELETE FROM sweeper_leases WHERE sweeper_name = ? AND owner_pod_id = ?")
-            .bind(lease_name)
-            .bind(pod_id)
-            .execute(self.pool.get())
-            .await
-            .map_err(|_| "observation lease release failed")?;
-        Ok(())
-    }
-
-    /// Read eligibility only for this page. Concrete predicates on *each*
-    /// table are deliberate: joining a limited head page is not sufficient
-    /// for MatrixOne to avoid scanning the entire checkpoint catalog.
-    pub async fn pending_keys(
+    /// Per-Session CAS, not a bucket lease. A held Session never owns another
+    /// Session's slot. The 90-second lease exceeds the bounded 60s attempt + 5s
+    /// receipt budget; cancellation is recovered through expiry, not a scan.
+    pub async fn claim(
         &self,
-        after: u64,
-        keys: &[(String, String)],
-    ) -> Result<Vec<(String, String)>, String> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        if keys.len() > 64 {
-            return Err("observation page exceeds limit".into());
-        }
-        eligibility_query(after, keys)
-            .build_query_as()
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|_| "observation eligibility page failed".into())
-    }
-
-    /// Capture eligibility and the immutable context head, without payloads.
-    /// Materialization must bind that head's generation/cursor directly at the
-    /// storage access: MatrixOne does not push derived-row join bounds down.
-    pub async fn next(
-        &self,
-        lease_name: &str,
-        pod_id: &str,
         user: &str,
         session: &str,
     ) -> Result<Option<ObservationCandidate>, String> {
-        let sql = candidate_sql();
-        let query = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(user)
-            .bind(session)
-            .bind(user)
-            .bind(session)
-            .bind(user)
-            .bind(session)
-            .bind(lease_name)
-            .bind(pod_id);
-        let Some(row) = query
-            .fetch_optional(self.pool.get())
+        let lease_token = format!("{}:{}", self.owner, uuid::Uuid::new_v4());
+        let mut connection = self
+            .pool
+            .get()
+            .acquire()
             .await
-            .map_err(|_| "observation discovery failed")?
+            .map_err(|_| "observation claim connection failed")?;
+        sqlx::query(CLAIM_SQL)
+            .bind(&lease_token)
+            .bind(user)
+            .bind(session)
+            .bind(user)
+            .bind(session)
+            .execute(&mut *connection)
+            .await
+            .map_err(|_| "observation claim failed")?;
+        // Read the token back, rather than relying on affected_rows semantics.
+        let Some(row) = sqlx::query(CANDIDATE_SQL)
+            .bind(user)
+            .bind(session)
+            .bind(&lease_token)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|_| "observation claim receipt failed")?
         else {
             return Ok(None);
         };
-        let key = astra_turn_types::SessionKeyV1 {
-            schema_version: astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION,
-            isolation_domain: row
-                .try_get("isolation_domain")
-                .map_err(|_| "invalid observation key")?,
-            owner_user_id: row
-                .try_get("owner_user_id")
-                .map_err(|_| "invalid observation key")?,
-            session_id: row
-                .try_get("session_id")
-                .map_err(|_| "invalid observation key")?,
-            branch_id: row
-                .try_get("branch_id")
-                .map_err(|_| "invalid observation key")?,
-        };
+        let key = astra_turn_types::SessionKeyV1::owner_session("server", user, session, "main");
         let turn = u32::try_from(
-            row.try_get::<i64, _>("head_completed_turn")
+            row.try_get::<i64, _>("completed_turn")
                 .map_err(|_| "invalid observation turn")?,
         )
         .map_err(|_| "invalid observation turn")?;
-        let head = serde_json::from_str::<SessionContextHeadV1>(
-            &row.try_get::<String, _>("head_json")
-                .map_err(|_| "invalid observation head")?,
-        )
-        .map_err(|_| "invalid observation head".to_owned())
-        .and_then(|head| {
-            if head.key != key || head.cursor.completed_turn != turn {
-                Err("observation head identity mismatch".into())
-            } else {
-                Ok(head)
-            }
-        });
+        let head = row
+            .try_get::<Option<String>, _>("head_json")
+            .map_err(|_| "invalid observation head")?
+            .ok_or("missing observation head".to_owned())
+            .and_then(|json| {
+                serde_json::from_str::<SessionContextHeadV1>(&json)
+                    .map_err(|_| "invalid observation head".to_owned())
+            })
+            .and_then(|head| {
+                if head.key == key && head.cursor.completed_turn == turn {
+                    Ok(head)
+                } else {
+                    Err("observation head identity mismatch".into())
+                }
+            });
         let checkpoint = row
             .try_get::<Option<String>, _>("observation_json")
             .map_err(|_| "invalid observation checkpoint")?
@@ -166,6 +135,7 @@ impl SessionObservationStore {
             turn,
             head,
             checkpoint,
+            lease_token,
         }))
     }
 
@@ -180,13 +150,11 @@ impl SessionObservationStore {
             .map_err(|_| "observation canonical context could not be materialized".into())
     }
 
-    /// One atomic checkpoint, independent of extraction/governance scheduling.
-    /// The lease and revision fence stale owners; JSON_SET preserves fields
-    /// owned by the canonical lifecycle even when another worker updates them.
+    /// The checkpoint and next due state change in the same fenced head write.
+    /// A completion racing this acknowledgement keeps the newer turn pending;
+    /// completion preserves an existing retry deadline or in-flight lease.
     pub async fn finish(
         &self,
-        lease_name: &str,
-        pod_id: &str,
         candidate: &ObservationCandidate,
         success: bool,
     ) -> Result<(), String> {
@@ -204,8 +172,8 @@ impl SessionObservationStore {
         } else {
             checkpoint.attempts = checkpoint.attempts.saturating_add(1);
         }
-        let backoff_ms = 5_000_i64 * (1_i64 << checkpoint.attempts.saturating_sub(1).min(8));
-        let backoff_ms = backoff_ms.min(960_000);
+        let backoff_ms =
+            (5_000_i64 * (1_i64 << checkpoint.attempts.saturating_sub(1).min(8))).min(960_000);
         let json =
             serde_json::to_string(&checkpoint).map_err(|_| "invalid observation checkpoint")?;
         let mut connection = self
@@ -214,103 +182,32 @@ impl SessionObservationStore {
             .acquire()
             .await
             .map_err(|_| "observation checkpoint connection failed")?;
-        sqlx::query(
-            "INSERT INTO agent_session_memory_work (user_id, session_id, state_json, complete)
-             SELECT s.user_id, s.session_id, JSON_OBJECT('observation', JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN CAST(? AS SIGNED) = 1 THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END)), 1
-             FROM agent_sessions s WHERE s.user_id = ? AND s.session_id = ? AND s.delete_requested_at IS NULL
-               AND EXISTS (SELECT 1 FROM sweeper_leases l WHERE l.sweeper_name = ?
-                           AND l.owner_pod_id = ? AND l.expires_at > NOW(6))
-             ON DUPLICATE KEY UPDATE state_json = CASE
-               WHEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.revision')) AS UNSIGNED), 0) = ?
-               THEN JSON_SET(state_json, '$.observation', JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN CAST(? AS SIGNED) = 1 THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END)) ELSE state_json END"
-        ).bind(&json).bind(success).bind(backoff_ms).bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id)
-            .bind(lease_name).bind(pod_id).bind(candidate.checkpoint.revision).bind(json).bind(success).bind(backoff_ms)
+        sqlx::query("UPDATE session_context_heads
+            SET observation_json = JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN CAST(? AS SIGNED) = 1 THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END),
+                observation_due_at = CASE WHEN CAST(? AS SIGNED) = 0 THEN DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
+                    WHEN completed_turn > ? THEN NOW(6) ELSE '9999-12-31 00:00:00' END,
+                observation_lease_token = NULL
+            WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
+              AND observation_lease_token = ? AND observation_due_at > NOW(6)
+              AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?")
+            .bind(json).bind(success).bind(backoff_ms).bind(success).bind(backoff_ms * 1000).bind(candidate.turn)
+            .bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id).bind(&candidate.lease_token).bind(candidate.checkpoint.revision)
             .execute(&mut *connection).await.map_err(|_| "observation checkpoint failed")?;
-        let stored: Option<String> = sqlx::query_scalar(
-            "SELECT JSON_UNQUOTE(JSON_EXTRACT(state_json, '$.observation.receipt_id'))
-             FROM agent_session_memory_work WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&candidate.key.owner_user_id)
-        .bind(&candidate.key.session_id)
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|_| "observation checkpoint receipt unavailable")?
-        .flatten();
+        let stored: Option<String> = sqlx::query_scalar("SELECT JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.receipt_id'))
+            FROM session_context_heads WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'")
+            .bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id).fetch_optional(&mut *connection).await
+            .map_err(|_| "observation checkpoint receipt unavailable")?.flatten();
         if stored.as_deref() != Some(receipt_id.as_str()) {
             return Err("observation checkpoint fence rejected or receipt superseded".into());
         }
         Ok(())
     }
-}
 
-// Physical identity is stable and independent of user/Session spelling. The
-// owner-scoped logical identity remains unique and authoritative for all reads.
-const KEY_PAGE_SQL: &str = "SELECT owner_user_id, session_id FROM session_context_heads
-    WHERE catalog_seq > ? AND catalog_seq <= ?
-      AND isolation_domain = 'server' AND branch_id = 'main'
-    ORDER BY catalog_seq";
-
-fn eligibility_query(after: u64, keys: &[(String, String)]) -> sqlx::QueryBuilder<sqlx::MySql> {
-    let mut query = sqlx::QueryBuilder::new(
-        "SELECT h.owner_user_id, h.session_id FROM (
-           SELECT owner_user_id, session_id, completed_turn FROM session_context_heads
-           WHERE catalog_seq > ",
-    );
-    query
-        .push_bind(after)
-        .push(" AND catalog_seq <= ")
-        .push_bind(after.saturating_add(64));
-    query.push(
-        " AND isolation_domain = 'server' AND branch_id = 'main'
-             AND head_json IS NOT NULL AND completed_turn > 0 AND ",
-    );
-    for (user_column, next) in [
-        ("owner_user_id", ") h JOIN (SELECT user_id, session_id FROM agent_sessions WHERE delete_requested_at IS NULL AND "),
-        ("user_id", ") s ON s.user_id = h.owner_user_id AND s.session_id = h.session_id LEFT JOIN (SELECT user_id, session_id, state_json FROM agent_session_memory_work WHERE "),
-        ("user_id", ") w ON w.user_id = h.owner_user_id AND w.session_id = h.session_id"),
-    ].into_iter() {
-        // These names are fixed above, never supplied by a caller.
-        let heads = user_column == "owner_user_id";
-        query.push(if heads {
-            "(isolation_domain, owner_user_id, session_id, branch_id) IN ("
-        } else {
-            "(user_id, session_id) IN ("
-        });
-        for (i, (user, session)) in keys.iter().enumerate() {
-            if i > 0 { query.push(", "); }
-            query.push(if heads { "('server', " } else { "(" })
-                .push_bind(user.clone()).push(", ").push_bind(session.clone())
-                .push(if heads { ", 'main')" } else { ")" });
-        }
-        query.push(")").push(next);
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub async fn expire_leases_for_test(&self) {
+        sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE observation_lease_token LIKE ?")
+            .bind(format!("{}:%", self.owner)).execute(self.pool.get()).await.unwrap();
     }
-    query.push(" WHERE h.completed_turn > COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(w.state_json, '$.observation.observed_turn')) AS SIGNED), 0)
-        AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(w.state_json, '$.observation.retry_at_ms')) AS SIGNED), 0)
-            <= CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
-        ORDER BY h.owner_user_id, h.session_id");
-    query
-}
-
-fn candidate_sql() -> &'static str {
-    "SELECT h.head_json, h.observation_json, h.isolation_domain, h.owner_user_id, h.session_id,
-                h.branch_id, h.completed_turn AS head_completed_turn
-         FROM (
-           SELECT h.*, CAST(JSON_EXTRACT(w.state_json, '$.observation') AS CHAR) AS observation_json
-           FROM (SELECT * FROM session_context_heads WHERE isolation_domain = 'server'
-                 AND branch_id = 'main' AND owner_user_id = ? AND session_id = ?) h
-           JOIN (SELECT user_id, session_id FROM agent_sessions
-                 WHERE user_id = ? AND session_id = ? AND delete_requested_at IS NULL) s
-             ON s.user_id = h.owner_user_id AND s.session_id = h.session_id
-           LEFT JOIN (SELECT user_id, session_id, state_json FROM agent_session_memory_work
-                      WHERE user_id = ? AND session_id = ?) w
-             ON w.user_id = h.owner_user_id AND w.session_id = h.session_id
-           WHERE h.head_json IS NOT NULL AND h.completed_turn > 0
-             AND h.completed_turn > COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(w.state_json, '$.observation.observed_turn')) AS SIGNED), 0)
-             AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(w.state_json, '$.observation.retry_at_ms')) AS SIGNED), 0)
-                 <= CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
-             AND EXISTS (SELECT 1 FROM sweeper_leases l WHERE l.sweeper_name = ?
-                         AND l.owner_pod_id = ? AND l.expires_at > NOW(6))
-         ) h"
 }
 
 #[cfg(test)]
@@ -382,8 +279,12 @@ mod tests {
         .await
         .unwrap();
         let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "EXPLAIN ANALYZE FORCE EXECUTE observation_plan USING {}",
-            variables.join(",")
+            "EXPLAIN ANALYZE FORCE EXECUTE observation_plan{}",
+            if variables.is_empty() {
+                String::new()
+            } else {
+                format!(" USING {}", variables.join(","))
+            }
         )))
         .fetch_all(&mut *connection)
         .await
@@ -425,8 +326,7 @@ mod tests {
         let store = SessionObservationStore::new(pool.clone());
         let mut cursor = None;
         let mut captured = None;
-        let mut catalog_bound = None;
-        for turn in 1..=3 {
+        for turn in 1..=4 {
             let reservation = match coordinator
                 .acquire_writer_and_reserve_turn(
                     &key,
@@ -451,7 +351,7 @@ mod tests {
                         completed_turn: turn,
                         journal_event_seq: u64::from(turn),
                         conversation_seq: u64::from(turn),
-                        compaction_generation: u64::from(turn == 3),
+                        compaction_generation: u64::from(turn >= 3),
                         config_version_id: None,
                         mode: if turn == 3 {
                             CanonicalDeltaModeV1::Replace
@@ -470,14 +370,6 @@ mod tests {
                 CoordinatorMutationV1::Applied { cursor } => cursor,
                 other => panic!("unexpected commit: {other:?}"),
             });
-            let bound = store.catalog_high_water().await.unwrap();
-            if let Some(previous) = catalog_bound {
-                assert_eq!(
-                    bound, previous,
-                    "re-admission/Append/Replace must not allocate new catalog identities"
-                );
-            }
-            catalog_bound = Some(bound);
             if let Some(candidate) = captured.take() {
                 let materialized = store.materialize(&candidate).await.unwrap();
                 assert_eq!(materialized.head, *candidate.head.as_ref().unwrap());
@@ -487,63 +379,95 @@ mod tests {
                     format!("turn-{}", turn - 1)
                 );
                 // SQL execution success is not a durable acknowledgement.
-                sqlx::query("UPDATE sweeper_leases SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE sweeper_name = 'plan-test'")
+                sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE session_id = 'captured-head'")
                     .execute(pool.get()).await.unwrap();
                 assert!(
-                    store
-                        .finish("plan-test", "plan-worker", &candidate, true)
-                        .await
-                        .is_err(),
+                    store.finish(&candidate, true).await.is_err(),
                     "an expired lease must not acknowledge an unstored checkpoint"
                 );
-                sqlx::query("UPDATE sweeper_leases SET expires_at = DATE_ADD(NOW(6), INTERVAL 1 HOUR) WHERE sweeper_name = 'plan-test'")
+                sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_ADD(NOW(6), INTERVAL 90 SECOND) WHERE session_id = 'captured-head'")
                     .execute(pool.get()).await.unwrap();
-                store
-                    .finish("plan-test", "plan-worker", &candidate, true)
-                    .await
-                    .unwrap();
+                store.finish(&candidate, true).await.unwrap();
                 assert!(
-                    store
-                        .finish("plan-test", "plan-worker", &candidate, false)
-                        .await
-                        .is_err(),
+                    store.finish(&candidate, false).await.is_err(),
                     "a stale revision must not acknowledge a rejected retry clock"
                 );
             }
-            // Finishing a captured older turn must leave the new turn pending.
-            let candidate = store
-                .next(
-                    "plan-test",
-                    "plan-worker",
-                    &key.owner_user_id,
-                    &key.session_id,
-                )
-                .await
-                .unwrap()
-                .expect("newer committed turn remains eligible");
+            // Finishing an older turn leaves new work pending. After a fully
+            // acknowledged idle head, a later completion must re-arm it too.
+            let candidate = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(candidate) = store
+                        .claim(&key.owner_user_id, &key.session_id)
+                        .await
+                        .unwrap()
+                    {
+                        break candidate;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("committed work must become due");
             assert_eq!(candidate.turn, turn);
-            captured = Some(candidate);
+            if turn == 3 {
+                assert_eq!(
+                    store.materialize(&candidate).await.unwrap().messages,
+                    vec![json!({"role":"assistant", "content":"turn-3"})]
+                );
+                store.finish(&candidate, true).await.unwrap();
+                assert!(
+                    store
+                        .claim(&key.owner_user_id, &key.session_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                captured = Some(candidate);
+            }
         }
         let candidate = captured.unwrap();
         assert_eq!(
             store.materialize(&candidate).await.unwrap().messages,
-            vec![json!({"role":"assistant", "content":"turn-3"})]
+            vec![
+                json!({"role":"assistant", "content":"turn-3"}),
+                json!({"role":"assistant", "content":"turn-4"})
+            ]
         );
-        store
-            .finish("plan-test", "plan-worker", &candidate, true)
-            .await
-            .unwrap();
+        store.finish(&candidate, true).await.unwrap();
         assert!(
             store
-                .next(
-                    "plan-test",
-                    "plan-worker",
-                    &key.owner_user_id,
-                    &key.session_id
-                )
+                .claim(&key.owner_user_id, &key.session_id)
                 .await
                 .unwrap()
                 .is_none()
+        );
+        // A deletion requested before claim retires the pending marker without
+        // returning a candidate, even when the canonical head still exists.
+        sqlx::query(
+            "UPDATE agent_sessions SET delete_requested_at=NOW(6) WHERE user_id=? AND session_id=?",
+        )
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE session_context_heads SET observation_due_at=NOW(6) WHERE owner_user_id=? AND session_id=?")
+            .bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .claim(&key.owner_user_id, &key.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .due_keys()
+                .await
+                .unwrap()
+                .contains(&(key.owner_user_id, key.session_id))
         );
     }
 
@@ -579,79 +503,52 @@ mod tests {
             "INSERT INTO session_context_heads (isolation_domain,owner_user_id,session_id,branch_id,head_json,completed_turn,conversation_seq,compaction_generation)
              SELECT 'server', 'synthetic-owner', LPAD(CAST(result AS CHAR),8,'0'), 'main', '{}', 1, 1, 0 FROM generate_series(1,100000) g",
             "INSERT INTO agent_sessions (user_id,session_id,status) SELECT owner_user_id,session_id,'active' FROM session_context_heads",
-            "INSERT INTO agent_session_memory_work (user_id,session_id,state_json,complete) SELECT owner_user_id,session_id,JSON_OBJECT('observation',JSON_OBJECT('observed_turn',1)),1 FROM session_context_heads",
+            "UPDATE session_context_heads SET observation_json = JSON_OBJECT('observed_turn',1)",
             "INSERT INTO conversation_manifest_nodes (isolation_domain,owner_user_id,session_id,branch_id,manifest_root,completed_turn,conversation_seq,compaction_generation,canonical_segment_bytes,total_canonical_bytes,total_message_count,manifest_json,content_json)
              SELECT isolation_domain,owner_user_id,session_id,branch_id,LPAD(session_id,64,'0'),1,1,0,1,1,1,'{}','[]' FROM session_context_heads",
             "INSERT INTO session_forks (isolation_domain,owner_user_id,fork_id,parent_session_id,parent_branch_id,child_session_id,child_branch_id,idempotency_hash,request_hash,state,manifest_json)
              SELECT isolation_domain,owner_user_id,session_id,'parent','main',session_id,'main',LPAD(session_id,64,'0'),LPAD(session_id,64,'0'),'active','{}' FROM session_context_heads",
-            "INSERT INTO sweeper_leases (sweeper_name,owner_pod_id,expires_at) VALUES ('plan-test','plan-worker',DATE_ADD(NOW(), INTERVAL 1 HOUR))",
         ] { sqlx::query(statement).execute(pool.get()).await.unwrap(); }
         let store = SessionObservationStore::new(pool.clone());
-        let page = store.key_page(50000).await.unwrap();
-        assert_eq!(page.len(), 64);
-        assert_eq!(page.first().unwrap().1, "00050001");
-        assert_eq!(page.last().unwrap().1, "00050064");
-        // Empty eligibility must still yield a next page, rather than restarting
-        // discovery at the beginning or loading any of the 100000 transcripts.
-        assert!(store.pending_keys(50000, &page).await.unwrap().is_empty());
-        let next = store.key_page(50064).await.unwrap();
-        assert_eq!(next.first().unwrap().1, "00050065");
-        for sparse in [false, true] {
-            // Check the production discovery storage operator, not only the
-            // eligibility/payload queries. Cover first, middle and last pages.
-            for after in [0_u64, 50000, 99936] {
-                let plan = prepared_plan(
-                    &pool,
-                    KEY_PAGE_SQL,
-                    &[serde_json::json!(after), serde_json::json!(after + 64)],
-                )
-                .await;
-                assert_scans_bounded(&plan, 8192);
-                assert_eq!(store.key_page(after).await.unwrap().len(), 64);
-            }
-            assert!(store.catalog_high_water().await.unwrap() >= 100000);
-            if sparse {
-                sqlx::query("UPDATE agent_session_memory_work SET state_json = '{}' WHERE user_id = 'synthetic-owner' AND session_id = '00050032'")
-                    .execute(pool.get()).await.unwrap();
-                assert_eq!(
-                    store.pending_keys(50000, &page).await.unwrap(),
-                    vec![("synthetic-owner".into(), "00050032".into())]
-                );
-            }
-            let builder = eligibility_query(50000, &page);
-            let arguments: Vec<_> = [serde_json::json!(50000), serde_json::json!(50064)]
-                .into_iter()
-                .chain((0..3).flat_map(|_| {
-                    page.iter().flat_map(|(user, session)| {
-                        [serde_json::json!(user), serde_json::json!(session)]
-                    })
-                }))
-                .collect();
-            let plan = prepared_plan(&pool, builder.sql().as_str(), &arguments).await;
-            // MatrixOne reads storage blocks (8192 rows), even for a 64-key IN.
-            // A full catalog/JSON join would read all 100000 rows and fail.
-            assert_scans_bounded(&plan, 8192);
-            assert!(!plan.join("\n").contains("conversation_manifest_nodes"));
-            let candidate = prepared_plan(
-                &pool,
-                candidate_sql(),
-                serde_json::json!([
-                    "synthetic-owner",
-                    "00050032",
-                    "synthetic-owner",
-                    "00050032",
-                    "synthetic-owner",
-                    "00050032",
-                    "plan-test",
-                    "plan-worker"
-                ])
-                .as_array()
-                .unwrap(),
-            )
-            .await;
-            assert_scans_bounded(&candidate, 8192);
-            assert!(!candidate.join("\n").contains("conversation_manifest_nodes"));
+        assert!(store.due_keys().await.unwrap().is_empty());
+        let plan = prepared_plan(&pool, DUE_SQL, &[]).await;
+        assert_scans_bounded(&plan, 8192);
+        // Due discovery skips unchanged history, including empty/sparse active
+        // sets. It must not join payloads or retained checkpoint history.
+        for session in ["00000001", "00050032", "00100000"] {
+            sqlx::query("UPDATE session_context_heads SET observation_due_at=NOW(6), observation_json=NULL WHERE owner_user_id='synthetic-owner' AND session_id=?")
+                .bind(session).execute(pool.get()).await.unwrap();
         }
+        assert_eq!(store.due_keys().await.unwrap().len(), 3);
+        let plan = prepared_plan(&pool, DUE_SQL, &[]).await;
+        assert_scans_bounded(&plan, 8192);
+        assert!(!plan.join("\n").contains("conversation_manifest_nodes"));
+        let candidate = prepared_plan(
+            &pool,
+            CANDIDATE_SQL,
+            &[
+                serde_json::json!("synthetic-owner"),
+                serde_json::json!("00050032"),
+                serde_json::json!("unused-token"),
+            ],
+        )
+        .await;
+        assert_scans_bounded(&candidate, 8192);
+        // Updating the physical due key must also stay selective, including
+        // Session deletion checks and secondary/unique-index maintenance.
+        let claim = prepared_plan(
+            &pool,
+            CLAIM_SQL,
+            &[
+                serde_json::json!("plan-token"),
+                serde_json::json!("synthetic-owner"),
+                serde_json::json!("00050032"),
+                serde_json::json!("synthetic-owner"),
+                serde_json::json!("00050032"),
+            ],
+        )
+        .await;
+        assert_scans_bounded(&claim, 8192);
         let plan = prepared_plan(
             &pool,
             &crate::session_context_coordinator::canonical_materialization_sql(),
@@ -681,25 +578,6 @@ mod tests {
             "INSERT INTO conversation_manifest_nodes (isolation_domain,owner_user_id,session_id,branch_id,manifest_root,completed_turn,conversation_seq,compaction_generation,canonical_segment_bytes,total_canonical_bytes,total_message_count,manifest_json,content_json)
              SELECT 'server','synthetic-owner','retained-generations','main',LPAD(CAST(result + 100000 AS CHAR),64,'0'),1,result,FLOOR((result - 1) / 1000),1,1,1,'{}','[]' FROM generate_series(1,100000) g",
         ] { sqlx::query(statement).execute(pool.get()).await.unwrap(); }
-        let candidate = prepared_plan(
-            &pool,
-            candidate_sql(),
-            serde_json::json!([
-                "synthetic-owner",
-                "retained-generations",
-                "synthetic-owner",
-                "retained-generations",
-                "synthetic-owner",
-                "retained-generations",
-                "plan-test",
-                "plan-worker"
-            ])
-            .as_array()
-            .unwrap(),
-        )
-        .await;
-        assert_scans_bounded(&candidate, 8192);
-        assert!(!candidate.join("\n").contains("conversation_manifest_nodes"));
         let materialization = prepared_plan(
             &pool,
             &crate::session_context_coordinator::canonical_materialization_sql(),

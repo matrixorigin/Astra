@@ -627,64 +627,66 @@ cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
   ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
 ```
 
-The raw limit is 23 statements: the original 20 plus a selective canonical
-materialization read, early admission, and checkpoint receipt verification.
-Auto similarly allows 32 nonperiodic / 34 raw (originally 29 / 31). These explicit
-reads avoid broad payload scans, denied-user materialization, and false
-acknowledgement merely to save statements; all are included in capture.
-Observation never inserts or locks a memory-job row during
-chat settlement. The managed background owner discovers committed canonical
-heads and coalesces each Session to its latest completed turn. It persists only
-a small checkpoint with an independent retry clock, not another transcript.
-The canonical coordinator validates materialized content and fork lineage.
+The scoped nonperiodic limits are 23 statements for ordinary chat, 33 for Auto
+and 20 with observation unconfigured. Every SQL statement remains in the raw
+total. At most one exact account/session authentication snapshot is allowed;
+exact control reads have a separate bound of `ceil(measured_elapsed_ms / 2000)`.
+Thus the raw envelope is the core limit plus that snapshot and the elapsed timer
+allowance. Extra business SQL, duplicate authentication reads or polling faster
+than the two-second contract still fail. This avoids assuming a loaded CI host
+will always finish before the second control tick.
 
-The probe measures each request on an initialized server pool, including all
-transactions, periodic control reads and the real observer's SQL. Pool and
-background leader initialization happen before capture, as in server startup;
-no statements are filtered out inside the measured interval. Warm-context setup
-consumes its complete SSE response and waits for observer completion before the
-next request. Capture ends only after observation discovery, fresh authority,
-HTTP dispatch, and the checkpoint write finish. The Router fixture has no
-managed timers, so it drives that same production owner for its exact Session.
-It requires the expected `eligible` and `success` metrics with `mode="canonical"`;
-only eligibility is signalled by chat. Eligibility alone cannot end capture.
-After capture, a fixture assertion separately verifies the persisted observed
-turn. Errors, dropped work, extra work, missing completions, or skipped outcomes
-cannot satisfy the authorized HTTP-path measurement. Unconfigured deployment
-coverage separately proves that no observer job or background owner is created.
+These are **scoped request-plus-attempt budgets**, not fleet totals. The Router
+fixture drives one Session through the production claim, authority,
+materialization, dispatch and receipt path. Pool setup and warm-up finish before
+capture; it ends only after the expected success and durable receipt. Denial,
+error and dispatch metrics alone cannot pass.
 
-The Session-scoped SQL probe does not measure global catalog traversal. The
-ignored `astra-services` test
+Observation adds no job insertion or synchronous SQL statement to chat settlement.
+The existing canonical completion write marks its head due, preserving active
+leases and retry deadlines. Changing that due time does update the physical key
+and indexes, so equal SQL counts are not a claim of identical database work.
+Unconfigured deployments do not poll or dispatch observations, but retain the
+canonical due fact for later recovery.
+
+`canonical_observation_burst_recovers_without_chat_job_writes` separately measures
+the actual managed loop with two owners, 1,000 canonical Sessions, a held slow
+observer, 16 paced arrivals and 4,096 deleted historical identities. Raw active
+capture includes **all** observation-recovery statements with the synthetic
+observer, receipt verification polls and arrival setup. Authority/HTTP SQL is
+covered by the scoped integration probes; unrelated Server maintenance loops
+are outside this observation scheduler fixture. It then restarts two idle owners for 5.2 seconds, first with the
+observed history retained and then deleted. Each interval must contain only due
+reads (at most eight total), with no lease writes or transcript reads. This makes
+idle fleet cost visible independently of the marginal per-Session attempt.
+The test first verifies named independent Sessions progress while a call remains
+held, then cancels that owner and separately waits for the full backlog and paced
+arrivals. Fairness does not require draining a thousand Sessions before the held
+request's production deadline. It also verifies the eight-attempt bound,
+non-overlapping claims, handoff and every durable receipt before shutdown.
+
+The ignored services test
 `session_observation::tests::retained_catalog_plans_keep_payload_reads_selective`
-runs in the online services lane and seeds 100,000 synthetic retained Sessions
-using the real schema. Prepared `EXPLAIN ANALYZE` statements exercise the actual
-canonical materializer, physical key-page query at first/middle/last cursors,
-64-key eligibility query, and selected-Session query in
-both fully observed and sparse-work states. It checks storage `inputRows`, not
-just returned rows or SQL count; page eligibility and selected-head discovery
-must not read transcripts. A second fixture retains 100 generations of 1,000
-nodes in one live Session and checks the canonical current-generation scan.
-Synthetic plan bodies are never passed through the application decoder. A
-separate valid Session uses real Append/Replace commits between head capture and
-materialization to verify pinned transcripts and checkpoint watermarks. It also
-rejects expired-lease/stale-revision checkpoint receipts and checks that repeat
-admission/Append/Replace do not consume new catalog identities.
-MatrixOne may read an 8,192-row storage block for an eligibility key set. Physical
-catalog intervals constrain primary-key storage reads independently of catalog
-size; a complete sweep remains linear in allocated identities, including gaps.
-Run it directly with `ASTRA_TEST_DB_IT=1 cargo test -p astra-services --lib
-session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
--- --exact --ignored --nocapture` against a dedicated local database service.
+uses the real schema with 100,000 retained heads. Prepared `EXPLAIN ANALYZE`
+checks actual storage input for empty and sparse due work, a selected head,
+claim/index-maintenance writes and canonical materialization. The due timestamp leads the primary key; a nullable
+secondary index was tested and rejected because it scanned retained history.
+The full SessionKey remains UNIQUE. The regression also covers a live Session
+with 100 generations of 1,000 nodes, bounding current-generation reads. Valid
+Append/Replace commits separately exercise captured-head materialization and
+acknowledging an older turn while a newer one remains pending. Expired claims and
+stale receipts must fail rather than appear acknowledged. Synthetic plan bodies
+are never decoded as application content.
 
-`canonical_observation_burst_recovers_without_chat_job_writes` runs the actual
-managed scheduling loop with two owners, 1,000 canonical Sessions, a held slow
-observer and new arrivals. It covers empty allocated intervals, bounded
-concurrency, independent progress, cancellation, lease handoff and durable
-receipts. `observer_expiry_during_dispatch_does_not_acknowledge_progress` expires
-a lease while the backend is held. `denied_recovery_never_reads_manifest_payloads`
-captures SQL and history-work counters through recovery, requiring denial before
-manifest loading or payload serialization. Run each exact ignored test in its
-own process, as with the SQL probe.
+Run it with `ASTRA_TEST_DB_IT=1 cargo test -p astra-services --lib
+session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
+-- --exact --ignored --nocapture` against a dedicated local database.
+
+`observer_expiry_during_dispatch_does_not_acknowledge_progress` expires a claim
+while the backend is held. `denied_recovery_never_reads_manifest_payloads` captures
+SQL and history counters, requiring denial before manifest loading or payload
+serialization. Run each exact ignored test in its own process, including the
+managed-loop test, because SQL tracing uses a global subscriber.
 
 The offline `ephemeral_burst_does_not_hold_cleanup_and_cancellation_releases_capacity`
 and `ephemeral_observer_burst_delivers_terminal_and_releases_run_resources` tests
@@ -694,8 +696,9 @@ database or live model provider.
 
 The readonly-round comparison accounts for exact periodic control reads and
 at most one account/session authentication snapshot when its 30-second cache
-expires. Those statements still count toward the raw 23-statement limit;
-repeated authentication snapshots or any other extra readonly-round SQL fail.
+expires. Those statements still count toward the measured raw total and its
+time-bounded envelope; repeated authentication snapshots or any other extra
+readonly-round SQL fail.
 The HTTP fixture binds both the Memoria URL and its master credential to the
 strict local mock. Enabling self-hosted access exercises the authenticated
 observer request, including its authority queries; a run with access disabled

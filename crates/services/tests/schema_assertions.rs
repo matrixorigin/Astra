@@ -1681,7 +1681,9 @@ async fn phase1_run_durability_schema_contract() {
     );
     let context_heads = column_names(&pool, &schema, "session_context_heads").await;
     for expected in [
-        "catalog_seq",
+        "observation_json",
+        "observation_due_at",
+        "observation_lease_token",
         "head_json",
         "canonical_root_hash",
         "latest_manifest_root",
@@ -1702,8 +1704,14 @@ async fn phase1_run_durability_schema_contract() {
     }
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_context_heads").await,
-        ["catalog_seq"],
-        "catalog recovery must page physical head identities without sorting SessionKeys"
+        [
+            "observation_due_at",
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id"
+        ],
+        "idle recovery must physically exclude completed history"
     );
     assert_eq!(
         unique_key_columns(
