@@ -202,8 +202,17 @@ An attempted send remains `dispatched` for result replay. Each connection owns
 at most one claimed batch; claim queries, settlement owners, and active
 settlement queries have separate limits. Returned settlement errors retry for up to 30 seconds; an
 in-flight query remains owned until it returns. If ownership or retries are
-exhausted, the row stays `dispatched` with an unknown outcome and is never
-returned to the claimable queue. A Server crash loses the in-memory proof that a claimed
+exhausted, the outcome is unconfirmed and the dispatch is not deliberately
+returned to the claimable queue. The
+`astra_edge_dispatch_settlement_unknown_total` counter records claimed
+unsent dispatches whose durable terminalization could not be confirmed,
+including direct delivery and relay settlement. A lost response may mean the
+write committed, or another terminal result may have won. Custom dispatch
+adapters must implement the direct-settlement reporting hook to include their
+direct outcomes. The
+`astra_edge_dispatch_observation_unknown_total` counter records dispatch
+identities reported to at least one waiter after an unknown observation error
+exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
 The number of retained batches is bounded by connection and settlement ownership,
 but their bytes are not: outbound requests are materialized whole. Many active
@@ -232,7 +241,12 @@ reconnect. Pools of one or two connections use recovery probes to preserve
 capacity for normal requests. The shared observer and registry heartbeat still
 access the database; this is not a claim of zero idle SQL or bounded active
 backlog scans. The dispatch index uses the fresh schema; there is no automatic
-upgrade of the previous index shape.
+upgrade of the previous index shape. Cleanup correlates live-run custody through the
+invocation identity inside `payload_json` on purpose: the `user_id` column
+stores the edge dispatch owner, not the session principal that owns the
+`agent_runs` row, so that JSON path is the only carrier of the custody key,
+and `agent_runs` has a `(user_id, run_id)` primary key. The actual cleanup
+plan depends on MatrixOne's optimizer.
 
 ## Durable sync dependency
 
