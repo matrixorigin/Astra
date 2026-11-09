@@ -97,6 +97,40 @@ fn append_envelope_cause(
     }
 }
 
+/// Extract documented provider correlation headers. Anthropic uses
+/// `request-id`; OpenAI-compatible providers commonly use `x-request-id`.
+fn llm_provider_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id"].iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(astra_core::validated_llm_provider_request_id)
+    })
+}
+
+/// Attach an already validated provider request ID at the common error owner,
+/// including terminal auth/quota paths that return before later enrichment.
+fn attach_provider_request_id(
+    mut error: astra_core::ClassifiedError,
+    status: u16,
+    request_id: Option<&str>,
+) -> astra_core::ClassifiedError {
+    let Some(request_id) = request_id else {
+        return error;
+    };
+    if !error.message.contains(request_id) {
+        error.message = append_envelope_cause(error.message, None, Some(request_id));
+    }
+    let mut details = error
+        .details_json
+        .as_deref()
+        .and_then(|details| serde_json::from_str::<Value>(details).ok())
+        .unwrap_or_else(|| json!({}));
+    details["http_status"] = Value::from(status);
+    details["request_id"] = Value::String(request_id.to_owned());
+    error.with_details_json(details.to_string())
+}
+
 /// Parse only the versioned envelope emitted by the trusted MOI model gateway.
 /// The provider message is deliberately ignored: only bounded machine fields
 /// cross the provider boundary, so echoed prompts, credentials, and arbitrary
@@ -172,14 +206,15 @@ fn moi_model_gateway_error(
 /// Only explicit machine fields identify provider quota or credentials. A
 /// generic 403 (including upstream_forbidden) proves neither cause. Never
 /// forward provider text: even an auth error body may echo arbitrary secrets.
-fn provider_access_error(status: u16, body: &str) -> Option<astra_core::ClassifiedError> {
+fn provider_access_error(
+    status: u16,
+    error: Option<&astra_core::StructuredLlmError>,
+) -> Option<astra_core::ClassifiedError> {
     use astra_core::ErrorKind;
-    let value = serde_json::from_str::<Value>(body).ok();
-    let code = value.as_ref().and_then(|value| {
-        value
-            .pointer("/error/code")
-            .and_then(Value::as_str)
-            .or_else(|| value.pointer("/error/type").and_then(Value::as_str))
+    let code = error.and_then(|error| {
+        error
+            .error_field("code")
+            .or_else(|| error.error_field("type"))
     });
     let kind = match (status, code) {
         (403 | 429, Some("insufficient_quota" | "insufficient_balance")) => {
@@ -206,12 +241,11 @@ fn provider_access_error(status: u16, body: &str) -> Option<astra_core::Classifi
 /// Keep the billing owner's machine-readable reason without forwarding an
 /// arbitrary provider body (which can echo credentials). Both HTTP adapters
 /// use this boundary; 402 is terminal and must never trigger login or retries.
-fn payment_required_error(body: &str) -> astra_core::ClassifiedError {
-    let value = serde_json::from_str::<Value>(body).ok();
-    let code = value
-        .as_ref()
-        .and_then(|value| value.pointer("/error/code"))
-        .and_then(Value::as_str)
+fn payment_required_error(
+    error: Option<&astra_core::StructuredLlmError>,
+) -> astra_core::ClassifiedError {
+    let code = error
+        .and_then(|error| error.error_field("code"))
         .filter(|code| {
             matches!(
                 *code,
@@ -6303,10 +6337,7 @@ async fn call_prepared_llm_with_total_budget(
             .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let request_id = headers
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .and_then(astra_core::validated_llm_provider_request_id);
+        let request_id = llm_provider_request_id(headers);
 
         let remaining = total_budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -6391,20 +6422,19 @@ async fn call_prepared_llm_with_total_budget(
             }
         };
 
-        // TaaS-style error envelopes carry a per-request id; surface it as a
-        // structured field on provider HTTP error logs for cross-system
-        // correlation. Empty when the body has no structured envelope.
-        let body_request_id = astra_core::structured_llm_error_request_id(&text);
-        // The whitelisted envelope code (a fixed protocol token) classifies
-        // the failure authoritatively and is the only provider-supplied cause
-        // allowed into user-visible messages besides the validated request id.
-        let envelope_code = astra_core::structured_llm_error_code(&text);
+        // Parse the response once and reuse its machine facts, semantic cause,
+        // and validated correlation ID across all streaming classifiers.
+        let structured_body = astra_core::StructuredLlmError::parse(&text);
+        let body_request_id = structured_body.as_ref().and_then(|error| error.request_id());
+        let envelope_code = structured_body.as_ref().and_then(|error| error.code());
+        let response_request_id = body_request_id.as_deref().or(request_id.as_deref());
 
         let direct_access_error = (subscription.is_none()
             && !uses_moi_model_gateway_error_contract(header_overrides)
             && model_gateway_error_contract.is_none())
-        .then(|| provider_access_error(status, &text))
-        .flatten();
+        .then(|| provider_access_error(status, structured_body.as_ref()))
+        .flatten()
+        .map(|error| attach_provider_request_id(error, status, response_request_id));
         let structured_error = if let Some(classified) = direct_access_error {
             Some(ProviderHttpRejection {
                 classified,
@@ -6416,7 +6446,11 @@ async fn call_prepared_llm_with_total_budget(
             && model_gateway_error_contract.is_none()
         {
             Some(ProviderHttpRejection {
-                classified: payment_required_error(&text),
+                classified: attach_provider_request_id(
+                    payment_required_error(structured_body.as_ref()),
+                    status,
+                    response_request_id,
+                ),
                 retryable: false,
             })
         } else if let Some(lease) = &lease {
@@ -6438,20 +6472,20 @@ async fn call_prepared_llm_with_total_budget(
         } else if (is_responses && !is_rate_limit_status(status) && !is_overload_status(status))
             || compatible_bad_request
         {
-            let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             // The structured envelope code is authoritative when present; the
             // Responses allowlist below only maps a few protocol codes and
             // would otherwise replace real causes (e.g. provider_schema_error)
             // with a generic invalid_request.
             let code = envelope_code.map(|(_, code)| code).or_else(|| {
-                body.pointer("/error/code")
-                    .and_then(Value::as_str)
+                structured_body
+                    .as_ref()
+                    .and_then(|error| error.error_field("code"))
                     .and_then(astra_core::model_wire::responses::provider_error)
                     .map(|(code, _)| code)
             });
-            let parameter = body
-                .pointer("/error/param")
-                .and_then(Value::as_str)
+            let parameter = structured_body
+                .as_ref()
+                .and_then(|error| error.error_field("param"))
                 .filter(|value| {
                     matches!(
                         *value,
@@ -6469,10 +6503,9 @@ async fn call_prepared_llm_with_total_budget(
                             | "max_output_tokens"
                     )
                 });
-            // Prefer the envelope's request id (TaaS issues req_<uuid> ids the
-            // header filter cannot see); the validated header id is the
-            // fallback for upstreams that only set x-request-id.
-            let correlation_id = body_request_id.as_deref().or(request_id.as_deref());
+            // Prefer the envelope's request id; the validated x-request-id or
+            // Anthropic request-id header is the fallback.
+            let correlation_id = response_request_id;
             let rejected_effort = (is_responses
                 && matches!(status, 400 | 422)
                 && matches!(
@@ -6514,14 +6547,20 @@ async fn call_prepared_llm_with_total_budget(
                         // a 413 gateway byte limit is not context overflow.
                         kind
                     } else if status == 400
-                        && !astra_core::has_structured_llm_error_facts(&text)
+                        && structured_body
+                            .as_ref()
+                            .is_some_and(|error| error.is_context_window_overflow())
+                    {
+                        astra_core::ErrorKind::ContextWindow
+                    } else if status == 400
+                        && !structured_body
+                            .as_ref()
+                            .is_some_and(|error| error.has_facts())
                         && astra_core::is_llm_context_window_error(&text)
                     {
                         // Prose needle matching is only for upstreams without
-                        // machine-readable error facts: a parsed provider
-                        // error with an unrecognized cause is bounded by the
-                        // HTTP status below, never re-read as context overflow
-                        // and funneled into compaction.
+                        // machine-readable error facts or the narrowly
+                        // documented Anthropic generic-family overflow above.
                         astra_core::ErrorKind::ContextWindow
                     } else {
                         provider_http_error_kind(status, code.unwrap_or("invalid_request"))
@@ -6559,7 +6598,8 @@ async fn call_prepared_llm_with_total_budget(
         // Likewise, an unsolicited gateway header is not trusted on BYOK routes.
         // Missing/mismatched gateway contracts retain only HTTP facts, never
         // a provider-body interpretation of gateway-owned billing or identity.
-        if let Some(error) = provider_access_error(status, "") {
+        if let Some(error) = provider_access_error(status, None) {
+            let error = attach_provider_request_id(error, status, response_request_id);
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
@@ -6578,7 +6618,7 @@ async fn call_prepared_llm_with_total_budget(
         // provider-side logs instead of a bare status (#19075). The body id
         // wins; the validated header id is the fallback so header-only
         // providers still correlate after retries are exhausted.
-        let terminal_request_id = body_request_id.as_deref().or(request_id.as_deref());
+        let terminal_request_id = response_request_id;
         last_err = append_envelope_cause(base_err.clone(), envelope_code, terminal_request_id);
 
         // Record rate-limit errors to cooldown tracker
@@ -6672,7 +6712,11 @@ async fn call_prepared_llm_with_total_budget(
         if let Some((kind, _)) = envelope_code {
             if !(kind == astra_core::ErrorKind::ContextWindow && status == 400) {
                 let message = append_envelope_cause(base_err, envelope_code, terminal_request_id);
-                let error = astra_core::ClassifiedError::new(kind, message);
+                let error = attach_provider_request_id(
+                    astra_core::ClassifiedError::new(kind, message),
+                    status,
+                    terminal_request_id,
+                );
                 finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
                 return Err(error);
             }
@@ -6684,15 +6728,21 @@ async fn call_prepared_llm_with_total_budget(
         // machine-readable error facts, so a parsed parameter rejection with
         // an unrecognized cause is bounded by the status ladder below
         // instead of authorizing compaction via message matching.
-        let context_overflow = matches!(
-            envelope_code,
-            Some((astra_core::ErrorKind::ContextWindow, _))
-        ) || (!astra_core::has_structured_llm_error_facts(&text)
-            && astra_core::is_llm_context_window_error(&text));
+        let context_overflow = structured_body
+            .as_ref()
+            .is_some_and(|error| error.is_context_window_overflow())
+            || (!structured_body
+                .as_ref()
+                .is_some_and(|error| error.has_facts())
+                && astra_core::is_llm_context_window_error(&text));
         if status == 400 && context_overflow {
-            let error = astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContextWindow,
-                format!("LLM error {status}: {text}"),
+            let error = attach_provider_request_id(
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContextWindow,
+                    format!("LLM error {status}: {text}"),
+                ),
+                status,
+                terminal_request_id,
             );
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
@@ -6700,13 +6750,31 @@ async fn call_prepared_llm_with_total_budget(
 
         // Other 400 errors
         if status == 400 {
-            let error =
-                astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, last_err);
+            let error = attach_provider_request_id(
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::InvalidRequest,
+                    last_err,
+                ),
+                status,
+                terminal_request_id,
+            );
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
 
-        let error = astra_core::ClassifiedError::new(last_kind, last_err);
+        // The final response owns its kind. In particular, an unstructured
+        // 413 after a retryable 500 is a terminal request-size rejection, not
+        // the previous attempt's ServerError.
+        let kind = provider_http_error_kind_with_projection(
+            status,
+            structured_body.as_ref(),
+            &text,
+        );
+        let error = attach_provider_request_id(
+            astra_core::ClassifiedError::new(kind, last_err),
+            status,
+            terminal_request_id,
+        );
         finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
         return Err(error);
     }
@@ -8438,6 +8506,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     };
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
+        let request_id = llm_provider_request_id(resp.headers());
         let response_contract_version = resp
             .headers()
             .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
@@ -8483,20 +8552,39 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
+        let structured_body = astra_core::StructuredLlmError::parse(&text);
+        let response_request_id = structured_body
+            .as_ref()
+            .and_then(|error| error.request_id())
+            .or(request_id);
         let ordinary_provider = !uses_moi_model_gateway_error_contract(header_overrides)
             && response_contract_version.is_none();
-        if let Some(error) =
-            provider_access_error(status, if ordinary_provider { &text } else { "" })
-        {
+        if let Some(error) = provider_access_error(
+            status,
+            if ordinary_provider {
+                structured_body.as_ref()
+            } else {
+                None
+            },
+        ) {
+            let error = attach_provider_request_id(error, status, response_request_id.as_deref());
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
         if status == 402 && ordinary_provider {
-            let error = payment_required_error(&text);
+            let error = attach_provider_request_id(
+                payment_required_error(structured_body.as_ref()),
+                status,
+                response_request_id.as_deref(),
+            );
             finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
             return Err(error);
         }
-        let kind = provider_http_error_kind(status, if ordinary_provider { &text } else { "" });
+        let kind = if ordinary_provider {
+            provider_http_error_kind_with_projection(status, structured_body.as_ref(), &text)
+        } else {
+            provider_http_error_kind(status, "")
+        };
         let message = if !ordinary_provider {
             format!("LLM request rejected: {status}")
         } else if kind == astra_core::ErrorKind::Auth {
@@ -8506,7 +8594,11 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
             format!("LLM non-stream request error {status}: {detail}")
         };
-        let error = astra_core::ClassifiedError::new(kind, message);
+        let error = attach_provider_request_id(
+            astra_core::ClassifiedError::new(kind, message),
+            status,
+            response_request_id.as_deref(),
+        );
         finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
         return Err(error);
     }
@@ -8907,6 +8999,15 @@ fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallRes
 
 /// Canonical HTTP recovery classification shared by inference protocols.
 fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
+    let structured = astra_core::StructuredLlmError::parse(body);
+    provider_http_error_kind_with_projection(status, structured.as_ref(), body)
+}
+
+fn provider_http_error_kind_with_projection(
+    status: u16,
+    structured: Option<&astra_core::StructuredLlmError>,
+    body: &str,
+) -> astra_core::ErrorKind {
     use astra_core::ErrorKind;
     if status == 401 {
         ErrorKind::Auth
@@ -8916,22 +9017,26 @@ fn provider_http_error_kind(status: u16, body: &str) -> astra_core::ErrorKind {
         ErrorKind::RateLimit
     } else if status >= 500 {
         ErrorKind::ServerError
-    } else if let Some(kind) = astra_core::structured_llm_error_kind(body) {
+    } else if let Some(kind) = structured.and_then(|error| error.kind()) {
         // Structured envelopes (e.g. TaaS) are authoritative: a 413 gateway
         // byte limit is a request-size problem, never context overflow.
         kind
     } else if status == 400
-        && !astra_core::has_structured_llm_error_facts(body)
+        && structured.is_some_and(|error| error.is_context_window_overflow())
+    {
+        // Anthropic documents prompt overflow as the generic
+        // invalid_request_error family plus a specific semantic cause.
+        ErrorKind::ContextWindow
+    } else if status == 400
+        && !structured.is_some_and(|error| error.has_facts())
         && astra_core::is_llm_context_window_error(body)
     {
-        // Prose needle matching is only for upstreams without
-        // machine-readable error facts: a parsed provider error with an
-        // unrecognized cause is bounded by the status ladder (400 →
-        // InvalidRequest), never re-read as context overflow and funneled
-        // into compaction. Only an explicit context-overflow code (above)
-        // may claim ContextWindow once structured facts are present.
+        // Unrecognized structured causes remain bounded by HTTP status;
+        // unstructured upstreams retain the existing prose fallback.
         ErrorKind::ContextWindow
-    } else if status == 400 {
+    } else if matches!(status, 400 | 413) {
+        // HTTP 413 is a terminal request-size rejection even for HTML bodies;
+        // it is neither model context overflow nor a retryable server fault.
         ErrorKind::InvalidRequest
     } else {
         ErrorKind::Unknown
@@ -9046,12 +9151,12 @@ mod tests {
     #[test]
     fn payment_required_preserves_owner_codes_without_echoing_provider_secrets() {
         for code in ["insufficient_credit", "monthly_spend_limit_exceeded"] {
-            let error = super::payment_required_error(
-                &serde_json::json!({
-                    "error": {"code": code, "message": "private-provider-credential"}
-                })
-                .to_string(),
-            );
+            let body = serde_json::json!({
+                "error": {"code": code, "message": "private-provider-credential"}
+            })
+            .to_string();
+            let structured = astra_core::StructuredLlmError::parse(&body);
+            let error = super::payment_required_error(structured.as_ref());
             assert_eq!(error.kind, astra_core::ErrorKind::PaymentRequired);
             assert!(!error.kind.is_retryable());
             assert!(error.message.contains(code));
@@ -9064,7 +9169,8 @@ mod tests {
             "malformed-private-body",
             r#"{"error":{"code":"private-provider-credential"}}"#,
         ] {
-            let error = super::payment_required_error(body);
+            let structured = astra_core::StructuredLlmError::parse(body);
+            let error = super::payment_required_error(structured.as_ref());
             assert_eq!(error.message, "LLM payment required (402)");
             assert!(!format!("{error:?}").contains("private-"));
         }
@@ -17266,6 +17372,34 @@ mod tests {
         }
     }
 
+    fn collect_provider_call<'a>(
+        base: &'a str,
+        messages: &'a [Value],
+        provider: &'static str,
+    ) -> LlmCall<'a> {
+        let mut call = collect_call(base, messages);
+        call.route.provider = provider;
+        call
+    }
+
+    async fn provider_http_error(
+        base: &str,
+        provider: &'static str,
+        streaming: bool,
+    ) -> astra_core::ClassifiedError {
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let call = collect_provider_call(base, &messages, provider);
+        if streaming {
+            call_llm_and_collect(call, LlmCancel::None)
+                .await
+                .expect_err("provider rejection must fail the streaming call")
+        } else {
+            call_llm_nonstream(global_llm_client(), call, std::time::Duration::from_secs(5))
+                .await
+                .expect_err("provider rejection must fail the non-stream call")
+        }
+    }
+
     /// Mock server that returns 400 with a TaaS-style invalid_request
     /// envelope carrying a hyphenated-uuid request id.
     async fn mock_400_invalid_request_envelope() -> Response {
@@ -17384,10 +17518,157 @@ mod tests {
         )
         .await
         .expect_err("unrecognized structured cause must fail the non-stream call");
-        // Even maximal context-window prose does not authorize compaction
-        // once machine-readable facts are present; only an explicit
-        // context_length_exceeded code may do that.
+        // Even maximal context-window prose does not authorize compaction for
+        // an unrecognized structured family; only an explicit overflow code
+        // or Anthropic's documented generic-family semantic cause may do that.
         assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn anthropic_prompt_too_long_is_context_overflow_in_both_http_adapters() {
+        const REQUEST_ID: &str = "req_011CSHoEeqs5C35K2UUqR7Fy";
+        const WITH_BODY_ID: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#;
+        const WITHOUT_BODY_ID: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"}}"#;
+
+        for streaming in [false, true] {
+            for (body, header) in [(WITH_BODY_ID, None), (WITHOUT_BODY_ID, Some(REQUEST_ID))] {
+                let app = Router::new().route(
+                    "/v1/messages",
+                    post(move || async move {
+                        let mut response = Response::builder().status(400);
+                        if let Some(request_id) = header {
+                            response = response.header("request-id", request_id);
+                        }
+                        response.body(Body::from(body)).unwrap()
+                    }),
+                );
+                let base = spawn_local_http_server(app).await;
+                let error = provider_http_error(&base, "anthropic", streaming).await;
+                assert_eq!(
+                    error.kind,
+                    astra_core::ErrorKind::ContextWindow,
+                    "streaming={streaming}, header={header:?}"
+                );
+                assert!(
+                    error.message.contains(REQUEST_ID),
+                    "missing correlated message (streaming={streaming}, header={header:?}): {}",
+                    error.message
+                );
+                let details: Value = serde_json::from_str(
+                    error.details_json.as_deref().expect("structured HTTP details"),
+                )
+                .expect("valid details");
+                assert_eq!(details["request_id"], REQUEST_ID);
+                assert_eq!(details["http_status"], 400);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn html_413_is_terminal_invalid_request_in_both_http_adapters() {
+        async fn html_413() -> Response {
+            Response::builder()
+                .status(413)
+                .body(Body::from(
+                    "<html><head><title>413 Request Entity Too Large</title></head></html>",
+                ))
+                .unwrap()
+        }
+
+        for streaming in [false, true] {
+            let app = Router::new().route("/chat/completions", post(html_413));
+            let base = spawn_local_http_server(app).await;
+            let error = provider_http_error(&base, "openai", streaming).await;
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+            assert!(!error.kind.is_retryable());
+            assert!(error.message.contains("413"), "{}", error.message);
+            assert!(!error.kind.guidance().contains("(400)"));
+            assert!(error.kind.guidance().contains("reduce request size"));
+        }
+    }
+
+    #[tokio::test]
+    async fn html_413_after_500_does_not_retain_retryable_server_error() {
+        let _backoff = set_test_retry_backoff_ms(0);
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(|State(Hit(hits)): State<Hit>| async move {
+                    if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Response::builder()
+                            .status(500)
+                            .body(Body::from("temporary upstream failure"))
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(413)
+                            .body(Body::from("<html>413 Request Entity Too Large</html>"))
+                            .unwrap()
+                    }
+                }),
+            )
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let error = provider_http_error(&base, "openai", true).await;
+        assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        assert!(!error.kind.is_retryable());
+        assert!(error.message.contains("413"), "{}", error.message);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn early_provider_errors_keep_validated_request_id_in_both_http_adapters() {
+        const REQUEST_ID: &str = "req_0123456789abcdef";
+        for (status, body, expected_kind) in [
+            (
+                401,
+                r#"{"error":{"code":"invalid_api_key","request_id":"req_0123456789abcdef"}}"#,
+                astra_core::ErrorKind::Auth,
+            ),
+            (
+                403,
+                r#"{"error":{"code":"invalid_api_key","request_id":"req_0123456789abcdef"}}"#,
+                astra_core::ErrorKind::Auth,
+            ),
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota","request_id":"req_0123456789abcdef"}}"#,
+                astra_core::ErrorKind::ProviderQuotaExhausted,
+            ),
+            (
+                402,
+                r#"{"error":{"code":"insufficient_credit","request_id":"req_0123456789abcdef"}}"#,
+                astra_core::ErrorKind::PaymentRequired,
+            ),
+        ] {
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || async move {
+                    Response::builder()
+                        .status(status)
+                        .header("x-request-id", REQUEST_ID)
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            );
+            let base = spawn_local_http_server(app).await;
+            for streaming in [false, true] {
+                let error = provider_http_error(&base, "openai", streaming).await;
+                assert_eq!(error.kind, expected_kind, "status={status}");
+                assert!(
+                    error.message.contains(REQUEST_ID),
+                    "status={status}, streaming={streaming}: {}",
+                    error.message
+                );
+                let details: Value = serde_json::from_str(
+                    error.details_json.as_deref().expect("structured HTTP details"),
+                )
+                .expect("valid details");
+                assert_eq!(details["request_id"], REQUEST_ID);
+                assert_eq!(details["http_status"], status);
+            }
+        }
     }
 
     /// Mock server that returns 413 with a context_length_exceeded envelope

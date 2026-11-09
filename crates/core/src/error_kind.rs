@@ -331,8 +331,8 @@ impl ErrorKind {
                  Reduce input size: drop older messages, summarize, or use a model with a larger context."
             }
             Self::InvalidRequest => {
-                "The request was rejected by the LLM provider (400). \
-                 This may indicate a bug in request assembly. Do NOT retry with the same parameters."
+                "The request was rejected by the LLM provider. Do NOT retry with the same parameters; \
+                 reduce request size if the provider reports a body-size limit."
             }
             Self::ContractViolation => {
                 "The runtime violated an internal lifecycle or delivery contract. \
@@ -664,27 +664,114 @@ impl From<String> for ClassifiedError {
 
 // ── Structured LLM provider error envelope ───────────────────────────────────
 
-/// Structured classification for provider error envelope bodies.
+/// One parsed provider error response, shared by all classifiers at an HTTP
+/// boundary. Keeping the parsed root avoids reparsing and cloning the same
+/// envelope for kind, machine facts, parameters, and correlation IDs.
 ///
 /// Gateways such as TaaS return
-/// `{"error":{"message","type","param","code","request_id"}}` where
-/// `error.code` (falling back to `error.type`) authoritatively distinguishes
-/// failures that text needles cannot: an HTTP 413 gateway byte limit
-/// (`request_body_too_large`) is a request-size problem, not model context
-/// overflow, and `invalid_request` / `provider_schema_error` are parameter or
-/// schema rejections, not server faults. `context_length_exceeded` is the only
-/// envelope code that means the model's context window was exceeded.
-///
-/// `body` may be the raw JSON body or a message that embeds it after a prefix
-/// (e.g. `"LLM error 413: {json}"`): the whole string is parsed first, then
-/// the suffix starting at the first `{`.
-///
-/// Returns `None` when the body carries no recognized code or type, so
-/// callers fall back to their existing text-needle classification for
-/// upstreams that do not emit structured envelopes.
+/// `{"error":{"message","type","param","code","request_id"}}`; Anthropic
+/// additionally places `request_id` at the top level. Explicit protocol codes
+/// classify authoritatively, while the generic Anthropic error family requires
+/// a specific semantic overflow cause.
+#[derive(Debug)]
+pub struct StructuredLlmError {
+    value: serde_json::Value,
+}
+
+impl StructuredLlmError {
+    /// Parse a raw provider body or a message with JSON appended after a
+    /// human-readable prefix. A JSON response without an `error` member is not
+    /// a provider error projection.
+    #[must_use]
+    pub fn parse(body: &str) -> Option<Self> {
+        let trimmed = body.trim();
+        let value = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .or_else(|| {
+                let start = trimmed.find('{')?;
+                serde_json::from_str::<serde_json::Value>(trimmed.get(start..)?).ok()
+            })?;
+        value.get("error")?;
+        Some(Self { value })
+    }
+
+    fn error(&self) -> &serde_json::Value {
+        // `parse` establishes this invariant.
+        self.value.get("error").expect("parsed provider error")
+    }
+
+    /// Borrow a string field from the provider's `error` object.
+    #[must_use]
+    pub fn error_field(&self, key: &str) -> Option<&str> {
+        self.error().get(key)?.as_str()
+    }
+
+    /// The whitelisted machine-readable cause and its recovery kind.
+    #[must_use]
+    pub fn code(&self) -> Option<(ErrorKind, &'static str)> {
+        let token = |key: &str| {
+            self.error_field(key)
+                .filter(|token| !token.trim().is_empty())
+        };
+        // A present but unrecognized `code` must not block a recognized
+        // `type`; only when neither classifies do callers fall back.
+        token("code")
+            .and_then(llm_error_envelope_code_class)
+            .or_else(|| token("type").and_then(llm_error_envelope_code_class))
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> Option<ErrorKind> {
+        self.code().map(|(kind, _)| kind)
+    }
+
+    /// Extract and validate either the OpenAI-compatible nested request ID or
+    /// Anthropic's documented top-level `request_id`.
+    #[must_use]
+    pub fn request_id(&self) -> Option<String> {
+        self.error_field("request_id")
+            .and_then(validated_llm_provider_request_id)
+            .or_else(|| {
+                self.value
+                    .get("request_id")?
+                    .as_str()
+                    .and_then(validated_llm_provider_request_id)
+            })
+    }
+
+    /// Whether machine-readable cause fields are present. A message-only
+    /// error object remains prose in JSON and does not count.
+    #[must_use]
+    pub fn has_facts(&self) -> bool {
+        ["code", "type", "param"].iter().any(|key| {
+            self.error_field(key)
+                .is_some_and(|token| !token.trim().is_empty())
+        })
+    }
+
+    /// Recognize an explicit context-overflow protocol code or Anthropic's
+    /// documented generic `invalid_request_error` family carrying the
+    /// specific `prompt is too long` cause. A specific code or output/input
+    /// parameter rejects prose interpretation, preserving the max_tokens fix.
+    #[must_use]
+    pub fn is_context_window_overflow(&self) -> bool {
+        if matches!(self.code(), Some((ErrorKind::ContextWindow, _))) {
+            return true;
+        }
+        self.error_field("code").is_none()
+            && self.error_field("type") == Some("invalid_request_error")
+            && self.error_field("param").is_none()
+            && self.error_field("message").is_some_and(|message| {
+                message.to_ascii_lowercase().contains("prompt is too long")
+            })
+    }
+}
+
+/// Classify only a recognized provider envelope code or type. Unrecognized
+/// machine facts return `None` so the HTTP owner can apply its status ladder.
 #[must_use]
 pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
-    structured_llm_error_code(body).map(|(kind, _)| kind)
+    StructuredLlmError::parse(body).and_then(|error| error.kind())
 }
 
 /// The whitelisted `error.code` of a provider error envelope, for surfacing
@@ -694,23 +781,7 @@ pub fn structured_llm_error_kind(body: &str) -> Option<ErrorKind> {
 /// show to users. Returns the classified kind alongside the code.
 #[must_use]
 pub fn structured_llm_error_code(body: &str) -> Option<(ErrorKind, &'static str)> {
-    let error = llm_error_envelope_error(body)?;
-    let token = |key: &str| {
-        error
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .filter(|token| !token.trim().is_empty())
-    };
-    // `code` wins when it classifies; OpenAI-compatible envelopes commonly
-    // carry `"code": null` (or omit it), so null/non-string/empty values fall
-    // back to `type`. A present but unrecognized `code` must not block a
-    // recognized `type` either: the envelope is still structured, so the
-    // recognized category (e.g. `invalid_request` on a parameter rejection)
-    // stays authoritative instead of dropping to text-needle guessing. Only
-    // when neither token classifies do callers fall back.
-    token("code")
-        .and_then(llm_error_envelope_code_class)
-        .or_else(|| token("type").and_then(llm_error_envelope_code_class))
+    StructuredLlmError::parse(body).and_then(|error| error.code())
 }
 
 /// Classify a single provider error-envelope code token.
@@ -742,6 +813,7 @@ pub fn llm_error_envelope_code_class(code: &str) -> Option<(ErrorKind, &'static 
 ///
 /// - `req_<uuid>` — TaaS and current OpenAI request ids.
 /// - `req_<hex>` — legacy OpenAI request ids (8..=96 hex digits).
+/// - `req_<24 ASCII alphanumerics>` — Anthropic request ids.
 /// - `<uuid>` — bare UUID request ids used by some gateways.
 ///
 /// Credential shapes (`sk-…`, `Bearer …`, `AKIA…`), free text, and overlong
@@ -768,19 +840,18 @@ pub fn validated_llm_provider_request_id(value: &str) -> Option<String> {
         is_uuid(token)
             || ((8..=MAX_REQ_HEX_LEN).contains(&token.len())
                 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            || (token.len() == 24 && token.bytes().all(|byte| byte.is_ascii_alphanumeric()))
     } else {
         is_uuid(value)
     };
     valid.then(|| value.to_string())
 }
 
-/// Extract `error.request_id` from a provider error envelope body for log
-/// correlation. Same parsing rules as [`structured_llm_error_kind`]; the id
-/// is validated by [`validated_llm_provider_request_id`] before use.
+/// Extract a nested `error.request_id` or Anthropic's top-level `request_id`
+/// for log correlation. The id is validated before use.
 #[must_use]
 pub fn structured_llm_error_request_id(body: &str) -> Option<String> {
-    let error = llm_error_envelope_error(body)?;
-    validated_llm_provider_request_id(error.get("request_id")?.as_str()?)
+    StructuredLlmError::parse(body).and_then(|error| error.request_id())
 }
 
 /// Whether the body carries a parsed provider error envelope with at least
@@ -794,32 +865,13 @@ pub fn structured_llm_error_request_id(body: &str) -> Option<String> {
 /// drive the failure kind: an unrecognized structured category is bounded by
 /// the status ladder instead of authorizing context compaction via needle
 /// matching, and only an explicit context-overflow code may claim
-/// [`ErrorKind::ContextWindow`]. A message-only error object is prose in
-/// JSON and does not count.
+/// [`ErrorKind::ContextWindow`], apart from the narrowly documented Anthropic
+/// generic-family overflow recognized by
+/// [`StructuredLlmError::is_context_window_overflow`]. A message-only error
+/// object is prose in JSON and does not count.
 #[must_use]
 pub fn has_structured_llm_error_facts(body: &str) -> bool {
-    llm_error_envelope_error(body).is_some_and(|error| {
-        ["code", "type", "param"].iter().any(|key| {
-            error
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|token| !token.trim().is_empty())
-        })
-    })
-}
-
-/// Parse the `error` object of a provider error envelope out of `body`,
-/// accepting either a raw JSON body or a message that embeds the JSON after a
-/// non-JSON prefix (e.g. `"LLM error 413: {...}"`).
-fn llm_error_envelope_error(body: &str) -> Option<serde_json::Value> {
-    let trimmed = body.trim();
-    let value = serde_json::from_str::<serde_json::Value>(trimmed)
-        .ok()
-        .or_else(|| {
-            let start = trimmed.find('{')?;
-            serde_json::from_str::<serde_json::Value>(trimmed.get(start..)?).ok()
-        })?;
-    value.get("error").cloned()
+    StructuredLlmError::parse(body).is_some_and(|error| error.has_facts())
 }
 
 // ── LLM error-message fallback classifier ────────────────────────────────────
@@ -1671,6 +1723,27 @@ mod tests {
     }
 
     #[test]
+    fn structured_context_overflow_requires_specific_semantic_cause() {
+        let anthropic = StructuredLlmError::parse(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
+        )
+        .expect("Anthropic envelope");
+        assert!(anthropic.is_context_window_overflow());
+
+        for body in [
+            r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
+            r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"some_future_type","code":"some_future_code"}}"#,
+            r#"{"error":{"message":"prompt is too long","type":"invalid_request_error","param":"max_tokens"}}"#,
+        ] {
+            let error = StructuredLlmError::parse(body).expect("structured envelope");
+            assert!(
+                !error.is_context_window_overflow(),
+                "specific or unrecognized machine facts must not authorize compaction: {body}"
+            );
+        }
+    }
+
+    #[test]
     fn structured_llm_error_request_id_extraction() {
         assert_eq!(
             structured_llm_error_request_id(
@@ -1691,6 +1764,13 @@ mod tests {
             None
         );
         assert_eq!(structured_llm_error_request_id("not json"), None);
+        assert_eq!(
+            structured_llm_error_request_id(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#
+            ),
+            Some("req_011CSHoEeqs5C35K2UUqR7Fy".to_string()),
+            "Anthropic's documented top-level, non-hexadecimal id must correlate"
+        );
     }
 
     #[test]
