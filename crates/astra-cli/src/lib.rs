@@ -151,7 +151,7 @@ pub(crate) mod tests {
     }
 
     mod auth_tests;
-    mod chat_stream_tests;
+    pub(crate) mod chat_stream_tests;
     mod chat_turn_tests;
     mod cli_args_tests;
     mod cloud_sync_tests;
