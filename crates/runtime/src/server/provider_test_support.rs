@@ -81,6 +81,9 @@ impl ObservationRecoveryForTest {
     pub async fn expire_lease(&self) {
         self.0.expire_lease_for_test().await;
     }
+    pub fn failure_paused(&self) -> bool {
+        self.0.failure_paused_for_test()
+    }
     pub async fn drive_one(&self) -> Result<bool, String> {
         self.0.drive_one().await
     }

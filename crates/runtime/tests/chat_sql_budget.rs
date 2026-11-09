@@ -1723,13 +1723,16 @@ async fn scripted_observation_turns(ctx: &MatrixE2eCtx, auth: &str, count: usize
     .await;
 }
 async fn complete_observation_turn(ctx: &MatrixE2eCtx, auth: &str) {
+    complete_observation_message(ctx, auth, "Remember this synthetic fact.").await;
+}
+async fn complete_observation_message(ctx: &MatrixE2eCtx, auth: &str, message: &str) {
     let request = axum::http::Request::builder()
         .method("POST")
         .uri("/chat/stream")
         .header("authorization", auth)
         .header("content-type", "application/json")
         .body(axum::body::Body::from(
-            json!({"message":"Remember this synthetic fact.",
+            json!({"message":message,
             "session_id":ctx.session_id, "model_selection":seeded_model_selection(ctx)})
             .to_string(),
         ))
@@ -1742,6 +1745,144 @@ async fn complete_observation_turn(ctx: &MatrixE2eCtx, auth: &str) {
             .any(|event| event["type"] == "run_finished" && event["status"] == "completed"),
         "{body}"
     );
+}
+
+/// The optional loopback upstream exercises the *real* Memoria extractor and
+/// checks its returned memory. Default CI remains deterministic/secret-free;
+/// the wire-only mode is not represented as extractor acceptance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; optional loopback Memoria extractor"]
+async fn canonical_observation_preserves_cross_turn_antecedent() {
+    require_system_e2e_env();
+    let mut b = bootstrap().await;
+    scripted_observation_turns(&b.ctx, &b.auth_header, 2).await;
+    let upstream = std::env::var("ASTRA_TEST_MEMORIA_EXTRACTOR_URL")
+        .ok()
+        .inspect(|value| {
+            let url = reqwest::Url::parse(value).expect("valid extractor URL");
+            assert!(
+                url.scheme() == "http"
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+            );
+            assert!(
+                url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            );
+        });
+    let master = if upstream.is_some() {
+        std::env::var("ASTRA_TEST_MEMORIA_EXTRACTOR_MASTER_KEY")
+            .expect("explicit local extractor credential")
+    } else {
+        "synthetic-master-key".into()
+    };
+    type ExtractorSample = (Value, Option<Value>);
+    let recorded: Arc<Mutex<Vec<ExtractorSample>>> = Arc::default();
+    let requests = recorded.clone();
+    let expected_master = master.clone();
+    let real_extractor = upstream.is_some();
+    let app = axum::Router::new().route(
+        "/v1/observe",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let recorded = recorded.clone();
+                let upstream = upstream.clone();
+                let master = expected_master.clone();
+                async move {
+                    if let Err(status) =
+                        memoria_observer_auth::validate_observer_auth(&headers, &master, None)
+                    {
+                        return status;
+                    }
+                    let payload: Value = serde_json::from_slice(&body).unwrap();
+                    let result = if let Some(url) = upstream {
+                        let response = reqwest::Client::builder()
+                            .no_proxy()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .timeout(std::time::Duration::from_secs(25))
+                            .build()
+                            .unwrap()
+                            .post(format!("{}/v1/observe", url.trim_end_matches('/')))
+                            .header("Authorization", headers.get("authorization").unwrap())
+                            .header("X-User-Id", headers.get("x-user-id").unwrap())
+                            .header("Content-Type", "application/json")
+                            .body(body)
+                            .send()
+                            .await
+                            .unwrap_or_else(|_| panic!("local extractor request failed"));
+                        assert!(
+                            response.status().is_success(),
+                            "local extractor rejected synthetic observation"
+                        );
+                        Some(
+                            response
+                                .json::<Value>()
+                                .await
+                                .expect("local extractor JSON response"),
+                        )
+                    } else {
+                        None
+                    };
+                    recorded.lock().unwrap().push((payload, result));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let state = b.ctx.app_state.clone().with_turn_observer_worker(Arc::new(
+        astra_runtime::DatabaseTurnObserverWorker::new(Some(Arc::new(
+            astra_runtime::HttpMemoriaPort::self_hosted(url, master),
+        ))),
+    ));
+    b.ctx.app = astra_runtime::build_app(state.clone());
+    b.ctx.app_state = state;
+    let owner = astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new(
+        &b.ctx.app_state,
+        &b.ctx.user_id,
+        &b.ctx.session_id,
+    )
+    .await
+    .unwrap();
+    for (index, message) in ["My cat is named Pixel.", "He had surgery yesterday."]
+        .into_iter()
+        .enumerate()
+    {
+        complete_observation_message(&b.ctx, &b.auth_header, message).await;
+        drive_scoped_observation_when_due(&owner).await.unwrap();
+        assert_observer_acknowledged(&b.ctx, (index + 1) as i64).await;
+    }
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let messages = requests[1].0["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["content"], "My cat is named Pixel.");
+        assert_eq!(messages[2]["content"], "He had surgery yesterday.");
+        if real_extractor {
+            let result = requests[1].1.as_ref().unwrap();
+            assert!(
+                result.get("warning").is_none(),
+                "extractor acceptance must not use raw fallback"
+            );
+            assert!(
+                result["memories"].as_array().unwrap().iter().any(|memory| {
+                    let content = memory["content"].as_str().unwrap_or_default();
+                    content.contains("Pixel") && content.to_lowercase().contains("surg")
+                }),
+                "real extractor must resolve the cross-turn antecedent"
+            );
+        }
+    }
+    eprintln!("cross_turn_antecedent real_extractor={real_extractor}");
+    server.abort();
+    let _ = server.await;
+    b.ctx.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1998,17 +2139,7 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         rows, 0,
         "canonical completion must not require observation jobs"
     );
-    let probe = Arc::new(SchedulerProbe {
-        slow: sessions[0].clone(),
-        slow_once: std::sync::atomic::AtomicBool::new(true),
-        slow_owner: std::sync::atomic::AtomicUsize::new(usize::MAX),
-        in_flight: Default::default(),
-        entered: Default::default(),
-        permits: tokio::sync::Semaphore::new(0),
-        seen: Default::default(),
-        active: Default::default(),
-        peak: Default::default(),
-    });
+    let probe = Arc::new(SchedulerProbe::new(sessions[0].clone(), false));
     *capture.0.lock().unwrap() = Some(Vec::new());
     let mut owners = Vec::new();
     let mut cancels = Vec::new();
@@ -2230,12 +2361,115 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; shared authority outage and recovery"]
+async fn shared_observer_failure_pauses_backlog_sql_then_recovers() {
+    require_system_e2e_env();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(40);
+    let capture = SqlCapture::default();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
+        .unwrap();
+    use sqlx::Connection;
+    let mut settings = astra_core::MatrixOneSettings::from_env();
+    settings.database = "mysql".into();
+    let mut admin = sqlx::MySqlConnection::connect(&settings.database_url_with_password())
+        .await
+        .unwrap();
+    let database = format!(
+        "astra_test_http_handoff_outage_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    let b = bootstrap_isolated_execution_handoff(database.clone()).await;
+    let sessions: Vec<_> = (0..128).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    seed_observation_sessions(&b.ctx, &sessions).await;
+    let probe = Arc::new(SchedulerProbe::new(String::new(), true));
+    let state = b
+        .ctx
+        .app_state
+        .clone()
+        .with_turn_observer_worker(Arc::new(SchedulerObserver {
+            probe: probe.clone(),
+            owner: 0,
+        }));
+    let owner = Arc::new(
+        astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new_catalog(
+            &state,
+        )
+        .await
+        .unwrap(),
+    );
+    *capture.0.lock().unwrap() = Some(Vec::new());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let running = owner.clone();
+    let token = cancel.clone();
+    let handle = tokio::spawn(async move {
+        running.run(token).await;
+    });
+    tokio::time::timeout_at(deadline, async {
+        while !owner.failure_paused() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("shared failure must pause the real recovery owner");
+    let settled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.attempts'))='1' AND observation_lease_token IS NULL")
+        .fetch_one(&b.ctx.pool).await.unwrap();
+    assert_eq!(settled, 8);
+    let before_pause = capture.0.lock().unwrap().as_ref().unwrap().len();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        probe.admissions.load(std::sync::atomic::Ordering::SeqCst),
+        8
+    );
+    assert!(capture.0.lock().unwrap().as_ref().unwrap()[before_pause..].iter().all(|sample|
+        sample.sql == "UPDATE auth_users SET last_login_at = CURRENT_TIMESTAMP(6) WHERE user_id = ? AND is_active = 1"),
+        "paused shared failure must issue no observation SQL");
+    probe
+        .dependency_failed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.observed_turn'))='1' AND observation_lease_token IS NULL")
+                .fetch_one(&b.ctx.pool).await.unwrap();
+            if receipts == sessions.len() as i64 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }).await.expect("fresh successful authority must drain the retained backlog");
+    cancel.cancel();
+    handle.await.unwrap();
+    assert_eq!(probe.seen.lock().unwrap().len(), sessions.len());
+    assert!(
+        sessions
+            .iter()
+            .all(|key| probe.seen.lock().unwrap().contains_key(key))
+    );
+    let sql = capture.0.lock().unwrap().take().unwrap();
+    assert!(sql.len() <= 20 * sessions.len());
+    eprintln!(
+        "shared_observation_outage sessions={} initial_callbacks=8 raw_sql={} recovered={}",
+        sessions.len(),
+        sql.len(),
+        probe.seen.lock().unwrap().len()
+    );
+    b.ctx.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+}
+
 /// Full public request + real unscoped recovery + production HTTP observer.
 /// Repeated turns, rather than many one-turn Sessions, expose quadratic history work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn repeated_chat_observation_has_linear_history_work() {
     require_system_e2e_env();
+    const ROUNDS: usize = 8;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(50);
     let capture = SqlCapture::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
         .unwrap();
@@ -2265,8 +2499,9 @@ async fn repeated_chat_observation_has_linear_history_work() {
             .await
             .unwrap();
     }
+    let observations = sessions.len() * ROUNDS;
     let model = format!("mock-{}", b.ctx.suffix);
-    let responses = (0..128)
+    let responses = (0..observations)
         .map(|_| {
             answer(
                 json!({"role":"assistant","content":"Synthetic answer. ".repeat(32)}),
@@ -2335,27 +2570,32 @@ async fn repeated_chat_observation_has_linear_history_work() {
     }
     let mut first_read_bytes = 0;
     let mut first_payload_bytes = 0;
-    for turn in 1..=16 {
+    let mut steady_payload_bytes = 0;
+    for turn in 1..=ROUNDS {
         let history =
             astra_core::history_work::HistoryWorkScenario::begin("repeated-observation").unwrap();
         let start = std::time::Instant::now();
-        let results = futures_util::future::join_all(sessions.iter().map(|session| {
-            let request = axum::http::Request::builder()
-                .method("POST")
-                .uri("/chat/stream")
-                .header("authorization", &b.auth_header)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    json!({
-                        "message":format!("turn={turn:02} {}", "Synthetic fact. ".repeat(32)),
-                        "session_id":session,"model_selection":seeded_model_selection(&b.ctx)
-                    })
-                    .to_string(),
-                ))
-                .unwrap();
-            collect_full_sse_stream(&b.ctx.app, request, 60)
-        }))
-        .await;
+        let results = tokio::time::timeout_at(
+            deadline,
+            futures_util::future::join_all(sessions.iter().map(|session| {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", &b.auth_header)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "message":format!("turn={turn:02} {}", "Synthetic fact. ".repeat(32)),
+                            "session_id":session,"model_selection":seeded_model_selection(&b.ctx)
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+                collect_full_sse_stream(&b.ctx.app, request, 60)
+            })),
+        )
+        .await
+        .expect("public chats must fit the complete observation workload budget");
         for (status, body) in results {
             assert_eq!(status, axum::http::StatusCode::OK, "{body}");
             assert!(
@@ -2366,7 +2606,7 @@ async fn repeated_chat_observation_has_linear_history_work() {
             );
         }
         let response_ms = start.elapsed().as_millis();
-        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        tokio::time::timeout_at(deadline, async {
             loop {
                 let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE owner_user_id=? AND JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.observed_turn'))=? AND observation_lease_token IS NULL")
                     .bind(&b.ctx.user_id).bind(turn.to_string()).fetch_one(&b.ctx.pool).await.unwrap();
@@ -2378,7 +2618,11 @@ async fn repeated_chat_observation_has_linear_history_work() {
         let read = report
             .scoped
             .measurement(astra_core::history_work::HistoryWorkSite::CanonicalObservationRead);
-        assert_eq!(read.rows, 8, "each Session must read only its new manifest");
+        assert_eq!(
+            read.rows,
+            8 * turn.min(5) as u64,
+            "only the new manifest and bounded four-turn context may be read"
+        );
         // Measure the actual received buffer, independent of optional tracing
         // instrumentation and without serializing the payload again to count it.
         let payload_bytes: u64 = {
@@ -2394,21 +2638,27 @@ async fn repeated_chat_observation_has_linear_history_work() {
             first_payload_bytes = payload_bytes;
         }
         assert!(
-            read.bytes <= first_read_bytes + 1024,
-            "history JSON grew with prior turns"
+            read.bytes <= 5 * first_read_bytes + 4096,
+            "history JSON exceeded the bounded context window"
         );
-        assert_eq!(
-            payload_bytes, first_payload_bytes,
-            "HTTP payload must not include prior turns"
-        );
+        assert!(payload_bytes <= 5 * first_payload_bytes);
+        if turn == 5 {
+            steady_payload_bytes = payload_bytes;
+        }
+        if turn > 5 {
+            assert_eq!(
+                payload_bytes, steady_payload_bytes,
+                "bounded overlap must plateau"
+            );
+        }
         {
             let bodies = bodies.lock().unwrap();
             assert_eq!(bodies.len(), turn * 8);
             for (body, _) in &bodies[(turn - 1) * 8..] {
                 let messages = body["messages"].as_array().unwrap();
-                assert_eq!(messages.len(), 2);
+                assert_eq!(messages.len(), 2 * turn.min(5));
                 assert!(
-                    messages[0]["content"]
+                    messages[messages.len() - 2]["content"]
                         .as_str()
                         .unwrap()
                         .starts_with(&format!("turn={turn:02} "))
@@ -2479,7 +2729,7 @@ async fn repeated_chat_observation_has_linear_history_work() {
         .filter(|sample| sample.sql == AUTHENTICATION_SNAPSHOT_SQL)
         .count();
     assert!(
-        authentication <= 128,
+        authentication <= observations,
         "at most one authentication snapshot per request in this workload"
     );
     let pool_setup = raw.iter().filter(|sample| sample.sql == "SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4;").count();
@@ -2492,13 +2742,19 @@ async fn repeated_chat_observation_has_linear_history_work() {
     // this static-authority profile, each warm request uses 17 core statements;
     // each successful observer adds 4 receipt/claim statements + 1 content read.
     // Losing claims and discovery remain in raw, separately counted, not hidden.
-    let frontend =
-        raw.len() - metadata - discovery - verification - controls - heartbeats - pool_setup - 128;
+    let frontend = raw.len()
+        - metadata
+        - discovery
+        - verification
+        - controls
+        - heartbeats
+        - pool_setup
+        - observations;
     eprintln!(
         "observation_sql_breakdown raw={} frontend={frontend} metadata={metadata} discovery={discovery} verification={verification} controls={controls} fixture_heartbeats={heartbeats} authentication={authentication} pool_setup={pool_setup}",
         raw.len()
     );
-    if frontend > 17 * 128 + authentication {
+    if frontend > 17 * observations + authentication {
         let mut shapes = std::collections::BTreeMap::new();
         for sample in &raw {
             *shapes
@@ -2508,23 +2764,23 @@ async fn repeated_chat_observation_has_linear_history_work() {
         eprintln!("observation_sql_shape_counts={shapes:?}");
     }
     assert!(
-        frontend <= 17 * 128 + authentication,
+        frontend <= 17 * observations + authentication,
         "frontend SQL grew beyond its canonical request contract: {frontend}"
     );
     assert!(
-        raw.len() <= 32 * 128 + verification + controls + heartbeats,
+        raw.len() <= 32 * observations + verification + controls + heartbeats,
         "full public chat plus two-owner recovery SQL: {}",
         raw.len()
     );
     eprintln!(
-        "observation_repeated sessions=8 turns=16 raw_sql={} frontend_sql={frontend} recovery_metadata_sql={metadata} discovery_sql={discovery} verification_sql={verification} control_sql={controls} fixture_heartbeat_sql={heartbeats} pool_setup_sql={pool_setup} sql_elapsed_ms={:.0} returned_rows={}",
+        "observation_repeated sessions=8 turns={ROUNDS} raw_sql={} frontend_sql={frontend} recovery_metadata_sql={metadata} discovery_sql={discovery} verification_sql={verification} control_sql={controls} fixture_heartbeat_sql={heartbeats} pool_setup_sql={pool_setup} sql_elapsed_ms={:.0} returned_rows={}",
         raw.len(),
         raw.iter()
             .map(|q| q.elapsed.as_secs_f64() * 1000.0)
             .sum::<f64>(),
         raw.iter().map(|q| q.returned_rows).sum::<u64>()
     );
-    assert!(raw.iter().map(|q| q.returned_rows).sum::<u64>() >= 128);
+    assert!(raw.iter().map(|q| q.returned_rows).sum::<u64>() >= observations as u64);
     server.abort();
     let _ = server.await;
     b.ctx.close().await;
@@ -2585,6 +2841,25 @@ struct SchedulerProbe {
     seen: Mutex<std::collections::BTreeMap<String, usize>>,
     active: [std::sync::atomic::AtomicUsize; 2],
     peak: [std::sync::atomic::AtomicUsize; 2],
+    dependency_failed: std::sync::atomic::AtomicBool,
+    admissions: std::sync::atomic::AtomicUsize,
+}
+impl SchedulerProbe {
+    fn new(slow: String, dependency_failed: bool) -> Self {
+        Self {
+            slow,
+            slow_once: std::sync::atomic::AtomicBool::new(true),
+            slow_owner: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            in_flight: Default::default(),
+            entered: Default::default(),
+            permits: tokio::sync::Semaphore::new(0),
+            seen: Default::default(),
+            active: Default::default(),
+            peak: Default::default(),
+            dependency_failed: std::sync::atomic::AtomicBool::new(dependency_failed),
+            admissions: Default::default(),
+        }
+    }
 }
 struct SchedulerObserver {
     probe: Arc<SchedulerProbe>,
@@ -2599,6 +2874,20 @@ impl Drop for ActiveProbeCall {
 }
 #[async_trait::async_trait]
 impl astra_runtime::TurnObserverWorker for SchedulerObserver {
+    async fn admits_observation(&self, _: &str) -> Result<bool, String> {
+        self.probe
+            .admissions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .probe
+            .dependency_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Err("synthetic shared authority failure".into())
+        } else {
+            Ok(true)
+        }
+    }
     async fn run(
         &self,
         request: astra_runtime::TurnObserverRequest,

@@ -100,6 +100,36 @@ pub fn should_run_observer(full_text: &str, has_tool_calls: bool) -> bool {
     !full_text.is_empty() && !has_tool_calls
 }
 
+/// Bounded prior context is reference material, never an independently due
+/// observation. Preserve the checkpoint's filter state for new content, and
+/// exclude a prior human segment if its memory-tool call arrives in the new
+/// suffix before the next human boundary.
+pub fn filter_memory_operation_turns_with_context(
+    context: &[Value],
+    messages: &[Value],
+    preceding_memory_operation: bool,
+) -> (Vec<Value>, bool) {
+    let (mut new, flag) = filter_memory_operation_turns_after(messages, preceding_memory_operation);
+    if new.is_empty() {
+        return (new, flag);
+    }
+    let continuation_is_memory_operation = messages
+        .iter()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(is_memory_tool_message);
+    let context_end = if continuation_is_memory_operation {
+        context
+            .iter()
+            .rposition(astra_turn_types::is_human_user_message)
+            .unwrap_or(0)
+    } else {
+        context.len()
+    };
+    let mut combined = filter_memory_operation_turns_after(&context[..context_end], true).0;
+    combined.append(&mut new);
+    (combined, flag)
+}
+
 pub fn build_observer_messages(
     user_content: Option<&str>,
     full_text: &str,
@@ -121,6 +151,41 @@ pub fn build_observer_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_context_resolves_antecedent_without_relearning_memory_segment() {
+        use serde_json::json;
+        let context = vec![
+            json!({"role":"user","content":"My cat is Pixel."}),
+            json!({"role":"assistant","content":"Noted."}),
+            json!({"role":"user","content":"Remember my address."}),
+            json!({"role":"assistant","content":"Checking."}),
+        ];
+        let messages = vec![
+            json!({"role":"assistant","tool_calls":[{"function":{"name":"memory"}}]}),
+            json!({"role":"tool","name":"memory","content":"saved"}),
+            json!({"role":"assistant","content":"Saved your address."}),
+            json!({"role":"user","content":"He had surgery."}),
+        ];
+        let (result, flag) = filter_memory_operation_turns_with_context(&context, &messages, false);
+        assert_eq!(
+            result,
+            vec![context[0].clone(), context[1].clone(), messages[3].clone()]
+        );
+        assert!(!flag);
+        let (empty, flag) =
+            filter_memory_operation_turns_with_context(&context, &messages[..3], false);
+        assert!(empty.is_empty());
+        assert!(flag);
+        let (continuation, flag) =
+            filter_memory_operation_turns_with_context(&[], &context[3..], false);
+        assert_eq!(continuation, context[3..]);
+        assert!(!flag);
+        let (empty, flag) =
+            filter_memory_operation_turns_with_context(&context, &context[3..], true);
+        assert!(empty.is_empty());
+        assert!(flag);
+    }
 
     #[test]
     fn should_run_text_no_calls() {

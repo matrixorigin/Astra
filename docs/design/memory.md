@@ -350,18 +350,37 @@ Append/Replace cannot substitute a newer transcript for the captured watermark.
 
 Successful acknowledgement also retains the canonical head metadata (no messages)
 as the next observation boundary. Within a generation, the canonical coordinator
-reads only `after.conversation_seq < sequence <= captured.conversation_seq` using
+reads new content in `after.conversation_seq < sequence <= captured.conversation_seq` using
 the existing physical key. It verifies the exact parent-root chain, cursor
 advance, immutable content and cumulative byte/message totals against that
 acknowledged boundary. Retries use the same unacknowledged suffix; accumulated
 completions are coalesced without skipping nodes. The first observation, legacy
 checkpoints without a head, and a compaction-generation change use the existing
-complete fork-aware materializer once. Later child turns do not reload an already
+complete fork-aware materializer once. Later child turns do not reload the entire
 acknowledged inherited prefix, including after ancestor deletion. Corrupt or
 divergent boundaries fail rather than silently falling back or acknowledging.
-Thus ordinary repeated turns read/send new content, rather than reprocessing
+Thus ordinary repeated turns read/send new content plus bounded context, rather than reprocessing
 `1 + ... + N` turns. A replacement can resend the new summary/context; this is
 consistent with at-least-once delivery, not an exactly-once extraction promise.
+The stateless Memoria extractor does not reload conversation history from
+`session_id`. Observation therefore includes up to four preceding canonical
+turns / 32 KiB of canonical content as bounded reference context alongside the
+unacknowledged suffix. One selective ordinary range read returns both parts; the prior
+tail is validated backwards against the acknowledged head's root, cursor and
+totals. The watermark still advances only over newly completed content. This is
+a finite overlap, not a guarantee to resolve references arbitrarily far back.
+It can resend older facts through Memoria's existing deduplication path.
+The overlap is memory-operation filtered with lookahead into continuations in
+the new suffix, suppressing leading content with no human boundary in the window.
+Empty/excluded new content
+does not dispatch an old context window on its own. No transcript copy is stored
+in the checkpoint. Fork lineage is returned once as a separate row in the same
+canonical materialization result, rather than repeated on every manifest row.
+If the window crosses an inherited boundary, the canonical fork owner supplies
+validated prefix identity/totals and selective ancestor ranges. There are at most
+four lineage hops, with the same aggregate four-turn / 32 KiB limits. These extra
+metadata/range queries are fork-context cost; no live ancestor head is required,
+so pinned context survives ancestor deletion and collection.
 The acknowledgement also carries the existing filter's memory-operation segment
 flag. Assistant/tool continuations after an excluded memory operation stay
 excluded until a real human message starts a new segment. The flag advances only
@@ -376,6 +395,23 @@ it. A newer completion racing acknowledgement remains pending. The extraction/
 governance journal is independent and is never rewritten by observation. Delivery
 is at least once: a backend success followed by uncertain acknowledgement can
 repeat. Session deletion removes the head through existing lifecycle cleanup.
+
+The configured process recovery owner also has an in-memory failure budget.
+Eight consecutive failed attempts open a shared five-second pause **before**
+discovery/claim SQL. One attempt probes after the pause; a failed probe doubles
+the delay up to 960 seconds, while a successful fresh admission/attempt/receipt
+reopens normal draining. No-work/lost claims do not assert dependency health;
+cancelled probes release the probe reservation with a bounded pause. Epochs
+prevent stale results from resetting a newer failure generation. In-flight
+reservations consume the same eight-attempt budget, so fast failures cannot
+refill the initial cohort while slower attempts are still running.
+This conservatively pauses this optional observer as a whole, so a persistent
+failure can defer unrelated healthy observation work until a successful probe.
+It is process-local, resets on restart, and its cost scales with replicas, not
+with every retained pending Session at the retry cap. It is not distributed
+outage coordination. Durable facts and current authority checks are retained;
+no credentials, grants or another durable queue are stored. Per-Session backoff
+still uses only `observation_due_at`; there is no duplicate JSON retry clock.
 
 The ordinary non-fork attempt uses two claim/receipt statements, selective
 materialization and two checkpoint/receipt statements, plus fresh authority SQL.

@@ -186,6 +186,7 @@ pub(crate) struct SessionObservationRecovery {
     store: astra_services::session_observation::SessionObservationStore,
     scope: Option<(String, String)>,
     pending: tokio::sync::Mutex<ObservationPending>,
+    failure_budget: std::sync::Arc<std::sync::Mutex<ObservationFailureBudget>>,
 }
 const OBSERVATION_CONCURRENCY: usize = 8;
 #[derive(Default)]
@@ -193,6 +194,114 @@ struct ObservationPending {
     keys: std::collections::VecDeque<(String, String)>,
     resume_at: Option<tokio::time::Instant>,
 }
+
+/// Process-local health budget for this configured optional observer. Eight
+/// consecutive failed attempts open a shared pause before any discovery/claim
+/// SQL. One fresh attempt probes recovery; no credentials or work are cached.
+#[derive(Default)]
+struct ObservationFailureBudget {
+    errors: u32,
+    in_flight: u32,
+    epoch: u64,
+    retry_at: Option<tokio::time::Instant>,
+    delay_secs: u64,
+    probing: bool,
+}
+struct ObservationHealthPermit {
+    budget: std::sync::Arc<std::sync::Mutex<ObservationFailureBudget>>,
+    epoch: u64,
+    probe: bool,
+    finished: bool,
+}
+impl ObservationFailureBudget {
+    fn acquire(shared: &std::sync::Arc<std::sync::Mutex<Self>>) -> Option<ObservationHealthPermit> {
+        let mut state = shared.lock().unwrap();
+        let probe = state.retry_at.is_some();
+        if state.probing
+            || state
+                .retry_at
+                .is_some_and(|at| tokio::time::Instant::now() < at)
+        {
+            return None;
+        }
+        if !probe && state.errors + state.in_flight >= OBSERVATION_CONCURRENCY as u32 {
+            return None;
+        }
+        if !probe {
+            state.in_flight += 1;
+        }
+        state.probing = probe;
+        Some(ObservationHealthPermit {
+            budget: shared.clone(),
+            epoch: state.epoch,
+            probe,
+            finished: false,
+        })
+    }
+}
+impl ObservationHealthPermit {
+    fn finish(mut self, outcome: Option<bool>) {
+        self.finished = true;
+        let mut state = self.budget.lock().unwrap();
+        if state.epoch != self.epoch {
+            return;
+        }
+        if !self.probe {
+            state.in_flight -= 1;
+        }
+        if self.probe {
+            state.probing = false;
+            if outcome == Some(true) {
+                state.errors = 0;
+                state.retry_at = None;
+                state.delay_secs = 0;
+            } else {
+                if outcome == Some(false) {
+                    state.delay_secs = (state.delay_secs * 2).min(960);
+                }
+                // A lost claim or empty page says nothing about dependency
+                // health. Continue to the next key; discovery retains its own
+                // shared idle cooldown, so this cannot spin on an empty catalog.
+                state.retry_at = Some(
+                    tokio::time::Instant::now()
+                        + Duration::from_secs(if outcome.is_none() {
+                            0
+                        } else {
+                            state.delay_secs
+                        }),
+                );
+            }
+            state.epoch = state.epoch.wrapping_add(1);
+        } else if outcome == Some(true) {
+            state.errors = 0;
+        } else if outcome == Some(false) {
+            state.errors += 1;
+            if state.errors >= OBSERVATION_CONCURRENCY as u32 {
+                state.delay_secs = 5;
+                state.retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                state.epoch = state.epoch.wrapping_add(1);
+            }
+        }
+    }
+}
+impl Drop for ObservationHealthPermit {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut state = self.budget.lock().unwrap();
+            if state.epoch == self.epoch {
+                if self.probe {
+                    state.probing = false;
+                    state.retry_at =
+                        Some(tokio::time::Instant::now() + Duration::from_secs(state.delay_secs));
+                    state.epoch = state.epoch.wrapping_add(1);
+                } else {
+                    state.in_flight -= 1;
+                }
+            }
+        }
+    }
+}
+
 impl SessionObservationRecovery {
     pub(crate) fn new(state: AppState) -> Option<Self> {
         let pool = state.shared_pool.clone()?;
@@ -204,6 +313,7 @@ impl SessionObservationRecovery {
             store: astra_services::session_observation::SessionObservationStore::new(pool),
             scope: None,
             pending: Default::default(),
+            failure_budget: Default::default(),
         })
     }
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -213,6 +323,14 @@ impl SessionObservationRecovery {
     #[cfg(any(test, feature = "e2e-hooks"))]
     pub(crate) async fn expire_lease_for_test(&self) {
         self.store.expire_leases_for_test().await;
+    }
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub(crate) fn failure_paused_for_test(&self) -> bool {
+        let state = self.failure_budget.lock().unwrap();
+        state.in_flight == 0
+            && state
+                .retry_at
+                .is_some_and(|at| tokio::time::Instant::now() < at)
     }
     pub(crate) async fn run(&self, cancel: CancellationToken) {
         use futures_util::{StreamExt, stream};
@@ -241,6 +359,17 @@ impl SessionObservationRecovery {
         }
     }
     pub(crate) async fn drive_one(&self) -> Result<bool, String> {
+        let Some(permit) = ObservationFailureBudget::acquire(&self.failure_budget) else {
+            return Ok(false);
+        };
+        let result = self.drive_one_admitted().await;
+        permit.finish(match &result {
+            Ok((_, health)) => *health,
+            Err(_) => Some(false),
+        });
+        result.map(|(progress, _)| progress)
+    }
+    async fn drive_one_admitted(&self) -> Result<(bool, Option<bool>), String> {
         let key = if let Some(key) = &self.scope {
             key.clone()
         } else {
@@ -250,7 +379,7 @@ impl SessionObservationRecovery {
                     .resume_at
                     .is_some_and(|until| tokio::time::Instant::now() < until)
                 {
-                    return Ok(false);
+                    return Ok((false, None));
                 }
                 // Set before the await as well: a failed discovery must not let
                 // eight workers retry the same unavailable dependency in a burst.
@@ -264,7 +393,7 @@ impl SessionObservationRecovery {
                 }
             }
             let Some(key) = pending.keys.pop_front() else {
-                return Ok(false);
+                return Ok((false, None));
             };
             key
         };
@@ -275,7 +404,7 @@ impl SessionObservationRecovery {
         let Some(mut candidate) = candidate else {
             // Another owner already took this Session; continue to other due
             // identities instead of sleeping or discarding a whole shard.
-            return Ok(self.scope.is_none());
+            return Ok((self.scope.is_none(), None));
         };
         let result = tokio::time::timeout(Duration::from_secs(60), async {
             if !self
@@ -302,7 +431,8 @@ impl SessionObservationRecovery {
                         == materialized.head.cursor.compaction_generation
                 });
             let (messages, memory_operation_segment) =
-                astra_turn_core::observer::filter_memory_operation_turns_after(
+                astra_turn_core::observer::filter_memory_operation_turns_with_context(
+                    &materialized.prior_context,
                     &materialized.messages,
                     same_generation && candidate.checkpoint.memory_operation_segment,
                 );
@@ -334,9 +464,67 @@ impl SessionObservationRecovery {
         )
         .await
         .map_err(|_| "observation checkpoint receipt timed out")??;
+        let succeeded = result.is_ok();
         if let Err(error) = result {
             tracing::warn!(%error, "canonical observation attempt deferred");
         }
-        Ok(true)
+        Ok((true, Some(succeeded)))
+    }
+}
+
+#[cfg(test)]
+mod observation_failure_budget_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_failure_budget_bounds_burst_backoff_and_cancelled_probe() {
+        let budget = Arc::new(std::sync::Mutex::new(ObservationFailureBudget::default()));
+        let held = ObservationFailureBudget::acquire(&budget).unwrap();
+        for _ in 0..7 {
+            ObservationFailureBudget::acquire(&budget)
+                .unwrap()
+                .finish(Some(false));
+        }
+        // A fast failing worker cannot refill the budget while another attempt
+        // is held. Cancellation frees that reservation without claiming health.
+        assert!(ObservationFailureBudget::acquire(&budget).is_none());
+        drop(held);
+        ObservationFailureBudget::acquire(&budget)
+            .unwrap()
+            .finish(Some(false));
+        for _ in 0..1000 {
+            assert!(ObservationFailureBudget::acquire(&budget).is_none());
+        }
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let probe = ObservationFailureBudget::acquire(&budget).unwrap();
+        assert!(ObservationFailureBudget::acquire(&budget).is_none());
+        probe.finish(Some(false));
+        assert_eq!(budget.lock().unwrap().delay_secs, 10);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drop(ObservationFailureBudget::acquire(&budget).unwrap());
+        assert!(ObservationFailureBudget::acquire(&budget).is_none());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        ObservationFailureBudget::acquire(&budget)
+            .unwrap()
+            .finish(Some(true));
+        for _ in 0..8 {
+            ObservationFailureBudget::acquire(&budget)
+                .unwrap()
+                .finish(Some(true));
+        }
+        // Repeated failed probes reach a fixed cap, without a per-Session timer.
+        for _ in 0..8 {
+            ObservationFailureBudget::acquire(&budget)
+                .unwrap()
+                .finish(Some(false));
+        }
+        for _ in 0..20 {
+            let delay = budget.lock().unwrap().delay_secs;
+            tokio::time::advance(Duration::from_secs(delay)).await;
+            ObservationFailureBudget::acquire(&budget)
+                .unwrap()
+                .finish(Some(false));
+        }
+        assert_eq!(budget.lock().unwrap().delay_secs, 960);
     }
 }

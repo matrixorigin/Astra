@@ -16,7 +16,6 @@ pub struct ObservationCheckpoint {
     pub observed_head: Option<SessionContextHeadV1>,
     pub memory_operation_segment: bool,
     pub attempts: u32,
-    pub retry_at_ms: i64,
     pub revision: u64,
     pub receipt_id: Option<String>,
 }
@@ -156,7 +155,7 @@ impl SessionObservationStore {
             return Err("observation checkpoint head and watermark disagree".into());
         }
         let value = DatabaseSessionContextCoordinator::new(self.pool.clone())
-            .materialize_after(head, candidate.checkpoint.observed_head.as_ref())
+            .materialize_observation(head, candidate.checkpoint.observed_head.as_ref())
             .await
             .map_err(|_| "observation canonical context could not be materialized".to_owned())?;
         astra_core::history_work::record_operation(
@@ -191,7 +190,6 @@ impl SessionObservationStore {
             checkpoint.memory_operation_segment =
                 candidate.next_memory_operation_segment.unwrap_or(true);
             checkpoint.attempts = 0;
-            checkpoint.retry_at_ms = 0;
         } else {
             checkpoint.attempts = checkpoint.attempts.saturating_add(1);
         }
@@ -206,14 +204,14 @@ impl SessionObservationStore {
             .await
             .map_err(|_| "observation checkpoint connection failed")?;
         sqlx::query("UPDATE session_context_heads
-            SET observation_json = JSON_SET(JSON_EXTRACT(?, '$'), '$.retry_at_ms', CASE WHEN CAST(? AS SIGNED) = 1 THEN 0 ELSE CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) + ? END),
+            SET observation_json = ?,
                 observation_due_at = CASE WHEN CAST(? AS SIGNED) = 0 THEN DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
                     WHEN completed_turn > ? THEN NOW(6) ELSE '9999-12-31 00:00:00' END,
                 observation_lease_token = NULL
             WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
               AND observation_lease_token = ? AND observation_due_at > NOW(6)
               AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?")
-            .bind(json).bind(success).bind(backoff_ms).bind(success).bind(backoff_ms * 1000).bind(candidate.turn)
+            .bind(json).bind(success).bind(backoff_ms * 1000).bind(candidate.turn)
             .bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id).bind(&candidate.lease_token).bind(candidate.checkpoint.revision)
             .execute(&mut *connection).await.map_err(|_| "observation checkpoint failed")?;
         let stored: Option<String> = sqlx::query_scalar("SELECT JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.receipt_id'))
@@ -383,7 +381,7 @@ mod tests {
                             CanonicalDeltaModeV1::Append
                         },
                         logical_segments: vec![vec![
-                            json!({"role":"assistant", "content":format!("turn-{turn}")}),
+                            json!({"role":"assistant", "content": if turn == 14 { format!("turn-{turn} {}", "x".repeat(32768)) } else { format!("turn-{turn}") }}),
                         ]],
                     },
                     &format!("commit-{turn}"),
@@ -399,7 +397,28 @@ mod tests {
                 assert_eq!(materialized.head, *candidate.head.as_ref().unwrap());
                 let expected_nodes = if turn == 11 { 3 } else { 1 };
                 assert_eq!(materialized.messages.len(), expected_nodes);
-                assert_eq!(materialized.loaded_manifest_count, expected_nodes as u64);
+                assert_eq!(
+                    materialized.loaded_manifest_count,
+                    (expected_nodes + materialized.prior_context.len()) as u64
+                );
+                assert!(materialized.prior_context.len() <= 4);
+                if turn == 16 {
+                    assert!(
+                        materialized.prior_context.is_empty(),
+                        "an oversized acknowledged turn must not enter the bounded context"
+                    );
+                    assert!(
+                        materialized.loaded_manifest_json_bytes < 4096,
+                        "SQL must exclude the large prior payload, not trim it after transfer"
+                    );
+                }
+                if turn == 17 {
+                    assert_eq!(
+                        materialized.prior_context.len(),
+                        1,
+                        "bounded context resumes after the oversized turn"
+                    );
+                }
                 if turn == 6 {
                     let head = candidate.head.as_ref().unwrap();
                     let base = candidate.checkpoint.observed_head.as_ref().unwrap();
@@ -436,7 +455,11 @@ mod tests {
                 }
                 assert_eq!(
                     materialized.messages.last().unwrap()["content"],
-                    format!("turn-{}", turn - 1)
+                    if turn == 15 {
+                        format!("turn-14 {}", "x".repeat(32768))
+                    } else {
+                        format!("turn-{}", turn - 1)
+                    }
                 );
                 // SQL execution success is not a durable acknowledgement.
                 sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE session_id = 'captured-head'")
@@ -504,6 +527,15 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+        let head = coordinator.load_head(&key).await.unwrap().unwrap();
+        let full = coordinator.materialize(&head).await.unwrap();
+        let large = format!("turn-14 {}", "x".repeat(32768));
+        assert!(
+            full.messages
+                .iter()
+                .any(|message| message["content"].as_str() == Some(large.as_str())),
+            "typed lineage UNION must preserve complete large canonical payloads"
         );
         // A deletion requested before claim retires the pending marker without
         // returning a candidate, even when the canonical head still exists.
@@ -660,9 +692,51 @@ mod tests {
         )
         .await;
         assert_scans_bounded(&materialization, 8192);
+        // A long fork returns lineage once, not once per history node. Measure
+        // actual result values; this is deliberately not a network-byte claim.
+        sqlx::query("INSERT INTO session_forks (isolation_domain,owner_user_id,fork_id,parent_session_id,parent_branch_id,child_session_id,child_branch_id,idempotency_hash,request_hash,state,manifest_json)
+            VALUES ('server','synthetic-owner','long-fork','parent','main','retained-generations','main',REPEAT('a',64),REPEAT('b',64),'active',?)")
+            .bind("x".repeat(2048)).execute(pool.get()).await.unwrap();
+        let rows = sqlx::query(sqlx::AssertSqlSafe(
+            crate::session_context_coordinator::canonical_materialization_sql(),
+        ))
+        .bind("server")
+        .bind("synthetic-owner")
+        .bind("retained-generations")
+        .bind("main")
+        .bind(99_i64)
+        .bind(100000_i64)
+        .bind("server")
+        .bind("synthetic-owner")
+        .bind("retained-generations")
+        .bind("main")
+        .fetch_all(pool.get())
+        .await
+        .unwrap();
+        let lineage: Vec<_> = rows
+            .iter()
+            .filter_map(|row| {
+                row.try_get::<Option<String>, _>("fork_manifest_json")
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(lineage.len(), 1);
+        assert_eq!(lineage.iter().map(String::len).sum::<usize>(), 2048);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row
+                    .try_get::<Option<String>, _>("manifest_root")
+                    .unwrap()
+                    .is_some())
+                .count(),
+            1000
+        );
         // Same-generation history must be pruned at the sequence boundary too.
         // Selecting only the last suffix row must not scan all 100,000 nodes.
-        sqlx::query("UPDATE conversation_manifest_nodes SET compaction_generation=0 WHERE session_id='retained-generations'")
+        // Seed a separate range instead of rewriting 100,000 physical primary
+        // keys. Fixture setup must not become an unrelated update benchmark.
+        sqlx::query("INSERT INTO conversation_manifest_nodes (isolation_domain,owner_user_id,session_id,branch_id,manifest_root,completed_turn,conversation_seq,compaction_generation,canonical_segment_bytes,total_canonical_bytes,total_message_count,manifest_json,content_json)
+             SELECT 'server','synthetic-owner','same-generation','main',LPAD(CAST(result + 200000 AS CHAR),64,'0'),1,result,0,1,1,1,'{}','[]' FROM generate_series(1,100000) g")
             .execute(pool.get()).await.unwrap();
         let suffix = prepared_plan(
             &pool,
@@ -670,7 +744,7 @@ mod tests {
             serde_json::json!([
                 "server",
                 "synthetic-owner",
-                "retained-generations",
+                "same-generation",
                 "main",
                 0,
                 99999,
@@ -681,6 +755,25 @@ mod tests {
         )
         .await;
         assert_scans_bounded(&suffix, 8192);
+        let context_plan = prepared_plan(
+            &pool,
+            &crate::session_context_coordinator::canonical_observation_materialization_sql(),
+            serde_json::json!([
+                "server",
+                "synthetic-owner",
+                "same-generation",
+                "main",
+                0,
+                99995,
+                100000,
+                99999,
+                0
+            ])
+            .as_array()
+            .unwrap(),
+        )
+        .await;
+        assert_scans_bounded(&context_plan, 8192);
         // Never send the malformed synthetic plan bodies through the decoder.
         // Use a distinct Session with valid canonical commits for the race check.
         assert_captured_head_is_materialized(&pool).await;

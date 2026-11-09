@@ -672,6 +672,13 @@ fixture, recovery, both idle intervals and cleanup must fit the unchanged
 cleanup stalls. The test also verifies the eight-attempt bound, non-overlapping
 claims and handoff. It does not establish 1,000-Session throughput; large-catalog
 query selectivity is checked separately below.
+`shared_observer_failure_pauses_backlog_sql_then_recovers` separately starts
+128 canonical Sessions with a persistent shared authority failure. After eight
+failed attempts, the shared pause must stop further
+observation SQL and callbacks across the remaining backlog. Restoring the
+dependency must drain all retained work with fresh admission. A virtual-time
+unit test separately covers single-probe exclusion, exponential delay/cap,
+cancelled normal/probe reservations and the bounded initial failure cohort.
 
 The ignored services test
 `session_observation::tests::retained_catalog_plans_keep_payload_reads_selective`
@@ -687,7 +694,7 @@ stale receipts must fail rather than appear acknowledged. Synthetic plan bodies
 are never decoded as application content.
 
 `repeated_chat_observation_has_linear_history_work` complements those scoped and
-catalog probes with 8 concurrent public `/chat/stream` Sessions over 16 rounds,
+catalog probes with 8 concurrent public `/chat/stream` Sessions over 8 rounds,
 two real unscoped recovery owners, and the production HTTP observer talking to
 an authenticated loopback Memoria stub. Capture starts before discovery and ends
 after every observation has a durable receipt. All request, discovery, competing
@@ -699,10 +706,15 @@ The profile uses the supported static self-hosted
 authority port; the existing scoped probe separately measures database-resolved
 authority. It is not an MOI/UC network latency benchmark.
 
-Each round asserts exactly 8 observation manifest rows and 16 outgoing messages;
-read JSON bytes stay near the first-round amount and the HTTP payload size stays
-constant with fixed-size synthetic facts. The stub also checks the current turn's
-content, so repeatedly sending an old or empty payload cannot satisfy the budget.
+Each round asserts 8 new observation manifest rows plus at most four prior
+canonical turns per Session for the stateless extractor. After the four-turn
+context window fills, read rows and HTTP payload bytes must plateau with these
+fixed-size synthetic facts. The probe includes three steady-state rounds beyond window warmup. The complete
+workload uses one 50-second deadline inside the unchanged 60-second nextest
+budget. Long-history behavior is separately covered by the 100,000-node plans
+and 20 valid coordinator commits; this CI fixture is not a throughput benchmark.
+The stub checks current-turn content, so repeatedly sending an old or empty
+payload cannot satisfy the budget.
 `CanonicalObservationRead` counts serialized manifest/content JSON returned by
 storage, excluding claim/checkpoint metadata, fork-lineage metadata, physical disk
 or MySQL protocol bytes. Prepared plans separately
@@ -723,6 +735,20 @@ checks 20 valid turns, coalesced unacknowledged suffixes, concurrent completions
 replacement, divergent roots/totals/owners and stale/expired acknowledgements.
 The HMAC fork journey checks the first inherited snapshot, incremental child
 observation, and recovery after ancestor deletion and collection.
+The services case also checks that an oversized old turn is excluded by SQL,
+with bounded returned JSON bytes, and that later context resumes after it.
+A 1,000-node fork result-shape check returns exactly one 2 KiB lineage value;
+this is a result-value measurement, not a network benchmark.
+
+`canonical_observation_preserves_cross_turn_antecedent` sends two public chat
+turns (Pixel the cat, then “He had surgery yesterday”) through production
+canonical recovery and HTTP encoding. Deterministic CI checks the actual second
+request contains both turns. It does **not** assert LLM extraction quality.
+For a separately configured local Memoria with an extraction LLM, the explicit
+`ASTRA_TEST_MEMORIA_EXTRACTOR_URL` (HTTP loopback only) and
+`ASTRA_TEST_MEMORIA_EXTRACTOR_MASTER_KEY` enable forwarding that exact request
+through `/v1/observe`; this mode requires a returned fact naming Pixel and
+surgery and rejects raw fallback. Do not provide live credentials to fork CI.
 
 Run it with `ASTRA_TEST_DB_IT=1 cargo test -p astra-services --lib
 session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
