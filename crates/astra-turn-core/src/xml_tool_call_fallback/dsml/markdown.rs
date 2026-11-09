@@ -364,6 +364,29 @@ pub(super) fn opens_fence(line: &str) -> bool {
     )
 }
 
+/// A backtick in the info string rejects the opener; otherwise the fence
+/// isn't known until the physical line ends. Both block interruption and
+/// fence entry must give CommonMark the same decisive prefix.
+pub(super) fn backtick_fence_prefix(
+    text: &str,
+    run: usize,
+    checked: &mut usize,
+    finish: bool,
+) -> Option<usize> {
+    let start = (*checked).max(run);
+    if let Some(index) = text[start..]
+        .bytes()
+        .position(|byte| matches!(byte, b'\n' | b'`'))
+    {
+        Some(start + index + 1)
+    } else if finish {
+        Some(text.len())
+    } else {
+        *checked = text.len();
+        None
+    }
+}
+
 /// Every punctuation/digit/whitespace prefix is a candidate, rather than a
 /// second enumeration of Markdown markers. Only safe leading letters bypass
 /// structural-prefix classification; the actual decision remains CommonMark's.
@@ -380,6 +403,7 @@ pub(super) fn may_interrupt(text: &str) -> bool {
 #[derive(Debug, Default)]
 pub(super) struct LineProbe {
     checked: usize,
+    backticks: usize,
     tag: super::tag::Scanner,
     html_tag: Option<(usize, String)>,
     prefix_checked: bool,
@@ -396,10 +420,33 @@ impl LineProbe {
         use super::tag::Scan;
         let start = prefix.end;
         if !text[start..].starts_with('<') {
-            let end = classification_end(text, self.checked.max(start), finish);
-            self.checked = text.len();
+            let payload = &text[start..];
+            let end = if payload.starts_with('`') {
+                self.backticks += payload.as_bytes()[self.backticks..]
+                    .iter()
+                    .take_while(|byte| **byte == b'`')
+                    .count();
+                if self.backticks == payload.len() && !finish {
+                    return None;
+                }
+                if self.backticks >= 3 {
+                    start
+                        + backtick_fence_prefix(payload, self.backticks, &mut self.checked, finish)?
+                } else {
+                    start
+                        + self.backticks
+                        + payload[self.backticks..]
+                            .chars()
+                            .next()
+                            .map_or(0, char::len_utf8)
+                }
+            } else {
+                let end = classification_end(text, self.checked.max(start), finish);
+                self.checked = text.len();
+                end?
+            };
             return Some(inspect_line(
-                &text[prefix.continuation_end..end?],
+                &text[prefix.continuation_end..end],
                 contextual,
                 None,
             ));
@@ -462,7 +509,7 @@ impl LineProbe {
 /// Probe a resolved container prefix only through its first inline payload.
 /// Ordinary numbered/bulleted/heading text need not wait for newline or EOF.
 /// Marker-only input remains ambiguous; its scan cursor is checkpointed.
-pub(super) fn classification_end(text: &str, start: usize, finish: bool) -> Option<usize> {
+fn classification_end(text: &str, start: usize, finish: bool) -> Option<usize> {
     text[start..]
         .char_indices()
         .find(|(_, ch)| {

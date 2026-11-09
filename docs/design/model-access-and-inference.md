@@ -1052,9 +1052,10 @@ prefix bytes checkpointed across chunks. One exact incremental grammar owns
 both complete and partial tag recognition; suffixed DSML names such as
 `invoke-example` are ordinary text. A fence consumes only its opening containers;
 blank lines may omit list indentation without ending that fence.
-CommonMark also validates the fence opening line and info string. The lexer
-checkpoints backtick fence lookahead until it can distinguish a fence from
-inline content. Backticks in a tilde fence's info string do not affect ownership.
+CommonMark also validates the fence opening line and info string. Block
+interruption and fence entry share the same checkpointed backtick lookahead:
+a later backtick in the info string can invalidate the candidate fence.
+Backticks in a tilde fence's info string do not affect ownership.
 Tabs retain physical columns and virtual padding; active inline spans ignore
 block indentation.
 Indented paragraph continuations retain their inline delimiter state; actual
@@ -1065,9 +1066,10 @@ invocation owns its full subtree before name/argument validation, including
 malformed unnamed openers and nested wrappers from another syntax family;
 nested content cannot escape as another call. Only DSML invocations can be
 recovered independently inside a DSML calls wrapper.
-When the body starts with a JSON object, object nesting, string quotes and
-escapes determine where that object ends. Protocol spellings inside JSON strings
-remain argument data even when they match the enclosing invocation's close tag.
+When the body starts with a JSON object, array or string, matching delimiters,
+quotes and escapes determine where the value ends. Protocol spellings inside
+JSON strings remain argument data even when they match the enclosing
+invocation's close tag. Argument validation still requires an object.
 Invocation and parameter attributes come only from their own lexical opening
 tags; descendants and quoted values of other attributes cannot supply a name.
 Both invocation families use the shared bounded argument decoder, retaining
@@ -1086,11 +1088,12 @@ indexes make unmatched closers constant-time and matching pops amortized linear.
 Physical line-prefix state follows every byte consumed, including newlines inside
 tags. LF and CRLF use the same line and blank facts; a CRLF pair split across
 deltas keeps its container context while awaiting the LF. Raw text and parameter bytes
-remain unchanged. List context survives continuation lines. The lexer retains
-the ambiguous tail after a possible inline code opener. Matching runs make it
-literal; at a block boundary or EOF the lexer replays an unmatched tail once
-with indexed delimiter runs, allowing real calls outside matched spans to be
-recovered. The existing CommonMark parser determines
+remain unchanged. List context survives continuation lines. After a possible
+inline code opener, the stream publishes prose before potential markup and
+releases the prefix when there is no competing delimiter to reconsider.
+Matching runs make any remaining tail literal; at a block boundary or EOF the
+lexer replays an unmatched tail once with indexed delimiter runs, allowing
+real calls outside matched spans to be recovered. The existing CommonMark parser determines
 paragraph continuation, heading boundaries and new container facts rather than a
 second set of block rules. Structural prefixes are classified through their
 first inline payload character: ordinary list, heading and punctuation-led

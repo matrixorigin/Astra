@@ -77,21 +77,24 @@ struct Lexer {
     literal: Option<(char, usize, bool)>,
     inline: Option<InlineProbe>,
     inline_plan: Option<InlinePlan>,
+    stream_published: Option<usize>,
     line_has_text: bool,
     escaped: bool,
     open: Scopes,
 }
 
 /// An inline opener is provisional until an equal run closes it in its block.
-/// Keep the uncommitted bytes in the lexer input so no projection or tool
-/// boundary is published before the owner is known.
+/// Retain a replay checkpoint for bytes whose ownership may still change.
 #[derive(Debug)]
 struct InlineProbe {
     start: usize,
     offset: usize,
+    line_prefix_done: bool,
     line_has_text: bool,
     line_paragraph: bool,
     paragraph_open: bool,
+    escaped: bool,
+    competing_run: bool,
     line_containers: Arc<[Container]>,
     block_containers: Arc<[Container]>,
 }
@@ -121,16 +124,16 @@ struct Scope {
     body: InvocationBody,
 }
 
-/// Once an invocation starts a JSON object, its complete object (including
-/// nested objects and escaped string bytes) owns the text before any tag can
-/// be interpreted. The argument decoder still validates the original JSON.
+/// JSON strings and containers own their bytes before tag recognition, even
+/// when the argument decoder later rejects their shape or syntax. Numbers
+/// and literal keywords contain no string or nested value to protect.
 #[derive(Debug, Default)]
 enum InvocationBody {
     #[default]
     Markup,
     Pending,
     Json {
-        objects: usize,
+        closes: Vec<u8>,
         string: bool,
         escaped: bool,
     },
@@ -148,12 +151,12 @@ impl InvocationBody {
             if line_bounded && first == '\n' {
                 return index + 1;
             }
-            if first != '{' {
+            if !matches!(first, '{' | '[' | '"') {
                 *self = Self::Markup;
                 return 0;
             }
             *self = Self::Json {
-                objects: 0,
+                closes: Vec::new(),
                 string: false,
                 escaped: false,
             };
@@ -162,7 +165,7 @@ impl InvocationBody {
             0
         };
         let Self::Json {
-            objects,
+            closes,
             string,
             escaped,
         } = self
@@ -177,14 +180,19 @@ impl InvocationBody {
                     *escaped = true;
                 } else if byte == b'"' {
                     *string = false;
+                    if closes.is_empty() {
+                        *self = Self::Markup;
+                        return index + 1;
+                    }
                 }
             } else {
                 match byte {
                     b'"' => *string = true,
-                    b'{' => *objects += 1,
-                    b'}' => {
-                        *objects -= 1;
-                        if *objects == 0 {
+                    b'{' => closes.push(b'}'),
+                    b'[' => closes.push(b']'),
+                    b'}' | b']' if closes.last() == Some(&byte) => {
+                        closes.pop();
+                        if closes.is_empty() {
                             *self = Self::Markup;
                             return index + 1;
                         }
@@ -274,6 +282,56 @@ impl Lexer {
         &self.pending[self.cursor..]
     }
 
+    fn projection_text(&self, start: usize, end: usize) -> String {
+        // A streaming callback may have received the common prefix before an
+        // inline match or replay. Final projection has no published watermark.
+        let published = self
+            .stream_published
+            .map_or(0, |offset| offset.saturating_sub(self.offset - self.cursor));
+        self.pending[published.max(start).min(end)..end].to_owned()
+    }
+
+    fn inline_checkpoint(&self) -> InlineProbe {
+        InlineProbe {
+            start: self.cursor,
+            offset: self.offset,
+            line_prefix_done: self.line_prefix_done,
+            line_has_text: self.line_has_text,
+            line_paragraph: self.line_paragraph,
+            paragraph_open: self.paragraph_open,
+            escaped: self.escaped,
+            competing_run: false,
+            line_containers: self.line_containers.clone(),
+            block_containers: self.block_containers.clone(),
+        }
+    }
+
+    fn publish_inline_prose(&mut self, fragments: &mut Vec<Fragment>) {
+        let (Some(published), Some(inline)) = (self.stream_published, &self.inline) else {
+            return;
+        };
+        let base = self.offset - self.cursor;
+        let start = inline.start.max(published.saturating_sub(base));
+        let end = self.pending[start..self.cursor]
+            .find('<')
+            .map_or(self.cursor, |index| start + index);
+        if end > start {
+            fragments.push(Fragment::Text {
+                text: self.pending[start..end].to_owned(),
+                visible: true,
+                literal: true,
+            });
+            self.stream_published = Some(base + end);
+        }
+        if end == self.cursor && !inline.competing_run {
+            // In either interpretation this prefix is just text. A different
+            // run could open a span on replay, so keep it and its raw suffix.
+            let mut checkpoint = self.inline_checkpoint();
+            checkpoint.paragraph_open |= checkpoint.line_paragraph;
+            self.inline = Some(checkpoint);
+        }
+    }
+
     fn push(&mut self, chunk: &str, finish: bool) -> Vec<Fragment> {
         self.pending.push_str(chunk);
         let mut fragments = Vec::new();
@@ -304,7 +362,7 @@ impl Lexer {
                     };
                     self.prefix_cursor = markdown::Cursor::default();
                     if let Some(prefix) = prefix {
-                        let text = self.remaining()[..prefix.end].to_owned();
+                        let text = self.projection_text(self.cursor, self.cursor + prefix.end);
                         self.consume(prefix.end);
                         fragments.push(Fragment::Text {
                             text,
@@ -340,7 +398,7 @@ impl Lexer {
                 if end == 0 {
                     break;
                 }
-                let text = self.remaining()[..end].to_owned();
+                let text = self.projection_text(self.cursor, self.cursor + end);
                 self.consume(end);
                 fragments.push(Fragment::Text {
                     text,
@@ -465,7 +523,7 @@ impl Lexer {
                         let text = self
                             .inline
                             .is_none()
-                            .then(|| self.remaining()[..end].to_owned());
+                            .then(|| self.projection_text(self.cursor, self.cursor + end));
                         self.consume(end);
                         self.line_has_text = false;
                         if let Some(text) = text {
@@ -487,7 +545,7 @@ impl Lexer {
                 if end == 0 {
                     break;
                 }
-                let text = self.remaining()[..end].to_owned();
+                let text = self.projection_text(self.cursor, self.cursor + end);
                 self.consume(end);
                 fragments.push(Fragment::Text {
                     text,
@@ -508,7 +566,7 @@ impl Lexer {
                         .bytes()
                         .take_while(|ch| matches!(ch, b' ' | b'\t' | b'\r'))
                         .count();
-                    let text = self.remaining()[..end].to_owned();
+                    let text = self.projection_text(self.cursor, self.cursor + end);
                     self.consume(end);
                     fragments.push(Fragment::Text {
                         text,
@@ -525,7 +583,7 @@ impl Lexer {
                     .json_prefix(&self.pending[self.cursor..], scope.literal)
             });
             if json != 0 {
-                let text = self.remaining()[..json].to_owned();
+                let text = self.projection_text(self.cursor, self.cursor + json);
                 let visible = self.open.visible();
                 let literal = self.open.literal();
                 self.consume(json);
@@ -546,7 +604,7 @@ impl Lexer {
                     tag::Scan::Incomplete => {
                         let len = self.remaining().len();
                         if self.open.visible() && (self.escaped || !self.open.is_empty()) {
-                            let text = self.remaining().to_owned();
+                            let text = self.projection_text(self.cursor, self.pending.len());
                             self.consume(len);
                             fragments.push(Fragment::Text {
                                 text,
@@ -562,7 +620,7 @@ impl Lexer {
                     tag::Scan::Opaque { end, terminator }
                         if self.open.is_empty() && !self.escaped =>
                     {
-                        let text = self.remaining()[..end].to_owned();
+                        let text = self.projection_text(self.cursor, self.cursor + end);
                         if !self.line_has_text {
                             self.line_paragraph = false;
                             self.paragraph_open = false;
@@ -581,7 +639,7 @@ impl Lexer {
                         continue;
                     }
                     tag::Scan::Html { end, name, closing } => {
-                        let text = self.remaining()[..end].to_owned();
+                        let text = self.projection_text(self.cursor, self.cursor + end);
                         if self.open.is_empty() && !self.escaped {
                             self.html.tag(&text, &name, closing);
                         }
@@ -691,12 +749,17 @@ impl Lexer {
                             self.open_inline(count);
                         }
                     }
+                    Some((_, _, false)) if first == '`' => {
+                        if let Some(inline) = &mut self.inline {
+                            inline.competing_run = true;
+                        }
+                    }
                     _ => {}
                 }
                 let text = self
                     .inline
                     .is_none()
-                    .then(|| self.pending[text_start..self.cursor + count].to_owned());
+                    .then(|| self.projection_text(text_start, self.cursor + count));
                 self.consume(count);
                 if let Some(text) = text {
                     fragments.push(Fragment::Text {
@@ -723,7 +786,7 @@ impl Lexer {
             let text = self
                 .inline
                 .is_none()
-                .then(|| self.remaining()[..end].to_owned());
+                .then(|| self.projection_text(self.cursor, self.cursor + end));
             let literal = self.literal.is_some()
                 || self.indented
                 || self.html.active()
@@ -737,6 +800,7 @@ impl Lexer {
                 });
             }
         }
+        self.publish_inline_prose(&mut fragments);
         let consumed = self
             .inline
             .as_ref()
@@ -757,18 +821,12 @@ impl Lexer {
         if delimiter == '~' {
             return Some(markdown::opens_fence(&self.remaining()[..count]));
         }
-        let checked = self.fence_info_checked.max(count);
-        let end = match self.remaining()[checked..]
-            .bytes()
-            .position(|byte| matches!(byte, b'\n' | b'`'))
-        {
-            Some(index) => checked + index + 1,
-            None if finish => self.remaining().len(),
-            None => {
-                self.fence_info_checked = self.remaining().len();
-                return None;
-            }
-        };
+        let end = markdown::backtick_fence_prefix(
+            &self.pending[self.cursor..],
+            count,
+            &mut self.fence_info_checked,
+            finish,
+        )?;
         self.fence_info_checked = 0;
         Some(markdown::opens_fence(&self.remaining()[..end]))
     }
@@ -784,15 +842,7 @@ impl Lexer {
             }
             return;
         }
-        self.inline = Some(InlineProbe {
-            start: self.cursor,
-            offset: self.offset,
-            line_has_text: self.line_has_text,
-            line_paragraph: self.line_paragraph,
-            paragraph_open: self.paragraph_open,
-            line_containers: self.line_containers.clone(),
-            block_containers: self.block_containers.clone(),
-        });
+        self.inline = Some(self.inline_checkpoint());
         self.literal = Some(('`', count, false));
     }
 
@@ -823,10 +873,10 @@ impl Lexer {
         self.paragraph_open = inline.paragraph_open;
         self.line_containers = inline.line_containers;
         self.block_containers = inline.block_containers;
-        self.line_prefix_done = true;
+        self.line_prefix_done = inline.line_prefix_done;
         self.line_opaque_block = false;
         self.indented = false;
-        self.escaped = false;
+        self.escaped = inline.escaped;
         self.literal = None;
         self.delimiter_run = 0;
         self.fence_info_checked = 0;
@@ -881,9 +931,20 @@ impl Lexer {
 }
 
 /// Streaming projection and final projection use the exact same lexer.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DsmlToolCallStreamFilter {
     lexer: Lexer,
+}
+
+impl Default for DsmlToolCallStreamFilter {
+    fn default() -> Self {
+        Self {
+            lexer: Lexer {
+                stream_published: Some(0),
+                ..Lexer::default()
+            },
+        }
+    }
 }
 
 impl DsmlToolCallStreamFilter {

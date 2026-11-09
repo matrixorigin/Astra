@@ -13246,6 +13246,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_dsml_non_object_json_cannot_release_nested_calls() {
+        let embedded = r#"quoted "data" \ </|DSML|invoke><|DSML|invoke name='bash'><|DSML|parameter name='command'>pwd</|DSML|parameter></|DSML|invoke>"#;
+        let nested = json!([{"examples":[embedded]}]);
+        let genuine = r#"<|DSML|invoke name="bash">{"command":"echo sibling"}</|DSML|invoke>"#;
+        let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+        for body in [
+            nested.to_string(),
+            json!(embedded).to_string(),
+            format!("[,{nested}]"),
+            "true".to_owned(),
+            "-3.25e2".to_owned(),
+            "null".to_owned(),
+        ] {
+            let content = format!(
+                "Before <|DSML|calls><|DSML|invoke name=\"write_file\">{body}</|DSML|invoke>{genuine}</|DSML|calls> after"
+            );
+            for fragmented in [false, true] {
+                let pieces = if fragmented {
+                    content.chars().map(|ch| ch.to_string()).collect::<Vec<_>>()
+                } else {
+                    vec![content.clone()]
+                };
+                let frames = pieces
+                    .into_iter()
+                    .map(|piece| {
+                        let event = json!({"choices":[{"delta":{"content":piece}}]});
+                        Ok(Bytes::from(format!("data: {event}\n\n")))
+                    })
+                    .chain([Ok(Bytes::from("data: [DONE]\n\n"))]);
+                let mut published = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Text(text) = update {
+                        published.push_str(&text);
+                    }
+                };
+                let streamed = collect_llm_stream_for_wire(
+                    stream::iter(frames),
+                    "deepseek-test",
+                    Instant::now(),
+                    None,
+                    LlmCancel::None,
+                    stream_idle_timeout(),
+                    stream_idle_timeout_after_progress(),
+                    &allowed,
+                    Some(&mut callback),
+                    None,
+                )
+                .await
+                .unwrap();
+                let nonstream = parse_openai_compatible_nonstream_response(
+                    &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+                    "deepseek-test",
+                );
+                assert_eq!(published, "Before  after");
+                for result in [streamed, nonstream] {
+                    assert_eq!(result.full_text, published);
+                    let calls = result
+                        .tool_calls
+                        .iter()
+                        .map(|call| {
+                            (
+                                call["function"]["name"].as_str(),
+                                astra_turn_core::tool::args::shape::parse_tool_call_arguments(call),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        calls.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                        vec![Some("write_file"), Some("bash")],
+                        "{body}"
+                    );
+                    assert!(calls[0].1.is_err(), "{body}");
+                    assert_eq!(calls[1].1, Ok(json!({"command":"echo sibling"})));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_dsml_markdown_examples_remain_data() {
         let call = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
         for content in [
@@ -13505,6 +13584,21 @@ mod tests {
             (
                 format!("Text ```example```\n{call}"),
                 "Text ```example```\n".to_owned(),
+                vec!["README.md"],
+            ),
+            (
+                format!("x ` y\n```{call}`"),
+                format!("x ` y\n```{call}`"),
+                vec![],
+            ),
+            (
+                format!("x `` y\n```text ` {call}``"),
+                format!("x `` y\n```text ` {call}``"),
+                vec![],
+            ),
+            (
+                format!("x ` y\n```text\n{call}\n```\n{call}"),
+                format!("x ` y\n```text\n{call}\n```\n"),
                 vec!["README.md"],
             ),
             (
@@ -13847,11 +13941,17 @@ mod tests {
 
     #[tokio::test]
     async fn collect_llm_stream_degraded_markup_delivers_prose_before_line_or_stream_end() {
-        for text in [
-            "1. This is an ordinary answer arriving incrementally.",
-            "- An ordinary bullet.",
-            "# An ordinary heading",
-            "(An ordinary opening parenthesis)",
+        for pieces in [
+            &["1. This is an ordinary answer arriving incrementally."][..],
+            &["- An ordinary bullet."],
+            &["# An ordinary heading"],
+            &["(An ordinary opening parenthesis)"],
+            &[
+                "Press the `",
+                " key to continue. ",
+                "Then check the result.",
+                " No tool markup is present.",
+            ],
         ] {
             let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
             let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
@@ -13878,33 +13978,38 @@ mod tests {
                 )
                 .await
             });
-            let event = json!({"choices":[{"delta":{"content":text}}]});
-            sender
-                .send(Bytes::from(format!("data: {event}\n\n")))
-                .await
-                .unwrap();
-            let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let mut published = String::new();
-                while published != text {
-                    published.push_str(
-                        &received
-                            .recv()
-                            .await
-                            .expect("text callback while stream stays open"),
-                    );
+            let mut expected = String::new();
+            let mut published = String::new();
+            for piece in pieces {
+                let event = json!({"choices":[{"delta":{"content":piece}}]});
+                sender
+                    .send(Bytes::from(format!("data: {event}\n\n")))
+                    .await
+                    .unwrap();
+                expected.push_str(piece);
+                // A run at the end of a chunk still needs its delimiter width.
+                let ready = expected.trim_end_matches('`');
+                let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while published.len() < ready.len() {
+                        published.push_str(
+                            &received
+                                .recv()
+                                .await
+                                .expect("text callback while stream stays open"),
+                        );
+                    }
+                })
+                .await;
+                if delivered.is_err() {
+                    task.abort();
                 }
-                published
-            })
-            .await;
-            if delivered.is_err() {
-                task.abort();
+                delivered.expect("ordinary prose must be delivered before newline or EOF");
+                assert_eq!(published, ready);
             }
-            assert_eq!(
-                delivered.expect("ordinary prose must be delivered before newline or EOF"),
-                text
-            );
             sender.send(Bytes::from("data: [DONE]\n\n")).await.unwrap();
-            assert_eq!(task.await.unwrap().unwrap().full_text, text);
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result.full_text, expected);
+            assert!(result.tool_calls.is_empty());
         }
     }
 
