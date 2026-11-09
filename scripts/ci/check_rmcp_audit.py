@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Keep the rmcp advisory exception tied to the disabled upstream backends."""
 
 import json
