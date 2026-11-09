@@ -161,6 +161,14 @@ fn event_to_json(event: &StreamEvent, owner: &StreamEventOwner) -> String {
         StreamEvent::RunBound(run_id) => {
             serde_json::json!({"type": "run_bound", "run_id": run_id, "owner": owner})
         }
+        StreamEvent::RunModelOutcome {
+            run_id,
+            session_id,
+            outcome,
+        } => {
+            serde_json::json!({"type":"run_model_outcome", "run_id":run_id,
+                "session_id":session_id, "outcome":outcome, "owner":owner})
+        }
         StreamEvent::ContextWindowPolicy {
             raw_window_tokens,
             usable_input_tokens,

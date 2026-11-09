@@ -60,7 +60,7 @@ use crate::turn::agentic_loop::host::{
 };
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute, RuntimeToolChoice,
-    call_prepared_llm_and_collect_with_stream_callback, prepare_streaming_call,
+    call_prepared_llm_and_collect_with_stream_callback, prepare_streaming_call_with_origin,
     provider_supports_no_tool_choice, sleep_ms_or_llm_cancel,
 };
 use crate::turn::llm::summary_client::RuntimeSummaryClient;
@@ -4465,15 +4465,150 @@ impl ServerAgenticLoopHost {
         self.open_authorized_private_responses(messages, scope, model)
     }
 
-    fn responses_budget_view(
+    fn model_replay_route(&self) -> Option<String> {
+        let execution = self.admitted_model_execution.as_ref()?;
+        Some(self.model_replay_route_for(execution))
+    }
+
+    fn model_replay_route_for(&self, execution: &astra_services::AdmittedModelExecution) -> String {
+        let protocol = execution
+            .inference_protocol
+            .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&execution.provider));
+        let endpoint = execution
+            .completions_url_override
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&execution.base_url);
+        let endpoint = reqwest::Url::parse(endpoint)
+            .map(|mut url| {
+                url.set_fragment(None);
+                url.to_string()
+            })
+            .unwrap_or_else(|_| endpoint.to_string());
+        let mut headers: Vec<_> = execution
+            .header_overrides
+            .iter()
+            .filter(|(name, _)| !name.starts_with("__astra_"))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value))
+            .collect();
+        headers.sort_unstable();
+        let auth_header =
+            if protocol == astra_core::model_wire::LlmProviderProtocol::AnthropicMessages {
+                "x-api-key"
+            } else {
+                "authorization"
+            };
+        let subscription = execution
+            .subscription
+            .as_ref()
+            .map(|value| value.connection_id());
+        let api_key = (subscription.is_none()
+            && !headers.iter().any(|(name, _)| name == auth_header))
+        .then_some(execution.api_key.as_str());
+        // Only the keyed digest is retained. Never log the route material.
+        let identity = json!({
+            "provider": execution.provider, "protocol": protocol, "endpoint": endpoint,
+            "model": execution.wire_model_name.as_deref().unwrap_or(&execution.model_name),
+            "offering": execution.offering_id, "source": execution.source_identity,
+            "subscription": subscription, "api_key": api_key, "headers": headers,
+            "responses_scope": execution.response_scope,
+        });
+        self.encryptor.keyed_digest(
+            "astra.model-replay-route.v1",
+            &astra_core::canonical_json_string(&identity),
+        )
+    }
+
+    fn project_model_history<'a>(
+        &self,
+        messages: &'a [Value],
+        state: &AgenticLoopState,
+    ) -> Result<std::borrow::Cow<'a, [Value]>, astra_core::ClassifiedError> {
+        let (Some(run_id), Some(route)) =
+            (state.current_run_id.as_deref(), self.model_replay_route())
+        else {
+            return Ok(std::borrow::Cow::Borrowed(messages));
+        };
+        let scope = crate::turn::llm::model_origin::ReplayScope {
+            encryptor: &self.encryptor,
+            user_id: &self.user_id,
+            session_id: &self.session_id,
+            allowed_session_ids: self.private_reasoning_origins.as_ref(),
+            run_id,
+            selection_revision: state
+                .run_settings_observation
+                .model()
+                .and_then(|settings| settings.applied.as_ref())
+                .map(|applied| applied.selection.revision),
+            route: &route,
+        };
+        crate::turn::llm::model_origin::project(&scope, messages)
+    }
+
+    fn attest_current_model_message(&self, state: &AgenticLoopState, message: &mut Value) {
+        let (Some(run_id), Some(route)) =
+            (state.current_run_id.as_deref(), self.model_replay_route())
+        else {
+            return;
+        };
+        let scope = crate::turn::llm::model_origin::ReplayScope {
+            encryptor: &self.encryptor,
+            user_id: &self.user_id,
+            session_id: &self.session_id,
+            allowed_session_ids: self.private_reasoning_origins.as_ref(),
+            run_id,
+            selection_revision: state
+                .run_settings_observation
+                .model()
+                .and_then(|settings| settings.applied.as_ref())
+                .map(|applied| applied.selection.revision),
+            route: &route,
+        };
+        crate::turn::llm::model_origin::attest(&scope, message);
+    }
+
+    fn attest_messages(&self, state: &mut AgenticLoopState, start: usize, runtime_generated: bool) {
+        let (Some(run_id), Some(route)) = (state.current_run_id.clone(), self.model_replay_route())
+        else {
+            return;
+        };
+        let scope = crate::turn::llm::model_origin::ReplayScope {
+            encryptor: &self.encryptor,
+            user_id: &self.user_id,
+            session_id: &self.session_id,
+            allowed_session_ids: self.private_reasoning_origins.as_ref(),
+            run_id: &run_id,
+            selection_revision: state
+                .run_settings_observation
+                .model()
+                .and_then(|settings| settings.applied.as_ref())
+                .map(|applied| applied.selection.revision),
+            route: &route,
+        };
+        let start = start.min(state.messages.len());
+        for message in &mut state.messages[start..] {
+            if runtime_generated {
+                crate::turn::llm::model_origin::attest_runtime(&scope, message);
+            } else {
+                crate::turn::llm::model_origin::attest(&scope, message);
+            }
+        }
+    }
+
+    fn provider_budget_view(
         &self,
         messages: &[Value],
         config: &ResolvedTurnLlmConfig,
+        state: &AgenticLoopState,
     ) -> Result<Option<Vec<Value>>, astra_core::ClassifiedError> {
+        let projected = self.project_model_history(messages, state)?;
         let Some((scope, model)) = config.responses_budget_scope() else {
-            return Ok(None);
+            return Ok(match projected {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(messages) => Some(messages),
+            });
         };
-        let mut opened = messages.to_vec();
+        let mut opened = projected.into_owned();
         if config.responses_reasoning_history
             == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
         {
@@ -5477,7 +5612,7 @@ fn fit_physical_retry_wire_budget(
     config: &ResolvedTurnLlmConfig,
     requested_output_tokens: usize,
     state: &AgenticLoopState,
-    prepare_budget_view: impl Fn(&mut [Value]) -> Result<(), astra_core::ClassifiedError>,
+    prepare_budget_view: impl Fn(&[Value]) -> Result<Option<Vec<Value>>, astra_core::ClassifiedError>,
 ) -> Result<
     (
         crate::turn::wire_assembly::WireBudgetStatus,
@@ -5487,13 +5622,7 @@ fn fit_physical_retry_wire_budget(
     astra_core::ClassifiedError,
 > {
     let measure = |messages: &[Value]| -> Result<_, astra_core::ClassifiedError> {
-        let budget_view = if config.responses_budget_scope().is_some() {
-            let mut view = messages.to_vec();
-            prepare_budget_view(&mut view)?;
-            Some(view)
-        } else {
-            None
-        };
+        let budget_view = prepare_budget_view(messages)?;
         let provider_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
             budget_view.as_deref().unwrap_or(messages),
             &config.provider,
@@ -14635,10 +14764,10 @@ impl ServerAgenticLoopHost {
         loop {
             let snapshot = context
                 .run_control
-                .permission_mode_snapshot(&context.user_id, &context.session_id, &context.run_id)
+                .run_settings_snapshot(&context.user_id, &context.session_id, &context.run_id)
                 .await?;
             if snapshot
-                .and_then(|snapshot| snapshot.requested)
+                .and_then(|snapshot| snapshot.permission.requested)
                 .is_some_and(|requested| requested.revision > context.permission_revision)
             {
                 return Ok(());
@@ -17829,14 +17958,16 @@ impl ServerAgenticLoopHost {
             model_context_window,
         );
         let cache_cfg = PromptCacheConfig::from_cache_capability(cache_capability, provider);
+        let projected_history = self.project_model_history(&state.messages, state)?;
         let planning_messages = if let Some(config) = self.resolved_llm_config.as_ref()
             && let Some((scope, wire_model)) = config.responses_budget_scope()
-            && state.messages.iter().any(|message| {
-                message
-                    .get(astra_core::model_wire::responses::CONTINUATION_KEY)
-                    .is_some()
-            }) {
-            let mut history = state.messages.clone();
+            && (matches!(projected_history, std::borrow::Cow::Owned(_))
+                || state.messages.iter().any(|message| {
+                    message
+                        .get(astra_core::model_wire::responses::CONTINUATION_KEY)
+                        .is_some()
+                })) {
+            let mut history = projected_history.into_owned();
             if config.responses_reasoning_history
                 == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
             {
@@ -17870,7 +18001,10 @@ impl ServerAgenticLoopHost {
             })?;
             Some(items)
         } else {
-            None
+            match projected_history {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(messages) => Some(messages),
+            }
         };
         crate::turn::llm::context::assemble_context_pipeline(
             crate::turn::llm::context::LlmContextAssemblyInput {
@@ -18048,7 +18182,7 @@ impl ServerAgenticLoopHost {
                 state.restore_volatile_attempt_lease();
             })?;
             let budget_source = self
-                .responses_budget_view(&candidate.messages, llm_cfg)
+                .provider_budget_view(&candidate.messages, llm_cfg, state)
                 .inspect_err(|_| state.restore_volatile_attempt_lease())?;
             let wire_messages = crate::turn::llm::client::consolidate_system_messages_for_protocol(
                 budget_source.as_deref().unwrap_or(&candidate.messages),
@@ -18158,11 +18292,11 @@ impl ServerAgenticLoopHost {
         }
 
         let (candidate, mut budget_source) = assembly.expect("bounded wire assembly must settle");
-        if budget_source.is_none() && llm_cfg.responses_budget_scope().is_some() {
+        if budget_source.is_none() {
             // A fallback stays sealed while later candidates are tried, so
             // concurrent requests do not retain an extra plaintext copy.
             budget_source = self
-                .responses_budget_view(&candidate.messages, llm_cfg)
+                .provider_budget_view(&candidate.messages, llm_cfg, state)
                 .inspect_err(|_| state.restore_volatile_attempt_lease())?;
         }
         let wire_messages = candidate.messages;
@@ -18838,6 +18972,13 @@ impl ServerAgenticLoopHost {
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn attest_model_messages(&self, state: &mut AgenticLoopState, start: usize) {
+        self.attest_messages(state, start, false);
+    }
+
+    fn attest_runtime_messages(&self, state: &mut AgenticLoopState, start: usize) {
+        self.attest_messages(state, start, true);
+    }
     fn context_history_artifacts_available(&self, state: &AgenticLoopState) -> bool {
         let Some(executor) = state.runtime_tool_executor.as_deref() else {
             return false;
@@ -18912,7 +19053,44 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<(), astra_core::ClassifiedError> {
-        self.prepare_auto_model_selection(state).await
+        let settings = state
+            .run_settings_observation
+            .model()
+            .cloned()
+            .unwrap_or_default();
+        let pending = settings.requested.as_ref().is_some_and(|selection| {
+            settings
+                .outcome
+                .as_ref()
+                .is_none_or(|outcome| &outcome.selection != selection)
+        });
+        // A recovered Auto choice can have expired while the user is asking
+        // for a different model. Restore its Work facts, but do not require
+        // re-admitting the old model before trying the new one.
+        let defer_auto =
+            settings.applied.is_none() && pending && self.restore_model_routing(state).await?;
+        if settings.applied.is_some() {
+            // Recover existing Auto Work facts without replacing the explicit
+            // model that the run owner already committed.
+            if self.restore_model_routing(state).await? {
+                self.project_work_admission_semantics(state, false);
+            }
+            self.model_routing = None;
+        } else if !defer_auto {
+            self.prepare_auto_model_selection(state).await?;
+        } else {
+            self.project_work_admission_semantics(state, false);
+        }
+        self.apply_explicit_model_settings(state, settings).await?;
+        if defer_auto
+            && state
+                .run_settings_observation
+                .model()
+                .is_none_or(|settings| settings.applied.is_none())
+        {
+            self.prepare_auto_model_selection(state).await?;
+        }
+        Ok(())
     }
     fn parent_model_reasoning_snapshot(
         &self,
@@ -21017,15 +21195,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             } else {
                 let budget = fit_physical_retry_wire_budget(
                     &mut llm_messages, &final_tools, &llm_cfg, effective_max_output, state,
-                    |view| {
-                        if let Some((scope, model)) = llm_cfg.responses_budget_scope() {
-                            if llm_cfg.responses_reasoning_history == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn) {
-                                crate::turn::llm::private_continuation::discard_completed_turn_reasoning(view);
-                            }
-                            self.open_authorized_private_responses(view, scope, model)?;
-                        }
-                        Ok(())
-                    },
+                    |view| self.provider_budget_view(view, &llm_cfg, state),
                 ).and_then(|(status, output, boundary)| {
                     primary_thinking.validate_output_budget(output as u64).map_err(|message| {
                         astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, message)
@@ -21200,24 +21370,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // providers, durably staged the execution deadline.  Keep this
             // exact vector immutable through provider dispatch; only the
             // timeout is sampled at the dispatch boundary.
-            let mut attempt_llm_messages_owned = if attempt_in_round == 0 {
+            let attempt_llm_messages_owned = if attempt_in_round == 0 {
                 first_responses_messages.take().unwrap_or_else(|| llm_messages.clone())
             } else {
-                llm_messages.clone()
+                self.provider_budget_view(&llm_messages, &llm_cfg, state)?
+                    .unwrap_or_else(|| llm_messages.clone())
             };
-            if attempt_in_round > 0 && let Some((scope, model)) = llm_cfg.responses_budget_scope() {
-                if llm_cfg.responses_reasoning_history
-                    == Some(astra_core::model_wire::responses::ReasoningHistory::CurrentTurn)
-                {
-                    crate::turn::llm::private_continuation::discard_completed_turn_reasoning(
-                        &mut attempt_llm_messages_owned,
-                    );
-                }
-                self.open_private_responses(&mut attempt_llm_messages_owned, scope, model)?;
-            }
             let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
             let execution_route = llm_cfg.execution_route();
-            let prepared_call = match prepare_streaming_call(
+            let replay_route = self.model_replay_route();
+            let replay_scope = state.current_run_id.as_deref().zip(replay_route.as_deref()).map(|(run_id, route)|
+                crate::turn::llm::model_origin::ReplayScope {
+                    encryptor: &self.encryptor, user_id: &self.user_id, session_id: &self.session_id,
+                    allowed_session_ids: self.private_reasoning_origins.as_ref(),
+                    run_id, selection_revision: state.run_settings_observation.model()
+                        .and_then(|settings| settings.applied.as_ref())
+                        .map(|applied| applied.selection.revision), route,
+                });
+            let prepared_call = match prepare_streaming_call_with_origin(
                 LlmCall {
                     purpose: state.inference_purpose,
                     messages: attempt_llm_messages,
@@ -21229,6 +21399,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     thinking: &primary_thinking,
                 },
                 if use_no_tool_choice { RuntimeToolChoice::None } else { RuntimeToolChoice::Auto },
+                replay_scope.as_ref(),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -21964,7 +22135,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 "canonical Work retry authority is missing content",
                             )
                         })?;
-                let retry_assistant = provider_retry_assistant(&r);
+                let mut retry_assistant = provider_retry_assistant(&r);
+                self.attest_current_model_message(state, &mut retry_assistant);
                 llm_messages.push(retry_assistant.clone());
                 let mut retry_canonical_prefix = state.messages.clone();
                 retry_canonical_prefix.push(retry_assistant.clone());
@@ -22023,7 +22195,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             {
                 output_cap_partial_text = r.full_text.clone();
                 output_cap_partial_reasoning = r.reasoning.clone();
-                let partial_assistant = provider_retry_assistant(&r);
+                let mut partial_assistant = provider_retry_assistant(&r);
+                self.attest_current_model_message(state, &mut partial_assistant);
                 llm_messages.push(partial_assistant.clone());
                 let mut continuation_canonical_prefix = state.messages.clone();
                 continuation_canonical_prefix.push(partial_assistant.clone());
@@ -22846,16 +23019,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 config.cache_capability,
                 &config.provider,
             );
-        if let Some((scope, model)) = config.responses_budget_scope()
-            && self
-                .authorize_private_responses(&state.messages, scope, model)
-                .is_err()
-        {
-            tracing::warn!(
-                "skipping pre-turn compaction because continuation authorization failed"
-            );
-            return None;
-        }
         let pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             &visible_tools,
@@ -22892,9 +23055,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         install_interrupted_summary_sink(client.as_mut(), &self.auxiliary_summary_usage);
         let accounted_client =
             AccountedSummaryClient::new(client.as_ref(), Arc::clone(&self.auxiliary_summary_usage));
+        let public_history = match crate::turn::llm::model_origin::public_summary_history(
+            &state.messages[..spill_count],
+        ) {
+            Ok(history) => history,
+            Err(error) => {
+                tracing::warn!(%error, "skipping pre-turn compaction with incomplete tool history");
+                return None;
+            }
+        };
         let summary_text = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
-            &state.messages[..spill_count],
+            &public_history,
             if matches!(
                 cache_capability.volatile_placement,
                 astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
@@ -24735,7 +24907,11 @@ mod tests {
             &cfg,
             256,
             &create_test_state(),
-            |view| host.open_authorized_private_responses(view, &scope, &cfg.model_name),
+            |messages| {
+                let mut view = messages.to_vec();
+                host.open_authorized_private_responses(&mut view, &scope, &cfg.model_name)?;
+                Ok(Some(view))
+            },
         )
         .unwrap();
         assert_eq!(
@@ -25348,7 +25524,7 @@ mod tests {
                     &cfg,
                     256,
                     &create_test_state(),
-                    |_| Ok(()),
+                    |_| Ok(None),
                 )
                 .unwrap();
                 assert!(!status.hard_limit_exceeded());
@@ -25395,7 +25571,7 @@ mod tests {
         let original = wire.clone();
         let error =
             fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state(), |_| {
-                Ok(())
+                Ok(None)
             })
             .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
@@ -25437,7 +25613,7 @@ mod tests {
         .unwrap();
         let (status, output, boundary) =
             fit_physical_retry_wire_budget(&mut wire, &[], &cfg, 256, &create_test_state(), |_| {
-                Ok(())
+                Ok(None)
             })
             .unwrap();
         assert!(!status.hard_limit_exceeded());
@@ -25503,8 +25679,10 @@ mod tests {
             }
             let original = candidate.clone();
             let (status, output, boundary) =
-                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state, |_| Ok(()))
-                    .unwrap();
+                fit_physical_retry_wire_budget(&mut candidate, &[], &cfg, 256, &state, |_| {
+                    Ok(None)
+                })
+                .unwrap();
             assert!(!status.hard_limit_exceeded());
             assert_eq!(output, 256);
             assert!(boundary.is_some());
@@ -25545,7 +25723,7 @@ mod tests {
         oversized = projected;
         let original = oversized.clone();
         let error =
-            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state, |_| Ok(()))
+            fit_physical_retry_wire_budget(&mut oversized, &[], &cfg, 256, &state, |_| Ok(None))
                 .unwrap_err();
         assert_eq!(error.kind, astra_core::ErrorKind::ContextWindow);
         assert_eq!(oversized, original);
@@ -30199,6 +30377,35 @@ mod tests {
             timeout_ms,
             128_000,
         )
+    }
+
+    #[test]
+    fn replay_route_tracks_the_actual_account_not_capacity_metadata() {
+        let host = test_host_builder("user", "session").build();
+        let mut execution = test_gateway_execution("https://model.example/v1", None);
+        execution.header_overrides.clear();
+        execution.base_url = "https://model.example/v1".into();
+        execution.completions_url_override = None;
+        execution.api_key = "original-account".into();
+        let route = host.model_replay_route_for(&execution);
+        let mut changed = execution.clone();
+        changed.context_window = Some(256_000);
+        changed.max_completion_tokens = Some(4096);
+        assert_eq!(host.model_replay_route_for(&changed), route);
+
+        changed.api_key = "another-account".into();
+        assert_ne!(host.model_replay_route_for(&changed), route);
+        changed = execution.clone();
+        changed.base_url = "https://other.example/v1".into();
+        assert_ne!(host.model_replay_route_for(&changed), route);
+        changed = execution.clone();
+        changed
+            .header_overrides
+            .insert("Authorization".into(), "Bearer other".into());
+        assert_ne!(host.model_replay_route_for(&changed), route);
+        let override_route = host.model_replay_route_for(&changed);
+        changed.api_key = "unused-default-credential".into();
+        assert_eq!(host.model_replay_route_for(&changed), override_route);
     }
 
     fn nonthinking_test_config() -> ResolvedTurnLlmConfig {

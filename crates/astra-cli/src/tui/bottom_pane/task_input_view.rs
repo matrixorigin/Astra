@@ -259,6 +259,42 @@ impl TaskInputView {
 }
 
 impl BottomPaneView for TaskInputView {
+    fn resolve_agent_guide(
+        &mut self,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        status: astra_turn_types::UserIntentStatus,
+    ) -> bool {
+        let InputPurpose::Returned {
+            target: original,
+            recipient,
+            intent_id: id,
+            uncertain,
+        } = &mut self.purpose
+        else {
+            return false;
+        };
+        if id != intent_id || !original.same_execution(target) {
+            return false;
+        }
+        match status {
+            astra_turn_types::UserIntentStatus::Returned => {
+                *uncertain = false;
+                self.error = Some(
+                    "The agent did not use the message. You may edit and send it again.".into(),
+                );
+            }
+            astra_turn_types::UserIntentStatus::Applied => {
+                let recipient = recipient.clone();
+                self.purpose = InputPurpose::Guide(recipient);
+                self.error =
+                    Some("The original message was received. This draft has not been sent.".into());
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;

@@ -3789,6 +3789,40 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        if event.get("type").and_then(Value::as_str) == Some("run_model_outcome") {
+            let run_id = event
+                .get("run_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            let session_id = event
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            if run_id.is_none()
+                || session_id.is_none()
+                || self.last_bound_run_id.as_deref() != run_id
+                || self.executor.active_session_id().as_deref() != session_id
+            {
+                tracing::warn!("ignored model acknowledgement for another execution");
+                return Ok(());
+            }
+            let Some(outcome) = event.get("outcome").cloned().and_then(|value| {
+                serde_json::from_value::<astra_turn_types::RunModelOutcome>(value).ok()
+            }) else {
+                tracing::warn!("ignored malformed model acknowledgement");
+                return Ok(());
+            };
+            if outcome.selection.revision < 0 || outcome.selection.request_id.is_empty() {
+                tracing::warn!("ignored model acknowledgement with invalid identity");
+                return Ok(());
+            }
+            self.emit_stream_event(chat_stream::StreamEvent::RunModelOutcome {
+                run_id: run_id.expect("validated run identity").to_owned(),
+                session_id: session_id.expect("validated session identity").to_owned(),
+                outcome,
+            })
+            .await;
+        }
         if event.get("type").and_then(Value::as_str) == Some("tool_request") {
             let read_only_execution = match event.get("read_only_execution") {
                 None => false,
@@ -15373,6 +15407,65 @@ mod tests {
         wrong_session["session_id"] = serde_json::json!("another-session");
         assert!(host.on_accepted_sse_event(&wrong_session).await.is_err());
         assert_eq!(mirror.applied_request_id().as_deref(), Some("mode-2"));
+    }
+
+    #[tokio::test]
+    async fn model_outcome_reaches_the_current_run_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id("session"),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        host.last_bound_run_id = Some("run".into());
+        let event = serde_json::json!({"type":"run_model_outcome",
+            "session_id":"session", "run_id":"run",
+            "outcome": {"selection":{"request_id":"change", "revision":3,
+                "model":{"offering_id":"model"}, "reasoning":{"mode":"model_default"}},
+                "owner_generation":1, "round_index":2,
+                "result":{"status":"applied", "model":{"offering_id":"model"},
+                    "reasoning":{"mode":"model_default"}}}});
+        let mut wrong = event.clone();
+        wrong["run_id"] = serde_json::json!("other-run");
+        host.on_accepted_sse_event(&wrong).await.unwrap();
+        wrong = event.clone();
+        wrong["session_id"] = serde_json::json!("other-session");
+        host.on_accepted_sse_event(&wrong).await.unwrap();
+        wrong = event.clone();
+        wrong["outcome"]["selection"]["revision"] = serde_json::json!(-1);
+        host.on_accepted_sse_event(&wrong).await.unwrap();
+        assert!(rx.try_recv().is_err());
+
+        host.on_accepted_sse_event(&event).await.unwrap();
+        assert!(
+            matches!(rx.try_recv(), Ok(chat_stream::StreamEvent::RunModelOutcome {
+            run_id, session_id, outcome
+        }) if run_id == "run" && session_id == "session"
+            && outcome.selection.request_id == "change")
+        );
     }
 
     #[serial_test::serial]

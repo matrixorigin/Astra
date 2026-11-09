@@ -2811,7 +2811,7 @@ fn append_only_history_contract_error(message: &'static str) -> astra_core::Clas
 /// assistant or synthetic tool message to be replaced. Malformed/incomplete
 /// groups therefore fail before provider I/O and remain recoverable through
 /// the canonical lifecycle instead of silently changing the cache prefix.
-fn validate_append_only_openai_history(
+pub(crate) fn validate_append_only_openai_history(
     messages: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
     let mut pending_tool_ids = HashSet::<&str>::new();
@@ -3594,6 +3594,10 @@ fn build_provider_request_body_with_cache_capability(
             .get(astra_core::model_wire::responses::CONTINUATION_KEY)
             .is_some()
             || message
+                .get(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD)
+                .is_some()
+            || message.get(super::model_origin::FOREIGN_GROUP).is_some()
+            || message
                 .get(astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD)
                 .is_some()
             || crate::turn::wire_assembly::is_required_runtime_preamble(message)
@@ -4298,6 +4302,8 @@ fn strip_internal_runtime_markers_with_ids(
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
+            object.remove(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD);
+            object.remove(super::model_origin::FOREIGN_GROUP);
             object.remove("_compact_boundary");
             object.remove(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD);
             // These fields are compaction/checkpoint bookkeeping. They are
@@ -5205,7 +5211,27 @@ pub(crate) fn prepare_streaming_call(
     call: LlmCall<'_>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<PreparedStreamingCall<'_>, astra_core::ClassifiedError> {
+    prepare_streaming_call_with_origin(call, tool_choice, None)
+}
+
+pub(crate) fn prepare_streaming_call_with_origin<'a>(
+    call: LlmCall<'a>,
+    tool_choice: RuntimeToolChoice,
+    scope: Option<&super::model_origin::ReplayScope<'_>>,
+) -> Result<PreparedStreamingCall<'a>, astra_core::ClassifiedError> {
     let preparation_started = Instant::now();
+    if let Some(scope) = scope {
+        super::model_origin::verify_projected(scope, call.messages)?;
+    } else if call
+        .messages
+        .iter()
+        .any(|message| message.get(super::model_origin::FOREIGN_GROUP).is_some())
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "Unverified model history",
+        ));
+    }
     let default_protocol = llm_provider_protocol(call.route.provider);
     if call.route.inference_protocol.is_some_and(|protocol| {
         protocol != default_protocol
@@ -5243,7 +5269,7 @@ pub(crate) fn prepare_streaming_call(
         .unwrap_or_else(|| llm_provider_protocol(call.route.provider))
         == LlmProviderProtocol::OpenAiResponses
     {
-        return responses::prepare(call, tool_choice, preparation_started);
+        return responses::prepare(call, tool_choice, preparation_started, scope.is_some());
     }
     if call
         .messages

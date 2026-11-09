@@ -835,6 +835,53 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
         ));
         messages.pop();
     }
+    // A user-authorized model switch may reuse complete tool evidence in the
+    // same human turn, without forwarding the previous provider's private
+    // continuation. Exercise the actual request and mock provider boundary.
+    let key = astra_services::FernetTokenEncryptor::new("model-switch-fixture").unwrap();
+    let old = crate::turn::llm::model_origin::ReplayScope {
+        encryptor: &key,
+        user_id: "owner",
+        session_id: "session",
+        allowed_session_ids: None,
+        run_id: "run",
+        selection_revision: None,
+        route: "old-route",
+    };
+    let current = crate::turn::llm::model_origin::ReplayScope {
+        selection_revision: Some(1),
+        route: "new-route",
+        ..old
+    };
+    let mut recorded = messages.clone();
+    for message in &mut recorded {
+        crate::turn::llm::model_origin::attest(&old, message);
+    }
+    let projected = crate::turn::llm::model_origin::project(&current, &recorded).unwrap();
+    let mut handoff_call = call(&projected, &tools, &other_scope, &base, &thinking);
+    handoff_call.route = LlmExecutionRoute::from_admitted(&second_execution);
+    handoff_call.route.response_scope = Some(&other_scope);
+    let prepared = crate::turn::llm::client::prepare_streaming_call_with_origin(
+        handoff_call,
+        RuntimeToolChoice::Auto,
+        Some(&current),
+    )
+    .unwrap();
+    let handoff_body: Value = serde_json::from_slice(&prepared.request.body).unwrap();
+    let input = handoff_body["input"].to_string();
+    assert!(input.contains("call-1") && input.contains("found"));
+    assert!(!input.contains("ciphertext"));
+    let result = crate::turn::llm::client::call_prepared_llm_and_collect_with_stream_callback(
+        prepared,
+        LlmCancel::None,
+        None,
+        None,
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.full_text, "done");
+
     messages.push(json!({"role":"user", "content":"a new human turn"}));
     let prepared = prepare_streaming_call(
         call(&messages, &tools, &other_scope, &base, &thinking),

@@ -4235,6 +4235,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // to overwrite it.
     capture_latest_provider_text(state, &turn_result);
     capture_deferred_candidate_text(state, &turn_result);
+    host.attest_model_messages(state, transcript_append_start);
     state.record_appended_prompt_history_from(transcript_append_start);
     if !turn_result.accum.has_tool_calls && turn_result.accum.tool_calls.is_empty() {
         super::finalization::bound_ingested_terminal_message(state, transcript_append_start);

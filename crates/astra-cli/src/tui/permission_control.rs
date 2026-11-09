@@ -133,6 +133,10 @@ impl ActivePermissionControl {
         self.session_id.clone()
     }
 
+    pub(super) fn session_bound_notification(&self) -> Arc<tokio::sync::Notify> {
+        self.session_bound.clone()
+    }
+
     pub(super) fn request(&mut self, mode: PermissionMode) {
         let intent = ModeIntent {
             request_id: uuid::Uuid::now_v7().to_string(),

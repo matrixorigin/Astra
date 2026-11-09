@@ -102,8 +102,7 @@ pub use delegation_model_admission::{
     DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,
     DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
     DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
-    DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
-    DelegationRequirementPropagation, DelegationRequirementStrength,
+    DelegationModelSlotConstraint, DelegationRequirementPropagation, DelegationRequirementStrength,
     DelegationUserRequirementSource, MAX_MODEL_ADMISSION_SLOTS,
 };
 pub use explain_analyze::{
@@ -127,8 +126,8 @@ pub use explain_analyze_projection::{
 };
 pub use inference::{
     AutoModelStrategy, CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose,
-    ModelSelection, ModelSelector, RequestedModelPolicy, RequestedModelPolicyError,
-    client_direct_execution_field, resolve_requested_model_selection,
+    ModelSelection, ModelSelector, ReasoningEffort, ReasoningRequirement, RequestedModelPolicy,
+    RequestedModelPolicyError, client_direct_execution_field, resolve_requested_model_selection,
     resolve_requested_model_selector,
 };
 pub use memory_ranking::{
@@ -259,9 +258,11 @@ pub use tool_invocation::{
     canonical_public_arguments_hash, canonical_public_tool_arguments,
 };
 pub use turn_provenance::{
-    MODEL_ITEM_ID_FIELD, TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    MODEL_ITEM_ID_FIELD, MODEL_REPLAY_ORIGIN_FIELD, ModelReplayOrigin,
+    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
     TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
-    mark_model_message, mark_turn_message, model_item_id, turn_message_provenance,
+    mark_model_message, mark_model_replay_origin, mark_turn_message, model_item_id,
+    model_replay_origin, turn_message_provenance,
 };
 pub use user_intent::{
     AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,
@@ -274,8 +275,9 @@ pub use verification_frontier::{
     BoundVerificationFrontier, VerificationEvidence, VerificationHandoff, VerificationUnavailable,
 };
 
-pub mod permission_control;
-pub use permission_control::{
+pub mod run_settings;
+pub use run_settings::{
+    RunModelOutcome, RunModelOutcomeKind, RunModelRequest, RunModelSelection, RunModelSnapshot,
     RunPermissionModeApplied, RunPermissionModeRequest, RunPermissionModeSelection,
     RunPermissionModeSnapshot,
 };

@@ -29,6 +29,11 @@ pub(crate) enum TuiAppEvent {
     /// cannot be safely projected against an unbound observer.
     SessionBound(String),
     RunBound(String),
+    RunModelOutcome {
+        run_id: String,
+        session_id: String,
+        outcome: astra_turn_types::RunModelOutcome,
+    },
     ContextWindowPolicy {
         raw_window_tokens: u64,
         usable_input_tokens: u64,
@@ -111,6 +116,11 @@ pub(crate) enum TuiAppEvent {
     /// The physical turn identity prevents a late result crossing turn ownership.
     ObservedUserIntent {
         turn_id: String,
+        event: Box<TuiAppEvent>,
+    },
+    /// Child events belong to the session attachment that created their sink.
+    ScopedAgentLive {
+        scope: std::sync::Arc<crate::tui::bottom_pane::RootIntentScope>,
         event: Box<TuiAppEvent>,
     },
     AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),

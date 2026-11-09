@@ -433,6 +433,11 @@ pub use astra_turn_core::interaction_types::{
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
 pub trait AgenticLoopHost: Send {
+    /// Bind freshly produced assistant messages to their actual model owner.
+    /// Hosts without durable model authority leave messages unchanged.
+    fn attest_model_messages(&self, _state: &mut AgenticLoopState, _start: usize) {}
+    fn attest_runtime_messages(&self, _state: &mut AgenticLoopState, _start: usize) {}
+
     /// The selected host must expose both a durable session writer and a
     /// model-visible reader before shared execution can spill history.
     fn context_history_artifacts_available(&self, _state: &AgenticLoopState) -> bool {
@@ -3667,7 +3672,7 @@ pub struct AgenticLoopState {
     pub current_run_owner_generation: Option<u64>,
     /// In-memory projection of the durable permission revision selected for this round.
     pub applied_permission_mode: Option<astra_turn_types::RunPermissionModeSelection>,
-    pub(crate) permission_mode_observation: super::permission_boundary::PermissionModeObservation,
+    pub(crate) run_settings_observation: super::settings_boundary::RunSettingsObservation,
     /// The sender lives inside the Server watcher task. A closed channel
     /// restores synchronous control observation if that task exits or panics.
     pub(crate) durable_control_watcher: Option<tokio::sync::watch::Receiver<()>>,
@@ -4051,7 +4056,7 @@ impl AgenticLoopState {
             current_run_id: None,
             current_run_owner_generation: None,
             applied_permission_mode: None,
-            permission_mode_observation: Default::default(),
+            run_settings_observation: Default::default(),
             durable_control_watcher: None,
             inference_purpose,
             owner_user_id: None,

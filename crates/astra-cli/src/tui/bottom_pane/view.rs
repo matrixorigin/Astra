@@ -306,6 +306,16 @@ pub(crate) trait BottomPaneView: Send {
 
     fn pre_draw_tick(&mut self, _now: std::time::Instant) {}
 
+    /// Reconcile a displayed child-message draft without losing edits.
+    fn resolve_agent_guide(
+        &mut self,
+        _target: &crate::tui::event_loop::AgentGuideTarget,
+        _intent_id: &str,
+        _status: astra_turn_types::UserIntentStatus,
+    ) -> bool {
+        false
+    }
+
     fn refresh_agent_monitor(
         &mut self,
         _snapshot: crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot,

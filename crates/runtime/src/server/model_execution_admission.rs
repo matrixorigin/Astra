@@ -1162,26 +1162,43 @@ pub(crate) async fn inherit_routed_execution<F, Fut>(
     parent_run_id: &str,
     inherited: Option<&AdmittedModelExecution>,
     resolve: F,
-) -> Result<Option<AdmittedModelExecution>, String>
+) -> Result<
+    (
+        Option<AdmittedModelExecution>,
+        Option<astra_turn_core::thinking_config::ThinkingConfig>,
+    ),
+    String,
+>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<AdmittedModelExecution, String>>,
 {
-    use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
-    let Some(event) = engine
-        .load_run_event_by_idempotency_key(user_id, parent_run_id, EVENT_TYPE, DECISION_KEY)
+    use astra_services::runs::InheritedRunModel;
+    match engine
+        .inherited_run_model(user_id, session_id, parent_run_id)
         .await?
-    else {
-        return Ok(inherited.cloned());
-    };
-    let decision: ModelRoutingDecision = serde_json::from_value(event["data"].clone())
-        .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
-    decision.validate_identity(parent_run_id, session_id)?;
-    let execution = resolve(decision.selected_offering_id).await?;
-    if model_execution_contract_root(&execution) != decision.selected_contract_root {
-        return Err("The inherited Auto model contract changed; start a new turn".into());
+    {
+        InheritedRunModel::Original => Ok((inherited.cloned(), None)),
+        InheritedRunModel::Auto(decision) => {
+            let execution = resolve(decision.selected_offering_id).await?;
+            if model_execution_contract_root(&execution) != decision.selected_contract_root {
+                return Err("The inherited Auto model contract changed; start a new turn".into());
+            }
+            Ok((Some(execution), None))
+        }
+        InheritedRunModel::Explicit(choice) => {
+            let execution = resolve(choice.resolved.offering_id.clone()).await?;
+            if choice.selection.model.offering_id != execution.offering_id
+                || choice.resolved.model_name != execution.model_name
+                || choice.resolved.source_identity != execution.source_identity
+            {
+                return Err("The inherited model identity changed; select it again".into());
+            }
+            let thinking = (&choice.reasoning).into();
+            validate_reasoning_control(&execution, &thinking)?;
+            Ok((Some(execution), Some(thinking)))
+        }
     }
-    Ok(Some(execution))
 }
 
 #[cfg(test)]

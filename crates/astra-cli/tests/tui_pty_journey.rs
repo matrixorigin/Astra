@@ -818,12 +818,31 @@ fn seed_account(home: &std::path::Path) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn active_model_picker_applies_to_a_queued_next_turn() {
+async fn active_model_picker_requests_next_round_without_interrupting() {
+    use axum::{Json, extract::Path, routing::post};
+    use std::sync::{Arc, Mutex};
     let _journey = pty_journey_lock().lock().await;
+    let changes = Arc::new(Mutex::new(Vec::new()));
+    let captured = changes.clone();
+    let routes = axum::Router::new().route(
+        "/chat/runs/{run_id}/model",
+        post(
+            move |Path(run_id): Path<String>, Json(body): Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push((run_id, body.clone()));
+                    Json(serde_json::json!({
+                        "request_id": body["request_id"], "revision": 5,
+                        "model": body["model"], "reasoning": body["reasoning"]
+                    }))
+                }
+            },
+        ),
+    );
     let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
         astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
         true,
-        axum::Router::new(),
+        routes,
     )
     .await
     .unwrap();
@@ -867,7 +886,20 @@ async fn active_model_picker_applies_to_a_queued_next_turn() {
     astra.write(b"gpt-5");
     astra.wait_for("gpt-5", UI_TRANSITION_TIMEOUT);
     astra.write(b"\r");
-    astra.wait_for("applies after this task", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("at the next model round", UI_TRANSITION_TIMEOUT);
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while changes.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the model change was not submitted"
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    let (run_id, change) = changes.lock().unwrap()[0].clone();
+    assert_eq!(run_id, "mock-run-agent-root");
+    assert_eq!(change["expected_session_id"], "mock-session");
+    assert_eq!(change["model"]["offering_id"], "offer-gpt-5");
     assert_eq!(
         mock.received_requests().len(),
         1,

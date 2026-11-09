@@ -942,7 +942,8 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         &skill_result,
     );
 
-    state.push_prompt_history_message(serde_json::json!({
+    let synthetic_start = state.messages.len();
+    state.messages.push(serde_json::json!({
         "role": "assistant",
         "content": null,
         "tool_calls": [{
@@ -957,6 +958,8 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
             }
         }]
     }));
+    host.attest_runtime_messages(state, synthetic_start);
+    state.record_appended_prompt_history_from(synthetic_start);
     let (tool_msg, tool_result) =
         astra_turn_core::headless_tool_assembly::openai_tool_roundtrip_values(
             &tool_call_id,
@@ -2148,7 +2151,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
     // Cancellation and pause have priority over round control. Capture the
     // permission selection before any mode-dependent preparation begins.
-    super::permission_boundary::apply_round_permission_mode(host, state)
+    super::settings_boundary::apply_round_settings(host, state)
         .await
         .map_err(|error| error.to_string())?;
 

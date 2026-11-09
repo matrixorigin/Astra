@@ -669,6 +669,7 @@ fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
                 | "provider_interaction_required"
                 | "provider_interaction_resolved"
                 | "permission_mode_applied"
+                | "run_model_outcome"
                 | "user_intent_applied"
                 | "user_intent_returned"
                 | "stream_gap"
@@ -1244,11 +1245,12 @@ fn canonical_edge_interaction_events(event: &Value) -> Vec<Value> {
 }
 
 fn incrementally_persisted_edge_interaction_event(event: &Value) -> bool {
-    // Permission application is committed by the round-control owner before
-    // emitting its flat client projection. Never append that projection as a
-    // second (and differently shaped) durable permission receipt at settlement.
-    event.get("type").and_then(Value::as_str) == Some("permission_mode_applied")
-        || !canonical_edge_interaction_events(event).is_empty()
+    // Setting outcomes are committed before their client projection. Never
+    // append that projection as a second durable receipt at settlement.
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("permission_mode_applied" | "run_model_outcome")
+    ) || !canonical_edge_interaction_events(event).is_empty()
 }
 
 #[cfg(test)]
@@ -14048,12 +14050,12 @@ impl AgenticRunLifecycleService {
                         .user_intents
                         .bind_opening_wake(input_wake.subscribe(), tail);
                     state
-                        .permission_mode_observation
+                        .run_settings_observation
                         .bind_opening_wake(input_wake.subscribe(), tail);
                 } else {
                     state.user_intents.bind_wake(Some(input_wake.subscribe()));
                     state
-                        .permission_mode_observation
+                        .run_settings_observation
                         .bind_wake(input_wake.subscribe());
                 }
                 let mut control_watcher = start_active_run_control_watcher(
@@ -17145,13 +17147,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|e| {
                 let status = match e.as_str() {
-                    "permission run not found" => StatusCode::NOT_FOUND,
-                    "permission request identity conflict"
-                    | "permission run is inactive"
-                    | "permission run is cancelled" => StatusCode::CONFLICT,
-                    _ if e.starts_with("permission request requires") => {
-                        StatusCode::UNPROCESSABLE_ENTITY
-                    }
+                    "run setting target not found" => StatusCode::NOT_FOUND,
+                    "run setting request identity conflict"
+                    | "run setting cannot be changed after the run is inactive"
+                    | "run setting target is cancelled" => StatusCode::CONFLICT,
+                    _ if e.starts_with("run setting requires") => StatusCode::UNPROCESSABLE_ENTITY,
                     _ => StatusCode::SERVICE_UNAVAILABLE,
                 };
                 error_response(status, &e)
@@ -17165,6 +17165,61 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         Ok(selection)
     }
+    async fn request_run_model(
+        &self,
+        user_id: String,
+        run_id: String,
+        request: astra_services::runs::RunModelRequest,
+    ) -> Result<astra_services::runs::RunModelSelection, (StatusCode, Json<ErrorResponse>)> {
+        let selection = self
+            .run_engine
+            .request_run_model(&user_id, &run_id, &request)
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e.as_str(),
+                    "run setting cannot be changed after the run is inactive"
+                        | "run setting target is cancelled"
+                ) {
+                    return error_response_coded(
+                        StatusCode::CONFLICT,
+                        &e,
+                        "run_model_target_inactive",
+                    );
+                }
+                let status = match e.as_str() {
+                    "run setting target not found" => StatusCode::NOT_FOUND,
+                    "run setting request identity conflict" => StatusCode::CONFLICT,
+                    "Offering ID selector is invalid" | "reasoning budget must be positive" => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
+                    _ if e.starts_with("run setting requires") => StatusCode::UNPROCESSABLE_ENTITY,
+                    _ => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                error_response(status, &e)
+            })?;
+        if let Some(run) = self.runs.read().await.get(&run_id) {
+            run.input_wake.send_if_modified(|current| {
+                let changed = selection.revision > *current;
+                *current = (*current).max(selection.revision);
+                changed
+            });
+        }
+        Ok(selection)
+    }
+    async fn run_model_snapshot(
+        &self,
+        user_id: String,
+        session_id: String,
+        run_id: String,
+    ) -> Result<astra_turn_types::RunModelSnapshot, (StatusCode, Json<ErrorResponse>)> {
+        self.run_engine
+            .run_settings_snapshot(&user_id, &session_id, &run_id)
+            .await
+            .map_err(|e| Self::durable_persist_error("model setting lookup", e))?
+            .map(|snapshot| snapshot.model.client_snapshot())
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
     async fn permission_mode_snapshot(
         &self,
         user_id: String,
@@ -17177,6 +17232,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await
             .map_err(|e| Self::durable_persist_error("permission mode lookup", e))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
+
+    async fn run_user_intent_status(
+        &self,
+        user_id: String,
+        session_id: String,
+        run_id: String,
+        intent_id: String,
+    ) -> Result<UserIntentStatus, (StatusCode, Json<ErrorResponse>)> {
+        if intent_id.is_empty() || intent_id.trim() != intent_id {
+            return Err(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid intent identity",
+            ));
+        }
+        self.run_engine
+            .store()
+            .run_user_intent_status(&user_id, &session_id, &run_id, &intent_id)
+            .await
+            .map_err(Self::durable_read_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Intent not found"))
     }
 
     async fn submit_run_user_intent(
@@ -18975,7 +19051,8 @@ impl ServerSpawnAgentExecutor {
                         }
                     },
                 )
-                .await?;
+                .await?
+                .0;
         }
         Ok(context)
     }
@@ -24767,7 +24844,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         let (input_wake, input_ready) = tokio::sync::watch::channel(-1);
         loop_state.user_intents.bind_wake(Some(input_ready));
-        loop_state.permission_mode_observation.bind_wake(input_wake.subscribe());
+        loop_state.run_settings_observation.bind_wake(input_wake.subscribe());
         let durable_control_watcher = start_active_run_control_watcher(
             durable_run_control,
             config.user_id.clone(),

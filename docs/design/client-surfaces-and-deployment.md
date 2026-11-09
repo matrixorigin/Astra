@@ -100,11 +100,21 @@ or explicit discard. An unconfirmed message is instead marked as possibly
 delivered and is never retried automatically. These drafts stay with the same
 account and session; they are neither sent to the main conversation nor
 claimed durable.
-A `/model` selection may be made while a turn is running. That run keeps its
-original model; the selected model applies to all subsequent turns, including
-messages already queued. Permission changes remain visibly requested until the
-active run reports that its execution boundary applied them. A previously
-started model request or tool is not retroactively changed.
+Child guidance receipts normally arrive on the existing parent live channel.
+If a receipt is delayed, the client performs one owner- and session-scoped
+lookup by intent identity; it does not attach another Run stream or replay its
+history. An accepted receipt remains pending if the child is paused or has
+not yet processed the message. Reconnection or a failed lookup never turns an
+unknown delivery into permission to resend it automatically.
+A `/model` selection may be made while a turn is running. The active Run
+rechecks the selected Offering and applies it at the next model-round
+boundary it observes. The interface reports the request as pending until the
+Run confirms application; an already started model request or tool continues
+unchanged. Rejected or unconfirmed changes are not presented as applied.
+The selected model is also used by this client for later turns, including
+queued messages. `/model clear` removes the client's override for later turns.
+Permission changes likewise remain visibly requested until the active Run
+reports that its execution boundary applied them.
 During an active turn, `/allow` and `/allow read_only` use that same permission
 control, while the `/plan` workflow command waits for the turn to finish.
 Other commands that need the mutable Session are queued with explicit feedback.

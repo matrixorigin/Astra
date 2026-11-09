@@ -3350,34 +3350,24 @@ pub(crate) fn canonical_delegation_slot_briefs(
 
 fn delegation_reasoning_requirement(
     selection: &astra_turn_core::orchestration_spawn_tool::ReasoningSelection,
-) -> astra_turn_types::DelegationReasoningRequirement {
+) -> astra_turn_types::ReasoningRequirement {
     use astra_turn_core::orchestration_spawn_tool::ReasoningSelection;
-    use astra_turn_types::{DelegationReasoningEffort, DelegationReasoningRequirement};
+    use astra_turn_types::{ReasoningEffort, ReasoningRequirement};
 
     match selection {
-        ReasoningSelection::ModelDefault => DelegationReasoningRequirement::ModelDefault,
-        ReasoningSelection::Off => DelegationReasoningRequirement::Off,
-        ReasoningSelection::On {} => DelegationReasoningRequirement::On {},
-        ReasoningSelection::Enabled { budget_tokens } => DelegationReasoningRequirement::Budget {
+        ReasoningSelection::ModelDefault => ReasoningRequirement::ModelDefault,
+        ReasoningSelection::Off => ReasoningRequirement::Off,
+        ReasoningSelection::On {} => ReasoningRequirement::On {},
+        ReasoningSelection::Enabled { budget_tokens } => ReasoningRequirement::Budget {
             tokens: *budget_tokens,
         },
-        ReasoningSelection::Adaptive { effort } => DelegationReasoningRequirement::Effort {
+        ReasoningSelection::Adaptive { effort } => ReasoningRequirement::Effort {
             effort: match effort {
-                astra_turn_core::thinking_config::ThinkingEffort::Low => {
-                    DelegationReasoningEffort::Low
-                }
-                astra_turn_core::thinking_config::ThinkingEffort::Medium => {
-                    DelegationReasoningEffort::Medium
-                }
-                astra_turn_core::thinking_config::ThinkingEffort::High => {
-                    DelegationReasoningEffort::High
-                }
-                astra_turn_core::thinking_config::ThinkingEffort::XHigh => {
-                    DelegationReasoningEffort::XHigh
-                }
-                astra_turn_core::thinking_config::ThinkingEffort::Max => {
-                    DelegationReasoningEffort::Max
-                }
+                astra_turn_core::thinking_config::ThinkingEffort::Low => ReasoningEffort::Low,
+                astra_turn_core::thinking_config::ThinkingEffort::Medium => ReasoningEffort::Medium,
+                astra_turn_core::thinking_config::ThinkingEffort::High => ReasoningEffort::High,
+                astra_turn_core::thinking_config::ThinkingEffort::XHigh => ReasoningEffort::XHigh,
+                astra_turn_core::thinking_config::ThinkingEffort::Max => ReasoningEffort::Max,
             },
         },
     }

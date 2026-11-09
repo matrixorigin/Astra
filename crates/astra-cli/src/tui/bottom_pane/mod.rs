@@ -216,7 +216,7 @@ impl RootIntentScope {
             && astra_core::sync_poison::recover_mutex_lock(&self.session_binding).is_none()
     }
 
-    fn attached_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
+    pub(crate) fn attached_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
         if !self.owner.is_current() {
             return false;
         }
@@ -855,6 +855,50 @@ impl BottomPane {
                 )
         })?;
         self.pending_user_intents.remove(index)
+    }
+
+    /// Settle only the exact attached child receipt named by the live event.
+    pub(crate) fn settle_agent_guide_signal(
+        &mut self,
+        intent_id: &str,
+        run_id: &str,
+        epoch: u64,
+        returned: bool,
+    ) -> Option<crate::tui::event_loop::AgentGuideTarget> {
+        let (session, attached_epoch) = self.session_attachment.as_ref()?;
+        if *attached_epoch != epoch {
+            return None;
+        }
+        let index = self.pending_user_intents.iter().position(|intent| {
+            intent.intent_id == intent_id
+                && intent.status != astra_turn_types::UserIntentStatus::Returned
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
+                    if target.is_attached(session.as_deref(), epoch) && target.run_id() == run_id)
+        })?;
+        let intent = self.pending_user_intents.get_mut(index)?;
+        let PendingUserIntentTarget::AgentRun { target } = &intent.target else {
+            return None;
+        };
+        let target = target.clone();
+        target.retire_observation();
+        if returned {
+            intent.status = astra_turn_types::UserIntentStatus::Returned;
+            intent.custody = PendingUserIntentCustody::Run;
+        } else {
+            self.pending_user_intents.remove(index);
+        }
+        Some(target)
+    }
+
+    pub(crate) fn resolve_agent_guide_view(
+        &mut self,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        status: astra_turn_types::UserIntentStatus,
+    ) {
+        for view in &mut self.view_stack {
+            view.resolve_agent_guide(target, intent_id, status);
+        }
     }
 
     pub(crate) fn remove_detached_agent_guide(

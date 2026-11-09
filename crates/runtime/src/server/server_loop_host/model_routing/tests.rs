@@ -457,6 +457,105 @@ async fn auto_choice_is_durable_idempotent_and_restored_after_policy_change() {
 }
 
 #[tokio::test]
+async fn explicit_model_change_applies_at_the_next_round_after_auto() {
+    use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind, RunModelRequest};
+    let (catalog, engine, mut host, mut state) = fixture().await;
+    state.run_control = Some(Arc::new(engine.clone()));
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "economy"
+    );
+    let run_id = state.current_run_id.clone().unwrap();
+    let request = RunModelRequest {
+        expected_session_id: "router-session".into(),
+        request_id: "switch-to-strong".into(),
+        model: astra_turn_types::ModelSelection {
+            offering_id: "strong".into(),
+        },
+        reasoning: ReasoningRequirement::ModelDefault,
+    };
+    engine
+        .request_run_model("router-user", &run_id, &request)
+        .await
+        .unwrap();
+    // The currently admitted request remains untouched until another round.
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "economy"
+    );
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        host.admitted_model_execution.as_ref().unwrap().offering_id,
+        "strong"
+    );
+    let snapshot = engine
+        .run_settings_snapshot("router-user", "router-session", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        snapshot.model.outcome.unwrap().result,
+        RunModelOutcomeKind::Applied { .. }
+    ));
+    assert_eq!(
+        snapshot.model.applied.unwrap().resolved.offering_id,
+        "strong"
+    );
+    assert!(host.model_routing.is_none());
+    let current = engine
+        .load_run("router-user", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.model_offering_id.as_deref(), Some("strong"));
+    // Auto revalidation must not repin economy after the user choice.
+    assert!(host.revalidate_auto_execution().await.unwrap().is_none());
+    // Both delegated agents and forked skills use this shared resolver; the
+    // earlier Auto decision must not override the later explicit choice.
+    let inherited = crate::server::model_execution_admission::inherit_routed_execution(
+        &engine,
+        "router-user",
+        "router-session",
+        &run_id,
+        None,
+        |id| async {
+            catalog
+                .admit_model_offering("router-user".into(), id)
+                .await
+                .map_err(|_| "not authorized".into())
+        },
+    )
+    .await
+    .unwrap()
+    .0
+    .unwrap();
+    assert_eq!(inherited.offering_id, "strong");
+    catalog.models.write().unwrap().remove("strong");
+    assert!(
+        crate::server::model_execution_admission::inherit_routed_execution(
+            &engine,
+            "router-user",
+            "router-session",
+            &run_id,
+            Some(&inherited),
+            |id| async {
+                catalog
+                    .admit_model_offering("router-user".into(), id)
+                    .await
+                    .map_err(|_| "not authorized".into())
+            },
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn unavailable_incompatible_and_cross_billing_economy_retain_strong() {
     for case in [
         "unavailable",
@@ -700,6 +799,7 @@ async fn auto_children_inherit_the_committed_model_instead_of_cached_baseline() 
     )
     .await
     .unwrap()
+    .0
     .unwrap();
     assert_eq!(inherited.offering_id, "economy");
     engine

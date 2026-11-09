@@ -43,6 +43,274 @@ fn preserves_contract(
 }
 
 impl ServerAgenticLoopHost {
+    /// Install one admitted model in the existing execution owner. Credentials
+    /// stay in memory; all derived policy follows the same selected model.
+    fn install_model_execution(
+        &mut self,
+        state: &mut AgenticLoopState,
+        execution: AdmittedModelExecution,
+        source: &str,
+    ) {
+        self.model_override = Some(execution.model_name.clone());
+        state.policy_model_name = Some(execution.model_name.clone());
+        state.hooks.admitted_model_execution = Some(execution.clone());
+        if let Some(executor) = state.runtime_tool_executor.as_ref() {
+            executor.set_agent_model_execution(&execution, &state.thinking);
+        }
+        let tool_policy = state
+            .admitted_tool_policy
+            .resolve_for_model(Some(&execution.model_name));
+        state.max_identical_tool_calls = tool_policy.max_identical_tool_calls;
+        state.max_tools_per_turn = tool_policy.max_tools_per_turn;
+        state.max_consecutive_empty_name = tool_policy.max_consecutive_empty_name;
+        if let Some(manifest) = state.runtime_manifest.as_mut() {
+            manifest["model_selection"] = json!({"offering_id": execution.offering_id});
+            manifest["selected_model"] = json!({"model": execution.model_name});
+            manifest["model_resolution"] = json!({"source":source, "offering_id":execution.offering_id, "model":execution.model_name, "resolved":true});
+        }
+        self.admitted_model_execution = Some(execution);
+        self.clear_resolved_llm_config();
+    }
+
+    async fn admit_explicit_model(
+        &self,
+        selection: &astra_turn_types::RunModelSelection,
+    ) -> Result<AdmittedModelExecution, (astra_core::ErrorKind, &'static str)> {
+        use astra_core::ErrorKind;
+        let execution = if let Some(current) =
+            self.admitted_model_execution.as_ref().filter(|current| {
+                current.execution_placement == ModelExecutionPlacement::Edge
+                    && current.offering_id == selection.model.offering_id
+            }) {
+            // An authenticated Edge descriptor grants only this exact Offering.
+            current.clone()
+        } else if let Some(service) = &self.model_service {
+            crate::server::model_execution_admission::admit_model_execution(
+                service,
+                astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+                &self.user_id,
+                &selection.model,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|(status, _)| match status.as_u16() {
+                401 => (ErrorKind::Auth, "model_authentication_failed"),
+                403 => (ErrorKind::ProviderForbidden, "model_access_denied"),
+                404 => (ErrorKind::InvalidRequest, "model_not_found"),
+                429 => (ErrorKind::RateLimit, "model_rate_limited"),
+                _ => (ErrorKind::ServerError, "model_admission_unavailable"),
+            })?
+        } else {
+            astra_services::revalidate_admitted_model_execution(
+                &self.matrixone,
+                self.encryptor.as_ref(),
+                &self.user_id,
+                &selection.model.offering_id,
+                self.shared_pool.as_ref().map(SharedPool::get),
+            )
+            .await
+            .map_err(|_| (ErrorKind::ServerError, "model_admission_unavailable"))?
+        };
+        astra_services::models::validate_model_execution_purpose(
+            &execution,
+            astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+        )
+        .map_err(|_| (ErrorKind::InvalidRequest, "model_purpose_unsupported"))?;
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::from(&selection.reasoning);
+        crate::server::model_execution_admission::validate_reasoning_control(&execution, &thinking)
+            .map_err(|_| (ErrorKind::InvalidRequest, "model_reasoning_unsupported"))?;
+        Ok(execution)
+    }
+
+    fn install_explicit_model(
+        &mut self,
+        state: &mut AgenticLoopState,
+        execution: AdmittedModelExecution,
+        reasoning: &astra_turn_types::ReasoningRequirement,
+    ) {
+        state.thinking = astra_turn_core::thinking_config::ThinkingConfig::from(reasoning);
+        self.preserve_thinking =
+            state.thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+        state.sticky_tool_schemas.clear();
+        self.model_routing = None;
+        self.install_model_execution(state, execution, "user");
+    }
+
+    async fn ensure_applied_model(
+        &mut self,
+        state: &mut AgenticLoopState,
+        applied: &astra_services::runs::RunModelApplied,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::from(&applied.reasoning);
+        let already_installed = self
+            .admitted_model_execution
+            .as_ref()
+            .is_some_and(|current| {
+                current.offering_id == applied.resolved.offering_id
+                    && current.model_name == applied.resolved.model_name
+                    && current.source_identity == applied.resolved.source_identity
+                    && state.thinking == thinking
+            });
+        if already_installed {
+            self.preserve_thinking =
+                thinking != astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+            self.model_routing = None;
+            return Ok(());
+        }
+        let mut selection = applied.selection.clone();
+        selection.reasoning = applied.reasoning.clone();
+        let execution = self.admit_explicit_model(&selection).await.map_err(|_| {
+            invalid("The selected model is no longer available; select another model to continue")
+        })?;
+        if execution.offering_id != applied.resolved.offering_id
+            || execution.model_name != applied.resolved.model_name
+            || execution.source_identity != applied.resolved.source_identity
+        {
+            return Err(invalid(
+                "The selected model identity changed; select the updated model to continue",
+            ));
+        }
+        self.install_explicit_model(state, execution, &applied.reasoning);
+        Ok(())
+    }
+
+    pub(super) async fn apply_explicit_model_settings(
+        &mut self,
+        state: &mut AgenticLoopState,
+        settings: astra_services::runs::RunModelSettingsSnapshot,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        use astra_turn_types::{RunModelOutcome, RunModelOutcomeKind};
+        let pending = settings
+            .requested
+            .as_ref()
+            .filter(|selection| {
+                settings
+                    .outcome
+                    .as_ref()
+                    .is_none_or(|outcome| &outcome.selection != *selection)
+            })
+            .cloned();
+        let Some(selection) = pending else {
+            if let Some(applied) = settings.applied.as_ref() {
+                self.ensure_applied_model(state, applied).await?;
+            }
+            return Ok(());
+        };
+        let (Some(control), Some(user_id), Some(session_id), Some(run_id), Some(generation)) = (
+            state.run_control.clone(),
+            state.owner_user_id.clone(),
+            state.current_session_id.clone(),
+            state.current_run_id.clone(),
+            state.current_run_owner_generation,
+        ) else {
+            return Err(invalid("Model change has no active execution owner"));
+        };
+        if user_id != self.user_id || session_id != self.session_id {
+            return Err(invalid("Model change does not belong to this execution"));
+        }
+        let admission = self
+            .admit_explicit_model(&selection)
+            .await
+            .and_then(|execution| {
+                if state.current_round_index == 0
+                    && let Some(limit) = self.initial_output_limit
+                {
+                    astra_turn_core::thinking_config::ThinkingConfig::from(&selection.reasoning)
+                        .validate_output_budget(u64::from(limit))
+                        .map_err(|_| {
+                            (
+                                astra_core::ErrorKind::InvalidRequest,
+                                "model_reasoning_unsupported",
+                            )
+                        })?;
+                }
+                let route = self.model_replay_route_for(&execution);
+                let scope = crate::turn::llm::model_origin::ReplayScope {
+                    encryptor: &self.encryptor,
+                    user_id: &user_id,
+                    session_id: &session_id,
+                    allowed_session_ids: self.private_reasoning_origins.as_ref(),
+                    run_id: &run_id,
+                    selection_revision: Some(selection.revision),
+                    route: &route,
+                };
+                crate::turn::llm::model_origin::project(&scope, &state.messages).map_err(|_| {
+                    (
+                        astra_core::ErrorKind::InvalidRequest,
+                        "model_history_incomplete",
+                    )
+                })?;
+                Ok(execution)
+            });
+        let (result, resolved) = match &admission {
+            Ok(execution) => (
+                RunModelOutcomeKind::Applied {
+                    model: selection.model.clone(),
+                    reasoning: selection.reasoning.clone(),
+                },
+                Some(astra_services::runs::ResolvedModelSelection {
+                    offering_id: execution.offering_id.clone(),
+                    model_name: execution.model_name.clone(),
+                    source_identity: execution.source_identity.clone(),
+                }),
+            ),
+            Err((kind, code)) => (
+                RunModelOutcomeKind::Rejected {
+                    kind: *kind,
+                    error_code: Some((*code).into()),
+                },
+                None,
+            ),
+        };
+        let outcome = RunModelOutcome {
+            selection: selection.clone(),
+            owner_generation: generation,
+            round_index: state.current_round_index,
+            result,
+        };
+        let committed = control
+            .finish_run_model(&user_id, &session_id, &run_id, &outcome, resolved.as_ref())
+            .await;
+        state.run_settings_observation.invalidate();
+        let fresh = state
+            .run_settings_observation
+            .read(control.as_ref(), &user_id, &session_id, &run_id)
+            .await
+            .map_err(|_| {
+                invalid(
+                    "The model change could not be confirmed; continue this task to reconcile it",
+                )
+            })?
+            .ok_or_else(|| invalid("The model change no longer belongs to this task"))?;
+        let decided = match committed {
+            Ok(Some(decided)) => decided,
+            Ok(None) => return Err(invalid("The model change lost its execution owner")),
+            Err(_) => fresh.model.outcome.clone().filter(|outcome| outcome.selection == selection)
+                .ok_or_else(|| invalid("The model change could not be confirmed; continue this task to reconcile it"))?,
+        };
+        if let Some(applied) = fresh.model.applied.as_ref() {
+            if let Ok(execution) = admission
+                && applied.selection == selection
+                && execution.offering_id == applied.resolved.offering_id
+                && execution.model_name == applied.resolved.model_name
+                && execution.source_identity == applied.resolved.source_identity
+                && matches!(decided.result, RunModelOutcomeKind::Applied { .. })
+            {
+                self.install_explicit_model(state, execution, &applied.reasoning);
+            } else {
+                self.ensure_applied_model(state, applied).await?;
+            }
+        }
+        self.emit_committed_lifecycle_projection(
+            json!({"type":"run_model_outcome", "run_id":run_id,
+            "session_id":session_id, "outcome":decided}),
+        )
+        .await;
+        Ok(())
+    }
+
     pub(crate) fn configure_model_routing(
         &mut self,
         policy: AutoModelRoutingPolicy,
@@ -331,27 +599,11 @@ impl ServerAgenticLoopHost {
 
         // Everything model-dependent is repinned before prompt construction or
         // compaction. No endpoint or credential is included in the saved fact.
-        self.model_override = Some(execution.model_name.clone());
-        state.policy_model_name = Some(execution.model_name.clone());
-        state.hooks.admitted_model_execution = Some(execution.clone());
-        if let Some(executor) = state.runtime_tool_executor.as_ref() {
-            executor.set_agent_model_execution(&execution);
-        }
-        let tool_policy = state
-            .admitted_tool_policy
-            .resolve_for_model(Some(&execution.model_name));
-        state.max_identical_tool_calls = tool_policy.max_identical_tool_calls;
-        state.max_tools_per_turn = tool_policy.max_tools_per_turn;
-        state.max_consecutive_empty_name = tool_policy.max_consecutive_empty_name;
+        self.install_model_execution(state, execution, "auto");
         if let Some(manifest) = state.runtime_manifest.as_mut() {
-            manifest["model_selection"] = json!({"offering_id": execution.offering_id});
-            manifest["selected_model"] = json!({"model": execution.model_name});
-            manifest["model_resolution"] = json!({"source":"auto", "offering_id":execution.offering_id, "model":execution.model_name, "resolved":true});
             manifest["model_routing"] =
                 serde_json::to_value(&decision).map_err(|error| invalid(error.to_string()))?;
         }
-        self.admitted_model_execution = Some(execution);
-        self.clear_resolved_llm_config();
         let routing = self.model_routing.as_mut().expect("Auto context");
         routing.decision = Some(decision);
         routing.applied = true;

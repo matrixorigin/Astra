@@ -171,6 +171,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         TuiAppEvent::RunBound(run_id) => Some(AppEvent::wire(WireEvent::RunBound(run_id))),
         // Bottom-pane-only events — ChatWidget doesn't care.
         TuiAppEvent::ContextWindowPolicy { .. }
+        | TuiAppEvent::RunModelOutcome { .. }
         | TuiAppEvent::SessionBound(_)
         | TuiAppEvent::WorkTaskBoardUpdate(_)
         | TuiAppEvent::ContextWindowEstimated(_)
@@ -189,6 +190,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::ObservedUserIntent { .. }
+        | TuiAppEvent::ScopedAgentLive { .. }
         | TuiAppEvent::PermissionAutoApproved { .. } => None,
     }
 }

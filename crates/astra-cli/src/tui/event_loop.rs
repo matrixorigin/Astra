@@ -147,14 +147,14 @@ impl ModelPickerScope {
 /// Keeping the sender alive makes `has_changed` distinguish a retry from a
 /// successfully completed turn, without another counter or durable state.
 #[derive(Clone)]
-struct CatalogAttempt {
+pub(super) struct CatalogAttempt {
     auth: tokio::sync::watch::Receiver<Option<crate::cli::session::session_runtime::AdmittedAuth>>,
     _auth_lifetime:
         tokio::sync::watch::Sender<Option<crate::cli::session::session_runtime::AdmittedAuth>>,
 }
 
 impl CatalogAttempt {
-    fn is_current(&self) -> bool {
+    pub(super) fn is_current(&self) -> bool {
         matches!(self.auth.has_changed(), Ok(false))
     }
 }
@@ -165,6 +165,45 @@ enum NextModelSelection {
         attempt: Option<CatalogAttempt>,
     },
     Requested(Option<String>),
+}
+
+fn project_model_feedback(
+    feedback: super::model_control::ModelFeedback,
+    staged: &mut Option<NextModelSelection>,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) {
+    use super::model_control::ModelFeedback;
+    match feedback {
+        ModelFeedback::Accepted => {}
+        ModelFeedback::Applied(name) => {
+            bottom_pane.footer.model = Some(name.clone());
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::response(
+                format!("Switched to {name}."),
+            ));
+        }
+        ModelFeedback::Rejected(reason) => {
+            // `/model clear` can be selected after this in-flight request;
+            // its later failure must not erase that newer client choice.
+            if !matches!(staged, Some(NextModelSelection::Requested(None))) {
+                *staged = None;
+            }
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(reason));
+        }
+        ModelFeedback::KeepForNext(reason) => {
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(reason));
+        }
+        ModelFeedback::Superseded => {
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+                "This task received a newer model choice. Your selection remains set for your next task.",
+            ));
+        }
+        ModelFeedback::Unknown => {
+            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+                "The model change could not be confirmed. The current model may still be in use.",
+            ))
+        }
+    }
 }
 
 fn active_model_picker_choice(
@@ -3506,6 +3545,19 @@ fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Opt
     }
 }
 
+fn accept_attached_agent_event(
+    event: TuiAppEvent,
+    session_id: Option<&str>,
+    epoch: u64,
+) -> Option<TuiAppEvent> {
+    match event {
+        TuiAppEvent::ScopedAgentLive { scope, event } => {
+            scope.attached_in(session_id, epoch).then_some(*event)
+        }
+        event => Some(event),
+    }
+}
+
 struct PrimaryGuidanceObserverClaim(
     std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
 );
@@ -4867,33 +4919,81 @@ fn apply_tui_control_event(
             UserIntentProjection::None
         }
         TuiAppEvent::AgentLive(event) => {
-            if let astra_turn_core::agent_live_event::AgentLiveEventKind::Signal(
-                astra_turn_core::agent_live_event::AgentLiveSignal::AgentCommunication(event),
-            ) = &event.kind
-            {
-                apply_agent_communication_event(event, bottom_pane, chat_widget, attachment_epoch);
-            }
+            apply_agent_live_control(event, bottom_pane, chat_widget, attachment_epoch);
             UserIntentProjection::None
         }
         TuiAppEvent::AgentLiveBatch(events) => {
             for event in events {
-                if let astra_turn_core::agent_live_event::AgentLiveEventKind::Signal(
-                    astra_turn_core::agent_live_event::AgentLiveSignal::AgentCommunication(
-                        communication,
-                    ),
-                ) = &event.kind
-                {
-                    apply_agent_communication_event(
-                        communication,
-                        bottom_pane,
-                        chat_widget,
-                        attachment_epoch,
-                    );
-                }
+                apply_agent_live_control(event, bottom_pane, chat_widget, attachment_epoch);
             }
             UserIntentProjection::None
         }
         _ => UserIntentProjection::None,
+    }
+}
+
+fn apply_agent_live_control(
+    event: &astra_turn_core::agent_live_event::AgentLiveEvent,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    attachment_epoch: u64,
+) {
+    use astra_turn_core::agent_live_event::{AgentLiveEventKind, AgentLiveSignal};
+    use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+    let AgentLiveEventKind::Signal(signal) = &event.kind else {
+        return;
+    };
+    match signal {
+        AgentLiveSignal::AgentCommunication(communication) => apply_agent_communication_event(
+            communication,
+            bottom_pane,
+            chat_widget,
+            attachment_epoch,
+        ),
+        AgentLiveSignal::UserIntentApplied {
+            intent_id,
+            delivery: UserIntentDelivery::GuideCurrentRun,
+            status: UserIntentStatus::Applied,
+            ..
+        } => {
+            if let Some(target) = bottom_pane.settle_agent_guide_signal(
+                intent_id,
+                &event.run_id,
+                attachment_epoch,
+                false,
+            ) {
+                bottom_pane.resolve_agent_guide_view(&target, intent_id, UserIntentStatus::Applied);
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                    format!("Message added for {}", target.agent_name()),
+                ));
+            }
+        }
+        AgentLiveSignal::UserIntentReturned {
+            intent_id,
+            delivery: UserIntentDelivery::GuideCurrentRun,
+            status: UserIntentStatus::Returned,
+            ..
+        } => {
+            if let Some(target) = bottom_pane.settle_agent_guide_signal(
+                intent_id,
+                &event.run_id,
+                attachment_epoch,
+                true,
+            ) {
+                bottom_pane.resolve_agent_guide_view(
+                    &target,
+                    intent_id,
+                    UserIntentStatus::Returned,
+                );
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                    format!(
+                        "Message to {} was not used. Press Alt+U to view it.",
+                        target.agent_name()
+                    ),
+                ));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -4924,6 +5024,12 @@ fn apply_agent_communication_event(
     ) {
         let agent_name = match intent.target {
             bottom_pane::PendingUserIntentTarget::AgentRun { target } => {
+                target.retire_observation();
+                bottom_pane.resolve_agent_guide_view(
+                    &target,
+                    &event.message_id,
+                    astra_turn_types::UserIntentStatus::Applied,
+                );
                 target.agent_name().to_owned()
             }
             bottom_pane::PendingUserIntentTarget::ActiveRun => return,
@@ -5311,6 +5417,19 @@ impl PartialEq for AgentGuideTarget {
 impl Eq for AgentGuideTarget {}
 
 impl AgentGuideTarget {
+    fn for_delivery(&self) -> Self {
+        Self(Arc::new(AgentGuideContext {
+            attachment_epoch: self.0.attachment_epoch,
+            session_id: self.0.session_id.clone(),
+            owner: self.0.owner.clone(),
+            api: self.0.api.clone(),
+            agent_name: self.0.agent_name.clone(),
+            run_id: self.0.run_id.clone(),
+            target: self.0.target.clone(),
+            auth: self.0.auth.clone(),
+            observation: tokio_util::sync::CancellationToken::new(),
+        }))
+    }
     pub(crate) fn capture(
         agent_name: String,
         run_id: String,
@@ -5612,10 +5731,38 @@ fn drain_agent_workbench_outcomes(
         ) {
             match &outcome {
                 AgentWorkbenchOutcome::GuideApplied { intent_id, target } => {
-                    bottom_pane.remove_detached_agent_guide(intent_id, target);
+                    if bottom_pane.remove_detached_agent_guide(intent_id, target)
+                        && target.can_view_draft(active_session_id, attachment_epoch)
+                    {
+                        bottom_pane.resolve_agent_guide_view(
+                            target,
+                            intent_id,
+                            astra_turn_types::UserIntentStatus::Applied,
+                        );
+                        chat_widget.commit_concurrent_system(
+                            history_cell::system::SystemCell::info(format!(
+                                "Message added for {}",
+                                target.agent_name()
+                            )),
+                        );
+                    }
                 }
                 AgentWorkbenchOutcome::GuideReturned { intent_id, target } => {
-                    bottom_pane.mark_agent_guide_returned(intent_id, target);
+                    if bottom_pane.mark_agent_guide_returned(intent_id, target)
+                        && target.can_view_draft(active_session_id, attachment_epoch)
+                    {
+                        bottom_pane.resolve_agent_guide_view(
+                            target,
+                            intent_id,
+                            astra_turn_types::UserIntentStatus::Returned,
+                        );
+                        chat_widget.commit_concurrent_system(
+                            history_cell::system::SystemCell::info(format!(
+                                "Message to {} was not used. Press Alt+U to view it.",
+                                target.agent_name()
+                            )),
+                        );
+                    }
                 }
                 AgentWorkbenchOutcome::GuideRejected {
                     intent_id, target, ..
@@ -5763,6 +5910,12 @@ fn drain_agent_workbench_outcomes(
                 ) && let bottom_pane::PendingUserIntentTarget::AgentRun { target } =
                     intent.target
                 {
+                    target.retire_observation();
+                    bottom_pane.resolve_agent_guide_view(
+                        &target,
+                        &intent_id,
+                        astra_turn_types::UserIntentStatus::Applied,
+                    );
                     let agent_name = target.agent_name();
                     chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                         format!("Message added for {agent_name}"),
@@ -5773,6 +5926,12 @@ fn drain_agent_workbench_outcomes(
                 if !bottom_pane.mark_agent_guide_returned(&intent_id, &target) {
                     continue;
                 }
+                target.retire_observation();
+                bottom_pane.resolve_agent_guide_view(
+                    &target,
+                    &intent_id,
+                    astra_turn_types::UserIntentStatus::Returned,
+                );
                 let agent_name = target.agent_name().to_owned();
                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     format!("Message to {agent_name} was not used. Press Alt+U to view it."),
@@ -6923,12 +7082,13 @@ fn dispatch_root_transcript_load(
     });
 }
 
-async fn submit_agent_guide(
+async fn submit_agent_guide_captured(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     guide_auth: AgentActionAuth,
     run_id: &str,
     request: &astra_thin_client::RunUserIntentRequest,
+    captured_auth: &mut Option<crate::cli::session::session_runtime::AdmittedAuth>,
 ) -> Result<String, GuidanceSubmissionError> {
     // The same deadline covers admission and delivery. Until POST starts,
     // failures are known not to have sent the message and the draft is safe.
@@ -6949,6 +7109,7 @@ async fn submit_agent_guide(
                 "Sign-in changed. Reopen guidance with the intended account.".into(),
             ));
         }
+        *captured_auth = Some(auth);
         Ok(token)
     })
     .await
@@ -6987,90 +7148,87 @@ async fn submit_agent_guide(
     Ok(token)
 }
 
+#[cfg(test)]
+async fn submit_agent_guide(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    guide_auth: AgentActionAuth,
+    run_id: &str,
+    request: &astra_thin_client::RunUserIntentRequest,
+) -> Result<String, GuidanceSubmissionError> {
+    submit_agent_guide_captured(api, owner, guide_auth, run_id, request, &mut None).await
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum AgentGuideDisposition {
     Applied,
     Returned,
 }
 
-async fn observe_agent_guide(
-    mut stream: impl tokio_stream::Stream<
-        Item = Result<astra_thin_client::StreamEvent, astra_thin_client::ThinClientError>,
-    > + Unpin,
-    run_id: &str,
+async fn authorized_guide_status(
+    target: &AgentGuideTarget,
+    initial_token: Option<&str>,
+    captured_auth: Option<&crate::cli::session::session_runtime::AdmittedAuth>,
     intent_id: &str,
-    observation: &tokio_util::sync::CancellationToken,
-    outcome_tx: &tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
 ) -> Result<Option<AgentGuideDisposition>, String> {
-    use astra_thin_client::StreamEvent;
-    let mut deadline = tokio::time::Instant::now() + AGENT_GUIDE_APPLICATION_TIMEOUT;
-    let mut paused_remaining = None;
-    let mut replay_paused = false;
-    let mut accepted_seen = false;
-    loop {
-        let next = tokio::select! {
-            _ = observation.cancelled() => return Ok(None),
-            _ = outcome_tx.closed() => return Ok(None),
-            next = async {
-                if paused_remaining.is_some() {
-                    Ok(stream.next().await)
-                } else {
-                    tokio::time::timeout_at(deadline, stream.next()).await
-                        .map_err(|_| "no matching applied event arrived within 60 seconds of active execution".to_string())
-                }
-            } => next?,
-        };
-        let Some(event) = next else {
-            return Err("the agent event stream ended before application was observed".into());
-        };
-        match event {
-            Ok(StreamEvent::RunPaused { run_id: Some(id) }) if id == run_id => {
-                replay_paused = true;
-                if accepted_seen {
-                    paused_remaining.get_or_insert_with(|| {
-                        deadline.saturating_duration_since(tokio::time::Instant::now())
-                    });
-                }
-            }
-            Ok(StreamEvent::RunResumed { run_id: Some(id) }) if id == run_id => {
-                replay_paused = false;
-                if let Some(remaining) = paused_remaining.take() {
-                    deadline = tokio::time::Instant::now() + remaining;
-                }
-            }
-            Ok(StreamEvent::RunUserIntentAccepted {
-                run_id: id,
-                intent_id: intent,
-                ..
-            }) if id == run_id && intent == intent_id && !accepted_seen => {
-                accepted_seen = true;
-                deadline = tokio::time::Instant::now() + AGENT_GUIDE_APPLICATION_TIMEOUT;
-                paused_remaining = replay_paused.then_some(AGENT_GUIDE_APPLICATION_TIMEOUT);
-            }
-            Ok(StreamEvent::RunUserIntentApplied {
-                run_id: id,
-                intent_id: intent,
-                ..
-            }) if id == run_id && intent == intent_id => {
-                return Ok(Some(AgentGuideDisposition::Applied));
-            }
-            Ok(StreamEvent::RunUserIntentReturned {
-                run_id: id,
-                intent_id: intent,
-                ..
-            }) if id == run_id && intent == intent_id => {
-                return Ok(Some(AgentGuideDisposition::Returned));
-            }
-            Ok(StreamEvent::RunFinished { .. }) | Ok(StreamEvent::RunCancelled { .. }) => {
-                return Err("the agent run ended before a matching applied event".into());
-            }
-            Ok(StreamEvent::RunError { message, .. }) => {
-                return Err(format!("the agent run reported an error: {message}"));
-            }
-            Err(error) => return Err(error.to_string()),
-            _ => {}
+    let context = &target.0;
+    let session_id = context
+        .session_id
+        .as_deref()
+        .ok_or("the session identity is unavailable")?;
+    let lookup = async {
+        if !context.owner.is_current() {
+            return Err("Sign-in changed".to_string());
         }
-    }
+        let auth = match captured_auth {
+            Some(auth) => auth.clone(),
+            None => context
+                .auth
+                .clone()
+                .resolve(&context.owner)
+                .await
+                .ok_or("authentication is unavailable")?,
+        };
+        let token = match initial_token {
+            Some(token) => token.to_owned(),
+            None => auth
+                .access_token(&context.api, None)
+                .await
+                .ok_or("authentication is unavailable")?,
+        };
+        if !context.owner.is_current() {
+            return Err("Sign-in changed".to_string());
+        }
+        let mut response = context
+            .api
+            .get_run_user_intent(Some(&token), &context.run_id, session_id, intent_id)
+            .await;
+        if matches!(&response, Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 401)
+            && let Some(refreshed) = auth.access_token(&context.api, Some(&token)).await
+        {
+            if !context.owner.is_current() {
+                return Err("Sign-in changed".to_string());
+            }
+            response = context
+                .api
+                .get_run_user_intent(Some(&refreshed), &context.run_id, session_id, intent_id)
+                .await;
+        }
+        if !context.owner.is_current() {
+            return Err("Sign-in changed".to_string());
+        }
+        match response.map_err(|error| error.to_string())? {
+            astra_turn_types::UserIntentStatus::AcceptedRemote => Ok(None),
+            astra_turn_types::UserIntentStatus::Applied => Ok(Some(AgentGuideDisposition::Applied)),
+            astra_turn_types::UserIntentStatus::Returned => {
+                Ok(Some(AgentGuideDisposition::Returned))
+            }
+            _ => Err("the server returned an invalid receipt status".into()),
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(15), lookup)
+        .await
+        .map_err(|_| "the receipt lookup timed out".to_string())?
 }
 
 // This is a one-shot UI-to-runtime command boundary; identity, routing, and
@@ -7152,6 +7310,7 @@ fn dispatch_agent_guide(
         frame_requester.schedule_frame();
         return false;
     }
+    let receipt = receipt.for_delivery();
     let intent_id = uuid::Uuid::new_v4().to_string();
     if !bottom_pane.accept_agent_guide(intent_id.clone(), receipt.clone(), content.clone()) {
         bottom_pane.push_view(Box::new(reopen(
@@ -7246,24 +7405,35 @@ fn dispatch_agent_guide(
             delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
             input: serde_json::json!({ "content": content }),
         };
-        let token = match submit_agent_guide(&api, &owner, guide_auth, &run_id, &request).await {
-            Ok(token) => token,
+        let mut captured_auth = None;
+        let token = match submit_agent_guide_captured(
+            &api,
+            &owner,
+            guide_auth,
+            &run_id,
+            &request,
+            &mut captured_auth,
+        )
+        .await
+        {
+            Ok(token) => Some(token),
+            Err(GuidanceSubmissionError::Unconfirmed(reason)) => {
+                let _ = outcome_tx
+                    .send(AgentWorkbenchOutcome::GuideUnconfirmed {
+                        target: receipt.clone(),
+                        intent_id: intent_id.clone(),
+                        reason,
+                    })
+                    .await;
+                None
+            }
             Err(error) => {
                 let reason = match error {
                     GuidanceSubmissionError::Rejected(reason) => reason,
                     GuidanceSubmissionError::GuidanceClosed(_) => {
                         "the selected run no longer accepts guidance".to_string()
                     }
-                    GuidanceSubmissionError::Unconfirmed(reason) => {
-                        let _ = outcome_tx
-                            .send(AgentWorkbenchOutcome::GuideUnconfirmed {
-                                target: receipt.clone(),
-                                intent_id,
-                                reason,
-                            })
-                            .await;
-                        return;
-                    }
+                    GuidanceSubmissionError::Unconfirmed(_) => unreachable!(),
                 };
                 let _ = outcome_tx
                     .send(AgentWorkbenchOutcome::GuideRejected {
@@ -7275,28 +7445,27 @@ fn dispatch_agent_guide(
                 return;
             }
         };
-        if outcome_tx
-            .send(AgentWorkbenchOutcome::GuideAccepted {
-                target: receipt.clone(),
-                intent_id: intent_id.clone(),
-            })
-            .await
-            .is_err()
+        if token.is_some()
+            && outcome_tx
+                .send(AgentWorkbenchOutcome::GuideAccepted {
+                    target: receipt.clone(),
+                    intent_id: intent_id.clone(),
+                })
+                .await
+                .is_err()
         {
             return;
         }
         let observation = receipt.0.observation.clone();
         let weak_receipt = Arc::downgrade(&receipt.0);
         drop(receipt);
-
-        let observed = observe_agent_guide(
-            api.stream_run(&run_id, 0, Some(&token)),
-            &run_id,
-            &intent_id,
-            &observation,
-            &outcome_tx,
-        )
-        .await;
+        // The parent stream normally carries the child receipt. Only a lost
+        // or delayed notification needs one bounded, indexed reconciliation.
+        tokio::select! {
+            _ = observation.cancelled() => return,
+            _ = outcome_tx.closed() => return,
+            _ = tokio::time::sleep(if token.is_some() { AGENT_GUIDE_APPLICATION_TIMEOUT } else { Duration::ZERO }) => {}
+        }
         if observation.is_cancelled() || outcome_tx.is_closed() {
             return;
         }
@@ -7304,6 +7473,19 @@ fn dispatch_agent_guide(
             return;
         };
         let receipt = AgentGuideTarget(context);
+        if !receipt.0.owner.is_current() {
+            return;
+        }
+        let observed = authorized_guide_status(
+            &receipt,
+            token.as_deref(),
+            captured_auth.as_ref(),
+            &intent_id,
+        )
+        .await;
+        if observation.is_cancelled() || !receipt.0.owner.is_current() {
+            return;
+        }
         let outcome = match observed {
             Ok(Some(AgentGuideDisposition::Applied)) => AgentWorkbenchOutcome::GuideApplied {
                 target: receipt.clone(),
@@ -7313,7 +7495,12 @@ fn dispatch_agent_guide(
                 target: receipt.clone(),
                 intent_id,
             },
-            Ok(None) => return,
+            Ok(None) => AgentWorkbenchOutcome::GuideUnconfirmed {
+                target: receipt.clone(),
+                intent_id,
+                reason: "the agent received this message but has not reported whether it was used"
+                    .into(),
+            },
             Err(reason) => AgentWorkbenchOutcome::GuideUnconfirmed {
                 target: receipt.clone(),
                 intent_id,
@@ -7747,13 +7934,48 @@ async fn dispatch_bottom_pane_view_action(
                     backends.session_attachment_epoch,
                     backends.turn_auth.clone(),
                 );
+                let uncertain = intent.status != astra_turn_types::UserIntentStatus::Returned;
+                if uncertain
+                    && matches!(
+                        &recipient.0.target,
+                        crate::tui::agent_run_projection::AgentControlTarget::DurableRun { .. }
+                    )
+                {
+                    let lookup_target = recipient.clone();
+                    let original_target = target.clone();
+                    let intent_id = intent.intent_id.clone();
+                    let outcome_tx = backends.agent_workbench_tx.clone();
+                    tokio::spawn(async move {
+                        let status =
+                            authorized_guide_status(&lookup_target, None, None, &intent_id).await;
+                        if !lookup_target.0.owner.is_current() {
+                            return;
+                        }
+                        let outcome = match status {
+                            Ok(Some(AgentGuideDisposition::Applied)) => {
+                                AgentWorkbenchOutcome::GuideApplied {
+                                    target: original_target,
+                                    intent_id,
+                                }
+                            }
+                            Ok(Some(AgentGuideDisposition::Returned)) => {
+                                AgentWorkbenchOutcome::GuideReturned {
+                                    target: original_target,
+                                    intent_id,
+                                }
+                            }
+                            _ => return,
+                        };
+                        let _ = outcome_tx.send(outcome).await;
+                    });
+                }
                 bottom_pane.push_view(Box::new(
                     bottom_pane::task_input_view::TaskInputView::returned(
                         target,
                         recipient,
                         intent.intent_id,
                         &intent.text,
-                        intent.status != astra_turn_types::UserIntentStatus::Returned,
+                        uncertain,
                     ),
                 ));
             } else {
@@ -10417,13 +10639,6 @@ pub(crate) async fn run_tui_session(
                                         Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                                     chat_widget.begin_root_stream();
-                                    let (turn_tx, turn_stream_bridge_control) =
-                                        stream_bridge::create_controlled_per_turn_bridge(
-                                            tui_tx.clone(),
-                                        );
-                                    let live_sink = stream_bridge::create_agent_live_sink(tui_tx.clone());
-                                    state.tui_stream_event_tx = Some(turn_tx);
-                                    state.tui_agent_live_event_sink = Some(live_sink);
                                     // The durable server run identity arrives on the accepted
                                     // stream. Keep it turn-scoped and share only that typed
                                     // identity with composer submissions; local execution state
@@ -10470,12 +10685,21 @@ pub(crate) async fn run_tui_session(
                                         permission_control.bind_session(session_id);
                                     }
                                     let turn_bound_session = permission_control.session_binding();
-                                    bottom_pane.set_root_intent_scope(Arc::new(
+                                    let mut model_control = super::model_control::ActiveModelControl::new(
+                                        api.clone(), turn_model_owner.clone(), active_remote_run_rx.clone(),
+                                        preinstalled_run_control.admitted_auth(), turn_bound_session.clone(),
+                                        permission_control.session_bound_notification(),
+                                    );
+                                    let turn_scope = Arc::new(
                                         bottom_pane::RootIntentScope::new(
                                             turn_model_owner.clone(), turn_model_epoch,
                                             turn_bound_session.clone(),
                                         ),
-                                    ));
+                                    );
+                                    let (turn_tx, turn_stream_bridge_control) = stream_bridge::create_scoped_per_turn_bridge(tui_tx.clone(), turn_scope.clone());
+                                    state.tui_stream_event_tx = Some(turn_tx);
+                                    state.tui_agent_live_event_sink = Some(stream_bridge::create_scoped_agent_live_sink(tui_tx.clone(), turn_scope.clone()));
+                                    bottom_pane.set_root_intent_scope(turn_scope);
                                     let turn_result = {
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let active_turn_local_run_control =
@@ -11243,11 +11467,20 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                         if let Some(requested) = slash_dispatch::active_model_override(&queued_text) {
                                                                             if turn_model_owner.is_current() {
-                                                                                let label = requested.as_deref().unwrap_or("no model");
-                                                                                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
-                                                                                    "Selected {label} · applies after this task, including queued messages."
-                                                                                )));
-                                                                                staged_model = Some(NextModelSelection::Requested(requested));
+                                                                                if let Some(name) = requested.as_ref() {
+                                                                                    match model_control.request(super::model_control::ModelChoice::Named(name.clone()), None) {
+                                                                                        Ok(()) => {
+                                                                                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
+                                                                                                "Switching to {name} at the next model round…"
+                                                                                            )));
+                                                                                            staged_model = Some(NextModelSelection::Requested(requested));
+                                                                                        }
+                                                                                        Err(error) => chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(error)),
+                                                                                    }
+                                                                                } else {
+                                                                                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info("Default model will be used after this task."));
+                                                                                    staged_model = Some(NextModelSelection::Requested(None));
+                                                                                }
                                                                             } else {
                                                                                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning("Account changed. Reopen /model to select a model."));
                                                                             }
@@ -11343,11 +11576,16 @@ pub(crate) async fn run_tui_session(
                                                                         if model_picker_scope.as_ref().is_some_and(|scope| scope.is_current(turn_model_session.as_deref(), turn_model_epoch, chat_widget.session_id())) {
                                                                             match slash_dispatch::prepare_model_picker_result(&result, &mut bottom_pane, &mut chat_widget) {
                                                                                 Some(Ok(Some(selection))) => {
-                                                                                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
-                                                                                        "Selected {} · applies after this task, including queued messages.", selection.name
-                                                                                    )));
                                                                                     let attempt = model_picker_scope.as_ref().and_then(|scope| scope.attempt.clone());
-                                                                                    staged_model = Some(NextModelSelection::Picked { selection, attempt });
+                                                                                    match model_control.request(super::model_control::ModelChoice::Picked(selection.clone()), attempt.clone()) {
+                                                                                        Ok(()) => {
+                                                                                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
+                                                                                                "Switching to {} at the next model round…", selection.name
+                                                                                            )));
+                                                                                            staged_model = Some(NextModelSelection::Picked { selection, attempt });
+                                                                                        }
+                                                                                        Err(error) => chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(error)),
+                                                                                    }
                                                                                     model_picker_scope = None;
                                                                                 }
                                                                                 Some(Err(())) => model_picker_scope = None,
@@ -11562,6 +11800,15 @@ pub(crate) async fn run_tui_session(
                                                 }
                                                 Some(ae) = tui_rx.recv() => {
                                                     let Some(ae) = accept_owned_tui_event(ae, Some(&turn_submission_id)) else { continue; };
+                                                    let visible_session = Some(chat_widget.session_id()).filter(|id| !id.is_empty());
+                                                    let Some(ae) = accept_attached_agent_event(ae, visible_session, live_session_attachment_epoch) else { continue; };
+                                                    if let TuiAppEvent::RunModelOutcome { run_id, session_id, outcome } = &ae {
+                                                        if let Some(feedback) = model_control.observe(run_id, session_id, outcome) {
+                                                            project_model_feedback(feedback, &mut staged_model, &mut bottom_pane, &mut chat_widget);
+                                                            frame_requester.schedule_frame();
+                                                        }
+                                                        continue;
+                                                    }
                                                     if let TuiAppEvent::RestoreInput(request) = &ae {
                                                         // A queue-full fallback may contain the
                                                         // same request if a retry raced the normal
@@ -12031,6 +12278,10 @@ pub(crate) async fn run_tui_session(
                                                             }
                                                         }
                                                     }
+                                                    if turn_model_owner.is_current()
+                                                        && let Some(feedback) = model_control.take_submission() {
+                                                        project_model_feedback(feedback, &mut staged_model, &mut bottom_pane, &mut chat_widget);
+                                                    }
                                                     let live_mode = perm_mode_mirror.current();
                                                     if turn_model_owner.is_current() && bottom_pane.footer.permission_mode
                                                         != Some(live_mode)
@@ -12086,6 +12337,17 @@ pub(crate) async fn run_tui_session(
                                     if same_turn_scope && matches!(permission_control.reconcile(&perm_mode_mirror), Some(Ok(_))) {
                                         bottom_pane.clear_staged_permission_mode();
                                     }
+                                    if same_turn_scope {
+                                        if let Some(feedback) = model_control.take_submission() {
+                                            project_model_feedback(feedback, &mut staged_model, &mut bottom_pane, &mut chat_widget);
+                                        }
+                                        if model_control.has_pending() {
+                                            chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                                "The task ended before its model change was confirmed. The selection will be used for the next task."
+                                            ));
+                                        }
+                                    }
+                                    drop(model_control);
                                     drop(permission_control);
                                     if let Some(selection) = staged_model.take() {
                                         if same_turn_scope {
@@ -13096,6 +13358,7 @@ pub(crate) async fn run_tui_session(
             }
             Some(ae) = tui_rx.recv() => {
                 let Some(ae) = accept_owned_tui_event(ae, None) else { continue; };
+                let Some(ae) = accept_attached_agent_event(ae, state.session_id.as_deref(), state.session_attachment_epoch) else { continue; };
                 if let TuiAppEvent::UserIntentApplied { intent_id, .. }
                 | TuiAppEvent::UserIntentReturned { intent_id, .. } = &ae
                     && bottom_pane.user_intent_belongs_to_other_turn(intent_id, "")
@@ -13961,6 +14224,8 @@ fn handle_app_event(
         | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::ObservedUserIntent { .. }
+        | TuiAppEvent::ScopedAgentLive { .. }
+        | TuiAppEvent::RunModelOutcome { .. }
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainAnalyze(_)
         | TuiAppEvent::ExplainAnalyzeSnapshot { .. }
@@ -22235,8 +22500,6 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn returned_member_guidance_remains_visible_without_becoming_main_input() {
-        use astra_thin_client::StreamEvent;
-
         let _credentials = crate::tests::isolate_credentials();
         let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
@@ -22245,28 +22508,7 @@ mod tests {
         )
         .unwrap();
 
-        let returned = |run: &str, intent: &str| StreamEvent::RunUserIntentReturned {
-            run_id: run.into(),
-            intent_id: intent.into(),
-            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-            event_index: 1,
-            content: "inspect the error\nand retry".into(),
-            index: 2,
-        };
         let (outcomes, mut rx) = tokio::sync::mpsc::channel(4);
-        let disposition = observe_agent_guide(
-            tokio_stream::iter(vec![
-                Ok(returned("other-run", "guide")),
-                Ok(returned("member-run", "guide")),
-            ]),
-            "member-run",
-            "guide",
-            &tokio_util::sync::CancellationToken::new(),
-            &outcomes,
-        )
-        .await
-        .unwrap();
-        assert_eq!(disposition, Some(AgentGuideDisposition::Returned));
 
         let guide = test_member_guide_target(Some("session".into()), 3);
         let mut pane = BottomPane::new();
@@ -22474,116 +22716,289 @@ mod tests {
         assert!(pane.take_queued_next_turn_submissions().is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn member_guidance_observation_preserves_active_budget_and_releases_the_stream() {
-        use astra_thin_client::StreamEvent;
-        use futures_util::poll;
-        use std::task::Poll;
+    #[serial_test::serial]
+    #[test]
+    fn child_live_receipts_settle_only_the_matching_message_and_run() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+        use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("guide-live-owner"),
+        )
+        .unwrap();
+        let first = test_member_guide_target(Some("session".into()), 3).for_delivery();
+        let second = first.for_delivery();
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        assert!(pane.accept_agent_guide("one".into(), first.clone(), "first".into()));
+        assert!(pane.accept_agent_guide("two".into(), second.clone(), "second".into()));
+        let mut widget = chat_widget::ChatWidget::new("session");
+        let event = |run: &str, id: &str| {
+            TuiAppEvent::AgentLive(AgentLiveEvent {
+                run_id: run.into(),
+                agent_id: "reviewer".into(),
+                kind: AgentLiveEventKind::Signal(AgentLiveSignal::UserIntentApplied {
+                    intent_id: id.into(),
+                    delivery: UserIntentDelivery::GuideCurrentRun,
+                    status: UserIntentStatus::Applied,
+                    event_index: 1,
+                    content: "first".into(),
+                }),
+            })
+        };
+        apply_tui_control_event(&event("wrong-run", "one"), &mut pane, &mut widget, 3);
+        assert_eq!(pane.pending_user_intent_count(), 2);
+        apply_tui_control_event(&event(first.run_id(), "one"), &mut pane, &mut widget, 3);
+        assert_eq!(pane.pending_user_intent_count(), 1);
+        assert!(first.0.observation.is_cancelled());
+        assert!(!second.0.observation.is_cancelled());
+        apply_tui_control_event(&event(first.run_id(), "one"), &mut pane, &mut widget, 3);
+        assert_eq!(pane.pending_user_intent_count(), 1);
+    }
 
-        let accepted = || StreamEvent::RunUserIntentAccepted {
-            run_id: "member".into(),
-            intent_id: "guide".into(),
-            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-            index: 1,
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn child_live_bridges_keep_the_original_session_attachment() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind, AgentLiveGap};
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("live-scope-owner"),
+        )
+        .unwrap();
+        let binding = Arc::new(std::sync::Mutex::new(None));
+        let scope = Arc::new(bottom_pane::RootIntentScope::new(
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            5,
+            binding.clone(),
+        ));
+        let (tx, mut rx) = stream_bridge::create_channels();
+        let sink = stream_bridge::create_scoped_agent_live_sink(tx.clone(), scope.clone());
+        let (stream, control) = stream_bridge::create_scoped_per_turn_bridge(tx, scope);
+        let event = AgentLiveEvent {
+            run_id: "child".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: None,
+                text: "private output".into(),
+            },
         };
-        let paused = || StreamEvent::RunPaused {
-            run_id: Some("member".into()),
-        };
-        let resumed = || StreamEvent::RunResumed {
-            run_id: Some("member".into()),
-        };
-        let applied = || StreamEvent::RunUserIntentApplied {
-            run_id: "member".into(),
-            intent_id: "guide".into(),
-            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-            event_index: 1,
-            content: "updated requirement".into(),
-            index: 2,
-        };
-        // Exercise the production observer, not a second clock model. Every
-        // scope owns its event stream and checks that retirement drops it.
-        for case in [
-            "resume",
-            "cancel",
-            "receiver_closed",
-            "replay_stalled",
-            "replay_resumed",
-            "active_timeout",
-            "remaining_timeout",
-        ] {
-            let (events, rx) = tokio::sync::mpsc::channel(8);
-            let (outcomes, output_rx) = tokio::sync::mpsc::channel(1);
-            let observation = tokio_util::sync::CancellationToken::new();
-            let mut future = std::pin::pin!(observe_agent_guide(
-                tokio_stream::wrappers::ReceiverStream::new(rx),
-                "member",
-                "guide",
-                &observation,
-                &outcomes,
-            ));
-            if case != "remaining_timeout" {
-                events.send(Ok(paused())).await.unwrap();
-            }
-            if case == "replay_resumed" {
-                events.send(Ok(resumed())).await.unwrap();
-            }
-            if case != "replay_stalled" {
-                events.send(Ok(accepted())).await.unwrap();
-            }
-            assert!(poll!(&mut future).is_pending(), "{case}");
-            if matches!(case, "replay_stalled" | "replay_resumed") {
-                tokio::time::advance(AGENT_GUIDE_APPLICATION_TIMEOUT).await;
-                assert!(matches!(poll!(&mut future), Poll::Ready(Err(_))));
-            } else {
-                if case == "remaining_timeout" {
-                    tokio::time::advance(Duration::from_secs(20)).await;
-                    events.send(Ok(paused())).await.unwrap();
-                    assert!(poll!(&mut future).is_pending());
-                }
-                tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
-                assert!(
-                    poll!(&mut future).is_pending(),
-                    "a retained pause must not expire: {case}"
-                );
-                match case {
-                    "cancel" => {
-                        observation.cancel();
-                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(None))));
-                    }
-                    "receiver_closed" => {
-                        drop(output_rx);
-                        assert!(matches!(poll!(&mut future), Poll::Ready(Ok(None))));
-                    }
-                    "resume" => {
-                        events.send(Ok(resumed())).await.unwrap();
-                        assert!(poll!(&mut future).is_pending());
-                        tokio::time::advance(Duration::from_secs(59)).await;
-                        events.send(Ok(applied())).await.unwrap();
-                        assert!(matches!(
-                            poll!(&mut future),
-                            Poll::Ready(Ok(Some(AgentGuideDisposition::Applied)))
-                        ));
-                    }
-                    "active_timeout" | "remaining_timeout" => {
-                        events.send(Ok(paused())).await.unwrap(); // Duplicate Pause cannot replenish time.
-                        assert!(poll!(&mut future).is_pending());
-                        events.send(Ok(resumed())).await.unwrap();
-                        assert!(poll!(&mut future).is_pending());
-                        let remaining = if case == "remaining_timeout" { 39 } else { 59 };
-                        tokio::time::advance(Duration::from_secs(remaining)).await;
-                        events.send(Ok(accepted())).await.unwrap(); // Duplicate cannot renew the budget.
-                        assert!(poll!(&mut future).is_pending());
-                        tokio::time::advance(Duration::from_secs(1)).await;
-                        assert!(matches!(poll!(&mut future), Poll::Ready(Err(_))));
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            assert!(
-                events.is_closed(),
-                "completed observer must release its stream: {case}"
-            );
+        sink.send(event.clone()).unwrap();
+        let from_sink = rx.recv().await.unwrap();
+        assert!(matches!(
+            accept_attached_agent_event(from_sink.clone(), None, 5),
+            Some(TuiAppEvent::AgentLive(_))
+        ));
+        *astra_core::sync_poison::recover_mutex_lock(&binding) = Some("session-a".into());
+        stream
+            .send(crate::cli::chat_stream::StreamEvent::AgentLive(event))
+            .await
+            .unwrap();
+        let from_stream = rx.recv().await.unwrap();
+        sink.send_gap(AgentLiveGap {
+            run_id: "child".into(),
+            agent_id: "reviewer".into(),
+            dropped_event_count: 1,
+        })
+        .unwrap();
+        let gap = rx.recv().await.unwrap();
+        for event in [from_sink, from_stream, gap] {
+            // A child may continue after its parent becomes idle in the same attachment.
+            assert!(accept_attached_agent_event(event.clone(), Some("session-a"), 6).is_some());
+            assert!(accept_attached_agent_event(event.clone(), Some("session-b"), 7).is_none());
+            assert!(accept_attached_agent_event(event, Some("session-a"), 8).is_none());
         }
+        drop(sink);
+        drop(stream);
+        control.close_and_drain();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn late_child_receipt_preserves_edits_in_open_unknown_draft() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("guide-draft-owner"),
+        )
+        .unwrap();
+        for returned in [false, true] {
+            let target = test_member_guide_target(Some("session".into()), 3).for_delivery();
+            let mut pane = BottomPane::new();
+            pane.set_session_attachment(Some("session"), 3);
+            assert!(pane.accept_agent_guide("guide".into(), target.clone(), "original".into()));
+            assert!(pane.mark_user_intent_unconfirmed("guide"));
+            pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::returned(
+                    target.clone(),
+                    target.clone(),
+                    "guide".into(),
+                    "original",
+                    true,
+                ),
+            ));
+            pane.handle_paste(" edited");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(if returned {
+                AgentWorkbenchOutcome::GuideReturned {
+                    intent_id: "guide".into(),
+                    target,
+                }
+            } else {
+                AgentWorkbenchOutcome::GuideApplied {
+                    intent_id: "guide".into(),
+                    target,
+                }
+            })
+            .unwrap();
+            let mut widget = chat_widget::ChatWidget::new("session");
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session"),
+                3,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            let rendered = render_bottom_pane_text(&pane, 100, 20);
+            assert!(rendered.contains("original edited"), "{rendered}");
+            let action = pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            if returned {
+                assert!(
+                    matches!(action, BottomPaneAction::ViewAction(BottomPaneViewAction::RetryReturnedAgentGuide { content, .. }) if content == "original edited")
+                );
+            } else {
+                assert!(
+                    matches!(action, BottomPaneAction::ViewAction(BottomPaneViewAction::SubmitAgentGuide { content, .. }) if content == "original edited")
+                );
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn child_receipt_reconciliation_uses_one_exact_lookup() {
+        use astra_credentials::{CredentialsFile, Profile};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("receipt-owner".into()),
+                access_token: Some("token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("receipt-owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/member/intents/guide"))
+            .and(wiremock::matchers::query_param(
+                "expected_session_id",
+                "session",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json("applied"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let target = AgentGuideTarget::capture(
+            "Reviewer".into(),
+            "member".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "member".into(),
+            },
+            api,
+            Some("session".into()),
+            3,
+            None,
+        );
+        assert_eq!(
+            authorized_guide_status(&target, Some("token"), None, "guide")
+                .await
+                .unwrap(),
+            Some(AgentGuideDisposition::Applied)
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn child_receipt_keeps_the_post_auth_when_turn_auth_changes() {
+        use crate::cli::session::session_runtime::AdmittedAuth;
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("auth-source-owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/member/intents"))
+            .and(wiremock::matchers::header("authorization", "Bearer original"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id":"member", "intent_id":"guide", "status":"accepted_remote", "duplicate":false, "event_index":1
+            }))).expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/member/intents/guide"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer original",
+            ))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (_run_tx, run_rx) = tokio::sync::watch::channel(Some("parent".to_owned()));
+        let (auth_tx, auth_rx) =
+            tokio::sync::watch::channel(Some(AdmittedAuth::Static("original".into())));
+        let target = AgentGuideTarget::capture(
+            "Reviewer".into(),
+            "member".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "member".into(),
+            },
+            api.clone(),
+            Some("session".into()),
+            3,
+            Some((run_rx, auth_rx)),
+        );
+        let request = astra_thin_client::RunUserIntentRequest {
+            intent_id: "guide".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            input: serde_json::json!({"content":"hello"}),
+        };
+        let mut source = None;
+        let token = submit_agent_guide_captured(
+            &api,
+            &target.0.owner,
+            target.0.auth.clone(),
+            "member",
+            &request,
+            &mut source,
+        )
+        .await
+        .unwrap();
+        auth_tx.send_replace(Some(AdmittedAuth::Static("replacement".into())));
+        assert!(
+            authorized_guide_status(&target, Some(&token), source.as_ref(), "guide")
+                .await
+                .is_err()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[serial_test::serial]
