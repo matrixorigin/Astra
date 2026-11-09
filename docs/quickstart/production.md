@@ -87,8 +87,10 @@ rejected; work already admitted keeps running. If a new credential cannot
 authenticate, the runner continues with the credential that last authenticated,
 and the same command can be run again later. A runner that is stopping does not
 accept a new credential, including before it has finished leaving the connected
-state; run the command again after it stops. `stop` waits for a start that is
-in progress, including one that has not recorded its metadata yet, and stops
-the runner it started. Closing the terminal before the command reports the
-runner connected cancels that startup. The token is not written to the runner
-metadata.
+state; run the command again after it stops. A start holds the registry lock
+until it also holds that runner's start lock, and `stop` takes the registry
+lock before it looks. `stop` then waits for a start that is in progress,
+including one that has not recorded its metadata yet, and stops the runner it
+started. The runner stays up only after the starting command accepts readiness.
+Closing the terminal, or losing that command before it accepts, cancels the
+startup. The token is not written to the runner metadata.

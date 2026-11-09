@@ -44,8 +44,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::token_renewal::{
-    read_valid_file_token, should_persist_proven, token_file_needs_permission_repair,
-    write_token_atomic,
+    parse_moi_token_claims, read_valid_file_token, same_moi_identity, should_persist_proven,
+    token_file_needs_permission_repair, write_token_atomic,
 };
 
 /// Result of applying a renewal response.
@@ -119,14 +119,16 @@ impl TokenManager {
     ///
     /// A renewal can install that newer token while this connection is still
     /// authenticating. Proving the pre-renewal snapshot must not rewind the
-    /// in-memory fallback behind the token the process is using now.
+    /// in-memory fallback behind the token the process is using now. Equal
+    /// `(iat, exp)` is not a newer generation: renewal may issue that sibling
+    /// in the same second, so the timestamp tie cannot order the two tokens.
     pub async fn mark_proven(&self, proven: &str) {
         let mut state = self.state.lock().await;
         let renewed_current = state.proven.as_deref() == Some(state.current.as_str())
             && proven != state.current
-            && !should_persist_proven(Some(&state.current), proven);
+            && Self::snapshot_is_not_newer_than_current(proven, &state.current);
         if renewed_current {
-            // The snapshot is older than the credential renewal installed.
+            // The snapshot is not newer than the credential renewal installed.
             // Leave both the in-memory fallback and the token file alone.
             return;
         }
@@ -197,6 +199,20 @@ impl TokenManager {
         }
         state.dirty = false;
         RenewApply::Applied
+    }
+
+    /// Same identity and not a strictly newer `(iat, exp)`. A different
+    /// identity, or a token this helper cannot parse, keeps the existing file
+    /// rule in `should_persist_proven`.
+    fn snapshot_is_not_newer_than_current(snapshot: &str, current: &str) -> bool {
+        let (Some(snapshot), Some(current)) = (
+            parse_moi_token_claims(snapshot),
+            parse_moi_token_claims(current),
+        ) else {
+            return false;
+        };
+        same_moi_identity(&snapshot, &current)
+            && (snapshot.iat, snapshot.exp) <= (current.iat, current.exp)
     }
 
     /// Try `candidate` on the next connection without writing it to the token
@@ -655,6 +671,25 @@ mod tests {
         );
         // The connection that authenticated with the pre-renewal token
         // observes AuthOk only after the replacement is installed.
+        manager.mark_proven(&old).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), renewed);
+        assert!(manager.stage_unproven_candidate("rejected".into()).await);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, renewed);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn late_authentication_does_not_rewind_an_equal_generation_renewal() {
+        let old = make_moi_token(100, 200, "old");
+        let renewed = make_moi_token(100, 200, "renewed");
+        let path = temp_token_path("equal-generation");
+        let manager = TokenManager::new(old.clone(), None, path.clone());
+        manager.mark_proven(&old).await;
+        assert_eq!(
+            manager.apply_renewed(&old, renewed.clone()).await,
+            RenewApply::Applied
+        );
         manager.mark_proven(&old).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), renewed);
         assert!(manager.stage_unproven_candidate("rejected".into()).await);

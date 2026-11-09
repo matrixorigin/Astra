@@ -191,16 +191,20 @@ fn signal_ready_for_epoch_with(
     dir: Option<&Path>,
     ready_fd: Option<i32>,
 ) {
-    let gate = lock_phase(state);
-    if gate.epoch != epoch {
-        return;
-    }
-    if let Some(connected) = gate.connected.as_ref()
-        && let Err(error) = connected.lock_exclusive()
     {
-        tracing::warn!(target: "astra.edge", error = %error, "cannot publish the connected state");
-        return;
+        let gate = lock_phase(state);
+        if gate.epoch != epoch {
+            return;
+        }
+        if let Some(connected) = gate.connected.as_ref()
+            && let Err(error) = connected.lock_exclusive()
+        {
+            tracing::warn!(target: "astra.edge", error = %error, "cannot publish the connected state");
+            return;
+        }
     }
+    // The acceptance read waits for the starting command. It must not hold
+    // the phase mutex across that wait.
     signal_ready_in(dir, ready_fd);
 }
 
@@ -233,12 +237,37 @@ fn signal_ready_in(dir: Option<&Path>, ready_fd: Option<i32>) {
 }
 
 fn notify_parent_ready_fd(fd: i32) -> io::Result<()> {
-    // The parent created this pipe end and passed its number. This process is
-    // the only remaining owner after the parent drops its copy. A closed read
-    // end means the starting command is gone, so startup was not accepted.
+    // The parent owns the other end of this socket. Writing the ready byte
+    // only fills the buffer; the starting command accepts startup by writing
+    // one byte back. EOF before that byte means the command is gone.
     let mut file = unsafe { File::from_raw_fd(fd) };
     file.write_all(b"1")?;
-    file.flush()
+    file.flush()?;
+    let mut ack = [0u8; 1];
+    match file.read_exact(&mut ack) {
+        Ok(()) if ack == *b"1" => Ok(()),
+        Ok(()) => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "the starting command did not accept readiness",
+        )),
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => Err(io::Error::new(
+            ErrorKind::BrokenPipe,
+            "the starting command is gone",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn readiness_channel() -> io::Result<(File, File)> {
+    use std::os::fd::OwnedFd;
+    // A connected pair, not a pipe: the child writes readiness and then reads
+    // the parent's acceptance. Both ends are close-on-exec until the child
+    // end is passed across `exec`.
+    let (parent, child) = std::os::unix::net::UnixStream::pair()?;
+    Ok((
+        File::from(OwnedFd::from(parent)),
+        File::from(OwnedFd::from(child)),
+    ))
 }
 
 pub fn prepare_child() -> io::Result<()> {
@@ -282,6 +311,16 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
             return 1;
         }
     };
+    // Hold the registry across directory creation and `start.lock`. Stop
+    // takes the same registry lock before it lists runners, so it cannot
+    // observe this directory before the start lock is held.
+    let registry = match lock_registry(root) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("Error: cannot lock runner startup: {error}");
+            return 1;
+        }
+    };
     let dir = state_dir(root, &identity);
     if let Err(error) = ensure_private_dir(&dir) {
         eprintln!("Error: cannot create runner state: {error}");
@@ -306,6 +345,7 @@ pub fn supervise(executable: &Path, args: &[String], root: &Path) -> i32 {
             return 1;
         }
     }
+    drop(registry);
     let token = option_value(args, "--token").unwrap_or("");
     match instance_is_locked(&dir) {
         Ok(true) => return running_instance(&dir, &identity, token, executable),
@@ -514,6 +554,16 @@ fn lock_start(dir: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Orders publication of a runner directory with `stop`. A start holds this
+/// lock from before the directory exists until `start.lock` is held.
+fn lock_registry(root: &Path) -> io::Result<File> {
+    let dir = root.join("edge-runners");
+    ensure_private_dir(&dir)?;
+    let file = open_lock_file(&dir.join("registry.lock"))?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
 fn open_lock_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -533,26 +583,26 @@ fn spawn_and_wait(
 ) -> Result<(), String> {
     let startup = StartupCancel::arm().map_err(|error| error.to_string())?;
     let args = command_with_workspace(args, workspace);
-    let (read_fd, write_fd) = nix::unistd::pipe().map_err(|error| error.to_string())?;
-    let write_raw = as_fd_raw(&write_fd);
+    let (parent_fd, child_fd) = readiness_channel().map_err(|error| error.to_string())?;
+    let child_raw = as_fd_raw(&child_fd);
     let mut command = Command::new(executable);
     command
         .args(&args)
         .env(MANAGED_ENV, "1")
         .env(STATE_DIR_ENV, dir)
-        .env(READY_FD_ENV, write_raw.to_string())
+        .env(READY_FD_ENV, child_raw.to_string())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     unsafe {
-        command.pre_exec(move || clear_cloexec(write_raw));
+        command.pre_exec(move || clear_cloexec(child_raw));
     }
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot start the background runner: {error}"))?;
-    drop(write_fd);
-    let mut read = File::from(read_fd);
-    if let Err(error) = wait_for_ready(&mut child, &mut read, READY_TIMEOUT, startup.flag()) {
+    drop(child_fd);
+    let mut channel = parent_fd;
+    if let Err(error) = wait_for_ready(&mut child, &mut channel, READY_TIMEOUT, startup.flag()) {
         kill_child(&mut child);
         return Err(error);
     }
@@ -561,19 +611,19 @@ fn spawn_and_wait(
 
 fn wait_for_ready(
     child: &mut Child,
-    read: &mut File,
+    channel: &mut File,
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    let raw = as_fd_raw(read);
+    let raw = as_fd_raw(channel);
     let _ = nix::fcntl::fcntl(
         unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) },
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
     );
     let started = Instant::now();
     loop {
-        match read_ready_byte(read)? {
-            ReadyByte::Ready => return accept_ready(child, cancelled),
+        match read_ready_byte(channel)? {
+            ReadyByte::Ready => return accept_parent_ready(child, channel, cancelled),
             ReadyByte::Pending => {}
         }
         if cancelled.load(Ordering::Relaxed) {
@@ -585,8 +635,8 @@ fn wait_for_ready(
         {
             // A byte left in the pipe by a child that has already exited is
             // not a running runner.
-            if read_ready_byte(read)? == ReadyByte::Ready {
-                return accept_ready(child, cancelled);
+            if read_ready_byte(channel)? == ReadyByte::Ready {
+                return accept_parent_ready(child, channel, cancelled);
             }
             return Err(format!("runner exited before it was ready ({status})"));
         }
@@ -601,6 +651,18 @@ fn wait_for_ready(
 enum ReadyByte {
     Ready,
     Pending,
+}
+
+fn accept_parent_ready(
+    child: &mut Child,
+    channel: &mut File,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    accept_ready(child, cancelled)?;
+    channel
+        .write_all(b"1")
+        .and_then(|()| channel.flush())
+        .map_err(|error| format!("cannot accept runner readiness: {error}"))
 }
 
 fn accept_ready(child: &mut Child, cancelled: &AtomicBool) -> Result<(), String> {
@@ -767,6 +829,13 @@ fn run_management(root: &Path, request: Management) -> i32 {
     if request.edge_id.as_deref() == Some("") || request.server_url.as_deref() == Some("") {
         return 2;
     }
+    let registry = match lock_registry(root) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("Error: cannot lock runner startup: {error}");
+            return 1;
+        }
+    };
     let instances = match list_instances(root) {
         Ok(instances) => instances,
         Err(error) => {
@@ -775,9 +844,13 @@ fn run_management(root: &Path, request: Management) -> i32 {
         }
     };
     if matches!(request.action, Action::Stop)
-        && let Some(code) = stop_pending_starts(&request, &instances)
+        && let Some(pending) = stop_pending_starts(&request, &instances)
     {
-        return code;
+        drop(registry);
+        return match pending {
+            PendingStart::Dir(dir) => stop_unpublished(&dir),
+            PendingStart::Error(code) => code,
+        };
     }
     let uninspectable = report_uninspectable(
         &instances.unreadable,
@@ -799,6 +872,7 @@ fn run_management(root: &Path, request: Management) -> i32 {
         Ok(selected) => selected,
         Err(code) => return code,
     };
+    drop(registry);
     match request.action {
         Action::Status => {
             let mut code = i32::from(uninspectable);
@@ -864,10 +938,15 @@ fn select_instances<'a>(
     Ok(matched)
 }
 
-/// Stop a start that has created its state directory but has not published
-/// metadata yet. Returns `Some` when this request is that start, so the
-/// caller does not report the runner absent.
-fn stop_pending_starts(request: &Management, instances: &Instances) -> Option<i32> {
+enum PendingStart {
+    Dir(PathBuf),
+    Error(i32),
+}
+
+/// A start whose directory is visible and whose `start.lock` is held, but
+/// which has not published metadata. The caller drops the registry lock
+/// before waiting, so the long stop does not block other runners.
+fn stop_pending_starts(request: &Management, instances: &Instances) -> Option<PendingStart> {
     let mut pending = Vec::new();
     for (dir, _) in &instances.unreadable {
         if !dir_selected(
@@ -885,7 +964,7 @@ fn stop_pending_starts(request: &Management, instances: &Instances) -> Option<i3
             (Ok(_), Ok(_)) => {}
             (Err(error), _) | (_, Err(error)) => {
                 eprintln!("Error: cannot inspect the runner lock: {error}");
-                return Some(1);
+                return Some(PendingStart::Error(1));
             }
         }
     }
@@ -913,9 +992,9 @@ fn stop_pending_starts(request: &Management, instances: &Instances) -> Option<i3
     }
     if pending.len() > 1 {
         eprintln!("Error: more than one runner startup; pass --edge-id and --server-url");
-        return Some(2);
+        return Some(PendingStart::Error(2));
     }
-    Some(stop_unpublished(&pending[0]))
+    Some(PendingStart::Dir(pending.remove(0)))
 }
 
 fn dir_selected(dir: &Path, edge_id: Option<&str>, server_url: Option<&str>) -> bool {
@@ -1115,8 +1194,13 @@ fn print_logs(record: &Record) -> i32 {
     let current = record.dir.join("edge.log");
     let previous = record.dir.join("edge.log.1");
     let mut lines = Vec::new();
-    if let Ok(mut older) = read_log_tail(&previous, LOG_TAIL_LINES, LOG_TAIL_BYTES) {
-        lines.append(&mut older);
+    match read_log_tail(&previous, LOG_TAIL_LINES, LOG_TAIL_BYTES) {
+        Ok(mut older) => lines.append(&mut older),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            eprintln!("Error: cannot read {}: {error}", previous.display());
+            return 1;
+        }
     }
     match read_log_tail(&current, LOG_TAIL_LINES, LOG_TAIL_BYTES) {
         Ok(mut newer) => lines.append(&mut newer),
@@ -1125,7 +1209,11 @@ fn print_logs(record: &Record) -> i32 {
             eprintln!("log: {}", current.display());
             return 0;
         }
-        Err(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            eprintln!("Error: cannot read {}: {error}", current.display());
+            return 1;
+        }
     }
     if lines.is_empty() {
         eprintln!("No logs yet.");
@@ -1933,11 +2021,33 @@ mod tests {
             connected: None,
         });
         let root = tempfile::tempdir().unwrap();
-        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
-        let raw = as_fd_raw(&write_fd);
-        std::mem::forget(write_fd);
+        let (parent_fd, child_fd) = readiness_channel().unwrap();
+        let raw = as_fd_raw(&child_fd);
+        std::mem::forget(child_fd);
+        let acker = std::thread::spawn(move || {
+            let mut parent = parent_fd;
+            let raw = as_fd_raw(&parent);
+            let _ = nix::fcntl::fcntl(
+                unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) },
+                nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+            );
+            let mut buf = [0u8; 1];
+            let started = Instant::now();
+            loop {
+                match parent.read(&mut buf) {
+                    Ok(1) => {
+                        parent.write_all(b"1").unwrap();
+                        parent.flush().unwrap();
+                        return;
+                    }
+                    _ if started.elapsed() > Duration::from_secs(2) => return,
+                    _ => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
         let epoch = phase_epoch(&state);
         signal_ready_for_epoch_with(&state, epoch, Some(root.path()), Some(raw));
+        acker.join().unwrap();
         note_phase_with(&state, root.path(), "reconnecting");
         signal_ready_for_epoch_with(&state, epoch, Some(root.path()), None);
         assert_eq!(
@@ -1950,10 +2060,6 @@ mod tests {
             std::fs::read_to_string(root.path().join("phase")).unwrap(),
             "connected"
         );
-        let mut read = File::from(read_fd);
-        let mut buf = [0u8; 8];
-        let count = read.read(&mut buf).unwrap();
-        assert_eq!(&buf[..count], b"1");
     }
 
     #[tokio::test]
@@ -1989,19 +2095,19 @@ mod tests {
     fn readiness_byte_unblocks_the_parent_and_failure_reaps_the_child() {
         // POSIX sh only redirects single-digit descriptors, so the pipe is
         // mapped to stdout rather than passed by its allocated number.
-        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let (mut parent_fd, child_fd) = readiness_channel().unwrap();
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
             .arg("printf 1; sleep 30")
             .env(READY_FD_ENV, "1")
-            .stdout(Stdio::from(write_fd));
+            .stdout(Stdio::from(child_fd));
         let mut child = command.spawn().unwrap();
         drop(command);
         let cancelled = AtomicBool::new(false);
         wait_for_ready(
             &mut child,
-            &mut File::from(read_fd),
+            &mut parent_fd,
             Duration::from_secs(2),
             &cancelled,
         )
@@ -2597,6 +2703,79 @@ mod tests {
     }
 
     #[test]
+    fn stop_waits_while_a_start_holds_the_registry_before_its_lock_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        let registry = lock_registry(root.path()).unwrap();
+        assert!(!dir.exists());
+        let stop_root = root.path().to_path_buf();
+        let stop = std::thread::spawn(move || {
+            management(
+                &stop_root,
+                &[
+                    "stop",
+                    "--edge-id",
+                    "runner-abc",
+                    "--server-url",
+                    "https://example.test",
+                ],
+            )
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !stop.is_finished(),
+            "stop listed runners while a start held the registry"
+        );
+        ensure_private_dir(&dir).unwrap();
+        let start = lock_start(&dir).unwrap();
+        drop(registry);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !stop.is_finished(),
+            "stop returned before the start lock was released"
+        );
+        drop(start);
+        assert_eq!(stop.join().unwrap(), 0);
+        assert!(
+            !dir.exists(),
+            "the unpublished start can still launch after stop"
+        );
+    }
+
+    #[test]
+    fn logs_report_an_unreadable_file_instead_of_no_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let command = connect_args("https://example.test", "secret-token", &workspace);
+        let identity = user_runner_identity_with(&command, None).unwrap().unwrap();
+        let dir = state_dir(root.path(), &identity);
+        ensure_private_dir(&dir).unwrap();
+        write_metadata(&dir, &identity).unwrap();
+        let logs = [
+            "logs",
+            "--edge-id",
+            "runner-abc",
+            "--server-url",
+            "https://example.test",
+        ];
+        assert_eq!(management(root.path(), &logs), 0);
+        let current = dir.join("edge.log");
+        std::fs::write(&current, b"kept").unwrap();
+        set_mode(&current, 0);
+        assert_eq!(management(root.path(), &logs), 1);
+        set_mode(&current, 0o600);
+        let previous = dir.join("edge.log.1");
+        std::fs::write(&previous, b"older").unwrap();
+        set_mode(&previous, 0);
+        assert_eq!(management(root.path(), &logs), 1);
+    }
+
+    #[test]
     fn stop_does_not_delete_unreadable_state_that_is_not_starting() {
         let root = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -2756,6 +2935,24 @@ mod tests {
         drop(read_fd);
         use std::os::fd::IntoRawFd;
         let error = notify_parent_ready_fd(write_fd.into_raw_fd()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn a_ready_byte_is_not_acceptance_until_the_parent_acks() {
+        use std::os::fd::IntoRawFd;
+        let (mut parent, child) = readiness_channel().unwrap();
+        let raw = child.into_raw_fd();
+        let worker = std::thread::spawn(move || notify_parent_ready_fd(raw));
+        let mut buf = [0u8; 1];
+        parent.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"1");
+        assert!(
+            !worker.is_finished(),
+            "the child treated the write as acceptance"
+        );
+        drop(parent);
+        let error = worker.join().unwrap().unwrap_err();
         assert_eq!(error.kind(), ErrorKind::BrokenPipe);
     }
 
