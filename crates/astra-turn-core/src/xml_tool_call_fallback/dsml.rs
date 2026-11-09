@@ -4,7 +4,7 @@
 //! path, including named calls whose arguments cannot be decoded.
 
 use serde_json::{Value, json};
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 mod html;
 mod markdown;
@@ -63,7 +63,8 @@ struct Lexer {
     paragraph_open: bool,
     line_paragraph: bool,
     literal_block: usize,
-    continuation_checked: usize,
+    line_probe: markdown::LineProbe,
+    line_opaque_block: bool,
     fence_containers: Arc<[Container]>,
     prefix_cursor: markdown::Cursor,
     tag_scanner: Option<tag::Scanner>,
@@ -72,17 +73,42 @@ struct Lexer {
     opaque: Option<Opaque>,
     delimiter_run: usize,
     fence_close_candidate: bool,
-    fence_opening: Option<String>,
+    fence_info_checked: usize,
     literal: Option<(char, usize, bool)>,
+    inline: Option<InlineProbe>,
+    inline_plan: Option<InlinePlan>,
     line_has_text: bool,
     escaped: bool,
     open: Scopes,
+}
+
+/// An inline opener is provisional until an equal run closes it in its block.
+/// Keep the uncommitted bytes in the lexer input so no projection or tool
+/// boundary is published before the owner is known.
+#[derive(Debug)]
+struct InlineProbe {
+    start: usize,
+    offset: usize,
+    line_has_text: bool,
+    line_paragraph: bool,
+    paragraph_open: bool,
+    line_containers: Arc<[Container]>,
+    block_containers: Arc<[Container]>,
+}
+
+/// On an unmatched opener, replay the resolved block tail once. Index the
+/// last run of each length so that other unmatched runs cannot rescan it.
+#[derive(Debug)]
+struct InlinePlan {
+    end: usize,
+    last: HashMap<usize, usize>,
 }
 
 #[derive(Debug)]
 struct Opaque {
     terminator: &'static str,
     containers: Arc<[Container]>,
+    block: bool,
 }
 
 #[derive(Debug)]
@@ -92,6 +118,88 @@ struct Scope {
     previous_same: Option<usize>,
     literal: bool,
     hidden: bool,
+    body: InvocationBody,
+}
+
+/// Once an invocation starts a JSON object, its complete object (including
+/// nested objects and escaped string bytes) owns the text before any tag can
+/// be interpreted. The argument decoder still validates the original JSON.
+#[derive(Debug, Default)]
+enum InvocationBody {
+    #[default]
+    Markup,
+    Pending,
+    Json {
+        objects: usize,
+        string: bool,
+        escaped: bool,
+    },
+}
+
+impl InvocationBody {
+    fn json_prefix(&mut self, text: &str, line_bounded: bool) -> usize {
+        let start = if matches!(self, Self::Pending) {
+            let Some((index, first)) = text
+                .char_indices()
+                .find(|(_, ch)| !ch.is_whitespace() || (line_bounded && *ch == '\n'))
+            else {
+                return text.len();
+            };
+            if line_bounded && first == '\n' {
+                return index + 1;
+            }
+            if first != '{' {
+                *self = Self::Markup;
+                return 0;
+            }
+            *self = Self::Json {
+                objects: 0,
+                string: false,
+                escaped: false,
+            };
+            index
+        } else {
+            0
+        };
+        let Self::Json {
+            objects,
+            string,
+            escaped,
+        } = self
+        else {
+            return 0;
+        };
+        for (index, byte) in text.bytes().enumerate().skip(start) {
+            if *string {
+                if *escaped {
+                    *escaped = false;
+                } else if byte == b'\\' {
+                    *escaped = true;
+                } else if byte == b'"' {
+                    *string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => *string = true,
+                    b'{' => *objects += 1,
+                    b'}' => {
+                        *objects -= 1;
+                        if *objects == 0 {
+                            *self = Self::Markup;
+                            return index + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Escaped examples belong to a Markdown block. Revisit the
+            // next line before granting the example any more JSON ownership.
+            if line_bounded && byte == b'\n' {
+                return index + 1;
+            }
+        }
+        text.len()
+    }
 }
 
 /// One indexed stack owns every protocol family before candidate validation.
@@ -135,6 +243,11 @@ impl Scopes {
             previous_same,
             literal,
             hidden,
+            body: if kind == Kind::Invoke {
+                InvocationBody::Pending
+            } else {
+                InvocationBody::Markup
+            },
         });
     }
     fn clear(&mut self) {
@@ -164,7 +277,22 @@ impl Lexer {
     fn push(&mut self, chunk: &str, finish: bool) -> Vec<Fragment> {
         self.pending.push_str(chunk);
         let mut fragments = Vec::new();
-        while !self.remaining().is_empty() {
+        loop {
+            if self.inline.is_some()
+                && (self.literal.is_none() || (finish && self.remaining().is_empty()))
+            {
+                self.replay_inline();
+            }
+            if self.remaining().is_empty() {
+                break;
+            }
+            if self
+                .inline_plan
+                .as_ref()
+                .is_some_and(|plan| self.offset >= plan.end)
+            {
+                self.inline_plan = None;
+            }
             if let Some(opaque) = &self.opaque {
                 if !self.line_prefix_done {
                     let Some(prefix) = self.prefix_cursor.fence(
@@ -194,7 +322,11 @@ impl Lexer {
                 let line_end = self.remaining().find('\n').map(|at| at + 1);
                 let limit = line_end.unwrap_or(self.remaining().len());
                 let end = if let Some(at) = self.remaining()[..limit].find(terminator) {
-                    self.opaque = None;
+                    let opaque = self.opaque.take().unwrap();
+                    if opaque.block {
+                        self.html
+                            .start_block(html::BlockEnd::Line, opaque.containers);
+                    }
                     at + terminator.len()
                 } else if finish || line_end.is_some() {
                     limit
@@ -221,10 +353,6 @@ impl Lexer {
                 let inline = matches!(self.literal, Some((_, _, false)));
                 let escaped_scope = self.open.literal();
                 let contextual = inline || escaped_scope || self.paragraph_open;
-                let classify = self.open.markdown_active()
-                    && !self.html.active()
-                    && self.literal.is_none_or(|(_, _, fence)| !fence)
-                    && markdown::may_interrupt(self.remaining());
                 if self.open.markdown_active() {
                     let mut prefix = self.prepared_prefix.take();
                     if prefix.is_none() && self.html.containers().is_some() {
@@ -265,20 +393,24 @@ impl Lexer {
                         break;
                     };
                     self.prefix_cursor = markdown::Cursor::default();
+                    // Leaving a literal container changes which grammar owns
+                    // this same line, before deriving its next block facts.
+                    let classify = !self.html.active()
+                        && self.literal.is_none_or(|(_, _, fence)| !fence)
+                        && markdown::may_interrupt(self.remaining());
                     let boundary = if classify {
-                        let start = self.continuation_checked.max(prefix.end);
-                        let end = markdown::classification_end(self.remaining(), start, finish);
-                        if let Some(end) = end {
-                            Some(markdown::inspect_line(
-                                &self.remaining()[prefix.continuation_end..end],
-                                contextual,
-                            ))
+                        if let Some(boundary) = self.line_probe.inspect(
+                            &self.pending[self.cursor..],
+                            &prefix,
+                            contextual,
+                            finish,
+                        ) {
+                            Some(boundary)
                         } else if prefix.indented {
                             // Indentation is already decidable; publish whitespace
                             // while preserving a continuing paragraph until newline.
                             None
                         } else {
-                            self.continuation_checked = self.remaining().len();
                             self.prepared_prefix = Some(prefix);
                             break;
                         }
@@ -289,6 +421,10 @@ impl Lexer {
                         .as_ref()
                         .is_some_and(|boundary| boundary.interrupts);
                     if inline && interrupts {
+                        if self.inline.is_some() {
+                            self.replay_inline();
+                            continue;
+                        }
                         self.literal = None;
                     }
                     if escaped_scope && interrupts {
@@ -316,16 +452,29 @@ impl Lexer {
                         prefix.containers.into()
                     };
                     self.block_containers = self.line_containers.clone();
+                    self.line_opaque_block = false;
+                    match boundary.and_then(|boundary| boundary.html) {
+                        Some(markdown::HtmlStart::Element(end)) => {
+                            self.html.start_block(end, self.line_containers.clone());
+                        }
+                        Some(markdown::HtmlStart::Opaque) => self.line_opaque_block = true,
+                        None => {}
+                    }
                     let end = prefix.end;
                     if end > 0 {
-                        let text = self.remaining()[..end].to_owned();
+                        let text = self
+                            .inline
+                            .is_none()
+                            .then(|| self.remaining()[..end].to_owned());
                         self.consume(end);
                         self.line_has_text = false;
-                        fragments.push(Fragment::Text {
-                            text,
-                            visible: true,
-                            literal: true,
-                        });
+                        if let Some(text) = text {
+                            fragments.push(Fragment::Text {
+                                text,
+                                visible: true,
+                                literal: true,
+                            });
+                        }
                     }
                 }
                 self.line_prefix_done = true;
@@ -333,6 +482,19 @@ impl Lexer {
             let first = self.remaining().chars().next().unwrap_or('\n');
             if self.remaining().is_empty() {
                 break;
+            }
+            if let Some(end) = self.html.block_prefix(&self.pending[self.cursor..], finish) {
+                if end == 0 {
+                    break;
+                }
+                let text = self.remaining()[..end].to_owned();
+                self.consume(end);
+                fragments.push(Fragment::Text {
+                    text,
+                    visible: true,
+                    literal: true,
+                });
+                continue;
             }
             // The closing fence line is literal until its remainder is known.
             // Publish whitespace incrementally instead of rescanning a growing
@@ -356,6 +518,23 @@ impl Lexer {
                     continue;
                 }
                 self.fence_close_candidate = false;
+            }
+            let json = self.open.frames.last_mut().map_or(0, |scope| {
+                scope
+                    .body
+                    .json_prefix(&self.pending[self.cursor..], scope.literal)
+            });
+            if json != 0 {
+                let text = self.remaining()[..json].to_owned();
+                let visible = self.open.visible();
+                let literal = self.open.literal();
+                self.consume(json);
+                fragments.push(Fragment::Text {
+                    text,
+                    visible,
+                    literal,
+                });
+                continue;
             }
             if self.literal.is_none() && !self.indented && first == '<' {
                 let mut scanner = self.tag_scanner.take().unwrap_or_default();
@@ -392,6 +571,7 @@ impl Lexer {
                         self.opaque = Some(Opaque {
                             terminator,
                             containers: self.line_containers.clone(),
+                            block: self.line_opaque_block,
                         });
                         fragments.push(Fragment::Text {
                             text,
@@ -403,17 +583,7 @@ impl Lexer {
                     tag::Scan::Html { end, name, closing } => {
                         let text = self.remaining()[..end].to_owned();
                         if self.open.is_empty() && !self.escaped {
-                            self.html.tag(
-                                &text,
-                                &name,
-                                closing,
-                                !self.line_has_text,
-                                self.line_containers.clone(),
-                            );
-                            if self.html.containers().is_some() {
-                                self.line_paragraph = false;
-                                self.paragraph_open = false;
-                            }
+                            self.html.tag(&text, &name, closing);
                         }
                         let visible = self.open.visible();
                         self.consume(end);
@@ -487,23 +657,8 @@ impl Lexer {
                     break;
                 }
                 self.delimiter_run = 0;
-                if first == '`'
-                    && let Some(opening) = &self.fence_opening
-                {
-                    // Both a possible fence and a code span are literal while
-                    // their opening line streams. Let CommonMark resolve the
-                    // info string when a later backtick can change its kind.
-                    let probe = format!("{opening}{}", &self.remaining()[..count]);
-                    if !markdown::opens_fence(&probe) {
-                        self.fence_opening = None;
-                        if let Some(literal) = &mut self.literal {
-                            literal.2 = false;
-                        }
-                        self.line_paragraph = markdown::inspect_line(&probe, false).paragraph;
-                        self.paragraph_open = self.line_paragraph;
-                    }
-                }
                 let fence_end = matches!(self.literal,Some((delimiter,length,true)) if first == delimiter && !self.line_has_text && count >= length);
+                let mut text_start = self.cursor;
                 match self.literal {
                     Some((delimiter, length, fence))
                         if first == delimiter
@@ -513,31 +668,43 @@ impl Lexer {
                             self.fence_close_candidate = true;
                         } else {
                             self.literal = None;
+                            if let Some(inline) = self.inline.take() {
+                                text_start = inline.start;
+                            }
                         }
                     }
                     None => {
-                        let fence = !self.line_has_text
-                            && markdown::opens_fence(&self.remaining()[..count]);
-                        if first == '`' || fence {
-                            self.literal = Some((first, count, fence));
-                            if fence {
-                                self.fence_containers = self.line_containers.clone();
-                                // Tilde fences are already settled: backticks
-                                // cannot invalidate their info string.
-                                self.fence_opening = (first == '`').then(String::new);
-                                self.paragraph_open = false;
-                            }
+                        let fence = if !self.line_has_text && count >= 3 {
+                            let Some(fence) = self.opens_fence(first, count, finish) else {
+                                self.delimiter_run = count;
+                                break;
+                            };
+                            fence
+                        } else {
+                            false
+                        };
+                        if fence {
+                            self.literal = Some((first, count, true));
+                            self.fence_containers = self.line_containers.clone();
+                            self.paragraph_open = false;
+                        } else if first == '`' {
+                            self.open_inline(count);
                         }
                     }
                     _ => {}
                 }
-                let text = self.remaining()[..count].to_owned();
+                let text = self
+                    .inline
+                    .is_none()
+                    .then(|| self.pending[text_start..self.cursor + count].to_owned());
                 self.consume(count);
-                fragments.push(Fragment::Text {
-                    text,
-                    visible: true,
-                    literal: true,
-                });
+                if let Some(text) = text {
+                    fragments.push(Fragment::Text {
+                        text,
+                        visible: true,
+                        literal: true,
+                    });
+                }
                 continue;
             }
             // Scan each run once and compact only after the batch. In particular,
@@ -553,32 +720,122 @@ impl Lexer {
                     .map(|(index, _)| index)
                     .unwrap_or(self.remaining().len())
             };
-            let text = self.remaining()[..end].to_owned();
+            let text = self
+                .inline
+                .is_none()
+                .then(|| self.remaining()[..end].to_owned());
             let literal = self.literal.is_some()
                 || self.indented
                 || self.html.active()
                 || self.open.literal();
             self.consume(end);
-            fragments.push(Fragment::Text {
-                text,
-                visible: self.open.visible(),
-                literal,
-            });
+            if let Some(text) = text {
+                fragments.push(Fragment::Text {
+                    text,
+                    visible: self.open.visible(),
+                    literal,
+                });
+            }
         }
-        self.pending.drain(..self.cursor);
-        self.cursor = 0;
+        let consumed = self
+            .inline
+            .as_ref()
+            .map_or(self.cursor, |inline| inline.start);
+        if consumed != 0 {
+            self.pending.drain(..consumed);
+            self.cursor -= consumed;
+            if let Some(inline) = &mut self.inline {
+                inline.start -= consumed;
+            }
+        }
         fragments
     }
 
-    fn consume(&mut self, end: usize) {
-        if self.fence_opening.is_some() {
-            let text = &self.pending[self.cursor..self.cursor + end];
-            if text.contains('\n') {
-                self.fence_opening = None;
+    fn opens_fence(&mut self, delimiter: char, count: usize, finish: bool) -> Option<bool> {
+        // Only a backtick can disqualify a backtick fence's info string.
+        // Tilde openings need no provisional line buffer.
+        if delimiter == '~' {
+            return Some(markdown::opens_fence(&self.remaining()[..count]));
+        }
+        let checked = self.fence_info_checked.max(count);
+        let end = match self.remaining()[checked..]
+            .bytes()
+            .position(|byte| matches!(byte, b'\n' | b'`'))
+        {
+            Some(index) => checked + index + 1,
+            None if finish => self.remaining().len(),
+            None => {
+                self.fence_info_checked = self.remaining().len();
+                return None;
+            }
+        };
+        self.fence_info_checked = 0;
+        Some(markdown::opens_fence(&self.remaining()[..end]))
+    }
+
+    fn open_inline(&mut self, count: usize) {
+        if let Some(plan) = &self.inline_plan {
+            if plan
+                .last
+                .get(&count)
+                .is_some_and(|last| *last > self.offset)
+            {
+                self.literal = Some(('`', count, false));
+            }
+            return;
+        }
+        self.inline = Some(InlineProbe {
+            start: self.cursor,
+            offset: self.offset,
+            line_has_text: self.line_has_text,
+            line_paragraph: self.line_paragraph,
+            paragraph_open: self.paragraph_open,
+            line_containers: self.line_containers.clone(),
+            block_containers: self.block_containers.clone(),
+        });
+        self.literal = Some(('`', count, false));
+    }
+
+    fn replay_inline(&mut self) {
+        let inline = self.inline.take().unwrap();
+        let mut last = HashMap::new();
+        let mut index = inline.start;
+        while index < self.cursor {
+            if self.pending.as_bytes()[index] == b'`' {
+                let len = self.pending.as_bytes()[index..self.cursor]
+                    .iter()
+                    .take_while(|byte| **byte == b'`')
+                    .count();
+                last.insert(len, inline.offset + index - inline.start);
+                index += len;
             } else {
-                self.fence_opening.as_mut().unwrap().push_str(text);
+                index += 1;
             }
         }
+        self.inline_plan = Some(InlinePlan {
+            end: self.offset,
+            last,
+        });
+        self.cursor = inline.start;
+        self.offset = inline.offset;
+        self.line_has_text = inline.line_has_text;
+        self.line_paragraph = inline.line_paragraph;
+        self.paragraph_open = inline.paragraph_open;
+        self.line_containers = inline.line_containers;
+        self.block_containers = inline.block_containers;
+        self.line_prefix_done = true;
+        self.line_opaque_block = false;
+        self.indented = false;
+        self.escaped = false;
+        self.literal = None;
+        self.delimiter_run = 0;
+        self.fence_info_checked = 0;
+        self.prefix_cursor = markdown::Cursor::default();
+        self.prepared_prefix = None;
+        self.line_probe = markdown::LineProbe::default();
+    }
+
+    fn consume(&mut self, end: usize) {
         for ch in self.pending[self.cursor..self.cursor + end].chars() {
             if ch == '\n' {
                 let blank = !self.line_has_text;
@@ -596,7 +853,8 @@ impl Lexer {
                 self.line_prefix_done = false;
                 self.indented = false;
                 self.prefix_cursor = markdown::Cursor::default();
-                self.continuation_checked = 0;
+                self.line_probe = markdown::LineProbe::default();
+                self.line_opaque_block = false;
                 if blank || !self.line_paragraph {
                     self.paragraph_open = false;
                 }

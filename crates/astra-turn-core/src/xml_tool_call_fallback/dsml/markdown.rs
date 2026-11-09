@@ -265,7 +265,13 @@ fn blank_line_start(bytes: &[u8], finish: bool) -> Option<bool> {
 pub(super) struct Boundary {
     pub interrupts: bool,
     pub paragraph: bool,
+    pub html: Option<HtmlStart>,
     containers: Vec<ContainerKind>,
+}
+
+pub(super) enum HtmlStart {
+    Element(super::html::BlockEnd),
+    Opaque,
 }
 
 enum ContainerKind {
@@ -294,7 +300,7 @@ impl Prefix {
     }
 }
 
-pub(super) fn inspect_line(line: &str, previous_paragraph: bool) -> Boundary {
+fn inspect_line(line: &str, previous_paragraph: bool, tag: Option<(&str, &str)>) -> Boundary {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
     let prefix = if previous_paragraph {
         "paragraph\n"
@@ -308,9 +314,14 @@ pub(super) fn inspect_line(line: &str, previous_paragraph: bool) -> Boundary {
     let mut paragraph = false;
     let mut containers = Vec::new();
     let mut literal_block = false;
+    let mut html_block = false;
     for (event, span) in events {
         match event {
-            Event::Start(Tag::Heading { .. } | Tag::CodeBlock(_) | Tag::HtmlBlock) => {
+            Event::Start(Tag::HtmlBlock) => {
+                html_block = span.start >= prefix.len();
+                literal_block = true;
+            }
+            Event::Start(Tag::Heading { .. } | Tag::CodeBlock(_)) => {
                 literal_block = true;
             }
             Event::End(TagEnd::Heading(_) | TagEnd::CodeBlock | TagEnd::HtmlBlock) => {
@@ -334,6 +345,11 @@ pub(super) fn inspect_line(line: &str, previous_paragraph: bool) -> Boundary {
     Boundary {
         interrupts,
         paragraph,
+        html: html_block.then(|| {
+            tag.map_or(HtmlStart::Opaque, |(raw, name)| {
+                HtmlStart::Element(super::html::BlockEnd::for_tag(raw, name))
+            })
+        }),
         containers,
     }
 }
@@ -356,6 +372,91 @@ pub(super) fn may_interrupt(text: &str) -> bool {
         .take(4)
         .find(|ch| !matches!(ch, ' ' | '\t'))
         .is_none_or(|ch| !ch.is_alphabetic())
+}
+
+/// Checkpoint line classification until the leading payload supplies enough
+/// CommonMark facts. An HTML opener/closer must be recognized before deciding
+/// if a paragraph or a lazy list/quote continuation ends on this line.
+#[derive(Debug, Default)]
+pub(super) struct LineProbe {
+    checked: usize,
+    tag: super::tag::Scanner,
+    html_tag: Option<(usize, String)>,
+    prefix_checked: bool,
+}
+
+impl LineProbe {
+    pub(super) fn inspect(
+        &mut self,
+        text: &str,
+        prefix: &Prefix,
+        contextual: bool,
+        finish: bool,
+    ) -> Option<Boundary> {
+        use super::tag::Scan;
+        let start = prefix.end;
+        if !text[start..].starts_with('<') {
+            let end = classification_end(text, self.checked.max(start), finish);
+            self.checked = text.len();
+            return Some(inspect_line(
+                &text[prefix.continuation_end..end?],
+                contextual,
+                None,
+            ));
+        }
+        if self.html_tag.is_none() {
+            let scan = self.tag.scan(&text[start..], finish);
+            match scan {
+                Scan::Html { end, name, .. } => self.html_tag = Some((start + end, name)),
+                Scan::Opaque { end, .. } => {
+                    return Some(inspect_line(
+                        &text[prefix.continuation_end..start + end],
+                        contextual,
+                        None,
+                    ));
+                }
+                _ => {
+                    if !self.prefix_checked
+                        && let Some((end, name)) = self.tag.html_prefix(&text[start..])
+                    {
+                        self.prefix_checked = true;
+                        let boundary = inspect_line(
+                            &text[prefix.continuation_end..start + end],
+                            contextual,
+                            Some((&text[start..start + end], name)),
+                        );
+                        if boundary.html.is_some() {
+                            return Some(boundary);
+                        }
+                    }
+                    // Protocol tags do not start Markdown HTML blocks.
+                    return (!matches!(scan, Scan::Pending)).then(|| {
+                        inspect_line(&text[prefix.continuation_end..start + 1], contextual, None)
+                    });
+                }
+            }
+        }
+        let (tag_end, name) = self.html_tag.as_ref().unwrap();
+        // A complete tag alone can start a type-7 block; trailing
+        // inline content changes that classification.
+        let checked = self.checked.max(*tag_end);
+        let end = if let Some((index, ch)) = text[checked..]
+            .char_indices()
+            .find(|(_, ch)| *ch == '\n' || !ch.is_whitespace())
+        {
+            checked + index + ch.len_utf8()
+        } else if finish {
+            text.len()
+        } else {
+            self.checked = text.len();
+            return None;
+        };
+        Some(inspect_line(
+            &text[prefix.continuation_end..end],
+            contextual,
+            Some((&text[start..*tag_end], name)),
+        ))
+    }
 }
 
 /// Probe a resolved container prefix only through its first inline payload.

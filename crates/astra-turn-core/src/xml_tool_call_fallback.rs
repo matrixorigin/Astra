@@ -847,6 +847,8 @@ mod tests {
             format!("Use a ` character.\n\n`{call}`"),
             format!("Use a ` character.\n# Heading\n`{call}`"),
             format!("# Unmatched ` delimiter\n`{call}`"),
+            format!("> ~~~\n# `\n`{call}`"),
+            format!("Start `\n<!-- -->\n`{call}`"),
             format!("- Example\ncontinued\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
             format!("- Example\n\n  ~~~text\n  example\n~~~\n{call}\n~~~\n"),
             format!("> - Example\n>   ~~~text\n>   example\n> ~~~\n> {call}\n> ~~~\n"),
@@ -884,6 +886,7 @@ mod tests {
     #[test]
     fn dsml_paragraph_and_escaped_scope_boundaries_preserve_real_calls() {
         let call = r#"<|DSML|invoke name="read_file">{"path":"README.md"}</|DSML|invoke>"#;
+        let escaped_json = r#"\<|DSML|invoke name="read_file">{"path":"unfinished"#;
         for (text, visible, executable) in [
             (
                 format!("Use a ` character\n===\n`{call}`"),
@@ -917,6 +920,11 @@ mod tests {
                 "Example opener: \\<|DSML|invoke name=\"read_file\">\n\n".to_owned(),
                 true,
             ),
+            (
+                format!("{escaped_json}\n\n{call}"),
+                format!("{escaped_json}\n\n"),
+                true,
+            ),
         ] {
             let calls = parse_degraded_tool_calls(&text).unwrap_or_default();
             assert_eq!(
@@ -939,6 +947,76 @@ mod tests {
             }
             published.push_str(&filter.finish());
             assert_eq!(published, visible);
+        }
+    }
+
+    #[test]
+    fn dsml_unmatched_code_delimiters_do_not_consume_invocations() {
+        let prefix = "Need to inspect ` README.\n";
+        let call = r#"<||DSML||tool_calls><||DSML||invoke name="read_file">{"path":"README.md"}</||DSML||invoke></||DSML||tool_calls>"#;
+        for (suffix, names) in [
+            (call.to_owned(), vec![Some("read_file")]),
+            (format!("``{call}``"), vec![]),
+        ] {
+            let text = format!("{prefix}{suffix}");
+            let expected = if names.is_empty() {
+                text.as_str()
+            } else {
+                prefix
+            };
+            let calls = parse_degraded_tool_calls(&text).unwrap_or_default();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                names,
+                "{text:?}"
+            );
+            assert_eq!(strip_degraded_tool_calls(&text), expected);
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut visible = String::new();
+            for ch in text.chars() {
+                visible.push_str(&filter.push(&ch.to_string()));
+            }
+            visible.push_str(&filter.finish());
+            assert_eq!(visible, expected);
+        }
+    }
+
+    #[test]
+    fn dsml_json_strings_own_embedded_protocol_tags() {
+        for content in [
+            "hello <invoke> world",
+            r#"</|DSML|invoke><|DSML|invoke name='bash'><|DSML|parameter name='command'>pwd</|DSML|parameter></|DSML|invoke>"#,
+            r#"quoted "text" and a slash \ </|DSML|invoke>"#,
+        ] {
+            let args = json!({"path":"example.txt","content":content});
+            let text = format!(
+                "Before <|DSML|calls><|DSML|invoke name=\"write_file\">{args}</|DSML|invoke></|DSML|calls> after"
+            );
+            let calls = parse_degraded_tool_calls(&text).expect("outer write_file");
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>(),
+                vec![Some("write_file")],
+                "{text:?}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap())
+                    .unwrap(),
+                args
+            );
+            assert_eq!(strip_degraded_tool_calls(&text), "Before  after");
+            let mut filter = DsmlToolCallStreamFilter::default();
+            let mut visible = String::new();
+            for ch in text.chars() {
+                visible.push_str(&filter.push(&ch.to_string()));
+            }
+            visible.push_str(&filter.finish());
+            assert_eq!(visible, "Before  after");
         }
     }
 
@@ -1066,6 +1144,15 @@ mod tests {
             ("<pre>\nexample\n</pre>\n    ", true),
             ("<!--\nexample\n-->\n    ", true),
             ("<div>\nexample\n</div>\n", true),
+            ("- item\n<div>\n", true),
+            ("- item\n<div\n", true),
+            ("> quote\n<div>\n", true),
+            ("</div>\n", true),
+            ("<!DOCTYPE html\n", true),
+            ("<!DOCTYPE html\n>\n", false),
+            ("<div\n<|DSML|invoke name='example\n\n", false),
+            ("<script>\n<img alt='</script>'>\n", false),
+            ("- item\n<div>\nexample\n</div>\n\n", false),
             ("<div>\nexample\n</div>\n\n", false),
             ("> <pre>\n> example\n", false),
             ("> <!--\n> example\n", false),
@@ -1100,6 +1187,7 @@ mod tests {
         for text in [
             "<!--\n<invoke name=\"bash\">\n-->",
             "Text <code><parameter=example> pwd</code>.",
+            "<div\n<|DSML|invoke name='example",
         ] {
             assert_eq!(strip_degraded_tool_calls(text), text);
         }

@@ -13186,6 +13186,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_dsml_json_owns_markup_before_wire_admission() {
+        let args = json!({
+            "path": "example.txt",
+            "content": r#"quoted "data" \ </|DSML|invoke><|DSML|invoke name='bash'>{"command":"pwd"}</|DSML|invoke>"#
+        });
+        let content = format!(
+            "Before <|DSML|calls><|DSML|invoke name=\"write_file\">{args}</|DSML|invoke></|DSML|calls> after"
+        );
+        let frames = content
+            .chars()
+            .map(|ch| {
+                let event = json!({"choices":[{"delta":{"content":ch.to_string()}}]});
+                Ok(Bytes::from(format!("data: {event}\n\n")))
+            })
+            .chain([Ok(Bytes::from("data: [DONE]\n\n"))])
+            .collect::<Vec<_>>();
+        let mut published = String::new();
+        let mut callback = |update| {
+            if let LlmStreamUpdate::Text(text) = update {
+                published.push_str(&text);
+            }
+        };
+        let allowed = HashSet::from(["bash".to_owned(), "write_file".to_owned()]);
+        let result = collect_llm_stream_for_wire(
+            stream::iter(frames),
+            "deepseek-test",
+            Instant::now(),
+            None,
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            &allowed,
+            Some(&mut callback),
+            None,
+        )
+        .await
+        .unwrap();
+        let nonstream = parse_openai_compatible_nonstream_response(
+            &json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]}),
+            "deepseek-test",
+        );
+        assert_eq!(published, "Before  after");
+        for result in [result, nonstream] {
+            assert_eq!(result.full_text, published);
+            assert_eq!(
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| (
+                        call["function"]["name"].as_str(),
+                        astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                            .unwrap(),
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(Some("write_file"), args.clone())]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_dsml_markdown_examples_remain_data() {
         let call = r#"<｜DSML｜ invoke name="bash">{"command":"pwd"}</｜DSML｜ invoke>"#;
         for content in [
@@ -13558,6 +13618,31 @@ mod tests {
                 "one</|DSML|\ncalls>    two</|DSML|calls>three".to_owned(),
                 "one    twothree".to_owned(),
                 vec![],
+            ),
+            (
+                format!("> ~~~\n# `\n`{call}`"),
+                format!("> ~~~\n# `\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("Start `\n<!-- -->\n`{call}`"),
+                format!("Start `\n<!-- -->\n`{call}`"),
+                vec![],
+            ),
+            (
+                format!("- item\n<div>\n{call}\n</div>\n\n{call}"),
+                format!("- item\n<div>\n{call}\n</div>\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("</div>\n{call}\n\n{call}"),
+                format!("</div>\n{call}\n\n"),
+                vec!["README.md"],
+            ),
+            (
+                format!("Need to inspect ` README.\n{call}"),
+                "Need to inspect ` README.\n".to_owned(),
+                vec!["README.md"],
             ),
             (
                 format!("{first}    {second}"),

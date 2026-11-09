@@ -10,8 +10,32 @@ struct Element {
 }
 #[derive(Debug)]
 struct Block {
-    until_blank: bool,
+    end: BlockEnd,
     containers: Arc<[Container]>,
+}
+#[derive(Debug)]
+pub(super) enum BlockEnd {
+    Blank,
+    ClosingTag(String),
+    Line,
+}
+
+impl BlockEnd {
+    pub fn for_tag(raw: &str, name: &str) -> Self {
+        use pulldown_cmark::{Event, Parser};
+        // The opener is already a CommonMark HTML block. Place the close on
+        // a separate line so a standalone type-7 opener stays a block.
+        let probe = format!("{raw}\n</{name}>\nplain");
+        let marker = probe.len() - "plain".len();
+        if Parser::new(&probe)
+            .into_offset_iter()
+            .any(|(event, range)| matches!(event, Event::Html(_)) && range.contains(&marker))
+        {
+            Self::Blank
+        } else {
+            Self::ClosingTag(format!("</{name}>"))
+        }
+    }
 }
 #[derive(Debug, Default)]
 pub(super) struct Context {
@@ -32,18 +56,41 @@ impl Context {
         self.block = None;
     }
     pub fn newline(&mut self, blank: bool) {
-        if blank && self.block.as_ref().is_none_or(|block| block.until_blank) {
+        if match self.block.as_ref().map(|block| &block.end) {
+            None | Some(BlockEnd::Blank) => blank,
+            Some(BlockEnd::Line) => true,
+            Some(BlockEnd::ClosingTag(_)) => false,
+        } {
             self.clear();
         }
     }
-    pub fn tag(
-        &mut self,
-        raw: &str,
-        name: &str,
-        closing: bool,
-        line_start: bool,
-        containers: Arc<[Container]>,
-    ) {
+    pub fn start_block(&mut self, end: BlockEnd, containers: Arc<[Container]>) {
+        self.block = Some(Block { end, containers });
+    }
+    /// Block contents are raw HTML. Only a block's own end rule can change
+    /// ownership, even if a close spelling occurs inside an apparent tag.
+    pub fn block_prefix(&mut self, text: &str, finish: bool) -> Option<usize> {
+        let block = self.block.as_mut()?;
+        let newline = text.find('\n');
+        let line = newline.map_or(text, |index| &text[..=index]);
+        if let BlockEnd::ClosingTag(close) = &block.end {
+            if line
+                .as_bytes()
+                .windows(close.len())
+                .any(|bytes| bytes.eq_ignore_ascii_case(close.as_bytes()))
+            {
+                block.end = BlockEnd::Line;
+            } else if newline.is_none() && !finish {
+                let mut safe = line.len().saturating_sub(close.len() - 1);
+                while !line.is_char_boundary(safe) {
+                    safe -= 1;
+                }
+                return Some(safe);
+            }
+        }
+        Some(line.len())
+    }
+    pub fn tag(&mut self, raw: &str, name: &str, closing: bool) {
         if closing {
             if let Some(index) = self.last.get(name).copied() {
                 while self.elements.len() > index {
@@ -54,31 +101,8 @@ impl Context {
                         self.last.remove(&frame.name);
                     }
                 }
-                if self.elements.is_empty()
-                    && self.block.as_ref().is_some_and(|block| !block.until_blank)
-                {
-                    self.block = None;
-                }
             }
             return;
-        }
-        if line_start && self.block.is_none() {
-            use pulldown_cmark::{Event, Parser, Tag};
-            if matches!(Parser::new(raw).next(), Some(Event::Start(Tag::HtmlBlock))) {
-                // Ask CommonMark whether this block ends on its closing element
-                // or only at a blank line. This includes arbitrary HTML elements.
-                let probe = format!("{raw}</{name}>\nplain");
-                let marker = probe.len() - "plain".len();
-                let until_blank = Parser::new(&probe)
-                    .into_offset_iter()
-                    .any(|(event, range)| {
-                        matches!(event, Event::Html(_)) && range.contains(&marker)
-                    });
-                self.block = Some(Block {
-                    until_blank,
-                    containers,
-                });
-            }
         }
         // HTML's void-element grammar has no matching end tag.
         if raw.trim_end_matches('>').trim_end().ends_with('/')

@@ -103,6 +103,17 @@ pub(super) enum Scan {
 }
 
 impl Scanner {
+    // Types 1 and 6 of a CommonMark HTML block can start before the full
+    // tag is available. Supply the lexical name boundary to the block parser.
+    pub(super) fn html_prefix(&self, text: &str) -> Option<(usize, &str)> {
+        let start = self.attributes_start?;
+        let ch = text[start..].chars().next()?;
+        (self.family == Family::Bare
+            && !matches!(self.name.as_str(), "invoke" | "parameter" | "tool_call")
+            && ch.is_whitespace())
+        .then_some((start + ch.len_utf8(), &self.name))
+    }
+
     fn complete(&self, end: usize, text: &str) -> Scan {
         let kind = match self.name.as_str() {
             "invoke" => Some(Kind::Invoke),
@@ -154,6 +165,13 @@ impl Scanner {
                 if opener.starts_with(text) && !finish {
                     return Scan::Pending;
                 }
+            }
+            if text.starts_with("<!") && text.as_bytes().get(2).is_some_and(u8::is_ascii_alphabetic)
+            {
+                return Scan::Opaque {
+                    end: 3,
+                    terminator: ">",
+                };
             }
             self.checked = 1;
         }

@@ -270,6 +270,19 @@ pub fn current() -> Carrier {
     }
 }
 
+/// Carrier for `span`, whether or not it is the task's current span.
+pub fn from_span(span: &tracing::Span) -> Carrier {
+    #[cfg(feature = "otel")]
+    {
+        from_span_otel(span)
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = span;
+        Carrier::default()
+    }
+}
+
 /// Make `span` a child of the active run. No-op when export is off.
 pub fn attach_link(span: &tracing::Span, link: &RunLink) {
     #[cfg(feature = "otel")]
@@ -430,6 +443,11 @@ fn start_otel(carrier: &Carrier) -> RunSpan {
 
 #[cfg(feature = "otel")]
 fn current_otel() -> Carrier {
+    from_span_otel(&tracing::Span::current())
+}
+
+#[cfg(feature = "otel")]
+fn from_span_otel(span: &tracing::Span) -> Carrier {
     use opentelemetry::global;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -438,10 +456,7 @@ fn current_otel() -> Carrier {
     }
     let mut values = std::collections::HashMap::<String, String>::new();
     global::get_text_map_propagator(|prop| {
-        prop.inject_context(
-            &tracing::Span::current().context(),
-            &mut MapInjector(&mut values),
-        );
+        prop.inject_context(&span.context(), &mut MapInjector(&mut values));
     });
     Carrier::from_header_values(
         values.get("traceparent").map(String::as_str),
@@ -956,5 +971,68 @@ mod tests {
             unscoped.span_context.trace_id(),
             run.span_context.trace_id()
         );
+    }
+
+    #[test]
+    fn instrumented_llm_attempt_injects_the_run_traceparent() {
+        use tracing::Instrument;
+
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (_, provider) = capture_provider();
+        global::set_tracer_provider(provider.clone());
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        mark_export_ready();
+        let tracer = provider.tracer("astra-test");
+        let filter = EnvFilter::new("astra.run=info,astra.llm=info,astra.tool=info");
+        let subscriber = tracing_subscriber::registry()
+            .with(OpenTelemetryLayer::new(tracer).with_filter(filter))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(EnvFilter::new("error")),
+            );
+        let _default = tracing::subscriber::set_default(subscriber);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+
+        let parent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
+        let trace_id = "0123456789abcdef0123456789abcdef";
+        runtime.block_on(async {
+            bind_run(&Carrier::from_header_values(Some(parent), None), async {
+                let span = tracing::info_span!(target: "astra.llm", "llm.call");
+                parent_to_active_run(&span);
+                {
+                    let _entered = span.enter();
+                }
+                let outside = current();
+                let send_request = async { current() };
+                let send_request = send_request.instrument(span.clone());
+                let inside = tokio::select! {
+                    biased;
+                    _ = std::future::pending::<()>() => unreachable!(),
+                    result = tokio::time::timeout(std::time::Duration::from_secs(2), send_request) => {
+                        result.expect("instrumented send should finish")
+                    }
+                };
+                let direct = from_span(&span);
+                assert_eq!(
+                    outside.traceparent.as_deref(),
+                    None,
+                    "inside={inside:?} direct={direct:?}"
+                );
+                let inside_parent = inside.traceparent.as_deref().unwrap_or("");
+                assert!(
+                    inside_parent.contains(trace_id) && valid_traceparent(inside_parent),
+                    "inside={inside:?} direct={direct:?} outside={outside:?}"
+                );
+                assert!(
+                    direct.traceparent.as_deref().unwrap_or("").contains(trace_id),
+                    "direct={direct:?}"
+                );
+            })
+            .await;
+        });
     }
 }
