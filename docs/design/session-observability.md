@@ -251,6 +251,16 @@ separately from canonical conversation items; C1 `item_seq` and C3 `event_idx`
 are independent cursor domains and do not establish a shared chronological order.
 `A` loads older activity; `R` refreshes the conversation and latest activity.
 
+For an open child conversation, the live view renders a bounded tail while
+keeping the full received item available to search and export. Expanding an
+item shows its sanitized Markdown source; inline and separate reasoning can
+be inspected explicitly, while the ordinary preview stays collapsed. When new
+output arrives during expanded reading, the displayed snapshot stays stable
+and indicates that newer output is available; `End` returns to the live tail.
+Search and export use the latest received content. Missing live events remain
+gaps rather than being inferred from the preview, and durable history replaces
+matching live items by their model identity.
+
 Large recorded tool outputs use bounded previews; expanding one activity collapses
 the previously expanded activity. Search and export retain the full available text.
 Live tools keep their logical identity when a deferred carrier resolves. Delegation

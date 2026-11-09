@@ -28,6 +28,7 @@ pub(crate) async fn settle_turn_attempt(
 ) -> Result<TurnSettlementOutcome, String> {
     match attempt {
         TurnAttempt::NotStarted(failure) => {
+            invalidate_attempt_auth(state);
             if let Some(outcome) =
                 try_retry_after_auth_refresh(state, dispatch, &failure, &run_chat_turn).await
             {
@@ -37,6 +38,14 @@ pub(crate) async fn settle_turn_attempt(
             Ok(TurnSettlementOutcome::NotStarted)
         }
         attempt => Ok(settle_attempt_without_retry(state, dispatch, attempt).await),
+    }
+}
+
+fn invalidate_attempt_auth(state: &SessionState) {
+    if let Some(control) =
+        astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).as_ref()
+    {
+        control.invalidate_admitted_auth();
     }
 }
 
@@ -122,6 +131,7 @@ async fn settle_attempt_without_retry(
 ) -> TurnSettlementOutcome {
     match retry {
         TurnAttempt::NotStarted(failure) => {
+            invalidate_attempt_auth(state);
             settle_not_started_turn(state, dispatch, &failure);
             TurnSettlementOutcome::NotStarted
         }
@@ -270,6 +280,13 @@ mod tests {
             let mut state = SessionState::default();
             state.set_session_id(&sid);
             state.turn = 20;
+            let run_control = super::super::local_run_control::LocalRunControl::shared();
+            run_control.publish_admitted_auth(
+                crate::cli::session::session_runtime::AdmittedAuth::new(bearer, None),
+            );
+            let mut attempt_auth = run_control.admitted_auth();
+            let _ = attempt_auth.borrow_and_update();
+            *state.active_turn_local_run_control.lock().unwrap() = Some(run_control.clone());
             state.server_resume_attachment =
                 Some((remote.cursor().clone(), state.session_attachment_epoch));
             let ctx = TurnContext {
@@ -310,7 +327,9 @@ mod tests {
             let captured = observed.clone();
             let outcome = settle_turn_attempt(&mut state, &mut dispatch, attempt, move |request| {
                 let captured = captured.clone();
+                let run_control = run_control.clone();
                 Box::pin(async move {
+                    assert!(run_control.admitted_auth().borrow().is_none(), "the failed attempt must be invalidated before retry");
                     let inputs = crate::cli::turn::turn_stream_runner::probe_admitted_retry_request_for_test(request).await;
                     *captured.lock().unwrap() = Some(inputs);
                     TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
@@ -319,6 +338,8 @@ mod tests {
                 })
             }).await.unwrap();
             assert_eq!(outcome, super::TurnSettlementOutcome::NotStarted);
+            assert!(attempt_auth.has_changed().unwrap());
+            assert!(attempt_auth.borrow().is_none());
             assert_eq!(
                 *observed.lock().unwrap(),
                 bound_owner.then(|| ("owner-rotated-access".to_string(), 21, messages))

@@ -353,7 +353,8 @@ struct ServerState {
     issued_tool_requests: Arc<Mutex<Vec<IssuedToolRequestIdentity>>>,
     tool_results: Arc<Mutex<Vec<Value>>>,
     completed_fanout_children: Arc<AtomicU8>,
-    cancelled_runs: Arc<Mutex<Vec<String>>>,
+    cancellation_requests: Arc<Mutex<Vec<String>>>,
+    completed_slow_runs: Arc<Mutex<Vec<String>>>,
     callback_ready: Arc<tokio::sync::Notify>,
     emitted_text: Arc<Mutex<Vec<(String, String)>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
@@ -819,7 +820,13 @@ async fn handle_chat_turn(
             unreachable!("tool scenarios use one orchestration stream")
         }
         MockScenario::Slow => {
-            body_slow(&agent_id, turn, state.held_response_release.as_deref()).await
+            let body = body_slow(&agent_id, turn, state.held_response_release.as_deref()).await;
+            state
+                .completed_slow_runs
+                .lock()
+                .expect("mock completed runs")
+                .push(format!("mock-run-{turn}"));
+            body
         }
     };
     // Callback authority is the exact request identity this mock emitted,
@@ -1045,7 +1052,7 @@ fn orchestration_snapshot(
         .is_empty();
     let completed = state.completed_fanout_children.load(Ordering::Acquire);
     let cancelled = state
-        .cancelled_runs
+        .cancellation_requests
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut runs = Vec::new();
@@ -1122,6 +1129,24 @@ async fn handle_cancel_run(
     State(state): State<ServerState>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<axum::Json<Value>, StatusCode> {
+    if state.scenario == MockScenario::Slow
+        && state
+            .completed_slow_runs
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .contains(&run_id)
+    {
+        // Slow holds the HTTP response until the completed turn is released;
+        // a later cancellation observes that already-settled exact run.
+        state
+            .cancellation_requests
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .push(run_id.clone());
+        return Ok(axum::Json(serde_json::json!({
+            "run_id": run_id, "status": "completed", "execution_settled": true
+        })));
+    }
     // A pending local tool approval can interrupt the fixture's root stream.
     if matches!(
         state.scenario,
@@ -1131,7 +1156,7 @@ async fn handle_cancel_run(
     ) && run_id == "mock-run-tool"
     {
         state
-            .cancelled_runs
+            .cancellation_requests
             .lock()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .push(run_id.clone());
@@ -1153,7 +1178,7 @@ async fn handle_cancel_run(
             return Err(StatusCode::CONFLICT);
         }
         state
-            .cancelled_runs
+            .cancellation_requests
             .lock()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .push(run_id.clone());
@@ -1299,7 +1324,7 @@ pub struct MockLlmServer {
     received_requests: Arc<Mutex<Vec<Value>>>,
     tool_results: Arc<Mutex<Vec<Value>>>,
     completed_fanout_children: Arc<AtomicU8>,
-    cancelled_runs: Arc<Mutex<Vec<String>>>,
+    cancellation_requests: Arc<Mutex<Vec<String>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
     held_binding_release: Option<Arc<tokio::sync::Notify>>,
     fail_model_catalog: Arc<AtomicBool>,
@@ -1363,7 +1388,7 @@ impl MockLlmServer {
         let issued_tool_requests = Arc::new(Mutex::new(Vec::new()));
         let tool_results = Arc::new(Mutex::new(Vec::new()));
         let completed_fanout_children = Arc::new(AtomicU8::new(0));
-        let cancelled_runs = Arc::new(Mutex::new(Vec::new()));
+        let cancellation_requests = Arc::new(Mutex::new(Vec::new()));
         let held_response_release = hold_response.then(|| Arc::new(tokio::sync::Notify::new()));
         let held_binding_release = hold_binding.then(|| Arc::new(tokio::sync::Notify::new()));
         let fail_model_catalog = Arc::new(AtomicBool::new(false));
@@ -1374,7 +1399,8 @@ impl MockLlmServer {
             issued_tool_requests,
             tool_results: tool_results.clone(),
             completed_fanout_children: completed_fanout_children.clone(),
-            cancelled_runs: cancelled_runs.clone(),
+            cancellation_requests: cancellation_requests.clone(),
+            completed_slow_runs: Arc::new(Mutex::new(Vec::new())),
             callback_ready: Arc::new(tokio::sync::Notify::new()),
             emitted_text: Arc::new(Mutex::new(Vec::new())),
             held_response_release: held_response_release.clone(),
@@ -1421,7 +1447,7 @@ impl MockLlmServer {
             received_requests,
             tool_results,
             completed_fanout_children,
-            cancelled_runs,
+            cancellation_requests,
             held_response_release,
             held_binding_release,
             fail_model_catalog,
@@ -1453,8 +1479,8 @@ impl MockLlmServer {
             .unwrap_or_default()
     }
 
-    pub fn cancelled_runs(&self) -> Vec<String> {
-        self.cancelled_runs
+    pub fn cancellation_requests(&self) -> Vec<String> {
+        self.cancellation_requests
             .lock()
             .expect("fixture cancellation records")
             .clone()
@@ -1598,7 +1624,10 @@ mod tests {
         assert_eq!(after.runs[2].status, SessionRunLifecycleStatus::Cancelled);
         assert!(after.runs[2].available_actions.is_empty());
         assert!(after.runs[2].run_event_high_watermark > before.runs[2].run_event_high_watermark);
-        assert_eq!(server.cancelled_runs(), std::slice::from_ref(selected));
+        assert_eq!(
+            server.cancellation_requests(),
+            std::slice::from_ref(selected)
+        );
         let retained = client
             .get_session_transcript(
                 Some("fixture"),

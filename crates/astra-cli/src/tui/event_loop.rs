@@ -114,17 +114,55 @@ enum StartupUiEffect {
 /// second remote fetch just to recover provider/thinking metadata.
 enum ModelCatalogEffect {
     Ready {
-        owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
-        attachment_epoch: u64,
-        initial_bound_session: Option<Arc<std::sync::Mutex<Option<String>>>>,
+        scope: ModelPickerScope,
         result: Result<(Vec<astra_services::ModelListItemResponse>, bool), String>,
     },
 }
 
+/// A picker can outlive the turn that opened it. Keep its catalog authority
+/// with the modal, including across the initial session binding.
+#[derive(Clone)]
+struct ModelPickerScope {
+    owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    attachment_epoch: u64,
+    initial_bound_session: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    attempt: Option<CatalogAttempt>,
+}
+
+impl ModelPickerScope {
+    fn is_current(&self, session: Option<&str>, epoch: u64, widget_session: &str) -> bool {
+        let initial_binding = epoch == self.attachment_epoch.saturating_add(1)
+            && self.initial_bound_session.as_ref().is_some_and(|binding| {
+                astra_core::sync_poison::recover_mutex_lock(binding)
+                    .as_deref()
+                    .is_some_and(|bound| session == Some(bound) && widget_session == bound)
+            });
+        self.owner.is_current()
+            && self.attempt.as_ref().is_none_or(CatalogAttempt::is_current)
+            && (epoch == self.attachment_epoch || initial_binding)
+    }
+}
+
+/// A catalog and its picker belong to one physical authenticated attempt.
+/// Keeping the sender alive makes `has_changed` distinguish a retry from a
+/// successfully completed turn, without another counter or durable state.
+#[derive(Clone)]
+struct CatalogAttempt {
+    auth: tokio::sync::watch::Receiver<Option<crate::cli::session::session_runtime::AdmittedAuth>>,
+    _auth_lifetime:
+        tokio::sync::watch::Sender<Option<crate::cli::session::session_runtime::AdmittedAuth>>,
+}
+
+impl CatalogAttempt {
+    fn is_current(&self) -> bool {
+        matches!(self.auth.has_changed(), Ok(false))
+    }
+}
+
 enum NextModelSelection {
     Picked {
-        result: Box<bottom_pane::view::ViewResult>,
         selection: crate::cli::session::session_runtime::ServerModelSelection,
+        attempt: Option<CatalogAttempt>,
     },
     Requested(Option<String>),
 }
@@ -135,9 +173,14 @@ fn active_model_picker_choice(
 ) -> Option<crate::cli::session::session_state::SessionModelChoice> {
     match staged {
         None => current.cloned(),
-        Some(NextModelSelection::Picked { selection, .. }) => Some(
-            crate::cli::session::session_state::SessionModelChoice::Selected(selection.clone()),
-        ),
+        Some(NextModelSelection::Picked { selection, attempt })
+            if attempt.as_ref().is_none_or(CatalogAttempt::is_current) =>
+        {
+            Some(
+                crate::cli::session::session_state::SessionModelChoice::Selected(selection.clone()),
+            )
+        }
+        Some(NextModelSelection::Picked { .. }) => current.cloned(),
         Some(NextModelSelection::Requested(name)) => name.clone().map(Into::into),
     }
 }
@@ -150,11 +193,35 @@ type ActiveTurnAuth = (
 enum ModelCatalogAuth {
     Presented(Option<String>),
     Active {
-        run: tokio::sync::watch::Receiver<Option<String>>,
         auth: tokio::sync::watch::Receiver<
             Option<crate::cli::session::session_runtime::AdmittedAuth>,
         >,
+        control: std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
     },
+}
+
+async fn wait_for_catalog_auth(
+    mut auth: tokio::sync::watch::Receiver<
+        Option<crate::cli::session::session_runtime::AdmittedAuth>,
+    >,
+    control: std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+) -> Option<(
+    crate::cli::session::session_runtime::AdmittedAuth,
+    CatalogAttempt,
+)> {
+    loop {
+        let current = auth.borrow_and_update().clone();
+        if let Some(current) = current {
+            return Some((
+                current,
+                CatalogAttempt {
+                    auth,
+                    _auth_lifetime: control.upgrade()?.retain_admitted_auth(),
+                },
+            ));
+        }
+        auth.changed().await.ok()?;
+    }
 }
 
 async fn wait_for_bound_turn_auth(
@@ -195,17 +262,22 @@ fn spawn_model_catalog_request(
         ModelCatalogAuth::Active { .. } => None,
     };
     tasks.spawn(async move {
+        let mut attempt = None;
         let result =
             match tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, async {
                 let auth = match auth {
                     ModelCatalogAuth::Presented(_) => presented.ok_or_else(|| {
                         "Authentication is unavailable for the model catalog.".to_string()
                     })?,
-                    ModelCatalogAuth::Active { run, auth } => {
-                        wait_for_bound_turn_auth(run, auth).await.ok_or_else(|| {
+                    ModelCatalogAuth::Active { auth, control } => {
+                        let (auth, selected_attempt) = wait_for_catalog_auth(auth, control)
+                            .await
+                            .ok_or_else(|| {
                             "The task ended before the model picker could open. Try /model again."
                                 .to_string()
-                        })?
+                        })?;
+                        attempt = Some(selected_attempt);
+                        auth
                     }
                 };
                 if !owner.is_current() {
@@ -224,9 +296,12 @@ fn spawn_model_catalog_request(
             };
         let _ = tx
             .send(ModelCatalogEffect::Ready {
-                owner,
-                attachment_epoch,
-                initial_bound_session,
+                scope: ModelPickerScope {
+                    owner,
+                    attachment_epoch,
+                    initial_bound_session,
+                    attempt,
+                },
                 result,
             })
             .await;
@@ -1264,26 +1339,10 @@ fn apply_model_catalog_effect_for_choice(
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
 ) -> bool {
-    let ModelCatalogEffect::Ready {
-        owner,
-        attachment_epoch,
-        initial_bound_session,
-        result,
-    } = effect;
-    let bound_from_initial = current_epoch == attachment_epoch.saturating_add(1)
-        && initial_bound_session.as_ref().is_some_and(|binding| {
-            astra_core::sync_poison::recover_mutex_lock(binding)
-                .as_deref()
-                .is_some_and(|session| {
-                    current_session == Some(session) && chat_widget.session_id() == session
-                })
-        });
-    if !owner.is_current() {
-        return false;
-    }
-    if attachment_epoch != current_epoch && !bound_from_initial {
+    let ModelCatalogEffect::Ready { scope, result } = effect;
+    if !scope.is_current(current_session, current_epoch, chat_widget.session_id()) {
         chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
-            "Session changed before the model picker opened. Open /model again.",
+            "Account, session or task changed. Open /model again.",
         ));
         return false;
     }
@@ -1308,6 +1367,40 @@ fn apply_model_catalog_effect_for_choice(
             false
         }
     }
+}
+
+fn apply_scoped_model_picker_result(
+    result: &bottom_pane::view::ViewResult,
+    scope: &mut Option<ModelPickerScope>,
+    state: &mut crate::cli::session::session_state::SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) -> Option<bool> {
+    if !matches!(
+        result,
+        bottom_pane::view::ViewResult::Model { .. }
+            | bottom_pane::view::ViewResult::ModelThinking { .. }
+    ) {
+        return None;
+    }
+    if scope.as_ref().is_some_and(|scope| {
+        !scope.is_current(
+            state.session_id.as_deref(),
+            state.session_attachment_epoch,
+            chat_widget.session_id(),
+        )
+    }) {
+        *scope = None;
+        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+            "Account, session or task changed. Open /model again.",
+        ));
+        return Some(false);
+    }
+    let result = slash_dispatch::apply_model_picker_result(result, state, bottom_pane, chat_widget);
+    if result == Some(false) {
+        *scope = None;
+    }
+    result
 }
 
 fn model_selection_attachment_matches(
@@ -2987,11 +3080,8 @@ fn active_submission_routes_to_next_turn(
     text: &str,
     output_has_settled: bool,
     guidance_admission_closed: bool,
-    earlier_next_turn_pending: bool,
 ) -> bool {
-    guidance_admission_closed
-        || earlier_next_turn_pending
-        || active_submission_belongs_to_next_turn(text, output_has_settled)
+    guidance_admission_closed || active_submission_belongs_to_next_turn(text, output_has_settled)
 }
 
 /// Handle the one active-run slash command that is a pure navigation action.
@@ -3035,15 +3125,6 @@ fn should_start_queued_followups(
         return false;
     }
     turn_ok && !turn_interrupted && !exit_after_turn_settlement
-}
-
-fn model_facing_followup_backlog(queued: &VecDeque<NextTurnSubmission>) -> bool {
-    queued.iter().any(|entry| match entry {
-        NextTurnSubmission::Guidance(_) | NextTurnSubmission::Conversation { .. } => true,
-        NextTurnSubmission::Interactive(text) => {
-            !slash_dispatch::parse_submission(text).is_command()
-        }
-    })
 }
 
 fn slash_result_releases_followups(result: &slash_dispatch::SlashResult) -> bool {
@@ -8585,6 +8666,7 @@ pub(crate) async fn run_tui_session(
     let login_phase = Arc::new(super::login_control::LoginControl::default());
     let mut login_view_open = false;
     let mut model_catalog_loading = false;
+    let mut model_picker_scope: Option<ModelPickerScope> = None;
     if state.model.is_none() {
         let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
         if owner.server_account_id.is_none()
@@ -9453,12 +9535,15 @@ pub(crate) async fn run_tui_session(
             }
             Some(effect) = model_catalog_rx.recv() => {
                 model_catalog_loading = false;
+                let ModelCatalogEffect::Ready { scope, .. } = &effect;
+                let scope = scope.clone();
                 pending_deferred_slash_flush = apply_model_catalog_effect(
                     effect,
                     &state,
                     &mut bottom_pane,
                     &mut chat_widget,
                 );
+                model_picker_scope = pending_deferred_slash_flush.then_some(scope);
                 if !pending_deferred_slash_flush {
                     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                     flush_chat_widget(&mut guard, &mut chat_widget, width);
@@ -10359,9 +10444,6 @@ pub(crate) async fn run_tui_session(
                                     // Later input stays queued for the next turn. This does not
                                     // mean the visible reply has settled.
                                     let mut guidance_admission_closed = false;
-                                    // An older next-turn backlog must stay ahead of new input.
-                                    let earlier_next_turn_pending =
-                                        model_facing_followup_backlog(&queued_followup_submissions);
                                     // Queue length when the in-flight guidance was submitted.
                                     // A delayed fence inserts there, ahead of messages queued
                                     // while that POST was still pending.
@@ -10377,7 +10459,6 @@ pub(crate) async fn run_tui_session(
                                     let turn_model_session = state.session_id.clone();
                                     let turn_model_epoch = state.session_attachment_epoch;
                                     let turn_model_owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
-                                    let mut picker_owner = None;
                                     let mut staged_model: Option<NextModelSelection> = None;
 
                                     let mut permission_control = super::permission_control::ActivePermissionControl::new(
@@ -10646,15 +10727,14 @@ pub(crate) async fn run_tui_session(
                                                 }
                                                 Some(effect) = model_catalog_rx.recv(), if model_catalog_loading => {
                                                     model_catalog_loading = false;
-                                                    let ModelCatalogEffect::Ready { owner, .. } = &effect;
-                                                    let owner = owner.clone();
+                                                    let ModelCatalogEffect::Ready { scope, .. } = &effect;
+                                                    let scope = scope.clone();
                                                     let chosen = active_model_picker_choice(staged_model.as_ref(), turn_model_choice.as_ref());
-                                                    if apply_model_catalog_effect_for_choice(
+                                                    let opened = apply_model_catalog_effect_for_choice(
                                                         effect, chosen.as_ref(),
                                                         turn_model_session.as_deref(), turn_model_epoch, &mut bottom_pane, &mut chat_widget,
-                                                    ) {
-                                                        picker_owner = Some(owner);
-                                                    }
+                                                    );
+                                                    model_picker_scope = opened.then_some(scope);
                                                     bottom_pane.sync_popups();
                                                     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                                                     flush_chat_widget(&mut guard, &mut chat_widget, width);
@@ -11152,7 +11232,8 @@ pub(crate) async fn run_tui_session(
                                                                                 let bound = turn_model_session.is_none()
                                                                                     .then(|| permission_control.session_binding());
                                                                                 spawn_model_catalog_request(api.clone(), owner, ModelCatalogAuth::Active {
-                                                                                    run: active_remote_run_rx.clone(), auth: preinstalled_run_control.admitted_auth(),
+                                                                                    auth: preinstalled_run_control.admitted_auth(),
+                                                                                    control: Arc::downgrade(&preinstalled_run_control),
                                                                                 }, turn_model_epoch, bound,
                                                                                     model_catalog_tx.clone(), &mut model_catalog_tasks);
                                                                             }
@@ -11177,11 +11258,9 @@ pub(crate) async fn run_tui_session(
                                                                         if active_submission_routes_to_next_turn(
                                                                             &queued_text,
                                                                             output_settled_at.is_some(),
-                                                                                                                                            guidance_admission_closed,
-                                                                            earlier_next_turn_pending,
+                                                                            guidance_admission_closed,
                                                                         ) {
-                                                                            // The current run has closed, or an older
-                                                                            // next-turn message already has priority.
+                                                                            // The current run no longer accepts guidance.
                                                                             if slash_dispatch::parse_submission(&queued_text).is_command() {
                                                                                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                                                                                     "Command queued until the current task finishes."
@@ -11261,21 +11340,22 @@ pub(crate) async fn run_tui_session(
                                                                         result: Some(result @ (bottom_pane::view::ViewResult::Model { .. }
                                                                             | bottom_pane::view::ViewResult::ModelThinking { .. })), ..
                                                                     } => {
-                                                                        if picker_owner.as_ref().is_some_and(|owner| owner.is_current()) {
+                                                                        if model_picker_scope.as_ref().is_some_and(|scope| scope.is_current(turn_model_session.as_deref(), turn_model_epoch, chat_widget.session_id())) {
                                                                             match slash_dispatch::prepare_model_picker_result(&result, &mut bottom_pane, &mut chat_widget) {
                                                                                 Some(Ok(Some(selection))) => {
                                                                                     chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
                                                                                         "Selected {} · applies after this task, including queued messages.", selection.name
                                                                                     )));
-                                                                                    staged_model = Some(NextModelSelection::Picked { result: Box::new(result), selection });
-                                                                                    picker_owner = None;
+                                                                                    let attempt = model_picker_scope.as_ref().and_then(|scope| scope.attempt.clone());
+                                                                                    staged_model = Some(NextModelSelection::Picked { selection, attempt });
+                                                                                    model_picker_scope = None;
                                                                                 }
-                                                                                Some(Err(())) => picker_owner = None,
+                                                                                Some(Err(())) => model_picker_scope = None,
                                                                                 _ => {}
                                                                             }
                                                                         } else {
-                                                                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning("Account changed. Reopen /model to select a model."));
-                                                                            picker_owner = None;
+                                                                            chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning("Account or task authentication changed. Reopen /model to select a model."));
+                                                                            model_picker_scope = None;
                                                                         }
                                                                         bottom_pane.sync_popups();
                                                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
@@ -11288,7 +11368,7 @@ pub(crate) async fn run_tui_session(
                                                                         chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                                                                             "Model setup will open after the current task."
                                                                         ));
-                                                                        picker_owner = None;
+                                                                        model_picker_scope = None;
                                                                         frame_requester.schedule_frame();
                                                                     }
                                                                     BottomPaneAction::ViewCompleted {
@@ -11355,6 +11435,11 @@ pub(crate) async fn run_tui_session(
                                                                         ) =>
                                                                     {
                                                                         continue;
+                                                                    }
+                                                                    BottomPaneAction::ViewCompleted { result: None, .. } => {
+                                                                        if !bottom_pane.has_active_view() {
+                                                                            model_picker_scope = None;
+                                                                        }
                                                                     }
                                                                     BottomPaneAction::Interrupt
                                                                     | BottomPaneAction::Quit
@@ -12005,10 +12090,16 @@ pub(crate) async fn run_tui_session(
                                     if let Some(selection) = staged_model.take() {
                                         if same_turn_scope {
                                             match selection {
-                                                NextModelSelection::Picked { result, .. } => {
-                                                    slash_dispatch::apply_model_picker_result(
-                                                        &result, &mut state, &mut bottom_pane, &mut chat_widget,
-                                                    );
+                                                NextModelSelection::Picked { selection, attempt } => {
+                                                    if attempt.as_ref().is_none_or(CatalogAttempt::is_current) {
+                                                        slash_dispatch::apply_model_selection(
+                                                            &mut state, &mut bottom_pane, &mut chat_widget, selection,
+                                                        );
+                                                    } else {
+                                                        chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                                            "Task authentication changed; model selection was not applied. Reopen /model."
+                                                        ));
+                                                    }
                                                 }
                                                 NextModelSelection::Requested(name) => slash_dispatch::apply_requested_model(
                                                     &mut state, &mut bottom_pane, &mut chat_widget, name.as_deref(),
@@ -12333,6 +12424,9 @@ pub(crate) async fn run_tui_session(
                             }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
                                 let mut followup_session_rebound = false;
+                                if result.is_none() && !bottom_pane.has_active_view() {
+                                    model_picker_scope = None;
+                                }
                                 if let Some(result) = result {
                                     if let bottom_pane::view::ViewResult::WorkspaceTrust(choice) = &result {
                                         match choice {
@@ -12550,6 +12644,7 @@ pub(crate) async fn run_tui_session(
                                     }
 
                                     if let bottom_pane::view::ViewResult::ModelSetup(action) = &result {
+                                        model_picker_scope = None;
                                         use super::model_setup::Action;
                                         match action.clone() {
                                             Action::Sources => super::model_setup::sources(&mut bottom_pane),
@@ -12583,8 +12678,8 @@ pub(crate) async fn run_tui_session(
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
-                                    if let Some(picker_open) = slash_dispatch::apply_model_picker_result(
-                                        &result, &mut state, &mut bottom_pane, &mut chat_widget,
+                                    if let Some(picker_open) = apply_scoped_model_picker_result(
+                                        &result, &mut model_picker_scope, &mut state, &mut bottom_pane, &mut chat_widget,
                                     ) {
                                         pending_deferred_slash_flush = picker_open;
                                         if !picker_open {
@@ -15339,6 +15434,16 @@ mod tests {
     #[tokio::test]
     async fn guidance_observer_drops_a_never_yielding_stream_after_turn_owner_release() {
         let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        run_control.publish_admitted_auth(crate::cli::session::session_runtime::AdmittedAuth::new(
+            "picker-token",
+            None,
+        ));
+        let (_, picker_attempt) = wait_for_catalog_auth(
+            run_control.admitted_auth(),
+            std::sync::Arc::downgrade(&run_control),
+        )
+        .await
+        .unwrap();
         let weak = std::sync::Arc::downgrade(&run_control);
         let mut stream = tokio_stream::pending::<()>();
         let observer = tokio::spawn(async move {
@@ -15353,6 +15458,10 @@ mod tests {
             .expect("owner release must stop a half-open stream within one check interval")
             .expect("observer task");
         assert_eq!(result, None);
+        assert!(
+            picker_attempt.is_current(),
+            "the picker remains usable after turn settlement"
+        );
     }
 
     #[tokio::test]
@@ -16927,26 +17036,17 @@ mod tests {
         assert!(!active_submission_routes_to_next_turn(
             "list my workspaces",
             false,
-            false,
             false
         ));
         assert!(active_submission_routes_to_next_turn(
             "list my workspaces",
             false,
-            true,
-            false
+            true
         ));
         assert!(active_submission_routes_to_next_turn(
             "please continue",
             true,
-            false,
             false
-        ));
-        assert!(active_submission_routes_to_next_turn(
-            "再加测试",
-            false,
-            false,
-            true
         ));
     }
 
@@ -17008,11 +17108,9 @@ mod tests {
         assert!(!queue_explicit_active_followup(
             &guidance, &mut pane, &mut chat
         ));
-        // Merely having an explicit follow-up does not close admission or
-        // arm the pre-bind FIFO latch for a bound run.
+        // Explicit next-turn input does not close current-run guidance.
         assert!(!active_submission_routes_to_next_turn(
             "use the existing helper",
-            false,
             false,
             false
         ));
@@ -21531,12 +21629,10 @@ mod tests {
         let unsent = pane.finish_turn_user_intents("turn");
         let mut queue = VecDeque::new();
         merge_unsubmitted_guidance(&mut queue, unsent);
-        assert!(model_facing_followup_backlog(&queue));
-        assert!(active_submission_routes_to_next_turn(
+        assert!(!active_submission_routes_to_next_turn(
             "later message",
             false,
-            false,
-            model_facing_followup_backlog(&queue)
+            false
         ));
         assert_eq!(interactive_texts(queue), vec!["//stop"]);
     }
@@ -24620,9 +24716,12 @@ mod tests {
 
         assert!(apply_model_catalog_effect(
             ModelCatalogEffect::Ready {
-                owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
-                attachment_epoch: state.session_attachment_epoch,
-                initial_bound_session: None,
+                scope: ModelPickerScope {
+                    owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                    attachment_epoch: state.session_attachment_epoch,
+                    initial_bound_session: None,
+                    attempt: None,
+                },
                 result: Ok((catalog, true))
             },
             &state,
@@ -24897,9 +24996,12 @@ mod tests {
 
         assert!(!apply_model_catalog_effect(
             ModelCatalogEffect::Ready {
-                owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
-                attachment_epoch: state.session_attachment_epoch,
-                initial_bound_session: None,
+                scope: ModelPickerScope {
+                    owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                    attachment_epoch: state.session_attachment_epoch,
+                    initial_bound_session: None,
+                    attempt: None,
+                },
                 result: Err("Cannot reach server — check connection".into())
             },
             &state,
@@ -24926,9 +25028,12 @@ mod tests {
         state.set_session_id("first");
         let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
         let effect = || ModelCatalogEffect::Ready {
-            owner: owner.clone(),
-            attachment_epoch: start_epoch,
-            initial_bound_session: Some(Arc::new(std::sync::Mutex::new(Some("first".into())))),
+            scope: ModelPickerScope {
+                owner: owner.clone(),
+                attachment_epoch: start_epoch,
+                initial_bound_session: Some(Arc::new(std::sync::Mutex::new(Some("first".into())))),
+                attempt: None,
+            },
             result: Err("catalog failed".into()),
         };
         let mut pane = BottomPane::new();
@@ -25496,7 +25601,6 @@ mod tests {
                 );
             }
             let queued = VecDeque::from([NextTurnSubmission::Interactive(raw.to_string())]);
-            assert!(model_facing_followup_backlog(&queued));
             assert_eq!(queued.front().unwrap().text(), raw, "queue keeps raw input");
             let mut widget = chat_widget::ChatWidget::new(String::new());
             commit_submission_projection(&mut widget, raw);
@@ -26210,9 +26314,12 @@ mod tests {
         let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
         apply_model_catalog_effect_for_choice(
             ModelCatalogEffect::Ready {
-                owner,
-                attachment_epoch: 0,
-                initial_bound_session: None,
+                scope: ModelPickerScope {
+                    owner,
+                    attachment_epoch: 0,
+                    initial_bound_session: None,
+                    attempt: None,
+                },
                 result: Err("catalog unavailable".into()),
             },
             None,
@@ -26248,7 +26355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_picker_waits_for_bound_attempt_and_stops_when_turn_ends() {
+    async fn run_control_waits_for_bound_attempt_and_stops_when_turn_ends() {
         use crate::cli::session::session_runtime::AdmittedAuth;
         let (run_tx, run_rx) = tokio::sync::watch::channel(None);
         let (auth_tx, auth_rx) =
@@ -26272,6 +26379,104 @@ mod tests {
         let (_auth_tx, auth_rx) = tokio::sync::watch::channel(None);
         drop(run_tx);
         assert!(wait_for_bound_turn_auth(run_rx, auth_rx).await.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn model_catalog_uses_the_authenticated_attempt_before_run_binding() {
+        use crate::cli::session::session_runtime::AdmittedAuth;
+        use crate::cli::turn::local_run_control::LocalRunControl;
+
+        let control = LocalRunControl::shared();
+        control.publish_admitted_auth(AdmittedAuth::new("first-attempt", None));
+        let (auth, first) =
+            wait_for_catalog_auth(control.admitted_auth(), Arc::downgrade(&control))
+                .await
+                .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        assert_eq!(
+            auth.access_token(&api, None).await.as_deref(),
+            Some("first-attempt")
+        );
+        assert!(first.is_current());
+        let original: crate::cli::session::session_state::SessionModelChoice = "original".into();
+        let staged = NextModelSelection::Picked {
+            selection: crate::cli::session::session_runtime::ServerModelSelection {
+                name: "candidate".into(),
+                context_window: None,
+                offering_id: "candidate-offering".into(),
+                pricing: None,
+            },
+            attempt: Some(first.clone()),
+        };
+        assert_eq!(
+            active_model_picker_choice(Some(&staged), Some(&original)).as_deref(),
+            Some("candidate")
+        );
+        let bound_scope = ModelPickerScope {
+            owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            attachment_epoch: 0,
+            initial_bound_session: Some(Arc::new(std::sync::Mutex::new(Some("session-1".into())))),
+            attempt: Some(first.clone()),
+        };
+        assert!(bound_scope.is_current(Some("session-1"), 1, "session-1"));
+        assert!(!bound_scope.is_current(Some("other"), 1, "other"));
+
+        // Even if the retry uses the same bearer, the old result and any
+        // picker opened from it are no longer associated with this attempt.
+        control.invalidate_admitted_auth();
+        control.publish_admitted_auth(AdmittedAuth::new("first-attempt", None));
+        assert!(!first.is_current());
+        assert_eq!(
+            active_model_picker_choice(Some(&staged), Some(&original)).as_deref(),
+            Some("original")
+        );
+        let mut idle_scope = Some(bound_scope);
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id("session-1");
+        state.model = Some(original.clone());
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("session-1");
+        assert_eq!(
+            apply_scoped_model_picker_result(
+                &bottom_pane::view::ViewResult::Model {
+                    name: "candidate".into()
+                },
+                &mut idle_scope,
+                &mut state,
+                &mut pane,
+                &mut widget,
+            ),
+            Some(false),
+            "a picker surviving the failed turn must not apply its stale catalog"
+        );
+        assert_eq!(state.model.as_deref(), Some("original"));
+        assert!(idle_scope.is_none());
+        assert!(!apply_model_catalog_effect_for_choice(
+            ModelCatalogEffect::Ready {
+                scope: ModelPickerScope {
+                    owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                    attachment_epoch: 0,
+                    initial_bound_session: None,
+                    attempt: Some(first),
+                },
+                result: Ok((Vec::new(), false)),
+            },
+            None,
+            None,
+            0,
+            &mut pane,
+            &mut widget,
+        ));
+        assert!(!pane.has_active_view());
+        let (_, retry) = wait_for_catalog_auth(control.admitted_auth(), Arc::downgrade(&control))
+            .await
+            .unwrap();
+        drop(control);
+        assert!(
+            retry.is_current(),
+            "normal turn completion must not invalidate the picker"
+        );
     }
 
     #[serial_test::serial]

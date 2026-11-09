@@ -112,11 +112,25 @@ impl LocalRunControl {
         self.admitted_auth.send_replace(Some(auth));
     }
 
+    /// Invalidate actions tied to an attempt that never started before a
+    /// retry can publish its own credentials.
+    pub(crate) fn invalidate_admitted_auth(&self) {
+        self.admitted_auth.send_replace(None);
+    }
+
     pub(crate) fn admitted_auth(
         &self,
     ) -> tokio::sync::watch::Receiver<Option<crate::cli::session::session_runtime::AdmittedAuth>>
     {
         self.admitted_auth.subscribe()
+    }
+
+    /// Keep the attempt's version observable without retaining the turn.
+    pub(crate) fn retain_admitted_auth(
+        &self,
+    ) -> tokio::sync::watch::Sender<Option<crate::cli::session::session_runtime::AdmittedAuth>>
+    {
+        self.admitted_auth.clone()
     }
 
     fn request_cancel(&self, origin: astra_turn_core::orchestration_types::CancellationOrigin) {

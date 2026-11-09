@@ -553,7 +553,7 @@ async fn completed_turn_does_not_restart_when_background_shell_finishes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn active_turn_guidance_sends_messages_in_order_while_first_ack_is_delayed() {
+async fn active_turn_guidance_preserves_order_and_steers_queued_turns() {
     use axum::{
         Json,
         extract::Path,
@@ -729,7 +729,7 @@ async fn active_turn_guidance_sends_messages_in_order_while_first_ack_is_delayed
     );
     astra.write(&[0x03]); // Clear the nonempty draft without stopping the task.
     astra.wait_for_absent("later pending", UI_TRANSITION_TIMEOUT);
-    assert!(mock.cancelled_runs().is_empty());
+    assert!(mock.cancellation_requests().is_empty());
     astra.paste_and_submit("corrected instruction");
     let corrected = tokio::time::timeout(UI_TRANSITION_TIMEOUT, sent_rx.recv())
         .await
@@ -743,7 +743,60 @@ async fn active_turn_guidance_sends_messages_in_order_while_first_ack_is_delayed
             "Bearer gateway-token".into()
         )
     );
+    // Future turns retain their FIFO while Enter continues to guide whichever
+    // task is running, including a task that itself came from the queue.
+    astra.write(b"\x1b[200~task B\x1b[201~\x11");
+    astra.wait_for("task B", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b[200~task C\x1b[201~\x11");
+    astra.wait_for("task C", UI_TRANSITION_TIMEOUT);
     mock.release_held_response();
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "task B did not start\n{}",
+            astra.screen_diagnostic()
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(mock.received_requests()[1]["message"], "task B");
+    astra.paste_and_submit("guide task B");
+    mock.release_held_binding();
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    let guided = loop {
+        if let Ok(guided) = sent_rx.try_recv() {
+            break guided;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "guidance did not reach task B; accepted={:?}\n{}",
+            received.lock().unwrap(),
+            astra.screen_diagnostic()
+        );
+        // Answer terminal capability/position queries while the new turn binds.
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(guided.1, "guide task B");
+    assert_eq!(
+        mock.received_requests().len(),
+        2,
+        "task C must remain queued"
+    );
+
+    mock.release_held_response();
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().len() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "task C did not start\n{}",
+            astra.screen_diagnostic()
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(mock.received_requests()[2]["message"], "task C");
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
@@ -767,8 +820,10 @@ fn seed_account(home: &std::path::Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_model_picker_applies_to_a_queued_next_turn() {
     let _journey = pty_journey_lock().lock().await;
-    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration(
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
         astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+        true,
+        axum::Router::new(),
     )
     .await
     .unwrap();
@@ -781,6 +836,18 @@ async fn active_model_picker_applies_to_a_queued_next_turn() {
     astra.write(b"\x1b");
     astra.wait_for_absent("Select model", UI_TRANSITION_TIMEOUT);
     astra.paste_and_submit("Start the current task.");
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().is_empty() {
+        assert!(Instant::now() < deadline, "the current task did not start");
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    // The catalog does not require the run binding, which may arrive late.
+    astra.paste_and_submit("/model");
+    astra.wait_for("Select model", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\x1b");
+    astra.wait_for_absent("Select model", UI_TRANSITION_TIMEOUT);
+    mock.release_held_binding();
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
 
     // Queue a message first: the new choice governs all turns not yet started.
@@ -1129,10 +1196,45 @@ async fn ctrl_o_opens_during_an_active_turn_and_receives_live_completion() {
     astra.wait_for("successfully.", Duration::from_secs(10));
 
     astra.write(&[0x0f]);
+    astra.wait_for_absent("· Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Message Astra", Duration::from_secs(10));
     astra.write(b"/exit\r");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_during_unbound_turn_reconciles_the_exact_run() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock =
+        astra_cli::cli::mock_llm::MockLlmServer::start_with_held_slow_response(axum::Router::new())
+            .await
+            .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.paste_and_submit("Hold this task open.");
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the task did not reach the provider"
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    astra.write(&[0x0f]);
+    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x0f]);
+    astra.wait_for_absent("· Transcript", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("/exit");
+    astra.wait_for_screen("exit or stopping", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("Stopping") || screen.contains("Exiting")
+    });
+    mock.release_held_response();
+    assert!(astra.wait_for_exit(Duration::from_secs(15)).success());
+    assert_eq!(mock.cancellation_requests(), ["mock-run-1"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2516,7 +2618,7 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
     astra.wait_for("stop available", UI_TRANSITION_TIMEOUT);
     astra.write(b"x");
     let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
-    while mock.cancelled_runs().is_empty() {
+    while mock.cancellation_requests().is_empty() {
         assert!(
             Instant::now() < deadline,
             "cancel not received: {}",
@@ -2525,7 +2627,7 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
         astra.receive(Duration::from_millis(25));
         tokio::task::yield_now().await;
     }
-    assert_eq!(mock.cancelled_runs(), ["mock-run-fanout-child-2"]);
+    assert_eq!(mock.cancellation_requests(), ["mock-run-fanout-child-2"]);
     astra.write(b"\x1b");
     astra.wait_for_absent("Agent runs", UI_TRANSITION_TIMEOUT);
     mock.release_held_response();
