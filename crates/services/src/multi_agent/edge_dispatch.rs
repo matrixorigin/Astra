@@ -120,7 +120,61 @@ fn edge_dispatch_payloads_match(
 ) -> Result<bool, String> {
     let replayed = serde_json::from_str::<serde_json::Value>(replayed)
         .map_err(|error| format!("replayed durable payload is invalid JSON: {error}"))?;
-    Ok(persisted == &replayed)
+    Ok(edge_dispatch_values_match(persisted, &replayed))
+}
+
+fn edge_dispatch_values_match(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    use serde_json::Value;
+
+    match (left, right) {
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| edge_dispatch_values_match(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| edge_dispatch_values_match(value, other))
+                })
+        }
+        (Value::Number(left), Value::Number(right)) => {
+            left == right
+                || integral_float_matches_integer(left, right)
+                || integral_float_matches_integer(right, left)
+        }
+        _ => left == right,
+    }
+}
+
+fn integral_float_matches_integer(
+    float: &serde_json::Number,
+    integer: &serde_json::Number,
+) -> bool {
+    if !float.is_f64() {
+        return false;
+    }
+    let Some(value) = float.as_f64() else {
+        return false;
+    };
+    if value.fract() != 0.0 {
+        return false;
+    }
+
+    // MatrixOne's JSON storage can return 120.0 as 120. Compare through an
+    // integer only when the float is in range: converting integers to f64, or
+    // allowing a saturating cast, would equate distinct large payloads.
+    if (0.0..18_446_744_073_709_551_616.0).contains(&value) {
+        integer.as_u64() == Some(value as u64)
+    } else if (-9_223_372_036_854_775_808.0..0.0).contains(&value) {
+        integer.as_i64() == Some(value as i64)
+    } else {
+        false
+    }
 }
 
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
@@ -3094,6 +3148,42 @@ mod tests {
                 .unwrap_err()
                 .contains("persisted durable payload is invalid JSON")
         );
+    }
+
+    #[test]
+    fn edge_dispatch_payload_matching_handles_database_numeric_normalization() {
+        let cases = [
+            (
+                r#"{"args":[120.0,-120.0,-0.0,0.125]}"#,
+                r#"{"args":[120,-120,0,0.125]}"#,
+                true,
+            ),
+            (r#"{"a":1.0,"b":[2.0]}"#, r#"{"b":[2],"a":1}"#, true),
+            ("9007199254740992.0", "9007199254740992", true),
+            ("9007199254740992.0", "9007199254740993", false),
+            ("-9223372036854775808.0", "-9223372036854775808", true),
+            ("-9223372036854775808.0", "-9223372036854775807", false),
+            ("18446744073709551616.0", "18446744073709551615", false),
+            ("120.5", "120", false),
+            (r#"{"timeout":"120"}"#, r#"{"timeout":120.0}"#, false),
+            ("[1,2]", "[2,1]", false),
+            (r#"{"a":1}"#, r#"{"b":1}"#, false),
+        ];
+        for (left, right, expected) in cases {
+            let left_value = serde_json::from_str(left).unwrap();
+            let right_value = serde_json::from_str(right).unwrap();
+            assert_eq!(
+                edge_dispatch_payloads_match(&left_value, right).unwrap(),
+                expected,
+                "{left} vs {right}"
+            );
+            assert_eq!(
+                edge_dispatch_payloads_match(&right_value, left).unwrap(),
+                expected,
+                "{right} vs {left}"
+            );
+        }
+        assert!(edge_dispatch_payloads_match(&serde_json::Value::Null, "not-json").is_err());
     }
 
     #[test]

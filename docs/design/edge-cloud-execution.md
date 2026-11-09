@@ -169,6 +169,12 @@ configuration, not this execution contract.
 Durable dispatch subscribes before a connection is published. The existing
 per-Server database observer discovers work admitted on another Server or
 before subscription; a wake only prompts the socket to claim durable work.
+Replay checks the same owner and JSON payload, treating an integral JSON number
+and its equivalent floating-point representation as the same value without
+rounding distinct representable i64/u64 integers. If admission fails in a
+batch, the failing call retains its own error and later unstarted calls report
+that they did not run;
+an uncertain outcome is not retried as a known failure.
 There is no per-socket periodic dispatch query during normal observation.
 The observer batches up to 1,024 connected targets and uses the
 status-leading dispatch index. Its SQL can match cross-pairs; only exact local

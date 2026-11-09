@@ -306,6 +306,81 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_preserves_numeric_identity_across_database_roundtrips() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user = format!("ed-numeric-{}", unique_suffix());
+    let edge = format!("edge-numeric-{}", unique_suffix());
+    let direct = dispatch_identity(&user, &unique_suffix());
+    let relay = dispatch_identity(&user, &unique_suffix());
+    let payload = r#"{"tool":"bash","args":{"command":"git status","timeout":120.0,"nested":[-120.0,-0.0,0.125,1e2,1e20],"large":9007199254740993,"max":18446744073709551615}}"#;
+    let equivalent = r#"{"args":{"max":18446744073709551615,"large":9007199254740993,"nested":[-120,0,0.125,100,1e20],"timeout":120,"command":"git status"},"tool":"bash"}"#;
+    let different_large = payload.replace("9007199254740993", "9007199254740992.0");
+    let different_type = payload.replace("\"timeout\":120.0", "\"timeout\":\"120\"");
+
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&direct, &edge, payload)
+            .await
+            .expect("first direct admission"),
+        EdgeDirectDispatchAdmission::Claimed
+    );
+    assert_eq!(
+        svc.admit_and_claim_direct_dispatch(&direct, &edge, equivalent)
+            .await
+            .expect("equivalent direct replay"),
+        EdgeDirectDispatchAdmission::Observing
+    );
+    for changed in [&different_large, &different_type] {
+        assert!(matches!(
+            svc.admit_and_claim_direct_dispatch(&direct, &edge, changed)
+                .await,
+            Err(EdgeDispatchAdmissionError::Rejected(_))
+        ));
+    }
+    assert!(matches!(
+        svc.admit_and_claim_direct_dispatch(&direct, "different-edge", payload)
+            .await,
+        Err(EdgeDispatchAdmissionError::Rejected(_))
+    ));
+
+    assert_eq!(
+        svc.admit_dispatch(&relay, &edge, payload).await.unwrap(),
+        EdgeDispatchAdmission::Pending
+    );
+    assert_eq!(
+        svc.admit_dispatch(&relay, &edge, equivalent).await.unwrap(),
+        EdgeDispatchAdmission::Pending
+    );
+    let rows = svc.poll_pending(&user, &edge).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].request_id, relay.request_id);
+    let stored: serde_json::Value = serde_json::from_str(&rows[0].payload_json).unwrap();
+    assert_eq!(stored["args"]["timeout"].as_f64(), Some(120.0));
+    assert_eq!(
+        stored["args"]["large"].as_u64(),
+        Some(9_007_199_254_740_993)
+    );
+
+    let result = r#"{"status":"completed","output":"ok"}"#;
+    for identity in [&direct, &relay] {
+        assert!(svc.deliver_result(identity, &edge, result).await.unwrap());
+        assert_eq!(
+            svc.admit_dispatch(identity, &edge, equivalent)
+                .await
+                .unwrap(),
+            EdgeDispatchAdmission::Terminal(result.to_owned())
+        );
+    }
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(&user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_dispatch_large_request_preserves_admission_and_replay() {
     require_env();
     let pool = common::setup_pool().await;
