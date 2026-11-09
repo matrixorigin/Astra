@@ -318,7 +318,7 @@ async fn refused_connection_then_rejection_restores_draft_with_login_guidance() 
     assert!(!shown.contains("unknown") && !shown.contains("do not resend"));
 }
 
-fn basic_chat_context<'a>(
+pub(crate) fn basic_chat_context<'a>(
     api: &'a astra_thin_client::ThinClient,
     registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     message: &'a str,
@@ -1005,7 +1005,7 @@ async fn server_admission_dispatch_evidence_comes_from_the_actual_request_bounda
 /// Build a canonical SSE response for the mock chat-turn endpoint. Exposed
 /// to sibling test modules (e.g. `resume_tests`) so they don't have to
 /// duplicate the payload literal.
-pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
+pub(crate) fn sse_text_response(text: &str, session_id: &str) -> String {
     sse_text_response_with_execution_summary(
         text,
         session_id,

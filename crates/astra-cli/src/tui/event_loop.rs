@@ -15348,6 +15348,362 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_login_environment_bearer_matches_services_and_turns_or_preserves_identity() {
+        use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
+        use crate::cli::{auth_flow, session::session_runtime};
+        use crate::tests::chat_stream_tests::{basic_chat_context, sse_text_response};
+        use base64::Engine as _;
+        use wiremock::matchers::{body_partial_json, header};
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _creds = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _native = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "environment-access");
+        }
+        for legacy in [false, true] {
+            for (browser_account, verified) in [
+                ("account-a", true),
+                ("account-b", true),
+                ("account-a", false),
+            ] {
+                let accepted = browser_account == "account-a" && verified;
+                let server = MockServer::start().await;
+                let website = MockServer::start().await;
+                let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+                auth_flow::save_profile_auth_tokens(
+                    None,
+                    "original",
+                    &auth_flow::AuthTokenPayload {
+                        user_id: "account-a".into(),
+                        access_token: "original-profile-access".into(),
+                        refresh_token: "original-refresh".into(),
+                    },
+                )
+                .unwrap();
+                let original_credentials =
+                    serde_json::to_value(crate::cli::cli_config::cli_utils::load_credentials())
+                        .unwrap();
+                let original_owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                let mut state = crate::SessionState::default();
+                let mut modules = auth_flow::build_identity_services(&api, None, "account-a")
+                    .await
+                    .apply(&mut state);
+                let original_memory = state.session_memory_port.clone().unwrap();
+                let original_registry = state.unified_skill_registry.clone();
+                let original_mcp = state.mcp_manager.clone();
+                let mut retired = Some((original_owner.clone(), state.session_memory_port.clone()));
+                Mock::given(method("POST")).and(path("/auth/memoria"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "user_id":browser_account,"access_token":"browser-access","refresh_token":"browser-refresh"
+                    }))).expect(1).mount(&server).await;
+                Mock::given(method("GET"))
+                    .and(path("/auth/me"))
+                    .and(header("authorization", "Bearer environment-access"))
+                    .respond_with(if verified {
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"user_id":"account-a"}))
+                    } else {
+                        ResponseTemplate::new(503)
+                    })
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path("/agents/edge"))
+                    .and(header("authorization", "Bearer environment-access"))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})),
+                    )
+                    .expect(if accepted { 2 } else { 1 })
+                    .mount(&server)
+                    .await;
+                crate::cli::edge_lifecycle::register_after_login(&api, "environment-access")
+                    .await
+                    .unwrap();
+                let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+                let original_heartbeat = heartbeat.as_ref().unwrap().abort_handle();
+                auth_flow::begin_browser_session_login(&mut state)
+                    .await
+                    .unwrap();
+                let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+                let opened_tx = std::sync::Mutex::new(Some(opened_tx));
+                let observer: auth_flow::LoginObserver = Arc::new(move |progress| {
+                    if let auth_flow::LoginProgress::OpenBrowser(url) = progress {
+                        opened_tx.lock().unwrap().take().unwrap().send(url).unwrap();
+                    }
+                    Ok(())
+                });
+                let login = auth_flow::browser_login_with_launcher(
+                    &api,
+                    None,
+                    auth_flow::LoginMethod::Memoria(website.uri()),
+                    observer,
+                    false,
+                    async |_| Ok(()),
+                );
+                let browser = async {
+                    let url = url::Url::parse(&opened_rx.await.unwrap()).unwrap();
+                    let fields: std::collections::HashMap<_, _> = url
+                        .query_pairs()
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect();
+                    let callback = format!("http://127.0.0.1:{}/callback", fields["port"]);
+                    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                    let code = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+                    let response = if legacy {
+                        client.post(&callback).header("Origin",website.uri())
+                            .json(&serde_json::json!({"state":fields["state"],"memoria_connection_key":"synthetic-key"}))
+                            .send().await.unwrap()
+                    } else {
+                        Mock::given(method("POST"))
+                            .and(path("/api/auth/astra/browser-login/redeem"))
+                            .respond_with(ResponseTemplate::new(200).set_body_json(
+                                serde_json::json!({"connection_key":"synthetic-key"}),
+                            ))
+                            .expect(1)
+                            .mount(&website)
+                            .await;
+                        client
+                            .get(&callback)
+                            .query(&[("state", fields["state"].as_str()), ("code", code.as_str())])
+                            .send()
+                            .await
+                            .unwrap()
+                    };
+                    let status = response.status();
+                    (status, response.text().await.unwrap())
+                };
+                let (login, (status, page)) =
+                    tokio::time::timeout(Duration::from_secs(20), async {
+                        tokio::join!(login, browser)
+                    })
+                    .await
+                    .unwrap();
+                let mut discovery = tokio::spawn(std::future::pending());
+                let mut discovery_pending = true;
+                let execution_api;
+                if accepted {
+                    login.unwrap();
+                    assert!(status.is_success());
+                    crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+                    let prepared = auth_flow::prepare_browser_session_login(&api, None, false)
+                        .await
+                        .unwrap();
+                    let (replacement, token, replacement_modules) =
+                        auth_flow::commit_browser_session_login(prepared, &mut state).unwrap();
+                    modules = replacement_modules;
+                    crate::cli::edge_lifecycle::complete_login_rebind(
+                        &replacement,
+                        &token,
+                        None,
+                        &mut heartbeat,
+                    )
+                    .await;
+                    execution_api = replacement;
+                    assert!(!original_owner.is_current());
+                    assert!(!Arc::ptr_eq(
+                        &original_memory,
+                        state.session_memory_port.as_ref().unwrap()
+                    ));
+                    assert!(!Arc::ptr_eq(
+                        &original_registry,
+                        &state.unified_skill_registry
+                    ));
+                    assert!(!Arc::ptr_eq(&original_mcp, &state.mcp_manager));
+                    assert_eq!(
+                        crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
+                            .access_token
+                            .as_deref(),
+                        Some("browser-access")
+                    );
+                } else {
+                    let error = login.unwrap_err();
+                    assert!(error.contains(if verified {
+                        "different account"
+                    } else {
+                        "Cannot verify"
+                    }));
+                    assert!(error.contains("Unset"));
+                    assert!(!page.contains("class=\"card success\""));
+                    if legacy {
+                        assert!(!status.is_success());
+                    }
+                    assert!(original_owner.is_current());
+                    assert_eq!(
+                        serde_json::to_value(crate::cli::cli_config::cli_utils::load_credentials())
+                            .unwrap(),
+                        original_credentials
+                    );
+                    assert!(!original_heartbeat.is_finished());
+                    assert_eq!(
+                        server
+                            .received_requests()
+                            .await
+                            .unwrap()
+                            .iter()
+                            .filter(|r| r.url.path() == "/agents/edge")
+                            .count(),
+                        1
+                    );
+                    restore_login_identity_services(
+                        &mut state,
+                        &mut retired,
+                        &mut discovery,
+                        &mut discovery_pending,
+                    );
+                    assert!(Arc::ptr_eq(
+                        &original_memory,
+                        state.session_memory_port.as_ref().unwrap()
+                    ));
+                    assert!(Arc::ptr_eq(
+                        &original_registry,
+                        &state.unified_skill_registry
+                    ));
+                    assert!(Arc::ptr_eq(&original_mcp, &state.mcp_manager));
+                    execution_api = api.clone();
+                }
+                discovery.abort();
+                let _ = discovery.await;
+                for secret in [
+                    "environment-access",
+                    "original-profile-access",
+                    "browser-access",
+                    "browser-refresh",
+                    "synthetic-key",
+                ] {
+                    assert!(!page.contains(secret));
+                }
+                assert_eq!(
+                    crate::cli::cli_config::cli_utils::cli_account_id().as_deref(),
+                    Some("account-a")
+                );
+                let record = serde_json::json!({"skill_id":"private-a","skill_name":"private-a","version":"1.0.0","metadata":{"instructions":"Private account-a instructions"}});
+                Mock::given(method("GET")).and(path("/skills")).and(header("authorization","Bearer environment-access"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"skills":[record.clone()],"limit":100,"total":1,"next_cursor":null}))).mount(&server).await;
+                Mock::given(method("GET"))
+                    .and(path("/skills/private-a"))
+                    .and(header("authorization", "Bearer environment-access"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(record))
+                    .mount(&server)
+                    .await;
+                assert!(
+                    state
+                        .unified_skill_registry
+                        .discover_all_report()
+                        .await
+                        .unwrap()
+                        .failures
+                        .is_empty()
+                );
+                state
+                    .unified_skill_registry
+                    .load("private-a")
+                    .await
+                    .unwrap();
+                Mock::given(method("POST")).and(path("/memory/retrieve")).and(header("authorization","Bearer environment-access"))
+                    .and(body_partial_json(serde_json::json!({"user_id":"account-a"})))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"memories":[{"memory_id":"account-a-memory","content":"Account A memory","memory_type":"semantic","user_id":"account-a"}]})))
+                    .expect(1).mount(&server).await;
+                let memories = state
+                    .session_memory_port
+                    .as_ref()
+                    .unwrap()
+                    .retrieve_ext("query", None, 1, false)
+                    .await
+                    .unwrap();
+                assert_eq!(memories[0].user_id.as_deref(), Some("account-a"));
+                for (route, value) in [
+                    (
+                        "/models",
+                        crate::test_utils::mock_model_catalog_json(&["test-model"]),
+                    ),
+                    (
+                        "/model-access",
+                        crate::test_utils::mock_model_access_json(&["test-model"]),
+                    ),
+                ] {
+                    Mock::given(method("GET"))
+                        .and(path(route))
+                        .and(header("authorization", "Bearer environment-access"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(value))
+                        .mount(&server)
+                        .await;
+                }
+                Mock::given(method("POST"))
+                    .and(path("/chat/stream"))
+                    .and(header("authorization", "Bearer environment-access"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .insert_header(
+                                astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                                astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                            )
+                            .set_body_string(sse_text_response(
+                                "Account A answer",
+                                "env-browser-session",
+                            )),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let token = session_runtime::fresh_access_token(&execution_api, None)
+                    .await
+                    .unwrap();
+                assert_eq!(token, "environment-access");
+                let mut context =
+                    basic_chat_context(&execution_api, &state.unified_skill_registry, "hi");
+                context.auth_owner =
+                    session_runtime::capture_admitted_auth_owner(&execution_api, None, &token)
+                        .await;
+                let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
+                let turn = stream_chat_sse(ChatTurnParams::basic_cli(
+                    &context,
+                    &token,
+                    None,
+                    &mut permissions,
+                ))
+                .await
+                .unwrap();
+                assert_eq!(turn.full_text, "Account A answer");
+                for request in server.received_requests().await.unwrap() {
+                    if matches!(
+                        request.url.path(),
+                        "/agents/edge"
+                            | "/skills"
+                            | "/skills/private-a"
+                            | "/memory/retrieve"
+                            | "/chat/stream"
+                            | "/models"
+                            | "/model-access"
+                    ) {
+                        assert_eq!(
+                            request.headers.get("authorization").unwrap(),
+                            "Bearer environment-access"
+                        );
+                    }
+                }
+                crate::cli::edge_lifecycle::stop_heartbeat(&mut heartbeat).await;
+                auth_flow::begin_browser_session_login(&mut state)
+                    .await
+                    .unwrap();
+                drop(modules);
+                server.verify().await;
+                website.verify().await;
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn escape_browser_login_restores_memory_and_external_discovery() {
         use crate::cli::{auth_flow, session::session_runtime};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

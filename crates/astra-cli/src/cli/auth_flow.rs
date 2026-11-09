@@ -292,9 +292,9 @@ pub(crate) async fn do_login(
     username: &str,
     password: &str,
 ) -> Result<String, String> {
-    let tokens = request_login_tokens(api, username, password).await?;
-    save_profile_auth_tokens(profile, username, &tokens)?;
-    Ok(tokens.access_token)
+    let authentication = request_password_authentication(api, username, password, None).await?;
+    save_profile_auth_tokens(profile, username, &authentication.tokens)?;
+    Ok(authentication.execution_token)
 }
 
 pub(crate) async fn do_memoria_login_with_key(
@@ -302,7 +302,9 @@ pub(crate) async fn do_memoria_login_with_key(
     profile: Option<&str>,
     connection_key: &str,
 ) -> Result<String, String> {
+    require_legacy_login()?;
     let tokens = request_memoria_tokens(api, connection_key).await?;
+    let execution_token = execution_token_for_login(api, &tokens).await?;
     save_profile_auth_tokens(profile, "memoria", &tokens)?;
     credential_store()
         .mutate(|creds| {
@@ -316,7 +318,47 @@ pub(crate) async fn do_memoria_login_with_key(
             }
         })
         .map_err(|error| error.to_string())?;
-    Ok(tokens.access_token)
+    Ok(execution_token)
+}
+
+fn require_legacy_login() -> Result<(), String> {
+    if crate::cli::native_auth::active().is_some() {
+        return Err("Use browser sign-in for the current authenticated connection.".into());
+    }
+    Ok(())
+}
+
+/// Every legacy login must bind local identity to the bearer used by turns.
+/// Validate an environment override before any credential/identity publication.
+async fn execution_token_for_login(
+    api: &astra_thin_client::ThinClient,
+    tokens: &AuthTokenPayload,
+) -> Result<String, String> {
+    let Some(token) = crate::cli::session::session_runtime::active_env_access_token(
+        chrono::Utc::now().timestamp(),
+    ) else {
+        return Ok(tokens.access_token.clone());
+    };
+    #[derive(Deserialize)]
+    struct AuthMe {
+        user_id: String,
+    }
+    // This is an explicit credential check, not a request under the old
+    // generation's bearer provider. Bound headers and body together.
+    let explicit_api = api.clone().without_bearer_provider();
+    let me = tokio::time::timeout(
+        Duration::from_secs(15),
+        explicit_api.get_auth_me_text(&token),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|body| serde_json::from_str::<AuthMe>(&body).ok())
+    .ok_or("Cannot verify ASTRA_ACCESS_TOKEN. Unset it and restart Astra before signing in.")?;
+    if me.user_id != tokens.user_id {
+        return Err("ASTRA_ACCESS_TOKEN selects a different account. Unset it and restart Astra before signing in.".into());
+    }
+    Ok(token)
 }
 
 async fn request_memoria_tokens(
@@ -826,9 +868,10 @@ pub(crate) async fn do_register(
     email: &str,
     password: &str,
 ) -> Result<String, String> {
-    let tokens = request_register_tokens(api, username, email, password).await?;
-    save_profile_auth_tokens(profile, username, &tokens)?;
-    Ok(tokens.access_token)
+    let authentication =
+        request_password_authentication(api, username, password, Some(email)).await?;
+    save_profile_auth_tokens(profile, username, &authentication.tokens)?;
+    Ok(authentication.execution_token)
 }
 
 const REGISTRATION_OUTCOME_UNKNOWN: &str = "Registration outcome is unknown: the account may have been created. Try /login with the chosen credentials before registering again.";
@@ -1108,9 +1151,7 @@ pub(crate) async fn request_password_authentication(
     email: Option<&str>,
 ) -> Result<PasswordAuthentication, String> {
     tokio::time::timeout(Duration::from_secs(15), async {
-        if crate::cli::native_auth::active().is_some() {
-            return Err("Use browser sign-in for the current authenticated connection.".to_string());
-        }
+        require_legacy_login()?;
         if email.is_some() && crate::cli::session::session_runtime::active_env_access_token(chrono::Utc::now().timestamp()).is_some() {
             return Err("Unset ASTRA_ACCESS_TOKEN and restart Astra before creating a new account. Use /login to sign in to an existing account.".into());
         }
@@ -1119,20 +1160,7 @@ pub(crate) async fn request_password_authentication(
         } else {
             request_login_tokens(api, username, password).await.map_err(|error| format!("Login failed: {error}"))?
         };
-        let execution_token = match crate::cli::session::session_runtime::active_env_access_token(chrono::Utc::now().timestamp()) {
-            None => tokens.access_token.clone(),
-            Some(token) => {
-                #[derive(Deserialize)]
-                struct AuthMe { user_id: String }
-                let me = api.get_auth_me_text(&token).await.ok()
-                    .and_then(|body| serde_json::from_str::<AuthMe>(&body).ok())
-                    .ok_or("Cannot verify ASTRA_ACCESS_TOKEN. Unset it and restart Astra before password sign-in.")?;
-                if me.user_id != tokens.user_id {
-                    return Err("ASTRA_ACCESS_TOKEN selects a different account. Unset it and restart Astra before password sign-in.".into());
-                }
-                token
-            }
-        };
+        let execution_token = execution_token_for_login(api, &tokens).await?;
         Ok(PasswordAuthentication { tokens, execution_token })
     }).await.map_err(|_| if email.is_some() {
         REGISTRATION_OUTCOME_UNKNOWN.to_string()
@@ -2190,6 +2218,36 @@ mod tests {
                 .any(|request| request.url.path() == "/agents/edge")
         );
         server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn memoria_key_login_cannot_replace_an_active_native_identity() {
+        let _creds = crate::tests::isolate_credentials();
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            astra_credentials::native::NativeStore::with_directory(root.path().join("auth"));
+        let (session, _) = store
+            .publish(crate::cli::native_auth::test_session())
+            .unwrap();
+        let binding = crate::cli::native_auth::binding_for_test(store, session);
+        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+        let original = serde_json::to_value(super::credential_store().load().unwrap()).unwrap();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let error = super::do_memoria_login_with_key(&api, None, "synthetic-key")
+            .await
+            .unwrap_err();
+        assert!(error.contains("Use browser sign-in"));
+        assert!(std::sync::Arc::ptr_eq(
+            &binding,
+            &crate::cli::native_auth::active().unwrap()
+        ));
+        assert_eq!(
+            serde_json::to_value(super::credential_store().load().unwrap()).unwrap(),
+            original
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]

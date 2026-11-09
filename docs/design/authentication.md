@@ -260,10 +260,13 @@ invalid successful credential response, or server-side failure reports an unknow
 outcome and directs users to try `/login` before registering again. Known
 connector failures and authoritative client-error rejections remain failures.
 
-When a valid `ASTRA_ACCESS_TOKEN` controls turn authentication, password sign-in
-checks its authenticated account against the password response before saving
-credentials or changing the session. A conflicting or unverifiable identity is
-rejected with instructions to unset the environment override and restart.
+When a valid `ASTRA_ACCESS_TOKEN` controls legacy turn authentication, password
+and Memoria sign-in share one account/bearer check before saving credentials or
+changing identity. This applies to terminal, manual-key and both browser callback
+transports. A conflicting or unverifiable identity is rejected with instructions
+to unset the environment override and restart. Browser rejection retains the old
+credential binding and restores its retired identity services; it does not
+publish the incompatible account or report successful sign-in.
 Same-account sign-in uses the environment bearer for registration and heartbeat,
 matching subsequent turn admission; the new profile credentials are still saved.
 With `ASTRA_NATIVE_COLLABORATORS` selected, the interactive lifecycle does not
