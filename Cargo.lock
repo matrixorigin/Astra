@@ -374,13 +374,17 @@ dependencies = [
  "astra-core",
  "astra-turn-core",
  "astra-turn-types",
+ "axum",
+ "bytes",
  "chrono",
  "futures-util",
  "reqwest 0.12.28",
+ "reqwest 0.13.3",
  "rmcp",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sse-stream",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.26.2",
@@ -5469,7 +5473,6 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "process-wrap",
- "reqwest 0.13.3",
  "rmcp-macros",
  "schemars",
  "serde",
@@ -6361,9 +6364,9 @@ dependencies = [
 
 [[package]]
 name = "sse-stream"
-version = "0.2.3"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3962b63f038885f15bce2c6e02c0e7925c072f1ac86bb60fd44c5c6b762fb72"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
 dependencies = [
  "bytes",
  "futures-util",

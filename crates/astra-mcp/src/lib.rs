@@ -8,6 +8,7 @@ mod classic_sse;
 mod connection;
 mod error;
 mod manager;
+mod streamable_http;
 mod tools;
 mod types;
 

@@ -284,6 +284,10 @@ without the `mcpServers` wrapper. It supports `stdio` (the default, using
 (using `url`, optional `headers`, and optional `auth_token`). Use the exact
 `streamable_http` spelling in configuration; `http`, `streamable-http`, and
 `websocket` are not accepted aliases.
+For `streamable_http`, a JSON response or an individual SSE event is limited to
+16 MiB, and an HTTP error body to 64 KiB. Oversized JSON or error bodies fail
+the response; an oversized SSE event terminates that stream, which may reconnect.
+If a tool request has already been sent, its execution outcome may be unknown.
 `add` writes a stdio entry. Both commands default to project scope and reject
 an existing name in that file; remove the existing entry or edit the file to
 replace it. Adding configuration does not install an executable or test access.
