@@ -22,6 +22,9 @@ pub fn truncate_str(s: &str, max: usize) -> String {
 /// char budget — `max_chars=5` on "hello world" returns "hell…".
 /// Multi-line input is reduced to the first line first.
 pub fn truncate_line(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let line = s.lines().next().unwrap_or(s);
     if line.chars().count() <= max_chars {
         line.to_string()
@@ -32,6 +35,9 @@ pub fn truncate_line(s: &str, max_chars: usize) -> String {
 }
 
 fn truncate_to_width(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
@@ -44,6 +50,11 @@ fn truncate_to_width(s: &str, max_chars: usize) -> String {
 pub fn shorten_path(path: &str, max_chars: usize) -> String {
     if path.chars().count() <= max_chars {
         return path.to_string();
+    }
+    // The shortest directory marker is four chars (".../"). For narrower
+    // previews, fall back to a character-budgeted prefix.
+    if max_chars < 4 {
+        return truncate_to_width(path, max_chars);
     }
 
     let parts: Vec<&str> = path.split('/').collect();
@@ -117,6 +128,38 @@ mod tests {
         assert_eq!(shorten_path("/a/b/c/d/e/file.txt", 15), ".../e/file.txt");
         assert_eq!(shorten_path("/a/very_long_filename.txt", 10), "very_long…");
         assert_eq!(shorten_path("/a/b/c/short.txt", 14), ".../short.txt");
+    }
+
+    #[test]
+    fn zero_budget_never_emits_an_ellipsis() {
+        for text in ["hello", "数据—flow", "hello\nworld"] {
+            assert_eq!(truncate_line(text, 0), "");
+        }
+        for path in ["/a/b/file.txt", "/a/b/", "文件/路径/", ""] {
+            assert_eq!(shorten_path(path, 0), "");
+        }
+    }
+
+    #[test]
+    fn previews_respect_every_small_unicode_budget() {
+        for text in ["hello world", "数据—flow", "hello\nworld", ""] {
+            for budget in 0..=10 {
+                let preview = truncate_line(text, budget);
+                assert!(
+                    preview.chars().count() <= budget,
+                    "truncate_line over budget {budget}: {preview}"
+                );
+            }
+        }
+        for path in ["/a/b/file.txt", "/a/b/", "数据/路径/", "", "filename.txt"] {
+            for budget in 0..=10 {
+                let preview = shorten_path(path, budget);
+                assert!(
+                    preview.chars().count() <= budget,
+                    "shorten_path over budget {budget}: {preview}"
+                );
+            }
+        }
     }
 
     #[test]
