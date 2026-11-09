@@ -1049,7 +1049,18 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         ));
     }
     for (scenario, rounds, warm_context, polls, statements, elapsed_ms) in &budgets {
-        assert_scoped_sql_budget(statements, 23, *elapsed_ms);
+        // A warm request restores its prior canonical Context once before
+        // execution, in addition to the observer's captured-head materialization.
+        // This is required history work, independent of readonly tool rounds.
+        let context_reads = statements
+            .iter()
+            .filter(|sql| {
+                sql.starts_with("SELECT m.manifest_root,")
+                    && sql.contains("FROM conversation_manifest_nodes")
+            })
+            .count();
+        assert_eq!(context_reads, 1 + usize::from(*warm_context));
+        assert_scoped_sql_budget(statements, 23 + usize::from(*warm_context), *elapsed_ms);
         let authentication_reads = authentication_snapshot_count(statements);
         if *scenario == "ordinary" {
             continue;
@@ -2078,20 +2089,32 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             handle.await.unwrap();
         }
         let statements = capture.0.lock().unwrap().take().unwrap();
+        // The shared HTTP fixture renews its test-account cleanup lease every
+        // 30s. That timer can overlap either 5.2s interval. Keep it in the raw
+        // total and account for this exact fixture-only statement separately;
+        // never allow an observation write or arbitrary query in an idle lane.
+        let fixture_heartbeat_sql = "UPDATE auth_users SET last_login_at = CURRENT_TIMESTAMP(6) WHERE user_id = ? AND is_active = 1";
+        let fixture_heartbeats = statements
+            .iter()
+            .filter(|q| q.sql == fixture_heartbeat_sql)
+            .count();
+        assert!(fixture_heartbeats <= 1);
         assert!(
-            (2..=8).contains(&statements.len()),
+            (2..=8).contains(&(statements.len() - fixture_heartbeats)),
             "idle fleet SQL grew with history: {}",
             statements.len()
         );
         assert!(
-            statements.iter().all(|q| q
-                .sql
-                .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
-                && q.sql.contains("LIMIT 64")),
-            "idle recovery must only poll due identities"
+            statements.iter().all(|q| q.sql == fixture_heartbeat_sql
+                || (q
+                    .sql
+                    .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
+                    && q.sql.contains("LIMIT 64"))),
+            "idle recovery must only poll due identities: {:?}",
+            statements.iter().map(|q| &q.sql).collect::<Vec<_>>()
         );
         eprintln!(
-            "observation_sql fleet=2 phase=idle retained={retained} seconds=5.2 raw_total={}",
+            "observation_sql fleet=2 phase=idle retained={retained} seconds=5.2 fixture_heartbeats={fixture_heartbeats} raw_total={}",
             statements.len()
         );
     }

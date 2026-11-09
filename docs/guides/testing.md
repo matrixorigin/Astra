@@ -627,8 +627,10 @@ cargo test -p astra-runtime --features e2e-hooks --test chat_sql_budget \
   ordinary_chat_and_readonly_rounds_have_bounded_total_sql -- --ignored --exact --nocapture
 ```
 
-The scoped nonperiodic limits are 23 statements for ordinary chat, 33 for Auto
-and 20 with observation unconfigured. Every SQL statement remains in the raw
+The scoped nonperiodic limits are 23 statements for a cold ordinary chat, 24
+for a warm chat, 33 for Auto and 20 with observation unconfigured. Warm chat
+restores prior canonical Context once in addition to the observer's captured-head
+read; the test asserts those reads explicitly. Every SQL statement remains in the raw
 total. At most one exact account/session authentication snapshot is allowed;
 exact control reads have a separate bound of `ceil(measured_elapsed_ms / 2000)`.
 Thus the raw envelope is the core limit plus that snapshot and the elapsed timer
@@ -656,8 +658,10 @@ capture includes **all** observation-recovery statements with the synthetic
 observer, receipt verification polls and arrival setup. Authority/HTTP SQL is
 covered by the scoped integration probes; unrelated Server maintenance loops
 are outside this observation scheduler fixture. It then restarts two idle owners for 5.2 seconds, first with the
-observed history retained and then deleted. Each interval must contain only due
-reads (at most eight total), with no lease writes or transcript reads. This makes
+observed history retained and then deleted. Observation SQL must contain only due
+reads (at most eight total), with no lease writes or transcript reads. The HTTP
+fixture's exact 30-second test-account heartbeat is reported separately (at most
+one per interval) and remains in the bounded raw total. No SQL is discarded. This makes
 idle fleet cost visible independently of the marginal per-Session attempt.
 The test first verifies named independent Sessions progress while a call remains
 held, then cancels that owner and separately waits for the full backlog and paced
