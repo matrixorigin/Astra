@@ -682,6 +682,44 @@ acknowledging an older turn while a newer one remains pending. Expired claims an
 stale receipts must fail rather than appear acknowledged. Synthetic plan bodies
 are never decoded as application content.
 
+`repeated_chat_observation_has_linear_history_work` complements those scoped and
+catalog probes with 8 concurrent public `/chat/stream` Sessions over 16 rounds,
+two real unscoped recovery owners, and the production HTTP observer talking to
+an authenticated loopback Memoria stub. Capture starts before discovery and ends
+after every observation has a durable receipt. All request, discovery, competing
+claim, materialization, authority, checkpoint, fixture-heartbeat and verification
+SQL remains in the raw total.
+The workload creates its own database so unscoped owners cannot process another
+test's Sessions in a shared catalog. It does not scope discovery to the test user.
+The profile uses the supported static self-hosted
+authority port; the existing scoped probe separately measures database-resolved
+authority. It is not an MOI/UC network latency benchmark.
+
+Each round asserts exactly 8 observation manifest rows and 16 outgoing messages;
+read JSON bytes stay near the first-round amount and the HTTP payload size stays
+constant with fixed-size synthetic facts. The stub also checks the current turn's
+content, so repeatedly sending an old or empty payload cannot satisfy the budget.
+`CanonicalObservationRead` counts serialized manifest/content JSON returned by
+storage, excluding claim/checkpoint metadata, fork-lineage metadata, physical disk
+or MySQL protocol bytes. Prepared plans separately
+check actual storage scan input for the same-generation suffix predicate. The
+report includes complete raw SQL and SQLx returned rows, separately identified verification/control/
+fixture and exact SQLx pool-initialization queries, summed SQL time, response completion time and receipt completion
+time. A separate frontend bound retains at most 17 core statements per warm
+request in this static-authority profile, plus bounded exact authentication reads. Pool
+initialization has its own connection-count bound and remains in raw totals. The
+four claim/checkpoint statements, one content read, discovery and competing
+claims are disclosed separately and remain in the complete raw ceiling.
+Its raw ceiling is deliberately above the former volatile 20-statement
+budget: this test bounds and discloses coordination cost, not a claim that durable
+recovery reduces statement counts. No captured SQL is discarded.
+
+Run the exact ignored test in its own process. The services regression also
+checks 20 valid turns, coalesced unacknowledged suffixes, concurrent completions,
+replacement, divergent roots/totals/owners and stale/expired acknowledgements.
+The HMAC fork journey checks the first inherited snapshot, incremental child
+observation, and recovery after ancestor deletion and collection.
+
 Run it with `ASTRA_TEST_DB_IT=1 cargo test -p astra-services --lib
 session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
 -- --exact --ignored --nocapture` against a dedicated local database.

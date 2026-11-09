@@ -8,7 +8,7 @@
 //! `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
 
 #[path = "../support/memoria_observer_auth.rs"]
-mod memoria_observer_auth;
+pub(super) mod memoria_observer_auth;
 
 use std::sync::Arc;
 

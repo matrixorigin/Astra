@@ -232,7 +232,7 @@ async fn prime_chat_pool(ctx: &MatrixE2eCtx) {
 }
 
 #[derive(Default)]
-struct Statement(String, f64);
+struct Statement(String, f64, u64);
 
 impl tracing::field::Visit for Statement {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -249,6 +249,12 @@ impl tracing::field::Visit for Statement {
         }
     }
 
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "rows_returned" {
+            self.2 = value;
+        }
+    }
+
     fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
 }
 
@@ -256,6 +262,7 @@ struct ObservedSql {
     sql: String,
     elapsed: std::time::Duration,
     finished_at: std::time::Instant,
+    returned_rows: u64,
 }
 
 #[derive(Clone, Default)]
@@ -317,12 +324,49 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SqlCapture {
                 sql: statement.0,
                 elapsed: std::time::Duration::from_secs_f64(statement.1),
                 finished_at: std::time::Instant::now(),
+                returned_rows: statement.2,
             });
         }
     }
 }
 
 const CONTROL_OBSERVATION_SQL: &str = "SELECT requested.ordinal, run_id, session_id, status, waiting_for, parent_run_id, ancestor_path, run_generation, last_event_idx, CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested, CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live FROM (VALUES ROW(0,?,?)) requested(ordinal, requested_user_id, requested_run_id) LEFT JOIN agent_runs ON user_id = requested_user_id AND run_id = requested_run_id AND run_id IN (?)";
+
+// The real shared control reader batches concurrently active Runs. Match its
+// exact statement for 1..=8 keys, including ordinal and candidate-IN cardinality,
+// rather than classifying any SELECT against agent_runs as periodic work.
+fn is_eight_session_control_observation(sql: &str) -> bool {
+    if !sql.starts_with("SELECT requested.ordinal, run_id,") {
+        return false;
+    }
+    (1..=8).any(|slots| {
+        let rows = (0..slots)
+            .map(|i| format!("ROW({i},?,?)"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let candidates = vec!["?"; slots].join(",");
+        sql == CONTROL_OBSERVATION_SQL
+            .replace("FROM (VALUES ROW(0,?,?))", &format!("FROM (VALUES {rows})"))
+            .replace("run_id IN (?)", &format!("run_id IN ({candidates})"))
+    })
+}
+
+#[test]
+fn batched_control_accounting_requires_the_exact_eight_session_contract() {
+    assert!(is_eight_session_control_observation(
+        CONTROL_OBSERVATION_SQL
+    ));
+    let batch = CONTROL_OBSERVATION_SQL
+        .replace("ROW(0,?,?)", "ROW(0,?,?),ROW(1,?,?)")
+        .replace("run_id IN (?)", "run_id IN (?,?)");
+    assert!(is_eight_session_control_observation(&batch));
+    assert!(!is_eight_session_control_observation(
+        &batch.replace("IN (?,?)", "IN (?)")
+    ));
+    assert!(!is_eight_session_control_observation(&format!(
+        "{batch} UNION ALL SELECT 1"
+    )));
+}
 
 // The account/session snapshot is cached for 30 seconds. A slow fixture can
 // cross that boundary independently of readonly tool rounds. Attribute only
@@ -1073,8 +1117,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         let context_reads = statements
             .iter()
             .filter(|sql| {
-                sql.starts_with("SELECT m.manifest_root,")
-                    && sql.contains("FROM conversation_manifest_nodes")
+                sql.starts_with("SELECT ") && sql.contains("FROM conversation_manifest_nodes")
             })
             .count();
         assert_eq!(context_reads, 1 + usize::from(*warm_context));
@@ -2145,6 +2188,310 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             statements.len()
         );
     }
+    b.ctx.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+}
+
+/// Full public request + real unscoped recovery + production HTTP observer.
+/// Repeated turns, rather than many one-turn Sessions, expose quadratic history work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn repeated_chat_observation_has_linear_history_work() {
+    require_system_e2e_env();
+    let capture = SqlCapture::default();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
+        .unwrap();
+    // A real unscoped owner must not consume other concurrently running test
+    // fixtures in the shared catalog. Give this entire workload its own schema.
+    use sqlx::Connection;
+    let mut settings = astra_core::MatrixOneSettings::from_env();
+    settings.database = "mysql".into();
+    let mut admin = sqlx::MySqlConnection::connect(&settings.database_url_with_password())
+        .await
+        .unwrap();
+    let database = format!(
+        "astra_test_http_handoff_round_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    let b = bootstrap_isolated_execution_handoff(database.clone()).await;
+    let sessions: Vec<_> = (0..8).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for session in &sessions {
+        sqlx::query("INSERT INTO agent_sessions (user_id,session_id,status) VALUES (?,?,'active')")
+            .bind(&b.ctx.user_id)
+            .bind(session)
+            .execute(&b.ctx.pool)
+            .await
+            .unwrap();
+    }
+    let model = format!("mock-{}", b.ctx.suffix);
+    let responses = (0..128)
+        .map(|_| {
+            answer(
+                json!({"role":"assistant","content":"Synthetic answer. ".repeat(32)}),
+                "stop",
+            )
+        })
+        .collect();
+    b.ctx
+        .install_native_provider(
+            &b.auth_header,
+            vec![ProviderScript::new(
+                "repeated concurrent observation",
+                move |request| request.body["model"] == model,
+                responses,
+            )],
+        )
+        .await;
+    let bodies: Arc<Mutex<Vec<(Value, usize)>>> = Arc::default();
+    let recorded = bodies.clone();
+    let app = axum::Router::new().route(
+        "/v1/observe",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let recorded = recorded.clone();
+                async move {
+                    if let Err(status) = memoria_observer_auth::validate_observer_auth(
+                        &headers,
+                        "synthetic-master-key",
+                        None,
+                    ) {
+                        return status;
+                    }
+                    let value = serde_json::from_slice(&body).unwrap();
+                    recorded.lock().unwrap().push((value, body.len()));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let state = b.ctx.app_state.clone().with_turn_observer_worker(Arc::new(
+        astra_runtime::DatabaseTurnObserverWorker::new(Some(Arc::new(
+            astra_runtime::HttpMemoriaPort::self_hosted(url, "synthetic-master-key".into()),
+        ))),
+    ));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut owners = Vec::new();
+    // Start capture before discovery: no prepared scoped claim or excluded SQL.
+    let measurement_start = std::time::Instant::now();
+    *capture.0.lock().unwrap() = Some(Vec::new());
+    for _ in 0..2 {
+        let owner =
+            astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new_catalog(
+                &state,
+            )
+            .await
+            .unwrap();
+        let token = cancel.clone();
+        owners.push(tokio::spawn(async move {
+            owner.run(token).await;
+        }));
+    }
+    let mut first_read_bytes = 0;
+    let mut first_payload_bytes = 0;
+    for turn in 1..=16 {
+        let history =
+            astra_core::history_work::HistoryWorkScenario::begin("repeated-observation").unwrap();
+        let start = std::time::Instant::now();
+        let results = futures_util::future::join_all(sessions.iter().map(|session| {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", &b.auth_header)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({
+                        "message":format!("turn={turn:02} {}", "Synthetic fact. ".repeat(32)),
+                        "session_id":session,"model_selection":seeded_model_selection(&b.ctx)
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            collect_full_sse_stream(&b.ctx.app, request, 60)
+        }))
+        .await;
+        for (status, body) in results {
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert!(
+                parse_sse_events(&body)
+                    .iter()
+                    .any(|event| event["type"] == "run_finished" && event["status"] == "completed"),
+                "{body}"
+            );
+        }
+        let response_ms = start.elapsed().as_millis();
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            loop {
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE owner_user_id=? AND JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.observed_turn'))=? AND observation_lease_token IS NULL")
+                    .bind(&b.ctx.user_id).bind(turn.to_string()).fetch_one(&b.ctx.pool).await.unwrap();
+                if count == 8 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }).await.expect("all public chat turns must receive durable observation receipts");
+        let report = history.finish().unwrap();
+        let read = report
+            .scoped
+            .measurement(astra_core::history_work::HistoryWorkSite::CanonicalObservationRead);
+        assert_eq!(read.rows, 8, "each Session must read only its new manifest");
+        // Measure the actual received buffer, independent of optional tracing
+        // instrumentation and without serializing the payload again to count it.
+        let payload_bytes: u64 = {
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), turn * 8);
+            bodies[(turn - 1) * 8..]
+                .iter()
+                .map(|(_, bytes)| *bytes as u64)
+                .sum()
+        };
+        if turn == 1 {
+            first_read_bytes = read.bytes;
+            first_payload_bytes = payload_bytes;
+        }
+        assert!(
+            read.bytes <= first_read_bytes + 1024,
+            "history JSON grew with prior turns"
+        );
+        assert_eq!(
+            payload_bytes, first_payload_bytes,
+            "HTTP payload must not include prior turns"
+        );
+        {
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), turn * 8);
+            for (body, _) in &bodies[(turn - 1) * 8..] {
+                let messages = body["messages"].as_array().unwrap();
+                assert_eq!(messages.len(), 2);
+                assert!(
+                    messages[0]["content"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("turn={turn:02} "))
+                );
+            }
+        }
+        eprintln!(
+            "observation_round sessions=8 turn={turn} response_ms={response_ms} receipt_ms={} read_rows={} read_json_bytes={} payload_bytes={}",
+            start.elapsed().as_millis(),
+            read.rows,
+            read.bytes,
+            payload_bytes
+        );
+    }
+    cancel.cancel();
+    for owner in owners {
+        owner.await.unwrap();
+    }
+    let raw = capture.0.lock().unwrap().take().unwrap();
+    let verification = raw
+        .iter()
+        .filter(|sample| {
+            sample
+                .sql
+                .starts_with("SELECT COUNT(*) FROM session_context_heads")
+        })
+        .count();
+    let controls = raw
+        .iter()
+        .filter(|sample| is_eight_session_control_observation(&sample.sql))
+        .count();
+    assert!(controls <= 8 * measurement_start.elapsed().as_millis().div_ceil(2_000) as usize);
+    let heartbeats = raw
+        .iter()
+        .filter(|sample| {
+            sample
+                .sql
+                .starts_with("UPDATE auth_users SET last_login_at")
+        })
+        .count();
+    let metadata = raw
+        .iter()
+        .filter(|sample| {
+            sample
+                .sql
+                .starts_with("UPDATE session_context_heads SET observation_lease_token")
+                || sample
+                    .sql
+                    .starts_with("SELECT head_json, completed_turn, observation_json")
+                || sample
+                    .sql
+                    .starts_with("UPDATE session_context_heads SET observation_json")
+                || sample.sql.starts_with(
+                    "SELECT JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.receipt_id'))",
+                )
+        })
+        .count();
+    let discovery = raw
+        .iter()
+        .filter(|sample| {
+            sample
+                .sql
+                .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
+        })
+        .count();
+    let authentication = raw
+        .iter()
+        .filter(|sample| sample.sql == AUTHENTICATION_SNAPSHOT_SQL)
+        .count();
+    assert!(
+        authentication <= 128,
+        "at most one authentication snapshot per request in this workload"
+    );
+    let pool_setup = raw.iter().filter(|sample| sample.sql == "SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4;").count();
+    assert!(
+        pool_setup
+            <= (b.ctx.pool.options().get_max_connections()
+                + b.ctx.shared_pool.get().options().get_max_connections()) as usize
+    );
+    // Retain a strict frontend bound as well as the complete raw ceiling. In
+    // this static-authority profile, each warm request uses 17 core statements;
+    // each successful observer adds 4 receipt/claim statements + 1 content read.
+    // Losing claims and discovery remain in raw, separately counted, not hidden.
+    let frontend =
+        raw.len() - metadata - discovery - verification - controls - heartbeats - pool_setup - 128;
+    eprintln!(
+        "observation_sql_breakdown raw={} frontend={frontend} metadata={metadata} discovery={discovery} verification={verification} controls={controls} fixture_heartbeats={heartbeats} authentication={authentication} pool_setup={pool_setup}",
+        raw.len()
+    );
+    if frontend > 17 * 128 + authentication {
+        let mut shapes = std::collections::BTreeMap::new();
+        for sample in &raw {
+            *shapes
+                .entry(sample.sql.chars().take(150).collect::<String>())
+                .or_insert(0_usize) += 1;
+        }
+        eprintln!("observation_sql_shape_counts={shapes:?}");
+    }
+    assert!(
+        frontend <= 17 * 128 + authentication,
+        "frontend SQL grew beyond its canonical request contract: {frontend}"
+    );
+    assert!(
+        raw.len() <= 32 * 128 + verification + controls + heartbeats,
+        "full public chat plus two-owner recovery SQL: {}",
+        raw.len()
+    );
+    eprintln!(
+        "observation_repeated sessions=8 turns=16 raw_sql={} frontend_sql={frontend} recovery_metadata_sql={metadata} discovery_sql={discovery} verification_sql={verification} control_sql={controls} fixture_heartbeat_sql={heartbeats} pool_setup_sql={pool_setup} sql_elapsed_ms={:.0} returned_rows={}",
+        raw.len(),
+        raw.iter()
+            .map(|q| q.elapsed.as_secs_f64() * 1000.0)
+            .sum::<f64>(),
+        raw.iter().map(|q| q.returned_rows).sum::<u64>()
+    );
+    assert!(raw.iter().map(|q| q.returned_rows).sum::<u64>() >= 128);
+    server.abort();
+    let _ = server.await;
     b.ctx.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
         .execute(&mut admin)
