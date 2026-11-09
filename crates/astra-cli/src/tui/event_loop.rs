@@ -5389,6 +5389,7 @@ struct AgentGuideContext {
     target: crate::tui::agent_run_projection::AgentControlTarget,
     auth: AgentActionAuth,
     observation: tokio_util::sync::CancellationToken,
+    recheck_in_flight: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for AgentGuideContext {
@@ -5405,6 +5406,16 @@ impl std::fmt::Debug for AgentGuideContext {
 impl Drop for AgentGuideContext {
     fn drop(&mut self) {
         self.observation.cancel();
+    }
+}
+
+struct AgentGuideRecheck(Arc<AgentGuideContext>);
+
+impl Drop for AgentGuideRecheck {
+    fn drop(&mut self) {
+        self.0
+            .recheck_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -5428,6 +5439,7 @@ impl AgentGuideTarget {
             target: self.0.target.clone(),
             auth: self.0.auth.clone(),
             observation: tokio_util::sync::CancellationToken::new(),
+            recheck_in_flight: std::sync::atomic::AtomicBool::new(false),
         }))
     }
     pub(crate) fn capture(
@@ -5452,6 +5464,7 @@ impl AgentGuideTarget {
             target,
             auth,
             observation: tokio_util::sync::CancellationToken::new(),
+            recheck_in_flight: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -5499,6 +5512,19 @@ impl AgentGuideTarget {
 
     pub(crate) fn retire_observation(&self) {
         self.0.observation.cancel();
+    }
+
+    fn begin_recheck(&self) -> Option<AgentGuideRecheck> {
+        self.0
+            .recheck_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| AgentGuideRecheck(self.0.clone()))
     }
 }
 
@@ -6068,16 +6094,18 @@ fn open_recoverable_guidance(
     backends: &ViewActionBackends,
     bottom_pane: &mut BottomPane,
 ) {
-    if bottom_pane.activate_recoverable_guidance(&intent) {
-        return;
-    }
+    let already_open = bottom_pane.activate_recoverable_guidance(&intent);
     match intent.target {
-        bottom_pane::PendingUserIntentTarget::ActiveRun => bottom_pane.push_view(Box::new(
-            bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
-                intent.intent_id,
-                &intent.text,
-            ),
-        )),
+        bottom_pane::PendingUserIntentTarget::ActiveRun => {
+            if !already_open {
+                bottom_pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                        intent.intent_id,
+                        &intent.text,
+                    ),
+                ));
+            }
+        }
         bottom_pane::PendingUserIntentTarget::AgentRun { target } => {
             let recipient = AgentGuideTarget::capture(
                 target.agent_name().to_owned(),
@@ -6089,17 +6117,22 @@ fn open_recoverable_guidance(
                 backends.turn_auth.clone(),
             );
             let uncertain = intent.status != astra_turn_types::UserIntentStatus::Returned;
+            if already_open {
+                bottom_pane.refresh_agent_guide_recipient(&target, &intent.intent_id, &recipient);
+            }
             if uncertain
                 && matches!(
                     &recipient.0.target,
                     crate::tui::agent_run_projection::AgentControlTarget::DurableRun { .. }
                 )
+                && let Some(guard) = target.begin_recheck()
             {
                 let lookup_target = recipient.clone();
                 let original_target = target.clone();
                 let intent_id = intent.intent_id.clone();
                 let outcome_tx = backends.agent_workbench_tx.clone();
                 tokio::spawn(async move {
+                    let _guard = guard;
                     let status =
                         authorized_guide_status(&lookup_target, None, None, &intent_id).await;
                     if !lookup_target.0.owner.is_current() {
@@ -6123,15 +6156,17 @@ fn open_recoverable_guidance(
                     let _ = outcome_tx.send(outcome).await;
                 });
             }
-            bottom_pane.push_view(Box::new(
-                bottom_pane::task_input_view::TaskInputView::returned(
-                    target,
-                    recipient,
-                    intent.intent_id,
-                    &intent.text,
-                    uncertain,
-                ),
-            ));
+            if !already_open {
+                bottom_pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::returned(
+                        target,
+                        recipient,
+                        intent.intent_id,
+                        &intent.text,
+                        uncertain,
+                    ),
+                ));
+            }
         }
     }
 }
@@ -22927,6 +22962,11 @@ mod tests {
         let second = first.for_delivery();
         let mut pane = BottomPane::new();
         pane.set_session_attachment(Some("session"), 3);
+        pane.set_root_intent_scope(Arc::new(bottom_pane::RootIntentScope::new(
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            3,
+            Arc::new(std::sync::Mutex::new(Some("session".into()))),
+        )));
         pane.try_accept_user_intent(
             "root",
             astra_turn_types::UserIntentDelivery::GuideCurrentRun,
@@ -22956,6 +22996,176 @@ mod tests {
         assert!(render_bottom_pane_text(&pane, 100, 20).contains("root draft edited"));
         pane.set_session_attachment(Some("other"), 4);
         assert!(pane.next_recoverable_guidance("root").is_none());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolved_child_draft_can_visit_the_only_other_message_and_return() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("resolved-draft-owner"),
+        )
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let backends = ViewActionBackends {
+            agent_spawner: None,
+            api,
+            profile: None,
+            session_id: Some("session".into()),
+            session_attachment_epoch: 3,
+            turn_auth: None,
+            file_writer: None,
+            agent_workbench_tx: tx.clone(),
+            native_delivery_refresh: Default::default(),
+        };
+        let first = test_member_guide_target(Some("session".into()), 3).for_delivery();
+        let second = first.for_delivery();
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        assert!(pane.accept_agent_guide("first".into(), first.clone(), "first draft".into()));
+        assert!(pane.mark_user_intent_unconfirmed("first"));
+        assert!(pane.accept_agent_guide("second".into(), second.clone(), "second draft".into()));
+        assert!(pane.mark_agent_guide_returned("second", &second));
+        let intent = pane
+            .returned_agent_guide(Some("session"), 3, Some("first"))
+            .unwrap()
+            .clone();
+        open_recoverable_guidance(intent, &backends, &mut pane);
+        pane.handle_paste(" edited");
+        tx.try_send(AgentWorkbenchOutcome::GuideApplied {
+            intent_id: "first".into(),
+            target: first,
+        })
+        .unwrap();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(matches!(pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'), crossterm::event::KeyModifiers::ALT,
+        )), BottomPaneAction::ViewAction(BottomPaneViewAction::NextRecoverableGuidance { after_intent_id }) if after_intent_id == "first"));
+        let next = pane.next_recoverable_guidance("first").unwrap();
+        assert_eq!(next.intent_id, "second");
+        open_recoverable_guidance(next, &backends, &mut pane);
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("first draft edited"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn reopening_unknown_child_rechecks_once_and_keeps_edits() {
+        use astra_credentials::{CredentialsFile, Profile};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("recheck-owner".into()),
+                access_token: Some("token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("recheck-owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/member-run/intents/guide"))
+            .respond_with(move |_: &wiremock::Request| {
+                let index = observed.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(60))
+                    .set_body_json(if index == 0 {
+                        "accepted_remote"
+                    } else {
+                        "returned"
+                    })
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let backends = ViewActionBackends {
+            agent_spawner: None,
+            api,
+            profile: None,
+            session_id: Some("session".into()),
+            session_attachment_epoch: 3,
+            turn_auth: None,
+            file_writer: None,
+            agent_workbench_tx: tx,
+            native_delivery_refresh: Default::default(),
+        };
+        let target = test_member_guide_target(Some("session".into()), 3).for_delivery();
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        assert!(pane.accept_agent_guide("guide".into(), target.clone(), "draft".into()));
+        assert!(pane.mark_user_intent_unconfirmed("guide"));
+        let intent = pane
+            .returned_agent_guide(Some("session"), 3, Some("guide"))
+            .unwrap()
+            .clone();
+        open_recoverable_guidance(intent.clone(), &backends, &mut pane);
+        pane.handle_paste(" edited");
+        open_recoverable_guidance(intent.clone(), &backends, &mut pane);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) < 1
+                || target.0.recheck_in_flight.load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "duplicate gestures share the pending lookup"
+        );
+        assert_eq!(
+            pane.next_recoverable_guidance("guide").unwrap().intent_id,
+            "guide"
+        );
+        open_recoverable_guidance(intent, &backends, &mut pane);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        let rendered = render_bottom_pane_text(&pane, 100, 20);
+        assert!(rendered.contains("draft edited"), "{rendered}");
+        assert!(matches!(pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE,
+        )), BottomPaneAction::ViewAction(BottomPaneViewAction::RetryReturnedAgentGuide { content, .. }) if content == "draft edited"));
     }
 
     #[serial_test::serial]

@@ -17281,18 +17281,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ));
         }
 
-        let durable = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let source_key = format!("user_intent:{intent_id}");
+        let durable = self
+            .run_engine
+            .store()
+            .load_run_guidance_preflight(&user_id, &run_id, &source_key)
+            .await
+            .map_err(Self::durable_read_error)?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         // An admitted source already passed native input validation. Retry
         // reconciliation belongs to the atomic admission owner, including
         // immutable-content conflicts and terminal runs; it must not depend
         // on the current collaborator directory being available.
-        let source_key = format!("user_intent:{intent_id}");
-        let source_already_admitted = durable.events.iter().any(|event| {
-            event.get("idempotency_key").and_then(Value::as_str) == Some(source_key.as_str())
-        });
         let native_target = if input.delivery
             == astra_turn_types::UserIntentDelivery::GuideCurrentRun
-            && !source_already_admitted
+            && !durable.source_already_admitted
         {
             self.native_collaborator_target(&durable)
                 .await
@@ -18186,7 +18189,7 @@ impl AgenticRunLifecycleService {
     /// only on this explicit control path; ordinary turns do not pay for it.
     async fn native_collaborator_target(
         &self,
-        run: &DurableRunRecord,
+        run: &astra_services::runs::RunGuidancePreflight,
     ) -> Result<Option<astra_messaging::AgentAddress>, astra_services::runs::RunAdmissionError>
     {
         let Some(agent_id) = run.agent_id.as_deref().map(str::trim) else {
@@ -18195,7 +18198,7 @@ impl AgenticRunLifecycleService {
         if agent_id.is_empty() {
             return Ok(None);
         }
-        if native_stage_admitted_on_run(run) {
+        if run.native_anchor {
             return Ok(Some(astra_messaging::AgentAddress::new(
                 run.run_id.clone(),
                 agent_id,
@@ -18222,19 +18225,6 @@ impl AgenticRunLifecycleService {
             }
         }
     }
-}
-
-/// Find the native child target from stage admission facts already present on
-/// the requested run. The run record is the capability fact; no model name,
-/// executable version, or display label is consulted.
-fn native_stage_admitted_on_run(run: &DurableRunRecord) -> bool {
-    run.events.iter().rev().any(|event| {
-        event.get("event_type").and_then(Value::as_str) == Some("collaborator_stage_admitted")
-            && serde_json::from_value::<astra_services::runs::CollaboratorStageAdmission>(
-                event.get("admission").cloned().unwrap_or(Value::Null),
-            )
-            .is_ok_and(|admission| admission.anchor_run_id == run.run_id)
-    })
 }
 
 impl AgenticRunLifecycleService {

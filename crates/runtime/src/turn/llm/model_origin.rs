@@ -190,13 +190,6 @@ fn foreign(
         return Ok(true);
     }
     if origin.run_id == scope.run_id
-        && origin.selection_revision == scope.selection_revision
-        && origin.route != scope.route
-    {
-        // A route drift without an admitted user selection is not a handoff.
-        return Err(invalid());
-    }
-    if origin.run_id == scope.run_id
         && origin.selection_revision.unwrap_or(-1) > scope.selection_revision.unwrap_or(-1)
     {
         return Err(invalid());
@@ -557,7 +550,10 @@ mod tests {
         assert!(verify_projected(&second, &messages).is_err());
 
         let drift = scope(&key, "different-route", None);
-        assert!(project(&drift, &messages).is_err());
+        let rotated = project(&drift, &messages).unwrap();
+        verify_projected(&drift, &rotated).unwrap();
+        assert!(rotated[1].get("reasoning_content").is_none());
+        assert_eq!(rotated[2]["content"], "found");
     }
 
     #[test]

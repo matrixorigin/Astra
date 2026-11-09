@@ -35069,6 +35069,37 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             intent.status,
             astra_turn_types::UserIntentStatus::AcceptedRemote
         );
+        let retry = service
+            .submit_run_user_intent(
+                identity.run_id.clone(),
+                user.clone(),
+                RunUserIntentData {
+                    intent_id: "during-question".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    input: json!({"content":"Also consider this constraint."}),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.event_index, intent.event_index);
+        let conflict = service
+            .submit_run_user_intent(
+                identity.run_id.clone(),
+                user.clone(),
+                RunUserIntentData {
+                    intent_id: "during-question".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    input: json!({"content":"A different message."}),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+        assert_eq!(
+            conflict.1.0.error_code.as_deref(),
+            Some("run_intent_identity_conflict")
+        );
         assert!(
             mailbox.try_recv().is_none(),
             "guidance has only one durable source"

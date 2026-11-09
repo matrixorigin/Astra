@@ -274,6 +274,14 @@ pub(crate) trait BottomPaneView: Send {
         false
     }
 
+    fn refresh_agent_guide_recipient(
+        &mut self,
+        _target: &crate::tui::event_loop::AgentGuideTarget,
+        _intent_id: &str,
+        _recipient: &crate::tui::event_loop::AgentGuideTarget,
+    ) {
+    }
+
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         CancellationEvent::Escalate
     }

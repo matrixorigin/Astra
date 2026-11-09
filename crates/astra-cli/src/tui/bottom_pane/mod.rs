@@ -473,7 +473,7 @@ impl BottomPane {
                 }
             })
             .collect();
-        if candidates.len() < 2 {
+        if candidates.is_empty() {
             return None;
         }
         let next = candidates
@@ -934,6 +934,17 @@ impl BottomPane {
     ) {
         for view in &mut self.view_stack {
             view.resolve_agent_guide(target, intent_id, status);
+        }
+    }
+
+    pub(crate) fn refresh_agent_guide_recipient(
+        &mut self,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        recipient: &crate::tui::event_loop::AgentGuideTarget,
+    ) {
+        for view in &mut self.view_stack {
+            view.refresh_agent_guide_recipient(target, intent_id, recipient);
         }
     }
 

@@ -39,6 +39,7 @@ enum InputPurpose {
 
 pub(crate) struct TaskInputView {
     purpose: InputPurpose,
+    recovery_navigation_id: Option<String>,
     input: TextArea,
     error: Option<String>,
     acknowledged_unknown: Vec<String>,
@@ -61,6 +62,7 @@ impl TaskInputView {
                 task_id,
                 attachment_epoch,
             },
+            recovery_navigation_id: None,
             input,
             error,
             acknowledged_unknown: Vec::new(),
@@ -72,6 +74,7 @@ impl TaskInputView {
     pub(crate) fn new(target: crate::tui::event_loop::AgentGuideTarget) -> Self {
         Self {
             purpose: InputPurpose::Guide(target),
+            recovery_navigation_id: None,
             input: TextArea::new(),
             error: None,
             acknowledged_unknown: Vec::new(),
@@ -90,6 +93,7 @@ impl TaskInputView {
         input.set_text(&draft);
         Self {
             purpose: InputPurpose::Continue(target),
+            recovery_navigation_id: None,
             input,
             error,
             acknowledged_unknown: Vec::new(),
@@ -118,6 +122,7 @@ impl TaskInputView {
         uncertain: bool,
     ) -> Self {
         let mut view = Self::new(target.clone());
+        view.recovery_navigation_id = Some(intent_id.clone());
         view.purpose = InputPurpose::Returned {
             target,
             recipient,
@@ -146,6 +151,7 @@ impl TaskInputView {
         let mut input = TextArea::new();
         input.set_text(text);
         Self {
+            recovery_navigation_id: Some(intent_id.clone()),
             purpose: InputPurpose::RootUnconfirmed { intent_id },
             input,
             error: None,
@@ -259,6 +265,24 @@ impl TaskInputView {
 }
 
 impl BottomPaneView for TaskInputView {
+    fn refresh_agent_guide_recipient(
+        &mut self,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        new_recipient: &crate::tui::event_loop::AgentGuideTarget,
+    ) {
+        if let InputPurpose::Returned {
+            target: original,
+            recipient,
+            intent_id: id,
+            ..
+        } = &mut self.purpose
+            && id == intent_id
+            && original.same_execution(target)
+        {
+            *recipient = new_recipient.clone();
+        }
+    }
     fn is_recoverable_guidance(&self, intent: &super::PendingUserIntent) -> bool {
         match (&self.purpose, &intent.target) {
             (
@@ -442,12 +466,7 @@ impl BottomPaneView for TaskInputView {
 
     fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers == crossterm::event::KeyModifiers::ALT && key.code == KeyCode::Char('n') {
-            let intent_id = match &self.purpose {
-                InputPurpose::RootUnconfirmed { intent_id }
-                | InputPurpose::Returned { intent_id, .. } => Some(intent_id),
-                _ => None,
-            };
-            if let Some(intent_id) = intent_id {
+            if let Some(intent_id) = &self.recovery_navigation_id {
                 self.pending_action = Some(ViewActionRequest {
                     action: BottomPaneViewAction::NextRecoverableGuidance {
                         after_intent_id: intent_id.clone(),
@@ -597,13 +616,15 @@ impl BottomPaneView for TaskInputView {
                     }
                 )
             {
-                "Alt+N next · Alt+C copy · Alt+D discard · Esc keep"
+                "Alt+N next/check · Alt+C copy · Alt+D discard · Esc keep"
             } else if matches!(self.purpose, InputPurpose::Returned { .. }) {
-                "Enter retry · Alt+N next · Alt+C copy · Alt+D discard · Esc keep original"
+                "Enter retry · Alt+N next/check · Alt+C copy · Alt+D discard · Esc keep original"
             } else if matches!(self.purpose, InputPurpose::Shell { .. }) {
                 "Enter send line · Ctrl+D close input · Esc cancel"
             } else if !self.acknowledged_unknown.is_empty() {
                 "Enter send anyway · Shift+Enter newline · Esc cancel"
+            } else if self.recovery_navigation_id.is_some() {
+                "Enter send · Alt+N next/check · Shift+Enter newline · Esc cancel"
             } else {
                 "Enter send · Shift+Enter newline · Esc cancel"
             }

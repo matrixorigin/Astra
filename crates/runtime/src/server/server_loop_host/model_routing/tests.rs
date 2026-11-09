@@ -152,6 +152,79 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
 struct Catalog {
     models: RwLock<HashMap<String, AdmittedModelExecution>>,
     separate_billing: AtomicBool,
+    admission_gate: RwLock<Option<AdmissionGate>>,
+}
+
+#[derive(Clone)]
+struct AdmissionGate {
+    model: String,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+struct LostModelAck {
+    engine: RunEngine,
+    lose_once: AtomicBool,
+}
+
+#[async_trait]
+impl crate::turn::run_control::RunStatusProvider for LostModelAck {
+    async fn run_settings_snapshot(
+        &self,
+        user: &str,
+        session: &str,
+        run: &str,
+    ) -> Result<Option<astra_services::runs::RunSettingsSnapshot>, String> {
+        self.engine.run_settings_snapshot(user, session, run).await
+    }
+    async fn finish_run_model(
+        &self,
+        user: &str,
+        session: &str,
+        run: &str,
+        outcome: &astra_turn_types::RunModelOutcome,
+        resolved: Option<&astra_services::runs::ResolvedModelSelection>,
+    ) -> Result<Option<astra_turn_types::RunModelOutcome>, String> {
+        let result = self
+            .engine
+            .finish_run_model(user, session, run, outcome, resolved)
+            .await?;
+        if self.lose_once.swap(false, Ordering::SeqCst) {
+            Err("ack lost after commit".into())
+        } else {
+            Ok(result)
+        }
+    }
+    async fn control_status(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<crate::turn::run_control::RunControlStatus>, String> {
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl crate::turn::run_control::UserIntentProvider for LostModelAck {
+    async fn poll_user_intents(
+        &self,
+        _: &str,
+        _: &str,
+        _: usize,
+    ) -> crate::turn::run_control::UserIntentPoll {
+        Default::default()
+    }
+    async fn mark_user_intents_applied(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[usize],
+        _: crate::turn::run_control::UserIntentAdmissionAuthority,
+        _: Option<crate::turn::run_control::UserIntentInvocationApplication<'_>>,
+    ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+        Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
+    }
 }
 
 fn unsupported<T>() -> Result<T, (StatusCode, Json<astra_core::ErrorResponse>)> {
@@ -171,6 +244,11 @@ impl ModelService for Catalog {
     ) -> Result<AdmittedModelExecution, (StatusCode, Json<astra_core::ErrorResponse>)> {
         if user != "router-user" {
             return unsupported();
+        }
+        let gate = self.admission_gate.read().unwrap().clone();
+        if let Some(gate) = gate.filter(|gate| gate.model == id) {
+            gate.entered.notify_one();
+            gate.release.notified().await;
         }
         self.models
             .read()
@@ -553,6 +631,323 @@ async fn explicit_model_change_applies_at_the_next_round_after_auto() {
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn newer_model_choice_wins_before_the_next_provider_request() {
+    use astra_turn_types::{ReasoningRequirement, RunModelOutcomeKind, RunModelRequest};
+    for lose_ack in [false, true] {
+        let (catalog, engine, mut host, mut state) = fixture().await;
+        let response = json!({
+            "choices":[{"message":{"content":"done"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":24}
+        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "newer_model_choice_wins_before_the_next_provider_request",
+            |request| request.path == "/v1/chat/completions",
+            vec![ProviderResponse::OpenAi(response)],
+        )])
+        .await;
+        let url = format!("{}/v1/chat/completions", provider.base_url);
+        for model in catalog.models.write().unwrap().values_mut() {
+            model.completions_url_override = Some(url.clone());
+        }
+        state.run_control = Some(Arc::new(engine.clone()));
+        crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        if lose_ack {
+            state.run_control = Some(Arc::new(LostModelAck {
+                engine: engine.clone(),
+                lose_once: AtomicBool::new(true),
+            }));
+        }
+        let run_id = state.current_run_id.clone().unwrap();
+        let request = |request_id: &str, offering_id: &str| RunModelRequest {
+            expected_session_id: "router-session".into(),
+            request_id: request_id.into(),
+            model: astra_turn_types::ModelSelection {
+                offering_id: offering_id.into(),
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+        };
+        engine
+            .request_run_model("router-user", &run_id, &request("first", "strong"))
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *catalog.admission_gate.write().unwrap() = Some(AdmissionGate {
+            model: "strong".into(),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let (prepared, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(
+                    &mut host, &mut state, 1
+                ),
+                async {
+                    entered.notified().await;
+                    engine
+                        .request_run_model("router-user", &run_id, &request("second", "economy"))
+                        .await
+                        .unwrap();
+                    release.notify_one();
+                },
+            )
+        })
+        .await
+        .expect("the paused admission must resume");
+        prepared.unwrap();
+        *catalog.admission_gate.write().unwrap() = None;
+        let snapshot = engine
+            .run_settings_snapshot("router-user", "router-session", &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .model
+                .applied
+                .as_ref()
+                .unwrap()
+                .resolved
+                .offering_id,
+            "economy"
+        );
+        assert!(matches!(
+            snapshot.model.outcome.unwrap().result,
+            RunModelOutcomeKind::Applied { .. }
+        ));
+        let run = engine
+            .load_run("router-user", &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            run.events
+                .iter()
+                .any(|event| event["data"]["change"]["kind"] == "model_outcome"
+                    && event["data"]["change"]["value"]["selection"]["request_id"] == "first"
+                    && event["data"]["change"]["value"]["result"]["status"] == "superseded")
+        );
+        state.run_control = None;
+        host.inference_owner_pod_id = Some("test-inference-owner".into());
+        host.provider_observations =
+            Some(crate::server::provider_test_support::ProviderObservationsFixture::default());
+        host.execute_turn(&mut state).await.unwrap();
+        let recorded = provider.requests.lock().await.clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].body["model"], "wire-economy");
+        provider.assert_complete();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_or_deadline_interrupts_model_admission_without_an_outcome() {
+    use astra_turn_types::{ReasoningRequirement, RunModelRequest};
+    for expire in [false, true] {
+        let (catalog, engine, mut host, mut state) = fixture().await;
+        state.run_control = Some(Arc::new(engine.clone()));
+        crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        let run_id = state.current_run_id.clone().unwrap();
+        engine
+            .request_run_model(
+                "router-user",
+                &run_id,
+                &RunModelRequest {
+                    expected_session_id: "router-session".into(),
+                    request_id: "cancelled-choice".into(),
+                    model: astra_turn_types::ModelSelection {
+                        offering_id: "strong".into(),
+                    },
+                    reasoning: ReasoningRequirement::ModelDefault,
+                },
+            )
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        *catalog.admission_gate.write().unwrap() = Some(AdmissionGate {
+            model: "strong".into(),
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        state.cancellation.token = Some(cancel.clone());
+        if expire {
+            host.execution_time_budget = Some(
+                ExecutionDeadlineAuthority::from_snapshot_at(
+                    astra_services::runs::ExecutionDeadlineSnapshot {
+                        deadline_unix_ms: 100,
+                        work_deadline_unix_ms: 100,
+                    },
+                    0,
+                )
+                .unwrap(),
+            );
+        }
+        let (prepared, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(
+                    &mut host, &mut state, 1
+                ),
+                async {
+                    entered.notified().await;
+                    if !expire {
+                        cancel.cancel();
+                    }
+                },
+            )
+        })
+        .await
+        .expect("cancellation must not wait for model admission");
+        let expected = if expire {
+            astra_core::ErrorKind::BudgetExhausted
+        } else {
+            astra_core::ErrorKind::Cancelled
+        };
+        assert!(matches!(prepared, Err(error) if error.kind == expected));
+        let snapshot = engine
+            .run_settings_snapshot("router-user", "router-session", &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            snapshot.model.outcome.is_none(),
+            "cancelled admission must not publish an outcome"
+        );
+        assert_eq!(
+            snapshot.model.requested.unwrap().request_id,
+            "cancelled-choice"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_or_deadline_interrupts_restoring_an_applied_model() {
+    use astra_turn_types::{ReasoningRequirement, RunModelSelection};
+    for expire in [false, true] {
+        let (catalog, _, mut host, mut state) = fixture().await;
+        host.admitted_model_execution = Some(catalog.models.read().unwrap()["economy"].clone());
+        let selection = RunModelSelection {
+            request_id: "applied".into(),
+            revision: 1,
+            model: astra_turn_types::ModelSelection {
+                offering_id: "strong".into(),
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+        };
+        let applied = astra_services::runs::RunModelApplied {
+            selection,
+            resolved: astra_services::runs::ResolvedModelSelection {
+                offering_id: "strong".into(),
+                model_name: "strong".into(),
+                source_identity: None,
+            },
+            reasoning: ReasoningRequirement::ModelDefault,
+            owner_generation: 0,
+            round_index: 0,
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        *catalog.admission_gate.write().unwrap() = Some(AdmissionGate {
+            model: "strong".into(),
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        state.cancellation.token = Some(cancel.clone());
+        if expire {
+            host.execution_time_budget = Some(
+                ExecutionDeadlineAuthority::from_snapshot_at(
+                    astra_services::runs::ExecutionDeadlineSnapshot {
+                        deadline_unix_ms: 100,
+                        work_deadline_unix_ms: 100,
+                    },
+                    0,
+                )
+                .unwrap(),
+            );
+        }
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(host.ensure_applied_model(&mut state, &applied), async {
+                entered.notified().await;
+                if !expire {
+                    cancel.cancel();
+                }
+            })
+        })
+        .await
+        .expect("restoring an applied model must be interruptible");
+        let expected = if expire {
+            astra_core::ErrorKind::BudgetExhausted
+        } else {
+            astra_core::ErrorKind::Cancelled
+        };
+        assert!(matches!(result, Err(error) if error.kind == expected));
+        assert_eq!(
+            host.admitted_model_execution.as_ref().unwrap().offering_id,
+            "economy"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rotated_catalog_route_preserves_public_tool_history_on_the_wire() {
+    let (catalog, _engine, mut host, mut state) = fixture().await;
+    host.model_routing = None;
+    host.inference_owner_pod_id = Some("test-inference-owner".into());
+    host.provider_observations =
+        Some(crate::server::provider_test_support::ProviderObservationsFixture::default());
+    let response = json!({"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":12,"completion_tokens":24}});
+    let provider = ProviderGateway::start(vec![ProviderScript::new(
+        "rotated_catalog_route_preserves_public_tool_history_on_the_wire",
+        |request| request.path == "/v1/chat/completions",
+        vec![ProviderResponse::OpenAi(response)],
+    )])
+    .await;
+    let mut initial = catalog.models.read().unwrap()["strong"].clone();
+    initial.api_key = "old-account".into();
+    initial.base_url = format!("{}/old", provider.base_url);
+    initial.completions_url_override =
+        Some(format!("{}/old/v1/chat/completions", provider.base_url));
+    catalog
+        .models
+        .write()
+        .unwrap()
+        .insert("strong".into(), initial.clone());
+    host.admitted_model_execution = Some(initial);
+    host.resolve_llm_config_for_state(&state).await.unwrap();
+    let mut assistant = json!({"role":"assistant", "content":"working", "reasoning_content":"old-private-reasoning",
+        "tool_calls":[{"id":"rotation-call", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]});
+    host.attest_current_model_message(&state, &mut assistant);
+    state.messages = vec![
+        json!({"role":"user","content":"inspect"}),
+        assistant,
+        json!({"role":"tool", "tool_call_id":"rotation-call", "content":"public-tool-result"}),
+    ];
+    {
+        let mut models = catalog.models.write().unwrap();
+        let updated = models.get_mut("strong").unwrap();
+        updated.api_key = "new-account".into();
+        updated.base_url = provider.base_url.clone();
+        updated.completions_url_override =
+            Some(format!("{}/v1/chat/completions", provider.base_url));
+    }
+    host.admitted_model_execution.as_mut().unwrap().admitted_at =
+        Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL;
+    let rotated = host.resolve_llm_config_for_state(&state).await.unwrap();
+    assert_eq!(rotated.api_key, "new-account");
+    host.execute_turn(&mut state).await.unwrap();
+    let requests = provider.requests.lock().await.clone();
+    assert_eq!(requests.len(), 1);
+    let wire = requests[0].body.to_string();
+    assert!(wire.contains("public-tool-result"), "{wire}");
+    assert!(!wire.contains("old-private-reasoning"), "{wire}");
+    provider.assert_complete();
 }
 
 #[tokio::test]

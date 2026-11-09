@@ -124,6 +124,37 @@ impl ServerAgenticLoopHost {
         Ok(execution)
     }
 
+    async fn admit_explicit_model_at_boundary(
+        &self,
+        state: &AgenticLoopState,
+        selection: &astra_turn_types::RunModelSelection,
+    ) -> Result<
+        Result<AdmittedModelExecution, (astra_core::ErrorKind, &'static str)>,
+        astra_core::ClassifiedError,
+    > {
+        let remaining = self
+            .execution_time_budget_remaining()
+            .map(|budget| budget.total_remaining);
+        tokio::select! {
+            biased;
+            _ = async {
+                match state.cancellation.token.as_ref() {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled, "Model selection was cancelled")),
+            _ = async {
+                match remaining {
+                    Some(remaining) => tokio::time::sleep(remaining).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::BudgetExhausted, "Execution deadline expired during model selection")),
+            result = self.admit_explicit_model(selection) => Ok(result),
+        }
+    }
+
     fn install_explicit_model(
         &mut self,
         state: &mut AgenticLoopState,
@@ -161,9 +192,14 @@ impl ServerAgenticLoopHost {
         }
         let mut selection = applied.selection.clone();
         selection.reasoning = applied.reasoning.clone();
-        let execution = self.admit_explicit_model(&selection).await.map_err(|_| {
-            invalid("The selected model is no longer available; select another model to continue")
-        })?;
+        let execution = self
+            .admit_explicit_model_at_boundary(state, &selection)
+            .await?
+            .map_err(|_| {
+                invalid(
+                    "The selected model is no longer available; select another model to continue",
+                )
+            })?;
         if execution.offering_id != applied.resolved.offering_id
             || execution.model_name != applied.resolved.model_name
             || execution.source_identity != applied.resolved.source_identity
@@ -179,45 +215,51 @@ impl ServerAgenticLoopHost {
     pub(super) async fn apply_explicit_model_settings(
         &mut self,
         state: &mut AgenticLoopState,
-        settings: astra_services::runs::RunModelSettingsSnapshot,
+        mut settings: astra_services::runs::RunModelSettingsSnapshot,
     ) -> Result<(), astra_core::ClassifiedError> {
         use astra_turn_types::{RunModelOutcome, RunModelOutcomeKind};
-        let pending = settings
-            .requested
-            .as_ref()
-            .filter(|selection| {
-                settings
-                    .outcome
-                    .as_ref()
-                    .is_none_or(|outcome| &outcome.selection != *selection)
-            })
-            .cloned();
-        let Some(selection) = pending else {
-            if let Some(applied) = settings.applied.as_ref() {
-                self.ensure_applied_model(state, applied).await?;
+        // A newer choice may arrive while the current one is being admitted.
+        // Consume the latest observed choice at this boundary before starting
+        // provider I/O. Bound retries under continuous user changes.
+        for _ in 0..8 {
+            let pending = settings
+                .requested
+                .as_ref()
+                .filter(|selection| {
+                    settings
+                        .outcome
+                        .as_ref()
+                        .is_none_or(|outcome| &outcome.selection != *selection)
+                })
+                .cloned();
+            let Some(selection) = pending else {
+                if let Some(applied) = settings.applied.as_ref() {
+                    self.ensure_applied_model(state, applied).await?;
+                }
+                return Ok(());
+            };
+            let (Some(control), Some(user_id), Some(session_id), Some(run_id), Some(generation)) = (
+                state.run_control.clone(),
+                state.owner_user_id.clone(),
+                state.current_session_id.clone(),
+                state.current_run_id.clone(),
+                state.current_run_owner_generation,
+            ) else {
+                return Err(invalid("Model change has no active execution owner"));
+            };
+            if user_id != self.user_id || session_id != self.session_id {
+                return Err(invalid("Model change does not belong to this execution"));
             }
-            return Ok(());
-        };
-        let (Some(control), Some(user_id), Some(session_id), Some(run_id), Some(generation)) = (
-            state.run_control.clone(),
-            state.owner_user_id.clone(),
-            state.current_session_id.clone(),
-            state.current_run_id.clone(),
-            state.current_run_owner_generation,
-        ) else {
-            return Err(invalid("Model change has no active execution owner"));
-        };
-        if user_id != self.user_id || session_id != self.session_id {
-            return Err(invalid("Model change does not belong to this execution"));
-        }
-        let admission = self
-            .admit_explicit_model(&selection)
-            .await
-            .and_then(|execution| {
-                if state.current_round_index == 0
-                    && let Some(limit) = self.initial_output_limit
-                {
-                    astra_turn_core::thinking_config::ThinkingConfig::from(&selection.reasoning)
+            let admission = self
+                .admit_explicit_model_at_boundary(state, &selection)
+                .await?
+                .and_then(|execution| {
+                    if state.current_round_index == 0
+                        && let Some(limit) = self.initial_output_limit
+                    {
+                        astra_turn_core::thinking_config::ThinkingConfig::from(
+                            &selection.reasoning,
+                        )
                         .validate_output_budget(u64::from(limit))
                         .map_err(|_| {
                             (
@@ -225,56 +267,58 @@ impl ServerAgenticLoopHost {
                                 "model_reasoning_unsupported",
                             )
                         })?;
-                }
-                let route = self.model_replay_route_for(&execution);
-                let scope = crate::turn::llm::model_origin::ReplayScope {
-                    encryptor: &self.encryptor,
-                    user_id: &user_id,
-                    session_id: &session_id,
-                    allowed_session_ids: self.private_reasoning_origins.as_ref(),
-                    run_id: &run_id,
-                    selection_revision: Some(selection.revision),
-                    route: &route,
-                };
-                crate::turn::llm::model_origin::project(&scope, &state.messages).map_err(|_| {
-                    (
-                        astra_core::ErrorKind::InvalidRequest,
-                        "model_history_incomplete",
-                    )
-                })?;
-                Ok(execution)
-            });
-        let (result, resolved) = match &admission {
-            Ok(execution) => (
-                RunModelOutcomeKind::Applied {
-                    model: selection.model.clone(),
-                    reasoning: selection.reasoning.clone(),
-                },
-                Some(astra_services::runs::ResolvedModelSelection {
-                    offering_id: execution.offering_id.clone(),
-                    model_name: execution.model_name.clone(),
-                    source_identity: execution.source_identity.clone(),
-                }),
-            ),
-            Err((kind, code)) => (
-                RunModelOutcomeKind::Rejected {
-                    kind: *kind,
-                    error_code: Some((*code).into()),
-                },
-                None,
-            ),
-        };
-        let outcome = RunModelOutcome {
-            selection: selection.clone(),
-            owner_generation: generation,
-            round_index: state.current_round_index,
-            result,
-        };
-        let committed = control
-            .finish_run_model(&user_id, &session_id, &run_id, &outcome, resolved.as_ref())
-            .await;
-        state.run_settings_observation.invalidate();
-        let fresh = state
+                    }
+                    let route = self.model_replay_route_for(&execution);
+                    let scope = crate::turn::llm::model_origin::ReplayScope {
+                        encryptor: &self.encryptor,
+                        user_id: &user_id,
+                        session_id: &session_id,
+                        allowed_session_ids: self.private_reasoning_origins.as_ref(),
+                        run_id: &run_id,
+                        selection_revision: Some(selection.revision),
+                        route: &route,
+                    };
+                    crate::turn::llm::model_origin::project(&scope, &state.messages).map_err(
+                        |_| {
+                            (
+                                astra_core::ErrorKind::InvalidRequest,
+                                "model_history_incomplete",
+                            )
+                        },
+                    )?;
+                    Ok(execution)
+                });
+            let (result, resolved) = match &admission {
+                Ok(execution) => (
+                    RunModelOutcomeKind::Applied {
+                        model: selection.model.clone(),
+                        reasoning: selection.reasoning.clone(),
+                    },
+                    Some(astra_services::runs::ResolvedModelSelection {
+                        offering_id: execution.offering_id.clone(),
+                        model_name: execution.model_name.clone(),
+                        source_identity: execution.source_identity.clone(),
+                    }),
+                ),
+                Err((kind, code)) => (
+                    RunModelOutcomeKind::Rejected {
+                        kind: *kind,
+                        error_code: Some((*code).into()),
+                    },
+                    None,
+                ),
+            };
+            let outcome = RunModelOutcome {
+                selection: selection.clone(),
+                owner_generation: generation,
+                round_index: state.current_round_index,
+                result,
+            };
+            let committed = control
+                .finish_run_model(&user_id, &session_id, &run_id, &outcome, resolved.as_ref())
+                .await;
+            state.run_settings_observation.invalidate();
+            let fresh = state
             .run_settings_observation
             .read(control.as_ref(), &user_id, &session_id, &run_id)
             .await
@@ -284,31 +328,68 @@ impl ServerAgenticLoopHost {
                 )
             })?
             .ok_or_else(|| invalid("The model change no longer belongs to this task"))?;
-        let decided = match committed {
-            Ok(Some(decided)) => decided,
-            Ok(None) => return Err(invalid("The model change lost its execution owner")),
-            Err(_) => fresh.model.outcome.clone().filter(|outcome| outcome.selection == selection)
-                .ok_or_else(|| invalid("The model change could not be confirmed; continue this task to reconcile it"))?,
-        };
-        if let Some(applied) = fresh.model.applied.as_ref() {
-            if let Ok(execution) = admission
-                && applied.selection == selection
-                && execution.offering_id == applied.resolved.offering_id
-                && execution.model_name == applied.resolved.model_name
-                && execution.source_identity == applied.resolved.source_identity
-                && matches!(decided.result, RunModelOutcomeKind::Applied { .. })
-            {
-                self.install_explicit_model(state, execution, &applied.reasoning);
-            } else {
-                self.ensure_applied_model(state, applied).await?;
+            let newer_pending = fresh.model.requested.as_ref().is_some_and(|requested| {
+                fresh
+                    .model
+                    .outcome
+                    .as_ref()
+                    .is_none_or(|outcome| &outcome.selection != requested)
+            });
+            let decided = match committed {
+                Ok(Some(decided)) => decided,
+                Ok(None) => return Err(invalid("The model change lost its execution owner")),
+                Err(_) => match fresh
+                    .model
+                    .outcome
+                    .clone()
+                    .filter(|outcome| outcome.selection == selection)
+                {
+                    Some(outcome) => outcome,
+                    None if newer_pending => {
+                        // The old commit may have succeeded, but a newer choice
+                        // is already authoritative. Do not invent its outcome.
+                        settings = fresh.model;
+                        continue;
+                    }
+                    None => {
+                        return Err(invalid(
+                            "The model change could not be confirmed; continue this task to reconcile it",
+                        ));
+                    }
+                },
+            };
+            if newer_pending {
+                self.emit_committed_lifecycle_projection(
+                    json!({"type":"run_model_outcome", "run_id":run_id,
+                "session_id":session_id, "outcome":decided}),
+                )
+                .await;
+                settings = fresh.model;
+                continue;
             }
-        }
-        self.emit_committed_lifecycle_projection(
-            json!({"type":"run_model_outcome", "run_id":run_id,
+            if let Some(applied) = fresh.model.applied.as_ref() {
+                if let Ok(execution) = admission
+                    && applied.selection == selection
+                    && execution.offering_id == applied.resolved.offering_id
+                    && execution.model_name == applied.resolved.model_name
+                    && execution.source_identity == applied.resolved.source_identity
+                    && matches!(decided.result, RunModelOutcomeKind::Applied { .. })
+                {
+                    self.install_explicit_model(state, execution, &applied.reasoning);
+                } else {
+                    self.ensure_applied_model(state, applied).await?;
+                }
+            }
+            self.emit_committed_lifecycle_projection(
+                json!({"type":"run_model_outcome", "run_id":run_id,
             "session_id":session_id, "outcome":decided}),
-        )
-        .await;
-        Ok(())
+            )
+            .await;
+            return Ok(());
+        }
+        Err(invalid(
+            "Model selection changed repeatedly; continue the task after choosing a model",
+        ))
     }
 
     pub(crate) fn configure_model_routing(

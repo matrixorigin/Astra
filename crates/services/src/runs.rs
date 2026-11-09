@@ -30,7 +30,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InheritedRunModel {
     Explicit(RunModelApplied),
-    Auto(crate::model_routing::ModelRoutingDecision),
+    Auto(Box<crate::model_routing::ModelRoutingDecision>),
     Original,
 }
 pub(crate) use terminal::TerminalReceiptRunIdentity;
@@ -2246,6 +2246,50 @@ pub struct StoredRunAdmission {
 impl StoredRunAdmission {
     pub fn run(&self) -> &DurableRunRecord {
         &self.run
+    }
+}
+
+/// Facts needed before admitting one guidance message. The admission
+/// transaction remains authoritative for the Run and message outcome.
+#[derive(Clone, Debug)]
+pub struct RunGuidancePreflight {
+    pub user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub agent_id: Option<String>,
+    pub source_already_admitted: bool,
+    pub native_anchor: bool,
+}
+
+fn project_run_guidance_preflight<'a>(
+    run: &DurableRunRecord,
+    source_key: &str,
+    events: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> RunGuidancePreflight {
+    let mut source_already_admitted = false;
+    let mut native_anchor = false;
+    for event in events {
+        source_already_admitted |= event
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str)
+            == Some(source_key);
+        native_anchor |= event.get("event_type").and_then(serde_json::Value::as_str)
+            == Some(COLLABORATOR_STAGE_EVENT)
+            && serde_json::from_value::<CollaboratorStageAdmission>(
+                event
+                    .get("admission")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .is_ok_and(|admission| admission.anchor_run_id == run.run_id);
+    }
+    RunGuidancePreflight {
+        user_id: run.user_id.clone(),
+        session_id: run.session_id.clone(),
+        run_id: run.run_id.clone(),
+        agent_id: run.agent_id.clone(),
+        source_already_admitted,
+        native_anchor,
     }
 }
 
@@ -6181,7 +6225,7 @@ pub trait RunStateStore: Send + Sync {
                     serde_json::from_value(event["data"].clone())
                         .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
                 decision.validate_identity(run_id, session_id)?;
-                Ok(InheritedRunModel::Auto(decision))
+                Ok(InheritedRunModel::Auto(Box::new(decision)))
             }
             None => Ok(InheritedRunModel::Original),
         }
@@ -6333,6 +6377,20 @@ pub trait RunStateStore: Send + Sync {
             .load_run(user_id, run_id)
             .await?
             .map(|run| StoredRunAdmission { run }))
+    }
+
+    /// Read only the facts used to route one explicit guidance request.
+    /// Implementations must not substitute this observation for atomic admission.
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        Ok(self
+            .load_run(user_id, run_id)
+            .await?
+            .map(|run| project_run_guidance_preflight(&run, source_key, &run.events)))
     }
 
     /// Order a no-row terminal receipt against child creation under the same
@@ -8648,6 +8706,19 @@ impl RunStateStore for InMemoryRunStateStore {
             .cloned())
     }
 
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        let runs = self.runs.read().await;
+        Ok(runs
+            .get(run_id)
+            .filter(|run| run.user_id == user_id)
+            .map(|run| project_run_guidance_preflight(run, source_key, &run.events)))
+    }
+
     async fn find_latest_root_run(
         &self,
         user_id: &str,
@@ -8719,9 +8790,8 @@ impl RunStateStore for InMemoryRunStateStore {
         let expected_key = format!("user_intent:{}", request.intent_id);
         if let Some((position, existing)) =
             run.events.iter().enumerate().rev().find(|(_, event)| {
-                extract_event_type(event) == "user_intent"
-                    && extract_optional_string(event, "idempotency_key").as_deref()
-                        == Some(expected_key.as_str())
+                extract_optional_string(event, "idempotency_key").as_deref()
+                    == Some(expected_key.as_str())
             })
         {
             if !run_guidance_event_matches(existing, request.event) {
@@ -16866,7 +16936,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 serde_json::from_value(event["data"].clone())
                     .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
             decision.validate_identity(run_id, session_id)?;
-            return Ok(InheritedRunModel::Auto(decision));
+            return Ok(InheritedRunModel::Auto(Box::new(decision)));
         }
         Ok(InheritedRunModel::Original)
     }
@@ -17594,6 +17664,56 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|error| error.to_string())
     }
 
+    async fn load_run_guidance_preflight(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        source_key: &str,
+    ) -> Result<Option<RunGuidancePreflight>, String> {
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        // The source key and native anchor stage have different owners and
+        // indexes. Keep them as separate equality probes in one round trip;
+        // an OR/IN predicate can make MatrixOne scan the whole Run history.
+        let rows = sqlx::query(
+            "SELECT payload_json, event_idx, session_id FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND idempotency_key = ? AND event_idx <= ?
+             UNION ALL
+             SELECT payload_json, event_idx, session_id FROM agent_run_events FORCE INDEX (idx_agent_run_events_owner_session_subject)
+             WHERE user_id = ? AND session_id = ? AND event_type = ? AND subject_run_id = ?
+               AND run_id = ? AND event_idx <= ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(source_key)
+        .bind(run.last_event_idx)
+        .bind(user_id)
+        .bind(&run.session_id)
+        .bind(COLLABORATOR_STAGE_EVENT)
+        .bind(run_id)
+        .bind(run_id)
+        .bind(run.last_event_idx)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_guidance_preflight", run_id, source).to_string())?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session_id: String = row.try_get("session_id").map_err(|e| e.to_string())?;
+            if session_id != run.session_id {
+                return Err("Guidance event belongs to a different session".into());
+            }
+            events.push(decode_run_event_payload(&row, run_id).map_err(|e| e.to_string())?);
+        }
+        Ok(Some(project_run_guidance_preflight(
+            &run, source_key, &events,
+        )))
+    }
+
     async fn load_run_observation(
         &self,
         user_id: &str,
@@ -18188,9 +18308,8 @@ impl RunStateStore for DatabaseRunStateStore {
         // subsequently fences or settles.
         let idempotency_key = format!("user_intent:{}", request.intent_id);
         let duplicate = sqlx::query(
-            "SELECT payload_json, event_idx, session_id, invocation_supersession_scope_key FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_type = 'user_intent'
-               AND idempotency_key = ? LIMIT 1",
+            "SELECT payload_json, event_idx, session_id, event_type, invocation_supersession_scope_key FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
         )
         .bind(request.user_id)
         .bind(request.run_id)
@@ -18201,9 +18320,13 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("admit_run_guidance_load_duplicate", request.run_id, source).to_string()
         })?;
         if let Some(row) = duplicate {
-            let projection_matches = row.try_get::<String, _>("session_id").map_err(|source| {
-                db_error("decode_guidance_duplicate_session", request.run_id, source).to_string()
-            })? == request.expected_session_id
+            let projection_matches = row.try_get::<String, _>("event_type").map_err(|source| {
+                db_error("decode_guidance_duplicate_type", request.run_id, source).to_string()
+            })? == "user_intent"
+                && row.try_get::<String, _>("session_id").map_err(|source| {
+                    db_error("decode_guidance_duplicate_session", request.run_id, source)
+                        .to_string()
+                })? == request.expected_session_id
                 && row
                     .try_get::<Option<String>, _>("invocation_supersession_scope_key")
                     .map_err(|source| {
@@ -35784,6 +35907,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!first.replayed);
+        let initial_preflight = store
+            .load_run_guidance_preflight(&user_id, &anchor_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(initial_preflight.native_anchor);
+        assert!(!initial_preflight.source_already_admitted);
         let native = CollaboratorNativeSession {
             anchor_run_id: anchor_id.clone(),
             provider: CollaboratorProvider::Codex,
@@ -35885,6 +36015,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(association.latest_stage.run_id, next_id);
+        let old_anchor = store
+            .load_run_guidance_preflight(&user_id, &anchor_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            old_anchor.native_anchor,
+            "the anchor remains identifiable after a later stage"
+        );
+        let later_stage = store
+            .load_run_guidance_preflight(&user_id, &next_id, "user_intent:new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !later_stage.native_anchor,
+            "later stages use the canonical association lookup"
+        );
+        assert!(
+            store
+                .load_run_guidance_preflight("other-user", &anchor_id, "user_intent:new")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store
                 .load_run(&user_id, &anchor_id)
@@ -48224,6 +48379,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guidance_preflight_does_not_clone_or_load_in_memory_history() {
+        let store = InMemoryRunStateStore::new();
+        let mut run = durable_run_record("guide-preflight");
+        run.events = (0..5_000)
+            .map(|index| json!({"event_type":"trace", "data":{"index":index}}))
+            .collect();
+        run.events
+            .push(json!({"event_type":"user_intent", "idempotency_key":"user_intent:message"}));
+        run.events
+            .push(json!({"event_type":"tool_result", "idempotency_key":"user_intent:collision"}));
+        let user = run.user_id.clone();
+        let session = run.session_id.clone();
+        store.runs.write().await.insert(run.run_id.clone(), run);
+        let facts = store
+            .load_run_guidance_preflight(&user, "guide-preflight", "user_intent:message")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(facts.source_already_admitted);
+        assert!(!facts.native_anchor);
+        let collision = json!({"event_type":"user_intent", "idempotency_key":"user_intent:collision",
+            "data":{"intent_id":"collision", "delivery":"guide_current_run", "input":{"content":"hello"}}});
+        assert!(matches!(
+            store
+                .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                    user_id: &user,
+                    run_id: "guide-preflight",
+                    expected_session_id: &session,
+                    intent_id: "collision",
+                    event: &collision,
+                    process_local_execution_live: true,
+                })
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::IdentityConflict
+        ));
+        assert!(
+            store
+                .load_run_guidance_preflight("other-user", "guide-preflight", "user_intent:message")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.load_run_call_count(), 0);
+    }
+
+    #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_paused_guidance_and_live_delta_share_the_owner_lease_boundary() {
         let (store, pool) = setup_database_run_state_store_it().await;
@@ -48261,6 +48463,13 @@ mod tests {
             initial.last_event_idx, 0,
             "insert preserves its run-created receipt"
         );
+        let before = store
+            .load_run_guidance_preflight(&user, &id, "user_intent:paused-guide")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!before.source_already_admitted);
+        assert!(!before.native_anchor);
         let admission = store.admit_run_guidance(request).await.unwrap();
         assert!(
             matches!(
@@ -48273,6 +48482,14 @@ mod tests {
             store.admit_run_guidance(request).await.unwrap(),
             AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
         ));
+        assert!(
+            store
+                .load_run_guidance_preflight(&user, &id, "user_intent:paused-guide")
+                .await
+                .unwrap()
+                .unwrap()
+                .source_already_admitted
+        );
         let observer = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("observer-pod");
         assert_eq!(
             observer
@@ -48318,6 +48535,32 @@ mod tests {
                 .unwrap(),
             Some(UserIntentStatus::Returned)
         );
+        store
+            .append_event(
+                &user,
+                &session,
+                &id,
+                json!({
+                    "event_type":"tool_result", "idempotency_key":"user_intent:collision", "data":{}
+                }),
+            )
+            .await
+            .unwrap();
+        let collision = json!({
+            "event_type":"user_intent", "idempotency_key":"user_intent:collision",
+            "data":{"intent_id":"collision", "delivery":"guide_current_run", "input":{"content":"hello"}}
+        });
+        assert!(matches!(
+            store
+                .admit_run_guidance(AtomicRunGuidanceAdmissionRequest {
+                    intent_id: "collision",
+                    event: &collision,
+                    ..request
+                })
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::IdentityConflict
+        ));
         sqlx::query("UPDATE agent_runs SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id = ? AND run_id = ?")
             .bind(&user).bind(&id).execute(pool.get()).await.unwrap();
         assert!(
