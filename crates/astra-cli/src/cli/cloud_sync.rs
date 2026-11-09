@@ -947,6 +947,7 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
                 break;
             }
         }
+        drop(schedule_guard);
         let next_delay = if !auth_snapshot.is_current() {
             None
         } else if let Some(blocker) = blocker {
@@ -966,7 +967,6 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
                 }
             }
         };
-        drop(schedule_guard);
         if !auth_snapshot.is_current() {
             // A newer login may have observed these records while they were
             // still claimed by this worker. Hand them back to its identity.
@@ -2533,12 +2533,14 @@ pub(crate) async fn run_post_auth_sync(
 pub(crate) struct PostAuthCloudResync {
     pull: CloudPullResult,
     preferences: Vec<(String, String)>,
-    pub(crate) report: SyncOutboxDrainReport,
 }
 
 pub(crate) async fn prepare_post_auth_cloud_resync(
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> PostAuthCloudResync {
+    if owner.is_current() {
+        schedule_sync_outbox_drain();
+    }
     let preferences = match owner
         .native_binding
         .as_ref()
@@ -2557,20 +2559,7 @@ pub(crate) async fn prepare_post_auth_cloud_resync(
         tracing::warn!(target: "astra_cli::cloud_sync", operation = "post_auth_resync", error = "preference_pull_unavailable", "post-authentication preference pull skipped");
         Vec::new()
     });
-    let report = try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, owner).await;
-    if report.can_retry_automatically() && owner.is_current() {
-        schedule_sync_outbox_drain();
-    } else if owner.is_current()
-        && let Some(delay) = report.blocker.and_then(SyncOutboxDrainBlocker::retry_delay)
-    {
-        notify_sync_issue(&owner.owner_scope);
-        schedule_sync_outbox_drain_after(delay);
-    }
-    PostAuthCloudResync {
-        pull,
-        preferences,
-        report,
-    }
+    PostAuthCloudResync { pull, preferences }
 }
 
 pub(crate) struct CloudPreferenceSnapshot {
@@ -2624,7 +2613,7 @@ pub(crate) fn apply_post_auth_cloud_resync(
     state: &mut SessionState,
     mut result: PostAuthCloudResync,
     baseline: &CloudPreferenceSnapshot,
-) -> SyncOutboxDrainReport {
+) {
     let current = cloud_preference_snapshot(state);
     result.preferences.retain(|(key, _)| {
         baseline.local_revisions.get(key.as_str()) == current.local_revisions.get(key.as_str())
@@ -2645,7 +2634,7 @@ pub(crate) fn apply_post_auth_cloud_resync(
     );
     let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     tokio::spawn(run_post_auth_sync(projection, binding, snapshot));
-    result.report
+
 }
 
 #[cfg(test)]

@@ -175,9 +175,9 @@ fn execution_selection_admission_rejection(
 ) -> (StatusCode, Json<ErrorResponse>) {
     if error.error_code.as_deref() == Some("execution_binding_provider_required") {
         error.metadata = Some(json!({
-            "attempt_admission_state": "rejected",
             "recovery_action": "register_or_select_execution_provider"
         }));
+        crate::server::http_helpers::mark_attempt_rejected(&mut error);
     }
     (status, Json(error))
 }

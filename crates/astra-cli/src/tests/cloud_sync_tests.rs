@@ -766,13 +766,7 @@ async fn post_auth_sync_schedules_its_marker_without_waiting_for_delivery() {
     let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     let baseline = cloud_sync::cloud_preference_snapshot(&state);
     let prepared = cloud_sync::prepare_post_auth_cloud_resync(&owner).await;
-    let report = cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
-    assert_eq!(report.attempted, 0);
-    assert_eq!(report.acked, 0);
-    assert_eq!(report.failed, 0);
-    assert_eq!(report.terminal, 0);
-    assert_eq!(report.blocker, None);
-    assert!(!report.is_incomplete());
+    cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -1400,7 +1394,7 @@ async fn relogin_hands_post_auth_claims_to_the_new_authentication() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
+async fn post_auth_preferences_without_a_token_preserve_ready_records() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
@@ -1421,16 +1415,7 @@ async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
     let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     let baseline = cloud_sync::cloud_preference_snapshot(&state);
     let prepared = cloud_sync::prepare_post_auth_cloud_resync(&owner).await;
-    let report = cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
-    assert!(report.cloud_configured);
-    assert_eq!(report.attempted, 0);
-    assert_eq!(report.acked, 0);
-    assert_eq!(report.failed, 0);
-    assert_eq!(
-        report.blocker,
-        Some(cloud_sync::SyncOutboxDrainBlocker::MissingAccessToken)
-    );
-    assert!(report.user_notice().is_some());
+    cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
 
     let status = SyncOutboxStore::local().status().expect("status");
     assert_eq!(status.pending, 2);
@@ -1492,11 +1477,15 @@ async fn delayed_post_auth_sync_preserves_local_choices_and_merges_untouched_pre
     );
     let baseline = cloud_sync::cloud_preference_snapshot(&state);
     let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
-    let mut pending = Box::pin(cloud_sync::prepare_post_auth_cloud_resync(&owner));
-    tokio::select! {
-        _ = &mut pending => panic!("outbox should hold the already fetched preference result"),
-        ready = tokio::time::timeout(std::time::Duration::from_secs(10),reached.notified()) => ready.expect("outbox dispatch barrier"),
-    }
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        cloud_sync::prepare_post_auth_cloud_resync(&owner),
+    )
+    .await
+    .expect("preferences must arrive independently of queued uploads");
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached.notified())
+        .await
+        .expect("outbox dispatch barrier");
     // The same setter is used by `/explain`. Return to the initial value to
     // exercise ABA: value equality alone must not erase explicit local intent.
     state.set_explain_mode(crate::ExplainMode::On);
@@ -1504,11 +1493,7 @@ async fn delayed_post_auth_sync_preserves_local_choices_and_merges_untouched_pre
     state.auto_memory_enabled = false;
     state.notifications_enabled = false;
     state.notification_method = crate::cli::notifications::NotificationMethod::Bell;
-    release.notify_one();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
-        .await
-        .unwrap();
-    let _report = cloud_sync::apply_post_auth_cloud_resync(None, &mut state, result, &baseline);
+    cloud_sync::apply_post_auth_cloud_resync(None, &mut state, result, &baseline);
     assert_eq!(state.explain, crate::ExplainMode::Off);
     assert!(!state.auto_memory_enabled && !state.notifications_enabled);
     assert_eq!(
@@ -1519,6 +1504,7 @@ async fn delayed_post_auth_sync_preserves_local_choices_and_merges_untouched_pre
         state.notification_threshold_secs, 99,
         "untouched settings still synchronize"
     );
+    release.notify_one();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while SyncOutboxStore::local().status().unwrap().acked < 2 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1530,8 +1516,7 @@ async fn delayed_post_auth_sync_preserves_local_choices_and_merges_untouched_pre
     // during that read. The previous edit is not a permanent cloud override.
     let baseline = cloud_sync::cloud_preference_snapshot(&state);
     let prepared = cloud_sync::prepare_post_auth_cloud_resync(&owner).await;
-    let report = cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
-    assert_eq!(report.blocker, None);
+    cloud_sync::apply_post_auth_cloud_resync(None, &mut state, prepared, &baseline);
     assert_eq!(state.explain, crate::ExplainMode::Verbose);
     assert!(state.auto_memory_enabled && state.notifications_enabled);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
